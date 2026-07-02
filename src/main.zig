@@ -598,6 +598,63 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // ── Web Push delivery worker ([webpush] enabled + account store) ────────
+    // Offline DMs (tegami) nudge the recipient's browser through their push
+    // service — payloads are RFC 8291-encrypted end-to-end to the browser.
+    const WebpushWorker = if (builtin.os.tag == .linux) orochi.daemon.webpush.Worker else void;
+    var webpush_worker: ?*WebpushWorker = null;
+    var webpush_resolver: ?*orochi.daemon.acme_runner.SystemResolver = null;
+    var webpush_pub_buf: [orochi.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
+    defer if (comptime builtin.os.tag == .linux) {
+        if (webpush_worker) |w| {
+            w.shutdown();
+            allocator.destroy(w);
+        }
+        if (webpush_resolver) |r| allocator.destroy(r);
+    };
+    if (held) |h| {
+        if (h.parsed.webpush.enabled) {
+            if (comptime builtin.os.tag == .linux) webpush_blk: {
+                if (srv_cfg.account_services == null) {
+                    std.debug.print("orochi: [webpush] enabled but no account store; web push disabled\n", .{});
+                    break :webpush_blk;
+                }
+                // Trust anchors + resolver live for the process lifetime.
+                const bundle_text = std.Io.Dir.cwd().readFileAlloc(init.io, orochi.daemon.acme_cli.default_ca_bundle, allocator, .limited(orochi.daemon.acme_cli.default_ca_bundle_max_bytes)) catch |err| {
+                    std.debug.print("orochi: [webpush] CA bundle read failed ({s}); web push disabled\n", .{@errorName(err)});
+                    break :webpush_blk;
+                };
+                defer allocator.free(bundle_text);
+                const anchors = orochi.daemon.acme_cli.loadTrustAnchors(allocator, bundle_text) catch |err| {
+                    std.debug.print("orochi: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
+                    break :webpush_blk;
+                };
+                const vapid = orochi.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path) catch |err| {
+                    std.debug.print("orochi: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
+                    break :webpush_blk;
+                };
+                const resolver = try allocator.create(orochi.daemon.acme_runner.SystemResolver);
+                resolver.* = .{ .allocator = allocator, .io = init.io };
+                webpush_resolver = resolver;
+                const w = try allocator.create(WebpushWorker);
+                w.* = .{
+                    .allocator = allocator,
+                    .vapid = vapid.key_pair,
+                    .subject = h.parsed.webpush.subject,
+                    .resolver = resolver.resolver(),
+                    .trust_anchors = anchors.items,
+                };
+                try w.spawn();
+                webpush_worker = w;
+                srv.webpush_worker = w;
+                srv.webpush_vapid_pub = vapid.publicB64(&webpush_pub_buf);
+                std.debug.print("orochi: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv.webpush_vapid_pub });
+            } else {
+                std.debug.print("orochi: [webpush] enabled but web push is Linux-only; disabled\n", .{});
+            }
+        }
+    }
+
     // Now that the server (and its live world) exists, attach the services state
     // hook so channel REGISTER/DROP reflects into the world's +r REGISTERED flag.
     if (account_store != null) {

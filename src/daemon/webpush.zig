@@ -29,6 +29,8 @@ const Allocator = std.mem.Allocator;
 const b64url = std.base64.url_safe_no_pad;
 
 pub const max_subscriptions_per_account: usize = 3;
+/// Length of the base64url-unpadded VAPID public key (65 SEC1 bytes).
+pub const vapid_pub_b64_len: usize = b64url.Encoder.calcSize(65);
 pub const max_endpoint_len: usize = 512;
 /// Push TTL we request: the service holds an undelivered push this long.
 pub const push_ttl_seconds: u32 = 12 * 60 * 60;
@@ -123,6 +125,16 @@ pub fn decodeList(allocator: Allocator, text: []const u8) CodecError![]Subscript
 pub fn freeList(allocator: Allocator, subs: []Subscription) void {
     for (subs) |*s| s.deinit(allocator);
     allocator.free(subs);
+}
+
+/// Parse a client-supplied `p256dh` value (base64url, 65-byte SEC1 point).
+pub fn decodeKey65(text: []const u8) error{InvalidSubscriptionKey}![wp_crypto.ua_public_length]u8 {
+    return wp_crypto.decodeFixed(wp_crypto.ua_public_length, text);
+}
+
+/// Parse a client-supplied `auth` value (base64url, 16 bytes).
+pub fn decodeAuth16(text: []const u8) error{InvalidSubscriptionKey}![wp_crypto.auth_secret_length]u8 {
+    return wp_crypto.decodeFixed(wp_crypto.auth_secret_length, text);
 }
 
 /// Validate a client-supplied endpoint: absolute https URL, sane length, no

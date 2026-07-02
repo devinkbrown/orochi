@@ -28,6 +28,10 @@ fn tegami(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleTegami(x.conn, x.parsed);
 }
+fn webpushCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleWebpush(x.conn, x.parsed);
+}
 fn activity(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleActivity(x.id, x.conn, x.parsed);
@@ -55,6 +59,7 @@ pub const module = registry.Module{
         .{ .name = "FILTER", .handler = filter },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "TEGAMI", .handler = tegami },
+        .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },
         .{ .name = "MEMO", .handler = tegami }, // alias: TEGAMI (手紙) is the memo system
         .{ .name = "ACTIVITY", .handler = activity },
         .{ .name = "GEOIP", .min_params = 1, .access = .oper, .handler = geoipCmd, .summary = "GeoIP lookup of an IP (oper)" },

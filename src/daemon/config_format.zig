@@ -63,6 +63,7 @@ pub const Config = struct {
     cloak: Cloak = .{},
     tls: Tls = .{},
     acme: Acme = .{},
+    webpush: Webpush = .{},
     sts: Sts = .{},
     dnsbl: Dnsbl = .{},
     mail: Mail = .{},
@@ -488,6 +489,18 @@ pub const Config = struct {
     /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
     /// and writes to the configured `[tls]` cert/key paths; this section only
     /// controls cadence and CA/account inputs.
+    /// `[webpush]` — browser Web Push delivery for offline DMs (tegami).
+    /// Off by default; enabling needs an account store (subscriptions are
+    /// account-scoped) and outbound HTTPS (same trust anchors as ACME).
+    pub const Webpush = struct {
+        enabled: bool = false,
+        /// VAPID `sub` claim — an operator contact the push service may use.
+        subject: []const u8 = "mailto:ops@eshmaki.me",
+        /// Where the ES256 VAPID secret persists (rotating it invalidates
+        /// every stored browser subscription).
+        vapid_key_path: []const u8 = "orochi-webpush-vapid.key",
+    };
+
     pub const Acme = struct {
         enabled: bool = false,
         directory_url: []const u8 = acme_default_directory_url,
@@ -842,6 +855,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("acme.contact"), &cfg.acme.contact);
     cfg.acme.renew_before_days = @intCast(try uintField(doc, "acme.renew_before_days", cfg.acme.renew_before_days, 1, 89));
     if (doc.getString("acme.check_interval")) |s| cfg.acme.check_interval_ms = try durationMs(s);
+
+    // [webpush]
+    if (doc.getBool("webpush.enabled")) |b| cfg.webpush.enabled = b;
+    try setStr(allocator, resolver, doc.getString("webpush.subject"), &cfg.webpush.subject);
+    try setStr(allocator, resolver, doc.getString("webpush.vapid_key_path"), &cfg.webpush.vapid_key_path);
 
     // [sts]
     if (doc.getBool("sts.enabled")) |b| cfg.sts.enabled = b;

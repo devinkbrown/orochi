@@ -223,6 +223,7 @@ fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyfr
     br.fanoutWebrtcToNative(rtp, keyframe_hint, &sctx, bridgeSendToNative);
 }
 const tegami_mod = @import("tegami.zig");
+const webpush_mod = @import("webpush.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
 const bot_registry_mod = @import("bot_registry.zig");
@@ -1159,6 +1160,23 @@ pub const ServerError = error{
 /// with the length tokens (TOPICLEN) replaced by their configured values. The
 /// returned slice and its dynamic entries are owned by `allocator`; install via
 /// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
+/// Minimal JSON string emitter for webpushNotify payloads (quotes + escapes).
+fn writeJsonEscaped(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeByte('"');
+    for (text) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0...8, 11, 12, 14...31 => try w.print("\\u{x:0>4}", .{c}),
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeByte('"');
+}
+
 pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
     // +3: PREFIX, STATUSMSG, and MODES are appended here. PREFIX/STATUSMSG derive
@@ -2664,6 +2682,10 @@ pub const LinuxServer = struct {
     grant_incarnation: u64 = 0,
     /// Account services backend (borrowed; owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Web Push delivery worker (borrowed; owned by main; null = disabled).
+    webpush_worker: ?*webpush_mod.Worker = null,
+    /// base64url VAPID public key (borrowed from main), for WEBPUSH VAPID.
+    webpush_vapid_pub: []const u8 = "",
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
     /// Wall-clock Unix seconds captured at init, for the registration 003
@@ -21793,6 +21815,9 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "TEGAMI", code, "Could not deliver tegami");
                 return;
             };
+            // Reach: the recipient has no attached session — nudge their
+            // browser(s) through Web Push (best-effort; tegami holds the DM).
+            self.webpushNotify(delivery, from, text);
             if (decision.forwarded) {
                 var fb: [192]u8 = undefined;
                 const msg = std.fmt.bufPrint(&fb, "TEGAMI: message stored (forwarded to {s})", .{delivery}) catch "TEGAMI: message stored for delivery";
@@ -21803,6 +21828,188 @@ pub const LinuxServer = struct {
             return;
         }
         try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, CLEAR, FORWARD, or IGNORE");
+    }
+
+    /// WEBPUSH — browser push subscriptions (Onyx "reach you with the tab
+    /// closed"). Subcommands:
+    ///   VAPID                                    → NOTE with the server public key
+    ///   SUBSCRIBE <endpoint> <p256dh> <auth>     → store (account-scoped, max 3)
+    ///   UNSUBSCRIBE <endpoint>                   → remove one
+    ///   LIST                                     → NOTE per stored endpoint
+    /// Keys are base64url-unpadded exactly as PushSubscription.getKey() gives
+    /// them. Disabled (no worker) → FAIL, so clients can probe safely.
+    pub fn handleWebpush(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (self.webpush_worker == null) {
+            try self.failReply(conn, "WEBPUSH", "DISABLED", "Web push is not enabled on this server");
+            return;
+        }
+        const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
+
+        if (std.ascii.eqlIgnoreCase(sub, "VAPID")) {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH VAPID :{s}\r\n", .{ self.serverName(), self.webpush_vapid_pub }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+
+        const acct = conn.session.account() orelse {
+            try self.failReply(conn, "WEBPUSH", "ACCOUNT_REQUIRED", "Log in to manage push subscriptions");
+            return;
+        };
+        const svc = self.account_services orelse {
+            try self.failReply(conn, "WEBPUSH", "TEMPORARILY_UNAVAILABLE", "Account services are unavailable");
+            return;
+        };
+
+        if (std.ascii.eqlIgnoreCase(sub, "SUBSCRIBE")) {
+            if (parsed.param_count < 4) {
+                try self.failReply(conn, "WEBPUSH", "NEED_MORE_PARAMS", "WEBPUSH SUBSCRIBE <endpoint> <p256dh> <auth>");
+                return;
+            }
+            const endpoint = parsed.paramSlice()[1];
+            if (!webpush_mod.validEndpoint(endpoint)) {
+                try self.failReply(conn, "WEBPUSH", "INVALID_ENDPOINT", "Endpoint must be a well-formed https URL");
+                return;
+            }
+            const ua_public = webpush_mod.decodeKey65(parsed.paramSlice()[2]) catch {
+                try self.failReply(conn, "WEBPUSH", "INVALID_KEY", "p256dh must be a base64url P-256 public key");
+                return;
+            };
+            const auth = webpush_mod.decodeAuth16(parsed.paramSlice()[3]) catch {
+                try self.failReply(conn, "WEBPUSH", "INVALID_KEY", "auth must be a 16-byte base64url secret");
+                return;
+            };
+
+            const subs = self.webpushLoad(svc, acct);
+            defer webpush_mod.freeList(self.allocator, subs);
+            // Re-subscribing an existing endpoint refreshes its keys in place.
+            var replaced = false;
+            for (subs) |*existing| {
+                if (std.mem.eql(u8, existing.endpoint, endpoint)) {
+                    existing.ua_public = ua_public;
+                    existing.auth = auth;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced and subs.len >= webpush_mod.max_subscriptions_per_account) {
+                try self.failReply(conn, "WEBPUSH", "TOO_MANY_SUBSCRIPTIONS", "Subscription limit reached — UNSUBSCRIBE one first");
+                return;
+            }
+            if (replaced) {
+                self.webpushStore(svc, acct, subs);
+            } else {
+                const ep_owned = self.allocator.dupe(u8, endpoint) catch return;
+                const grown = std.mem.concat(self.allocator, webpush_mod.Subscription, &.{ subs, &.{.{ .endpoint = ep_owned, .ua_public = ua_public, .auth = auth }} }) catch {
+                    self.allocator.free(ep_owned);
+                    return;
+                };
+                defer self.allocator.free(grown);
+                self.webpushStore(svc, acct, grown);
+                self.allocator.free(ep_owned);
+            }
+            try self.noticeTo(conn, "WEBPUSH: subscription stored");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "UNSUBSCRIBE")) {
+            if (parsed.param_count < 2) {
+                try self.failReply(conn, "WEBPUSH", "NEED_MORE_PARAMS", "WEBPUSH UNSUBSCRIBE <endpoint>");
+                return;
+            }
+            const endpoint = parsed.paramSlice()[1];
+            const subs = self.webpushLoad(svc, acct);
+            defer webpush_mod.freeList(self.allocator, subs);
+            var kept: [webpush_mod.max_subscriptions_per_account]webpush_mod.Subscription = undefined;
+            var n: usize = 0;
+            for (subs) |existing| {
+                if (std.mem.eql(u8, existing.endpoint, endpoint)) continue;
+                if (n < kept.len) {
+                    kept[n] = existing;
+                    n += 1;
+                }
+            }
+            if (n == subs.len) {
+                try self.failReply(conn, "WEBPUSH", "NOT_SUBSCRIBED", "No such subscription");
+                return;
+            }
+            self.webpushStore(svc, acct, kept[0..n]);
+            try self.noticeTo(conn, "WEBPUSH: subscription removed");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const subs = self.webpushLoad(svc, acct);
+            defer webpush_mod.freeList(self.allocator, subs);
+            for (subs) |existing| {
+                var buf: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH ENDPOINT :{s}\r\n", .{ self.serverName(), existing.endpoint }) catch continue;
+                try appendToConn(conn, line);
+            }
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH :End of subscriptions ({d})\r\n", .{ self.serverName(), subs.len }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+
+        try self.failReply(conn, "WEBPUSH", "INVALID_SUBCOMMAND", "Use VAPID, SUBSCRIBE, UNSUBSCRIBE, or LIST");
+    }
+
+    /// Load an account's stored subscriptions (empty on any failure).
+    fn webpushLoad(self: *LinuxServer, svc: *services_mod.Services, account: []const u8) []webpush_mod.Subscription {
+        const blob = svc.webpushGetAlloc(self.allocator, account) orelse return &.{};
+        defer self.allocator.free(blob);
+        return webpush_mod.decodeList(self.allocator, blob) catch &.{};
+    }
+
+    /// Persist a subscription list (best-effort).
+    fn webpushStore(self: *LinuxServer, svc: *services_mod.Services, account: []const u8, subs: []const webpush_mod.Subscription) void {
+        const blob = webpush_mod.encodeList(self.allocator, subs) catch return;
+        defer self.allocator.free(blob);
+        svc.webpushPut(account, blob) catch {};
+    }
+
+    /// Fire a push for an offline DM: encrypted `{"type":"dm","from":…,"text":…}`
+    /// to every subscription the recipient account holds. Also prunes endpoints
+    /// the push service reported gone (404/410) since the last call.
+    fn webpushNotify(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8) void {
+        const worker = self.webpush_worker orelse return;
+        const svc = self.account_services orelse return;
+
+        const subs = self.webpushLoad(svc, account);
+        defer webpush_mod.freeList(self.allocator, subs);
+
+        // Opportunistic pruning: drop this account's dead endpoints first.
+        const dead = worker.drainDead();
+        defer {
+            for (dead) |e| self.allocator.free(e);
+            if (dead.len != 0) self.allocator.free(dead);
+        }
+        var live: [webpush_mod.max_subscriptions_per_account]webpush_mod.Subscription = undefined;
+        var n: usize = 0;
+        outer: for (subs) |existing| {
+            for (dead) |gone| {
+                if (std.mem.eql(u8, existing.endpoint, gone)) continue :outer;
+            }
+            if (n < live.len) {
+                live[n] = existing;
+                n += 1;
+            }
+        }
+        if (n != subs.len) self.webpushStore(svc, account, live[0..n]);
+        if (n == 0) return;
+
+        // Payload: compact JSON, text truncated so it always encrypts in one record.
+        var pb: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&pb);
+        w.writeAll("{\"type\":\"dm\",\"from\":") catch return;
+        writeJsonEscaped(&w, from) catch return;
+        w.writeAll(",\"text\":") catch return;
+        const preview = if (text.len > 240) text[0..240] else text;
+        writeJsonEscaped(&w, preview) catch return;
+        w.writeAll("}") catch return;
+
+        for (live[0..n]) |s_| worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
     }
 
     /// Emit the caller's pending tegami as NOTE lines (without clearing).

@@ -1640,6 +1640,48 @@ pub const Services = struct {
         }
     }
 
+    // ── Durable Web Push subscriptions (per-account blob) ───────────────────────
+    // One serialized subscription list per account in `.props` ("wps\x00<account>").
+    // The blob format is owned by daemon/webpush.zig (encodeList/decodeList);
+    // services just stores it. Same private-namespace rule as TOTP: never
+    // reachable through the METADATA command surface.
+    const webpush_prefix = "wps\x00";
+    const webpush_key_max = webpush_prefix.len + account_max;
+    /// 3 subscriptions × (512-byte endpoint + b64url keys + separators), rounded up.
+    pub const webpush_value_max: usize = 4096;
+
+    fn webpushKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < webpush_prefix.len + account.len) return null;
+        @memcpy(buf[0..webpush_prefix.len], webpush_prefix);
+        for (account, 0..) |c, i| buf[webpush_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. webpush_prefix.len + account.len];
+    }
+
+    /// Copy of the account's stored subscription blob (caller frees), or null.
+    pub fn webpushGetAlloc(self: *Services, allocator: std.mem.Allocator, account: []const u8) ?[]u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [webpush_key_max]u8 = undefined;
+        const k = webpushKey(&kb, account) orelse return null;
+        const blob = self.store.family(.props).get(k) orelse return null;
+        return allocator.dupe(u8, blob) catch null;
+    }
+
+    /// Replace the account's subscription blob; empty blob deletes the record.
+    pub fn webpushPut(self: *Services, account: []const u8, blob: []const u8) ServiceError!void {
+        if (blob.len > webpush_value_max) return;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [webpush_key_max]u8 = undefined;
+        const k = webpushKey(&kb, account) orelse return;
+        if (blob.len == 0) {
+            try self.store.family(.props).delete(k);
+        } else {
+            try self.store.family(.props).put(k, blob);
+        }
+    }
+
     // ── Durable account-scoped TOTP secret (2FA enrollment survives restart) ────
     // The base32 shared secret for an account's ACTIVE TOTP enrollment, stored in
     // the private `.props` family under "tot\x00<account>". This namespace is
