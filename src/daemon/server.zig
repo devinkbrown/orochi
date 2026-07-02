@@ -72,6 +72,7 @@ const mesh_report = @import("../proto/mesh_report.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const event_history_mod = @import("event_history.zig");
+const event_collapse_mod = @import("event_collapse.zig");
 const route_report = @import("../proto/route_report.zig");
 const swim_report = @import("../proto/swim_report.zig");
 const link_health_mod = @import("link_health.zig");
@@ -2547,6 +2548,10 @@ pub const LinuxServer = struct {
     /// Lock-free per-category/severity Event Spine counters (since boot) for
     /// `EVENT STATS`. Incremented at the same two points as the history ring.
     event_stats: event_history_mod.EventStats = .{},
+    /// Flood-collapse of identical low-severity locally-raised events: past a
+    /// threshold within a window they are suppressed and later summarized (see
+    /// the stats-tick flush). Never collapses severity >= warn.
+    event_collapse: event_collapse_mod.CollapseTable(64) = .{},
     /// Persistent expected-membership set for split/heal transition detection:
     /// remembers every node id observed so a vanished node still registers as a
     /// split until it ages out (see updatePartitionTransitions).
@@ -3684,6 +3689,24 @@ pub const LinuxServer = struct {
             if (self.event_history_last_write_ms == 0 or enow - self.event_history_last_write_ms >= self.config.stats_interval_ms) {
                 self.event_history_last_write_ms = enow;
                 self.saveEventHistory();
+            }
+        }
+        // Flush any elapsed flood-collapse windows (reactor 0) into a single
+        // ".flood/.warn" summary each — published as >= warn so they bypass the
+        // collapser (no self-collapse).
+        if (self.rx() == &self.reactors[0]) {
+            var summaries: [16]event_collapse_mod.Summary = undefined;
+            const n = self.event_collapse.flush(platform.realtimeMillis(), &summaries);
+            for (summaries[0..n]) |*s| {
+                const cat: event_spine.EventCategory = if (s.category < @typeInfo(event_spine.EventCategory).@"enum".fields.len)
+                    @enumFromInt(s.category)
+                else
+                    .flood;
+                var mb: [320]u8 = undefined;
+                const msg = std.fmt.bufPrint(&mb, "collapsed {d}x {s} ({d} suppressed in {d}s): {s}", .{
+                    s.total, cat.code(), s.suppressed, @divTrunc(s.span_ms, 1000), s.message(),
+                }) catch continue;
+                self.publishOperEvent(.flood, .warn, msg) catch {};
             }
         }
 
@@ -23082,6 +23105,11 @@ pub const LinuxServer = struct {
         // name as the origin), then fan the same event to every mesh peer so opers
         // on OTHER nodes see it too — network-wide Event Spine. A peer renders it
         // with THIS node's name as the origin (carried on the wire).
+        // Flood-collapse: an identical low-severity event repeated past the
+        // threshold within the window is suppressed here (dropped from delivery,
+        // mesh, history, and stats); the stats-tick flush later emits one
+        // "collapsed N×" summary. Severity >= warn is never collapsed.
+        if (!self.event_collapse.admit(@intFromEnum(category), @intFromEnum(severity), message, platform.realtimeMillis())) return;
         self.event_history.record(@intFromEnum(category), @intFromEnum(severity), platform.realtimeMillis(), self.serverName(), message);
         self.event_stats.record(@intFromEnum(category), @intFromEnum(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
