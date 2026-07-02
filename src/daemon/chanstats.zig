@@ -267,11 +267,28 @@ pub const ChanStats = struct {
 
     // ── JSON emission ────────────────────────────────────────────────────────
 
+    /// Live network context injected by the server at flush time (the flush
+    /// runs under world.lockWrite, so presence reads are consistent). All
+    /// fields default to "absent" so tests and headless callers can pass `.{}`.
+    pub const NetInfo = struct {
+        /// Mesh-wide users online (server meshUserCount) — 0 when unknown.
+        users_online: u64 = 0,
+        presence_ctx: ?*anyopaque = null,
+        /// Current member count (local + mesh roster) for a channel name.
+        presence_fn: ?*const fn (ctx: *anyopaque, channel: []const u8) usize = null,
+
+        fn presentOf(self: NetInfo, chan_name: []const u8) usize {
+            const f = self.presence_fn orelse return 0;
+            const ctx = self.presence_ctx orelse return 0;
+            return f(ctx, chan_name);
+        }
+    };
+
     /// Write `index.json` + one `<slug>.json` per channel into `dir_path` (which
     /// must already exist — the deploy creates it). Best-effort: any render/I/O
     /// error on one file is swallowed so a single bad channel never aborts the
     /// flush. `io` is the daemon's crypto IO (the Zig 0.16 file API).
-    pub fn writeJson(self: *ChanStats, io: std.Io, dir_path: []const u8, network: []const u8, node: []const u8, now_ms: i64) void {
+    pub fn writeJson(self: *ChanStats, io: std.Io, dir_path: []const u8, network: []const u8, node: []const u8, now_ms: i64, net: NetInfo) void {
         var iaw = std.Io.Writer.Allocating.init(self.allocator);
         defer iaw.deinit();
         const iw = &iaw.writer;
@@ -279,6 +296,8 @@ pub const ChanStats = struct {
         writeJsonString(iw, network) catch return;
         iw.writeAll(",\"node\":") catch return;
         writeJsonString(iw, node) catch return;
+        iw.print(",\"users_online\":{d}", .{net.users_online}) catch return;
+        self.writeNetworkDays(iw) catch return;
         iw.writeAll(",\"channels\":[") catch return;
 
         var first = true;
@@ -286,14 +305,15 @@ pub const ChanStats = struct {
         while (it.next()) |e| {
             const agg = e.value_ptr.*;
             if (agg.messages < self.min_messages) continue;
-            self.writeChannelFile(io, dir_path, agg, now_ms);
+            const present = net.presentOf(agg.name);
+            self.writeChannelFile(io, dir_path, agg, now_ms, present);
 
             if (!first) iw.writeByte(',') catch return;
             first = false;
             iw.writeAll("{\"channel\":") catch return;
             writeJsonString(iw, agg.name) catch return;
-            iw.print(",\"messages\":{d},\"active_users\":{d},\"last_active\":{d},\"topic\":", .{
-                agg.messages, agg.users.count(), @divFloor(agg.last_active, 1000),
+            iw.print(",\"messages\":{d},\"active_users\":{d},\"present\":{d},\"last_active\":{d},\"topic\":", .{
+                agg.messages, agg.users.count(), present, @divFloor(agg.last_active, 1000),
             }) catch return;
             writeJsonString(iw, currentTopic(agg)) catch return;
             // Compact recent-activity sparkline: the last up-to-14 daily message
@@ -319,7 +339,57 @@ pub const ChanStats = struct {
         saveSnapshot(self, io, dir_path);
     }
 
-    fn writeChannelFile(self: *ChanStats, io: std.Io, dir_path: []const u8, agg: *ChannelAgg, now_ms: i64) void {
+    /// Network-wide recent activity: per-day message totals summed across every
+    /// tracked channel (last `spark_days` days), emitted as
+    /// `,"network_days":[{"date":"YYYY-MM-DD","messages":N},…]` oldest→newest.
+    fn writeNetworkDays(self: *ChanStats, w: *std.Io.Writer) !void {
+        const cap = 64;
+        var days: [cap]i64 = undefined;
+        var totals: [cap]u64 = undefined;
+        var n: usize = 0;
+        var it = self.channels.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.*.days.items) |d| {
+                // insertion into a day-sorted bounded set
+                var lo: usize = 0;
+                while (lo < n and days[lo] < d.day) lo += 1;
+                if (lo < n and days[lo] == d.day) {
+                    totals[lo] += d.messages;
+                    continue;
+                }
+                if (n == cap) {
+                    // full: drop the OLDEST if this day is newer, else skip
+                    if (d.day <= days[0]) continue;
+                    var i: usize = 0;
+                    while (i + 1 < n) : (i += 1) {
+                        days[i] = days[i + 1];
+                        totals[i] = totals[i + 1];
+                    }
+                    n -= 1;
+                    if (lo > 0) lo -= 1;
+                }
+                var j: usize = n;
+                while (j > lo) : (j -= 1) {
+                    days[j] = days[j - 1];
+                    totals[j] = totals[j - 1];
+                }
+                days[lo] = d.day;
+                totals[lo] = d.messages;
+                n += 1;
+            }
+        }
+        try w.writeAll(",\"network_days\":[");
+        const start = if (n > spark_days) n - spark_days else 0;
+        var i = start;
+        while (i < n) : (i += 1) {
+            if (i != start) try w.writeByte(',');
+            var buf: [16]u8 = undefined;
+            try w.print("{{\"date\":\"{s}\",\"messages\":{d}}}", .{ fmtDay(days[i], &buf), totals[i] });
+        }
+        try w.writeAll("]");
+    }
+
+    fn writeChannelFile(self: *ChanStats, io: std.Io, dir_path: []const u8, agg: *ChannelAgg, now_ms: i64, present: usize) void {
         var buf: [128]u8 = undefined;
         const slug = slugify(agg.name, &buf) orelse return;
         var name_buf: [160]u8 = undefined;
@@ -327,19 +397,22 @@ pub const ChanStats = struct {
 
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
-        self.renderChannel(&aw.writer, agg, now_ms);
+        self.renderChannel(&aw.writer, agg, now_ms, present);
         writeFileAtomicIo(io, dir_path, fname, aw.written());
     }
 
     /// Render one channel's full statistics JSON into `w`. Separated from the file
     /// write so it can be unit-tested (parse the output back) and reused as the
     /// persistence snapshot.
-    fn renderChannel(self: *ChanStats, w: *std.Io.Writer, agg: *ChannelAgg, now_ms: i64) void {
+    fn renderChannel(self: *ChanStats, w: *std.Io.Writer, agg: *ChannelAgg, now_ms: i64, present: usize) void {
         w.writeAll("{\"channel\":") catch return;
         writeJsonString(w, agg.name) catch return;
-        w.print(",\"generated_at\":{d},\"first_seen\":{d},\"last_active\":{d},", .{
-            @divFloor(now_ms, 1000), @divFloor(agg.first_seen, 1000), @divFloor(agg.last_active, 1000),
+        w.print(",\"generated_at\":{d},\"first_seen\":{d},\"last_active\":{d},\"present\":{d},", .{
+            @divFloor(now_ms, 1000), @divFloor(agg.first_seen, 1000), @divFloor(agg.last_active, 1000), present,
         }) catch return;
+        w.writeAll("\"last_speaker\":") catch return;
+        writeJsonString(w, agg.last_speaker) catch return;
+        w.writeByte(',') catch return;
         w.print("\"totals\":{{\"messages\":{d},\"words\":{d},\"active_users\":{d},\"joins\":{d},\"parts\":{d},\"quits\":{d},\"kicks\":{d},\"topic_changes\":{d}}},", .{
             agg.messages, agg.words, agg.users.count(), agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes,
         }) catch return;
@@ -909,7 +982,7 @@ test "renderChannel emits valid JSON matching the dashboard contract" {
     const agg = s.channels.get("#root").?;
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    s.renderChannel(&aw.writer, agg, ts);
+    s.renderChannel(&aw.writer, agg, ts, 0);
 
     // Must parse as JSON and carry the shape the SolidJS app expects.
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, aw.written(), .{});

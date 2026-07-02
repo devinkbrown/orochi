@@ -3676,7 +3676,20 @@ pub const LinuxServer = struct {
             if (self.chanstats_last_write_ms == 0 or cnow - self.chanstats_last_write_ms >= self.config.stats_interval_ms) {
                 self.chanstats_last_write_ms = cnow;
                 if (self.config.crypto_io) |io| {
-                    self.chanstats.writeJson(io, self.config.chanstats_dir, self.config.network_name, self.serverName(), platform.realtimeMillis());
+                    // Presence provider: current members (local + mesh roster)
+                    // per channel, read under the same world.lockWrite the
+                    // flush already holds.
+                    const Presence = struct {
+                        fn count(ctx: *anyopaque, channel: []const u8) usize {
+                            const srv: *LinuxServer = @ptrCast(@alignCast(ctx));
+                            return srv.globalMemberCount(channel, srv.world.memberCount(channel));
+                        }
+                    };
+                    self.chanstats.writeJson(io, self.config.chanstats_dir, self.config.network_name, self.serverName(), platform.realtimeMillis(), .{
+                        .users_online = self.meshUserCount(),
+                        .presence_ctx = self,
+                        .presence_fn = Presence.count,
+                    });
                 }
             }
         }
