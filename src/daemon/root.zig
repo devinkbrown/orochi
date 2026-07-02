@@ -113,6 +113,7 @@ pub const svc_sessionview = @import("svc_sessionview.zig");
 pub const svc_successor = @import("svc_successor.zig");
 pub const svc_tempmode = @import("svc_tempmode.zig");
 pub const tegami = @import("tegami.zig");
+pub const webpush = @import("webpush.zig");
 pub const tiered_keys = @import("tiered_keys.zig");
 pub const tls_certs = @import("tls_certs.zig");
 pub const tls_conn = @import("tls_conn.zig");
@@ -241,6 +242,7 @@ test {
     _ = svc_successor;
     _ = svc_tempmode;
     _ = tegami;
+    _ = webpush;
     _ = tiered_keys;
     _ = tls_certs;
     _ = tls_conn;

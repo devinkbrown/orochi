@@ -108,7 +108,7 @@ pub const Url = struct {
 /// Perform a single request/response over a fresh TLS 1.3 connection and return
 /// the decrypted HTTP response bytes (caller owns). `Connection: close` is sent;
 /// one connection serves exactly one exchange (simple and correct for ACME).
-fn httpsRequest(
+pub fn httpsRequest(
     allocator: Allocator,
     resolver: Resolver,
     trust_anchors: []const []const u8,
