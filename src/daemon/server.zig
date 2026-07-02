@@ -17444,6 +17444,15 @@ pub const LinuxServer = struct {
             if (secs != 0 and (secs < ephemeral_min_secs or secs > ephemeral_max_secs)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, "PINS")) {
+            // Pinned messages: a comma-separated list of msgids. Op-gated (all
+            // channel prop writes are), bounded here, then persisted+propagated
+            // as a plain prop (`.not_handled`). Clients render a pins drawer and
+            // resolve each msgid against their history. 0-length = no pins.
+            if (deleting) return .not_handled;
+            if (!validPinsValue(value)) return .bad_value;
+            return .not_handled;
+        }
         return .not_handled;
     }
 
@@ -17451,6 +17460,28 @@ pub const LinuxServer = struct {
     /// at most 30 days (beyond that, just leave it non-ephemeral).
     const ephemeral_min_secs: u64 = 60;
     const ephemeral_max_secs: u64 = 30 * 24 * 60 * 60;
+
+    /// Pinned-message limits: bounded so the PINS prop stays small enough to
+    /// mesh-propagate and render cheaply.
+    const pins_max_count: usize = 50;
+    const pins_msgid_max: usize = 64;
+
+    /// A PINS value is a comma-separated list of msgid tokens: each printable,
+    /// non-empty, ≤64 chars, no whitespace/commas; at most `pins_max_count`.
+    fn validPinsValue(value: []const u8) bool {
+        if (value.len == 0) return true;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |tok| {
+            if (tok.len == 0 or tok.len > pins_msgid_max) return false;
+            count += 1;
+            if (count > pins_max_count) return false;
+            for (tok) |c| {
+                if (c <= 0x20 or c == 0x7f or c == ',') return false;
+            }
+        }
+        return true;
+    }
 
     /// Broadcast the equivalent MODE change after a PROP built-in linked to a
     /// channel mode, so every member's mode view stays in sync (MEMBERKEY→+k,
@@ -28195,6 +28226,44 @@ test "relayed channel message is recorded into CHATHISTORY for cross-node read-b
     });
     const after = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
     try std.testing.expectEqual(@as(usize, 1), after.len); // still just the first
+}
+
+test "pinned messages: PINS prop value validation" {
+    // Empty (no pins) is valid; a bounded comma-list of msgids is valid.
+    try std.testing.expect(LinuxServer.validPinsValue(""));
+    try std.testing.expect(LinuxServer.validPinsValue("abc123"));
+    try std.testing.expect(LinuxServer.validPinsValue("a1,b2,c3"));
+    // Whitespace, commas-in-token, empty token, or overlong token are invalid.
+    try std.testing.expect(!LinuxServer.validPinsValue("has space"));
+    try std.testing.expect(!LinuxServer.validPinsValue("a,,b")); // empty token
+    try std.testing.expect(!LinuxServer.validPinsValue("a," ++ "x" ** 65));
+    // Over the count cap.
+    var buf: [8 * 60]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var i: usize = 0;
+    while (i < 51) : (i += 1) {
+        if (i != 0) w.writeAll(",") catch unreachable;
+        w.print("m{d}", .{i}) catch unreachable;
+    }
+    try std.testing.expect(!LinuxServer.validPinsValue(w.buffered()));
+}
+
+test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the generic prop" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#pins" };
+    // Valid → not_handled (falls through to the persisted, mesh-propagated store).
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "msg1,msg2", false), .not_handled);
+    // Malformed → bad_value.
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "bad token", false), .bad_value);
+    // Round-trips through the generic store.
+    _ = try server.props.setProp(chan, "PINS", "msg1,msg2", .{ .id = "op", .access = .owner });
+    const ev = try server.props.getProp(chan, "PINS");
+    try std.testing.expectEqualStrings("msg1,msg2", ev.value);
 }
 
 test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {
