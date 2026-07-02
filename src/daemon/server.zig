@@ -12712,6 +12712,9 @@ pub const LinuxServer = struct {
         if (self.config.chanstats_dir.len == 0) return;
         if (!world_model.isChannelName(target)) return;
         if (!std.ascii.eqlIgnoreCase(command, "PRIVMSG")) return;
+        // Ephemeral rooms leave no persistent footprint: their messages must
+        // not accumulate into the durable chanstats aggregate either.
+        if (self.channelEphemeralTtlMs(target) != 0) return;
         const nick = nickFromPrefix(sender_prefix);
         if (nick.len == 0) return;
         self.chanstats.recordMessage(target, nick, text, platform.realtimeMillis());
@@ -12791,16 +12794,44 @@ pub const LinuxServer = struct {
         target: []const u8,
         messages: []const lotus.Message,
     ) ![]const u8 {
-        _ = self;
+        // Ephemeral rooms: a channel with the EPHEMERAL prop set drops any
+        // message older than its TTL from EVERY replay path (this is the single
+        // funnel for CHATHISTORY, bouncer rewind and SEARCH), so the server
+        // simply never re-serves expired content. The ring still bounds memory;
+        // this makes the expiry policy authoritative on read.
+        const floor: u64 = self.ephemeralFloorMs(target);
         var writer = std.Io.Writer.fixed(out);
         const use_batch = conn.session.hasCap(.batch);
         if (use_batch) try writer.print("BATCH +{s} chathistory {s}\r\n", .{ ref, target });
         for (messages) |message| {
+            if (message.timestamp < floor) continue;
             if (!historyMessageVisibleTo(&conn.session, message)) continue;
             try writeHistoryReplayLine(&writer, &conn.session, target, message);
         }
         if (use_batch) try writer.print("BATCH -{s}\r\n", .{ref});
         return writer.buffered();
+    }
+
+    /// The EPHEMERAL TTL for a channel in milliseconds (0 = not ephemeral).
+    /// Read straight from the IRCX EPHEMERAL prop (a plain, mesh-propagated
+    /// channel property), parsed as a whole-second TTL.
+    fn channelEphemeralTtlMs(self: *LinuxServer, channel: []const u8) u64 {
+        if (channel.len == 0) return 0;
+        if (channel[0] != '#' and channel[0] != '&') return 0; // DMs never expire here
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "EPHEMERAL") catch return 0;
+        const secs = std.fmt.parseInt(u64, ev.value, 10) catch return 0;
+        return secs *| 1000;
+    }
+
+    /// The oldest message timestamp (epoch ms) still visible in `channel`, or 0
+    /// when the channel is not ephemeral. Messages before this are expired.
+    fn ephemeralFloorMs(self: *LinuxServer, channel: []const u8) u64 {
+        const ttl_ms = self.channelEphemeralTtlMs(channel);
+        if (ttl_ms == 0) return 0;
+        const now_i = platform.realtimeMillis();
+        const now: u64 = if (now_i > 0) @intCast(now_i) else 0;
+        return if (now > ttl_ms) now - ttl_ms else 0;
     }
 
     fn writeHistoryReplayLine(writer: anytype, session: *const dispatch.ClientSession, target: []const u8, message: lotus.Message) !void {
@@ -17403,8 +17434,23 @@ pub const LinuxServer = struct {
             }
             return .applied;
         }
+        if (std.ascii.eqlIgnoreCase(key, "EPHEMERAL")) {
+            // Ephemeral-room message TTL, in whole seconds. Validate here but
+            // return `.not_handled` so the value PERSISTS + PROPAGATES through
+            // the generic (signed, mesh-replicated) channel-prop store; the
+            // history-replay filter reads it back per request. 0 = disable.
+            if (deleting) return .not_handled;
+            const secs = std.fmt.parseInt(u64, value, 10) catch return .bad_value;
+            if (secs != 0 and (secs < ephemeral_min_secs or secs > ephemeral_max_secs)) return .bad_value;
+            return .not_handled;
+        }
         return .not_handled;
     }
+
+    /// EPHEMERAL TTL bounds: at least a minute (below that, history is useless),
+    /// at most 30 days (beyond that, just leave it non-ephemeral).
+    const ephemeral_min_secs: u64 = 60;
+    const ephemeral_max_secs: u64 = 30 * 24 * 60 * 60;
 
     /// Broadcast the equivalent MODE change after a PROP built-in linked to a
     /// channel mode, so every member's mode view stays in sync (MEMBERKEY→+k,
@@ -28149,6 +28195,93 @@ test "relayed channel message is recorded into CHATHISTORY for cross-node read-b
     });
     const after = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
     try std.testing.expectEqual(@as(usize, 1), after.len); // still just the first
+}
+
+test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+    // Out-of-range and non-numeric values are rejected; 0 (disable) and an
+    // in-range TTL fall through to the generic store (`.not_handled`).
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "5", false), .bad_value);
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "nope", false), .bad_value);
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "9999999999", false), .bad_value);
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "3600", false), .not_handled);
+    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "0", false), .not_handled);
+}
+
+test "ephemeral room: TTL reader parses the prop; DMs never expire" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // No prop → not ephemeral.
+    try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("#plain"));
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+    try std.testing.expectEqual(@as(u64, 3_600_000), server.channelEphemeralTtlMs("#eph"));
+
+    // A DM target (non-#/&) is never treated as ephemeral even if a prop leaks.
+    try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("someuser"));
+}
+
+test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const member_id = try addTestLocalClient(&server, "Reader", null);
+    const member = server.connFor(member_id).?;
+
+    const now: u64 = @intCast(platform.realtimeMillis());
+    const two_hours: u64 = 2 * 60 * 60 * 1000;
+    const one_min: u64 = 60 * 1000;
+    _ = server.history.append("#eph", .{ .msgid = "old1", .sender = "a!u@h", .text = "ancient", .timestamp = now - two_hours }) catch {};
+    _ = server.history.append("#eph", .{ .msgid = "new1", .sender = "b!u@h", .text = "recent", .timestamp = now - one_min }) catch {};
+
+    // Without the prop, both replay.
+    var out_buf: [4096]u8 = undefined;
+    var hbuf: [8]lotus.Message = undefined;
+    const all = server.history.latest("#eph", hbuf.len, &hbuf) catch &.{};
+    const before_prop = try server.renderHistoryReplay(member, &out_buf, "t", "#eph", all);
+    try expectContains(before_prop, "ancient");
+    try expectContains(before_prop, "recent");
+
+    // With a 1-hour TTL, the 2-hour-old message is filtered; the 1-min one stays.
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+    var out_buf2: [4096]u8 = undefined;
+    const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all);
+    try std.testing.expect(std.mem.indexOf(u8, after_prop, "ancient") == null);
+    try expectContains(after_prop, "recent");
+}
+
+test "ephemeral room: messages are not recorded into durable chanstats" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // chanstats only records when a dir is configured; point it somewhere.
+    server.config.chanstats_dir = "/tmp";
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+
+    // An ephemeral channel's message is skipped; a plain channel's is recorded.
+    server.chanstatsMessage("#eph", "nick!u@h", "PRIVMSG", "secret");
+    server.chanstatsMessage("#plain", "nick!u@h", "PRIVMSG", "public");
+    try std.testing.expectEqual(@as(usize, 0), server.chanstats.channelMessageCount("#eph"));
+    try std.testing.expect(server.chanstats.channelMessageCount("#plain") >= 1);
 }
 
 test "mesh WARD applies and removes via applyRemoteWard" {

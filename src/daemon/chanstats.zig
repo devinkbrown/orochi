@@ -113,6 +113,13 @@ pub const ChanStats = struct {
         self.channels.deinit(self.allocator);
     }
 
+    /// Total recorded messages for a channel (0 if never recorded). Read-only
+    /// accessor used by tests and diagnostics; never creates a channel.
+    pub fn channelMessageCount(self: *const ChanStats, name: []const u8) u64 {
+        const e = self.channels.getEntry(name) orelse return 0;
+        return e.value_ptr.*.messages;
+    }
+
     fn channel(self: *ChanStats, name: []const u8, now_ms: i64) ?*ChannelAgg {
         if (self.channels.getEntry(name)) |e| return e.value_ptr.*;
         const key = self.allocator.dupe(u8, name) catch return null;
