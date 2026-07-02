@@ -2544,6 +2544,9 @@ pub const LinuxServer = struct {
     /// what they missed. The ring can serialize to a snapshot (persistence
     /// wiring is a follow-up); today it is per-process-lifetime.
     event_history: event_history_mod.EventHistory(512) = .{},
+    /// Lock-free per-category/severity Event Spine counters (since boot) for
+    /// `EVENT STATS`. Incremented at the same two points as the history ring.
+    event_stats: event_history_mod.EventStats = .{},
     /// Persistent expected-membership set for split/heal transition detection:
     /// remembers every node id observed so a vanished node still registers as a
     /// split until it ages out (see updatePartitionTransitions).
@@ -14994,6 +14997,10 @@ pub const LinuxServer = struct {
             return self.handleEventReplay(conn, is_oper, params);
         }
 
+        if (std.ascii.eqlIgnoreCase(params[0], "STATS")) {
+            return self.handleEventStats(conn, is_oper);
+        }
+
         if (std.ascii.eqlIgnoreCase(params[0], "ADD")) {
             if (params.len < 2) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "Not enough parameters");
@@ -15093,7 +15100,7 @@ pub const LinuxServer = struct {
         }
 
         var notice_buf: [256]u8 = undefined;
-        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|DEL|CLEAR|LIST|SEVERITY <CHANNEL|MEMBER|USER|MEDIA | category | ALL> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
+        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|DEL|CLEAR|LIST|SEVERITY|REPLAY|STATS <CHANNEL|MEMBER|USER|MEDIA | category | ALL> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
         try self.noticeTo(conn, notice);
     }
 
@@ -15202,6 +15209,50 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, text);
         }
         if (got != 0) try self.noticeTo(conn, "End of event replay.");
+    }
+
+    /// `EVENT STATS` (oper-only): per-category + per-severity Event Spine event
+    /// counts since boot, plus the total and the live history-ring depth.
+    fn handleEventStats(self: *LinuxServer, conn: *ConnState, is_oper: bool) !void {
+        if (!is_oper) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT STATS is for operators");
+            return;
+        }
+        var hb: [96]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&hb, "Event stats since boot: {d} total, {d} in history ring", .{ self.event_stats.totalCount(), self.event_history.len() }) catch "Event stats");
+        // Per-category line (skip zero-count categories to stay compact).
+        {
+            var buf: [640]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            w.writeAll("  by category:") catch {};
+            var any = false;
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
+                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+                const n = self.event_stats.categoryCount(@intFromEnum(cat));
+                if (n != 0) {
+                    var nb: [40]u8 = undefined;
+                    w.writeAll(std.fmt.bufPrint(&nb, " {s}={d}", .{ cat.code(), n }) catch "") catch {};
+                    any = true;
+                }
+            }
+            if (!any) w.writeAll(" (none yet)") catch {};
+            try self.noticeTo(conn, w.buffered());
+        }
+        // Per-severity line.
+        {
+            var buf: [320]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            w.writeAll("  by severity:") catch {};
+            inline for (@typeInfo(event_spine.EventSeverity).@"enum".fields) |field| {
+                const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field.name);
+                const n = self.event_stats.severityCount(@intFromEnum(sev));
+                if (n != 0) {
+                    var nb: [40]u8 = undefined;
+                    w.writeAll(std.fmt.bufPrint(&nb, " {s}={d}", .{ sev.token(), n }) catch "") catch {};
+                }
+            }
+            try self.noticeTo(conn, w.buffered());
+        }
     }
 
     /// NOTICE the session's current Event Spine category subscriptions + severity.
@@ -23029,6 +23080,7 @@ pub const LinuxServer = struct {
         // on OTHER nodes see it too — network-wide Event Spine. A peer renders it
         // with THIS node's name as the origin (carried on the wire).
         self.event_history.record(@intFromEnum(category), @intFromEnum(severity), platform.realtimeMillis(), self.serverName(), message);
+        self.event_stats.record(@intFromEnum(category), @intFromEnum(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
         self.meshBroadcastOperEvent(category, severity, message);
     }
@@ -23143,6 +23195,7 @@ pub const LinuxServer = struct {
             // Origin is the authenticated peer, not the spoofable wire field.
             const origin = trustedOrigin(link, ev.origin_server);
             self.event_history.record(ev.category, ev.severity, platform.realtimeMillis(), origin, ev.message);
+            self.event_stats.record(ev.category, ev.severity);
             self.deliverOperEventLocal(origin, category, severity, ev.message, ev.message);
         }
     }

@@ -60,6 +60,35 @@ pub const StoredEvent = struct {
     }
 };
 
+pub const category_count = @typeInfo(event_spine.EventCategory).@"enum".fields.len;
+pub const severity_count = @typeInfo(event_spine.EventSeverity).@"enum".fields.len;
+
+/// Lock-free per-category / per-severity Event Spine counters backing
+/// `EVENT STATS`. Incremented from any reactor + the mesh drain (atomic adds),
+/// read for the stats reply. Process-lifetime (not persisted — a running total
+/// resets on restart, which is the useful semantics for "since this boot").
+pub const EventStats = struct {
+    by_category: [category_count]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** category_count,
+    by_severity: [severity_count]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** severity_count,
+    total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn record(self: *EventStats, cat: u8, sev: u8) void {
+        if (cat < category_count) _ = self.by_category[cat].fetchAdd(1, .monotonic);
+        if (sev < severity_count) _ = self.by_severity[sev].fetchAdd(1, .monotonic);
+        _ = self.total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn categoryCount(self: *const EventStats, cat: usize) u64 {
+        return self.by_category[cat].load(.monotonic);
+    }
+    pub fn severityCount(self: *const EventStats, sev: usize) u64 {
+        return self.by_severity[sev].load(.monotonic);
+    }
+    pub fn totalCount(self: *const EventStats) u64 {
+        return self.total.load(.monotonic);
+    }
+};
+
 const snapshot_magic = "OEH1";
 const snapshot_version: u8 = 1;
 
@@ -233,6 +262,22 @@ const Cursor = struct {
         return s;
     }
 };
+
+test "EventStats counts per category, per severity, and total" {
+    var s = EventStats{};
+    s.record(7, 3); // category 7, severity 3
+    s.record(7, 1); // category 7, severity 1
+    s.record(3, 3); // category 3, severity 3
+    try std.testing.expectEqual(@as(u64, 3), s.totalCount());
+    try std.testing.expectEqual(@as(u64, 2), s.categoryCount(7));
+    try std.testing.expectEqual(@as(u64, 1), s.categoryCount(3));
+    try std.testing.expectEqual(@as(u64, 0), s.categoryCount(0));
+    try std.testing.expectEqual(@as(u64, 2), s.severityCount(3));
+    try std.testing.expectEqual(@as(u64, 1), s.severityCount(1));
+    // Out-of-range ordinals still bump the total but no per-slot counter.
+    s.record(250, 250);
+    try std.testing.expectEqual(@as(u64, 4), s.totalCount());
+}
 
 test "records, evicts oldest, and collects newest-first" {
     var h = EventHistory(3){};
