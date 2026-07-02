@@ -9863,6 +9863,9 @@ pub const LinuxServer = struct {
         // channel traps are configured.
         self.spamtrapCheck(conn.session.displayName(), .channel, join_target, conn.session.isOper());
         try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
+        // Standing OBSERVE feed: fire the join action so an oper watching a
+        // host sees channel joins (previously defined but never emitted).
+        self.notifyObservers(.join, observeSubject(conn, join_target));
         if (creating) {
             var flags_buf: [16]u8 = undefined;
             const flags = self.world.channelModeString(join_target, &flags_buf);
@@ -9963,6 +9966,8 @@ pub const LinuxServer = struct {
         const destroys_channel = self.willChannelDestroyOnPart(channel);
         const parted_nick = conn.session.displayName();
         try self.publishMemberEvent("PART", channel, parted_nick, reason);
+        // Standing OBSERVE feed: fire the part action (previously never emitted).
+        self.notifyObservers(.part, observeSubject(conn, channel));
         try self.world.part(channel, wid);
         if (destroys_channel and !self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
         // Tell mesh peers this member left, carrying the real identity so the far
@@ -15644,11 +15649,23 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Publish a SECURITY-category Event Spine event (`.warn`) describing a
+    /// connection-refusing enforcement, so opers subscribed to SECURITY (and the
+    /// EVENT REPLAY history) see WARD/DNSBL/auth blocks in real time. Best-effort.
+    fn publishSecurityBlock(self: *LinuxServer, conn: *const ConnState, comptime what: []const u8, detail: []const u8) void {
+        var pbuf: [256]u8 = undefined;
+        const prefix = clientPrefix(conn, &pbuf) catch conn.session.displayName();
+        var mbuf: [640]u8 = undefined;
+        const msg = std.fmt.bufPrint(&mbuf, what ++ " refused {s} ({s})", .{ prefix, detail }) catch return;
+        self.publishOperEvent(.security, .warn, msg) catch {};
+    }
+
     /// Emit a Warden close ERROR and mark the connection for teardown.
     fn closeWarded(self: *LinuxServer, conn: *ConnState, reason: []const u8) bool {
         var eb: [640]u8 = undefined;
         const el = std.fmt.bufPrint(&eb, ":{s} ERROR :Closing Link: {s} (Banned: {s})\r\n", .{ protocol_inventory.currentServerName(), conn.session.displayName(), reason }) catch null;
         if (el) |line| appendToConn(conn, line) catch {};
+        self.publishSecurityBlock(conn, "WARD", reason);
         conn.close_reason = "Banned (WARD)";
         conn.closing = true;
         self.armSendIfNeeded(conn) catch {};
@@ -15697,6 +15714,8 @@ pub const LinuxServer = struct {
             .{ protocol_inventory.currentServerName(), conn.session.displayName(), code },
         ) catch null;
         if (el) |line| appendToConn(conn, line) catch {};
+        var db: [48]u8 = undefined;
+        self.publishSecurityBlock(conn, "DNSBL", std.fmt.bufPrint(&db, "listed [{d}]", .{code}) catch "listed");
         conn.close_reason = "DNSBL listed";
         conn.closing = true;
         self.armSendIfNeeded(conn) catch {};
@@ -19795,6 +19814,11 @@ pub const LinuxServer = struct {
         const now = self.nowMs();
         _ = self.login_throttle.recordFailure(.account, account, now);
         if (loginThrottleIp(conn)) |ip| _ = self.login_throttle.recordFailure(.ip, ip, now);
+        // SECURITY event: surface auth failures so opers see brute-force activity
+        // (and it lands in EVENT REPLAY). Real host — a security/oper-trust feed.
+        var mbuf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&mbuf, "auth failure for account {s} from {s}", .{ account, conn.session.realHost() }) catch return;
+        self.publishOperEvent(.security, .warn, msg) catch {};
     }
 
     /// Clear throttle state for `account` + the source IP after a success.
@@ -22741,6 +22765,9 @@ pub const LinuxServer = struct {
         conn.session.setVisibleHost(new_host);
         try self.notifyCommonChannels(id, msg, .chghost, id, conn.session.displayName());
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
+        // Standing OBSERVE feed: fire the host-change action (previously never
+        // emitted) so an oper watching a nick sees vhost/cloak changes.
+        self.notifyObservers(.host_change, observeSubject(conn, new_host));
         var nb: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ self.serverName(), conn.session.displayName(), new_host }) catch return;
         try appendToConn(conn, note);
