@@ -5824,12 +5824,16 @@ pub const LinuxServer = struct {
         pubkey_buf: *[channel_prop_event.pubkey_len]u8,
         sig_buf: *[channel_prop_event.sig_len]u8,
     ) LocalPropSig {
-        const origin_node = self.config.node_id;
-        const ident = self.config.node_identity orelse return .{ .node = origin_node };
-        // Self-certification invariant: the stamped origin id MUST equal
-        // `originShortId(pubkey)`. Only sign when `config.node_id` agrees with the
-        // node key's derived short id, so a receiver's origin check holds.
-        if (ident.shortId() != origin_node) return .{ .node = origin_node };
+        // Stamp the origin with the node's MESH identity — the key's short id,
+        // which is what the secured s2s link speaks (`local_node_id`) — NOT
+        // `config.node_id` (a human-facing label an operator sets independently
+        // of the key). Using the short id makes the fact self-certifying: the
+        // receiver's `originShortId(pubkey) == origin_node` check holds, the
+        // signed fact bypasses the direct-origin gate, and it applies. Stamping
+        // config.node_id instead left the fact unsigned AND with an origin the
+        // peer's direct-origin gate rejected — so channel props never propagated.
+        const ident = self.config.node_identity orelse return .{ .node = self.config.node_id };
+        const origin_node = ident.shortId();
 
         var ev = channel_prop_event.ChannelPropEvent{
             .present = present,
@@ -5863,9 +5867,11 @@ pub const LinuxServer = struct {
         pubkey_buf: *[entity_prop_event.pubkey_len]u8,
         sig_buf: *[entity_prop_event.sig_len]u8,
     ) LocalPropSig {
-        const origin_node = self.config.node_id;
-        const ident = self.config.node_identity orelse return .{ .node = origin_node };
-        if (ident.shortId() != origin_node) return .{ .node = origin_node };
+        // Mesh identity (key short id), not config.node_id — see
+        // `signLocalChannelProp` for why. Entity (user/member) props share the
+        // same CRDT propagation gate, so they had the same silent drop.
+        const ident = self.config.node_identity orelse return .{ .node = self.config.node_id };
+        const origin_node = ident.shortId();
 
         var ev = entity_prop_event.EntityPropEvent{
             .present = present,
