@@ -3454,6 +3454,8 @@ pub const LinuxServer = struct {
                     // `bytes` is the raw chatsvc event BODY; render the per-recipient
                     // `:<origin> EVENT <target> <body>` line for each local subscriber
                     // (target = that subscriber's own nick), matching the origin shard.
+                    var tag_buf: [128]u8 = undefined;
+                    const tags = event_spine.buildEventTags(&tag_buf, category, severity) catch "";
                     var it = self.rx().clients.iterator();
                     while (it.next()) |entry| {
                         const c = entry.value;
@@ -3465,7 +3467,8 @@ pub const LinuxServer = struct {
                         // MEDIA events stay member-scoped on this shard too.
                         if (!self.mediaEventAllowed(entry.id, &c.session, bytes)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
-                        const line = event_spine.renderEvent(origin, c.session.displayName(), bytes, &line_buf) catch continue;
+                        const client_tags = if (c.session.hasCap(.message_tags)) tags else "";
+                        const line = event_spine.renderEventTagged(client_tags, origin, c.session.displayName(), bytes, &line_buf) catch continue;
                         appendToConn(c, line) catch continue;
                         self.armSendIfNeeded(c) catch {};
                     }
@@ -23100,6 +23103,11 @@ pub const LinuxServer = struct {
         // chatsvc-faithful delivery: render a raw `:<origin> EVENT <target> <body>`
         // line PER RECIPIENT (target = the subscribed oper's OWN nick). Category
         // gates delivery; the TYPE leads the body (e.g. "USER CONNECT …").
+        // Structured IRCv3 message-tags (category + severity), built once and
+        // delivered only to clients that negotiated `message-tags`; everyone
+        // else gets the plain line.
+        var tag_buf: [128]u8 = undefined;
+        const tags = event_spine.buildEventTags(&tag_buf, category, severity) catch "";
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!sessionWantsEvent(&entry.value.session, category, severity, message, subject)) continue;
@@ -23107,7 +23115,8 @@ pub const LinuxServer = struct {
             // channels they are in (no snooping calls in channels they've not joined).
             if (!self.mediaEventAllowed(entry.id, &entry.value.session, message)) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
-            const line = event_spine.renderEvent(origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
+            const client_tags = if (entry.value.session.hasCap(.message_tags)) tags else "";
+            const line = event_spine.renderEventTagged(client_tags, origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
             self.deliver(entry.id, line) catch continue;
         }
         // Cross-shard fan-out: opers on OTHER reactors are not in this reactor's

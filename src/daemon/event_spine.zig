@@ -439,6 +439,47 @@ pub fn renderEvent(server_name: []const u8, target: []const u8, message: []const
     return out[0..writer.len];
 }
 
+/// Build the IRCv3 message-tag prefix for a structured event delivery, e.g.
+/// `orochi.io/category=KILL;orochi.io/severity=warn`. Both values come from
+/// fixed `code()`/`token()` tables (uppercase / lowercase ASCII), so they are
+/// already tag-safe and need no escaping.
+pub fn buildEventTags(out: []u8, category: EventCategory, severity: EventSeverity) RenderError![]const u8 {
+    return std.fmt.bufPrint(out, "orochi.io/category={s};orochi.io/severity={s}", .{ category.code(), severity.token() }) catch error.OutputTooSmall;
+}
+
+/// Like `renderEvent`, but prepends an IRCv3 message-tag block:
+///   `@<tags> :<server> EVENT <target> <message>\r\n`
+/// Empty `tags` degrades to the plain `renderEvent` form. Delivered only to
+/// clients that negotiated `message-tags`; everyone else gets the plain line.
+pub fn renderEventTagged(tags: []const u8, server_name: []const u8, target: []const u8, message: []const u8, out: []u8) RenderError![]const u8 {
+    if (tags.len == 0) return renderEvent(server_name, target, message, out);
+    // Tags are server-built from known-safe tables, but validate defensively so
+    // a future caller can never inject a space/control byte into the tag block.
+    for (tags) |ch| {
+        if (ch <= ' ' or ch == 0x7f) return error.InvalidMessage;
+    }
+    try validateServerName(server_name);
+    if (!validAtom(target)) return error.InvalidMessage;
+    if (message.len == 0) return error.InvalidMessage;
+    for (message) |ch| {
+        if (unsafeTextByte(ch)) return error.InvalidMessage;
+    }
+    const needed = "@".len + tags.len + " ".len + ":".len + server_name.len + " EVENT ".len + target.len + " ".len + message.len + "\r\n".len;
+    if (needed > max_event_line_len) return error.MessageTooLong;
+    if (out.len < needed) return error.OutputTooSmall;
+    var writer = SliceWriter{ .buf = out };
+    try writer.append("@");
+    try writer.append(tags);
+    try writer.append(" :");
+    try writer.append(server_name);
+    try writer.append(" EVENT ");
+    try writer.append(target);
+    try writer.append(" ");
+    try writer.append(message);
+    try writer.append("\r\n");
+    return out[0..writer.len];
+}
+
 fn validateSubscriberId(id: []const u8) SubscriptionError!void {
     if (!validAtom(id)) return error.InvalidSubscriberId;
 }
@@ -589,6 +630,23 @@ test "unsubscribe removes selected categories and drops empty subscribers" {
     try std.testing.expect(try spine.unsubscribe("oper-a", CategoryMask.only(.flood)));
     try std.testing.expectEqual(@as(usize, 0), spine.subscriberSlice().len);
     try std.testing.expect(!try spine.unsubscribeAll("oper-a"));
+}
+
+test "tagged render prepends an IRCv3 message-tag block; empty tags degrade to plain" {
+    var tbuf: [128]u8 = undefined;
+    const tags = try buildEventTags(&tbuf, .kill, .warn);
+    try std.testing.expectEqualStrings("orochi.io/category=KILL;orochi.io/severity=warn", tags);
+
+    var out: [256]u8 = undefined;
+    const line = try renderEventTagged(tags, "orochi.local", "kain", "k killed s (flood)", &out);
+    try std.testing.expectEqualStrings(
+        "@orochi.io/category=KILL;orochi.io/severity=warn :orochi.local EVENT kain k killed s (flood)\r\n",
+        line,
+    );
+    // Empty tags → identical to the plain renderer.
+    var out2: [256]u8 = undefined;
+    const plain = try renderEventTagged("", "orochi.local", "kain", "SERVER LINK ircx.us", &out2);
+    try std.testing.expectEqualStrings(":orochi.local EVENT kain SERVER LINK ircx.us\r\n", plain);
 }
 
 test "render output is a chatsvc-faithful raw EVENT line (per-recipient target)" {
