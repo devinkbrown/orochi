@@ -1184,7 +1184,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // token list); MODES is the config-tunable per-command channel-mode cap. +1
     // more for the optional NETWORKICON token when a network icon URL is set.
     const has_icon = cfg.network_icon_url.len != 0;
-    const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)));
+    const has_vapid = cfg.webpush_vapid_pub.len != 0;
+    const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)) + @as(usize, @intFromBool(has_vapid)));
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
@@ -1226,6 +1227,11 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     if (has_icon) {
         out[base.len + 3] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
     }
+    // Web Push server key — ISUPPORT is the discovery surface (no NOTE data
+    // channel): the client reads 005 once and can subscribe immediately.
+    if (has_vapid) {
+        out[base.len + 3 + @as(usize, @intFromBool(has_icon))] = try std.fmt.allocPrint(allocator, "VAPID={s}", .{cfg.webpush_vapid_pub});
+    }
     return out;
 }
 
@@ -1249,6 +1255,9 @@ pub fn freeIsupportTokens(allocator: std.mem.Allocator, tokens: []const []const 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// base64url VAPID public key; when set, advertised as ISUPPORT `VAPID=`
+    /// so clients can pushManager.subscribe without any round-trip.
+    webpush_vapid_pub: []const u8 = "",
     /// Network name advertised in ISUPPORT `NETWORK=` and the welcome burst.
     /// Configurable via `[network] name`; installed into the protocol_inventory
     /// override at boot.
@@ -2684,8 +2693,6 @@ pub const LinuxServer = struct {
     account_services: ?*services_mod.Services = null,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
-    /// base64url VAPID public key (borrowed from main), for WEBPUSH VAPID.
-    webpush_vapid_pub: []const u8 = "",
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
     /// Wall-clock Unix seconds captured at init, for the registration 003
@@ -21831,11 +21838,11 @@ pub const LinuxServer = struct {
     }
 
     /// WEBPUSH — browser push subscriptions (Onyx "reach you with the tab
-    /// closed"). Subcommands:
-    ///   VAPID                                    → NOTE with the server public key
+    /// closed"). The server VAPID key is discovered via ISUPPORT `VAPID=`
+    /// (never a NOTE data channel); lifecycle lands on the Event Spine.
     ///   SUBSCRIBE <endpoint> <p256dh> <auth>     → store (account-scoped, max 3)
     ///   UNSUBSCRIBE <endpoint>                   → remove one
-    ///   LIST                                     → NOTE per stored endpoint
+    ///   LIST                                     → NOTICE per stored endpoint
     /// Keys are base64url-unpadded exactly as PushSubscription.getKey() gives
     /// them. Disabled (no worker) → FAIL, so clients can probe safely.
     pub fn handleWebpush(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -21844,13 +21851,6 @@ pub const LinuxServer = struct {
             return;
         }
         const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
-
-        if (std.ascii.eqlIgnoreCase(sub, "VAPID")) {
-            var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH VAPID :{s}\r\n", .{ self.serverName(), self.webpush_vapid_pub }) catch return;
-            try appendToConn(conn, line);
-            return;
-        }
 
         const acct = conn.session.account() orelse {
             try self.failReply(conn, "WEBPUSH", "ACCOUNT_REQUIRED", "Log in to manage push subscriptions");
@@ -21909,6 +21909,11 @@ pub const LinuxServer = struct {
                 self.allocator.free(ep_owned);
             }
             try self.noticeTo(conn, "WEBPUSH: subscription stored");
+            // Subscription lifecycle rides the Event Spine (oper-observable),
+            // never a NOTE data channel.
+            var eb: [192]u8 = undefined;
+            const ev = std.fmt.bufPrint(&eb, "WEBPUSH: {s} subscribed a push endpoint", .{acct}) catch "WEBPUSH: subscription stored";
+            self.publishOperEventSubject(.service, .notice, ev, acct) catch {};
             return;
         }
 
@@ -21935,6 +21940,9 @@ pub const LinuxServer = struct {
             }
             self.webpushStore(svc, acct, kept[0..n]);
             try self.noticeTo(conn, "WEBPUSH: subscription removed");
+            var eb: [192]u8 = undefined;
+            const ev = std.fmt.bufPrint(&eb, "WEBPUSH: {s} removed a push endpoint", .{acct}) catch "WEBPUSH: subscription removed";
+            self.publishOperEventSubject(.service, .notice, ev, acct) catch {};
             return;
         }
 
@@ -21943,16 +21951,16 @@ pub const LinuxServer = struct {
             defer webpush_mod.freeList(self.allocator, subs);
             for (subs) |existing| {
                 var buf: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH ENDPOINT :{s}\r\n", .{ self.serverName(), existing.endpoint }) catch continue;
-                try appendToConn(conn, line);
+                const msg = std.fmt.bufPrint(&buf, "WEBPUSH: {s}", .{existing.endpoint}) catch continue;
+                try self.noticeTo(conn, msg);
             }
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBPUSH :End of subscriptions ({d})\r\n", .{ self.serverName(), subs.len }) catch return;
-            try appendToConn(conn, line);
+            const msg = std.fmt.bufPrint(&buf, "WEBPUSH: {d} subscription(s)", .{subs.len}) catch return;
+            try self.noticeTo(conn, msg);
             return;
         }
 
-        try self.failReply(conn, "WEBPUSH", "INVALID_SUBCOMMAND", "Use VAPID, SUBSCRIBE, UNSUBSCRIBE, or LIST");
+        try self.failReply(conn, "WEBPUSH", "INVALID_SUBCOMMAND", "Use SUBSCRIBE, UNSUBSCRIBE, or LIST");
     }
 
     /// Load an account's stored subscriptions (empty on any failure).

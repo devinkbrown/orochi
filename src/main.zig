@@ -212,6 +212,22 @@ pub fn main(init: std.process.Init) !void {
     // NETWORK= token and the welcome burst both reflect it. Write-once at boot.
     orochi.proto.protocol_inventory.setNetworkName(srv_cfg.network_name);
     orochi.proto.protocol_inventory.setServerName(srv_cfg.server_name);
+    // Web Push VAPID key: loaded (or created) BEFORE ISUPPORT is built so the
+    // 005 burst can advertise `VAPID=` — discovery is ISUPPORT, not a NOTE
+    // round-trip. The delivery worker itself spawns later (needs `srv`).
+    var webpush_vapid: ?orochi.daemon.webpush.Vapid = null;
+    var webpush_pub_buf: [orochi.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
+    if (held) |h| {
+        if (h.parsed.webpush.enabled and builtin.os.tag == .linux) {
+            if (orochi.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)) |v| {
+                webpush_vapid = v;
+                srv_cfg.webpush_vapid_pub = v.publicB64(&webpush_pub_buf);
+            } else |err| {
+                std.debug.print("orochi: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
+            }
+        }
+    }
+
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
     // here, before any connection is served; owned for the process lifetime.
     const isupport_tokens = try orochi.daemon.server.buildIsupportTokens(allocator, srv_cfg);
@@ -604,7 +620,6 @@ pub fn main(init: std.process.Init) !void {
     const WebpushWorker = if (builtin.os.tag == .linux) orochi.daemon.webpush.Worker else void;
     var webpush_worker: ?*WebpushWorker = null;
     var webpush_resolver: ?*orochi.daemon.acme_runner.SystemResolver = null;
-    var webpush_pub_buf: [orochi.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
     defer if (comptime builtin.os.tag == .linux) {
         if (webpush_worker) |w| {
             w.shutdown();
@@ -629,8 +644,8 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("orochi: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
-                const vapid = orochi.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path) catch |err| {
-                    std.debug.print("orochi: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
+                const vapid = webpush_vapid orelse {
+                    std.debug.print("orochi: [webpush] no VAPID key; web push disabled\n", .{});
                     break :webpush_blk;
                 };
                 const resolver = try allocator.create(orochi.daemon.acme_runner.SystemResolver);
@@ -647,8 +662,7 @@ pub fn main(init: std.process.Init) !void {
                 try w.spawn();
                 webpush_worker = w;
                 srv.webpush_worker = w;
-                srv.webpush_vapid_pub = vapid.publicB64(&webpush_pub_buf);
-                std.debug.print("orochi: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv.webpush_vapid_pub });
+                std.debug.print("orochi: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
             } else {
                 std.debug.print("orochi: [webpush] enabled but web push is Linux-only; disabled\n", .{});
             }
