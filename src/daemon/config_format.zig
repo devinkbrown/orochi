@@ -546,6 +546,10 @@ pub const Config = struct {
         errdefer allocator.free(geoip_asn_db);
         const acme_directory_url = try allocator.dupe(u8, acme_default_directory_url);
         errdefer allocator.free(acme_directory_url);
+        const webpush_subject = try allocator.dupe(u8, "mailto:ops@eshmaki.me");
+        errdefer allocator.free(webpush_subject);
+        const webpush_vapid_key_path = try allocator.dupe(u8, "orochi-webpush-vapid.key");
+        errdefer allocator.free(webpush_vapid_key_path);
         return .{
             .network = .{ .name = try allocator.dupe(u8, "Orochi") },
             .admin = .{
@@ -558,6 +562,7 @@ pub const Config = struct {
             .stats = .{ .dir = stats_dir, .channel_dir = stats_channel_dir },
             .metrics = .{ .bind = metrics_bind },
             .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
+            .webpush = .{ .subject = webpush_subject, .vapid_key_path = webpush_vapid_key_path },
             .acme = .{ .directory_url = acme_directory_url },
         };
     }
@@ -636,6 +641,8 @@ pub const Config = struct {
         if (self.tls.cert_path) |value| allocator.free(value);
         if (self.tls.key_path) |value| allocator.free(value);
         allocator.free(self.acme.directory_url);
+        allocator.free(self.webpush.subject);
+        allocator.free(self.webpush.vapid_key_path);
         if (self.acme.domain) |value| allocator.free(value);
         if (self.acme.contact) |value| allocator.free(value);
         self.* = .{};
