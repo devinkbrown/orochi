@@ -50,6 +50,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.geo.default_location) |v| out.geo_default_location = v;
     if (cfg.geo.news_cache_dir) |v| out.geo_news_cache_dir = v;
     if (cfg.oper.grants_path) |v| out.oper_grants_path = v;
+    if (cfg.oper.event_history_path) |v| out.event_history_path = v;
     out.oper_auto_override = cfg.oper.auto_override;
     if (cfg.wasm.plugin_dir) |v| out.wasm_plugin_dir = v;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;

@@ -1288,6 +1288,10 @@ pub const Config = struct {
     /// active grants are written here on change and reloaded at boot so they
     /// survive a restart. `[oper] grants_path`.
     oper_grants_path: []const u8 = "",
+    /// Path for persisting the Event Spine history ring (`[oper]
+    /// event_history_path`); loaded at boot, rewritten on the stats cadence.
+    /// Empty = in-memory only (per-process lifetime).
+    event_history_path: []const u8 = "",
     /// Auto-enable the +j override umode on elevation for opers with the
     /// oper_override privilege (full channel authority without `/mode +j`).
     /// `[oper] auto_override`.
@@ -2413,6 +2417,8 @@ pub const LinuxServer = struct {
     /// on the stats interval. Only active when `config.chanstats_dir` is set.
     chanstats: chanstats_mod.ChanStats,
     chanstats_last_write_ms: i64 = 0,
+    /// Throttle stamp for the Event Spine history-ring snapshot save (reactor 0).
+    event_history_last_write_ms: i64 = 0,
     warden: warden.Registry,
     /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
     /// legitimate user has no reason to contact. A non-oper that touches one
@@ -2999,6 +3005,8 @@ pub const LinuxServer = struct {
         // Restore per-channel statistics persisted by a previous run so they
         // survive a restart or USR2 hot-upgrade.
         self.loadChanstats();
+        // Restore the Event Spine history ring (EVENT REPLAY) the same way.
+        self.loadEventHistory();
         if (self.config.media_enabled) {
             const frame_cap: usize = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)));
             self.media_plane.max_frame_bytes = frame_cap;
@@ -3659,6 +3667,17 @@ pub const LinuxServer = struct {
                 if (self.config.crypto_io) |io| {
                     self.chanstats.writeJson(io, self.config.chanstats_dir, self.config.network_name, self.serverName(), platform.realtimeMillis());
                 }
+            }
+        }
+        // Event Spine history snapshot, gated to reactor 0 (writeFileAbs is not
+        // atomic, so a single writer avoids interleaved writes) and throttled to
+        // the stats cadence. The ring is shared across reactors, so reactor 0's
+        // snapshot captures events raised on every shard.
+        if (self.config.event_history_path.len != 0 and self.rx() == &self.reactors[0]) {
+            const enow = self.nowMs();
+            if (self.event_history_last_write_ms == 0 or enow - self.event_history_last_write_ms >= self.config.stats_interval_ms) {
+                self.event_history_last_write_ms = enow;
+                self.saveEventHistory();
             }
         }
 
@@ -19625,6 +19644,26 @@ pub const LinuxServer = struct {
         if (self.config.chanstats_dir.len == 0) return;
         const io = self.config.crypto_io orelse return;
         chanstats_mod.loadSnapshot(&self.chanstats, io, self.config.chanstats_dir);
+    }
+
+    /// Restore the Event Spine history ring from `[oper] event_history_path` so
+    /// `EVENT REPLAY` survives a USR2 hot-upgrade and a cold restart. Best-effort.
+    fn loadEventHistory(self: *LinuxServer) void {
+        if (self.config.event_history_path.len == 0) return;
+        const io = self.config.crypto_io orelse return;
+        const data = std.Io.Dir.cwd().readFileAlloc(io, self.config.event_history_path, self.allocator, .limited(1 << 22)) catch return;
+        defer self.allocator.free(data);
+        _ = self.event_history.load(data);
+    }
+
+    /// Persist the Event Spine history ring (best-effort). Called on the stats
+    /// cadence so at most one interval of events is lost across a restart.
+    fn saveEventHistory(self: *LinuxServer) void {
+        if (self.config.event_history_path.len == 0) return;
+        var aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer aw.deinit();
+        self.event_history.serializeInto(&aw.writer) catch return;
+        writeFileAbs(self.allocator, self.config.event_history_path, aw.written());
     }
 
     // --- Account command family (Phase 2) ----------------------------------

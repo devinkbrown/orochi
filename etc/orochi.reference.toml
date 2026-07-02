@@ -451,6 +451,10 @@ allow_anonymous = false
 # boot, so runtime-granted opers survive a restart. Revoked accounts are dropped
 # from the file. Leave unset to keep runtime grants in-memory only.
 # grants_path = "/var/lib/orochi/oper_grants.tsv"
+# Path for persisting the Event Spine history ring so `EVENT REPLAY` survives a
+# USR2 hot-upgrade and a cold restart. Rewritten on the stats cadence, loaded at
+# boot. Leave unset to keep event history in-memory (per-process lifetime).
+# event_history_path = "/var/lib/orochi/event_history.bin"
 
 
 # --- [[opers]] — operator bindings (SASL-only) -------------------------------

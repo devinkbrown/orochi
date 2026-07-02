@@ -188,6 +188,10 @@ pub const Config = struct {
     pub const OperSection = struct {
         /// Path for persisting runtime GRANT/REVOKE grants across restarts.
         grants_path: ?[]const u8 = null,
+        /// Path for persisting the Event Spine history ring so `EVENT REPLAY`
+        /// survives a USR2 hot-upgrade and a cold restart. Written on the stats
+        /// cadence + loaded at boot. Unset = history is per-process-lifetime.
+        event_history_path: ?[]const u8 = null,
         /// Auto-enable the +j override umode on elevation for any operator holding
         /// the `oper_override` privilege, so admins get full channel authority
         /// (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. Default false
@@ -563,6 +567,7 @@ pub const Config = struct {
         if (self.geo.default_location) |v| allocator.free(v);
         if (self.geo.news_cache_dir) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
+        if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
         allocator.free(self.listen.host);
         freeStringList(allocator, self.listen.trusted_proxies);
@@ -676,6 +681,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [oper]
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
+    try setOpt(allocator, resolver, doc.getString("oper.event_history_path"), &cfg.oper.event_history_path);
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
     try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
 
