@@ -2313,6 +2313,59 @@ fn akickLiveFailCode(err: anyerror) []const u8 {
     };
 }
 
+/// Dedup window (ms) for synthetic oper-prefix (+Y/-Y) announcements. A mesh
+/// relink re-bursts membership + grant within a few ms; anything longer than a
+/// genuine transition is coincidental, so a small window is enough.
+const oper_prefix_dedup_ms: i64 = 2_000;
+
+/// Bounded ring of recent oper-prefix announcements, for `emitOperPrefixMode`
+/// idempotence. No allocation: fixed capacity, fixed-size name buffers. A
+/// matching (channel, nick, add) within the window is suppressed as a repeat.
+const OperPrefixDedup = struct {
+    const cap = 16;
+    const name_max = 64;
+    const Entry = struct {
+        chan: [name_max]u8 = undefined,
+        chan_len: u8 = 0,
+        nick: [name_max]u8 = undefined,
+        nick_len: u8 = 0,
+        add: bool = false,
+        ts_ms: i64 = 0,
+        used: bool = false,
+    };
+    entries: [cap]Entry = [_]Entry{.{}} ** cap,
+    head: usize = 0,
+
+    fn eqCi(buf: []const u8, s: []const u8) bool {
+        if (buf.len != s.len) return false;
+        return std.ascii.eqlIgnoreCase(buf, s);
+    }
+
+    /// Return true if the same (channel, nick, add) was announced within the
+    /// window — a duplicate to suppress. Otherwise records it and returns false.
+    fn seenRecently(self: *OperPrefixDedup, channel: []const u8, nick: []const u8, add: bool, now_ms: i64) bool {
+        if (channel.len > name_max or nick.len > name_max) return false; // don't dedup outliers
+        for (&self.entries) |*e| {
+            if (!e.used) continue;
+            if (now_ms - e.ts_ms > oper_prefix_dedup_ms) continue;
+            if (e.add == add and eqCi(e.chan[0..e.chan_len], channel) and eqCi(e.nick[0..e.nick_len], nick)) {
+                return true;
+            }
+        }
+        // Record (evicting the oldest slot via the ring head).
+        const e = &self.entries[self.head];
+        self.head = (self.head + 1) % cap;
+        @memcpy(e.chan[0..channel.len], channel);
+        e.chan_len = @intCast(channel.len);
+        @memcpy(e.nick[0..nick.len], nick);
+        e.nick_len = @intCast(nick.len);
+        e.add = add;
+        e.ts_ms = now_ms;
+        e.used = true;
+        return false;
+    }
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -2601,6 +2654,12 @@ pub const LinuxServer = struct {
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry = .{},
+    /// Recently-emitted synthetic oper-prefix (+Y/-Y) announcements, for
+    /// idempotence. A mesh relink re-bursts BOTH a member's JOIN and its oper
+    /// grant, and both re-announce the derived `*` — so a rejoining remote oper
+    /// otherwise gets duplicate `+Y` lines. This bounded ring collapses repeats
+    /// of the SAME (channel, nick, add) within `oper_prefix_dedup_ms`.
+    oper_prefix_dedup: OperPrefixDedup = .{},
     /// Distinct established S2S peer count, PUBLISHED by reactor 0 (which owns
     /// the S2S listener + every peer link) for cross-shard reads. Under
     /// multithreading, a client's LUSERS/MAP runs on whatever shard accepted it,
@@ -8660,6 +8719,11 @@ pub const LinuxServer = struct {
     /// status appears/disappears. Only this node's local members are notified;
     /// peers converge independently when they apply the same oper grant.
     fn emitOperPrefixMode(self: *LinuxServer, channel: []const u8, nick: []const u8, add: bool) void {
+        // Idempotence: a mesh relink re-bursts a member's JOIN and its oper
+        // grant, and both would announce the derived `*`. Collapse repeats of
+        // the same (channel, nick, add) within the dedup window so a rejoining
+        // remote oper gets a single +Y, not two (or the churn on every relink).
+        if (self.oper_prefix_dedup.seenRecently(channel, nick, add, self.nowMs())) return;
         var buf: [600]u8 = undefined;
         const sign: u8 = if (add) '+' else '-';
         const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {c}{c} {s}\r\n", .{
@@ -28444,6 +28508,22 @@ test "status.json: emits node health + mesh peers for the public status page" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+}
+
+test "oper-prefix dedup: collapses repeat +Y within the window, allows real transitions" {
+    var d = OperPrefixDedup{};
+    // First announce is not a repeat.
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1000));
+    // Same (channel, nick, add) within the window IS a repeat (the duplicate +Y).
+    try std.testing.expect(d.seenRecently("#root", "trev", true, 1010));
+    try std.testing.expect(d.seenRecently("#root", "TREV", true, 1500)); // case-insensitive
+    // A different sign (-Y) is a real transition, not a repeat.
+    try std.testing.expect(!d.seenRecently("#root", "trev", false, 1600));
+    // A different channel or nick is not a repeat.
+    try std.testing.expect(!d.seenRecently("#other", "trev", true, 1600));
+    try std.testing.expect(!d.seenRecently("#root", "kain", true, 1600));
+    // After the window elapses, the same announcement fires again (real re-add).
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1000 + oper_prefix_dedup_ms + 1));
 }
 
 test "status.json: peerStatusString maps every link state" {
