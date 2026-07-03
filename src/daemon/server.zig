@@ -14934,6 +14934,18 @@ pub const LinuxServer = struct {
         link.clearOutbound();
         self.sendMeshStateBurstTo(conn);
         self.armSendIfNeeded(conn) catch {};
+        // Re-register the operational surfaces the fresh-establishment hook would
+        // have: the link resumes ALREADY established, so driveS2sSecured's
+        // `!was and established` block never fires for it. Without this the
+        // successor shows an empty peer list / "1 server" LUSERS / no peer-health
+        // even though the link is live.
+        const rname = link.remoteName();
+        if (rname.len != 0) {
+            self.publishServerLink(rname, true);
+            self.markPeerHealth(rname, .established);
+        }
+        self.publishPeerCount();
+        self.updatePartitionTransitions();
         self.stats.onS2sAccept();
         self.traceLog(.info, .s2s, "s2s secured peer preserved across upgrade");
         return true;
