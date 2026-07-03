@@ -23,10 +23,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
+      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
+      # so it can't find a release tag. Install straight from the official
+      # /download/ release tarball instead — deterministic, no mirror dependency.
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
       # `zig build check` semantically analyses the daemon without emitting a
       # binary — the fastest signal that the tree still compiles.
@@ -39,10 +44,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
+      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
+      # so it can't find a release tag. Install straight from the official
+      # /download/ release tarball instead — deterministic, no mirror dependency.
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
       - name: Build (debug)
         run: zig build
@@ -63,10 +73,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
+      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
+      # so it can't find a release tag. Install straight from the official
+      # /download/ release tarball instead — deterministic, no mirror dependency.
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       # The static-musl ReleaseFast binary is the production artifact — verify it
       # links and produces a stripped executable on every change.
       - name: Build static musl release
