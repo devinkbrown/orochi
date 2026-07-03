@@ -3719,6 +3719,9 @@ pub const LinuxServer = struct {
                         .presence_ctx = self,
                         .presence_fn = Presence.count,
                     });
+                    // Public status page feed: this node's health + its mesh
+                    // peers, written alongside the channel stats.
+                    self.writeStatusJson(io);
                 }
             }
         }
@@ -3949,6 +3952,73 @@ pub const LinuxServer = struct {
         var w = std.Io.Writer.fixed(buf);
         render(snapshot, &w) catch return;
         writeStatsFileAtomic(io, dir, name, w.buffered());
+    }
+
+    /// Map a mesh peer's link state to a compact public status string.
+    fn peerStatusString(state: link_health_mod.PeerState) []const u8 {
+        return switch (state) {
+            .established => "up",
+            .connecting, .handshaking => "connecting",
+            .draining => "draining",
+            .down => "down",
+        };
+    }
+
+    /// Emit `status.json` — the public status-page feed. This node's identity,
+    /// uptime, live user count and mesh-quorum health, plus every known mesh
+    /// peer's link state, smoothed RTT and time-in-state. Read from this node's
+    /// perspective (each node writes its own); best-effort, same cadence as the
+    /// channel stats. Timestamps are wall-clock seconds; durations are seconds.
+    fn writeStatusJson(self: *LinuxServer, io: std.Io) void {
+        var buf: [8192]u8 = undefined;
+        const json = self.buildStatusJson(&buf);
+        writeStatsFileAtomic(io, self.config.chanstats_dir, "status.json", json);
+    }
+
+    /// Pure builder for `status.json` (see `writeStatusJson`). Returns the JSON
+    /// slice backed by `buf`; on overflow returns whatever was written so far
+    /// (best-effort, never fails). Separated so it is testable without file I/O.
+    fn buildStatusJson(self: *LinuxServer, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        const now_unix = @divTrunc(platform.realtimeMillis(), 1000);
+        const uptime: i64 = @max(0, now_unix - self.boot_unix);
+        const now_mono: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+
+        w.writeAll("{\"generated_at\":") catch return w.buffered();
+        w.print("{d}", .{now_unix}) catch return w.buffered();
+        w.writeAll(",\"network\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.config.network_name) catch return w.buffered();
+        w.writeAll(",\"node\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.serverName()) catch return w.buffered();
+        w.print(",\"uptime_seconds\":{d}", .{uptime}) catch return w.buffered();
+        w.print(",\"users_online\":{d}", .{self.meshUserCount()}) catch return w.buffered();
+        w.print(",\"mesh\":{{\"quorum\":{s},\"partitioned\":{s},\"components\":{d}}}", .{
+            if (self.partition_quorum) "true" else "false",
+            if (self.partition_split) "true" else "false",
+            self.partition_components,
+        }) catch return w.buffered();
+
+        w.writeAll(",\"peers\":[") catch return w.buffered();
+        var first = true;
+        for (&self.peer_health.slots) |*slot| {
+            if (!slot.used) continue;
+            const h = &slot.health;
+            if (!first) w.writeAll(",") catch return w.buffered();
+            first = false;
+            w.writeAll("{\"name\":") catch return w.buffered();
+            writeJsonEscaped(&w, slot.name()) catch return w.buffered();
+            w.print(",\"state\":\"{s}\"", .{peerStatusString(h.state)}) catch return w.buffered();
+            w.print(",\"up\":{s}", .{if (h.state == .established) "true" else "false"}) catch return w.buffered();
+            if (h.ewma_rtt_ms) |rtt| {
+                w.print(",\"rtt_ms\":{d}", .{@as(u64, @intFromFloat(@max(0, rtt)))}) catch return w.buffered();
+            } else {
+                w.writeAll(",\"rtt_ms\":null") catch return w.buffered();
+            }
+            w.print(",\"since_seconds\":{d}", .{@divTrunc(h.since(now_mono), 1000)}) catch return w.buffered();
+            w.writeAll("}") catch return w.buffered();
+        }
+        w.writeAll("]}") catch return w.buffered();
+        return w.buffered();
     }
 
     fn writeStatsFileAtomic(io: anytype, dir: []const u8, name: []const u8, data: []const u8) void {
@@ -28338,6 +28408,39 @@ test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones
     const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all);
     try std.testing.expect(std.mem.indexOf(u8, after_prop, "ancient") == null);
     try expectContains(after_prop, "recent");
+}
+
+test "status.json: emits node health + mesh peers for the public status page" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Seed a live peer and a downed one, then build the JSON in memory.
+    server.markPeerHealth("ircx.us", .established);
+    server.markPeerHealth("stale.node", .down);
+
+    var buf: [8192]u8 = undefined;
+    const text = server.buildStatusJson(&buf);
+
+    // Node identity + health envelope.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
+    // Both peers present, with correct up/state.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+}
+
+test "status.json: peerStatusString maps every link state" {
+    try std.testing.expectEqualStrings("up", LinuxServer.peerStatusString(.established));
+    try std.testing.expectEqualStrings("connecting", LinuxServer.peerStatusString(.connecting));
+    try std.testing.expectEqualStrings("connecting", LinuxServer.peerStatusString(.handshaking));
+    try std.testing.expectEqualStrings("draining", LinuxServer.peerStatusString(.draining));
+    try std.testing.expectEqualStrings("down", LinuxServer.peerStatusString(.down));
 }
 
 test "ephemeral room: messages are not recorded into durable chanstats" {
