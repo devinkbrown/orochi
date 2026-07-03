@@ -14370,14 +14370,16 @@ pub const LinuxServer = struct {
             // dials are re-dialed by the successor's mesh boot pass instead.
             if (e.value.s2s != null or e.value.s2s_secured != null) {
                 if (e.value.s2s_secured) |link| {
-                    // Skip preservation while a send is in flight: `send_offset`
-                    // only advances on the send CQE (server.zig ~5415), so with
-                    // `send_armed` set we can't tell how much of the armed record
-                    // the kernel already transmitted — replaying it would double a
-                    // sealed record and desync the peer's recv counter (AuthFailed
-                    // → drop). Fall back to the re-dial hint for this one link (old
-                    // behavior); still no nonce reuse, just a one-time drop.
-                    if (link.established() and !e.value.send_armed and self.sealSecuredLink(e.value, link, &pieces, &blobs)) {
+                    // Preserve an established secured link (zero-drop). A record that
+                    // was already on the wire is not re-sealed (only the undrained
+                    // SendQ tail is carried); if an in-flight send races the swap the
+                    // peer AuthFails one record and re-dials — fail-safe (old
+                    // behavior), never a nonce reuse. So we do NOT gate on
+                    // `send_armed` (a gossip-chatty mesh link is armed often, which
+                    // would defeat preservation entirely).
+                    const est = link.established();
+                    const sealed = est and self.sealSecuredLink(e.value, link, &pieces, &blobs);
+                    if (sealed) {
                         // Preserved: carry the fd across execve; do NOT also seal a
                         // re-dial hint (that would open a duplicate link → churn).
                         _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
@@ -14386,6 +14388,7 @@ pub const LinuxServer = struct {
                         s2s_preserved += 1;
                         continue;
                     }
+                    srvLog("orochi: UPGRADE — s2s_secured NOT preserved (established={}, send_armed={}); falling back to re-dial\n", .{ est, e.value.send_armed });
                 }
                 if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
                     const hint = mesh_redial.encode(.{
