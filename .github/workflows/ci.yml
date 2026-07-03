@@ -14,7 +14,9 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.16.0"
+  # 0.16.0 is not a tagged release yet, so setup-zig 404s on "0.16.0" (the local
+  # toolchain is a 0.16.0-dev/master build). Track master until 0.16.0 ships.
+  ZIG_VERSION: "master"
 
 jobs:
   check:
