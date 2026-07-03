@@ -1,37 +1,64 @@
-# m_ircx_access — IRCX ACCESS command
+# IRCX ACCESS
 
-_Source-verified module reference for `m_ircx_access`, which provides the IRCX ACCESS command._
+_The IRCX `ACCESS` command — persistent channel access lists (FOUNDER/OWNER/HOST/VOICE/GRANT/DENY) applied on join._
 
-## Overview
+`ACCESS` is a real server command registered in
+[`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig), handled
+by `LinuxServer.handleAccess` in
+[`src/daemon/server.zig`](../../../src/daemon/server.zig). Parsing, the entry
+store, and the reply builders live in
+[`src/proto/ircx_access_store.zig`](../../../src/proto/ircx_access_store.zig).
+It is IRCX-gated: opt in with `IRCX`/`ISIRCX` first, or dispatch replies
+`421 ERR_UNKNOWNCOMMAND`.
 
-`m_ircx_access` is a C module implemented in `modules/m_ircx_access.c`. It provides the IRCX ACCESS command.
+## Syntax
 
-The command table is derived from the module registration source. The configuration table lists module-owned options plus core config fields read directly by the module.
+```text
+ACCESS <channel> LIST   [<level>] [<mask>]
+ACCESS <channel> ADD    <level> <mask> [<timeout-secs>] [:<reason>]
+ACCESS <channel> DELETE <level> <mask>
+ACCESS <channel> CLEAR  [<level>]
 
-## Commands
+ACCESS * …           # server-level list — routed to the SACCESS path
+```
 
-| Command | Required | Description |
+`<level>` is one of `FOUNDER`, `OWNER`, `HOST`, `VOICE`, `GRANT`, `DENY`
+(`ircx_access_store.Level`). `<mask>` is a `nick!user@host` hostmask.
+
+## Behavior
+
+- **Management is channel-operator-gated.** `accessCanManage` requires the
+  caller to be a channel operator (or network operator) for the target channel
+  and level; otherwise `482 ERR_CHANOPRIVSNEEDED`. A malformed request yields
+  `461 ERR_NEEDMOREPARAMS`. Writes made under an active operator override are
+  audited.
+- **Join-time application.** When a user joins, a matching entry applies its
+  effect: `FOUNDER/OWNER/HOST/VOICE` grant the corresponding member status;
+  `DENY` blocks the join; `GRANT` bypasses a matching server-level (SACCESS)
+  deny/gag. `HOST` maps to channel-operator (`+o`) status.
+- **`ACCESS *`** is the server-access selector and is forwarded to the
+  server-access request path (see [IRCX oper surface](m_ircx_oper.md) and
+  `SACCESS`), which is operator-gated.
+- Entries carry an optional expiry (`<timeout-secs>`) and free-text reason, and
+  are held in the `ircx_access_store` (bounded by the config-driven limits).
+
+## Numerics
+
+| Numeric | Name | Use |
 | --- | --- | --- |
-| `ACCESS` | 2 | Registered command; handler access: registered. |
-| `BTACCESS` | 4 | Registered command; handler access: client/server as handled by source. |
-| `DENY` | source-defined | Registered command; handler access: dynamic alias. |
-| `TACCESS` | 5 | Registered command; handler access: client/server as handled by source. |
-
-## Configuration
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `ConfigChannel.max_access` | ircd.toml/core default | Read by this module from the core configuration store. |
+| `801` | `RPL_ACCESSADD` | entry added |
+| `802` | `RPL_ACCESSDELETE` | entry removed |
+| `803` | `RPL_ACCESSSTART` | opens a `LIST` |
+| `804` | `RPL_ACCESSENTRY` | one per listed entry |
+| `805` | `RPL_ACCESSEND` | closes a `LIST` / `CLEAR` |
 
 ## Examples
 
 ```irc
-ACCESS
-BTACCESS
-DENY
+IRCX
+ACCESS #zig ADD OWNER nick!*@host.test 3600 :trusted founder
+ACCESS #zig ADD DENY *!*@spam.example
+ACCESS #zig LIST HOST
+ACCESS #zig DELETE OWNER nick!*@host.test
+ACCESS #zig CLEAR DENY
 ```
-
-## Notes
-
-- Hooks used: `burst_channel`, `can_join`, `channel_join`, `channel_lowerts`.
-- Module flags: `MAPI_FLAG_AUTOLOAD`, `MAPI_FLAG_SINGLETON`.

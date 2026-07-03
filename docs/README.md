@@ -35,6 +35,8 @@ richer `INFO`.
 - [Cryptography](architecture/crypto.md) — the Tsumugi handshake, Yoroi, signing, sealed tokens
 - [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
 - [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins
+- [Event Spine](architecture/event-spine.md) — typed operator/observer events: subscription, severity, replay, stats, flood-collapse
+- [Observability & stats](architecture/observability-stats.md) — channel-statistics engine and the public `status.json` mesh-health feed
 
 ## Command reference
 
@@ -60,6 +62,8 @@ richer `INFO`.
 - [IRCv3](reference/ircv3.md) — capability and message-tag support
 - [IRCX](reference/ircx/README.md) — the IRCX protocol surface (PROP, ACCESS, EVENT, AUTH)
 - [Native media MAC](reference/native-media-mac.md) — the media authentication tag
+- [Web Push](reference/web-push.md) — browser push for offline DMs (RFC 8291/8292, VAPID discovery)
+- [Host cloaking](reference/host-cloaking.md) — keyed-HMAC cloaks, per-account cloak, rotation, and oper cross-mesh identity
 
 ## Configuration
 

@@ -1,39 +1,60 @@
-# m_ircx_oper — IRCX operator tools
+# IRCX oper surface
 
-_Source-verified module reference for `m_ircx_oper`, which provides IRCX operator tools: GAG mode (+g) and OPFORCE commands._
+_The operator-gated corner of Orochi's IRCX family — server access lists (`SACCESS`), the `+z` GAG umode, and the operator `EVENT` plane._
 
-## Overview
+Orochi is not the old ophion C daemon: there is no `modules/m_ircx_oper.c`, no
+MAPI, and no `OPFORCE`/`SVSJOIN` pseudo-commands. The operator surface is plain
+English and rides real server commands in
+[`src/daemon/server.zig`](../../../src/daemon/server.zig), registered through
+[`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig).
 
-`m_ircx_oper` is a C module implemented in `modules/m_ircx_oper.c`. It provides IRCX operator tools: GAG mode (+g) and OPFORCE commands.
+## SACCESS — server-level access lists
 
-The command table is derived from the module registration source. The configuration table lists module-owned options plus core config fields read directly by the module.
+```text
+SACCESS <channel|*> <ADD|DELETE|LIST|CLEAR> [<level>] [<mask>] [<timeout>] [:<reason>]
+ACCESS  *           …                                # same server-access path
+```
 
-## Commands
+`SACCESS` is registered with `.access = .oper`, so the dispatch layer refuses it
+to non-operators before the handler runs. It is the network-wide counterpart to
+the channel-scoped [`ACCESS`](m_ircx_access.md) command: entries match on
+`nick!user@host` facets and gate connection, nick, and channel-join at the
+server level (`handleSaccess` / `handleServerAccessRequest`). Live entries are
+persisted to the durable services store and replayed on restart. The bare
+`ACCESS *` form is routed here as well.
 
-| Command | Required | Description |
-| --- | --- | --- |
-| `GAG` | 2 | Registered command; handler access: registered. |
-| `GAG_ADD` | source-defined | Registered command; handler access: client/server as handled by source. |
-| `GAG_CLEAR` | source-defined | Registered command; handler access: client/server as handled by source. |
-| `GAG_DEL` | source-defined | Registered command; handler access: client/server as handled by source. |
-| `OPFORCE` | 3 | Registered command; handler access: registered. |
-| `SVSJOIN` | 3 | Registered command; handler access: oper, registered. |
+## GAG — `MODE <nick> +z`
 
-## Configuration
+An operator may silence another user with `MODE <nick> +z` (cleared with `-z`),
+handled by `applyGag`. The server records the target's real IP in its gag set
+and drops that user's channel/private messages network-wide; `-z` lifts it. The
+change is reflected back as `:<server> MODE <nick> +z`. This is the IRCX
+operator "gag"; it is a cross-user umode that only operators may set.
 
-| Option | Default | Description |
-| --- | --- | --- |
-| None | n/a | No dedicated module configuration was found in source. |
+## Operator EVENT plane
+
+Operators drive the wider event surface through [`EVENT`](m_ircx_event.md):
+
+- `EVENT BROADCAST :<message>` — the operator announce that replaces WALLOPS.
+- `EVENT OBSERVE <mask> …` — a standing lifecycle feed with real hosts.
+
+Both require operator status and the `event_subscribe` privilege. See
+[event-spine.md](../../architecture/event-spine.md) for the full model.
+
+## Notes
+
+- The legacy ophion `OPFORCE`/`SVSJOIN` commands are intentionally absent.
+  Forced joins and moderation are expressed through the modern surface (SACCESS,
+  channel `ACCESS`, WARD ban policy) rather than services pseudo-commands.
+- All of these are IRCX-family commands except `MODE`; the IRCX ones require the
+  session to have opted in via `IRCX`/`ISIRCX` first.
 
 ## Examples
 
 ```irc
-GAG
-GAG_ADD
-GAG_CLEAR
+IRCX
+SACCESS * ADD DENY *!*@*.spamhost.example 86400 :network ban
+SACCESS #ops LIST
+MODE badnick +z
+EVENT BROADCAST :ring 0 restart in 5m
 ```
-
-## Notes
-
-- Hooks used: `burst_finished`, `new_local_user`, `privmsg_channel`, `privmsg_user`, `umode_changed`.
-- Module flags: `MAPI_FLAG_AUTOLOAD`, `MAPI_FLAG_SINGLETON`.

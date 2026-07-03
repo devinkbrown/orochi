@@ -1,32 +1,80 @@
-# m_ircx_event — IRCX EVENT command
+# IRCX EVENT
 
-_Source-verified module reference for `m_ircx_event`, which provides the IRCX EVENT command for oper event monitoring._
+_The IRCX `EVENT` command — client/operator subscription control over Orochi's typed event planes. Concise command reference; for the full model see [event-spine.md](../../architecture/event-spine.md)._
 
-## Overview
+Orochi has no `modules/` directory and no pseudo-clients. `EVENT` is a real
+server command registered in the SerpentRegistry module table
+[`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig) as a thin
+thunk over `LinuxServer.handleEvent` in
+[`src/daemon/server.zig`](../../../src/daemon/server.zig). It is an IRCX-family
+command: the session must first opt in with `IRCX`/`ISIRCX`/`MODE ISIRCX`, or
+the dispatch gate rejects it with `421 ERR_UNKNOWNCOMMAND` (`IRCX command
+requires ISIRCX`).
 
-`m_ircx_event` is a C module implemented in `modules/m_ircx_event.c`. It provides the IRCX EVENT command for oper event monitoring.
+## Syntax
 
-The command table is derived from the module registration source. The configuration table lists module-owned options plus core config fields read directly by the module.
+```text
+EVENT LIST [<type>]
+EVENT ADD    <type> [<subject-mask>]
+EVENT CHANGE <type> <subject-mask>
+EVENT DELETE|DEL <type>
+EVENT CLEAR  [<type>]
 
-## Commands
+# operator-only sub-verbs
+EVENT BROADCAST :<message>
+EVENT OBSERVE <mask> [<actions>…] | OFF | LIST
+EVENT SEVERITY <level>
+EVENT REPLAY  [<args>…]
+EVENT STATS
+```
 
-| Command | Required | Description |
+`<type>` is an IRCX event type from
+[`src/daemon/event_spine.zig`](../../../src/daemon/event_spine.zig)
+(`IrcxEventType`): `CHANNEL`, `MEMBER`, `USER`, `MEDIA`. `<subject-mask>`
+defaults to `*`.
+
+## Behavior
+
+- **Subscription plane.** `LIST/ADD/CHANGE/DELETE/CLEAR` manage the calling
+  session's IRCX event subscriptions, each with a per-type subject mask. The
+  IRCX plane is token-routed by type and deliberately kept separate from the
+  operator Event-Spine category mask, so a `USER` subscriber receives only
+  `USER` events.
+- **Client vs operator scope.** Ordinary clients may subscribe only to the
+  channel-scoped `MEDIA` type (the call-presence feed for channels they are in).
+  `CHANNEL/MEMBER/USER`, plus `BROADCAST` and `OBSERVE`, are operator-only; the
+  operator path additionally requires the `event_subscribe` privilege.
+- **`EVENT BROADCAST`** sends an operator announce (the former WALLOPS, folded
+  into the Event Spine) to every announce-subscribed operator as
+  `:<server> EVENT <oper> <message>`.
+- **`EVENT OBSERVE`** installs a standing operator observation subscription over
+  a nick/host mask and pushes a live lifecycle feed (with real hosts); it emits
+  an immediate snapshot of the currently-matching population on subscribe.
+- **`SEVERITY` / `REPLAY` / `STATS`** tune the per-session minimum severity,
+  replay recorded events, and report counters — see
+  [event-spine.md](../../architecture/event-spine.md).
+
+## Numerics
+
+| Numeric | Name | Use |
 | --- | --- | --- |
-| `EVENT` | 0 | Registered command; handler access: registered. |
-
-## Configuration
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `ConfigFileEntry.kline_reason` | ircd.toml/core default | Read by this module from the core configuration store. |
+| `806` | `RPL_EVENTADD` | subscription added |
+| `807` | `RPL_EVENTDELETE` | subscription removed |
+| `808` | `RPL_EVENTSTART` | opens a `LIST` |
+| `809` | `RPL_EVENTLIST` | one per subscription |
+| `810` | `RPL_EVENTEND` | closes a `LIST` |
+| `825` | `RPL_EVENTCHANGE` | subject mask updated |
+| `821` | `ERR_EVENTDUP` | already subscribed |
+| `822` | `ERR_EVENTMIS` | not subscribed |
+| `823` | `ERR_NOSUCHEVENT` | unknown event type |
 
 ## Examples
 
 ```irc
-EVENT
+IRCX
+EVENT ADD MEDIA #studio
+EVENT LIST
+EVENT DELETE MEDIA
+EVENT BROADCAST :network maintenance in 10 minutes
+EVENT OBSERVE *!*@*.example.net JOIN PART
 ```
-
-## Notes
-
-- Hooks used: `account_login`, `account_logout`, `after_client_exit`, `burst_channel`, `can_kick`, `channel_ban_add`, `channel_ban_remove`, `channel_destroy`, `channel_join`, `channel_modes_set`, `channel_part`, `client_exit`, `doing_admin`, `doing_info`, `doing_links`, `doing_motd`, `doing_stats`, `doing_stats_p`, `doing_trace`, `doing_whois`, ...
-- Module flags: `MAPI_FLAG_AUTOLOAD`, `MAPI_FLAG_SINGLETON`.

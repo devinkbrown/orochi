@@ -1,48 +1,73 @@
-# IRCX reference and Orochi conformance cross-check
+# IRCX reference (Orochi)
 
-_Index of the IRCX reference set, plus a conformance check of Orochi's live IRCX surface against the canonical draft._
+_Index of Orochi's IRCX command family, with a cross-check of the live surface against the canonical draft._
+
+Orochi implements IRCX natively in Zig. There is **no `modules/` directory, no
+MAPI, and no pseudo-clients** — every IRCX verb is a real server command
+registered in the SerpentRegistry module table
+[`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig) as a thin
+thunk over a `LinuxServer.handle*` method in
+[`src/daemon/server.zig`](../../../src/daemon/server.zig). Protocol parsing,
+stores, and reply builders live under [`src/proto/`](../../../src/proto/).
+
+Except for discovery, IRCX commands are **gated behind IRCX mode**: a session
+opts in with `IRCX`, `ISIRCX`, or `MODE ISIRCX`; using an IRCX command without
+opting in returns `421 ERR_UNKNOWNCOMMAND` (`IRCX command requires ISIRCX`).
+Discovery itself works before registration.
+
+## Command pages
+
+| Page | Command(s) | Handler |
+| --- | --- | --- |
+| [m_ircx_prop.md](m_ircx_prop.md) | `PROP` | `handleProp` |
+| [m_ircx_prop_channel_builtins.md](m_ircx_prop_channel_builtins.md) | channel properties (+ `EPHEMERAL`, `PINS`) | `channelBuiltinGet`/`Set` |
+| [m_ircx_prop_entity_user.md](m_ircx_prop_entity_user.md) | user / member properties | `handleProp` + prop providers |
+| [m_ircx_access.md](m_ircx_access.md) | `ACCESS` | `handleAccess` |
+| [m_ircx_auth.md](m_ircx_auth.md) | `AUTH` | `handleIrcxAuth` |
+| [m_ircx_event.md](m_ircx_event.md) | `EVENT` | `handleEvent` |
+| [m_ircx_oper.md](m_ircx_oper.md) | `SACCESS`, `MODE +z` GAG, oper `EVENT` | `handleSaccess`/`applyGag` |
+| [m_ircx_auditorium.md](m_ircx_auditorium.md) | `+x AUDITORIUM`, `+h HIDDEN` | `auditorium.zig` / channel model |
+
+Other IRCX-family commands registered in the module: `IRCX`/`ISIRCX`
+(discovery), `DATA`/`REQUEST`/`REPLY` (typed directed messaging), `WHISPER`
+(channel-scoped private message, `+w NOWHISPER` / `923`), `MODEX` (named channel
+modes), and `LISTX` (extended `LIST`). `CREATE` lives with the channel-ops
+module.
 
 ## Authoritative material
 
 | Document | Role |
 | --- | --- |
-| `ircx-draft-pfenning-04.md` | Canonical IETF draft. Source of truth for numerics, commands, modes, and properties. |
-| `ircx-protocol-ophion.md` and `m_ircx_*.md` | Ophion implementation notes (behavioral blueprint). Not authoritative on identity/SID — Orochi is SID-free. |
-| `../ircv3.md` and `../ircv3-ophion.md` | Orochi IRCv3 capabilities, plus the richer ophion IRCv3 capability list. |
+| [`ircx-draft-pfenning-04.md`](ircx-draft-pfenning-04.md) | Canonical IETF draft — source of truth for numerics, commands, modes, and properties. |
+| [`ircx-protocol-ophion.md`](ircx-protocol-ophion.md) | Legacy behavioral blueprint (ophion). Historical only — not authoritative on identity/SID; Orochi is SID-free. |
+| [../../architecture/event-spine.md](../../architecture/event-spine.md) | Full architecture behind `EVENT`, OBSERVE, BROADCAST, categories, and severity. |
 
-## Cross-check: live IRCX versus the draft
+## Numeric map (live)
 
-Orochi implements live: CREATE, ACCESS (801–805), PROP (818/819), EVENT
-(ADD/DEL/LIST), MODEX, WHISPER (+w/923), AUDITORIUM (+x), the visibility and
-extended channel modes (a/x/w/u/f/d/E/r/z/Y), and AUTH (lib). Comparing this
-surface against the draft surfaces numeric conflicts to fix:
+| Range | Replies |
+| --- | --- |
+| `800` | `RPL_IRCX` (discovery / AUTH package list) |
+| `801–805` | `ACCESS` — ADD / DELETE / START / ENTRY / END |
+| `806–810` | `EVENT` — ADD / DELETE / START / LIST / END |
+| `818–819` | `PROP` — `RPL_PROPLIST` / `RPL_PROPEND` |
+| `821–823`, `825` | `EVENT` — EVENTDUP / EVENTMIS / NOSUCHEVENT / EVENTCHANGE |
+| `826–827` | `MODEX` — `RPL_MODEXLIST` / `RPL_MODEXEND` (an Orochi extension, kept clear of draft-reserved codes) |
+| `906` | `ERR_BADVALUE` (invalid `PROP` value) |
+| `913` | `ERR_NOACCESS` (`PROP`/property permission denial) |
+| `923` | `ERR_NOWHISPER` (`+w` channel) |
 
-| Orochi now | Draft says | Action |
-| --- | --- | --- |
-| `ERR_PROPDENIED = 918` (PROP set/delete denial) | `918 = IRCERR_EVENTDUP` | Bug. PROP permission denial should be `908 IRCERR_SECURITY` (or 913 NOACCESS). Move it and free 918 for EVENT-dup. |
-| `RPL_MODEXLIST/END = 826/827` | `806/807 = IRCRPL_EVENTADD/DEL` | Resolved. EVENT now uses the draft `806–810` (ADD/DEL/START/LIST/END); MODEX (a non-draft Orochi extension) moved to `826/827`, clear of ACCESS/EVENT/LISTX/PROP. |
-| `ERR_NOWHISPER = 923` | `923 IRCERR_NOWHISPER` | Correct. |
-| ACCESS 801–805 | `801–805 ACCESS*` | Correct. |
-| PROP 818/819 | `818/819 PROPLIST/END` | Correct. |
-| `ERR_KEYNOPERMISSION = 769` (METADATA) | n/a (IRCv3 metadata-2, not IRCX) | Correct domain. |
+## Conformance notes
 
-## Open conformance items
-
-Honor these as EVENT and IRCX-mode are wired fully:
-
-- **800 IRCRPL_IRCX discovery** (`MODE ISIRCX` / `IRCX`). Orochi has the `ircx_gate`
-  builder; wire the 800 reply and the `IRCX`/`ISIRCX` mode switch (parity item 51).
-- **EVENT numerics 806–810** plus event types CHANNEL/MEMBER/SERVER/CONNECTION/
-  SOCKET/USER. Orochi's EVENT currently rides the daemon Event-Spine categories;
-  reconcile names and numerics with the draft, or document the deliberate
-  divergence (WALLOPS-as-Event-Spine is an intentional Orochi change).
-- **AUTH ordering** (AUTH before USER/NICK). Orochi uses IRCv3 SASL via CAP; IRCX
-  AUTH is the legacy path (the lib exists but is not the primary).
-- **Clone takeover protection** (CREATE clone removes a same-named channel). Note
-  for CLONEABLE/CLONE (+d/+e) if and when implemented.
-
-## Decision
-
-Treat the draft numerics as authoritative for IRCX-namespaced replies. Orochi
-extensions (MODEX) must not squat draft-reserved codes. Fix the `ERR_PROPDENIED`
-and `MODEX` numerics in a dedicated conformance pass (tracked).
+- **PROP permission denials** use `913 ERR_NOACCESS` and invalid values use
+  `906 ERR_BADVALUE` — no `918` squatting (918 is left free for the draft's
+  `EVENTDUP` family; Orochi uses `821` for event-dup).
+- **EVENT numerics** follow the draft `806–810` band; the IRCX event types are
+  `CHANNEL/MEMBER/USER` plus the Orochi-specific `MEDIA` call-presence type.
+  Delivery maps these onto Event-Spine categories while replies stay on the IRCX
+  numeric surface — see [event-spine.md](../../architecture/event-spine.md).
+- **MODEX** (`826/827`) is a deliberate Orochi extension and is kept clear of
+  ACCESS/EVENT/PROP draft codes.
+- **AUTH ordering.** Orochi's primary authentication is IRCv3 SASL via `CAP`;
+  IRCX `AUTH` is the legacy pre-CAP path, layered over the same mechanisms.
+- **WALLOPS is folded into the Event Spine** (`EVENT BROADCAST`) rather than a
+  `+w` umode — an intentional divergence from the draft.

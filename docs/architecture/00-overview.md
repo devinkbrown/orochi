@@ -22,6 +22,10 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Media | `src/substrate/suimyaku/media.zig`, `src/daemon/media_room.zig`, `src/daemon/media_plane.zig`, `src/daemon/native_media_transport.zig`, `src/daemon/media_bridge.zig` | SFU participant model, per-channel rooms, RTP/STUN media plane, native KaguraVox/KaguraVis UDP leg, cross-leg rewrap | `src/substrate/suimyaku/media.zig:1`, `src/daemon/media_room.zig:1`, `src/daemon/media_plane.zig:1`, `src/daemon/native_media_transport.zig:1`, `src/daemon/media_bridge.zig:1` |
 | Helix upgrade | `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig`, `src/daemon/helix/live.zig`, `src/daemon/helix/handoff.zig` | UPGRADE command, sealed memfd arena, listener/session fd inheritance, successor adoption | `src/daemon/modules/upgrade.zig:1`, `src/daemon/server.zig:6070`, `src/daemon/helix/live.zig:1`, `src/daemon/helix/handoff.zig:1` |
 | OroWasm | `src/wasm/host/*`, `src/wasm/kagura_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser KaguraVox/KaguraVis exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/kagura_wasm.zig:1` |
+| Event Spine | `src/daemon/event_spine.zig`, `src/daemon/event_history.zig`, `src/daemon/event_collapse.zig`, `src/daemon/server.zig` | Typed, mesh-propagated operator/observer events: `EVENT` category subscription + severity filtering, `OBSERVE` mask feed, `EVENT REPLAY` history ring, `EVENT STATS`, IRCv3 message-tags, flood-collapse | `src/daemon/event_spine.zig:1`, `src/daemon/event_history.zig:1`, `src/daemon/event_collapse.zig:1` |
+| Web Push | `src/crypto/webpush.zig`, `src/daemon/webpush.zig` | Browser push for offline DMs: RFC 8291 content encryption + RFC 8292 VAPID, background delivery worker, ISUPPORT `VAPID=` discovery, account-scoped subscriptions | `src/crypto/webpush.zig:1`, `src/daemon/webpush.zig:1`, `src/daemon/server.zig:1234` |
+| Host cloaking | `src/proto/cloak.zig`, `src/daemon/server.zig` | Keyed-HMAC v2 IP cloaks (hierarchical subnet-bannable or opaque), per-account cloak, rotatable key with ban continuity, GeoIP/ASN mixing, oper-only rDNS + cross-mesh real-IP/certfp in WHOIS | `src/proto/cloak.zig:1`, `src/daemon/config_format.zig:201` |
+| Observability / stats | `src/daemon/chanstats.zig`, `src/daemon/server.zig` | Per-channel statistics engine (JSON dashboard feed), USR2-durable binary snapshot, dead-channel prune, and the public `status.json` mesh-health feed | `src/daemon/chanstats.zig:1`, `src/daemon/server.zig` (`buildStatusJson`) |
 
 ## End-to-end client request flow
 
@@ -57,6 +61,8 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | [02-world-dispatch-modules.md](02-world-dispatch-modules.md) | `World`, preregistration dispatch, SerpentRegistry modules, hooks, introspection |
 | [03-media.md](03-media.md) | SFU/session model, media rooms, RTP/STUN plane, native KaguraVox/KaguraVis transport, WASM shims |
 | [04-upgrade-wasm.md](04-upgrade-wasm.md) | Helix UPGRADE handoff and OroWasm plugin host |
+| [event-spine.md](event-spine.md) | Typed operator/observer event plane: subscription, severity, replay, stats, flood-collapse |
+| [observability-stats.md](observability-stats.md) | Channel-statistics engine + the public `status.json` mesh-health feed |
 | [mesh-s2s.md](mesh-s2s.md) | Mesh/S2S architecture; separate document |
 | [crypto.md](crypto.md) | Cryptography architecture; separate document |
 

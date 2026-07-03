@@ -30,6 +30,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 | `EXTBAN` | `$,acgmrz` | Extended-ban namespace and supported extban types. | World list matching parses `$` entries for account, channel, country, mute, realname, secure-transport, and negation contexts; malformed `$` masks are rejected before storage. | `src/proto/protocol_inventory.zig:60`, `src/proto/extban.zig`, `src/daemon/world.zig` |
 | `WHOX` | present | WHOX extended WHO replies are supported. | WHOX uses `RPL_WHOSPCRPL` 354 and `RPL_ENDOFWHO` 315. | `src/proto/protocol_inventory.zig:61`, `src/daemon/server.zig:4660`, `src/daemon/server.zig:4750` |
 | `UTF8ONLY` | present | Clients must send UTF-8 message bodies. | Invalid PRIVMSG body gets `FAIL <command> INVALID_UTF8`; NOTICE stays silent. | `src/proto/protocol_inventory.zig:62`, `src/daemon/server.zig:10803` |
+| `VAPID` | *(absent)* | base64url ES256 VAPID public key for browser [Web Push](../web-push.md). | **Config-driven, not static** — advertised only when `[webpush] enabled = true`; the value is the node's VAPID public key, so a browser can subscribe without any NOTE data channel. | `src/daemon/server.zig:1234`, `src/daemon/server.zig:1259`, `src/daemon/server.zig:22364` |
 
 ## Override path
 

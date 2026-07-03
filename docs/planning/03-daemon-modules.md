@@ -11,7 +11,7 @@ Orochi should not port Ophion’s module system. Ophion’s MAPI v4 centers on r
 
 Orochi’s core should be a statically linked, compile-time assembled daemon. Modules are Zig packages selected by build profile. The compiler validates the graph, emits command tables, hook dispatchers, capability bitsets, ISUPPORT rows, mode tables, config schemas, and numeric metadata. Runtime `/REHASH` changes config and policy, not the code graph. Runtime feature-set changes happen through graceful drain into a newly built binary.
 
-This matches the Orochi brief: clean-slate Zig-native, Ophion/libop/opssl as reference only, full feature surface, and LADON+VEIL replacing TS6 ([BRIEF.md](orochi/docs/BRIEF.md), [BRIEF.md](orochi/docs/BRIEF.md), [BRIEF.md](orochi/docs/BRIEF.md)).
+This matches the Orochi brief: clean-slate Zig-native, Ophion/libop/opssl as reference only, full feature surface, and LADON+VEIL replacing TS6 ([BRIEF.md](../BRIEF.md), [BRIEF.md](../BRIEF.md), [BRIEF.md](../BRIEF.md)).
 
 ## Daemon lifecycle
 
@@ -256,7 +256,7 @@ Ophion’s parser resolves prefixes, looks up `struct Message`, intercepts batch
 | Cloaking/host identity | `mangledhost` in `client.h`; config `cloaking_style` in `s_conf.h` | DROP-AND-REPLACE | M | Replace ad hoc host mangling with typed identity policy. |
 | Spamfilter | Scoring/actions in `m_spamfilter.c`; hooks in `m_spamfilter.c` | DROP-AND-REPLACE | L | Compile filters to Zig-native DFA/glob/regex programs at rehash. |
 | Bans: KLINE, DLINE, XLINE, RESV, GAG, NOCHANNEL, NONICK, GRANT | Unified ban module in `m_banlist.c`; DB tables in `bans_db.c` | NATIVE-ZIG | M | Store-backed ban graph with generated oper commands. |
-| LADON/VEIL/media: LADON, MEDIA, MEDIAFRAME, MEDIASTATUS, VOICELIST, BWREPORT, DATASTAT, WHITEBOARD, STREAM/POLL/RAID, ABR, simulcast, mixer, CRDT, transcript, datachannel, E2E | Brief mandates LADON+VEIL replacing TS6 ([BRIEF.md](orochi/docs/BRIEF.md)); modules exist under `modules/m_ladon_*` | NATIVE-ZIG | XL | Native network substrate, not an IRC module bolted on. |
+| LADON/VEIL/media: LADON, MEDIA, MEDIAFRAME, MEDIASTATUS, VOICELIST, BWREPORT, DATASTAT, WHITEBOARD, STREAM/POLL/RAID, ABR, simulcast, mixer, CRDT, transcript, datachannel, E2E | Brief mandates LADON+VEIL replacing TS6 ([BRIEF.md](../BRIEF.md)); modules exist under `modules/m_ladon_*` | NATIVE-ZIG | XL | Native network substrate, not an IRC module bolted on. |
 | Python modules: API, bot, bridge/relay, webadmin, OAuth, push, RSS, search, URL preview, Twitch, Matrix, moderation, games, notes, polls, paste, Prometheus, etc. | CPython embedding in `pymod.c`; API capsules in `pymod_api.c`; Python module set in `python_modules/` | DROP-AND-REPLACE | XL | Replace CPython with sandboxed WASM plugins. |
 
 ## Scripting and extensibility

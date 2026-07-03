@@ -363,6 +363,18 @@ Source: struct at `src/daemon/config_format.zig:201`, parsing at `src/daemon/con
 | `mode` | string or null | `hierarchical` | `hierarchical` \| `opaque` | IP cloak granularity. `hierarchical` emits subnet-bannable prefix tokens plus `a<asn>.<cc>` geo labels; `opaque` emits a single token over the whole address (nothing leaks — not even country/ASN or subnet membership — but it cannot be subnet-banned). |
 | `account_cloak` | bool | `false` | `true` \| `false` | When true, a logged-in client's visible host becomes the friendly `<account>.users.<suffix>`, stable across IPs and devices. Explicit VHOST personas still override it. |
 
+## `[webpush]`
+
+Source: struct at `src/daemon/config_format.zig:495`, parsing at `src/daemon/config_format.zig:866`.
+
+Browser [Web Push](web-push.md) delivery for offline direct messages (triggered by the `tegami` away-delivery path). Off by default; enabling it needs an account store (subscriptions are account-scoped) and outbound HTTPS (it reuses the same trust anchors as ACME). The VAPID public key is advertised to clients through an ISUPPORT `VAPID=` token so nothing rides a NOTE data channel.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master switch. When off, the `WEBPUSH` command is not registered. |
+| `subject` | string | `mailto:ops@eshmaki.me` | VAPID JWT `sub` claim (RFC 8292) — an operator contact the push service may use to reach the node. |
+| `vapid_key_path` | string | `orochi-webpush-vapid.key` | Where the ES256 VAPID secret persists. **Rotating it invalidates every stored browser subscription** (the advertised public key changes). |
+
 ## `[tls]`
 
 Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/config_format.zig:408`, TLS boot projection at `src/daemon/config_boot.zig:97`, live listener at `src/main.zig:216`.

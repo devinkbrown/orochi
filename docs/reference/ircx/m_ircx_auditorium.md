@@ -1,31 +1,53 @@
-# m_ircx_auditorium — IRCX auditorium channel mode (+x)
+# IRCX AUDITORIUM (+x) and HIDDEN (+h)
 
-_Source-verified module reference for `m_ircx_auditorium`, which provides the IRCX auditorium channel mode (+x) that hides non-ops from each other._
+_Two IRCX channel visibility modes: `+x AUDITORIUM` hides ordinary members from each other, and `+h HIDDEN` hides the channel itself from listings._
 
-## Overview
+These are named channel modes, not commands. They live in Orochi's Zig channel
+model, not a C module. The mode letters and MODEX names are declared in
+[`src/proto/chanmode_ext.zig`](../../../src/proto/chanmode_ext.zig); the
+auditorium visibility predicates are in
+[`src/proto/auditorium.zig`](../../../src/proto/auditorium.zig); enforcement is
+in [`src/daemon/server.zig`](../../../src/daemon/server.zig). Set them with
+either `MODE` or the IRCX [`MODEX`](README.md) named-mode form.
 
-`m_ircx_auditorium` is a C module implemented in `modules/m_ircx_auditorium.c`. It provides the IRCX auditorium channel mode (+x), which hides non-ops from each other.
+## Syntax
 
-The command table is derived from the module registration source. The configuration table lists module-owned options plus core config fields read directly by the module.
+```text
+MODE  <channel> +x | -x        # AUDITORIUM
+MODE  <channel> +h | -h        # HIDDEN
+MODEX <channel> +AUDITORIUM    # named-mode equivalent
+MODEX <channel> +HIDDEN
+```
 
-## Commands
+## Behavior
 
-| Command | Required | Description |
-| --- | --- | --- |
-| None | n/a | This module does not register a standalone IRC command in its source. |
+### `+x` AUDITORIUM (`auditorium.zig`, letter `x`)
 
-## Configuration
+Regular members are hidden from one another; only operators and voiced members
+see the full roster. Visibility is by rank (`auditorium.Rank`):
 
-| Option | Default | Description |
-| --- | --- | --- |
-| None | n/a | No dedicated module configuration was found in source. |
+- An **op** member is visible to everyone.
+- A **viewer** who is op or voice sees everyone.
+- A plain **regular** member sees only ops (and always their own record).
+
+This filter is applied wherever the roster is projected — `NAMES`/`WHO`
+(`renderNames`, ~`server.zig:26014`), and `JOIN`/`PART` relays
+(`server.zig:9551` / `:10201`): a regular member's join/part is relayed only to
+ops and voiced members (`auditorium.shouldRelayJoinPart`). It applies across the
+mesh — remote members are rank-filtered the same way when merged into `NAMES`.
+
+### `+h` HIDDEN (`chanmode_ext` letter `h`)
+
+`HIDDEN` marks the channel as unlisted: it is skipped from `LIST`/`LISTX`, the
+busiest-channels directory, and the home-view pulse unless the requester is a
+member (mirroring `+s SECRET`, but a distinct flag). It is stored on the channel
+record (`world.isHidden` / `setHidden`) and rendered as the state-flag diff `h`
+in `MODE` output.
 
 ## Examples
 
-```sh
-MODLOAD m_ircx_auditorium
+```irc
+MODE #townhall +x            ; audience can't see each other, only the panel
+MODE #townhall +h            ; keep it out of channel listings
+MODEX #townhall +AUDITORIUM  ; same as +x, by name
 ```
-
-## Notes
-
-- Module flags: `MAPI_FLAG_AUTOLOAD`, `MAPI_FLAG_SINGLETON`.

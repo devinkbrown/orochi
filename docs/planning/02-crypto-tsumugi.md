@@ -5,7 +5,7 @@ This planning document defines the clean-room Zig crypto, TLS, and Tsumugi desig
 
 ## Evidence anchors
 
-Orochi is explicitly clean-slate Zig, replacing libop/opssl rather than porting them [BRIEF.md](orochi/docs/BRIEF.md), with crypto/TLS required to be TLS 1.3-first, PQ-hybrid, and constant-time by construction [BRIEF.md](orochi/docs/BRIEF.md). opssl is useful as inventory: it exposes TLS 1.2/1.3, PQ group IDs, Ed25519, RSA-PSS, AEADs, session export, and kTLS `types.h`, `crypto.h`, `conn.h`, `ktls.h`. VEIL currently wraps LADON frames after Ed25519/X25519 LADON auth using X25519, HKDF-SHA-256, and ChaCha20-Poly1305 [veil-security.md](ophion/docs/protocols/veil-security.md).
+Orochi is explicitly clean-slate Zig, replacing libop/opssl rather than porting them [BRIEF.md](../BRIEF.md), with crypto/TLS required to be TLS 1.3-first, PQ-hybrid, and constant-time by construction [BRIEF.md](../BRIEF.md). opssl is useful as inventory: it exposes TLS 1.2/1.3, PQ group IDs, Ed25519, RSA-PSS, AEADs, session export, and kTLS `types.h`, `crypto.h`, `conn.h`, `ktls.h`. VEIL currently wraps LADON frames after Ed25519/X25519 LADON auth using X25519, HKDF-SHA-256, and ChaCha20-Poly1305 [veil-security.md](ophion/docs/protocols/veil-security.md).
 
 ## Architecture
 

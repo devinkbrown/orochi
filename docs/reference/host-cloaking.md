@@ -1,0 +1,175 @@
+# Orochi host cloaking
+
+*How Orochi masks a client's real address from other users, and how an operator recovers the real identity — locally and across the mesh.*
+
+Orochi never shows a client's raw IP or reverse-DNS name to other users by
+default. The visible host is a deterministic **cloak**: a keyed one-way token
+that hides the address while still supporting coherent wildcard bans. The real
+identity is surfaced only to operators (and to the user themselves), and only
+over channels safe to carry it. This document describes the cloak engine, the
+operator's view, and the `[cloak]` configuration as they exist in the source
+tree; it complements
+[../architecture/mesh-security.md](../architecture/mesh-security.md) (how the
+secured mesh leg is authenticated).
+
+## The cloak engine (v2)
+
+The engine is [src/proto/cloak.zig](../../src/proto/cloak.zig). Every cloak
+segment is a keyed **HMAC-SHA256** token over a *cumulative prefix* of the real
+address (`macTag`, `token32`, `token64`). Because each segment depends only on
+the prefix up to that point:
+
+- the same real input + key always yields the same cloak (deterministic);
+- a different key yields a completely different, unlinkable cloak;
+- two addresses in the same subnet share the broad-prefix segments and differ in
+  the specific ones, so subnet bans keep working without exposing the raw
+  address.
+
+The full-address token is **64 bits** (16 hex, `full_token_hex_len` /
+`token64`); the coarser subnet-prefix tokens are **32 bits** (8 hex,
+`token_hex_len` / `token32`). A 32-bit token birthday-collides around 65k
+distinct addresses, so the full-address token was widened to 64 bits to make two
+real addresses effectively never share a cloak. HMAC domain tags are versioned
+(`ip4/v2/32|`, `ip6/v2/64|`, `ip4/v2/opq|`, …) so token families and scheme
+versions can never be related. Key bytes are wiped after every use (`secureZero`
+in `macTag`).
+
+`cloak()` routes on `classify()`:
+
+```text
+IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet
+IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet
+opaque             -> <f>.opq.ircxnet
+account            -> kain.users.ircxnet
+```
+
+The most specific token comes **first** (leftmost), matching DNS semantics where
+the rightmost labels are the broadest — masking the leading labels while keeping
+a shared tail is what makes wildcard bans coherent. `cloakIPv4` masks at /24,
+/16, and /8; `cloakIPv6` at /64, /56, /48, and /32.
+
+### GeoIP mixed in as ban-able labels
+
+`appendGeo` inserts the ISO country and origin AS number as two visible labels
+`a<asn>.<cc>` between the masked IP tokens and the `ip`/`ip6` marker. This lets
+an operator ban a country (`*.us.ip.<net>`) or an ASN (`*.a13335.*.ip.<net>`)
+while the exact address stays masked. Unknown geo renders the stable
+placeholders `a0` (unknown ASN) and `xx` (unknown/invalid country, via
+`appendCountry` / `unknown_country`), so the cloak shape never varies. The geo
+labels **do not perturb the IP tokens**, so subnet bans stay geo-independent.
+The server fills `Geo` from its MaxMind databases in `cloakGeo`
+([src/daemon/server.zig](../../src/daemon/server.zig)); any miss falls back to
+`Geo.none`.
+
+## Hierarchical vs opaque
+
+`[cloak] mode` selects the IP-cloak granularity; the tradeoff is
+**subnet-ban-ability vs. maximum privacy**:
+
+| `mode` | Form (`cloak` fn) | Subnet-bannable? | What leaks |
+| --- | --- | --- | --- |
+| `hierarchical` (default) | `cloakIPv4` / `cloakIPv6` | Yes — shared prefix tokens + `a<asn>.<cc>` labels | Which users share a subnet; country + ASN |
+| `opaque` | `cloakOpaque` → `<f>.opq.<suffix>` | No | Nothing — one token, no subnet hierarchy, no geo |
+
+Opaque emits a single 64-bit token over the whole address (`opaque_marker =
+"opq"`), so nothing about the address leaks — not even country/ASN or which
+users share a subnet — at the cost that opaque cloaks cannot be subnet-banned.
+Two addresses in the same /24 share nothing under opaque.
+
+## Per-account cloak
+
+With `[cloak] account_cloak = true`, a logged-in client's visible host becomes
+the friendly, stable `<account>.users.<suffix>` (`cloakAccount`,
+`account_subdomain = "users"`) that follows them across IPs and devices. It is
+**key-free** — no secret is involved, so it is stable across restarts and key
+rotation. The server selects it in `applyVisibleHost` in the order **account
+cloak → opaque → hierarchical**, and re-applies it after a post-registration
+login via `maybeApplyAccountCloak`, which fans a CHGHOST out to common channels.
+An explicit **VHOST persona sets the host directly and still wins** — it is not
+recomputed by `applyVisibleHost`. An unusable account label (or a logged-out
+client) falls through to the IP cloak. Loopback (`127.x` / `::1`) always stays
+the conventional `localhost`.
+
+## Rotatable cloak key
+
+The cloak key is derived at boot by SHA-256 of `[cloak] secret`
+([src/main.zig](../../src/main.zig)); with no secret, the daemon generates a
+random per-boot key so privacy is on by default. `[cloak] previous_secret`
+derives a second key kept live for **ban continuity across a rotation**.
+
+New cloaks always use the primary key. But bans written under the old key
+reference old host/mask tokens, so `enforceWard`
+([src/daemon/server.zig](../../src/daemon/server.zig)) does a fallback: on a
+primary-key miss it re-checks the **host and mask facets recomputed under the
+previous key** (`prevKeyCloakHost` mirrors the IP-cloak branch of
+`applyVisibleHost`, honoring opaque mode). Only the key-derived facets differ —
+address, account, country, ASN, certfp, and realname are key-independent, so the
+primary check already covered them. Account/loopback hosts do not change with
+the key and are skipped. Drop `previous_secret` once the old bans age out.
+
+## rDNS: live but decoupled
+
+Reverse DNS is resolved (the resolver is
+[src/daemon/rdns.zig](../../src/daemon/rdns.zig), wired as `config.rdns`) but
+**never feeds the public cloak** — cloaking the rDNS name
+would expose the ISP's registrable domain (`….comcast.net`). `applyVisibleHost`
+therefore always cloaks the **IP itself**, not the resolved name. The
+forward-confirmed rDNS name is surfaced only in the operator/self view: it is
+folded into the free-form `RPL_WHOISSPECIAL` (320) line as `rDNS <name> · <geo>`
+in the local WHOIS path. (The `cloakHostname` primitive — mask dynamic labels,
+keep the registrable domain — exists in the engine but is not on the daemon's
+visible-host path for this reason.)
+
+## Cross-mesh operator view of real identity
+
+A remote (cross-mesh) user's WHOIS historically showed only the cloaked host,
+because the mesh roster never carried the deanonymized identity. It is now
+propagated so oper **admins** get the same view they have for local users
+(commit `caa9c78`).
+
+- **Wire** — `real_host` and `certfp` are OPTIONAL trailing blocks #3/#4 on the
+  membership event ([src/proto/membership_event.zig](../../src/proto/membership_event.zig),
+  `max_real_host_len` / `max_certfp_len`), positional and count-disambiguated so
+  an older peer that never negotiates them sees zero extra bytes.
+- **Gating** — these fields are SENSITIVE, so they ride **only the secured leg**.
+  `s2s_peer` advertises `cap_member_oper_info` **only when it holds a node
+  signing key** — the same secured-link indicator as frame signing
+  ([src/substrate/suimyaku/s2s_peer.zig](../../src/substrate/suimyaku/s2s_peer.zig),
+  `caps |= cap_frame_signing | cap_member_oper_info`). `sendMembership` emits the
+  fields only to a peer that negotiated the cap, else empty — a plaintext leg
+  never carries them.
+- **Storage** — `route_table` `MemberIdentity`/`Member` own `real_host`/`certfp`
+  ([src/substrate/suimyaku/route_table.zig](../../src/substrate/suimyaku/route_table.zig)),
+  duped on create and `replaceOwned` on LWW update; `recvMembership` threads the
+  decoded fields into `applyMembership`.
+- **Display** — `sendRemoteWhois` reveals the real IP (338), GeoIP/ASN (320,
+  resolved locally from that IP), and certfp (276) **only to an operator
+  requester**, and only when the fields actually propagated.
+
+### WHOIS numerics — who sees what
+
+Numerics are defined in [src/proto/numeric.zig](../../src/proto/numeric.zig).
+
+| Numeric | Meaning | Local user WHOIS | Remote (mesh) user WHOIS |
+| --- | --- | --- | --- |
+| `338` `RPL_WHOISACTUALLY` | real host / IP | Oper or self | Oper requester + field propagated (secured leg) |
+| `320` `RPL_WHOISSPECIAL` | GeoIP/ASN summary + rDNS name | Oper or self | Oper requester + real IP propagated (geo resolved locally) |
+| `276` `RPL_WHOISCERTFP` | TLS client-cert fingerprint | Any requester (it is the value SASL EXTERNAL matches) | Oper requester + certfp propagated |
+
+Note the asymmetry: locally, `276` is not oper-gated (a client's certfp is not
+address-sensitive), but cross-mesh it rides the oper-info cap and is shown only
+to opers — a regular user never sees a remote user's certfp.
+
+## `[cloak]` configuration
+
+Section parsed in
+[src/daemon/config_format.zig](../../src/daemon/config_format.zig) (`Cloak`) and
+wired in [src/main.zig](../../src/main.zig).
+
+| Key | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `secret` | string | random per-boot | Passphrase SHA-256'd to the 32-byte cloak key. Absent → random key (privacy still on; cloaks are not stable across restarts). |
+| `previous_secret` | string | none | Prior secret kept live so WARD host/mask bans written under it keep matching during a rotation grace window. Drop once old bans age out. |
+| `suffix` | string | `ircxnet` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
+| `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one token, no subnet/geo leak, not subnet-bannable. |
+| `account_cloak` | bool | `false` | Logged-in clients show the key-free `<account>.users.<suffix>`. Explicit VHOST personas still override. |
