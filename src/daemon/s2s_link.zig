@@ -161,6 +161,62 @@ pub const S2sLink = struct {
         return self.peer.linkState() == .established;
     }
 
+    pub const ResumeHeader = s2s_peer.S2sPeer.ResumeHeader;
+
+    /// Bounded identity/transport header to resume this link across a hot upgrade.
+    /// The converged CRDT/route state is NOT captured — refilled from the peer via
+    /// a RESYNC burst (see `s2s_peer.resumeEstablished`).
+    pub fn snapshotResume(self: *const S2sLink) ResumeHeader {
+        return self.peer.snapshotResume();
+    }
+
+    /// The remote server name (for the resume capsule's variable-length field).
+    pub fn snapshotRemoteName(self: *const S2sLink) []const u8 {
+        return self.peer.remoteName();
+    }
+
+    /// Initialize in place directly in the established state from a resume header,
+    /// bypassing the handshake. `self` must already live at its final address (the
+    /// inner peer's clock captures `&self`). Stands up a FRESH empty CRDT replica;
+    /// the caller must RESYNC to refill the roster.
+    pub fn resumeEstablished(self: *S2sLink, opts: Options, hdr: ResumeHeader, remote_name: []const u8, rng_seed: u64) !void {
+        self.* = .{
+            .allocator = opts.allocator,
+            .now_ms = opts.now_ms,
+            .state = undefined,
+            .peer = undefined,
+            .out = .empty,
+        };
+        const state = try opts.allocator.create(ChannelCrdt);
+        errdefer opts.allocator.destroy(state);
+        state.* = ChannelCrdt.init(opts.allocator, opts.local_node_id);
+        errdefer state.deinit();
+        self.state = state;
+
+        self.peer = try s2s_peer.S2sPeer.resumeEstablished(.{
+            .allocator = opts.allocator,
+            .state = state,
+            .clock = .{ .ptr = self, .now_fn = clockNow },
+            .local_node_id = opts.local_node_id,
+            .remote_node_id = hdr.remote_node_id,
+            .local_epoch_ms = opts.local_epoch_ms,
+            .server_name = opts.server_name,
+            .description = opts.description,
+            .channel_name = opts.channel_name,
+            .signing_key = opts.signing_key,
+        }, hdr, remote_name, opts.now_ms, rng_seed);
+    }
+
+    /// Ask the peer to re-send its full converged state (post-resume reconverge).
+    pub fn sendResync(self: *S2sLink) !void {
+        try self.peer.sendResync(self.sink());
+    }
+
+    /// Consume a pending peer RESYNC request (the daemon answers with a full burst).
+    pub fn takeResyncRequest(self: *S2sLink) bool {
+        return self.peer.takeResyncRequest();
+    }
+
     /// Install (or clear) the borrowed local-world nick predicate used for
     /// cross-namespace NICK collision resolution (a remote nick that matches a
     /// LOCAL one is renamed to its mesh UID rather than overwriting the holder).

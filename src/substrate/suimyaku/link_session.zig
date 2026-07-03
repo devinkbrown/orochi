@@ -132,6 +132,57 @@ pub const LinkSession = struct {
         self.last_repair_ms = now_ms;
     }
 
+    /// Snapshot the bounded transport state (seq/ack/credit/epoch) for a Helix
+    /// resume. The CRDT `state` itself is NOT captured here — the successor starts
+    /// with an empty replica and the anti-entropy repair backfills it from the peer
+    /// (which never dropped) within one `repair_interval_ms`.
+    pub fn snapshotResume(self: *const LinkSession) peer_link.PeerLink.ResumeHeader {
+        return self.link.snapshotResume();
+    }
+
+    /// Rebuild a session directly in the established state from a resume header,
+    /// bypassing the handshake+burst. The peer is marked as a live gossip member so
+    /// SWIM/repair immediately target it. `state` is a FRESH empty replica — the
+    /// caller relies on repair (and an explicit local re-burst) to reconverge.
+    pub fn resumeEstablished(
+        allocator: Allocator,
+        state: *ChannelCrdt,
+        options: Options,
+        hdr: peer_link.PeerLink.ResumeHeader,
+        now_ms: u64,
+        rng_seed: u64,
+    ) !LinkSession {
+        var gossip = try gossip_round.GossipRound.init(
+            allocator,
+            options.local_node_id,
+            options.config.view_config,
+            options.config.swim_config,
+        );
+        errdefer gossip.deinit();
+        try gossip.observeJoin(options.remote_node_id, try i64Ms(now_ms), rng_seed);
+
+        return .{
+            .allocator = allocator,
+            .state = state,
+            .link = PeerLink.resumeEstablished(.{
+                .clock = options.clock,
+                .local_epoch_ms = options.local_epoch_ms,
+                .initial_send_credit = options.initial_send_credit,
+                .replay_window = options.config.peer_link_config.replay_window,
+                .handshake_timeout_ms = options.config.peer_link_config.handshake_timeout_ms,
+                .heartbeat_interval_ms = options.config.peer_link_config.heartbeat_interval_ms,
+                .idle_timeout_ms = options.config.peer_link_config.idle_timeout_ms,
+                .drain_timeout_ms = options.config.peer_link_config.drain_timeout_ms,
+            }, hdr),
+            .gossip = gossip,
+            .local_node_id = options.local_node_id,
+            .remote_node_id = options.remote_node_id,
+            .config = options.config,
+            .last_gossip_ms = now_ms,
+            .last_repair_ms = now_ms,
+        };
+    }
+
     pub fn tick(self: *LinkSession, now_ms: u64, rng_seed: u64, peers: []const NodeId) !void {
         switch (self.link.tick()) {
             .heartbeat_due => try self.emitControl(.heartbeat),

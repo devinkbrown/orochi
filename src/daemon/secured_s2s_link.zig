@@ -120,6 +120,11 @@ pub const SecuredLink = struct {
 
     phase: Phase,
     session: ?tsumugi_session.Session = null,
+    /// Set ONLY on a link resumed across a Helix hot-upgrade: the post-AKE
+    /// `Established` (record keys + peer identity) rebuilt from its capsule instead
+    /// of re-running the handshake. When present, `session` is null and every
+    /// identity/key accessor reads here. See `resumeOuter`.
+    resumed_established: ?hs.Established = null,
     inner: ?*s2s_link.S2sLink = null,
     /// Borrowed local-world nick predicate for cross-namespace NICK collision
     /// resolution, retained so it survives the lazy `inner` stand-up (the inner
@@ -183,8 +188,86 @@ pub const SecuredLink = struct {
         return self;
     }
 
+    /// Everything needed to rebuild an established secured link across a Helix hot
+    /// upgrade WITHOUT re-running the AKE: the outer record-layer secrets/counters
+    /// (from `exportOuter` + `Established.deserialize`) plus the inner CRDT link's
+    /// bounded identity/transport header (`s2s_link.ResumeHeader` + remote name).
+    /// The converged roster is NOT carried — a RESYNC refills it from the peer,
+    /// whose socket was preserved so it never saw a drop.
+    pub const ResumeState = struct {
+        established: hs.Established,
+        send_counter: u64,
+        recv_counter: u64,
+        feed_seq: u64,
+        inner: s2s_link.S2sLink.ResumeHeader,
+        remote_name: []const u8,
+        rec_inbuf: []const u8,
+        now_ms: u64,
+        rng_seed: u64,
+    };
+
+    /// Rebuild an established secured link from a resume capsule. Borrows the same
+    /// identity/config as `init` (via `opts`) and takes ownership of `rs.established`
+    /// (moved into `resumed_established`; do NOT deinit it separately). The inner
+    /// CRDT link is stood up established with a FRESH empty replica.
+    pub fn resumeOuter(opts: Options, rs: ResumeState) anyerror!SecuredLink {
+        var expected: [max_expected_remotes][20]u8 = undefined;
+        var expected_count: usize = 0;
+        if (opts.expected_remote) |pin| {
+            expected[expected_count] = pin;
+            expected_count += 1;
+        }
+        for (opts.expected_remotes) |pin| {
+            if (expected_count == expected.len) break;
+            expected[expected_count] = pin;
+            expected_count += 1;
+        }
+        var self = SecuredLink{
+            .allocator = opts.allocator,
+            .role = opts.role,
+            .identity = opts.identity,
+            .local_prekey = opts.local_prekey,
+            .cfg = opts.cfg,
+            .rng = opts.rng,
+            .expected_remotes = expected,
+            .expected_remote_count = expected_count,
+            .trusted_node_keys = opts.trusted_node_keys,
+            .server_name = opts.server_name,
+            .description = opts.description,
+            .local_epoch_ms = opts.local_epoch_ms,
+            .channel_name = opts.channel_name,
+            .phase = .established,
+            .resumed_established = rs.established,
+            .send_counter = rs.send_counter,
+            .recv_counter = rs.recv_counter,
+            .feed_seq = rs.feed_seq,
+        };
+        // On any failure below, wipe the moved-in record keys (secret hygiene) and
+        // free the partial-record carry.
+        errdefer self.resumed_established.?.deinit();
+        errdefer self.rec_inbuf.deinit(self.allocator);
+        try self.rec_inbuf.appendSlice(self.allocator, rs.rec_inbuf);
+
+        const link = try self.allocator.create(s2s_link.S2sLink);
+        errdefer self.allocator.destroy(link);
+        try link.resumeEstablished(.{
+            .allocator = self.allocator,
+            .local_node_id = node_short_id.shortId(self.identity.node_id),
+            .remote_node_id = rs.inner.remote_node_id,
+            .local_epoch_ms = self.local_epoch_ms,
+            .server_name = self.server_name,
+            .description = self.description,
+            .channel_name = self.channel_name,
+            .now_ms = rs.now_ms,
+            .signing_key = self.identity.sign_kp,
+        }, rs.inner, rs.remote_name, rs.rng_seed);
+        self.inner = link;
+        return self;
+    }
+
     pub fn deinit(self: *SecuredLink) void {
         if (self.session) |*s| s.deinit();
+        if (self.resumed_established) |*e| e.deinit();
         if (self.inner) |l| {
             l.deinit();
             self.allocator.destroy(l);
@@ -204,6 +287,65 @@ pub const SecuredLink = struct {
     pub fn established(self: *const SecuredLink) bool {
         return if (self.inner) |l| l.established() else false;
     }
+
+    /// Bounded outer (Tsumugi record-layer) resume state for the Helix s2s-link
+    /// capsule. `established` is a by-value COPY of the live record keys — the
+    /// capsule layer serializes it and should wipe its copy afterward. The
+    /// `rec_inbuf`/`pending_out` slices are borrowed and valid only until the next
+    /// link mutation. Only meaningful once `phase == .established`.
+    pub const OuterResume = struct {
+        role: Role,
+        send_counter: u64,
+        recv_counter: u64,
+        feed_seq: u64,
+        established: hs.Established,
+        /// Partial inbound record awaiting more bytes (reassembly carry).
+        rec_inbuf: []const u8,
+        /// Sealed records not yet drained to the transport (self.out). The
+        /// kernel-buffered tail rides the preserved fd; the ConnState app-send
+        /// buffer is captured separately by the daemon and ordered BEFORE this.
+        pending_out: []const u8,
+    };
+
+    /// Snapshot the outer record-layer state needed to resume this link across a
+    /// hot upgrade without re-running the AKE. Asserts the link is established.
+    pub fn exportOuter(self: *const SecuredLink) OuterResume {
+        std.debug.assert(self.phase == .established);
+        return .{
+            .role = self.role,
+            .send_counter = self.send_counter,
+            .recv_counter = self.recv_counter,
+            .feed_seq = self.feed_seq,
+            .established = self.establishedKeys().*,
+            .rec_inbuf = self.rec_inbuf.items,
+            .pending_out = self.out.items,
+        };
+    }
+
+    /// The inner CRDT link's bounded resume header (identity/transport), or null if
+    /// the inner link isn't stood up yet.
+    pub fn snapshotInner(self: *const SecuredLink) ?s2s_link.S2sLink.ResumeHeader {
+        return if (self.inner) |l| l.snapshotResume() else null;
+    }
+
+    /// The remote server name for the resume capsule's variable-length field.
+    pub fn snapshotInnerRemoteName(self: *const SecuredLink) []const u8 {
+        return if (self.inner) |l| l.snapshotRemoteName() else "";
+    }
+
+    /// Ask the peer to re-send its full state (post-resume reconverge). Seals the
+    /// RESYNC frame into an outbound record; caller flushes `outbound()`.
+    pub fn sendResync(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendResync();
+        try self.drainInner();
+    }
+
+    /// Consume a pending peer RESYNC request; the daemon answers with a full burst.
+    pub fn takeResyncRequest(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeResyncRequest();
+    }
     /// Install (or clear) the borrowed local-world nick predicate for
     /// cross-namespace NICK collision resolution. Retained across the lazy inner
     /// stand-up and applied immediately when `inner` already exists.
@@ -212,7 +354,9 @@ pub const SecuredLink = struct {
         if (self.inner) |l| l.setLocalNickResolver(resolver);
     }
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
-        return if (self.session) |s| s.peerShortId() else null;
+        if (self.session) |s| return s.peerShortId();
+        if (self.resumed_established) |e| return node_short_id.shortId(e.peer_node_id);
+        return null;
     }
     /// The peer's node id as a `u64` (the authenticated session short id),
     /// matching the plaintext link's `remoteNodeId` shape so generic mesh code
@@ -221,13 +365,17 @@ pub const SecuredLink = struct {
         return self.peerShortId();
     }
     pub fn peerNodeId(self: *const SecuredLink) ?[20]u8 {
-        return if (self.session) |s| s.peerNodeId() else null;
+        if (self.session) |s| return s.peerNodeId();
+        if (self.resumed_established) |e| return e.peer_node_id;
+        return null;
     }
 
     /// The peer's authenticated raw Ed25519 signing public key (null before the
     /// AKE establishes). Verifies peer-signed cross-mesh operator grants.
     pub fn peerNodeKey(self: *const SecuredLink) ?[32]u8 {
-        return if (self.session) |s| s.peerNodeKey() else null;
+        if (self.session) |s| return s.peerNodeKey();
+        if (self.resumed_established) |e| return e.peer_node_key;
+        return null;
     }
 
     fn trustRootAllows(self: *const SecuredLink, key: [32]u8) bool {
@@ -685,7 +833,8 @@ pub const SecuredLink = struct {
     /// inner link is only created alongside establishment, so this never returns
     /// null on the post-AKE paths that call it.
     fn establishedKeys(self: *const SecuredLink) *const hs.Established {
-        return self.session.?.established().?;
+        if (self.session) |*s| return s.established().?;
+        return &self.resumed_established.?;
     }
 
     /// Inbound: append the transport bytes to the record reassembly buffer, then
@@ -988,6 +1137,98 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
         if (std.mem.eql(u8, c.nick, "ann")) saw_ann = true;
     }
     try testing.expect(saw_ann);
+}
+
+test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
+    var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x9e3d };
+
+    const optsA = Options{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.orochi",
+    };
+    var a = try SecuredLink.init(optsA);
+    var a_live = true;
+    defer if (a_live) a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = &idb,
+        .local_prekey = pre_b,
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.orochi",
+    });
+    defer b.deinit();
+
+    try pump(&a, &b, false);
+    try testing.expect(a.established() and b.established());
+
+    // B announces a member; A converges to it over the secured link.
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "Bob", .host = "h.b" };
+    try b.sendMembership("#suimyaku", "bob", 0, 100, true, ident, "");
+    try pump(&a, &b, false);
+    try testing.expect(a.findRemoteMember("bob") != null);
+
+    // --- Simulate a Helix hot upgrade of A: snapshot, tear down, resume. ---
+    const outer = a.exportOuter();
+    var est_buf: [hs.Established.serialized_len]u8 = undefined;
+    outer.established.serialize(&est_buf);
+    const inner_hdr = a.snapshotInner().?;
+    const remote_name = try testing.allocator.dupe(u8, a.snapshotInnerRemoteName());
+    defer testing.allocator.free(remote_name);
+    const saved_send = outer.send_counter;
+    const saved_recv = outer.recv_counter;
+    // At quiescence there is no partial record / undrained ciphertext to carry.
+    try testing.expectEqual(@as(usize, 0), outer.rec_inbuf.len);
+    try testing.expectEqual(@as(usize, 0), outer.pending_out.len);
+
+    a.deinit();
+    a_live = false;
+
+    var a2 = try SecuredLink.resumeOuter(optsA, .{
+        .established = hs.Established.deserialize(&est_buf),
+        .send_counter = saved_send,
+        .recv_counter = saved_recv,
+        .feed_seq = outer.feed_seq,
+        .inner = inner_hdr,
+        .remote_name = remote_name,
+        .rec_inbuf = &.{},
+        .now_ms = 1000,
+        .rng_seed = 0x5151,
+    });
+    defer a2.deinit();
+
+    // The resumed link is established with the peer identity intact, but its CRDT
+    // replica is fresh — the converged roster was intentionally dropped.
+    try testing.expect(a2.established());
+    try testing.expectEqual(idb.shortId(), a2.peerShortId().?);
+    try testing.expect(a2.findRemoteMember("bob") == null);
+
+    // A2 asks the (untouched) peer to re-burst; the record stream continues from
+    // the saved counters — B decrypts it with its live recv counter.
+    try a2.sendResync();
+    try pump(&a2, &b, false);
+    try testing.expect(b.takeResyncRequest());
+
+    // The daemon answers a RESYNC with a full membership burst. A2 reconverges.
+    try b.sendMembership("#suimyaku", "bob", 0, 200, true, ident, "");
+    try pump(&a2, &b, false);
+    try testing.expect(a2.findRemoteMember("bob") != null);
+
+    // The encrypted stream truly continued (records flowed post-resume).
+    try testing.expect(a2.send_counter > saved_send);
+    try testing.expect(a2.recv_counter > saved_recv);
 }
 
 test "a trust-pin mismatch rejects the peer prekey" {

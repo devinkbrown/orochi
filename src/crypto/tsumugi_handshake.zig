@@ -99,6 +99,74 @@ pub const Established = struct {
         self.recv_key.wipe();
     }
 
+    /// Fixed serialized size of an Established (see `serialize`).
+    pub const serialized_len: usize =
+        32 + 32 + 32 + // root_key, send_key, recv_key
+        @sizeOf(Nonce96) + @sizeOf(Nonce96) + // send_nonce, recv_nonce
+        @sizeOf(NodeId) + 32 + // peer_node_id, peer_node_key
+        16 + 16; // accepted_bands, accepted_features (u128 each)
+
+    /// Serialize the post-AKE directional secrets + peer identity into `out`
+    /// (must be `serialized_len`). Used ONLY by the Helix s2s-link capsule to
+    /// resume an established mesh link across a hot upgrade — this hands over the
+    /// live record keys, so the buffer is capsule-sealed and never touches disk.
+    pub fn serialize(self: *const Established, out: *[serialized_len]u8) void {
+        var p: usize = 0;
+        const put = struct {
+            fn bytes(dst: *[serialized_len]u8, off: *usize, b: []const u8) void {
+                @memcpy(dst[off.*..][0..b.len], b);
+                off.* += b.len;
+            }
+        };
+        put.bytes(out, &p, &self.root_key.declassify());
+        put.bytes(out, &p, &self.send_key.declassify());
+        put.bytes(out, &p, &self.recv_key.declassify());
+        put.bytes(out, &p, &self.send_nonce);
+        put.bytes(out, &p, &self.recv_nonce);
+        put.bytes(out, &p, &self.peer_node_id);
+        put.bytes(out, &p, &self.peer_node_key);
+        std.mem.writeInt(u128, out[p..][0..16], self.accepted_bands, .little);
+        p += 16;
+        std.mem.writeInt(u128, out[p..][0..16], self.accepted_features, .little);
+        p += 16;
+        std.debug.assert(p == serialized_len);
+    }
+
+    /// Inverse of `serialize`. Reconstructs the Established directly (no AKE).
+    pub fn deserialize(in: *const [serialized_len]u8) Established {
+        var p: usize = 0;
+        const take = struct {
+            fn arr(comptime n: usize, src: *const [serialized_len]u8, off: *usize) [n]u8 {
+                var a: [n]u8 = undefined;
+                @memcpy(&a, src[off.*..][0..n]);
+                off.* += n;
+                return a;
+            }
+        };
+        const root = take.arr(32, in, &p);
+        const send_k = take.arr(32, in, &p);
+        const recv_k = take.arr(32, in, &p);
+        const send_n = take.arr(@sizeOf(Nonce96), in, &p);
+        const recv_n = take.arr(@sizeOf(Nonce96), in, &p);
+        const peer_id = take.arr(@sizeOf(NodeId), in, &p);
+        const peer_key = take.arr(32, in, &p);
+        const bands = std.mem.readInt(u128, in[p..][0..16], .little);
+        p += 16;
+        const features = std.mem.readInt(u128, in[p..][0..16], .little);
+        p += 16;
+        return .{
+            .root_key = RootKey.init(root),
+            .send_key = ChainKey.init(send_k),
+            .recv_key = ChainKey.init(recv_k),
+            .send_nonce = send_n,
+            .recv_nonce = recv_n,
+            .peer_node_id = peer_id,
+            .peer_node_key = peer_key,
+            .accepted_bands = bands,
+            .accepted_features = features,
+        };
+    }
+
     /// AEAD-seal one post-handshake record with the send direction's key.
     ///
     /// The record nonce is the handshake-derived base `send_nonce` with a 64-bit
@@ -831,6 +899,72 @@ test "established record layer round-trips and rejects tamper across counters" {
             try std.testing.expectError(error.AuthFailed, est_r.openRecord(counter + 1, "aad", ct, tag, &opened));
         }
     }
+}
+
+test "serialized Established resumes the record layer with counter continuity" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    var rng = DeterministicIo{ .s = 0x7abc };
+    var initr = Initiator.init(std.testing.allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, fx.cfg_i);
+    defer initr.deinit();
+    var respr = Responder.init(std.testing.allocator, &fx.r_node, fx.r_pre, &fx.r_kem.secret_key, fx.cfg_r);
+    defer respr.deinit();
+    const m1 = try initr.start(rng.io());
+    defer std.testing.allocator.free(m1);
+    const m2 = try respr.recv(m1, rng.io());
+    defer std.testing.allocator.free(m2);
+    var est_i = try initr.recv(m2);
+    defer est_i.deinit();
+    const est_r = &respr.established.?;
+
+    // Advance the live send side a few records so resume must continue mid-stream,
+    // not from counter 0. The exact plaintext/counter pairing is what a resumed
+    // link must reproduce byte-for-byte or the peer's open desyncs (nonce reuse or
+    // AuthFailed).
+    inline for (.{ "burst-0", "burst-1", "burst-2" }, 0..) |pt, c| {
+        var sealed: [pt.len + ChaCha.tag_length]u8 = undefined;
+        est_i.sealRecord(c, "aad", pt, &sealed);
+        var opened: [pt.len]u8 = undefined;
+        try est_r.openRecord(c, "aad", sealed[0..pt.len], sealed[pt.len..][0..ChaCha.tag_length].*, &opened);
+        try std.testing.expectEqualSlices(u8, pt, &opened);
+    }
+
+    // Serialize the initiator's Established at the exact wire size, then rebuild a
+    // fresh copy from those bytes — the Helix s2s-link capsule path.
+    var buf: [Established.serialized_len]u8 = undefined;
+    est_i.serialize(&buf);
+    var est_i2 = Established.deserialize(&buf);
+    defer est_i2.deinit();
+
+    // Every directional secret + identity survives the round-trip verbatim.
+    try std.testing.expectEqualSlices(u8, &est_i.send_key.declassify(), &est_i2.send_key.declassify());
+    try std.testing.expectEqualSlices(u8, &est_i.recv_key.declassify(), &est_i2.recv_key.declassify());
+    try std.testing.expectEqualSlices(u8, &est_i.root_key.declassify(), &est_i2.root_key.declassify());
+    try std.testing.expectEqualSlices(u8, &est_i.send_nonce, &est_i2.send_nonce);
+    try std.testing.expectEqualSlices(u8, &est_i.recv_nonce, &est_i2.recv_nonce);
+    try std.testing.expectEqualSlices(u8, &est_i.peer_node_id, &est_i2.peer_node_id);
+    try std.testing.expectEqualSlices(u8, &est_i.peer_node_key, &est_i2.peer_node_key);
+    try std.testing.expectEqual(est_i.accepted_bands, est_i2.accepted_bands);
+    try std.testing.expectEqual(est_i.accepted_features, est_i2.accepted_features);
+
+    // The resumed copy continues the SAME counter stream: record #3 sealed by the
+    // rebuilt Established opens under the untouched peer at counter 3. This is the
+    // property the whole zero-drop upgrade rests on — the peer never re-handshaked
+    // and validates the next record against its live recv counter.
+    const next = "post-resume";
+    var sealed3: [next.len + ChaCha.tag_length]u8 = undefined;
+    est_i2.sealRecord(3, "aad", next, &sealed3);
+    var opened3: [next.len]u8 = undefined;
+    try est_r.openRecord(3, "aad", sealed3[0..next.len], sealed3[next.len..][0..ChaCha.tag_length].*, &opened3);
+    try std.testing.expectEqualSlices(u8, next, &opened3);
+
+    // And the resumed copy opens what the peer seals next (recv direction intact).
+    const reply = "peer-reply";
+    var rsealed: [reply.len + ChaCha.tag_length]u8 = undefined;
+    est_r.sealRecord(0, "aad", reply, &rsealed);
+    var ropened: [reply.len]u8 = undefined;
+    try est_i2.openRecord(0, "aad", rsealed[0..reply.len], rsealed[reply.len..][0..ChaCha.tag_length].*, &ropened);
+    try std.testing.expectEqualSlices(u8, reply, &ropened);
 }
 
 test "two parties complete Tsumugi handshake and derive crossed keys" {

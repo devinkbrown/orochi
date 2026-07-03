@@ -164,6 +164,7 @@ const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
+const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
@@ -5119,6 +5120,16 @@ pub const LinuxServer = struct {
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
             self.sendMeshWardsTo(conn); // converge this node's mesh-scope bans on the new peer
             self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
+        }
+        // A peer that resumed this link across a hot upgrade (its converged view was
+        // reset to empty) asked us to re-send our full state. Answer with the same
+        // burst a fresh establishment sends — it rides the preserved encrypted
+        // stream, so the peer reconverges within one round-trip with no netsplit.
+        if (link.established() and link.takeResyncRequest()) {
+            self.sendMeshStateBurstTo(conn);
+            self.rebroadcastLocalOpers();
+            self.sendMeshWardsTo(conn);
+            self.sendCloneAntiEntropy(conn, link);
         }
     }
 
@@ -14247,6 +14258,81 @@ pub const LinuxServer = struct {
     /// registered session is carried and status is logged. The oper privilege
     /// check lives in the `handleUpgrade` wrapper; a signal-triggered upgrade is
     /// implicitly privileged (it came from the service manager / root).
+    /// Seal an established secured mesh link for a zero-drop Helix upgrade. Queues
+    /// an `.s2s_link` capsule carrying the link's crypto (Tsumugi record keys +
+    /// counters), inner framing header, partial-record carry, and all not-yet-sent
+    /// outbound bytes. The caller preserves the socket fd (CLOEXEC cleared) so the
+    /// peer never sees a drop. Returns true on success; false on ANY failure, so
+    /// the caller falls back to the re-dial hint path. Mutually exclusive with that
+    /// hint — a preserved link must NOT also be re-dialed.
+    fn sealSecuredLink(
+        self: *LinuxServer,
+        conn: *ConnState,
+        link: *secured_s2s_link.SecuredLink,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) bool {
+        const outer = link.exportOuter();
+        const inner = link.snapshotInner() orelse return false;
+        const remote_name = link.snapshotInnerRemoteName();
+
+        // Full unsent outbound, in wire order: the ConnState SendQ (inline tail +
+        // heap overflow) — bytes drained from the link but not yet on the kernel —
+        // FIRST, then the link's own undrained sealed records. The kernel-buffered
+        // tail already on the socket rides the preserved fd.
+        const conn_tail = conn.send_buf[conn.send_offset..conn.send_len];
+        const conn_ovf = conn.send_overflow.items;
+        const total_pending = conn_tail.len + conn_ovf.len + outer.pending_out.len;
+        var pending_buf: ?[]u8 = null;
+        defer if (pending_buf) |p| self.allocator.free(p);
+        var pending: []const u8 = &.{};
+        if (total_pending != 0) {
+            const buf = self.allocator.alloc(u8, total_pending) catch return false;
+            @memcpy(buf[0..conn_tail.len], conn_tail);
+            @memcpy(buf[conn_tail.len..][0..conn_ovf.len], conn_ovf);
+            @memcpy(buf[conn_tail.len + conn_ovf.len ..], outer.pending_out);
+            pending_buf = buf;
+            pending = buf;
+        }
+
+        var caps: u8 = 0;
+        if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
+        if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
+        if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
+
+        var snap = s2s_snapshot.Snapshot{
+            .fd = conn.fd,
+            .role = @intFromEnum(outer.role),
+            .s2s_initiator = conn.s2s_initiator,
+            .send_counter = outer.send_counter,
+            .recv_counter = outer.recv_counter,
+            .feed_seq = outer.feed_seq,
+            .pl_local_epoch_ms = inner.link.local_epoch_ms,
+            .pl_remote_epoch_ms = inner.link.remote_epoch_ms,
+            .pl_send_credit = inner.link.send_credit,
+            .pl_pending_credit = inner.link.pending_credit,
+            .pl_next_out_seq = inner.link.next_out_seq,
+            .pl_next_in_seq = inner.link.next_in_seq,
+            .pl_last_acked = inner.link.last_acked_by_remote,
+            .remote_node_id = inner.remote_node_id,
+            .remote_epoch_ms = inner.remote_epoch_ms,
+            .caps = caps,
+            .remote_name = remote_name,
+            .connect_addr = if (conn.s2s_initiator) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
+            .rec_inbuf = outer.rec_inbuf,
+            .pending_out = pending,
+        };
+        outer.established.serialize(&snap.established);
+
+        const blob = s2s_snapshot.encode(self.allocator, snap) catch return false;
+        blobs.append(self.allocator, blob) catch {
+            self.allocator.free(blob);
+            return false;
+        };
+        pieces.append(self.allocator, .{ .kind = .s2s_link, .bytes = blob }) catch return false;
+        return true;
+    }
+
     fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
         if (comptime builtin.os.tag != .linux) {
             self.upgradeNotice(requester, "UPGRADE is Linux-only");
@@ -14271,16 +14357,36 @@ pub const LinuxServer = struct {
         var carried_fd_count: usize = 0;
         var tls_carried: usize = 0;
         var s2s_hints: usize = 0;
+        var s2s_preserved: usize = 0;
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
-            // S2S peer links are not carried: the secured Tsumugi link's post-AKE
-            // stream cannot be re-entered mid-connection, so the socket keeps
-            // CLOEXEC (the peer sees the drop the instant we exec and can react).
-            // For links THIS node dialed by hand (oper CONNECT), seal a re-dial
-            // hint so the successor reconnects immediately at boot; config-managed
-            // [mesh].connect dials are skipped — the successor's mesh boot pass
-            // re-dials those itself in its first loop iteration.
+            // S2S peer links: PRESERVE an established secured link across the swap
+            // (zero-drop) — seal its crypto + inner framing state into an .s2s_link
+            // capsule and carry the socket fd so the PEER never sees a drop (no
+            // netsplit, no oper-prefix churn). A plaintext link (no crypto to
+            // resume) or a secured link we can't snapshot falls back to the re-dial
+            // hint: for a hand-dialed initiator (oper CONNECT), seal a re-dial hint
+            // so the successor reconnects at boot; config-managed [mesh].connect
+            // dials are re-dialed by the successor's mesh boot pass instead.
             if (e.value.s2s != null or e.value.s2s_secured != null) {
+                if (e.value.s2s_secured) |link| {
+                    // Skip preservation while a send is in flight: `send_offset`
+                    // only advances on the send CQE (server.zig ~5415), so with
+                    // `send_armed` set we can't tell how much of the armed record
+                    // the kernel already transmitted — replaying it would double a
+                    // sealed record and desync the peer's recv counter (AuthFailed
+                    // → drop). Fall back to the re-dial hint for this one link (old
+                    // behavior); still no nonce reuse, just a one-time drop.
+                    if (link.established() and !e.value.send_armed and self.sealSecuredLink(e.value, link, &pieces, &blobs)) {
+                        // Preserved: carry the fd across execve; do NOT also seal a
+                        // re-dial hint (that would open a duplicate link → churn).
+                        _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
+                        carried_fds[carried_fd_count] = e.value.fd;
+                        carried_fd_count += 1;
+                        s2s_preserved += 1;
+                        continue;
+                    }
+                }
                 if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
                     const hint = mesh_redial.encode(.{
                         .addr = e.value.s2s_connect_addr.addr,
@@ -14415,7 +14521,7 @@ pub const LinuxServer = struct {
             return self.upgradeListenerOnly(requester);
         };
         var sbuf: [160]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_hints }) catch "UPGRADE: re-exec");
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh link(s) preserved, {d} re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_preserved, s2s_hints }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -14520,12 +14626,29 @@ pub const LinuxServer = struct {
             redialed += 1;
         }
 
+        // Pass 4: re-attach PRESERVED secured mesh links (zero-drop). Their socket
+        // fd survived execve; rebuild the SecuredLink established from the capsule
+        // (crypto + inner framing) and RESYNC with the peer to refill the roster.
+        // These are disjoint from the re-dial hints above (a preserved link never
+        // sealed one), so there is no double-connect.
+        var s2s_resumed: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .s2s_link) continue;
+            if (c.fields.len == 0) continue;
+            const snap = s2s_snapshot.decode(c.fields[0].bytes) catch |e| {
+                srvLog("orochi: UPGRADE resume — s2s link decode failed ({s})\n", .{@errorName(e)});
+                continue;
+            };
+            if (snap.fd < 0) continue;
+            if (self.adoptInheritedS2sLink(snap)) s2s_resumed += 1;
+        }
+
         // The arena is fully consumed; close the inherited memfd.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS), {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, s2s_resumed, redialed },
         );
     }
 
@@ -14653,6 +14776,163 @@ pub const LinuxServer = struct {
             };
             self.armSendIfNeeded(conn) catch {};
         }
+        return true;
+    }
+
+    /// Re-attach a PRESERVED secured mesh link across a Helix upgrade: take
+    /// ownership of its inherited socket fd, rebuild the SecuredLink established
+    /// from the capsule (Tsumugi record keys + counters + inner framing header),
+    /// arm recv, then RESYNC with the peer + re-burst our state so the roster
+    /// reconverges within a round-trip — the peer never saw a drop. Returns true on
+    /// success; ANY failure closes the fd + frees the slot (the mesh then heals via
+    /// the normal re-dial on the next sweep).
+    fn adoptInheritedS2sLink(self: *LinuxServer, snap: s2s_snapshot.Snapshot) bool {
+        if (!self.s2sSecured() or self.rx().clients.len() >= self.config.max_clients) {
+            closeFd(snap.fd);
+            return false;
+        }
+        const ident = self.config.node_identity orelse {
+            closeFd(snap.fd);
+            return false;
+        };
+        const io = self.config.crypto_io orelse {
+            closeFd(snap.fd);
+            return false;
+        };
+        const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch {
+            closeFd(snap.fd);
+            return false;
+        };
+        const conn = self.rx().clients.get(id).?;
+        conn.overflow_allocator = self.allocator;
+        if (self.config.class_registry) |*reg| conn.sendq_cap = reg.classFor(.{ .is_server_link = true }).policy.sendq;
+        conn.token = tokenFromId(id) catch {
+            _ = self.rx().clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        const now = self.nowMs();
+        conn.connected_at_ms = now;
+        conn.last_activity_ms = now;
+        conn.last_message_ms = now;
+        conn.s2s_initiator = snap.s2s_initiator;
+        // Restore the dial target so the [mesh].connect sweep recognizes this
+        // preserved link and never dials a duplicate (→ collision churn).
+        if (snap.connect_addr.len == @sizeOf(@TypeOf(conn.s2s_connect_addr))) {
+            @memcpy(std.mem.asBytes(&conn.s2s_connect_addr), snap.connect_addr);
+        }
+        self.captureClientHost(conn);
+
+        const wall: u64 = @intCast(@max(0, platform.realtimeMillis()));
+        const not_before = wall -| (5 * 60 * 1000);
+        const prekey = ident.signedPrekey(1, not_before, 24 * 60 * 60 * 1000, s2s_bands, s2s_features) catch {
+            _ = self.rx().clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        var pins: [secured_s2s_link.max_expected_remotes][20]u8 = undefined;
+        var pin_count: usize = 0;
+        for (self.config.mesh_trust_roots) |root| {
+            if (pin_count == pins.len) break;
+            if (parseMeshTrustRoot(root)) |pin| {
+                pins[pin_count] = pin;
+                pin_count += 1;
+            }
+        }
+        const role: secured_s2s_link.Role = if (snap.role == 1) .responder else .initiator;
+        const now_u: u64 = @intCast(@max(@as(i64, 0), now));
+        const link = self.allocator.create(secured_s2s_link.SecuredLink) catch {
+            _ = self.rx().clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        link.* = secured_s2s_link.SecuredLink.resumeOuter(.{
+            .allocator = self.allocator,
+            .role = role,
+            .identity = ident,
+            .local_prekey = prekey,
+            .cfg = .{
+                .realm = ident.realm,
+                .supported_bands = s2s_bands,
+                .supported_features = s2s_features,
+                .mesh_pass = self.config.mesh_pass,
+                .now_ms = wall,
+            },
+            .rng = io,
+            .server_name = self.serverName(),
+            .description = self.config.server_description,
+            .local_epoch_ms = wall,
+            .expected_remotes = pins[0..pin_count],
+            .trusted_node_keys = self.mesh_trusted_node_keys,
+        }, .{
+            .established = tsumugi_hs.Established.deserialize(&snap.established),
+            .send_counter = snap.send_counter,
+            .recv_counter = snap.recv_counter,
+            .feed_seq = snap.feed_seq,
+            .inner = .{
+                .link = .{
+                    .local_epoch_ms = snap.pl_local_epoch_ms,
+                    .remote_epoch_ms = snap.pl_remote_epoch_ms,
+                    .send_credit = snap.pl_send_credit,
+                    .pending_credit = snap.pl_pending_credit,
+                    .next_out_seq = snap.pl_next_out_seq,
+                    .next_in_seq = snap.pl_next_in_seq,
+                    .last_acked_by_remote = snap.pl_last_acked,
+                },
+                .remote_node_id = snap.remote_node_id,
+                .remote_epoch_ms = snap.remote_epoch_ms,
+                .peer_supports_signing = (snap.caps & s2s_snapshot.cap_signing) != 0,
+                .peer_supports_account = (snap.caps & s2s_snapshot.cap_account) != 0,
+                .peer_supports_oper_info = (snap.caps & s2s_snapshot.cap_oper_info) != 0,
+            },
+            .remote_name = snap.remote_name,
+            .rec_inbuf = snap.rec_inbuf,
+            .now_ms = now_u,
+            .rng_seed = snap.remote_node_id ^ now_u ^ @as(u64, @intCast(@max(@as(i32, 0), snap.fd))),
+        }) catch {
+            self.allocator.destroy(link);
+            _ = self.rx().clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        conn.s2s_secured = link;
+        link.setLocalNickResolver(self.localNickResolver());
+        conn.s2s_burst_done = true; // the reconverge below is driven explicitly
+
+        if (snap.pending_out.len != 0) {
+            conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
+            appendToConn(conn, snap.pending_out) catch {
+                link.deinit();
+                self.allocator.destroy(link);
+                conn.s2s_secured = null;
+                conn.send_overflow.deinit(self.allocator); // freed slot won't; may have grown
+                _ = self.rx().clients.free(id);
+                closeFd(snap.fd);
+                return false;
+            };
+        }
+        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
+            link.deinit();
+            self.allocator.destroy(link);
+            conn.s2s_secured = null;
+            conn.send_overflow.deinit(self.allocator); // a large pending_out may have spilled here
+            _ = self.rx().clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        // The fd survived ONE execve on purpose; re-arm CLOEXEC so it never leaks.
+        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
+
+        // Reconverge over the preserved encrypted stream: ask the peer to re-burst
+        // its full state (RESYNC) and re-burst ours. The record counters continue
+        // from the capsule, so the peer accepts these seamlessly — no netsplit.
+        link.sendResync() catch {};
+        self.flushS2sOutbound(conn, link.outbound()) catch {};
+        link.clearOutbound();
+        self.sendMeshStateBurstTo(conn);
+        self.armSendIfNeeded(conn) catch {};
+        self.stats.onS2sAccept();
+        self.traceLog(.info, .s2s, "s2s secured peer preserved across upgrade");
         return true;
     }
 

@@ -335,6 +335,51 @@ pub const PeerLink = struct {
         return self.next_in_seq;
     }
 
+    /// Bounded transport state needed to resume an established link across a Helix
+    /// hot upgrade WITHOUT re-running the handshake. The peer never saw the socket
+    /// drop, so its `remote_epoch_ms` + `next_in_seq` for us are unchanged — we
+    /// MUST replay exactly these values or the peer rejects our next frame with
+    /// BadEpoch / ReplayedFrame. Timeout clocks are intentionally excluded: they
+    /// legitimately reset to "now" on the successor.
+    pub const ResumeHeader = struct {
+        local_epoch_ms: u64,
+        remote_epoch_ms: u64,
+        send_credit: u32,
+        pending_credit: u32,
+        next_out_seq: u64,
+        next_in_seq: u64,
+        last_acked_by_remote: u64,
+    };
+
+    pub fn snapshotResume(self: *const PeerLink) ResumeHeader {
+        return .{
+            .local_epoch_ms = self.local_epoch_ms,
+            .remote_epoch_ms = self.remote_epoch_ms orelse 0,
+            .send_credit = self.send_credit,
+            .pending_credit = self.pending_credit,
+            .next_out_seq = self.next_out_seq,
+            .next_in_seq = self.next_in_seq,
+            .last_acked_by_remote = self.last_acked_by_remote,
+        };
+    }
+
+    /// Rebuild a link directly in the `established` state from a resume header,
+    /// bypassing the handshake. `options` supplies the clock + tunables; the
+    /// header supplies the exact sequencing/credit/epoch continuity the peer still
+    /// expects. Timeout clocks start fresh at `options.clock.now()`.
+    pub fn resumeEstablished(options: Options, hdr: ResumeHeader) PeerLink {
+        var link = PeerLink.init(options);
+        link.local_epoch_ms = hdr.local_epoch_ms;
+        link.remote_epoch_ms = hdr.remote_epoch_ms;
+        link.send_credit = hdr.send_credit;
+        link.pending_credit = hdr.pending_credit;
+        link.next_out_seq = hdr.next_out_seq;
+        link.next_in_seq = hdr.next_in_seq;
+        link.last_acked_by_remote = hdr.last_acked_by_remote;
+        link.state = .established;
+        return link;
+    }
+
     fn emitControl(self: *PeerLink, kind: FrameKind, out: []u8) Error!EmitResult {
         try self.requireEstablishedOrDraining();
         const credit = self.pending_credit;
@@ -599,6 +644,50 @@ test "out of window and replayed frames are rejected" {
         .payload = "future",
     }, &forged);
     try std.testing.expectError(error.OutOfWindow, pair.b.receive(future));
+}
+
+test "resumeEstablished continues the exact seq/epoch stream the peer expects" {
+    var clock = TestClock.init(1_000);
+    var pair = try establishedPair(&clock, default_send_credit);
+    var a_to_b: [256]u8 = undefined;
+    var b_to_a: [256]u8 = undefined;
+
+    // Advance the live stream: A sends two deltas, B acks, so A's next_out_seq,
+    // last_acked_by_remote, and send_credit are all mid-stream (not initial).
+    const d1 = try pair.a.emitDelta("one", &a_to_b);
+    _ = try pair.b.receive(d1.bytes);
+    const ack1 = try pair.b.emitAck(&b_to_a);
+    _ = try pair.a.receive(ack1.bytes);
+    const d2 = try pair.a.emitDelta("two", &a_to_b);
+    _ = try pair.b.receive(d2.bytes);
+    const ack2 = try pair.b.emitAck(&b_to_a);
+    _ = try pair.a.receive(ack2.bytes);
+
+    // Snapshot A across a simulated upgrade and rebuild it from the header alone —
+    // B is untouched (it never saw a drop).
+    const hdr = pair.a.snapshotResume();
+    var a2 = PeerLink.resumeEstablished(.{
+        .clock = clock.clock(),
+        .local_epoch_ms = 10, // A's original epoch — B validates every frame against it
+        .initial_send_credit = 1, // deliberately wrong; header must override
+    }, hdr);
+
+    try std.testing.expectEqual(State.established, a2.state);
+    try std.testing.expectEqual(pair.a.next_out_seq, a2.next_out_seq);
+    try std.testing.expectEqual(pair.a.send_credit, a2.send_credit);
+
+    // The resumed A emits the NEXT delta; B accepts it at the continued seq/epoch.
+    const d3 = try a2.emitDelta("three", &a_to_b);
+    try std.testing.expectEqual(d2.seq + 1, d3.seq);
+    const got = try pair.b.receive(d3.bytes);
+    try std.testing.expectEqual(ReceiveEvent.delta, got.event);
+    try std.testing.expectEqualSlices(u8, "three", got.payload);
+
+    // And the resumed A still accepts B's next frame (recv epoch continuity).
+    const bd = try pair.b.emitDelta("reply", &b_to_a);
+    const gotb = try a2.receive(bd.bytes);
+    try std.testing.expectEqual(ReceiveEvent.delta, gotb.event);
+    try std.testing.expectEqualSlices(u8, "reply", gotb.payload);
 }
 
 test "heartbeat and timeout are deterministic with caller supplied clock" {

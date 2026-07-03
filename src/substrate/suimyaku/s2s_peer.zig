@@ -167,6 +167,11 @@ pub const S2sPeer = struct {
     handshake_sent: bool = false,
     established: bool = false,
     burst_sent: bool = false,
+    /// A peer asked us (via a RESYNC frame) to re-send our full state after it
+    /// resumed a mesh link across a hot upgrade. The daemon drains this and runs
+    /// its full membership/mode/prop/topic burst to this conn. Substrate-pure: the
+    /// driver only records the request; the daemon owns the burst.
+    resync_requested: bool = false,
     ping_rx_count: usize = 0,
     pong_rx_count: usize = 0,
     config: Config,
@@ -306,6 +311,118 @@ pub const S2sPeer = struct {
         };
     }
 
+    /// Bounded identity/capability header needed to resume a peer across a Helix
+    /// hot upgrade. The converged CRDT/route/registry state is NOT captured — the
+    /// resumed node re-fetches it from the peer via a RESYNC-triggered full burst
+    /// (the peer's socket was preserved, so it never saw a drop). `remote_name` is
+    /// carried alongside as a length-delimited string.
+    pub const ResumeHeader = struct {
+        link: peer_link.PeerLink.ResumeHeader,
+        remote_node_id: NodeId,
+        remote_epoch_ms: u64,
+        peer_supports_signing: bool,
+        peer_supports_account: bool,
+        peer_supports_oper_info: bool,
+    };
+
+    pub fn snapshotResume(self: *const S2sPeer) ResumeHeader {
+        return .{
+            .link = self.session.snapshotResume(),
+            .remote_node_id = self.remote_node_id,
+            .remote_epoch_ms = self.remote_epoch_ms orelse 0,
+            .peer_supports_signing = self.peer_supports_signing,
+            .peer_supports_account = self.peer_supports_account,
+            .peer_supports_oper_info = self.peer_supports_oper_info,
+        };
+    }
+
+    /// Rebuild a peer driver directly in the established state from a resume header
+    /// (post-upgrade), bypassing the handshake. Mirrors `init` but stands the link
+    /// up established with the peer's identity/caps restored and a FRESH empty CRDT
+    /// replica. The caller must send a RESYNC to the peer to refill the converged
+    /// roster/props/topics, and re-burst its own local state.
+    pub fn resumeEstablished(options: Options, hdr: ResumeHeader, remote_name: []const u8, now_ms: u64, rng_seed: u64) !S2sPeer {
+        const server_name = try options.allocator.dupe(u8, options.server_name);
+        errdefer options.allocator.free(server_name);
+        const description = try options.allocator.dupe(u8, options.description);
+        errdefer options.allocator.free(description);
+        const channel_name = try options.allocator.dupe(u8, options.channel_name);
+        errdefer options.allocator.free(channel_name);
+        const owned_remote_name = try options.allocator.dupe(u8, remote_name);
+        errdefer options.allocator.free(owned_remote_name);
+
+        var registry = try server_registry.ServerRegistry.init(options.allocator, options.config.registry);
+        errdefer registry.deinit();
+        try registry.add(.{
+            .node_id = options.local_node_id,
+            .name = server_name,
+            .description = description,
+            .last_seen_ms = try i64Ms(options.local_epoch_ms),
+        });
+        // Re-register the remote server so WHOIS/LINKS name it immediately; its
+        // members/routes are refilled by the RESYNC burst.
+        if (remote_name.len != 0 and hdr.remote_node_id != 0) {
+            _ = try registry.addOrUpdate(.{
+                .node_id = hdr.remote_node_id,
+                .name = remote_name,
+                .description = "",
+                .hopcount = 1,
+                .uplink = options.local_node_id,
+                .last_seen_ms = try i64Ms(now_ms),
+            });
+        }
+
+        var routes = try route_table.RouteTable.init(options.allocator, options.config.routes);
+        errdefer routes.deinit();
+        try routes.setNickLocation(server_name, options.local_node_id);
+        if (remote_name.len != 0 and hdr.remote_node_id != 0) {
+            try routes.setNickLocation(remote_name, hdr.remote_node_id);
+        }
+
+        var session = try link_session.LinkSession.resumeEstablished(
+            options.allocator,
+            options.state,
+            .{
+                .clock = options.clock,
+                .local_epoch_ms = options.local_epoch_ms,
+                .local_node_id = options.local_node_id,
+                .remote_node_id = hdr.remote_node_id,
+                .initial_send_credit = options.initial_send_credit,
+                .config = options.config.link,
+            },
+            hdr.link,
+            now_ms,
+            rng_seed,
+        );
+        errdefer session.deinit();
+
+        return .{
+            .allocator = options.allocator,
+            .decoder = s2s_frame.Decoder.init(options.allocator, options.config.max_frame_size),
+            .state = options.state,
+            .session = session,
+            .registry = registry,
+            .routes = routes,
+            .local_node_id = options.local_node_id,
+            .remote_node_id = hdr.remote_node_id,
+            .local_epoch_ms = options.local_epoch_ms,
+            .server_name = server_name,
+            .description = description,
+            .channel_name = channel_name,
+            .remote_epoch_ms = hdr.remote_epoch_ms,
+            .remote_name = owned_remote_name,
+            .handshake_sent = true,
+            .established = true,
+            .burst_sent = true,
+            .peer_supports_signing = hdr.peer_supports_signing,
+            .peer_supports_account = hdr.peer_supports_account,
+            .peer_supports_oper_info = hdr.peer_supports_oper_info,
+            .config = options.config,
+            .signing_key = options.signing_key,
+            .seen = message_relay.SeenSet.init(options.allocator, 1024),
+        };
+    }
+
     pub fn deinit(self: *S2sPeer) void {
         for (self.inbound.items) |*owned| owned.deinit(self.allocator);
         self.inbound.deinit(self.allocator);
@@ -381,6 +498,18 @@ pub const S2sPeer = struct {
 
     pub fn sendPing(self: *S2sPeer, payload: []const u8, sink: ByteSink) !void {
         try emitFrame(self.allocator, sink, .PING, payload);
+    }
+
+    /// Ask the peer to re-send its full converged state (used right after a Helix
+    /// resume). Unsigned control frame — carries no trusted state itself.
+    pub fn sendResync(self: *S2sPeer, sink: ByteSink) !void {
+        try emitFrame(self.allocator, sink, .RESYNC, "");
+    }
+
+    /// Consume a pending RESYNC request from the peer (see `resync_requested`).
+    pub fn takeResyncRequest(self: *S2sPeer) bool {
+        defer self.resync_requested = false;
+        return self.resync_requested;
     }
 
     pub fn tick(self: *S2sPeer, sink: ByteSink, now_ms: u64, rng_seed: u64, peers: []const NodeId) !void {
@@ -495,6 +624,7 @@ pub const S2sPeer = struct {
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
             .KILL => try self.recvKill(frame.payload),
             .WARD => try self.recvWard(frame.payload),
+            .RESYNC => self.resync_requested = true,
         }
     }
 

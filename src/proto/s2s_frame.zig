@@ -86,6 +86,15 @@ pub const FrameType = enum(u8) {
     /// signed like other oper-trust facts (the setter is operator authority).
     WARD = 0x17,
 
+    /// Full-state resync request. Sent by a node that has just resumed a mesh link
+    /// across a Helix hot upgrade: the encrypted socket was preserved (the peer
+    /// never saw a drop), but the resumed node's converged view of the peer's
+    /// roster/props/topics was intentionally discarded. On receipt, the peer
+    /// re-runs its full state burst (the same one a fresh link establishment
+    /// sends), reconverging the resumed node without any visible netsplit. Empty
+    /// payload; unsigned (a trivial control trigger carrying no trusted state).
+    RESYNC = 0x18,
+
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
     }
@@ -115,6 +124,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
             @intFromEnum(FrameType.KILL) => .KILL,
             @intFromEnum(FrameType.WARD) => .WARD,
+            @intFromEnum(FrameType.RESYNC) => .RESYNC,
             else => null,
         };
     }
