@@ -283,10 +283,22 @@ pub const ChanStats = struct {
         presence_ctx: ?*anyopaque = null,
         /// Current member count (local + mesh roster) for a channel name.
         presence_fn: ?*const fn (ctx: *anyopaque, channel: []const u8) usize = null,
+        /// Whether a channel STILL EXISTS: currently populated (present > 0) or
+        /// durably registered. When absent, every channel is treated as existing
+        /// (tests / callers with no world context). A channel that no longer
+        /// exists is pruned from the index, its `<slug>.json` deleted, and its
+        /// aggregate freed — so transient/probe channels don't linger forever.
+        exists_fn: ?*const fn (ctx: *anyopaque, channel: []const u8) bool = null,
 
         fn presentOf(self: NetInfo, chan_name: []const u8) usize {
             const f = self.presence_fn orelse return 0;
             const ctx = self.presence_ctx orelse return 0;
+            return f(ctx, chan_name);
+        }
+
+        fn existsOf(self: NetInfo, chan_name: []const u8) bool {
+            const f = self.exists_fn orelse return true;
+            const ctx = self.presence_ctx orelse return true;
             return f(ctx, chan_name);
         }
     };
@@ -296,6 +308,13 @@ pub const ChanStats = struct {
     /// error on one file is swallowed so a single bad channel never aborts the
     /// flush. `io` is the daemon's crypto IO (the Zig 0.16 file API).
     pub fn writeJson(self: *ChanStats, io: std.Io, dir_path: []const u8, network: []const u8, node: []const u8, now_ms: i64, net: NetInfo) void {
+        // Prune channels that no longer exist (unregistered AND empty) BEFORE
+        // rendering, so the index, per-channel files and network_days all reflect
+        // only live channels. Transient/probe channels vanish once the last
+        // member leaves; a registered channel survives even while momentarily
+        // empty. Best-effort: pruning never blocks the flush.
+        self.pruneDeadChannels(io, dir_path, net);
+
         var iaw = std.Io.Writer.Allocating.init(self.allocator);
         defer iaw.deinit();
         const iw = &iaw.writer;
@@ -394,6 +413,47 @@ pub const ChanStats = struct {
             try w.print("{{\"date\":\"{s}\",\"messages\":{d}}}", .{ fmtDay(days[i], &buf), totals[i] });
         }
         try w.writeAll("]");
+    }
+
+    /// Remove channels that no longer exist: delete each dead channel's served
+    /// `<slug>.json`, free its aggregate, and drop it from the map. `exists_fn`
+    /// absent (no world context) → nothing is pruned. Two-phase (collect keys,
+    /// then remove) so the map isn't mutated mid-iteration.
+    fn pruneDeadChannels(self: *ChanStats, io: std.Io, dir_path: []const u8, net: NetInfo) void {
+        if (net.exists_fn == null) return;
+        // Collect dead channel keys. Bounded scratch keeps this alloc-free on the
+        // flush path; if more than `max_prune` die in one interval the rest are
+        // reaped on the next flush.
+        const max_prune = 64;
+        var dead: [max_prune][]const u8 = undefined;
+        var n: usize = 0;
+        var it = self.channels.iterator();
+        while (it.next()) |e| {
+            if (n >= max_prune) break;
+            if (net.existsOf(e.value_ptr.*.name)) continue;
+            dead[n] = e.key_ptr.*;
+            n += 1;
+        }
+        for (dead[0..n]) |key| {
+            const entry = self.channels.getEntry(key) orelse continue;
+            const agg = entry.value_ptr.*;
+            // Delete the served per-channel file (best-effort).
+            var buf: [128]u8 = undefined;
+            if (slugify(agg.name, &buf)) |slug| {
+                var name_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&name_buf, "{s}.json", .{slug})) |fname| {
+                    var path_buf: [1024]u8 = undefined;
+                    if (std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, fname })) |path| {
+                        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                    } else |_| {}
+                } else |_| {}
+            }
+            const owned_key = entry.key_ptr.*;
+            agg.deinit(self.allocator);
+            self.allocator.destroy(agg);
+            _ = self.channels.remove(key);
+            self.allocator.free(owned_key);
+        }
     }
 
     fn writeChannelFile(self: *ChanStats, io: std.Io, dir_path: []const u8, agg: *ChannelAgg, now_ms: i64, present: usize) void {
@@ -957,6 +1017,47 @@ test "records membership events and topic history" {
     try std.testing.expectEqual(@as(u64, 1), agg.topic_changes);
     try std.testing.expectEqual(@as(usize, 1), agg.topics.items.len);
     try std.testing.expectEqualStrings("the new topic", agg.topics.items[0].topic);
+}
+
+test "writeJson prunes channels that no longer exist (unregistered + empty)" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const ts: i64 = 1_700_000_000_000;
+    // Three channels with activity: one live (has members), one registered but
+    // empty, one transient probe (empty + unregistered).
+    s.recordMessage("#live", "a", "hello", ts);
+    s.recordMessage("#registered", "b", "hi", ts);
+    s.recordMessage("#probe-123", "c", "test", ts);
+    try std.testing.expectEqual(@as(usize, 3), s.channels.count());
+
+    const Ctx = struct {
+        fn exists(_: *anyopaque, channel: []const u8) bool {
+            // #live has a member; #registered is registered; #probe-* is gone.
+            return std.mem.eql(u8, channel, "#live") or std.mem.eql(u8, channel, "#registered");
+        }
+    };
+    var dummy: u8 = 0;
+    // A dir that doesn't matter — file writes/deletes are best-effort and the
+    // channel we prune has no file yet, so deleteFile just no-ops.
+    s.writeJson(std.testing.io, "/tmp", "IRCXNet", "test.node", ts, .{
+        .presence_ctx = @ptrCast(&dummy),
+        .exists_fn = Ctx.exists,
+    });
+
+    // The probe channel is gone; the live + registered ones remain.
+    try std.testing.expectEqual(@as(usize, 2), s.channels.count());
+    try std.testing.expect(s.channels.get("#live") != null);
+    try std.testing.expect(s.channels.get("#registered") != null);
+    try std.testing.expect(s.channels.get("#probe-123") == null);
+}
+
+test "writeJson without an exists_fn prunes nothing (backward compatible)" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    s.recordMessage("#a", "x", "hi", 1_700_000_000_000);
+    s.recordMessage("#b", "y", "hi", 1_700_000_000_000);
+    s.writeJson(std.testing.io, "/tmp", "IRCXNet", "n", 1_700_000_000_000, .{});
+    try std.testing.expectEqual(@as(usize, 2), s.channels.count());
 }
 
 test "slugify strips the channel prefix and neutralises unsafe / traversal bytes" {

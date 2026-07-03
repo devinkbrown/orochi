@@ -3713,11 +3713,22 @@ pub const LinuxServer = struct {
                             const srv: *LinuxServer = @ptrCast(@alignCast(ctx));
                             return srv.globalMemberCount(channel, srv.world.memberCount(channel));
                         }
+                        // A channel STILL EXISTS if it currently has members
+                        // (local + mesh roster) OR is durably registered.
+                        // Everything else (a transient channel whose last member
+                        // left) is pruned from stats.
+                        fn exists(ctx: *anyopaque, channel: []const u8) bool {
+                            const srv: *LinuxServer = @ptrCast(@alignCast(ctx));
+                            if (srv.globalMemberCount(channel, srv.world.memberCount(channel)) > 0) return true;
+                            if (srv.account_services) |svc| return svc.channelIsRegistered(channel);
+                            return false;
+                        }
                     };
                     self.chanstats.writeJson(io, self.config.chanstats_dir, self.config.network_name, self.serverName(), platform.realtimeMillis(), .{
                         .users_online = self.meshUserCount(),
                         .presence_ctx = self,
                         .presence_fn = Presence.count,
+                        .exists_fn = Presence.exists,
                     });
                     // Public status page feed: this node's health + its mesh
                     // peers, written alongside the channel stats.

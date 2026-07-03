@@ -2152,6 +2152,14 @@ pub const Services = struct {
         return decodeChannel(value);
     }
 
+    /// Whether `channel` has a durable registration (a `.chanregs` record).
+    /// Used to decide a channel still "exists" for stats even when momentarily
+    /// empty; a malformed name is simply not registered.
+    pub fn channelIsRegistered(self: *Services, channel: []const u8) bool {
+        const key = channelKey(channel) catch return false;
+        return self.store.family(.chanregs).get(key.asSlice()) != null;
+    }
+
     fn putAccess(
         self: *Services,
         channel: ChannelRecord,
