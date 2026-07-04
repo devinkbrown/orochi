@@ -26,6 +26,7 @@ pub const membership_burst = @import("membership_burst.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
 pub const merkle_props = @import("merkle_props.zig");
+pub const mesh_clock = @import("mesh_clock.zig");
 pub const mesh = @import("mesh.zig");
 pub const mesh_topology = @import("mesh_topology.zig");
 pub const message_relay = @import("message_relay.zig");
@@ -69,6 +70,7 @@ test {
     _ = membership_view;
     _ = merkle;
     _ = merkle_props;
+    _ = mesh_clock;
     _ = mesh;
     _ = mesh_topology;
     _ = message_relay;

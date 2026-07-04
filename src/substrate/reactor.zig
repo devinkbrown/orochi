@@ -17,12 +17,24 @@ pub const Reactor = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Monotonic time in milliseconds.
+        /// Monotonic time in milliseconds. For intervals/timeouts ONLY — a
+        /// per-process clock (time-since-boot on the system backend), NOT
+        /// comparable across hosts.
         nowMillis: *const fn (ctx: *anyopaque) i64,
+        /// Wall-clock (Unix-epoch) milliseconds. Comparable across hosts (both
+        /// nodes track real time), so this — never `nowMillis` — is the physical
+        /// base for the cross-mesh Hybrid Logical Clock. Under the deterministic
+        /// backends it is the single virtual clock shared by every simulated
+        /// node, keeping cross-node HLC ordering both correct AND reproducible.
+        wallMillis: *const fn (ctx: *anyopaque) i64,
     };
 
     pub fn nowMillis(self: Reactor) i64 {
         return self.vtable.nowMillis(self.ptr);
+    }
+
+    pub fn wallMillis(self: Reactor) i64 {
+        return self.vtable.wallMillis(self.ptr);
     }
 };
 
@@ -43,7 +55,12 @@ pub const SystemReactor = struct {
         return platform.monotonicMillis();
     }
 
-    const vtable = Reactor.VTable{ .nowMillis = nowMillis };
+    fn wallMillis(_: *anyopaque) i64 {
+        // Real Unix-epoch time — the cross-host-comparable base for the mesh HLC.
+        return platform.realtimeMillis();
+    }
+
+    const vtable = Reactor.VTable{ .nowMillis = nowMillis, .wallMillis = wallMillis };
 };
 
 /// Deterministic backend: the clock only moves when the test advances it.
@@ -68,7 +85,9 @@ pub const SimReactor = struct {
         return self.clock_ms;
     }
 
-    const vtable = Reactor.VTable{ .nowMillis = nowMillis };
+    // Deterministic backend: wall == monotonic == the one controlled clock, so
+    // the mesh HLC stays reproducible and cross-node comparable in simulation.
+    const vtable = Reactor.VTable{ .nowMillis = nowMillis, .wallMillis = nowMillis };
 };
 
 /// Deterministic backend bound to a `sim_net.Sim`: the reactor clock IS the
@@ -103,7 +122,10 @@ pub const SimNetReactor = struct {
         return self.sim.now();
     }
 
-    const vtable = Reactor.VTable{ .nowMillis = nowMillis };
+    // The simulated network's single global clock is shared by every node, so it
+    // is the ideal HLC base: identical across nodes (comparable) and driven only
+    // by simulated events (reproducible).
+    const vtable = Reactor.VTable{ .nowMillis = nowMillis, .wallMillis = nowMillis };
 };
 
 test "sim reactor clock is deterministic and advances on command" {

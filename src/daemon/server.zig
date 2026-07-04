@@ -22,6 +22,7 @@ const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
+const mesh_clock_mod = @import("../substrate/suimyaku/mesh_clock.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
@@ -164,6 +165,7 @@ const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
+const ws_snapshot = @import("helix/ws_snapshot.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -1751,6 +1753,23 @@ const WsState = struct {
     tx_len: usize = 0,
 };
 
+/// Whether a WebSocket adapter is at a clean framing boundary — safe to carry
+/// across a Helix UPGRADE by rebuilding a fresh empty adapter on the successor.
+/// True only when the handshake is complete (phase=open) and nothing is in
+/// flight in either direction: no partial inbound frame buffered in the
+/// deframer, no pending deframed event or error, no open fragmented message,
+/// and no partial outbound line accumulated in tx. If any residue exists,
+/// rebuilding a fresh adapter would drop those bytes and corrupt the stream, so
+/// the client is not carried (it reconnects instead).
+fn wsCleanBoundary(ws: *const WsState) bool {
+    return ws.phase == .open and
+        ws.tx_len == 0 and
+        ws.deframer.len == 0 and
+        !ws.deframer.fragmented and
+        ws.deframer.pending == null and
+        ws.deframer.pending_error == null;
+}
+
 const AcceptKind = enum { plain, tls, ws };
 
 pub const ConnState = struct {
@@ -2562,6 +2581,11 @@ pub const LinuxServer = struct {
     shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
+    /// Cross-mesh Hybrid Logical Clock. Its physical base is WALL-CLOCK time so
+    /// LWW/collision ordering compares across hosts by recency, not per-node
+    /// uptime (see suimyaku/mesh_clock.zig). Monotonic-guarded so a wall-clock
+    /// step-back never regresses our own writes.
+    mesh_clock: mesh_clock_mod.MeshClock = .{},
     /// Snowflake msgid generator: globally-unique, time-ordered, node-embedded
     /// message ids for CHATHISTORY/REDACT (better than a per-node counter on a mesh).
     snowflake: snowflake_id.Generator,
@@ -4702,6 +4726,16 @@ pub const LinuxServer = struct {
     /// Monotonic ms as a non-negative u64 (the reputation table's clock type).
     fn nowU64(self: *const LinuxServer) u64 {
         return @intCast(@max(0, self.nowMs()));
+    }
+
+    /// Wall-clock (Unix-epoch) ms — the physical base for the cross-mesh HLC.
+    /// Sourced through the reactor so deterministic simulation controls it (and
+    /// keeps it shared/comparable across simulated nodes); off-reactor it is the
+    /// system wall clock. NEVER `nowMs()`, whose monotonic value is per-host and
+    /// not comparable across the mesh.
+    fn meshWallMs(self: *const LinuxServer) u64 {
+        const w = if (self.reactor) |r| r.wallMillis() else platform.realtimeMillis();
+        return @intCast(@max(@as(i64, 0), w));
     }
 
     /// WALL-CLOCK ms (u64) for the cross-node oper-grant domain. A grant carries an
@@ -7265,7 +7299,10 @@ pub const LinuxServer = struct {
     /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
     /// immediately rather than only after subsequent joins. Best-effort. (#65)
     fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) void {
-        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
+        // keyed), so it must be recency-comparable, never monotonic (was the
+        // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
+        const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             var members = self.world.memberIterator(cv.name) orelse continue;
@@ -7327,7 +7364,10 @@ pub const LinuxServer = struct {
     /// Burst aggregate local channel MODE flags to ONE freshly-established peer
     /// so a relink converges immediately instead of waiting for the next MODE.
     fn sendChannelModeFlagsBurstTo(self: *LinuxServer, conn: *ConnState) void {
-        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
+        // keyed), so it must be recency-comparable, never monotonic (was the
+        // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
+        const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const flags = self.channelModeFlagBits(cv.name);
@@ -7477,8 +7517,12 @@ pub const LinuxServer = struct {
     /// millisecond still order. Shared by PROP and TOPIC propagation.
     fn nextMeshHlc(self: *LinuxServer) u64 {
         self.msg_seq +%= 1;
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        return (now << 16) | (self.msg_seq & 0xffff);
+        // Physical base is WALL-CLOCK, not monotonic: a mesh hlc is compared
+        // against a PEER's hlc under LWW/collision resolution, and only real
+        // (epoch) time is comparable across hosts. MeshClock guards against a
+        // wall-clock step-back so our own writes never regress. The packed
+        // layout `(physical << 16) | seq` is unchanged (wire-compatible).
+        return self.mesh_clock.stamp(self.meshWallMs(), self.msg_seq);
     }
 
     fn nextChannelPropHlc(self: *LinuxServer) u64 {
@@ -8073,7 +8117,10 @@ pub const LinuxServer = struct {
     }
 
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity, setter: []const u8) void {
-        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
+        // keyed), so it must be recency-comparable, never monotonic (was the
+        // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
+        const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -8094,7 +8141,10 @@ pub const LinuxServer = struct {
     }
 
     fn announceChannelModeFlags(self: *LinuxServer, channel: []const u8, flags: u16) void {
-        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
+        // keyed), so it must be recency-comparable, never monotonic (was the
+        // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
+        const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -8123,7 +8173,10 @@ pub const LinuxServer = struct {
         set_at: i64,
         present: bool,
     ) void {
-        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
+        // keyed), so it must be recency-comparable, never monotonic (was the
+        // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
+        const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -14356,6 +14409,7 @@ pub const LinuxServer = struct {
         defer self.allocator.free(carried_fds);
         var carried_fd_count: usize = 0;
         var tls_carried: usize = 0;
+        var ws_carried: usize = 0;
         var s2s_hints: usize = 0;
         var s2s_preserved: usize = 0;
         var it = self.rx().clients.iterator();
@@ -14412,10 +14466,17 @@ pub const LinuxServer = struct {
             if (requester_fd) |rfd| {
                 if (e.value.fd == rfd) continue;
             }
-            // wss browser clients are not carried yet (the TLS+WebSocket adapter
-            // stack has no resume path); their sockets close at execve and the
-            // browser reconnects against the still-bound listener.
-            if (e.value.ws != null) continue;
+            // wss browser client (Ruri & friends): carry it ONLY when its
+            // WebSocket adapter is at a clean framing boundary — handshake done
+            // (phase=open), no partial inbound frame in the deframer, no partial
+            // outbound line in the tx accumulator. At such a boundary the
+            // successor rebuilds a fresh empty adapter and resumes framing with
+            // no lost bytes (the TLS crypto rides its own capsule below). If the
+            // adapter is mid-frame, fall back to the historical behavior: don't
+            // carry it, its socket closes at execve and the browser reconnects
+            // against the still-bound listener.
+            const carry_ws = if (e.value.ws) |wsst| wsCleanBoundary(wsst) else false;
+            if (e.value.ws != null and !carry_ws) continue;
             // TLS client: export the live engine state FIRST — if it cannot be
             // exported the connection is not carried at all (its fd keeps
             // CLOEXEC, closes at exec, and the client reconnects). A TLS socket
@@ -14489,12 +14550,32 @@ pub const LinuxServer = struct {
                     continue;
                 };
             }
+            // Queue the WS marker BEFORE the session piece too (same ordering
+            // rationale as TLS): its presence tells the successor to rebuild the
+            // WebSocket adapter for this fd. An orphaned WS capsule is harmless
+            // (ignored when no client matches its fd).
+            if (carry_ws) {
+                const wb = ws_snapshot.encode(self.allocator, .{ .fd = e.value.fd, .phase_open = true }) catch {
+                    self.allocator.free(blob);
+                    continue;
+                };
+                blobs.append(self.allocator, wb) catch {
+                    self.allocator.free(wb);
+                    self.allocator.free(blob);
+                    continue;
+                };
+                pieces.append(self.allocator, .{ .kind = .ws_session, .bytes = wb }) catch {
+                    self.allocator.free(blob);
+                    continue;
+                };
+            }
             blobs.append(self.allocator, blob) catch {
                 self.allocator.free(blob);
                 continue;
             };
             pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch continue;
             if (tls_blob != null) tls_carried += 1;
+            if (carry_ws) ws_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
             _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
             carried_fds[carried_fd_count] = e.value.fd;
@@ -14524,7 +14605,7 @@ pub const LinuxServer = struct {
             return self.upgradeListenerOnly(requester);
         };
         var sbuf: [160]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh link(s) preserved, {d} re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_preserved, s2s_hints }) catch "UPGRADE: re-exec");
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -14586,9 +14667,22 @@ pub const LinuxServer = struct {
             tls_snaps.append(self.allocator, ts) catch continue;
         }
 
+        // Pass 1b: index the carried WebSocket adapter markers by socket fd, the
+        // same join key. A wss client is joined to BOTH its TLS state and this
+        // marker; the marker tells the successor to rebuild the WS framing layer.
+        var ws_snaps: std.ArrayList(ws_snapshot.Snapshot) = .empty;
+        defer ws_snaps.deinit(self.allocator);
+        for (caps) |c| {
+            if (c.header.kind != .ws_session) continue;
+            if (c.fields.len == 0) continue;
+            const wss = ws_snapshot.decode(c.fields[0].bytes) catch continue;
+            ws_snaps.append(self.allocator, wss) catch continue;
+        }
+
         // Pass 2: adopt the carried clients.
         var adopted: usize = 0;
         var adopted_tls: usize = 0;
+        var adopted_ws: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .clients) continue;
             if (c.fields.len == 0) continue;
@@ -14601,9 +14695,17 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
-            if (self.adoptInheritedClient(snap, tls_state)) {
+            var ws_state: ?ws_snapshot.Snapshot = null;
+            for (ws_snaps.items) |wss| {
+                if (wss.fd == snap.fd) {
+                    ws_state = wss;
+                    break;
+                }
+            }
+            if (self.adoptInheritedClient(snap, tls_state, ws_state)) {
                 adopted += 1;
                 if (tls_state != null) adopted_tls += 1;
+                if (ws_state != null) adopted_ws += 1;
             }
         }
 
@@ -14650,15 +14752,15 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, s2s_resumed, redialed },
         );
     }
 
     /// Re-attach one carried-over client: take ownership of its inherited socket
     /// fd, restore its session (and live TLS engine when carried), and arm recv.
     /// Returns true on success; ANY failure closes the fd and frees the slot.
-    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot) bool {
+    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot) bool {
         if (self.rx().clients.len() >= self.config.max_clients) {
             closeFd(snap.fd);
             return false;
@@ -14699,6 +14801,29 @@ pub const LinuxServer = struct {
                 return false;
             }
         }
+        // wss browser client: rebuild the WebSocket framing adapter. It was
+        // carried only from a clean boundary, so a FRESH, empty adapter (phase
+        // open) resumes framing with no lost bytes — the TLS engine rebuilt
+        // above sits beneath it. Allocation failure drops the client cleanly
+        // (its fd is closed and the slot freed), never adopting a wss socket as
+        // raw IRC bytes (which would corrupt every frame the browser receives).
+        if (ws_state) |wsv| {
+            if (wsv.phase_open) {
+                const ws = self.allocator.create(WsState) catch {
+                    if (conn.tls) |t| {
+                        t.deinit();
+                        self.allocator.destroy(t);
+                        conn.tls = null;
+                        conn.is_tls = false;
+                    }
+                    _ = self.rx().clients.free(id);
+                    closeFd(snap.fd);
+                    return false;
+                };
+                ws.* = .{ .phase = .open };
+                conn.ws = ws;
+            }
+        }
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
         // collisions; ignore NickInUse defensively. Channel membership carry-over
@@ -14717,6 +14842,10 @@ pub const LinuxServer = struct {
                 t.deinit();
                 self.allocator.destroy(t);
                 conn.tls = null;
+            }
+            if (conn.ws) |w| {
+                self.allocator.destroy(w);
+                conn.ws = null;
             }
             _ = self.rx().clients.free(id);
             closeFd(snap.fd);
@@ -39757,6 +39886,40 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
         if (std.mem.indexOf(u8, bob.written(), "DATA #x Mood :comic-frame-payload") != null) data_ok = true;
     }
     try std.testing.expect(data_ok);
+}
+
+test "wsCleanBoundary: only an idle, open, residue-free adapter is carriable" {
+    const alloc = std.testing.allocator;
+    const ws = try alloc.create(WsState); // heap: WsState holds MiB-sized buffers
+    defer alloc.destroy(ws);
+
+    // A fresh adapter is still in the HTTP Upgrade handshake — never carried.
+    ws.* = .{};
+    try std.testing.expect(!wsCleanBoundary(ws));
+
+    // Open, with nothing buffered in either direction: safe to carry.
+    ws.* = .{ .phase = .open };
+    try std.testing.expect(wsCleanBoundary(ws));
+
+    // A partial inbound frame mid-arrival would be lost by a fresh deframer.
+    ws.* = .{ .phase = .open };
+    ws.deframer.len = 3;
+    try std.testing.expect(!wsCleanBoundary(ws));
+
+    // A partial outbound line in the tx accumulator would be lost.
+    ws.* = .{ .phase = .open };
+    ws.tx_len = 5;
+    try std.testing.expect(!wsCleanBoundary(ws));
+
+    // An open fragmented message must complete before a clean handoff.
+    ws.* = .{ .phase = .open };
+    ws.deframer.fragmented = true;
+    try std.testing.expect(!wsCleanBoundary(ws));
+
+    // A buffered, not-yet-dispatched deframed event blocks the carry.
+    ws.* = .{ .phase = .open };
+    ws.deframer.pending = .pong;
+    try std.testing.expect(!wsCleanBoundary(ws));
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {

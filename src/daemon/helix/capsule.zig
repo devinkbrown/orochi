@@ -36,6 +36,7 @@ pub const CapsuleKind = enum(u8) {
     mesh_checkpoint = 6,
     send_queue = 7,
     s2s_link = 8,
+    ws_session = 9,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -47,6 +48,7 @@ pub const CapsuleKind = enum(u8) {
             6 => .mesh_checkpoint,
             7 => .send_queue,
             8 => .s2s_link,
+            9 => .ws_session,
             else => error.UnknownKind,
         };
     }
@@ -81,6 +83,7 @@ pub const registry = [_]Descriptor{
     .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .send_queue, .schema_id = 0x4853_4551, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
