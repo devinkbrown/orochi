@@ -295,6 +295,10 @@ pub const Server = struct {
     early_read_seq: u64 = 0,
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
+    /// RFC 8449 record_size_limit advertised by the peer: the max TLSInnerPlaintext
+    /// length it will accept. Default 2^14+1 = "no restriction beyond the protocol
+    /// max". Outbound application records are fragmented to honor it.
+    peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
@@ -578,9 +582,27 @@ pub const Server = struct {
     pub fn encrypt(self: *Server, appdata: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .application_data, appdata);
-        self.app_write_seq += 1;
-        return out;
+        const limit = tls_record.recordContentLimit(self.peer_record_size_limit);
+        if (appdata.len <= limit) {
+            const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .application_data, appdata);
+            self.app_write_seq += 1;
+            return out;
+        }
+        // RFC 8449: the peer advertised a smaller record_size_limit — fragment the
+        // application data into multiple records, each within its limit, and
+        // return them concatenated (one record per fragment, seq bumped per record).
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var off: usize = 0;
+        while (off < appdata.len) {
+            const n = @min(limit, appdata.len - off);
+            const rec = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            defer self.allocator.free(rec);
+            try buf.appendSlice(self.allocator, rec);
+            self.app_write_seq += 1;
+            off += n;
+        }
+        return buf.toOwnedSlice(self.allocator);
     }
 
     pub fn decrypt(self: *Server, record: []const u8) Error![]u8 {
@@ -811,6 +833,13 @@ pub const Server = struct {
                     }
                 },
                 .alpn => self.maybeSelectAlpn(ext.data),
+                .record_size_limit => {
+                    // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
+                    if (ext.data.len != 2) return error.BadHandshake;
+                    const limit = std.mem.readInt(u16, ext.data[0..2], .big);
+                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                    self.peer_record_size_limit = limit;
+                },
                 .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
                 .early_data => {
                     if (ext.data.len != 0) return error.BadHandshake;
@@ -1031,6 +1060,12 @@ pub const Server = struct {
             try ext_builder.addTyped(.alpn, try alpn_builder.finish());
         }
         if (self.early_data_accepted) try ext_builder.addTyped(.early_data, "");
+        // RFC 8449: advertise the max TLSInnerPlaintext we accept (full-size
+        // records — our recv path handles them). Enforcement of the PEER's limit
+        // happens on our send path (see `encrypt`).
+        var rsl_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
+        try ext_builder.addTyped(.record_size_limit, &rsl_buf);
         try self.emit(out, .encrypted_extensions, try ext_builder.finish());
     }
 
@@ -1930,6 +1965,77 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: record_size_limit negotiated + fragments outbound records (RFC 8449)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5d} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5d, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(client.handshakeDone() and server.handshakeDone());
+
+    // Both advertised the maximum, so each stored the "no restriction" default.
+    try std.testing.expectEqual(@as(usize, tls_record.max_plaintext_len + 1), server.peer_record_size_limit);
+    try std.testing.expectEqual(@as(usize, tls_record.max_plaintext_len + 1), client.peer_record_size_limit);
+
+    // Simulate a peer that advertised a small limit (100) → content limit 99.
+    // A 250-byte payload must fragment into ceil(250/99) = 3 records, and the
+    // client must decrypt each and reassemble the original bytes exactly.
+    server.peer_record_size_limit = 100;
+    var payload: [250]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    const wire = try server.encrypt(&payload);
+    defer alloc.free(wire);
+
+    var reassembled: std.ArrayList(u8) = .empty;
+    defer reassembled.deinit(alloc);
+    var records: usize = 0;
+    var off: usize = 0;
+    while (off < wire.len) {
+        try std.testing.expect(wire.len - off >= 5);
+        const rec_len = std.mem.readInt(u16, wire[off + 3 ..][0..2], .big);
+        // TLSInnerPlaintext = content + 1 content-type byte; ciphertext adds the
+        // AEAD tag. So each record's inner plaintext stays within the 100 limit.
+        const rec = wire[off .. off + 5 + rec_len];
+        const pt = try client.decrypt(rec);
+        defer alloc.free(pt);
+        try reassembled.appendSlice(alloc, pt);
+        records += 1;
+        off += 5 + rec_len;
+    }
+    try std.testing.expectEqual(off, wire.len);
+    try std.testing.expectEqual(@as(usize, 3), records);
+    try std.testing.expectEqualSlices(u8, &payload, reassembled.items);
 }
 
 test "loopback: exportResume/resumeConnected carries a live session across Server instances" {

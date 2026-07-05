@@ -361,6 +361,10 @@ pub const Client = struct {
     early_write_seq: u64 = 0,
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
+    /// RFC 8449 record_size_limit advertised by the server (max TLSInnerPlaintext
+    /// it accepts). Default 2^14+1 = unrestricted; outbound records are fragmented
+    /// to honor a smaller value.
+    peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
         if (options.server_name.len == 0) return error.BadHandshake;
@@ -633,16 +637,26 @@ pub const Client = struct {
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const out = try sealRecordAlloc(
-            self.allocator,
-            suite,
-            &self.client_app_keys,
-            self.app_write_seq,
-            .application_data,
-            appdata,
-        );
-        self.app_write_seq += 1;
-        return out;
+        const limit = tls_record.recordContentLimit(self.peer_record_size_limit);
+        if (appdata.len <= limit) {
+            const out = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .application_data, appdata);
+            self.app_write_seq += 1;
+            return out;
+        }
+        // RFC 8449: fragment application data to the server's smaller record limit,
+        // one record per fragment, concatenated (seq bumped per record).
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var off: usize = 0;
+        while (off < appdata.len) {
+            const n = @min(limit, appdata.len - off);
+            const rec = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            defer self.allocator.free(rec);
+            try buf.appendSlice(self.allocator, rec);
+            self.app_write_seq += 1;
+            off += n;
+        }
+        return buf.toOwnedSlice(self.allocator);
     }
 
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
@@ -844,6 +858,12 @@ pub const Client = struct {
             .rsa_pkcs1_sha256,
         });
         try ext_builder.addTyped(.signature_algorithms, sigs);
+
+        // RFC 8449 record_size_limit: advertise the largest TLSInnerPlaintext we
+        // accept (the protocol max — our recv path handles full-size records).
+        var rsl_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
+        try ext_builder.addTyped(.record_size_limit, &rsl_buf);
 
         var keyshare_buf: [256]u8 = undefined;
         const keyshares = if (self.force_p256_only_for_test)
@@ -1229,6 +1249,14 @@ pub const Client = struct {
                 .early_data => {
                     if (ext.data.len != 0 or self.early_data == null or !self.psk_accepted) return error.BadHandshake;
                     server_accepted_early = true;
+                },
+                .record_size_limit => {
+                    // RFC 8449: a 2-byte value in [64, 2^14+1]; anything else is
+                    // illegal_parameter. Store it so our outbound records honor it.
+                    if (ext.data.len != 2) return error.BadHandshake;
+                    const limit = std.mem.readInt(u16, ext.data[0..2], .big);
+                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                    self.peer_record_size_limit = limit;
                 },
                 // key_share / supported_versions / signature_algorithms belong to
                 // ServerHello/CertificateRequest and are illegal here. server_name

@@ -118,6 +118,21 @@ pub const max_ciphertext_len = tls.max_ciphertext_len;
 pub const legacy_record_version = tls.tls12_wire_version;
 pub const outer_content_type = ContentType.application_data;
 
+/// RFC 8449: the largest application-data content one record may carry given a
+/// peer's advertised `record_size_limit` (a TLSInnerPlaintext bound). Since
+/// TLSInnerPlaintext = content + 1 content-type byte + padding(0), content must
+/// be <= limit - 1, and is never allowed above the protocol max (2^14). The
+/// default limit (2^14+1) yields exactly `max_plaintext_len` — no restriction.
+pub fn recordContentLimit(peer_record_size_limit: usize) usize {
+    const inner = if (peer_record_size_limit > 1) peer_record_size_limit - 1 else 1;
+    return @min(max_plaintext_len, inner);
+}
+
+/// RFC 8449 record_size_limit bounds: the smallest legal advertised value is 64;
+/// the largest is 2^14+1 (TLSInnerPlaintext including the content-type byte).
+pub const record_size_limit_min: u16 = 64;
+pub const record_size_limit_max: u16 = max_plaintext_len + 1;
+
 pub const Error = aead.Error || error{
     BadRecordHeader,
     InvalidContentType,
