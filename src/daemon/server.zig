@@ -24401,8 +24401,13 @@ pub const LinuxServer = struct {
 
     /// Reactor-0 side of the OCSP-staple handoff: swap in the newest staple and
     /// free the prior live generation. Runs only on reactor 0 (like
-    /// `maybeReloadAcmeTls`), serialized with per-connection `tls*Config` reads by
-    /// the same completion lock that guards `config.tls_cert_chain` swaps.
+    /// `maybeReloadAcmeTls`). The `world.lockWrite` around each completion
+    /// serializes this swap against per-connection `tls*Config` reads, exactly as
+    /// for `config.tls_cert_chain`. NOTE: that lock prevents concurrent access, not
+    /// a stale slice value captured into an in-flight handshake before the swap;
+    /// freeing the superseded generation inline shares the same (rare-cadence,
+    /// accepted) cross-completion window as the cert-chain reload. The published
+    /// buffer is Service-allocated and freed with the same `self.allocator`.
     fn maybeSwapOcspStaple(self: *LinuxServer) void {
         if (!self.ocsp_staple_pending.swap(false, .acq_rel)) return;
         lockSpin(&self.ocsp_staple_lock);

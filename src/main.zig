@@ -600,7 +600,10 @@ pub fn main(init: std.process.Init) !void {
             allocator.destroy(s);
         }
     };
-    if (held) |h| {
+    // `|*h|`: `setAcmeTlsReloadConfig` and the renewal worker both retain
+    // `&h.parsed.tls` past this block, so it must point at `held`'s function-scope
+    // payload rather than a block-local copy.
+    if (held) |*h| {
         if (h.acme.enabled) {
             if (comptime builtin.os.tag == .linux) {
                 srv.setAcmeTlsReloadConfig(&h.parsed.tls);
@@ -628,7 +631,10 @@ pub fn main(init: std.process.Init) !void {
             allocator.destroy(s);
         }
     };
-    if (held) |h| {
+    // Capture by pointer (`|*h|`): the worker thread holds `&h.parsed.tls` for its
+    // whole lifetime, so it must target `held`'s function-scope payload, not a
+    // block-local copy that dies at the end of this `if`.
+    if (held) |*h| {
         if (h.parsed.ocsp.enabled and h.parsed.tls.enabled and h.parsed.tls.cert_path != null) {
             if (comptime builtin.os.tag == .linux) {
                 const svc = try allocator.create(OcspStapleService);

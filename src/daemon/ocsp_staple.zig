@@ -212,12 +212,18 @@ pub const Service = struct {
             return;
         };
 
-        // Surface a revocation of our OWN leaf loudly; never staple it.
+        // Surface a revocation of our OWN leaf loudly; never staple it. Trust the
+        // revoked verdict only if the response is actually issuer-signed — the
+        // transport runs with cert verification off (the response signature is the
+        // real authenticator), so an unsigned injected "revoked" must not forge a
+        // CRITICAL alert.
         if (ocsp.parse(der)) |parsed| {
-            if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
-                if (status == .revoked) {
-                    dlog.log("orochi: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
-                    return;
+            if (ocsp.verifyResponseSignature(parsed, issuer.spki_der)) {
+                if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
+                    if (status == .revoked) {
+                        dlog.log("orochi: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
+                        return;
+                    }
                 }
             }
         } else |_| {}
