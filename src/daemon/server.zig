@@ -2759,6 +2759,18 @@ pub const LinuxServer = struct {
     /// reloaded 1.3 leaf is neither ECDSA-P256 nor RSA (so the 1.2 leg needs its
     /// own ECDSA-P256 leaf). Same ownership/lifetime rules as `reload_tls`.
     reload_tls12: ?tls_certs.Tls12 = null,
+    /// The PREVIOUS reload generation, kept alive for one extra swap cycle so a
+    /// TLS handshake that captured a cert-chain slice at accept time cannot read
+    /// freed bytes if a reload commits mid-handshake (the superseded generation
+    /// is freed only on the *next* reload — reloads are cadenced in hours/days,
+    /// handshakes complete in milliseconds, so no live handshake can reference a
+    /// generation two reloads old). Freed on the next reload and on deinit.
+    /// Boundary: this buys safety across exactly ONE reload; correctness relies on
+    /// handshake lifetime ≪ reload cadence (true given ACME/REHASH ≫ handshake +
+    /// idle-reap). A handshake straddling two reloads is not covered — not
+    /// reachable in practice.
+    reload_tls_prev: ?tls_certs.Loaded = null,
+    reload_tls12_prev: ?tls_certs.Tls12 = null,
     /// Cross-thread ACME signal: the renewal worker sets this only after writing
     /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
     /// performs the actual live TLS reload, so ACME never mutates listener state.
@@ -2779,9 +2791,14 @@ pub const LinuxServer = struct {
     ocsp_staple_incoming: ?[]u8 = null,
     ocsp_staple_lock: std.atomic.Mutex = .unlocked,
     /// The live staple generation `config.tls_ocsp_staple` borrows. Reactor 0 owns
-    /// it, freeing the prior generation when it publishes a new one; freed on
-    /// deinit. Null until the first staple is published.
+    /// it; on a new publish it becomes `ocsp_staple_prev` (freed one cycle later)
+    /// so an in-flight handshake that captured the staple slice can't read freed
+    /// bytes. Freed on deinit. Null until the first staple is published.
     ocsp_staple_owned: ?[]u8 = null,
+    /// The previous staple generation, retained one extra swap cycle for the same
+    /// cross-completion reason as `reload_tls_prev`. Freed on the next swap and on
+    /// deinit.
+    ocsp_staple_prev: ?[]u8 = null,
     /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
     /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
     /// wake eventfd now live on `reactor`.)
@@ -3476,12 +3493,16 @@ pub const LinuxServer = struct {
         self.allocator.free(self.reload_bindings);
         if (self.reload_class_registry) |*r| r.deinit();
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
-        // Free the server-owned TLS reload generation, if any. The boot cert
-        // generation is main-owned and is never freed here.
+        // Free the server-owned TLS reload generations, if any (the current plus
+        // the one-cycle-retained previous generation). The boot cert generation is
+        // main-owned and is never freed here.
         if (self.reload_tls) |*t| t.deinit(self.allocator);
         if (self.reload_tls12) |*t| t.deinit(self.allocator);
-        // Free the live + not-yet-consumed OCSP staple generations, if any.
+        if (self.reload_tls_prev) |*t| t.deinit(self.allocator);
+        if (self.reload_tls12_prev) |*t| t.deinit(self.allocator);
+        // Free the live + retained-previous + not-yet-consumed OCSP staple gens.
         if (self.ocsp_staple_owned) |owned| self.allocator.free(owned);
+        if (self.ocsp_staple_prev) |prev| self.allocator.free(prev);
         if (self.ocsp_staple_incoming) |incoming| self.allocator.free(incoming);
         self.read_markers.deinit();
         self.monitor.deinit();
@@ -24399,15 +24420,15 @@ pub const LinuxServer = struct {
         self.ocsp_staple_pending.store(true, .release);
     }
 
-    /// Reactor-0 side of the OCSP-staple handoff: swap in the newest staple and
-    /// free the prior live generation. Runs only on reactor 0 (like
-    /// `maybeReloadAcmeTls`). The `world.lockWrite` around each completion
-    /// serializes this swap against per-connection `tls*Config` reads, exactly as
-    /// for `config.tls_cert_chain`. NOTE: that lock prevents concurrent access, not
-    /// a stale slice value captured into an in-flight handshake before the swap;
-    /// freeing the superseded generation inline shares the same (rare-cadence,
-    /// accepted) cross-completion window as the cert-chain reload. The published
-    /// buffer is Service-allocated and freed with the same `self.allocator`.
+    /// Reactor-0 side of the OCSP-staple handoff: swap in the newest staple. Runs
+    /// only on reactor 0 (like `maybeReloadAcmeTls`). The `world.lockWrite` around
+    /// each completion serializes this swap against per-connection `tls*Config`
+    /// reads, exactly as for `config.tls_cert_chain`. That lock does not cover a
+    /// slice value already captured into an in-flight handshake before the swap,
+    /// so the superseded generation is retained one extra cycle (`ocsp_staple_prev`)
+    /// and freed on the NEXT swap rather than inline — closing the cross-completion
+    /// window. The published buffer is Service-allocated and freed with the same
+    /// `self.allocator`.
     fn maybeSwapOcspStaple(self: *LinuxServer) void {
         if (!self.ocsp_staple_pending.swap(false, .acq_rel)) return;
         lockSpin(&self.ocsp_staple_lock);
@@ -24416,7 +24437,10 @@ pub const LinuxServer = struct {
         self.ocsp_staple_lock.unlock();
         const next = incoming orelse return;
         self.config.tls_ocsp_staple = next;
-        if (self.ocsp_staple_owned) |prior| self.allocator.free(prior);
+        // Defer the free by one generation (see `reload_tls_prev`): a handshake
+        // that captured the old staple slice must not read freed bytes.
+        if (self.ocsp_staple_prev) |old| self.allocator.free(old);
+        self.ocsp_staple_prev = self.ocsp_staple_owned;
         self.ocsp_staple_owned = next;
     }
 
@@ -24503,8 +24527,14 @@ pub const LinuxServer = struct {
             self.config.tls12_signing_key = tls12_key;
         }
 
-        if (self.reload_tls) |*prior| prior.deinit(self.allocator);
-        if (self.reload_tls12) |*prior| prior.deinit(self.allocator);
+        // Defer the free by one generation: an in-flight handshake may still alias
+        // the just-replaced generation's cert bytes, so keep it as `*_prev` and
+        // free only the generation from two reloads ago (which no live handshake
+        // can reference). The boot generation is main-owned and never freed here.
+        if (self.reload_tls_prev) |*old| old.deinit(self.allocator);
+        if (self.reload_tls12_prev) |*old| old.deinit(self.allocator);
+        self.reload_tls_prev = self.reload_tls;
+        self.reload_tls12_prev = self.reload_tls12;
         self.reload_tls = loaded;
         self.reload_tls12 = new_tls12;
 
@@ -40400,6 +40430,42 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
     };
     _ = try server.reloadTlsCerts(std.testing.io, &tls_c);
     try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
+    // Cross-completion UAF fix (deferred-free by one generation): the just-replaced
+    // generation B is RETAINED as `reload_tls_prev` rather than freed inline, so an
+    // in-flight handshake that captured B's cert slice can't read freed bytes.
+    try std.testing.expect(server.reload_tls_prev != null);
+    try std.testing.expectEqualSlices(u8, b.der, server.reload_tls_prev.?.cert_chain[0]);
+
+    // Third reload to cert D: this is what actually fires the deferred-free branch
+    // on the live reload path — B (now two generations old) is freed here, C is
+    // retained as the new `reload_tls_prev`. Under the testing allocator a leak or
+    // double-free of B fails; the boot cert A is still never freed.
+    var d_buf: [1024]u8 = undefined;
+    const d = try mintRehashTlsLeaf(&d_buf, 0x77, "d.test");
+    const d_seed = [_]u8{0x77} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    var d_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+    const d_key_der = try ed25519_pkcs8.encode(&d_key_der_buf, d_seed);
+    var d_cert_pem_buf: [4096]u8 = undefined;
+    const d_cert_pem = try pem.encode(&d_cert_pem_buf, "CERTIFICATE", d.der);
+    var d_key_pem_buf: [4096]u8 = undefined;
+    const d_key_pem = try pem.encode(&d_key_pem_buf, "PRIVATE KEY", d_key_der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.pem", .data = d_cert_pem });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.key", .data = d_key_pem });
+    const d_cert_path = try rehashTmpPath(allocator, tmp, "d.pem");
+    defer allocator.free(d_cert_path);
+    const d_key_path = try rehashTmpPath(allocator, tmp, "d.key");
+    defer allocator.free(d_key_path);
+    const tls_d = config_format.Config.Tls{
+        .enabled = true,
+        .cert_path = d_cert_path,
+        .key_path = d_key_path,
+        .dns_name = "d.test",
+    };
+    _ = try server.reloadTlsCerts(std.testing.io, &tls_d);
+    try std.testing.expectEqualSlices(u8, d.der, server.config.tls_cert_chain[0]);
+    // C is now the retained previous generation (B was freed by this reload).
+    try std.testing.expect(server.reload_tls_prev != null);
+    try std.testing.expectEqualSlices(u8, c.der, server.reload_tls_prev.?.cert_chain[0]);
 }
 
 test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" {
