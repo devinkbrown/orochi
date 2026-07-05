@@ -38,6 +38,9 @@ pub const Params = struct {
     /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
     /// own trust anchor (self-signed root). Off by default.
     is_ca: bool = false,
+    /// basicConstraints pathLenConstraint (0..=127 supported by this test
+    /// builder). Only emitted when `is_ca` and set. Null omits it.
+    path_len: ?u8 = null,
 };
 
 pub const EcdsaP256Params = struct {
@@ -239,6 +242,10 @@ fn writeExtensions(w: *DerWriter, params: anytype) !void {
         var bc_buf: [8]u8 = undefined;
         var bc = DerWriter.init(&bc_buf);
         try bc.tlv(tag_boolean, &.{0xff});
+        // pathLenConstraint INTEGER (small values only; positive so no sign byte).
+        if (comptime @hasField(@TypeOf(params), "path_len")) {
+            if (params.path_len) |pl| try bc.tlv(tag_integer, &[_]u8{pl & 0x7f});
+        }
         var bc_seq_buf: [12]u8 = undefined;
         var bc_seq = DerWriter.init(&bc_seq_buf);
         try bc_seq.tlv(tag_sequence, bc.bytes());
@@ -700,6 +707,33 @@ test "buildSelfSigned emits SAN dnsNames + CA basic-constraints parseable by x50
     const sig_bits = try readTlv(outer.value, &body_cursor);
     const signature = Ed25519.Signature.fromBytes(sig_bits.value[1..][0..Ed25519.Signature.encoded_length].*);
     try signature.verify(tbs.full, params.key_pair.public_key);
+}
+
+test "basicConstraints pathLenConstraint round-trips through x509 parse" {
+    const x509 = @import("../crypto/x509.zig");
+    var out: [1024]u8 = undefined;
+
+    // CA with pathLen:2 -> parsed field is 2.
+    var p2 = try testParams();
+    p2.is_ca = true;
+    p2.path_len = 2;
+    const cert2 = try x509.parse(try buildSelfSigned(&out, p2));
+    try testing.expect(cert2.basic_constraints_ca);
+    try testing.expectEqual(@as(?u32, 2), cert2.basic_constraints_path_len);
+
+    // CA with pathLen:0 -> parsed field is 0 (distinct from absent/null).
+    var p0 = try testParams();
+    p0.is_ca = true;
+    p0.path_len = 0;
+    const cert0 = try x509.parse(try buildSelfSigned(&out, p0));
+    try testing.expectEqual(@as(?u32, 0), cert0.basic_constraints_path_len);
+
+    // CA without an explicit pathLen -> null (no constraint).
+    var pnone = try testParams();
+    pnone.is_ca = true;
+    const certn = try x509.parse(try buildSelfSigned(&out, pnone));
+    try testing.expect(certn.basic_constraints_ca);
+    try testing.expectEqual(@as(?u32, null), certn.basic_constraints_path_len);
 }
 
 test "buildSelfSignedEcdsaP256 emits P-256 SPKI and ECDSA-SHA256 signature" {

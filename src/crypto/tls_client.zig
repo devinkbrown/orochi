@@ -2035,6 +2035,21 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         try enforceNameConstraints(issuer, leaf);
     }
 
+    // RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement. Reduce the
+    // chain to per-cert facts (path limit + self-issued) then check with the
+    // pure `enforcePathLen` helper.
+    var facts_buf: [16]CaPathFact = undefined;
+    const fn_count = @min(chain.len, facts_buf.len);
+    for (chain[0..fn_count], 0..) |der, idx| {
+        const parsed_pl = if (x509.parse(der)) |p| p.basic_constraints_path_len else |_| null;
+        const self_issued = if (extractCertParts(der)) |parts|
+            std.mem.eql(u8, parts.subject_der, parts.issuer_der)
+        else |_|
+            false;
+        facts_buf[idx] = .{ .path_len = parsed_pl, .self_issued = self_issued };
+    }
+    try enforcePathLen(facts_buf[0..fn_count]);
+
     const last = chain[chain.len - 1];
     const last_parts = try extractCertParts(last);
     for (anchors) |anchor_der| {
@@ -2061,6 +2076,63 @@ fn verifyIssuedBy(child_der: []const u8, issuer_der: []const u8) Error!void {
     const issuer = try extractCertParts(issuer_der);
     if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return error.BadCertificate;
     try verifyCertSignature(child, issuer_der);
+}
+
+/// One certificate's inputs to path-length checking. `path_len` is its
+/// basicConstraints pathLenConstraint (null = absent); `self_issued` is
+/// subject DN == issuer DN.
+const CaPathFact = struct { path_len: ?u32, self_issued: bool };
+
+/// RFC 5280 §4.2.1.10 / §6.1.4(m). `facts[0]` is the leaf; `facts[1..]` are the
+/// CAs from the leaf toward the trust anchor. A CA's pathLenConstraint bounds
+/// the number of NON-self-issued intermediate CAs strictly between it and the
+/// leaf. This per-CA check is equivalent to the RFC's running-budget algorithm.
+fn enforcePathLen(facts: []const CaPathFact) Error!void {
+    var ci: usize = 1;
+    while (ci < facts.len) : (ci += 1) {
+        const limit = facts[ci].path_len orelse continue;
+        var below: u32 = 0;
+        var bi: usize = 1;
+        while (bi < ci) : (bi += 1) {
+            if (!facts[bi].self_issued) below += 1;
+        }
+        if (below > limit) return error.BadCertificate;
+    }
+}
+
+test "enforcePathLen: pathLenConstraint bounds intermediates below a CA" {
+    const F = CaPathFact;
+    // Normal chain [leaf, R3(pathLen:0), root]: 0 intermediates below R3 — OK.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 0, .self_issued = false },
+    });
+    // [leaf, subCA, root(pathLen:0)]: subCA is a non-self-issued intermediate
+    // below the pathLen:0 root — REJECT.
+    try std.testing.expectError(error.BadCertificate, enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 0, .self_issued = false },
+    }));
+    // pathLen:1 permits exactly one intermediate below.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 1, .self_issued = false },
+    });
+    // Two intermediates below a pathLen:1 CA — REJECT.
+    try std.testing.expectError(error.BadCertificate, enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 1, .self_issued = false },
+    }));
+    // A self-issued (cross-signed) intermediate is exempt from the count.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = true },
+        .{ .path_len = 0, .self_issued = false },
+    });
 }
 
 fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {

@@ -208,6 +208,11 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         san_ips: [max_ip_addresses]IpAddress,
         san_ip_count: usize,
         basic_constraints_ca: bool,
+        /// basicConstraints pathLenConstraint (RFC 5280 §4.2.1.10): the maximum
+        /// number of non-self-issued intermediate CAs that may follow this cert
+        /// toward the leaf. `null` when absent (CA with no path limit, or a
+        /// non-CA cert). Only meaningful when `basic_constraints_ca` is true.
+        basic_constraints_path_len: ?u32,
         /// KeyUsage extension (2.5.29.15). `key_usage_present` is false when the
         /// extension is absent; the bit fields are only meaningful when present.
         key_usage_present: bool,
@@ -243,6 +248,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .san_ips = undefined,
                 .san_ip_count = 0,
                 .basic_constraints_ca = false,
+                .basic_constraints_path_len = null,
                 .key_usage_present = false,
                 .key_usage_digital_signature = false,
                 .key_usage_cert_sign = false,
@@ -548,7 +554,9 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
         if (std.mem.eql(u8, oid_tlv.value, &Oid.subject_alt_name)) {
             try parseSubjectAltName(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.basic_constraints)) {
-            cert.basic_constraints_ca = try parseBasicConstraints(one, value.value);
+            const bc = try parseBasicConstraints(one, value.value);
+            cert.basic_constraints_ca = bc.ca;
+            cert.basic_constraints_path_len = bc.path_len;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.key_usage)) {
             try parseKeyUsage(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.extended_key_usage)) {
@@ -665,7 +673,9 @@ fn parseSubjectAltName(comptime CertType: type, cert: *CertType, parent: DerRead
     }
 }
 
-fn parseBasicConstraints(parent: DerReader, value: []const u8) Error!bool {
+const BasicConstraints = struct { ca: bool, path_len: ?u32 };
+
+fn parseBasicConstraints(parent: DerReader, value: []const u8) Error!BasicConstraints {
     var inner = try nestedBytes(parent, value);
     const seq_tlv = try inner.readExpected(Tag.sequence);
     try inner.expectEmpty();
@@ -675,12 +685,36 @@ fn parseBasicConstraints(parent: DerReader, value: []const u8) Error!bool {
     if (seq.hasRemaining() and try seq.peekTag() == Tag.boolean) {
         ca = try parseBoolean(try seq.readTlv());
     }
+    var path_len: ?u32 = null;
     if (seq.hasRemaining() and try seq.peekTag() == Tag.integer) {
-        const path_len = try seq.readTlv();
-        try validatePositiveInteger(path_len.value);
+        const pl = try seq.readTlv();
+        try validatePositiveInteger(pl.value);
+        path_len = derIntegerToU32(pl.value);
     }
     try seq.expectEmpty();
-    return ca;
+    return .{ .ca = ca, .path_len = path_len };
+}
+
+/// Decode a validated non-negative DER INTEGER body (big-endian, optional
+/// leading sign byte) into a u32. An absurdly large value (>4 bytes) is clamped
+/// to maxInt — a path length that big is effectively no constraint.
+fn derIntegerToU32(bytes: []const u8) u32 {
+    var v = bytes;
+    while (v.len > 0 and v[0] == 0x00) v = v[1..];
+    if (v.len == 0) return 0;
+    if (v.len > 4) return std.math.maxInt(u32);
+    var acc: u32 = 0;
+    for (v) |b| acc = (acc << 8) | b;
+    return acc;
+}
+
+test "derIntegerToU32 decodes small path-length integers" {
+    try std.testing.expectEqual(@as(u32, 0), derIntegerToU32(&.{0x00}));
+    try std.testing.expectEqual(@as(u32, 0), derIntegerToU32(&.{}));
+    try std.testing.expectEqual(@as(u32, 5), derIntegerToU32(&.{0x05}));
+    try std.testing.expectEqual(@as(u32, 200), derIntegerToU32(&.{ 0x00, 0xC8 })); // sign byte stripped
+    try std.testing.expectEqual(@as(u32, 0x0102), derIntegerToU32(&.{ 0x01, 0x02 }));
+    try std.testing.expectEqual(std.math.maxInt(u32), derIntegerToU32(&.{ 0x01, 0x02, 0x03, 0x04, 0x05 }));
 }
 
 fn nestedBytes(parent: DerReader, value: []const u8) Error!DerReader {
