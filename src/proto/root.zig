@@ -43,6 +43,7 @@ pub const cap_sts_preload = @import("cap_sts_preload.zig");
 pub const cap_values = @import("cap_values.zig");
 pub const casemap = @import("casemap.zig");
 pub const cbor = @import("cbor.zig");
+pub const cert_compression = @import("cert_compression.zig");
 pub const certfp = @import("certfp.zig");
 pub const chan_forward = @import("chan_forward.zig");
 pub const chan_log = @import("chan_log.zig");
@@ -379,6 +380,7 @@ test {
     _ = cap_values;
     _ = casemap;
     _ = cbor;
+    _ = cert_compression;
     _ = certfp;
     _ = chan_forward;
     _ = chan_log;

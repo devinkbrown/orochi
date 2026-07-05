@@ -28,6 +28,7 @@ const tls_keyshare = @import("../proto/tls_keyshare.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
+const cert_compression = @import("../proto/cert_compression.zig");
 const sni = @import("../proto/sni.zig");
 const tls_alert = @import("../proto/tls_alert.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
@@ -94,7 +95,7 @@ pub const Error = error{
     tls_signature_scheme.Error || supported_groups.Error || tls_alpn.Error ||
     tls_alert.ParseError || rsa_verify.Error || sign.VerifyError ||
     tls_psk.Error || tls_session_ticket.ParseError || tls_session_ticket.EncodeError ||
-    tls_resumption.Error || ocsp.Error;
+    tls_resumption.Error || ocsp.Error || cert_compression.Error;
 
 pub const Options = struct {
     server_name: []const u8,
@@ -141,6 +142,7 @@ const HandshakeType = enum(u8) {
     certificate_verify = 15,
     finished = 20,
     key_update = 24,
+    compressed_certificate = 25, // RFC 8879
     _,
 };
 
@@ -311,12 +313,21 @@ pub const Client = struct {
     // the tls_server mTLS loopback tests, never by the production HTTPS path.
     /// Set true once the server's CertificateRequest is seen.
     cert_requested: bool = false,
+    /// RFC 8879 diagnostic: set true when the server's certificate arrived as a
+    /// CompressedCertificate that we inflated (rather than a plain Certificate).
+    received_compressed_cert: bool = false,
     /// Borrowed client leaf DER to present, or null to present an empty
     /// Certificate (decline). Only meaningful when the server requested a cert.
     client_cert_der: ?[]const u8 = null,
     /// Key pair matching `client_cert_der`'s SPKI, used to sign the client
     /// CertificateVerify (Ed25519 or ECDSA P-256).
     client_key_pair: ?ClientCertKey = null,
+    /// RFC 8879: when true, advertise `compress_certificate` (zlib) and decode a
+    /// server's CompressedCertificate. Default false ⇒ the ClientHello is
+    /// byte-identical and no compressed-cert decode path is reachable, keeping
+    /// the outbound (ACME) TLS surface unchanged until explicitly opted in —
+    /// symmetric with the server's `enable_cert_compression`.
+    offer_cert_compression: bool = false,
     /// When true, the server certificate's chain-to-trust-anchor and DNS-name
     /// checks are skipped (the leaf key is still parsed so the server
     /// CertificateVerify signature is verified). Used only by the tls_server
@@ -659,6 +670,12 @@ pub const Client = struct {
         self.force_no_shares_for_test = true;
     }
 
+    /// Opt into RFC 8879 certificate compression: advertise `compress_certificate`
+    /// (zlib) and decode a server's CompressedCertificate under the bomb guard.
+    pub fn offerCertCompression(self: *Client) void {
+        self.offer_cert_compression = true;
+    }
+
     /// Groups this client can complete a key exchange for. Kept in sync with the
     /// supported_groups advertisement and the key_share builder in writeClientHello.
     fn supportsGroup(self: *const Client, g: supported_groups.NamedGroup) bool {
@@ -976,6 +993,15 @@ pub const Client = struct {
         // status_type=ocsp(1), empty responder_id_list, empty request_extensions.
         try ext_builder.add(ext_status_request, &[_]u8{ 1, 0, 0, 0, 0 });
 
+        // RFC 8879 certificate compression: advertise the one algorithm we can
+        // decode (zlib). algorithms_length=2, then the u16 zlib(1) code point. A
+        // server MAY then send a CompressedCertificate; our wait_certificate path
+        // inflates it under the mandatory decompression-bomb guard. Opt-in so the
+        // outbound TLS surface stays unchanged by default.
+        if (self.offer_cert_compression) {
+            try ext_builder.addTyped(.compress_certificate, &[_]u8{ 2, 0x00, 0x01 });
+        }
+
         // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
         // extension body is opaque cookie<1..2^16-1>: a u16 length then the bytes.
         if (self.cookie) |cookie| {
@@ -1228,6 +1254,19 @@ pub const Client = struct {
                     try validateCertificateRequest(msg.body);
                     self.cert_requested = true;
                     try self.appendTranscript(msg.raw);
+                } else if (msg.typ == .compressed_certificate) {
+                    // RFC 8879 §4: a CompressedCertificate we never solicited is a
+                    // protocol violation — reject it rather than decode it.
+                    if (!self.offer_cert_compression) return error.BadHandshake;
+                    // Inflate into a plain Certificate body, verify it, then fold
+                    // the type-25 wire bytes (not a reconstructed type-11) into the
+                    // transcript — exactly what the peer hashed.
+                    const plain = try self.decompressCertificate(msg.body);
+                    defer self.allocator.free(plain);
+                    try self.parseAndVerifyCertificate(plain);
+                    try self.appendTranscript(msg.raw);
+                    self.received_compressed_cert = true;
+                    self.state = .wait_certificate_verify;
                 } else {
                     if (msg.typ != .certificate) return error.BadHandshake;
                     try self.parseAndVerifyCertificate(msg.body);
@@ -1385,6 +1424,22 @@ pub const Client = struct {
             }
         }
         if (self.early_data != null) self.early_data_accepted = server_accepted_early;
+    }
+
+    /// Inflate a CompressedCertificate (RFC 8879 §5) body into the plain
+    /// Certificate message bytes. Layout: u16 algorithm, u24 uncompressed_length,
+    /// then `compressed_certificate_message<1..2^24-1>` (a u24-prefixed vector).
+    /// We only advertised zlib, so any other algorithm is a protocol violation.
+    /// Caller owns the returned slice. The bomb guard lives in `inflateZlib`.
+    fn decompressCertificate(self: *Client, body: []const u8) Error![]u8 {
+        var c = Cursor.init(body);
+        const algorithm = try c.readU16();
+        if (algorithm != cert_compression.Algorithm.zlib.toInt()) return error.BadHandshake;
+        const uncompressed_length = try c.readU24();
+        const compressed_length = try c.readU24();
+        const compressed = try c.take(compressed_length);
+        try c.expectEmpty();
+        return cert_compression.inflateZlib(self.allocator, compressed, uncompressed_length);
     }
 
     fn parseAndVerifyCertificate(self: *Client, body: []const u8) Error!void {

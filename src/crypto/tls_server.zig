@@ -35,6 +35,7 @@ const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
+const cert_compression = @import("../proto/cert_compression.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
 const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
@@ -94,7 +95,7 @@ pub const Error = error{
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
-    tls_resumption.Error;
+    tls_resumption.Error || cert_compression.Error;
 
 pub const Config = struct {
     /// DER certificates, leaf first. The leaf SPKI must match the configured
@@ -127,6 +128,13 @@ pub const Config = struct {
     /// The default is false so existing full handshakes remain byte-for-byte
     /// unchanged unless the caller opts into resumption.
     enable_session_tickets: bool = false,
+    /// RFC 8879: when true, and a client offers `compress_certificate` with an
+    /// algorithm we can produce (zlib), the Certificate message is sent as a
+    /// zlib-compressed `CompressedCertificate` — but only when that actually
+    /// shrinks it. Default false ⇒ the handshake stays byte-for-byte identical
+    /// until opted in, and even then only clients that advertised support (and
+    /// therefore can decode it) ever receive the compressed form.
+    enable_cert_compression: bool = false,
     /// Optional reusable ticket key. When omitted, `Server.init` generates a
     /// fresh per-server key; callers can retrieve it with `ticketKey()`.
     ticket_key: ?tls_resumption.TicketKey = null,
@@ -338,6 +346,11 @@ pub const Server = struct {
     /// When true AND `config.ocsp_staple` is non-empty, the leaf CertificateEntry
     /// carries the staple.
     client_requested_ocsp: bool = false,
+    /// RFC 8879: the compression algorithm negotiated from the client's
+    /// `compress_certificate` extension (only ever `.zlib`, and only when
+    /// `config.enable_cert_compression`). Null ⇒ send a plain Certificate.
+    /// Re-derived per ClientHello (so a HelloRetryRequest re-reads it).
+    cert_compression: ?cert_compression.Algorithm = null,
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
@@ -943,6 +956,7 @@ pub const Server = struct {
         var p256_share: ?[]const u8 = null;
         var hybrid_share: ?[]const u8 = null; // X25519MLKEM768 (post-quantum)
         var offered_groups: ?[]const u8 = null; // supported_groups body (for HRR)
+        var offered_cert_compression: ?cert_compression.Algorithm = null; // RFC 8879
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
@@ -967,6 +981,10 @@ pub const Server = struct {
                 },
                 .alpn => self.maybeSelectAlpn(ext.data),
                 .status_request => self.client_requested_ocsp = true,
+                .compress_certificate => if (self.config.enable_cert_compression) {
+                    // RFC 8879: remember the first algorithm we can produce (zlib).
+                    offered_cert_compression = cert_compression.pickSupported(ext.data);
+                },
                 .record_size_limit => {
                     // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
                     if (ext.data.len != 2) return error.BadHandshake;
@@ -989,6 +1007,7 @@ pub const Server = struct {
 
         if (!offered_tls13) return error.ProtocolVersion;
         self.selected_suite = full_suite;
+        self.cert_compression = offered_cert_compression;
         self.resumed = false;
         self.early_data_offered = offered_early_data;
         self.early_data_accepted = false;
@@ -1324,6 +1343,26 @@ pub const Server = struct {
         }
         try appendU24(self.allocator, &body, list.items.len);
         try body.appendSlice(self.allocator, list.items);
+
+        // RFC 8879: when the client negotiated zlib compression, send the
+        // Certificate body as a CompressedCertificate — but only if it actually
+        // shrinks (a tiny Ed25519/ECDSA chain can deflate larger). `emit` folds
+        // whichever message we send into the transcript, so the peer hashes the
+        // exact type-25 (or type-11) bytes it receives (RFC 8879 §5).
+        if (self.cert_compression == cert_compression.Algorithm.zlib) {
+            const compressed = try cert_compression.deflateZlib(self.allocator, body.items);
+            defer self.allocator.free(compressed);
+            if (compressed.len < body.items.len) {
+                var cc: std.ArrayList(u8) = .empty;
+                defer cc.deinit(self.allocator);
+                try appendU16(self.allocator, &cc, cert_compression.Algorithm.zlib.toInt());
+                try appendU24(self.allocator, &cc, body.items.len); // uncompressed_length
+                try appendU24(self.allocator, &cc, compressed.len); // compressed vector length
+                try cc.appendSlice(self.allocator, compressed);
+                try self.emit(out, .compressed_certificate, cc.items);
+                return;
+            }
+        }
         try self.emit(out, .certificate, body.items);
     }
 
@@ -1662,6 +1701,7 @@ const HandshakeType = enum(u8) {
     encrypted_extensions = 8,
     certificate_request = 13,
     certificate = 11,
+    compressed_certificate = 25, // RFC 8879
     certificate_verify = 15,
     finished = 20,
     key_update = 24,
@@ -3248,6 +3288,65 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     const got2 = try server.decrypt(c2s);
     defer alloc.free(got2);
     try std.testing.expectEqualStrings("client after retry", got2);
+}
+
+test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x88} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    // Duplicate certs make the Certificate body highly compressible (the repeats
+    // deflate to back-references), so the server's "only compress if it shrinks"
+    // guard reliably takes the compressed path.
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{ der, der, der },
+        .signing_key = kp,
+        .enable_cert_compression = true,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    // Opt into RFC 8879 compression and skip chain-to-anchor validation so the
+    // duplicated self-signed chain passes.
+    client.offerCertCompression();
+    client.skipServerCertVerifyForTest();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expect(server.cert_compression == cert_compression.Algorithm.zlib);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(client.received_compressed_cert);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const s2c = try server.encrypt("compressed cert ok");
+    defer alloc.free(s2c);
+    const got = try client.decrypt(s2c);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("compressed cert ok", got);
 }
 
 test "loopback: client rejects an expired server certificate when a clock is supplied" {
