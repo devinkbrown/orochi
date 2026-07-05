@@ -130,6 +130,36 @@ pub fn get(
     return try getTls12(allocator, fd2, host, request_bytes, opts);
 }
 
+/// Perform one HTTP POST of `body` to `url` with `content_type`, returning the
+/// full HTTP response (headers+body, caller owns). Built for the OCSP stapler,
+/// which submits a DER `OCSPRequest` (`application/ocsp-request`) to a
+/// responder's AIA URL; responder URLs are almost always plain `http://`
+/// (responses are signed, so plain transport is correct). Emits
+/// `Connection: close` so the responder ends the stream and the read loop
+/// terminates deterministically. The request line is built into a
+/// caller-scoped scratch buffer sized to the (small) body plus header framing.
+pub fn post(
+    allocator: std.mem.Allocator,
+    url: Url,
+    content_type: []const u8,
+    body: []const u8,
+    opts: Options,
+) Error![]u8 {
+    const headers = [_]http1.Header{
+        .{ .name = "Content-Type", .value = content_type },
+        .{ .name = "Accept", .value = "application/ocsp-response" },
+        .{ .name = "Connection", .value = "close" },
+    };
+    // buildRequest writes method/path/Host + each header + Content-Length + body.
+    // 256 bytes covers the fixed framing and the three short headers above.
+    const cap = body.len + url.host.len + url.path.len + content_type.len + 256;
+    const req_buf = try allocator.alloc(u8, cap);
+    defer allocator.free(req_buf);
+    const request_bytes = http1.buildRequest(req_buf, "POST", url.host, url.path, &headers, body) catch
+        return error.ResponseTooLarge;
+    return get(allocator, url.host, url.port, url.tls, request_bytes, opts);
+}
+
 /// TLS 1.2 variant of `getTls` (hardened `tls12_client`). Used as the fallback
 /// when the TLS 1.3 handshake fails — broadens outbound reach to TLS-1.2-only
 /// hosts. Mirrors `getTls` but uses the 1.2 client's `decrypt` (no KeyUpdate).

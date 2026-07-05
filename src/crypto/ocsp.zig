@@ -146,6 +146,58 @@ pub fn statusForSerial(parsed: anytype, serial: []const u8) ?CertStatus {
     return null;
 }
 
+/// The full SingleResponse matching `serial`, or null when absent. Unlike
+/// `statusForSerial` this exposes `thisUpdate`/`nextUpdate` so freshness can be
+/// evaluated on the *matching* entry rather than assuming a single-response body.
+pub fn singleForSerial(parsed: anytype, serial: []const u8) ?SingleResponse {
+    for (parsed.responses[0..parsed.response_count]) |single| {
+        if (serialsEqual(single.serial, serial)) return single;
+    }
+    return null;
+}
+
+/// Skew tolerance (seconds) applied to OCSP `thisUpdate`/`nextUpdate` when
+/// deciding whether a cached staple is still safe to serve. Five minutes covers
+/// ordinary host/responder clock drift without meaningfully weakening the
+/// revocation-freshness guarantee.
+pub const default_staple_skew_seconds: i64 = 300;
+
+/// Decide whether a raw DER OCSP response is safe to staple *right now* for the
+/// certificate with serial `leaf_serial`, given the daemon wall-clock `now_unix`
+/// (Unix seconds) and the issuer SubjectPublicKeyInfo used to authenticate the
+/// responder signature. This is the security gate the fetch service applies
+/// before caching/publishing a staple (OCSP-stapling design §5 step 4):
+///   - parse succeeds and `responseStatus == successful`;
+///   - the BasicOCSPResponse signature verifies against `issuer_spki_der`
+///     (direct-issuer signing only — delegated responders are rejected);
+///   - the SingleResponse for `leaf_serial` is present and `good`;
+///   - it carries a `nextUpdate`, and `thisUpdate <= now < nextUpdate` after
+///     applying `skew_seconds` of clock tolerance on each bound.
+/// Any parse/verify/decoding failure returns `false` rather than throwing, so a
+/// caller can treat a bad fetch as "keep the previous good staple, or none".
+pub fn isStapleServable(
+    response_der: []const u8,
+    issuer_spki_der: []const u8,
+    leaf_serial: []const u8,
+    now_unix: i64,
+    skew_seconds: i64,
+) bool {
+    const parsed = parse(response_der) catch return false;
+    if (parsed.response_status != .successful) return false;
+    if (!verifyResponseSignature(parsed, issuer_spki_der)) return false;
+
+    const single = singleForSerial(parsed, leaf_serial) orelse return false;
+    if (single.cert_status != .good) return false;
+
+    const next_bytes = single.next_update orelse return false;
+    const this_epoch = x509.generalizedTimeToEpoch(single.this_update) catch return false;
+    const next_epoch = x509.generalizedTimeToEpoch(next_bytes) catch return false;
+    if (next_epoch <= this_epoch) return false;
+    if (now_unix + skew_seconds < this_epoch) return false; // not yet valid
+    if (now_unix >= next_epoch + skew_seconds) return false; // expired
+    return true;
+}
+
 /// Verify a BasicOCSPResponse signed directly by the issuing CA.
 ///
 /// This covers the common stapling case where `signature` authenticates
@@ -710,7 +762,7 @@ test "ocsp verifyResponseSignature accepts direct issuer Ed25519 signature" {
     const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5A} ** Ed25519.KeyPair.seed_length);
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
-    const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good);
+    const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, "20260202030405Z");
     defer allocator.free(response);
 
     const parsed = try parse(response);
@@ -799,11 +851,75 @@ test "buildRequestForCerts derives the CertID from parsed leaf + issuer certs" {
     try std.testing.expect(std.mem.indexOf(u8, req, cert.serial_der) != null);
 }
 
+test "isStapleServable accepts a good, signed, in-window response" {
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7B} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, "20260202030405Z");
+    defer allocator.free(response);
+
+    // The helper stamps thisUpdate=20260102030405Z, nextUpdate=20260202030405Z.
+    const this_epoch = try x509.generalizedTimeToEpoch("20260102030405Z");
+    const next_epoch = try x509.generalizedTimeToEpoch("20260202030405Z");
+    const in_window = this_epoch + @divTrunc(next_epoch - this_epoch, 2);
+
+    try std.testing.expect(isStapleServable(response, spki, &[_]u8{0x44}, in_window, 0));
+
+    // Before thisUpdate and after nextUpdate (beyond skew) are both stale/premature.
+    try std.testing.expect(!isStapleServable(response, spki, &[_]u8{0x44}, this_epoch - 100, 0));
+    try std.testing.expect(!isStapleServable(response, spki, &[_]u8{0x44}, next_epoch + 100, 0));
+
+    // Skew tolerance lets a slightly-off clock still serve a boundary response.
+    try std.testing.expect(isStapleServable(response, spki, &[_]u8{0x44}, this_epoch - 100, 300));
+    try std.testing.expect(isStapleServable(response, spki, &[_]u8{0x44}, next_epoch + 100, 300));
+}
+
+test "isStapleServable rejects revoked, wrong-serial, and tampered responses" {
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7C} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const in_window = try x509.generalizedTimeToEpoch("20260115030405Z");
+
+    // Revoked status is never servable, even in-window and correctly signed.
+    const revoked = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .revoked, "20260202030405Z");
+    defer allocator.free(revoked);
+    try std.testing.expect(!isStapleServable(revoked, spki, &[_]u8{0x44}, in_window, 0));
+
+    const good = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, "20260202030405Z");
+    defer allocator.free(good);
+
+    // A serial the response does not cover has no matching SingleResponse.
+    try std.testing.expect(!isStapleServable(good, spki, &[_]u8{0x45}, in_window, 0));
+
+    // Any signature/body tamper fails verification.
+    const tampered = try allocator.dupe(u8, good);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    try std.testing.expect(!isStapleServable(tampered, spki, &[_]u8{0x44}, in_window, 0));
+
+    // A different issuer key fails verification even for a pristine good response.
+    const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x2D} ** Ed25519.KeyPair.seed_length);
+    const other_spki = try testEd25519Spki(allocator, other.public_key.toBytes());
+    defer allocator.free(other_spki);
+    try std.testing.expect(!isStapleServable(good, other_spki, &[_]u8{0x44}, in_window, 0));
+
+    // Garbage bytes decode-fail rather than throw.
+    try std.testing.expect(!isStapleServable("not der", spki, &[_]u8{0x44}, in_window, 0));
+
+    // A response with no nextUpdate has no verifiable upper freshness bound.
+    const no_next = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, null);
+    defer allocator.free(no_next);
+    try std.testing.expect(!isStapleServable(no_next, spki, &[_]u8{0x44}, in_window, 0));
+}
+
 fn testSignedOcspResponse(
     allocator: std.mem.Allocator,
     kp: Ed25519.KeyPair,
     serial: []const u8,
     status: CertStatus,
+    next_update: ?[]const u8,
 ) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
@@ -832,6 +948,13 @@ fn testSignedOcspResponse(
         },
     }
     try appendDerTlv(allocator, &single_body, x509.Tag.generalized_time, "20260102030405Z");
+    if (next_update) |nu| {
+        // nextUpdate is [0] EXPLICIT GeneralizedTime.
+        var next_body: std.ArrayList(u8) = .empty;
+        defer next_body.deinit(allocator);
+        try appendDerTlv(allocator, &next_body, x509.Tag.generalized_time, nu);
+        try appendDerTlv(allocator, &single_body, x509.Tag.context_0_constructed, next_body.items);
+    }
     try appendDerSeq(allocator, &responses_body, single_body.items);
     try appendDerSeq(allocator, &tbs_body, responses_body.items);
 

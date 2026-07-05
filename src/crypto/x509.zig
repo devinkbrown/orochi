@@ -884,6 +884,15 @@ fn parseGeneralizedTime(bytes: []const u8) Error!Time {
     };
 }
 
+/// Convert validated `YYYYMMDDHHMMSSZ` GeneralizedTime bytes to a Unix epoch
+/// second count. Callers that already hold validated GeneralizedTime slices
+/// (e.g. OCSP `thisUpdate`/`nextUpdate`) use this to do freshness arithmetic
+/// against a wall-clock second count without re-plumbing the private `Time`
+/// struct. Rejects any input `parseGeneralizedTime` would reject.
+pub fn generalizedTimeToEpoch(bytes: []const u8) Error!i64 {
+    return (try parseGeneralizedTime(bytes)).epoch_seconds;
+}
+
 fn twoDigits(bytes: []const u8, min: u8, max: u8) Error!u8 {
     if (bytes.len != 2) return error.InvalidTime;
     if (!std.ascii.isDigit(bytes[0]) or !std.ascii.isDigit(bytes[1])) return error.InvalidTime;
