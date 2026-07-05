@@ -2150,6 +2150,23 @@ fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(cert.tbs_der, &digest, .{});
         if (!rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, cert.signature)) return error.BadSignature;
+    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha384_rsa)) {
+        // sha384WithRSAEncryption — common on real CA intermediate/leaf certs.
+        const pk = switch (key) {
+            .rsa => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        var digest: [48]u8 = undefined;
+        std.crypto.hash.sha2.Sha384.hash(cert.tbs_der, &digest, .{});
+        if (!rsa_verify.verifyPkcs1v15(pk, .sha384, &digest, cert.signature)) return error.BadSignature;
+    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha512_rsa)) {
+        const pk = switch (key) {
+            .rsa => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        var digest: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(cert.tbs_der, &digest, .{});
+        if (!rsa_verify.verifyPkcs1v15(pk, .sha512, &digest, cert.signature)) return error.BadSignature;
     } else if (oidEq(cert.signature_algorithm_oid, &oid_rsassa_pss)) {
         const pk = switch (key) {
             .rsa => |pk| pk,
@@ -2359,6 +2376,8 @@ fn oidEq(a: []const u8, b: []const u8) bool {
 
 const oid_rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
 const oid_sha256_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
+const oid_sha384_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C };
+const oid_sha512_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
 const oid_rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
 const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
