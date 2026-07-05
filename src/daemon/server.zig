@@ -1576,6 +1576,10 @@ pub const Config = struct {
     /// completed TLS 1.3 client conn offloads server→client encryption to the
     /// kernel once its send buffer drains. Default false ⇒ TLS stays in userspace.
     tls_ktls_tx: bool = false,
+    /// kTLS RX offload gate: true only when `[tls] ktls=txrx` AND the kernel is
+    /// capable. Offloads client→server decryption to the kernel (recv() returns
+    /// plaintext). Default false ⇒ inbound stays in userspace.
+    tls_ktls_rx: bool = false,
     /// Optional hardened TLS 1.2 leg. When `tls12_signing_key` is set, the TLS
     /// listener accepts TLS 1.2 ECDHE-AEAD clients (routed by version-dispatch in
     /// tls_conn) presenting this ECDSA-P256 leaf; otherwise the listener is
@@ -1927,6 +1931,13 @@ pub const ConnState = struct {
     /// `[tls] ktls=tx` on a kTLS-capable kernel with a TLS 1.3 session.
     tls_tx_offloaded: bool = false,
     ktls_attach_pending: bool = false,
+    /// kTLS RX offload (roadmap 3.1, `[tls] ktls=txrx`): the kernel now decrypts
+    /// this conn's inbound records, so `recv()` returns plaintext that bypasses
+    /// the userspace TLS engine (routed straight to the IRC/WS layer). A control
+    /// record (KeyUpdate/close_notify) surfaces as a recv error → the conn closes.
+    /// Attached one-shot at the connected transition when the inbound is at a
+    /// clean record boundary; false unless offload is enabled for a TLS 1.3 conn.
+    tls_rx_offloaded: bool = false,
     /// Non-null for a `[listen] ws` WebSocket client: inbound (decrypted)
     /// bytes run the HTTP Upgrade then RFC 6455 deframing before the IRC line
     /// parser, and outbound IRC lines are wrapped in text frames before the
@@ -5395,6 +5406,19 @@ pub const LinuxServer = struct {
             self.driveS2sSecured(conn, link, chunk);
         } else if (conn.s2s) |link| {
             self.driveS2s(conn, link, chunk);
+        } else if (conn.tls != null and conn.tls_rx_offloaded) {
+            // kTLS RX offload: recv() already returned kernel-decrypted plaintext;
+            // route it exactly as driveTls routes its decrypted output (WS frames
+            // or IRC lines), bypassing the userspace TLS engine. A control record
+            // would have surfaced as a recv error and closed the conn upstream.
+            (if (conn.ws != null) self.driveWs(id, conn, chunk) else self.feedBytes(id, conn, chunk)) catch |err| switch (err) {
+                error.LineTooLong => {
+                    conn.close_reason = "Line too long";
+                    try self.closeConn(conn.token, conn.close_reason);
+                    return false;
+                },
+                else => return err,
+            };
         } else if (conn.tls != null) {
             self.driveTls(id, conn, chunk) catch |err| switch (err) {
                 error.LineTooLong => {
@@ -6657,6 +6681,20 @@ pub const LinuxServer = struct {
             } else {
                 try self.feedBytes(id, conn, outcome.plaintext);
             }
+        }
+        // kTLS RX offload (txrx): attach once the handshake is done and the inbound
+        // is at a clean record boundary (any app data in this chunk was just
+        // consumed above, advancing app_read_seq; no partial record is buffered),
+        // so the kernel resumes decryption from exactly app_read_seq. One-shot: a
+        // conn that still holds a partial inbound record stays on userspace RX.
+        // After this, recv() returns plaintext (routed via driveClientBytes).
+        if (self.config.tls_ktls_rx and conn.tls.?.handshakeDone() and
+            !conn.tls_rx_offloaded and conn.tls.?.negotiatedVersion() == .tls13 and
+            !conn.tls.?.hasBufferedInbound())
+        {
+            if (conn.tls.?.enableKtlsRx(conn.fd)) |_| {
+                conn.tls_rx_offloaded = true;
+            } else |_| {} // attach failed → stay on userspace RX
         }
         // If offload is pending and the send buffer is already drained (e.g. no
         // NewSessionTicket to flush), attach now; otherwise the send-completion
@@ -14632,6 +14670,9 @@ pub const LinuxServer = struct {
                     // encrypts on send); the successor's inherited-fd kernel state
                     // keeps encrypting, so it re-queues it as plaintext too.
                     .tx_offloaded = e.value.tls_tx_offloaded,
+                    // RX offload rides the inherited fd's kernel state the same way;
+                    // the successor resumes reading plaintext from recv().
+                    .rx_offloaded = e.value.tls_rx_offloaded,
                 }) catch continue;
             }
             var snap = e.value.session.snapshot();
@@ -15011,11 +15052,13 @@ pub const LinuxServer = struct {
         };
         conn.tls = t;
         conn.is_tls = true;
-        // kTLS: the predecessor's kernel TX state rides the inherited fd across
+        // kTLS: the predecessor's kernel TX/RX state rides the inherited fd across
         // execve, so re-attach nothing — just resume treating this conn as
-        // offloaded (its send seam hands the kernel plaintext, RX stays
-        // userspace). `pending_out` was carried as plaintext accordingly.
+        // offloaded (its send seam hands the kernel plaintext; recv() returns
+        // kernel-decrypted plaintext). `pending_out` was carried as plaintext
+        // accordingly.
         conn.tls_tx_offloaded = ts.tx_offloaded;
+        conn.tls_rx_offloaded = ts.rx_offloaded;
         // Re-bind the mTLS client-cert fingerprint (SASL EXTERNAL identity).
         if (ts.certfp.len == certfp.fingerprint_len) {
             @memcpy(&conn.certfp_buf, ts.certfp);

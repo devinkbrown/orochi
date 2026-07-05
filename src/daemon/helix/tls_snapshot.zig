@@ -64,6 +64,11 @@ pub const Snapshot = struct {
     /// resumes sending plaintext (RX + the engine's carried secrets/seqs stay
     /// userspace exactly as for a non-offloaded conn).
     tx_offloaded: bool = false,
+    /// kTLS RX offload: true when the predecessor had offloaded client→server
+    /// decryption. Same path-A carry: the kernel RX state survives execve on the
+    /// inherited fd, so the successor re-attaches nothing and just resumes reading
+    /// plaintext from `recv()` (routing it past the userspace TLS engine).
+    rx_offloaded: bool = false,
 };
 
 /// Encode `snap` into a freshly-allocated buffer the caller owns. The result
@@ -105,8 +110,9 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try out.appendSlice(allocator, snap.pending_out);
     try out.append(allocator, @intCast(snap.certfp.len));
     try out.appendSlice(allocator, snap.certfp);
-    // kTLS offload flag (trailing, so an older decoder tolerantly ignores it).
+    // kTLS offload flags (trailing, so an older decoder tolerantly ignores them).
     try out.append(allocator, @intFromBool(snap.tx_offloaded));
+    try out.append(allocator, @intFromBool(snap.rx_offloaded));
     return out.toOwnedSlice(allocator);
 }
 
@@ -157,9 +163,10 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     state.pending_recv = try r.take(try r.int(u32));
     const pending_out = try r.take(try r.int(u32));
     const certfp = try r.take(try r.byte());
-    // Trailing kTLS offload flag; absent in older snapshots ⇒ not offloaded.
+    // Trailing kTLS offload flags; absent in older snapshots ⇒ not offloaded.
     const tx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
-    return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx_offloaded };
+    const rx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
+    return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx_offloaded, .rx_offloaded = rx_offloaded };
 }
 
 fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) std.mem.Allocator.Error!void {
@@ -213,6 +220,7 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
         .pending_out = "queued-record",
         .certfp = "ab" ** 32,
         .tx_offloaded = true,
+        .rx_offloaded = true,
     });
     defer allocator.free(bytes);
 
@@ -228,11 +236,13 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
     try testing.expectEqualStrings("queued-record", got.pending_out);
     try testing.expectEqualStrings("ab" ** 32, got.certfp);
     try testing.expect(got.tx_offloaded);
+    try testing.expect(got.rx_offloaded);
 
-    // Tolerant decode: a snapshot missing the trailing kTLS flag (an older
+    // Tolerant decode: a snapshot missing the trailing kTLS flags (an older
     // encoder) decodes as not-offloaded rather than erroring.
-    const legacy = try decode(bytes[0 .. bytes.len - 1]);
+    const legacy = try decode(bytes[0 .. bytes.len - 2]);
     try testing.expect(!legacy.tx_offloaded);
+    try testing.expect(!legacy.rx_offloaded);
 }
 
 test "tls12 snapshot round-trips key material and seqs" {

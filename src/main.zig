@@ -490,15 +490,17 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
-                // kTLS TX offload (roadmap 3.1): activate server→client kernel
-                // encryption only when the operator opted in via `[tls] ktls` AND
-                // the running kernel offers the TLS ULP. RX offload is not yet
-                // implemented, so `txrx` currently behaves as `tx` (TX only).
+                // kTLS offload (roadmap 3.1): activate kernel record crypto only
+                // when the operator opted in via `[tls] ktls` AND the running
+                // kernel offers the TLS ULP. `tx` offloads server→client encryption;
+                // `txrx` additionally offloads client→server decryption.
                 const ktls_capable = orochi.daemon.ktls.probeUlpSupport();
                 srv_cfg.tls_ktls_tx = (h.tls.ktls != .off and ktls_capable);
+                srv_cfg.tls_ktls_rx = (h.tls.ktls == .txrx and ktls_capable);
                 if (h.tls.ktls != .off) {
                     if (ktls_capable) {
-                        std.debug.print("orochi: kTLS TX offload ACTIVE ({s}) — server→client encryption runs in the kernel for TLS 1.3 clients (RX stays userspace)\n", .{@tagName(h.tls.ktls)});
+                        const dirs = if (h.tls.ktls == .txrx) "TX+RX" else "TX";
+                        std.debug.print("orochi: kTLS {s} offload ACTIVE ({s}) — TLS 1.3 record crypto runs in the kernel\n", .{ dirs, @tagName(h.tls.ktls) });
                     } else {
                         std.debug.print("orochi: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
                     }

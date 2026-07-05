@@ -171,15 +171,22 @@ pub const TlsConn = struct {
     }
 
     /// Attach Linux kTLS RX offload to `fd`, so the kernel decrypts inbound
-    /// records and `recv()` returns plaintext. The caller MUST have consumed all
-    /// buffered inbound ciphertext into the userspace engine first (the kernel
-    /// takes over decryption from `app_read_seq`), and thereafter read via
-    /// `recvmsg` to demux control records. Only TLS 1.3 is supported.
+    /// records and `recv()` returns plaintext. The caller MUST first ensure the
+    /// inbound stream is at a clean record boundary (`hasBufferedInbound()` false)
+    /// so the kernel takes over from `app_read_seq` with no partial record left in
+    /// userspace. Only TLS 1.3 is supported.
     pub fn enableKtlsRx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try self.buildKtlsRxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachRx(fd, encoded);
+    }
+
+    /// True when a partial inbound TLS record is buffered (an incomplete record
+    /// awaiting more socket bytes). kTLS RX offload must NOT attach while this is
+    /// true — the kernel would resume mid-record and desync.
+    pub fn hasBufferedInbound(self: *const TlsConn) bool {
+        return self.recv_buf.items.len != 0;
     }
 
     /// The negotiated protocol version, or null before the engine is chosen.
@@ -726,6 +733,28 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     const n: usize = @intCast(rr);
     // recv() returns the KERNEL-DECRYPTED plaintext (not a TLS record).
     try std.testing.expectEqualStrings(msg, buf[0..n]);
+
+    // Control-record behavior (the recv-path decision-maker for RX offload): the
+    // client emits a KeyUpdate — a TLS 1.3 *control* record. The kernel decrypts
+    // it but MUST NOT hand it to a plain recv() as application data. Confirm recv()
+    // signals it distinctly (an error, typically EIO) so the daemon's recv-error
+    // path closes/handles the conn rather than feeding a control record to the IRC
+    // parser. This is why the RX recv-path can treat control records as a drop.
+    try client.sendKeyUpdateForTest();
+    const ku = (try client.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ku);
+    var ko: usize = 0;
+    while (ko < ku.len) {
+        const w = linux.write(client_fd, ku[ko..].ptr, ku.len - ko);
+        if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+        ko += @intCast(w);
+    }
+    var cbuf: [256]u8 = undefined;
+    const cr = linux.read(server_fd, &cbuf, cbuf.len);
+    // The safe invariant: a control record is never delivered as app-data
+    // plaintext. recv() returns an error (kTLS surfaces non-data records only via
+    // recvmsg + cmsg), so the byte stream is not corrupted.
+    try std.testing.expect(posix.errno(cr) != .SUCCESS);
 }
 
 test "shared ticket key and replay guard resume across TlsConn instances" {

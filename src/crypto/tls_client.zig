@@ -676,6 +676,13 @@ pub const Client = struct {
         self.offer_cert_compression = true;
     }
 
+    /// Test-only: emit a post-handshake KeyUpdate — a TLS 1.3 *control* record
+    /// (inner content_type = handshake). Drain it via `takePendingSend`. Used to
+    /// exercise how a kTLS-RX peer surfaces a non-application-data record.
+    pub fn sendKeyUpdateForTest(self: *Client) Error!void {
+        try self.sendKeyUpdate(.not_requested);
+    }
+
     /// Groups this client can complete a key exchange for. Kept in sync with the
     /// supported_groups advertisement and the key_share builder in writeClientHello.
     fn supportsGroup(self: *const Client, g: supported_groups.NamedGroup) bool {
