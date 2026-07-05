@@ -67,6 +67,24 @@ pub fn refreshDelaySeconds(
     return std.math.clamp(delay, min_s, max_s);
 }
 
+/// Retry delay after `failures` consecutive responder-fetch failures: exponential
+/// backoff starting at `min_s` and doubling each additional failure, clamped to
+/// `max_s`. `failures == 0/1` yields `min_s`. Keeps a down responder from being
+/// hammered every check interval while still recovering within `max_s`.
+pub fn backoffSeconds(failures: u32, min_s: i64, max_s: i64) i64 {
+    var delay = min_s;
+    var n: u32 = 1;
+    while (n < failures and delay < max_s) : (n += 1) {
+        // Guard against i64 overflow on an absurd `max_s`; we clamp anyway.
+        if (delay > @divTrunc(std.math.maxInt(i64), 2)) {
+            delay = max_s;
+            break;
+        }
+        delay *= 2;
+    }
+    return std.math.clamp(delay, min_s, max_s);
+}
+
 /// Extract the DER OCSPResponse body from a complete HTTP response, or null if
 /// the status is not 200 or the body is empty. `http_response` is decoded in
 /// place (chunked/Content-Length framing); the returned slice aliases it.
@@ -91,6 +109,10 @@ pub const Service = struct {
     last_serial: [max_serial_len]u8 = undefined,
     last_serial_len: usize = 0,
     next_refresh_unix: i64 = 0,
+    // Exponential-backoff state so a down responder isn't re-contacted every check
+    // interval. Reset on a successful publish or a leaf-serial change.
+    fail_count: u32 = 0,
+    next_retry_unix: i64 = 0,
     // One-shot log gates for persistent skip conditions (avoid per-wake spam).
     warned_no_issuer: bool = false,
     warned_no_aia: bool = false,
@@ -176,22 +198,46 @@ pub const Service = struct {
         self.warned_no_aia = false;
 
         const now = @divTrunc(platform.realtimeMillis(), 1000);
+
+        // A cert rotation (new serial vs the last published one) deserves a fresh
+        // attempt, not the backoff accumulated against the previous leaf.
+        if (self.last_serial_len != 0 and
+            !std.mem.eql(u8, self.last_serial[0..self.last_serial_len], leaf.serial_der))
+        {
+            self.fail_count = 0;
+            self.next_retry_unix = 0;
+        }
+
         // A still-valid staple for this exact serial doesn't need re-fetching yet.
         if (self.hasFreshStapleFor(leaf.serial_der, now)) return;
+        // Back off after consecutive failures instead of re-hammering a down
+        // responder every check interval.
+        if (now < self.next_retry_unix) return;
 
-        self.fetchAndPublish(leaf, issuer, now);
+        if (!self.fetchAndPublish(leaf, issuer, now)) self.noteFetchFailure(now);
     }
 
-    fn fetchAndPublish(self: *Service, leaf: x509.Certificate, issuer: x509.Certificate, now: i64) void {
+    /// Record a failed fetch and schedule the next attempt with exponential
+    /// backoff (`backoffSeconds`). Bounded so the counter can't wrap.
+    fn noteFetchFailure(self: *Service, now: i64) void {
+        if (self.fail_count < std.math.maxInt(u32)) self.fail_count += 1;
+        const delay = backoffSeconds(self.fail_count, self.opts.min_refresh_seconds, self.opts.max_refresh_seconds);
+        self.next_retry_unix = now + delay;
+        dlog.log("orochi: ocsp fetch retry backing off {d}s after {d} consecutive failure(s)\n", .{ delay, self.fail_count });
+    }
+
+    /// Returns true when a fresh, servable staple was published; false on any
+    /// failure (so the caller can apply backoff).
+    fn fetchAndPublish(self: *Service, leaf: x509.Certificate, issuer: x509.Certificate, now: i64) bool {
         const req = ocsp.buildRequestForCerts(self.allocator, leaf, issuer) catch |err| {
             dlog.log("orochi: ocsp staple skipped: cannot build request ({s})\n", .{@errorName(err)});
-            return;
+            return false;
         };
         defer self.allocator.free(req);
 
         const url = http_fetch.parseUrl(leaf.aia_ocsp_url) catch {
             dlog.log("orochi: ocsp staple skipped: malformed AIA URL\n", .{});
-            return;
+            return false;
         };
         // The OCSPResponse is signature-verified against the issuer below, so the
         // responder's transport authentication is not load-bearing — skip cert
@@ -203,13 +249,13 @@ pub const Service = struct {
             .max_response_bytes = self.opts.max_response_bytes,
         }) catch |err| {
             dlog.log("orochi: ocsp fetch failed ({s}); keeping current staple\n", .{@errorName(err)});
-            return;
+            return false;
         };
         defer self.allocator.free(http_resp);
 
         const der = extractOcspBody(http_resp) orelse {
             dlog.log("orochi: ocsp fetch: responder returned no usable OCSPResponse body\n", .{});
-            return;
+            return false;
         };
 
         // Surface a revocation of our OWN leaf loudly; never staple it. Trust the
@@ -222,7 +268,7 @@ pub const Service = struct {
                 if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
                     if (status == .revoked) {
                         dlog.log("orochi: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
-                        return;
+                        return false;
                     }
                 }
             }
@@ -230,15 +276,16 @@ pub const Service = struct {
 
         if (!ocsp.isStapleServable(der, issuer.spki_der, leaf.serial_der, now, self.opts.skew_seconds)) {
             dlog.log("orochi: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
-            return;
+            return false;
         }
 
         const owned = self.allocator.dupe(u8, der) catch {
             dlog.log("orochi: ocsp staple skipped: out of memory copying response\n", .{});
-            return;
+            return false;
         };
         self.server.publishOcspStaple(owned);
         self.recordPublished(der, leaf.serial_der, now);
+        return true;
     }
 
     /// True when the last published staple covers `serial` and it is not yet time
@@ -252,6 +299,9 @@ pub const Service = struct {
     /// Record the serial + schedule the next responder contact from the freshly
     /// published response's thisUpdate/nextUpdate (falls back to min interval).
     fn recordPublished(self: *Service, der: []const u8, serial: []const u8, now: i64) void {
+        // A successful publish clears the failure backoff.
+        self.fail_count = 0;
+        self.next_retry_unix = 0;
         if (serial.len <= max_serial_len) {
             @memcpy(self.last_serial[0..serial.len], serial);
             self.last_serial_len = serial.len;
@@ -303,6 +353,21 @@ test "refreshDelaySeconds halves the validity window, clamped" {
     // A very long window clamps down to the daily ceiling.
     const long_next = this_u + 30 * 24 * 60 * 60;
     try std.testing.expectEqual(@as(i64, 86_400), refreshDelaySeconds(this_u, long_next, this_u, 60, 86_400));
+}
+
+test "backoffSeconds doubles per failure, clamped to [min,max]" {
+    // 0/1 failures → the minimum.
+    try std.testing.expectEqual(@as(i64, 300), backoffSeconds(0, 300, 86_400));
+    try std.testing.expectEqual(@as(i64, 300), backoffSeconds(1, 300, 86_400));
+    // Then doubles each additional failure.
+    try std.testing.expectEqual(@as(i64, 600), backoffSeconds(2, 300, 86_400));
+    try std.testing.expectEqual(@as(i64, 1200), backoffSeconds(3, 300, 86_400));
+    try std.testing.expectEqual(@as(i64, 2400), backoffSeconds(4, 300, 86_400));
+    // Clamps to max once the doubling would exceed it, and stays there.
+    try std.testing.expectEqual(@as(i64, 86_400), backoffSeconds(20, 300, 86_400));
+    try std.testing.expectEqual(@as(i64, 86_400), backoffSeconds(std.math.maxInt(u32), 300, 86_400));
+    // A tiny window never returns below min even for 1 failure.
+    try std.testing.expectEqual(@as(i64, 300), backoffSeconds(1, 300, 300));
 }
 
 test "extractOcspBody returns body only for a 200 with content" {
