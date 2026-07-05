@@ -254,6 +254,8 @@ pub const AttachError = error{
     /// The kernel refused the TX crypto state (unsupported suite/kernel, or the
     /// socket was not ESTABLISHED).
     KtlsTxUnsupported,
+    /// The kernel refused the RX crypto state (as `KtlsTxUnsupported`, RX side).
+    KtlsRxUnsupported,
 };
 
 /// Attach the TLS ULP to `fd` (`setsockopt(SOL_TCP, TCP_ULP, "tls")`). One-way
@@ -262,7 +264,13 @@ pub const AttachError = error{
 pub fn attachUlp(fd: linux.fd_t) AttachError!void {
     if (builtin.os.tag != .linux) return error.KtlsUlpUnsupported;
     const rc = linux.setsockopt(fd, @intCast(SOL_TCP), TCP_ULP, ulp_name.ptr, @intCast(ulp_name.len));
-    if (posix.errno(rc) != .SUCCESS) return error.KtlsUlpUnsupported;
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        // The TLS ULP is already attached — we only ever attach "tls", so EEXIST
+        // means a prior direction (TX before RX on the same conn) already did it.
+        .EXIST => {},
+        else => return error.KtlsUlpUnsupported,
+    }
 }
 
 /// Install the server→client TX crypto state (`setsockopt(SOL_TLS, TLS_TX)`) from
@@ -273,6 +281,18 @@ pub fn attachTx(fd: linux.fd_t, crypto_info: []const u8) AttachError!void {
     if (builtin.os.tag != .linux) return error.KtlsTxUnsupported;
     const rc = linux.setsockopt(fd, @intCast(SOL_TLS), TLS_TX, crypto_info.ptr, @intCast(crypto_info.len));
     if (posix.errno(rc) != .SUCCESS) return error.KtlsTxUnsupported;
+}
+
+/// Install the client→server RX crypto state (`setsockopt(SOL_TLS, TLS_RX)`) from
+/// an already-encoded `crypto_info`. Requires `attachUlp` first and an
+/// ESTABLISHED socket; thereafter the kernel decrypts inbound records and
+/// `recv()` returns plaintext application data (control records must be read via
+/// `recvmsg` + a `TLS_GET_RECORD_TYPE` cmsg — the recv-path wiring for that is a
+/// later phase).
+pub fn attachRx(fd: linux.fd_t, crypto_info: []const u8) AttachError!void {
+    if (builtin.os.tag != .linux) return error.KtlsRxUnsupported;
+    const rc = linux.setsockopt(fd, @intCast(SOL_TLS), TLS_RX, crypto_info.ptr, @intCast(crypto_info.len));
+    if (posix.errno(rc) != .SUCCESS) return error.KtlsRxUnsupported;
 }
 
 // ---------------------------------------------------------------------------

@@ -517,6 +517,27 @@ pub const Server = struct {
         };
     }
 
+    /// RX offload parameters for a connected TLS 1.3 session: the client→server
+    /// (decrypt) direction — the client application key, the client's 12-byte
+    /// static IV, and the current read sequence. Same `KtlsTxParams` shape (the
+    /// kernel `crypto_info` is direction-agnostic). Null before the handshake.
+    /// `key` aliases the live traffic key — exposed only for the offload path.
+    pub fn ktlsRxParams(self: *const Server) ?KtlsTxParams {
+        if (self.state != .connected) return null;
+        const suite = self.selected_suite orelse return null;
+        const cipher: KtlsCipher = switch (suite) {
+            .tls_aes_128_gcm_sha256 => .aes_128_gcm,
+            .tls_aes_256_gcm_sha384 => .aes_256_gcm,
+            .tls_chacha20_poly1305_sha256 => .chacha20_poly1305,
+        };
+        return .{
+            .cipher = cipher,
+            .key = self.client_app_keys.key[0..suite.keyLen()],
+            .iv = self.client_app_keys.iv,
+            .seq = self.app_read_seq,
+        };
+    }
+
     /// True when the current handshake accepted a PSK ticket and used the
     /// abbreviated TLS 1.3 resumption flight.
     pub fn acceptedSessionTicket(self: *const Server) bool {

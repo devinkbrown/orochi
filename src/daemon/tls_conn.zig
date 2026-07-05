@@ -124,6 +124,17 @@ pub const TlsConn = struct {
         KtlsUnsupportedEngine,
     } || ktls.Error || ktls.AttachError;
 
+    /// Map a `tls_server` kTLS param bundle to an encoded kernel `crypto_info`.
+    fn encodeKtlsCryptoInfo(params: tls_server.Server.KtlsTxParams, out: []u8) KtlsError![]const u8 {
+        const cipher: ktls.Cipher = switch (params.cipher) {
+            .aes_128_gcm => .aes_gcm_128,
+            .aes_256_gcm => .aes_gcm_256,
+            .chacha20_poly1305 => .chacha20_poly1305,
+        };
+        const info = try ktls.tls13CryptoInfo(cipher, &params.iv, params.key, params.seq);
+        return info.encode(out);
+    }
+
     /// Encode this session's server→client TX `crypto_info` into `out` (see
     /// `ktls.CryptoInfo.encode`), ready for `setsockopt(TLS_TX)`. Only the TLS 1.3
     /// engine is supported (1.2 kTLS derivation is deferred to a later phase);
@@ -134,13 +145,17 @@ pub const TlsConn = struct {
             .tls13 => |*s| s.ktlsTxParams() orelse return error.KtlsUnsupportedEngine,
             .undecided, .tls12 => return error.KtlsUnsupportedEngine,
         };
-        const cipher: ktls.Cipher = switch (params.cipher) {
-            .aes_128_gcm => .aes_gcm_128,
-            .aes_256_gcm => .aes_gcm_256,
-            .chacha20_poly1305 => .chacha20_poly1305,
+        return encodeKtlsCryptoInfo(params, out);
+    }
+
+    /// The client→server RX `crypto_info` (for `setsockopt(TLS_RX)`). Same
+    /// constraints as `buildKtlsTxCryptoInfo`.
+    pub fn buildKtlsRxCryptoInfo(self: *const TlsConn, out: []u8) KtlsError![]const u8 {
+        const params = switch (self.engine) {
+            .tls13 => |*s| s.ktlsRxParams() orelse return error.KtlsUnsupportedEngine,
+            .undecided, .tls12 => return error.KtlsUnsupportedEngine,
         };
-        const info = try ktls.tls13CryptoInfo(cipher, &params.iv, params.key, params.seq);
-        return info.encode(out);
+        return encodeKtlsCryptoInfo(params, out);
     }
 
     /// Attach Linux kTLS TX offload to `fd` for the completed TLS 1.3 session, so
@@ -153,6 +168,18 @@ pub const TlsConn = struct {
         const encoded = try self.buildKtlsTxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachTx(fd, encoded);
+    }
+
+    /// Attach Linux kTLS RX offload to `fd`, so the kernel decrypts inbound
+    /// records and `recv()` returns plaintext. The caller MUST have consumed all
+    /// buffered inbound ciphertext into the userspace engine first (the kernel
+    /// takes over decryption from `app_read_seq`), and thereafter read via
+    /// `recvmsg` to demux control records. Only TLS 1.3 is supported.
+    pub fn enableKtlsRx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
+        var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        const encoded = try self.buildKtlsRxCryptoInfo(&buf);
+        try ktls.attachUlp(fd);
+        try ktls.attachRx(fd, encoded);
     }
 
     /// The negotiated protocol version, or null before the engine is chosen.
@@ -632,6 +659,73 @@ test "kTLS TX offload: the kernel encrypts server writes and tls_client decrypts
     const got = try client.decrypt(rec[0..n]);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(msg, got);
+}
+
+test "kTLS RX offload: the kernel decrypts client records into recv() plaintext" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    // In-memory TLS 1.3 handshake → a connected TlsConn whose keys the client
+    // shares (so records the client encrypts, the kernel — using our RX
+    // crypto_info from the same keys — can decrypt).
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // Real ESTABLISHED loopback pair.
+    const listen_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(listen_fd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+    addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+    const client_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(client_fd);
+    if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+    const server_fd: linux.fd_t = @intCast(accept_rc);
+    defer _ = linux.close(server_fd);
+
+    // Offload RX (client→server decrypt) to the kernel. app_read_seq is 0 (no
+    // inbound app data consumed yet), matching the client's write seq 0.
+    conn.enableKtlsRx(server_fd) catch return error.SkipZigTest;
+
+    // The client encrypts an app record; the KERNEL decrypts it on recv().
+    const msg = "kernel-decrypted client->server hello";
+    const rec = try client.encrypt(msg);
+    defer alloc.free(rec);
+    var off: usize = 0;
+    while (off < rec.len) {
+        const wr = linux.write(client_fd, rec[off..].ptr, rec.len - off);
+        if (posix.errno(wr) != .SUCCESS) return error.SkipZigTest;
+        off += @intCast(wr);
+    }
+
+    var buf: [256]u8 = undefined;
+    const rr = linux.read(server_fd, &buf, buf.len);
+    if (posix.errno(rr) != .SUCCESS) return error.SkipZigTest;
+    const n: usize = @intCast(rr);
+    // recv() returns the KERNEL-DECRYPTED plaintext (not a TLS record).
+    try std.testing.expectEqualStrings(msg, buf[0..n]);
 }
 
 test "shared ticket key and replay guard resume across TlsConn instances" {
