@@ -81,6 +81,9 @@ const Oid = struct {
     // id-kp-serverAuth (1.3.6.1.5.5.7.3.1) and anyExtendedKeyUsage (2.5.29.37.0).
     const eku_server_auth = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01 };
     const eku_any = [_]u8{ 0x55, 0x1D, 0x25, 0x00 };
+    // id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9) — a delegated OCSP responder's cert
+    // MUST carry this (RFC 6960 §4.2.2.2). anyExtendedKeyUsage does NOT satisfy it.
+    const eku_ocsp_signing = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09 };
     // authorityInfoAccess (1.3.6.1.5.5.7.1.1); id-ad-ocsp (1.3.6.1.5.5.7.48.1).
     const authority_info_access = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 };
     const id_ad_ocsp = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
@@ -237,9 +240,12 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         key_usage_cert_sign: bool,
         /// ExtendedKeyUsage extension (2.5.29.37). `eku_present` is false when
         /// absent. `eku_server_auth` is true when id-kp-serverAuth or
-        /// anyExtendedKeyUsage is listed.
+        /// anyExtendedKeyUsage is listed. `eku_ocsp_signing` is true ONLY when
+        /// id-kp-OCSPSigning is listed (anyExtendedKeyUsage does not count — RFC
+        /// 6960 requires the specific OID on a delegated OCSP responder cert).
         eku_present: bool,
         eku_server_auth: bool,
+        eku_ocsp_signing: bool,
         /// NameConstraints extension (2.5.29.30) dNSName subtrees. Only meaningful
         /// when `name_constraints_present`. When `nc_permitted_dns_count > 0`, a
         /// constrained dNSName must match one permitted subtree; it must match no
@@ -275,6 +281,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .key_usage_cert_sign = false,
                 .eku_present = false,
                 .eku_server_auth = false,
+                .eku_ocsp_signing = false,
                 .name_constraints_present = false,
                 .nc_permitted_dns = undefined,
                 .nc_permitted_dns_count = 0,
@@ -707,6 +714,11 @@ fn parseExtendedKeyUsage(comptime CertType: type, cert: *CertType, parent: DerRe
         {
             cert.eku_server_auth = true;
         }
+        // id-kp-OCSPSigning only — anyExtendedKeyUsage deliberately does NOT
+        // authorize OCSP delegation (RFC 6960 §4.2.2.2 wants the exact OID).
+        if (std.mem.eql(u8, oid_tlv.value, &Oid.eku_ocsp_signing)) {
+            cert.eku_ocsp_signing = true;
+        }
     }
 }
 
@@ -1003,6 +1015,7 @@ test "parse embedded certificate and compute certfp" {
     try std.testing.expect(!cert.key_usage_cert_sign);
     try std.testing.expect(!cert.eku_present);
     try std.testing.expect(!cert.eku_server_auth);
+    try std.testing.expect(!cert.eku_ocsp_signing);
 
     var cert_hex: [64]u8 = undefined;
     var spki_hex: [64]u8 = undefined;

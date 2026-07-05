@@ -10,6 +10,7 @@
 //! freshness or authenticity of the result.
 const std = @import("std");
 const x509 = @import("x509.zig");
+const x509_verify = @import("x509_verify.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
 
@@ -56,6 +57,18 @@ pub const CertStatus = enum {
     unknown,
 };
 
+/// How the BasicOCSPResponse identifies its signer (RFC 6960 ResponderID).
+pub const ResponderIdKind = enum {
+    /// No responderID captured (parse skipped it / absent).
+    none,
+    /// byName [1]: the responder's subject `Name`. `responder_id_value` is the
+    /// full `Name` TLV, to byte-compare against a cert's `subject_der`.
+    by_name,
+    /// byKey [2]: SHA-1 of the responder's subjectPublicKey. `responder_id_value`
+    /// is that 20-byte KeyHash.
+    by_key,
+};
+
 pub const SingleResponse = struct {
     /// AlgorithmIdentifier.algorithm from CertID.hashAlgorithm.
     hash_algorithm_oid: []const u8,
@@ -87,6 +100,17 @@ pub fn ParsedResponse(comptime max_responses: usize) type {
         signature_algorithm_oid: []const u8,
         /// Raw bytes from BasicOCSPResponse.signature BIT STRING.
         signature_value: []const u8,
+        /// How tbsResponseData.responderID names the signer. Defaulted so a
+        /// hand-built literal (e.g. a status-decision test) need not set the
+        /// delegation fields.
+        responder_id_kind: ResponderIdKind = .none,
+        /// The ResponderID payload (byName: the `Name` TLV; byKey: the 20-byte
+        /// KeyHash). A view into the OCSP DER input.
+        responder_id_value: []const u8 = &.{},
+        /// BasicOCSPResponse.certs [0] content — a `SEQUENCE OF Certificate` (the
+        /// embedded delegated-responder cert chain), or empty when absent. A view
+        /// into the OCSP DER input.
+        certs_der: []const u8 = &.{},
         responses: [max_responses]SingleResponse,
         response_count: usize,
 
@@ -114,6 +138,9 @@ pub fn parseBounded(comptime max_responses: usize, der: []const u8) Error!Parsed
         .tbs_response_data_der = &.{},
         .signature_algorithm_oid = &.{},
         .signature_value = &.{},
+        .responder_id_kind = .none,
+        .responder_id_value = &.{},
+        .certs_der = &.{},
         .responses = undefined,
         .response_count = 0,
     };
@@ -168,8 +195,9 @@ pub const default_staple_skew_seconds: i64 = 300;
 /// responder signature. This is the security gate the fetch service applies
 /// before caching/publishing a staple (OCSP-stapling design §5 step 4):
 ///   - parse succeeds and `responseStatus == successful`;
-///   - the BasicOCSPResponse signature verifies against `issuer_spki_der`
-///     (direct-issuer signing only — delegated responders are rejected);
+///   - the BasicOCSPResponse signature verifies against `issuer_spki_der`,
+///     accepting either direct-issuer signing OR an issuer-authorized delegated
+///     responder cert (`id-kp-OCSPSigning`, ResponderID-matched, in-window);
 ///   - the SingleResponse for `leaf_serial` is present and `good`;
 ///   - it carries a `nextUpdate`, and `thisUpdate <= now < nextUpdate` after
 ///     applying `skew_seconds` of clock tolerance on each bound.
@@ -184,7 +212,7 @@ pub fn isStapleServable(
 ) bool {
     const parsed = parse(response_der) catch return false;
     if (parsed.response_status != .successful) return false;
-    if (!verifyResponseSignature(parsed, issuer_spki_der)) return false;
+    if (!verifyResponseSignatureWithChain(parsed, issuer_spki_der, now_unix)) return false;
 
     const single = singleForSerial(parsed, leaf_serial) orelse return false;
     if (single.cert_status != .good) return false;
@@ -221,6 +249,85 @@ pub fn verifyResponseSignature(parsed: anytype, issuer_spki_der: []const u8) boo
         parsed.tbs_response_data_der,
         parsed.signature_value,
     );
+}
+
+/// Verify a BasicOCSPResponse that is EITHER directly issuer-signed OR signed by
+/// a delegated responder (RFC 6960 §4.2.2.2 — the majority of public CAs). The
+/// delegated path authorizes an embedded responder cert BEFORE trusting its
+/// signature: the cert must
+///   - match the response's ResponderID (byName or byKey),
+///   - carry id-kp-OCSPSigning (anyExtendedKeyUsage deliberately does NOT count),
+///   - be valid at `now_unix`, and
+///   - be signed by `issuer_spki_der` — the CA that issued the certificate whose
+///     status this response asserts.
+/// Only then is the BasicOCSPResponse signature checked under the responder key.
+/// `now_unix` is Unix seconds (used only for the responder-cert validity window).
+///
+/// Fail-closed: false on any parse/authorization/verification failure. A
+/// multi-cert `certs` chain is NOT walked to a different root — only a responder
+/// DIRECTLY delegated by `issuer_spki_der` is honored (the RFC 6960 common case).
+pub fn verifyResponseSignatureWithChain(parsed: anytype, issuer_spki_der: []const u8, now_unix: i64) bool {
+    // Direct issuer signing — the common stapling case; try it first.
+    if (verifyResponseSignature(parsed, issuer_spki_der)) return true;
+
+    // Delegated responder: needs a ResponderID, an embedded cert, and a signature.
+    if (parsed.responder_id_kind == .none or parsed.certs_der.len == 0) return false;
+    if (parsed.tbs_response_data_der.len == 0 or
+        parsed.signature_algorithm_oid.len == 0 or
+        parsed.signature_value.len == 0)
+    {
+        return false;
+    }
+
+    var reader = x509.DerReader.init(parsed.certs_der);
+    const seq = reader.readExpected(x509.Tag.sequence) catch return false;
+    var certs = reader.child(seq) catch return false;
+    while (certs.hasRemaining()) {
+        // `readTlv` (not `readExpected`) so a non-Certificate element is SKIPPED,
+        // not fatal: a valid responder cert after a malformed sibling is still
+        // tried. A length-malformed TLV can't be skipped safely, so stop there.
+        const cert_tlv = certs.readTlv() catch break;
+        if (cert_tlv.tag != x509.Tag.sequence) continue;
+        if (delegateAuthorizesResponse(parsed, cert_tlv.raw, issuer_spki_der, now_unix)) return true;
+    }
+    return false;
+}
+
+/// True when `cert_der` is an issuer-authorized OCSP responder that signed
+/// `parsed`. See `verifyResponseSignatureWithChain` for the authorization rules.
+fn delegateAuthorizesResponse(parsed: anytype, cert_der: []const u8, issuer_spki_der: []const u8, now_unix: i64) bool {
+    const cert = x509.Certificate.parse(cert_der) catch return false;
+    // (a) Authorized for OCSP signing by the exact EKU (RFC 6960 §4.2.2.2).
+    if (!cert.eku_ocsp_signing) return false;
+    // (b) Is the responder the response committed to in its ResponderID.
+    if (!responderIdMatchesCert(parsed, cert)) return false;
+    // (c) Within its own validity window at `now_unix`.
+    x509_verify.validateDerAt(cert_der, now_unix) catch return false;
+    // (d) Issued (signed) by the trusted CA — `linkInfo` exposes the outer
+    //     signature that the parsed Certificate view does not.
+    const link = x509_verify.linkInfo(cert_der) catch return false;
+    x509_verify.verifyCertSignature(link.tbs_der, link.signature_der, link.sig_alg_oid, issuer_spki_der) catch return false;
+    // (e) The response must verify under this authorized responder's key.
+    return verifyDerSignature(
+        parsed.signature_algorithm_oid,
+        cert.spki_der,
+        parsed.tbs_response_data_der,
+        parsed.signature_value,
+    );
+}
+
+fn responderIdMatchesCert(parsed: anytype, cert: x509.Certificate) bool {
+    return switch (parsed.responder_id_kind) {
+        .by_name => std.mem.eql(u8, parsed.responder_id_value, cert.subject_der),
+        .by_key => blk: {
+            const Sha1 = std.crypto.hash.Sha1;
+            var key_hash: [Sha1.digest_length]u8 = undefined;
+            Sha1.hash(cert.subject_public_key, &key_hash, .{});
+            break :blk parsed.responder_id_value.len == key_hash.len and
+                std.mem.eql(u8, parsed.responder_id_value, &key_hash);
+        },
+        .none => false,
+    };
 }
 
 /// Verify an X.509-style DER signature whose key is carried in SPKI form.
@@ -284,7 +391,10 @@ fn parseBasicOcspResponse(
     parsed.signature_algorithm_oid = try parseAlgorithmIdentifier(body, try body.readExpected(x509.Tag.sequence));
     parsed.signature_value = try parseSignatureBitString(try body.readExpected(x509.Tag.bit_string));
     if (body.hasRemaining()) {
-        _ = try body.readExpected(x509.Tag.context_0_constructed); // certs
+        // certs [0] EXPLICIT SEQUENCE OF Certificate — captured for delegated
+        // responder authorization; its content is the `SEQUENCE OF Certificate`.
+        const certs_explicit = try body.readExpected(x509.Tag.context_0_constructed);
+        parsed.certs_der = certs_explicit.value;
     }
     try body.expectEmpty();
 
@@ -305,10 +415,28 @@ fn parseResponseData(
 
     const responder = try tbs.readTlv();
     switch (responder.tag) {
-        x509.Tag.context_1_constructed,
-        Asn1Tag.context_2_primitive,
-        Asn1Tag.context_2_constructed,
-        => {},
+        x509.Tag.context_1_constructed => {
+            // byName [1] EXPLICIT Name — the wrapper holds the subject `Name`
+            // SEQUENCE; capture it whole for a byte-compare against subject_der.
+            var inner = try parent.child(responder);
+            const name = try inner.readExpected(x509.Tag.sequence);
+            parsed.responder_id_kind = .by_name;
+            parsed.responder_id_value = name.raw;
+        },
+        Asn1Tag.context_2_constructed => {
+            // byKey [2] EXPLICIT KeyHash (OCTET STRING) — the SHA-1 of the
+            // responder's subjectPublicKey.
+            var inner = try parent.child(responder);
+            const oct = try inner.readExpected(x509.Tag.octet_string);
+            parsed.responder_id_kind = .by_key;
+            parsed.responder_id_value = oct.value;
+        },
+        Asn1Tag.context_2_primitive => {
+            // byKey [2] IMPLICIT (lenient — some encoders emit a primitive
+            // OCTET STRING) — the value is the KeyHash directly.
+            parsed.responder_id_kind = .by_key;
+            parsed.responder_id_value = responder.value;
+        },
         else => return error.InvalidOcspResponse,
     }
 
@@ -989,6 +1117,301 @@ fn testSignedOcspResponse(
     errdefer outer.deinit(allocator);
     try appendDerSeq(allocator, &outer, outer_body.items);
     return outer.toOwnedSlice(allocator);
+}
+
+/// Build a BasicOCSPResponse signed by a DELEGATED responder (ECDSA-P256):
+/// `responder_id_der` is the fully-encoded ResponderID element (byKey/byName, any
+/// tagging), the response is signed with `responder_kp`, and `responder_cert_der`
+/// is embedded in `certs [0]`. Status good, thisUpdate 2026-01-02, nextUpdate
+/// `next_update`.
+fn testDelegatedOcspResponse(
+    allocator: std.mem.Allocator,
+    responder_kp: ecdsa_p256.KeyPair,
+    responder_cert_der: []const u8,
+    responder_id_der: []const u8,
+    serial: []const u8,
+    next_update: []const u8,
+) ![]u8 {
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(allocator);
+    try tbs_body.appendSlice(allocator, responder_id_der); // responderID
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.generalized_time, "20260102030405Z"); // producedAt
+
+    var single_body: std.ArrayList(u8) = .empty;
+    defer single_body.deinit(allocator);
+    var cert_id_body: std.ArrayList(u8) = .empty;
+    defer cert_id_body.deinit(allocator);
+    try appendAlgId(allocator, &cert_id_body, &oid_sha1, true);
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x11} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x22} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.integer, serial);
+    try appendDerSeq(allocator, &single_body, cert_id_body.items);
+    try appendDerTlv(allocator, &single_body, Asn1Tag.context_0_primitive, ""); // certStatus good
+    try appendDerTlv(allocator, &single_body, x509.Tag.generalized_time, "20260102030405Z"); // thisUpdate
+    var next_body: std.ArrayList(u8) = .empty;
+    defer next_body.deinit(allocator);
+    try appendDerTlv(allocator, &next_body, x509.Tag.generalized_time, next_update);
+    try appendDerTlv(allocator, &single_body, x509.Tag.context_0_constructed, next_body.items); // nextUpdate [0]
+
+    var responses_body: std.ArrayList(u8) = .empty;
+    defer responses_body.deinit(allocator);
+    try appendDerSeq(allocator, &responses_body, single_body.items);
+    try appendDerSeq(allocator, &tbs_body, responses_body.items);
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
+    try appendDerSeq(allocator, &tbs, tbs_body.items);
+
+    // Sign tbsResponseData with the responder key (ECDSA-P256/SHA-256).
+    const sig = try ecdsa_p256.sign(tbs.items, responder_kp);
+    var sig_der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+
+    var basic_body: std.ArrayList(u8) = .empty;
+    defer basic_body.deinit(allocator);
+    try basic_body.appendSlice(allocator, tbs.items);
+    try appendAlgId(allocator, &basic_body, &oid_ecdsa_sha256, false);
+    try appendDerBitString(allocator, &basic_body, sig_der);
+    // certs [0] EXPLICIT SEQUENCE OF Certificate { responder }.
+    var certs_seq: std.ArrayList(u8) = .empty;
+    defer certs_seq.deinit(allocator);
+    try appendDerSeq(allocator, &certs_seq, responder_cert_der);
+    try appendDerTlv(allocator, &basic_body, x509.Tag.context_0_constructed, certs_seq.items);
+
+    var basic: std.ArrayList(u8) = .empty;
+    defer basic.deinit(allocator);
+    try appendDerSeq(allocator, &basic, basic_body.items);
+
+    var rb_body: std.ArrayList(u8) = .empty;
+    defer rb_body.deinit(allocator);
+    try appendDerTlv(allocator, &rb_body, x509.Tag.oid, &Oid.ocsp_basic);
+    try appendDerTlv(allocator, &rb_body, x509.Tag.octet_string, basic.items);
+    var rb: std.ArrayList(u8) = .empty;
+    defer rb.deinit(allocator);
+    try appendDerSeq(allocator, &rb, rb_body.items);
+
+    var outer_body: std.ArrayList(u8) = .empty;
+    defer outer_body.deinit(allocator);
+    try appendDerTlv(allocator, &outer_body, Asn1Tag.enumerated, &[_]u8{0});
+    try appendDerTlv(allocator, &outer_body, x509.Tag.context_0_constructed, rb.items);
+    var outer: std.ArrayList(u8) = .empty;
+    errdefer outer.deinit(allocator);
+    try appendDerSeq(allocator, &outer, outer_body.items);
+    return outer.toOwnedSlice(allocator);
+}
+
+/// SHA-1 of a cert's subjectPublicKey — the byKey ResponderID hash.
+fn responderKeyHashFromCert(cert_der: []const u8) ![20]u8 {
+    const cert = try x509.Certificate.parse(cert_der);
+    var kh: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(cert.subject_public_key, &kh, .{});
+    return kh;
+}
+
+/// ResponderID byKey [2] IMPLICIT (primitive OCTET STRING contents) — the lenient
+/// encoding many responders emit. Caller frees.
+fn ridByKeyPrimitive(allocator: std.mem.Allocator, key_hash: []const u8) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(allocator);
+    try appendDerTlv(allocator, &b, Asn1Tag.context_2_primitive, key_hash);
+    return b.toOwnedSlice(allocator);
+}
+
+/// ResponderID byKey [2] EXPLICIT { KeyHash OCTET STRING } — the RFC 6960 form.
+/// Caller frees.
+fn ridByKeyExplicit(allocator: std.mem.Allocator, key_hash: []const u8) ![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try appendDerTlv(allocator, &inner, x509.Tag.octet_string, key_hash);
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(allocator);
+    try appendDerTlv(allocator, &b, Asn1Tag.context_2_constructed, inner.items);
+    return b.toOwnedSlice(allocator);
+}
+
+/// ResponderID byName [1] EXPLICIT Name — `subject_der` is the responder cert's
+/// subject `Name` TLV (itself a SEQUENCE). Caller frees.
+fn ridByName(allocator: std.mem.Allocator, subject_der: []const u8) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(allocator);
+    try appendDerTlv(allocator, &b, x509.Tag.context_1_constructed, subject_der);
+    return b.toOwnedSlice(allocator);
+}
+
+test "isStapleServable accepts a delegated OCSP responder (issuer-signed + OCSPSigning EKU)" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+
+    // CA (issuer) and the delegated responder each get their own P-256 key.
+    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+
+    // The CA cert — we authorize the responder against ITS public key (SPKI).
+    var ca_buf: [1024]u8 = undefined;
+    const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
+        .common_name = "ocsp.ca.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = issuer_kp,
+        .is_ca = true,
+    });
+    const ca = try x509.Certificate.parse(ca_der);
+
+    // The delegated responder cert: ISSUER-signed, id-kp-OCSPSigning.
+    var resp_buf: [1024]u8 = undefined;
+    const responder_der = try x509_selfsign.buildEcdsaP256IssuedBy(&resp_buf, .{
+        .common_name = "ocsp.responder.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x02},
+        .key_pair = responder_kp,
+        .eku_ocsp_signing = true,
+    }, issuer_kp);
+    const key_hash = try responderKeyHashFromCert(responder_der);
+    const rid = try ridByKeyPrimitive(allocator, &key_hash);
+    defer allocator.free(rid);
+
+    const response = try testDelegatedOcspResponse(allocator, responder_kp, responder_der, rid, &[_]u8{0x44}, "20260202030405Z");
+    defer allocator.free(response);
+
+    const this_epoch = try x509.generalizedTimeToEpoch("20260102030405Z");
+    const next_epoch = try x509.generalizedTimeToEpoch("20260202030405Z");
+    const in_window = this_epoch + @divTrunc(next_epoch - this_epoch, 2);
+
+    // Accepted: authorized responder, matched ResponderID, good + in window.
+    try std.testing.expect(isStapleServable(response, ca.spki_der, &[_]u8{0x44}, in_window, 0));
+    // Rejected under a DIFFERENT issuer key (the responder was not delegated by it).
+    const other_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var other_buf: [1024]u8 = undefined;
+    const other_der = try x509_selfsign.buildSelfSignedEcdsaP256(&other_buf, .{
+        .common_name = "other.ca.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x03},
+        .key_pair = other_kp,
+        .is_ca = true,
+    });
+    const other = try x509.Certificate.parse(other_der);
+    try std.testing.expect(!isStapleServable(response, other.spki_der, &[_]u8{0x44}, in_window, 0));
+}
+
+test "isStapleServable rejects a responder cert lacking id-kp-OCSPSigning" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+
+    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+
+    var ca_buf: [1024]u8 = undefined;
+    const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
+        .common_name = "ocsp.ca.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = issuer_kp,
+        .is_ca = true,
+    });
+    const ca = try x509.Certificate.parse(ca_der);
+
+    // Issuer-signed but WITHOUT the OCSPSigning EKU — must not be trusted to
+    // sign OCSP responses (a plain issuer-signed leaf is not a responder).
+    var resp_buf: [1024]u8 = undefined;
+    const responder_der = try x509_selfsign.buildEcdsaP256IssuedBy(&resp_buf, .{
+        .common_name = "not.a.responder.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x02},
+        .key_pair = responder_kp,
+        .eku_ocsp_signing = false,
+    }, issuer_kp);
+    const key_hash = try responderKeyHashFromCert(responder_der);
+    const rid = try ridByKeyPrimitive(allocator, &key_hash);
+    defer allocator.free(rid);
+
+    const response = try testDelegatedOcspResponse(allocator, responder_kp, responder_der, rid, &[_]u8{0x44}, "20260202030405Z");
+    defer allocator.free(response);
+
+    const this_epoch = try x509.generalizedTimeToEpoch("20260102030405Z");
+    const next_epoch = try x509.generalizedTimeToEpoch("20260202030405Z");
+    const in_window = this_epoch + @divTrunc(next_epoch - this_epoch, 2);
+    try std.testing.expect(!isStapleServable(response, ca.spki_der, &[_]u8{0x44}, in_window, 0));
+}
+
+test "delegated OCSP: byName + EXPLICIT-byKey accept; ResponderID-mismatch and wrong-signer reject" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+    const serial = &[_]u8{0x44};
+
+    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+
+    var ca_buf: [1024]u8 = undefined;
+    const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
+        .common_name = "ocsp.ca.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = issuer_kp,
+        .is_ca = true,
+    });
+    const ca = try x509.Certificate.parse(ca_der);
+
+    var resp_buf: [1024]u8 = undefined;
+    const responder_der = try x509_selfsign.buildEcdsaP256IssuedBy(&resp_buf, .{
+        .common_name = "ocsp.responder.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x02},
+        .key_pair = responder_kp,
+        .eku_ocsp_signing = true,
+    }, issuer_kp);
+    const responder = try x509.Certificate.parse(responder_der);
+
+    const this_epoch = try x509.generalizedTimeToEpoch("20260102030405Z");
+    const next_epoch = try x509.generalizedTimeToEpoch("20260202030405Z");
+    const in_window = this_epoch + @divTrunc(next_epoch - this_epoch, 2);
+
+    // (1) byName [1] EXPLICIT accept — exercises the byName parse + match arm.
+    {
+        const rid = try ridByName(allocator, responder.subject_der);
+        defer allocator.free(rid);
+        const resp = try testDelegatedOcspResponse(allocator, responder_kp, responder_der, rid, serial, "20260202030405Z");
+        defer allocator.free(resp);
+        try std.testing.expect(isStapleServable(resp, ca.spki_der, serial, in_window, 0));
+    }
+
+    // (2) byKey [2] EXPLICIT { OCTET STRING } accept — exercises that parse branch.
+    var kh: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(responder.subject_public_key, &kh, .{});
+    {
+        const rid = try ridByKeyExplicit(allocator, &kh);
+        defer allocator.free(rid);
+        const resp = try testDelegatedOcspResponse(allocator, responder_kp, responder_der, rid, serial, "20260202030405Z");
+        defer allocator.free(resp);
+        try std.testing.expect(isStapleServable(resp, ca.spki_der, serial, in_window, 0));
+    }
+
+    // (3) ResponderID names a DIFFERENT subject than the embedded cert → reject at
+    //     the binding check (b), even though the cert is issuer-signed + OCSP-EKU.
+    {
+        const rid = try ridByName(allocator, ca.subject_der); // the CA's name, not the responder's
+        defer allocator.free(rid);
+        const resp = try testDelegatedOcspResponse(allocator, responder_kp, responder_der, rid, serial, "20260202030405Z");
+        defer allocator.free(resp);
+        try std.testing.expect(!isStapleServable(resp, ca.spki_der, serial, in_window, 0));
+    }
+
+    // (4) Response signed by a key OTHER than the responder's → passes (a)-(d) but
+    //     the response-signature check (e) fails. Isolates (e).
+    {
+        const wrong_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+        const rid = try ridByKeyPrimitive(allocator, &kh);
+        defer allocator.free(rid);
+        const resp = try testDelegatedOcspResponse(allocator, wrong_kp, responder_der, rid, serial, "20260202030405Z");
+        defer allocator.free(resp);
+        try std.testing.expect(!isStapleServable(resp, ca.spki_der, serial, in_window, 0));
+    }
 }
 
 fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.encoded_length]u8) ![]u8 {

@@ -65,6 +65,9 @@ pub const EcdsaP256Params = struct {
     /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
     /// own trust anchor (self-signed root). Off by default.
     is_ca: bool = false,
+    /// Emit an ExtendedKeyUsage extension listing id-kp-OCSPSigning — marks the
+    /// cert as a delegated OCSP responder (RFC 6960 §4.2.2.2). Off by default.
+    eku_ocsp_signing: bool = false,
 };
 
 pub const RsaParams = struct {
@@ -118,6 +121,8 @@ const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x
 const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
+const oid_extended_key_usage = [_]u8{ 0x55, 0x1d, 0x25 }; // 2.5.29.37
+const oid_eku_ocsp_signing = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09 }; // 1.3.6.1.5.5.7.3.9
 const oid_authority_info_access = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 };
 const oid_id_ad_ocsp = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
 const oid_tls_feature = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
@@ -173,6 +178,34 @@ pub fn buildSelfSignedEcdsaP256(out: []u8, params: EcdsaP256Params) ![]const u8 
     const public_sec1 = params.key_pair.public_key.toUncompressedSec1();
     const tbs = try buildTbs(&tbs_buf, params, .ecdsa_p256_sha256, .{ .ecdsa_p256_sec1 = public_sec1 });
     const sig = try ecdsa_p256.sign(tbs, params.key_pair);
+    var sig_der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+
+    var cert_body_buf: [1600]u8 = undefined;
+    var cert_body = DerWriter.init(&cert_body_buf);
+    try cert_body.write(tbs);
+    try writeSignatureAlgorithmIdentifier(&cert_body, .ecdsa_p256_sha256);
+    try writeSignatureBitString(&cert_body, sig_der);
+
+    var cert = DerWriter.init(out);
+    try cert.tlv(tag_sequence, cert_body.bytes());
+    return cert.bytes();
+}
+
+/// Like `buildSelfSignedEcdsaP256`, but the TBS is signed by `issuer_key` rather
+/// than the subject's own key — an ISSUER-signed leaf. The subject SPKI is still
+/// `params.key_pair`'s public key. Used to mint a delegated OCSP responder cert
+/// (issuer-signed, `eku_ocsp_signing`) for tests. The subject/issuer Names both
+/// read `params.common_name`; delegation authorization checks the issuer's
+/// SIGNATURE over this cert (not a Name chain), so that is sufficient here.
+pub fn buildEcdsaP256IssuedBy(out: []u8, params: EcdsaP256Params, issuer_key: ecdsa_p256.KeyPair) ![]const u8 {
+    if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
+    try validateParams(params);
+
+    var tbs_buf: [1400]u8 = undefined;
+    const public_sec1 = params.key_pair.public_key.toUncompressedSec1();
+    const tbs = try buildTbs(&tbs_buf, params, .ecdsa_p256_sha256, .{ .ecdsa_p256_sec1 = public_sec1 });
+    const sig = try ecdsa_p256.sign(tbs, issuer_key);
     var sig_der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
     const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
 
@@ -245,7 +278,11 @@ fn buildTbs(out: []u8, params: anytype, signature_algorithm: SignatureAlgorithm,
     try writeValidity(&body, params.not_before, params.not_after);
     try writeName(&body, params.common_name);
     try writeSubjectPublicKeyInfo(&body, public_key);
-    if (params.dns_names.len != 0 or params.ip_addresses.len != 0 or params.is_ca) try writeExtensions(&body, params);
+    var want_ext = params.dns_names.len != 0 or params.ip_addresses.len != 0 or params.is_ca;
+    if (comptime @hasField(@TypeOf(params), "eku_ocsp_signing")) {
+        if (params.eku_ocsp_signing) want_ext = true;
+    }
+    if (want_ext) try writeExtensions(&body, params);
 
     var tbs = DerWriter.init(out);
     try tbs.tlv(tag_sequence, body.bytes());
@@ -298,6 +335,19 @@ fn writeExtensions(w: *DerWriter, params: anytype) !void {
             var aia = DerWriter.init(&aia_buf);
             try aia.tlv(tag_sequence, ad_seq.bytes());
             try writeExtension(&seq, &oid_authority_info_access, false, aia.bytes());
+        }
+    }
+
+    if (comptime @hasField(@TypeOf(params), "eku_ocsp_signing")) {
+        if (params.eku_ocsp_signing) {
+            // ExtendedKeyUsage ::= SEQUENCE OF KeyPurposeId { id-kp-OCSPSigning }.
+            var eku_buf: [16]u8 = undefined;
+            var eku = DerWriter.init(&eku_buf);
+            try eku.tlv(tag_oid, &oid_eku_ocsp_signing);
+            var eku_seq_buf: [20]u8 = undefined;
+            var eku_seq = DerWriter.init(&eku_seq_buf);
+            try eku_seq.tlv(tag_sequence, eku.bytes());
+            try writeExtension(&seq, &oid_extended_key_usage, false, eku_seq.bytes());
         }
     }
 
