@@ -264,7 +264,10 @@ pub const Service = struct {
         // real authenticator), so an unsigned injected "revoked" must not forge a
         // CRITICAL alert.
         if (ocsp.parse(der)) |parsed| {
-            if (ocsp.verifyResponseSignature(parsed, issuer.spki_der)) {
+            // Chain-aware: honor a revoked verdict signed by an issuer-authorized
+            // delegated responder too (the common CA setup), not just a directly
+            // issuer-signed one — otherwise a real revocation could be missed.
+            if (ocsp.verifyResponseSignatureWithChain(parsed, issuer.spki_der, now)) {
                 if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
                     if (status == .revoked) {
                         dlog.log("orochi: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});

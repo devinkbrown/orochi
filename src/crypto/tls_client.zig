@@ -1484,7 +1484,7 @@ pub const Client = struct {
             const leaf = try x509.parse(chain[0]);
             const issuer_der = if (chain.len > 1) chain[1] else chain[0];
             const issuer_parts = try extractCertParts(issuer_der);
-            try verifyOcspStapleForLeaf(staple, issuer_parts.spki_der, leaf.serial_der);
+            try verifyOcspStapleForLeaf(staple, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
@@ -2022,9 +2022,19 @@ fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
 /// Absence is handled by the caller. A signed `good`, signed `unknown`, or a
 /// signed response with no matching SingleResponse soft-passes; a matching
 /// `revoked` SingleResponse fails closed.
-fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, leaf_serial: []const u8) Error!void {
+///
+/// `now_unix` (the client's validity clock) enables delegated-responder
+/// authorization (RFC 6960 §4.2.2.2 — most public CAs), which needs a clock to
+/// check the responder cert's validity window. Without a clock we fall back to
+/// direct-issuer signing only (fail-closed: a delegated staple is rejected rather
+/// than trusted with an unverifiable responder-cert lifetime).
+fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, leaf_serial: []const u8, now_unix: ?i64) Error!void {
     const parsed = try ocsp.parse(staple_der);
-    if (!ocsp.verifyResponseSignature(parsed, issuer_spki_der)) return error.BadCertificate;
+    const authenticated = if (now_unix) |now|
+        ocsp.verifyResponseSignatureWithChain(parsed, issuer_spki_der, now)
+    else
+        ocsp.verifyResponseSignature(parsed, issuer_spki_der);
+    if (!authenticated) return error.BadCertificate;
     try enforceOcspStatusForSerial(parsed, leaf_serial);
 }
 
