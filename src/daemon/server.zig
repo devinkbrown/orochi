@@ -1550,6 +1550,12 @@ pub const Config = struct {
     tls_cert_chain: []const []const u8 = &.{},
     /// Ed25519 key matching the leaf cert's SPKI; signs each TLS CertificateVerify.
     tls_signing_key: ?std.crypto.sign.Ed25519.KeyPair = null,
+    /// Cached, verified DER OCSPResponse stapled into the leaf when the client
+    /// offers status_request. Null = no staple (byte-identical handshakes).
+    /// Published by the OCSP fetch service via `publishOcspStaple` and swapped in
+    /// on reactor 0 by `maybeSwapOcspStaple`; borrows a server-owned generation
+    /// (`ocsp_staple_owned`).
+    tls_ocsp_staple: ?[]const u8 = null,
     /// RSA key matching the leaf cert's SPKI; signs TLS 1.3 CertificateVerify
     /// with rsa_pss_rsae_sha256, and TLS 1.2 ServerKeyExchange with
     /// rsa_pkcs1_sha256 when the hardened 1.2 leg is enabled for an RSA leaf.
@@ -2761,6 +2767,21 @@ pub const LinuxServer = struct {
     /// paths through live REHASH while ACME is enabled is intentionally unsupported;
     /// REHASH still uses `reload_parsed` for its own operator-requested reload.
     acme_reload_tls: ?*const config_format.Config.Tls = null,
+    /// Cross-thread OCSP-staple signal: the fetch worker sets this after handing a
+    /// freshly verified OCSPResponse DER to `ocsp_staple_incoming`. Reactor 0
+    /// consumes it on the housekeeping tick (`maybeSwapOcspStaple`) and swaps the
+    /// live `config.tls_ocsp_staple`, so the worker never touches listener state.
+    ocsp_staple_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Worker→reactor-0 handoff slot for the next staple DER (server-owned).
+    /// Guarded by `ocsp_staple_lock` because the fetch worker writes it off the
+    /// reactor thread. Non-null only between `publishOcspStaple` and the reactor
+    /// consuming it.
+    ocsp_staple_incoming: ?[]u8 = null,
+    ocsp_staple_lock: std.atomic.Mutex = .unlocked,
+    /// The live staple generation `config.tls_ocsp_staple` borrows. Reactor 0 owns
+    /// it, freeing the prior generation when it publishes a new one; freed on
+    /// deinit. Null until the first staple is published.
+    ocsp_staple_owned: ?[]u8 = null,
     /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
     /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
     /// wake eventfd now live on `reactor`.)
@@ -3262,6 +3283,7 @@ pub const LinuxServer = struct {
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = request_client_cert,
         };
+        if (self.config.tls_ocsp_staple) |staple| cfg.ocsp_staple = staple;
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
@@ -3286,6 +3308,15 @@ pub const LinuxServer = struct {
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = self.config.tls_request_client_cert,
         };
+        // Only staple on the 1.2 leg when it presents the SAME leaf as the 1.3
+        // leg (shared chain object). An Ed25519 1.3 leaf forces a separately
+        // minted ECDSA 1.2 leaf whose serial the staple does not cover, so it must
+        // not be stapled (design §6 signing-key independence).
+        if (self.config.tls_ocsp_staple) |staple| {
+            if (self.config.tls12_cert_chain.len != 0 and self.config.tls_cert_chain.len != 0 and
+                self.config.tls12_cert_chain[0].ptr == self.config.tls_cert_chain[0].ptr)
+                cfg.ocsp_staple = staple;
+        }
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
@@ -3449,6 +3480,9 @@ pub const LinuxServer = struct {
         // generation is main-owned and is never freed here.
         if (self.reload_tls) |*t| t.deinit(self.allocator);
         if (self.reload_tls12) |*t| t.deinit(self.allocator);
+        // Free the live + not-yet-consumed OCSP staple generations, if any.
+        if (self.ocsp_staple_owned) |owned| self.allocator.free(owned);
+        if (self.ocsp_staple_incoming) |incoming| self.allocator.free(incoming);
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -3639,6 +3673,7 @@ pub const LinuxServer = struct {
             };
         }
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
+        if (self.rx() == &self.reactors[0]) self.maybeSwapOcspStaple();
         self.sweepTimeouts();
         // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
         // maintenance; runs under the same world write lock as hold/check/release).
@@ -24351,6 +24386,35 @@ pub const LinuxServer = struct {
         self.acme_reload_requested.store(true, .release);
     }
 
+    /// Hand a freshly verified OCSPResponse DER (server-owned; this takes it) to
+    /// reactor 0 for publication. Called from the OCSP fetch worker thread, so the
+    /// handoff slot is mutex-guarded; the atomic wakes the reactor's housekeeping
+    /// tick. If a prior staple is still waiting to be consumed it is freed here so
+    /// only the newest staple is ever published.
+    pub fn publishOcspStaple(self: *LinuxServer, owned_der: []u8) void {
+        lockSpin(&self.ocsp_staple_lock);
+        if (self.ocsp_staple_incoming) |prior| self.allocator.free(prior);
+        self.ocsp_staple_incoming = owned_der;
+        self.ocsp_staple_lock.unlock();
+        self.ocsp_staple_pending.store(true, .release);
+    }
+
+    /// Reactor-0 side of the OCSP-staple handoff: swap in the newest staple and
+    /// free the prior live generation. Runs only on reactor 0 (like
+    /// `maybeReloadAcmeTls`), serialized with per-connection `tls*Config` reads by
+    /// the same completion lock that guards `config.tls_cert_chain` swaps.
+    fn maybeSwapOcspStaple(self: *LinuxServer) void {
+        if (!self.ocsp_staple_pending.swap(false, .acq_rel)) return;
+        lockSpin(&self.ocsp_staple_lock);
+        const incoming = self.ocsp_staple_incoming;
+        self.ocsp_staple_incoming = null;
+        self.ocsp_staple_lock.unlock();
+        const next = incoming orelse return;
+        self.config.tls_ocsp_staple = next;
+        if (self.ocsp_staple_owned) |prior| self.allocator.free(prior);
+        self.ocsp_staple_owned = next;
+    }
+
     fn maybeReloadAcmeTls(self: *LinuxServer) void {
         if (!self.acme_reload_requested.swap(false, .acq_rel)) return;
         const tls = self.acme_reload_tls orelse {
@@ -24438,6 +24502,11 @@ pub const LinuxServer = struct {
         if (self.reload_tls12) |*prior| prior.deinit(self.allocator);
         self.reload_tls = loaded;
         self.reload_tls12 = new_tls12;
+
+        // The new leaf has a new serial, so any cached staple no longer covers it.
+        // Stop stapling until the OCSP fetch worker publishes a fresh response for
+        // the new serial; the owned buffer is freed on the next publish/deinit.
+        self.config.tls_ocsp_staple = null;
         return .reloaded;
     }
 
