@@ -81,6 +81,11 @@ const Oid = struct {
     // id-kp-serverAuth (1.3.6.1.5.5.7.3.1) and anyExtendedKeyUsage (2.5.29.37.0).
     const eku_server_auth = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01 };
     const eku_any = [_]u8{ 0x55, 0x1D, 0x25, 0x00 };
+    // authorityInfoAccess (1.3.6.1.5.5.7.1.1); id-ad-ocsp (1.3.6.1.5.5.7.48.1).
+    const authority_info_access = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 };
+    const id_ad_ocsp = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
+    // id-pe-tlsfeature (1.3.6.1.5.5.7.1.24) — OCSP must-staple carrier.
+    const tls_feature = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
 };
 
 pub const TimeKind = enum { utc, generalized };
@@ -206,6 +211,12 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         /// The raw subjectPublicKey BIT STRING value WITHOUT the leading
         /// unused-bits octet — the `issuer_key_bytes` an OCSP CertID hashes.
         subject_public_key: []const u8,
+        /// The id-ad-ocsp responder URI from authorityInfoAccess (empty if absent):
+        /// where to fetch an OCSP response to staple.
+        aia_ocsp_url: []const u8,
+        /// True when the cert carries the TLS Feature (id-pe-tlsfeature) extension
+        /// listing status_request(5) — OCSP must-staple.
+        must_staple: bool,
         not_before: Time,
         not_after: Time,
         signature_algorithm_oid: []const u8,
@@ -248,6 +259,8 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .spki_value = &.{},
                 .subject_der = &.{},
                 .subject_public_key = &.{},
+                .aia_ocsp_url = &.{},
+                .must_staple = false,
                 .not_before = emptyTime(),
                 .not_after = emptyTime(),
                 .signature_algorithm_oid = &.{},
@@ -580,7 +593,42 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
             try parseExtendedKeyUsage(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.name_constraints)) {
             try parseNameConstraints(CertType, cert, one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.authority_info_access)) {
+            try parseAuthorityInfoAccess(CertType, cert, one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.tls_feature)) {
+            try parseTlsFeature(CertType, cert, one, value.value);
         }
+    }
+}
+
+/// authorityInfoAccess (RFC 5280 §4.2.2.1): capture the id-ad-ocsp responder URI
+/// (GeneralName uniformResourceIdentifier, context-primitive tag [6] = 0x86).
+fn parseAuthorityInfoAccess(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
+    var inner = try nestedBytes(parent, value);
+    const seq_tlv = try inner.readExpected(Tag.sequence); // SEQUENCE OF AccessDescription
+    try inner.expectEmpty();
+    var seq = try inner.child(seq_tlv);
+    while (seq.hasRemaining()) {
+        const ad_tlv = try seq.readExpected(Tag.sequence); // AccessDescription
+        var ad = try seq.child(ad_tlv);
+        const method = try ad.readExpected(Tag.oid);
+        if (std.mem.eql(u8, method.value, &Oid.id_ad_ocsp) and ad.hasRemaining()) {
+            const loc = try ad.readTlv();
+            if (loc.tag == 0x86 and cert.aia_ocsp_url.len == 0) cert.aia_ocsp_url = loc.value;
+        }
+    }
+}
+
+/// id-pe-tlsfeature (RFC 7633): `Features ::= SEQUENCE OF INTEGER`. Set
+/// `must_staple` when status_request(5) is present.
+fn parseTlsFeature(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
+    var inner = try nestedBytes(parent, value);
+    const seq_tlv = try inner.readExpected(Tag.sequence);
+    try inner.expectEmpty();
+    var seq = try inner.child(seq_tlv);
+    while (seq.hasRemaining()) {
+        const feat = try seq.readExpected(Tag.integer);
+        if (feat.value.len == 1 and feat.value[0] == 5) cert.must_staple = true;
     }
 }
 

@@ -42,6 +42,11 @@ pub const Params = struct {
     /// basicConstraints pathLenConstraint (0..=127 supported by this test
     /// builder). Only emitted when `is_ca` and set. Null omits it.
     path_len: ?u8 = null,
+    /// Emit an authorityInfoAccess extension with this id-ad-ocsp responder URI.
+    /// Empty omits it.
+    ocsp_url: []const u8 = &.{},
+    /// Emit the id-pe-tlsfeature extension listing status_request(5) — must-staple.
+    must_staple: bool = false,
 };
 
 pub const EcdsaP256Params = struct {
@@ -113,6 +118,9 @@ const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x
 const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
+const oid_authority_info_access = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 };
+const oid_id_ad_ocsp = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
+const oid_tls_feature = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
 const tag_boolean: u8 = 0x01;
 const tag_octet_string: u8 = 0x04;
 const tag_context_3_constructed: u8 = 0xa3;
@@ -274,6 +282,36 @@ fn writeExtensions(w: *DerWriter, params: anytype) !void {
         var san = DerWriter.init(&san_buf);
         try san.tlv(tag_sequence, names.bytes());
         try writeExtension(&seq, &oid_subject_alt_name, false, san.bytes());
+    }
+
+    if (comptime @hasField(@TypeOf(params), "ocsp_url")) {
+        if (params.ocsp_url.len != 0) {
+            // AIA ::= SEQUENCE OF AccessDescription{ OID id-ad-ocsp, [6] URI }.
+            var ad_buf: [320]u8 = undefined;
+            var ad = DerWriter.init(&ad_buf);
+            try ad.tlv(tag_oid, &oid_id_ad_ocsp);
+            try ad.tlv(0x86, params.ocsp_url); // [6] uniformResourceIdentifier
+            var ad_seq_buf: [340]u8 = undefined;
+            var ad_seq = DerWriter.init(&ad_seq_buf);
+            try ad_seq.tlv(tag_sequence, ad.bytes());
+            var aia_buf: [360]u8 = undefined;
+            var aia = DerWriter.init(&aia_buf);
+            try aia.tlv(tag_sequence, ad_seq.bytes());
+            try writeExtension(&seq, &oid_authority_info_access, false, aia.bytes());
+        }
+    }
+
+    if (comptime @hasField(@TypeOf(params), "must_staple")) {
+        if (params.must_staple) {
+            // TLS Feature ::= SEQUENCE { INTEGER 5 (status_request) }.
+            var feat_buf: [8]u8 = undefined;
+            var feat = DerWriter.init(&feat_buf);
+            try feat.tlv(tag_integer, &.{0x05});
+            var tf_buf: [12]u8 = undefined;
+            var tf = DerWriter.init(&tf_buf);
+            try tf.tlv(tag_sequence, feat.bytes());
+            try writeExtension(&seq, &oid_tls_feature, false, tf.bytes());
+        }
     }
 
     var explicit_buf: [768]u8 = undefined;
@@ -767,6 +805,26 @@ test "x509 exposes subject_der + raw subject_public_key (OCSP CertID inputs)" {
     // For an Ed25519 cert the raw subjectPublicKey (BIT STRING value minus the
     // unused-bits octet) is exactly the 32-byte public key.
     try testing.expectEqualSlices(u8, &params.key_pair.public_key.toBytes(), cert.subject_public_key);
+}
+
+test "x509 extracts AIA OCSP responder URL + must-staple flag" {
+    const x509 = @import("../crypto/x509.zig");
+    var out: [1024]u8 = undefined;
+
+    var params = try testParams();
+    params.dns_names = &.{"aia.test"};
+    params.ocsp_url = "http://ocsp.example.test/";
+    params.must_staple = true;
+    const cert = try x509.parse(try buildSelfSigned(&out, params));
+    try testing.expectEqualStrings("http://ocsp.example.test/", cert.aia_ocsp_url);
+    try testing.expect(cert.must_staple);
+
+    // Absent by default (no AIA / no TLS-feature extension).
+    var plain = try testParams();
+    plain.dns_names = &.{"plain.test"};
+    const c2 = try x509.parse(try buildSelfSigned(&out, plain));
+    try testing.expectEqual(@as(usize, 0), c2.aia_ocsp_url.len);
+    try testing.expect(!c2.must_staple);
 }
 
 test "buildSelfSignedEcdsaP256 emits P-256 SPKI and ECDSA-SHA256 signature" {
