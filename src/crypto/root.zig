@@ -41,6 +41,7 @@ pub const tls12_client = @import("tls12_client.zig");
 pub const tls12_server = @import("tls12_server.zig");
 pub const tls12 = @import("tls12.zig");
 pub const tls_client = @import("tls_client.zig");
+pub const tls_fuzz = @import("tls_fuzz.zig");
 pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
 pub const tls_record = @import("tls_record.zig");
@@ -101,6 +102,7 @@ test {
     _ = tls12_server;
     _ = tls12;
     _ = tls_client;
+    _ = tls_fuzz;
     _ = tls_kat;
     _ = tls_props;
     _ = tls_record;
