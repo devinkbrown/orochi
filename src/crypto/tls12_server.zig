@@ -91,6 +91,10 @@ pub const Config = struct {
     /// AEAD key sealing/opening ticket blobs. Shared with the TLS 1.3 leg so a
     /// successor process resumes either. Required when tickets are enabled.
     ticket_key: ?tls_resumption.TicketKey = null,
+    /// Optional PREVIOUS ticket key retained across a rotation (see the TLS 1.3
+    /// `Config.previous_ticket_key`): new tickets seal under `ticket_key`; on
+    /// open, a ticket failing under the current key is retried under this one.
+    previous_ticket_key: ?tls_resumption.TicketKey = null,
     /// Single-use guard against ticket replay. Shared with the TLS 1.3 leg.
     replay_guard: ?*tls_resumption.ReplayGuard = null,
     /// Wall-clock seconds at handshake time (the crypto layer takes no clock).
@@ -811,7 +815,7 @@ pub const Server = struct {
         const key = self.config.ticket_key orelse return false;
         const ticket = self.presented_ticket orelse return false;
 
-        const opened = tls_resumption.openTicket(self.allocator, key, ticket) catch return false;
+        const opened = tls_resumption.openTicketWithRotation(self.allocator, key, self.config.previous_ticket_key, ticket) catch return false;
         // opened.plain holds the cleartext session (incl. the 48-byte master_secret);
         // wipe it before returning the allocation.
         defer {

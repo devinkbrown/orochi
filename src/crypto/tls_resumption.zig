@@ -172,11 +172,33 @@ pub fn sealTicket(
 }
 
 /// Open a server-side ticket blob. Returned slices alias `out_plain`.
+/// Result of opening a ticket: the decrypted plaintext (caller frees) plus the
+/// parsed session fields.
+pub const OpenedTicketResult = struct { plain: []u8, opened: OpenedTicket };
+
+/// Open a ticket trying the current key first, then an optional previous key.
+/// Lets a server rotate its ticket key (install a fresh current, keep the old
+/// as `previous`) without invalidating tickets still in flight — the same
+/// rotate-with-previous pattern as the host-cloak `previous_secret`. A retired
+/// or forged ticket fails AEAD-open under both keys, so nothing is accepted that
+/// wasn't sealed by one of them.
+pub fn openTicketWithRotation(
+    allocator: Allocator,
+    current: TicketKey,
+    previous: ?TicketKey,
+    ticket: []const u8,
+) Error!OpenedTicketResult {
+    return openTicket(allocator, current, ticket) catch |err| {
+        if (previous) |pk| return openTicket(allocator, pk, ticket);
+        return err;
+    };
+}
+
 pub fn openTicket(
     allocator: Allocator,
     key: TicketKey,
     ticket: []const u8,
-) Error!struct { plain: []u8, opened: OpenedTicket } {
+) Error!OpenedTicketResult {
     if (ticket.len < 1 + ChaCha20Poly1305.nonce_length + ChaCha20Poly1305.tag_length) return error.BadTicket;
     if (ticket[0] != sealed_magic and ticket[0] != sealed_magic_v1) return error.BadTicket;
     const nonce = ticket[1..][0..ChaCha20Poly1305.nonce_length].*;
@@ -333,4 +355,34 @@ test "sealed server ticket opens with the same key" {
     try std.testing.expectEqualSlices(u8, "nonce", opened.opened.ticket_nonce);
     try std.testing.expectEqualSlices(u8, &psk, opened.opened.psk);
     try std.testing.expectEqual(@as(u32, 8192), opened.opened.max_early_data_size);
+}
+
+test "openTicketWithRotation accepts current and previous keys, rejects retired" {
+    const allocator = std.testing.allocator;
+    const key_a = [_]u8{0xaa} ** ChaCha20Poly1305.key_length;
+    const key_b = [_]u8{0xbb} ** ChaCha20Poly1305.key_length;
+    const nonce = [_]u8{0x22} ** ChaCha20Poly1305.nonce_length;
+    const psk = [_]u8{0x33} ** 32;
+
+    // A ticket sealed under the OLD key A.
+    const ticket_a = try sealTicket(allocator, key_a, nonce, 0x1301, &psk, "n", 1, 0);
+    defer allocator.free(ticket_a);
+
+    // After rotation: current = B, previous = A. The A-ticket still opens.
+    {
+        const opened = try openTicketWithRotation(allocator, key_b, key_a, ticket_a);
+        defer allocator.free(opened.plain);
+        try std.testing.expectEqualSlices(u8, &psk, opened.opened.psk);
+    }
+    // A ticket sealed under the new current key B also opens.
+    {
+        const ticket_b = try sealTicket(allocator, key_b, nonce, 0x1301, &psk, "n", 1, 0);
+        defer allocator.free(ticket_b);
+        const opened = try openTicketWithRotation(allocator, key_b, key_a, ticket_b);
+        defer allocator.free(opened.plain);
+        try std.testing.expectEqualSlices(u8, &psk, opened.opened.psk);
+    }
+    // After a SECOND rotation A is fully retired (current = B, previous = none):
+    // the A-ticket no longer opens.
+    try std.testing.expectError(error.BadTicket, openTicketWithRotation(allocator, key_b, null, ticket_a));
 }

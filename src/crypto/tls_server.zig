@@ -110,6 +110,12 @@ pub const Config = struct {
     /// Optional reusable ticket key. When omitted, `Server.init` generates a
     /// fresh per-server key; callers can retrieve it with `ticketKey()`.
     ticket_key: ?tls_resumption.TicketKey = null,
+    /// Optional PREVIOUS ticket key retained across a rotation. New tickets are
+    /// always sealed with `ticket_key`; on open, a ticket that fails under the
+    /// current key is retried under this one, so rotating the key (set
+    /// `previous_ticket_key` = the old `ticket_key`, install a new `ticket_key`)
+    /// does not drop tickets still in flight. Mirrors cloak `previous_secret`.
+    previous_ticket_key: ?tls_resumption.TicketKey = null,
     /// Lifetime advertised in NewSessionTicket.
     ticket_lifetime_seconds: u32 = 86_400,
     /// Maximum TLS 1.3 early data bytes advertised in NewSessionTicket and
@@ -909,7 +915,7 @@ pub const Server = struct {
         if ((parsed.identities.next() catch return null) != null) return null;
         if ((parsed.binders.next() catch return null) != null) return null;
 
-        const opened = tls_resumption.openTicket(self.allocator, self.ticket_key, identity.identity) catch return null;
+        const opened = tls_resumption.openTicketWithRotation(self.allocator, self.ticket_key, self.config.previous_ticket_key, identity.identity) catch return null;
         defer self.allocator.free(opened.plain);
         const suite = CipherSuite.fromWire(opened.opened.suite) catch return null;
         if (!clientOfferedSuite(suites_block, suite)) return null;
