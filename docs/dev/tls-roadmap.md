@@ -35,7 +35,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 | 1.3 | **Validator + sig-alg consolidation** — collapse the two chain validators; align accepted sig set (RSA-PSS everywhere, SHA-384/512-RSA on the tls_client path) | M | Med | `x509_verify.zig`, `tls_client.zig` |
 | 1.4 | **Client-side PQ offering** — client never offers X25519MLKEM768 (server-only today) | S | Low | `tls_client.zig` |
 | 1.5 | **record_size_limit (RFC 8449)** — negotiate + enforce both legs | M | Med | `tls_server.zig`, `tls_client.zig`, `tls12*.zig` |
-| 1.6 | **Ticket-key rotation** — single key, no `previous_key`; reuse the cloak-secret rotation pattern | M | Med | `tls_resumption.zig`, `tls12_server.zig`, `tls_server.zig` |
+| 1.6 | 🟡 **MECHANISM DONE** — **Ticket-key rotation**: `openTicketWithRotation` + `previous_ticket_key` on both TLS Configs (try current, then previous); unit-tested. **Follow-up:** daemon-level trigger (rotate on REHASH + carry `previous` across USR2). | M | Med | `tls_resumption.zig`, `tls12_server.zig`, `tls_server.zig` |
 
 ## Phase 2 — Server-facing protocol features
 
