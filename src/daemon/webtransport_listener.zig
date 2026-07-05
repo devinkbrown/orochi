@@ -1220,7 +1220,7 @@ fn sleepMs(ms: u32) void {
 }
 
 fn connectLoopbackTcp(port: u16) ?linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
     var addr = linux.sockaddr.in{
@@ -1235,8 +1235,8 @@ fn connectLoopbackTcp(port: u16) ?linux.fd_t {
 }
 
 fn setNonBlocking(fd: linux.fd_t) void {
-    const flags = linux.fcntl(fd, posix.F.GETFL, 0);
-    _ = linux.fcntl(fd, posix.F.SETFL, flags | @as(usize, 0o4000)); // O_NONBLOCK
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    _ = linux.fcntl(fd, linux.F.SETFL, flags | @as(usize, 0o4000)); // O_NONBLOCK
 }
 
 fn writeAllFd(fd: linux.fd_t, bytes: []const u8) bool {
@@ -1348,7 +1348,7 @@ const FakeIrcServer = struct {
     fn start(reply: []const u8) !*FakeIrcServer {
         const self = try testing.allocator.create(FakeIrcServer);
         errdefer testing.allocator.destroy(self);
-        const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
         self.listen_fd = @intCast(rc);
         var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };

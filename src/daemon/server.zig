@@ -26438,6 +26438,10 @@ const PortableServer = struct {
     pub fn runThreaded(_: *PortableServer, _: *std.atomic.Value(bool)) void {}
     /// Symbol parity for the services → world +r bridge (see LinuxServer).
     pub fn markChannelRegistered(_: *PortableServer, _: []const u8, _: bool) std.mem.Allocator.Error!void {}
+    /// Symbol parity so `main.zig` type-checks on non-Linux targets. Never
+    /// reached: `init` returns Unsupported before any of these can run.
+    pub fn replayServicesLiveState(_: *PortableServer, _: *services_mod.Services) void {}
+    pub fn loadWasmPlugins(_: *PortableServer) void {}
 };
 
 const CompletionHandler = struct {

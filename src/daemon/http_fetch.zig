@@ -483,18 +483,20 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!linux.fd_t {
 }
 
 fn waitWritable(fd: linux.fd_t, timeout_ms: u31) Error!void {
-    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    // linux.pollfd/POLL/SOCK.* (not posix.*): these pair with the raw linux
+    // syscalls; posix.* resolves to libc/ws2_32 on non-Linux (build-time only).
+    var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
     const rc = linux.poll(&pfd, 1, timeout_ms);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => return error.ConnectFailed,
     }
     if (rc == 0) return error.ConnectTimeout;
-    if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return error.ConnectFailed;
+    if (pfd[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0) return error.ConnectFailed;
 }
 
 fn socketTcpNonblock() Error!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
@@ -502,7 +504,7 @@ fn socketTcpNonblock() Error!linux.fd_t {
 }
 
 fn udpSocket() Error!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    const rc = linux.socket(posix.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,

@@ -50,7 +50,7 @@ pub const DualStackUdpSocket = struct {
     /// `port` 0 = ephemeral. The socket has `IPV6_V6ONLY=0`, so even an `[::]`
     /// bind also accepts IPv4 peers as IPv4-mapped sources.
     pub fn bind(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
-        const rc = linux.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+        const rc = linux.socket(posix.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
         const fd: linux.fd_t = @intCast(rc);
         errdefer _ = linux.close(fd);
@@ -293,7 +293,7 @@ test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive
     try testing.expect(sport != 0);
 
     // --- IPv4 leg: send from a real 127.0.0.1 UDP socket. ---
-    const c4_rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    const c4_rc = linux.socket(posix.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(c4_rc));
     const c4: linux.fd_t = @intCast(c4_rc);
     defer _ = linux.close(c4);
@@ -340,7 +340,7 @@ test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
     // --- IPv6 leg: send from a real ::1 UDP socket. If the sandbox lacks IPv6
     // loopback, gracefully skip THIS leg only (the v4-over-v6-socket leg above
     // and the pure mapping tests still hold coverage). ---
-    const c6_rc = linux.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    const c6_rc = linux.socket(posix.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
     if (posix.errno(c6_rc) != .SUCCESS) return error.SkipZigTest;
     const c6: linux.fd_t = @intCast(c6_rc);
     defer _ = linux.close(c6);
