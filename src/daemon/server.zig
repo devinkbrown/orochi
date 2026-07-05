@@ -2394,6 +2394,10 @@ pub const LinuxServer = struct {
     /// resumption is enabled, then copied into every per-connection TLS config so
     /// a ticket issued on one reactor can resume on another.
     tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey),
+    /// The PREVIOUS ticket key, retained across one rotation so tickets sealed
+    /// before the last REHASH still resume for one more window. Null until the
+    /// first rotation. See `rotateTicketKey` + tls_resumption.openTicketWithRotation.
+    tls_previous_ticket_key: ?tls_resumption.TicketKey = null,
     /// Per-process secret keying the native-media kagura stream-id derivation.
     /// The stream id is a server-issued capability the client stamps into every
     /// kagura frame; keying it makes it unguessable to anyone without the secret,
@@ -3261,6 +3265,7 @@ pub const LinuxServer = struct {
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
+            cfg.previous_ticket_key = self.tls_previous_ticket_key;
             cfg.replay_guard = &self.tls_replay_guard;
             cfg.now_unix_seconds = @divTrunc(platform.realtimeMillis(), 1000);
             cfg.max_early_data_size = self.config.tls_early_data_max_size;
@@ -3284,6 +3289,7 @@ pub const LinuxServer = struct {
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
+            cfg.previous_ticket_key = self.tls_previous_ticket_key;
             cfg.replay_guard = &self.tls_replay_guard;
             cfg.now_unix_seconds = @divTrunc(platform.realtimeMillis(), 1000);
         }
@@ -24212,6 +24218,11 @@ pub const LinuxServer = struct {
             break :blk TlsReloadOutcome.kept;
         };
 
+        // Rotate the session-ticket key: the current key becomes PREVIOUS (so
+        // tickets issued before this REHASH still resume for one more window) and
+        // a fresh current key is generated. No-op when resumption is off.
+        if (self.config.tls_enable_resumption) self.rotateTicketKey();
+
         var note_buf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(
             &note_buf,
@@ -24219,6 +24230,15 @@ pub const LinuxServer = struct {
             .{ bindings.len, tls_outcome.note() },
         ) catch "Configuration reloaded";
         try queueNumeric(conn, .RPL_REHASHING, &.{path}, note);
+    }
+
+    /// Rotate the RFC 5077 / TLS 1.3 session-ticket key: the current key becomes
+    /// the previous key (tickets sealed under it still open for one more window,
+    /// via tls_resumption.openTicketWithRotation) and a fresh current key is
+    /// generated. Called on REHASH when resumption is enabled.
+    fn rotateTicketKey(self: *LinuxServer) void {
+        self.tls_previous_ticket_key = self.tls_ticket_key;
+        secure_fns.randomBytes(&self.tls_ticket_key);
     }
 
     /// Apply the anti-abuse runtime knobs from a freshly parsed config on REHASH:
@@ -40360,6 +40380,31 @@ test "REHASH cert hot-reload: not configured when TLS is absent" {
     try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.not_configured, outcome);
     try std.testing.expect(server.reload_tls == null);
     try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
+}
+
+test "rotateTicketKey moves current to previous and generates a fresh key" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const key_a = [_]u8{0xAA} ** @sizeOf(tls_resumption.TicketKey);
+    server.tls_ticket_key = key_a;
+    server.tls_previous_ticket_key = null;
+
+    // First rotation: A becomes previous, a fresh current is generated.
+    server.rotateTicketKey();
+    try std.testing.expect(server.tls_previous_ticket_key != null);
+    try std.testing.expectEqualSlices(u8, &key_a, &server.tls_previous_ticket_key.?);
+    try std.testing.expect(!std.mem.eql(u8, &key_a, &server.tls_ticket_key));
+
+    // Second rotation: A is fully retired; the first-generated key becomes previous.
+    const key_b = server.tls_ticket_key;
+    server.rotateTicketKey();
+    try std.testing.expectEqualSlices(u8, &key_b, &server.tls_previous_ticket_key.?);
+    try std.testing.expect(!std.mem.eql(u8, &key_b, &server.tls_ticket_key));
 }
 
 test "REHASH applyReloadedLimits: swaps class registry + throttle without double-free" {
