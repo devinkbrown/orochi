@@ -481,6 +481,42 @@ pub const Server = struct {
         return self.ticket_key;
     }
 
+    /// Cipher identity for Linux kTLS offload, deliberately decoupled from the
+    /// daemon's `ktls` module (crypto must not depend on the daemon). The daemon
+    /// maps this to the kernel `TLS_CIPHER_*` code points.
+    pub const KtlsCipher = enum { aes_128_gcm, aes_256_gcm, chacha20_poly1305 };
+
+    /// The server→client (TX) crypto material a completed TLS 1.3 AEAD session
+    /// hands to the kernel for `setsockopt(TLS_TX)`: the negotiated cipher, the
+    /// application write key, the 12-byte static write IV, and the current write
+    /// sequence number. `key` aliases the live traffic key (valid only while this
+    /// `Server`'s keys are unrotated) and is exposed ONLY for the kernel-offload
+    /// path — treat it as sensitive.
+    pub const KtlsTxParams = struct {
+        cipher: KtlsCipher,
+        key: []const u8,
+        iv: [12]u8,
+        seq: u64,
+    };
+
+    /// TX offload parameters for a connected TLS 1.3 session, or null before the
+    /// handshake completes (kTLS can only be attached post-handshake).
+    pub fn ktlsTxParams(self: *const Server) ?KtlsTxParams {
+        if (self.state != .connected) return null;
+        const suite = self.selected_suite orelse return null;
+        const cipher: KtlsCipher = switch (suite) {
+            .tls_aes_128_gcm_sha256 => .aes_128_gcm,
+            .tls_aes_256_gcm_sha384 => .aes_256_gcm,
+            .tls_chacha20_poly1305_sha256 => .chacha20_poly1305,
+        };
+        return .{
+            .cipher = cipher,
+            .key = self.server_app_keys.key[0..suite.keyLen()],
+            .iv = self.server_app_keys.iv,
+            .seq = self.app_write_seq,
+        };
+    }
+
     /// True when the current handshake accepted a PSK ticket and used the
     /// abbreviated TLS 1.3 resumption flight.
     pub fn acceptedSessionTicket(self: *const Server) bool {
@@ -2244,6 +2280,8 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
 
     // No suite negotiated before the ClientHello is processed.
     try std.testing.expectEqual(@as(?[]const u8, null), server.cipherName());
+    // kTLS TX params are unavailable until the handshake completes.
+    try std.testing.expect(server.ktlsTxParams() == null);
 
     const ch = try client.start();
     defer alloc.free(ch);
@@ -2262,6 +2300,18 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
 
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
+
+    // kTLS TX offload params: available once connected, matching the live server
+    // app write keys and the negotiated (default AES-128-GCM) suite. Checked
+    // before any encrypt() so app_write_seq is still 0.
+    {
+        const p = server.ktlsTxParams() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(Server.KtlsCipher.aes_128_gcm, p.cipher);
+        try std.testing.expectEqual(@as(usize, 16), p.key.len);
+        try std.testing.expectEqualSlices(u8, server.server_app_keys.key[0..16], p.key);
+        try std.testing.expectEqualSlices(u8, &server.server_app_keys.iv, &p.iv);
+        try std.testing.expectEqual(server.app_write_seq, p.seq);
+    }
 
     // The negotiated suite renders as its IANA name for WHOIS 671. The server
     // prefers AES-128-GCM whenever the client offers it (pickSuite).
