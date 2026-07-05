@@ -804,7 +804,7 @@ test "node promotion across all adaptive sizes" {
     var art = Art(u8).init();
     defer art.deinit(allocator);
 
-    var key = [_]u8{'x', 0};
+    var key = [_]u8{ 'x', 0 };
     for (0..5) |i| {
         key[1] = @intCast(i);
         try art.insert(allocator, &key, @intCast(i));
@@ -830,7 +830,7 @@ test "remove and demote adaptive nodes" {
     var art = Art(u16).init();
     defer art.deinit(allocator);
 
-    var key = [_]u8{'p', 0};
+    var key = [_]u8{ 'p', 0 };
     for (0..49) |i| {
         key[1] = @intCast(i);
         try art.insert(allocator, &key, @intCast(i));

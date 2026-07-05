@@ -170,4 +170,3 @@ test "encode rejects more than thirty two sources" {
 
     try testing.expectError(error.TooMany, encode(0, sources[0..], out[0..]));
 }
-

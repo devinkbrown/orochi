@@ -331,12 +331,13 @@ fn buildMessage(out: *[max_message_len]u8, config: Config, job: Job) []const u8 
     const body = job.body[0..@min(job.body.len, max_body_len)];
     // The Date is a fixed, syntactically-valid stub; the relay stamps its own
     // Received date, so a wall-clock-to-civil-time conversion is not worth it.
-    return std.fmt.bufPrint(out,
+    return std.fmt.bufPrint(
+        out,
         "From: <{s}>\r\nTo: <{s}>\r\nSubject: {s}\r\n" ++
             "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nMessage-ID: <{d}@{s}>\r\n" ++
             "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{s}",
         .{
-            config.from, job.to, job.subject,
+            config.from,                                    job.to,             job.subject,
             @as(u64, @bitCast(platform.monotonicMillis())), config.ehlo_domain, body,
         },
     ) catch out[0..0];

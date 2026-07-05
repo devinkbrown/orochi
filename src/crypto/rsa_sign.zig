@@ -675,7 +675,7 @@ test "modular inverse returns rinv where r * rinv mod n is one" {
         &[_]u8{0x02},
         &[_]u8{0x03},
         &[_]u8{0x11},
-        &[_]u8{0x01, 0x00, 0x01},
+        &[_]u8{ 0x01, 0x00, 0x01 },
         &[_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x42 },
     };
 

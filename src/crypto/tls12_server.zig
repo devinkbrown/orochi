@@ -1361,11 +1361,20 @@ fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }) !void {
 
     const ch = try client.start();
     defer allocator.free(ch);
-    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(sf);
-    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(cf);
-    const sfin = switch (try server.feed(cf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(sfin);
     _ = try client.feed(sfin);
 
@@ -1414,11 +1423,20 @@ test "TLS 1.2 mTLS: client may decline (empty Certificate) and still connect" {
 
     const ch = try client.start();
     defer allocator.free(ch);
-    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(sf);
-    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(cf);
-    const sfin = switch (try server.feed(cf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(sfin);
     _ = try client.feed(sfin);
 
@@ -1456,9 +1474,15 @@ test "TLS 1.2 mTLS: tampered client CertificateVerify is rejected, no certfp exp
 
     const ch = try client.start();
     defer allocator.free(ch);
-    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(sf);
-    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
     defer allocator.free(cf);
 
     // The client flight is [Certificate][ClientKeyExchange][CertificateVerify]

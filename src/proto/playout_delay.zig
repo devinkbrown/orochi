@@ -90,6 +90,6 @@ test "encode reports small output buffer" {
 
 test "decode reports truncated input" {
     try std.testing.expectError(error.Truncated, decode(&.{}));
-    try std.testing.expectError(error.Truncated, decode(&.{ 0x00 }));
+    try std.testing.expectError(error.Truncated, decode(&.{0x00}));
     try std.testing.expectError(error.Truncated, decode(&.{ 0x00, 0x00 }));
 }

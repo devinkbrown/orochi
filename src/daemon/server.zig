@@ -12506,18 +12506,18 @@ pub const LinuxServer = struct {
                     for (reg.classes) |*cls| {
                         var buf: [900]u8 = undefined;
                         const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_per_account={d} max_per_host={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} nick_delay_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
-                            cls.policy.sendq,            cls.policy.recvq,
-                            cls.policy.max_clients,      cls.policy.max_per_ip,
-                            cls.policy.max_per_account,  cls.policy.max_per_host,
-                            cls.policy.max_channels,     cls.policy.max_targets,
-                            cls.policy.monitor,          cls.policy.silence,
-                            cls.policy.ping_interval_ms, cls.policy.ping_timeout_ms,
+                            cls.policy.sendq,               cls.policy.recvq,
+                            cls.policy.max_clients,         cls.policy.max_per_ip,
+                            cls.policy.max_per_account,     cls.policy.max_per_host,
+                            cls.policy.max_channels,        cls.policy.max_targets,
+                            cls.policy.monitor,             cls.policy.silence,
+                            cls.policy.ping_interval_ms,    cls.policy.ping_timeout_ms,
                             cls.policy.register_timeout_ms, cls.policy.flood_lines,
-                            cls.policy.flood_window_ms,  cls.policy.require_tls,
-                            cls.policy.require_sasl,     cls.policy.flood_exempt,
-                            cls.policy.nick_delay_exempt, cls.cidrs.len,
-                            cls.tls_only,                cls.account_only,
-                            cls.oper_only,               self.countClassMembers(cls.name),
+                            cls.policy.flood_window_ms,     cls.policy.require_tls,
+                            cls.policy.require_sasl,        cls.policy.flood_exempt,
+                            cls.policy.nick_delay_exempt,   cls.cidrs.len,
+                            cls.tls_only,                   cls.account_only,
+                            cls.oper_only,                  self.countClassMembers(cls.name),
                         }) catch continue;
                         try queueNumeric(conn, .RPL_STATSYLINE, &.{ "Y", cls.name }, text);
                     }
@@ -12541,7 +12541,7 @@ pub const LinuxServer = struct {
                         const up_s: i64 = @divTrunc(now - c.connected_at_ms, 1000);
                         var buf: [256]u8 = undefined;
                         const text = std.fmt.bufPrint(&buf, "sendq_cap={d} queued={d} uptime={d}s", .{ c.sendq_cap, queued, @max(@as(i64, 0), up_s) }) catch continue;
-                        try queueNumeric(conn, .RPL_STATSLLINE, &.{ if (name.len != 0) name else "*" }, text);
+                        try queueNumeric(conn, .RPL_STATSLLINE, &.{if (name.len != 0) name else "*"}, text);
                     }
                 }
             },
@@ -24655,9 +24655,9 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_INFO, &.{}, " ");
         var b: [480]u8 = undefined;
         if (std.fmt.bufPrint(&b, "Limits: NICKLEN={d} CHANNELLEN={d} TOPICLEN={d} AWAYLEN={d} KICKLEN={d} CHANLIMIT={d} MAXTARGETS={d} MONITOR={d} SILENCE={d} MAXLIST={d}", .{
-            self.config.nicklen,      self.config.channellen, self.config.topiclen,
-            self.config.awaylen,      self.config.kicklen,    self.config.chanlimit,
-            self.config.maxtargets,   self.config.monitorlimit, self.config.silencelimit,
+            self.config.nicklen,    self.config.channellen,   self.config.topiclen,
+            self.config.awaylen,    self.config.kicklen,      self.config.chanlimit,
+            self.config.maxtargets, self.config.monitorlimit, self.config.silencelimit,
             self.config.maxlist,
         })) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
 

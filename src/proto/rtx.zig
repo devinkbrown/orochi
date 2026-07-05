@@ -113,6 +113,6 @@ test "wrap and unwrap RTX packet" {
 test "short input is truncated" {
     var out: [rtp_profile.header_len + osn_len]u8 = undefined;
 
-    try std.testing.expectError(error.Truncated, wrap(&.{ 0x80 }, 0x0000bbbb, 5, 97, &out));
-    try std.testing.expectError(error.Truncated, unwrap(&.{ 0x80 }, 0x0000aaaa, 96, &out));
+    try std.testing.expectError(error.Truncated, wrap(&.{0x80}, 0x0000bbbb, 5, 97, &out));
+    try std.testing.expectError(error.Truncated, unwrap(&.{0x80}, 0x0000aaaa, 96, &out));
 }

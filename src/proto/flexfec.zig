@@ -140,4 +140,3 @@ test "recover rejects more than one missing packet" {
     var recovered_buf: [16]u8 = undefined;
     try testing.expectError(error.NotRecoverable, recover(fec, present[0..], 1, &recovered_buf));
 }
-

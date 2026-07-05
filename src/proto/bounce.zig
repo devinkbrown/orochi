@@ -143,4 +143,3 @@ test "encodeTokenBase64 rejects short buffer" {
 
     try std.testing.expectError(error.BufferTooSmall, encodeTokenBase64(&buf, &token));
 }
-
