@@ -41,7 +41,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 
 | # | Item | Effort | Risk | Notes |
 |---|------|--------|------|-------|
-| 2.1 | **Server-side OCSP stapling** — CertificateStatus + status_request response, response cache, must-staple; fetch via ACME/OCSP responder | M | Med | We consume staples but never produce them |
+| 2.1 | 🟡 **TLS 1.3 FUNCTIONAL** — server-side OCSP stapling. **DONE:** ocsp.buildRequest[ForCerts] (inc 1-2), x509 AIA-URL + must-staple + CertID inputs (inc 3), TLS 1.3 leaf CertificateEntry staple gated on client status_request + `Config.ocsp_staple` (inc 4, tested). **Remaining:** daemon OCSP fetch/cache service to auto-populate `ocsp_staple` from the AIA URL (background HTTP, mirror acme_renewal), + TLS 1.2 CertificateStatus parity. | M | Med | `ocsp.zig`, `x509.zig`, `tls_server.zig`, `tls_extension.zig` |
 | 2.2 | **Server-side HelloRetryRequest** — recover when a client offers only groups we lack a key_share for | M | Med | Interop robustness; server currently can't HRR |
 | 2.3 | **Certificate compression (RFC 8879)** — zstd/brotli; smaller handshakes | M | Low | Both BoringSSL + WolfSSL have it |
 | 2.4 | **SNI-based cert selection** — client sends SNI, server ignores it; prereq for multi-cert + ECH | M | Low | |
