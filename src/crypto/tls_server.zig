@@ -2038,6 +2038,64 @@ test "loopback: record_size_limit negotiated + fragments outbound records (RFC 8
     try std.testing.expectEqualSlices(u8, &payload, reassembled.items);
 }
 
+test "loopback: X25519MLKEM768 post-quantum hybrid handshake (client offer + server encaps)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6a} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6a, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    client.offerOnlyHybridForTest(); // force the server to select x25519mlkem768
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    // The server negotiated the PQ hybrid group (0x11ec).
+    try std.testing.expectEqual(@as(u16, 0x11ec), @intFromEnum(server.selected_group));
+
+    // A completed Finished + a data round-trip proves both sides derived the SAME
+    // 64-byte combined secret (ml-kem_ss || x25519_ss, the raw IETF concat) — if
+    // the client had used the wrong combiner the transcript MACs would not match.
+    const s2c = try server.encrypt("pq hello client");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("pq hello client", got_c);
+
+    const c2s = try client.encrypt("pq hello server");
+    defer alloc.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("pq hello server", got_s);
+}
+
 test "loopback: exportResume/resumeConnected carries a live session across Server instances" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");

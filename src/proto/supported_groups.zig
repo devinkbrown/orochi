@@ -43,6 +43,8 @@ pub const NamedGroup = enum(u16) {
     x448 = 0x001e,
     /// FFDHE group with 2048-bit safe prime (RFC 7919).
     ffdhe2048 = 0x0100,
+    /// X25519MLKEM768 post-quantum hybrid (draft-ietf-tls-ecdhe-mlkem).
+    x25519mlkem768 = 0x11ec,
     _,
 
     /// Wrap a raw wire `u16` as a `NamedGroup` (total over the enum).

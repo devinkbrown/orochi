@@ -262,6 +262,11 @@ pub const Client = struct {
     verify_time: ?i64 = null,
     x25519_pair: kx.X25519Kx.KeyPair,
     p256_pair: ecdh_p256.KeyPair,
+    /// Ephemeral X25519MLKEM768 keypair (its own x25519 half + an ML-KEM-768
+    /// keypair) backing the post-quantum hybrid key_share we offer. Distinct from
+    /// `x25519_pair` (the classical x25519 share) so the two shares never share
+    /// an ephemeral.
+    hybrid_pair: kx.HybridKx.KeyPair,
     legacy_session_id: [32]u8,
     /// ClientHello random, generated once. RFC 8446 §4.1.2 requires the second
     /// ClientHello (after a HelloRetryRequest) to carry the same random.
@@ -316,6 +321,10 @@ pub const Client = struct {
     /// Test-only: offer secp256r1 as the sole key-exchange group, so the server's
     /// P-256 fallback path can be exercised over the loopback.
     force_p256_only_for_test: bool = false,
+    /// Test-only: offer X25519MLKEM768 as the sole key-exchange group, so the
+    /// post-quantum hybrid encaps/decaps path is exercised over the loopback (the
+    /// server otherwise prefers classical x25519).
+    force_hybrid_only_for_test: bool = false,
     /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite, so the
     /// SHA-384 key schedule is exercised end-to-end over the loopback.
     force_aes256_only_for_test: bool = false,
@@ -370,6 +379,9 @@ pub const Client = struct {
         if (options.server_name.len == 0) return error.BadHandshake;
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
+        var hy_seed: [kx.HybridKx.seed_len]u8 = undefined;
+        try osEntropy(&hy_seed);
+        defer secureZero(&hy_seed);
         var session_id: [32]u8 = undefined;
         try osEntropy(&session_id);
         var random: [32]u8 = undefined;
@@ -390,6 +402,7 @@ pub const Client = struct {
             .verify_time = options.now_unix_seconds,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
+            .hybrid_pair = try kx.HybridKx.generateDeterministic(hy_seed),
             .legacy_session_id = session_id,
             .client_random = random,
         };
@@ -397,6 +410,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.x25519_pair.wipe();
+        self.hybrid_pair.wipe();
         secureZero(&self.p256_pair.secret);
         secureZero(&self.legacy_session_id);
         secureZero(&self.early_secret);
@@ -619,6 +633,11 @@ pub const Client = struct {
     /// Test-only: offer secp256r1 as the sole supported group + key share.
     pub fn offerOnlyP256ForTest(self: *Client) void {
         self.force_p256_only_for_test = true;
+    }
+
+    /// Test-only: offer X25519MLKEM768 as the sole supported group + key share.
+    pub fn offerOnlyHybridForTest(self: *Client) void {
+        self.force_hybrid_only_for_test = true;
     }
 
     /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite.
@@ -845,8 +864,11 @@ pub const Client = struct {
         var groups_buf: [16]u8 = undefined;
         const groups = if (self.force_p256_only_for_test)
             try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{.secp256r1})
+        else if (self.force_hybrid_only_for_test)
+            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{.x25519mlkem768})
         else
-            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519, .secp256r1 });
+            // Prefer the post-quantum hybrid, then classical x25519 / P-256.
+            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519mlkem768, .x25519, .secp256r1 });
         try ext_builder.addTyped(.supported_groups, groups);
 
         var sigs_buf: [16]u8 = undefined;
@@ -865,13 +887,25 @@ pub const Client = struct {
         std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
         try ext_builder.addTyped(.record_size_limit, &rsl_buf);
 
-        var keyshare_buf: [256]u8 = undefined;
+        // X25519MLKEM768 client key_share = ml-kem_ek(1184) || x25519_pub(32).
+        var hybrid_share: [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 = undefined;
+        const hy_pub = self.hybrid_pair.publicShare();
+        @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
+        @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
+
+        // Sized for the hybrid share (1216B) + x25519 (32B) + P-256 (65B) + headers.
+        var keyshare_buf: [1400]u8 = undefined;
         const keyshares = if (self.force_p256_only_for_test)
             try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
                 .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
             })
+        else if (self.force_hybrid_only_for_test)
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
+            })
         else
             try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
                 .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
                 .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
             });
@@ -1004,8 +1038,8 @@ pub const Client = struct {
 
             var selected = try self.parseServerHello(msg.body);
             try self.appendTranscript(msg.raw);
-            try self.deriveHandshakeKeys(selected.shared_secret);
-            secureZero(&selected.shared_secret);
+            try self.deriveHandshakeKeys(selected.buf[0..selected.len]);
+            secureZero(&selected.buf);
             consumePrefix(&self.recv_buf, rec.wire_len);
             self.state = .wait_encrypted_extensions;
             return .proceed;
@@ -1056,11 +1090,13 @@ pub const Client = struct {
         self.selected_suite = suite; // selects the transcript hash below
 
         // RFC 8446 §4.1.4: the requested group must be one we support AND did not
-        // already offer a key_share for. We always offer shares for both groups we
-        // support (x25519, secp256r1), so any group-change request is non-compliant.
+        // already offer a key_share for. We always offer shares for every group we
+        // support (x25519mlkem768, x25519, secp256r1), so any group-change request
+        // is non-compliant.
         if (hrr_group) |g| {
             if (g == @intFromEnum(supported_groups.NamedGroup.x25519) or
-                g == @intFromEnum(supported_groups.NamedGroup.secp256r1))
+                g == @intFromEnum(supported_groups.NamedGroup.secp256r1) or
+                g == @intFromEnum(supported_groups.NamedGroup.x25519mlkem768))
             {
                 return error.BadHandshake; // group already offered — illegal
             }
@@ -1167,7 +1203,11 @@ pub const Client = struct {
         return true;
     }
 
-    fn parseServerHello(self: *Client, body: []const u8) Error!struct { shared_secret: [32]u8 } {
+    /// The negotiated (EC)DHE secret: 32 bytes for a classical group, 64 for the
+    /// X25519MLKEM768 hybrid (ml-kem_ss || x25519_ss). Fed to the key schedule.
+    const ServerKexSecret = struct { buf: [64]u8 = undefined, len: usize = 0 };
+
+    fn parseServerHello(self: *Client, body: []const u8) Error!ServerKexSecret {
         var c = Cursor.init(body);
         if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
         const random = try c.take(32);
@@ -1208,22 +1248,47 @@ pub const Client = struct {
             self.psk_accepted = true;
         }
         const share = selected_share.?;
-        const shared = switch (share.group) {
-            .x25519 => blk: {
+        var out = ServerKexSecret{};
+        switch (share.group) {
+            .x25519 => {
                 if (share.key_exchange.len != kx.X25519Kx.public_len) return error.BadHandshake;
                 var peer: kx.PublicKey = undefined;
                 @memcpy(&peer, share.key_exchange);
                 var secret = try kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer);
                 defer secret.wipe();
-                break :blk secret.declassify();
+                const ss = secret.declassify();
+                @memcpy(out.buf[0..32], &ss);
+                out.len = 32;
             },
-            .secp256r1 => blk: {
+            .secp256r1 => {
                 if (share.key_exchange.len != ecdh_p256.public_length) return error.BadHandshake;
-                break :blk try ecdh_p256.sharedSecret(self.p256_pair.secret, share.key_exchange[0..ecdh_p256.public_length].*);
+                const ss = try ecdh_p256.sharedSecret(self.p256_pair.secret, share.key_exchange[0..ecdh_p256.public_length].*);
+                @memcpy(out.buf[0..32], &ss);
+                out.len = 32;
+            },
+            .x25519mlkem768 => {
+                // Server share = ml-kem_ct(1088) || x25519_pub(32). The combined
+                // (EC)DHE secret is the RAW concatenation ml-kem_ss(32) || x25519_ss(32)
+                // fed to the TLS key schedule — matching tls_server. (NOT
+                // kx.HybridKx.decapsulate, which is the TSUMUGI mesh HKDF combiner.)
+                const ct_len = kx.HybridKx.mlkem_ciphertext_len;
+                if (share.key_exchange.len != ct_len + kx.X25519Kx.public_len) return error.BadHandshake;
+                var ct: [ct_len]u8 = undefined;
+                @memcpy(&ct, share.key_exchange[0..ct_len]);
+                var mlkem_ss = try self.hybrid_pair.mlkem.secret_key.decaps(&ct);
+                defer secureZero(&mlkem_ss);
+                var x_peer: kx.PublicKey = undefined;
+                @memcpy(&x_peer, share.key_exchange[ct_len..]);
+                var x_secret = try kx.X25519Kx.sharedSecret(&self.hybrid_pair.x25519.secret_key, x_peer);
+                defer x_secret.wipe();
+                const x_ss = x_secret.declassify();
+                @memcpy(out.buf[0..32], &mlkem_ss);
+                @memcpy(out.buf[32..64], &x_ss);
+                out.len = 64;
             },
             else => return error.UnsupportedGroup,
-        };
-        return .{ .shared_secret = shared };
+        }
+        return out;
     }
 
     fn parseEncryptedExtensions(self: *Client, body: []const u8) Error!void {
@@ -1510,7 +1575,7 @@ pub const Client = struct {
         }
     }
 
-    fn deriveHandshakeKeys(self: *Client, shared_secret: [32]u8) Error!void {
+    fn deriveHandshakeKeys(self: *Client, shared_secret: []const u8) Error!void {
         switch (self.hashAlg()) {
             .sha256 => try self.deriveHandshakeKeysT(Sha256, shared_secret),
             .sha384 => try self.deriveHandshakeKeysT(Sha384, shared_secret),
@@ -1538,7 +1603,7 @@ pub const Client = struct {
         self.early_write_seq = 0;
     }
 
-    fn deriveHandshakeKeysT(self: *Client, comptime KS: type, shared_secret: [32]u8) Error!void {
+    fn deriveHandshakeKeysT(self: *Client, comptime KS: type, shared_secret: []const u8) Error!void {
         const psk = if (self.psk_accepted) blk: {
             const offer = self.resume_offer orelse return error.BadHandshake;
             if (offer.psk_len != KS.hash_len) return error.BadHandshake;
@@ -1548,7 +1613,7 @@ pub const Client = struct {
         defer early.wipe();
         self.early_secret[0..KS.hash_len].* = early.declassify();
 
-        var handshake = try KS.handshakeSecret(&early, &shared_secret);
+        var handshake = try KS.handshakeSecret(&early, shared_secret);
         defer handshake.wipe();
         self.handshake_secret[0..KS.hash_len].* = handshake.declassify();
 
