@@ -27,6 +27,7 @@ const tls_record = @import("../crypto/tls_record.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const ktls = @import("ktls.zig");
 const linux = std.os.linux;
+const posix = std.posix;
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("tls_conn requires a 64-bit target");
@@ -559,6 +560,78 @@ test "buildKtlsTxCryptoInfo produces a kernel-shaped TLS 1.3 crypto_info post-ha
     try std.testing.expectEqual(@as(usize, 40), encoded.len);
     try std.testing.expectEqual(ktls.TLS_1_3_VERSION, std.mem.readInt(u16, encoded[0..2], native));
     try std.testing.expectEqual(ktls.CipherType.aes_gcm_128.toInt(), std.mem.readInt(u16, encoded[2..4], native));
+}
+
+fn testTcpSocketOrSkip() !linux.fd_t {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM, linux.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    return @intCast(rc);
+}
+
+test "kTLS TX offload: the kernel encrypts server writes and tls_client decrypts them" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    // In-memory TLS 1.3 handshake → a connected TlsConn whose keys the client
+    // shares (so the client can decrypt whatever the kernel produces from them).
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // A real ESTABLISHED loopback pair for the kernel to encrypt over.
+    const listen_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(listen_fd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+    addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+    const client_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(client_fd);
+    if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+    const server_fd: linux.fd_t = @intCast(accept_rc);
+    defer _ = linux.close(server_fd);
+
+    // Offload TX to the kernel using the live handshake keys; skip if no CONFIG_TLS.
+    // (`TlsConn.init` leaves session tickets off, so no NST is emitted and
+    // `app_write_seq` is 0 at attach — the kernel starts at seq 0, matching the
+    // client's read seq 0. With tickets on, an undelivered NST would desync this.)
+    conn.enableKtlsTx(server_fd) catch return error.SkipZigTest;
+
+    // Plaintext written to the socket is TLS-record-encrypted BY THE KERNEL.
+    const msg = "kernel-encrypted server->client hello";
+    if (posix.errno(linux.write(server_fd, msg.ptr, msg.len)) != .SUCCESS) return error.SkipZigTest;
+
+    // Read the record on the client end and decrypt it with the shared keys —
+    // a green decrypt proves the kernel used our key/iv/salt/seq correctly.
+    var rec: [512]u8 = undefined;
+    const rr = linux.read(client_fd, &rec, rec.len);
+    if (posix.errno(rr) != .SUCCESS) return error.SkipZigTest;
+    const n: usize = @intCast(rr);
+    try std.testing.expect(n != 0);
+    try std.testing.expectEqual(@as(u8, 23), rec[0]); // TLS application_data record
+    const got = try client.decrypt(rec[0..n]);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(msg, got);
 }
 
 test "shared ticket key and replay guard resume across TlsConn instances" {

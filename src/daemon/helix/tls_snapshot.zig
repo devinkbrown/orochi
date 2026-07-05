@@ -58,6 +58,12 @@ pub const Snapshot = struct {
     pending_out: []const u8 = &.{},
     /// The bound mTLS client-cert fingerprint (lowercase hex), or empty.
     certfp: []const u8 = &.{},
+    /// kTLS TX offload (roadmap 3.1): true when the predecessor had offloaded
+    /// server→client encryption to the kernel. The kernel TX state rides the
+    /// inherited fd across execve, so the successor re-attaches nothing — it just
+    /// resumes sending plaintext (RX + the engine's carried secrets/seqs stay
+    /// userspace exactly as for a non-offloaded conn).
+    tx_offloaded: bool = false,
 };
 
 /// Encode `snap` into a freshly-allocated buffer the caller owns. The result
@@ -99,6 +105,8 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try out.appendSlice(allocator, snap.pending_out);
     try out.append(allocator, @intCast(snap.certfp.len));
     try out.appendSlice(allocator, snap.certfp);
+    // kTLS offload flag (trailing, so an older decoder tolerantly ignores it).
+    try out.append(allocator, @intFromBool(snap.tx_offloaded));
     return out.toOwnedSlice(allocator);
 }
 
@@ -149,7 +157,9 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     state.pending_recv = try r.take(try r.int(u32));
     const pending_out = try r.take(try r.int(u32));
     const certfp = try r.take(try r.byte());
-    return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp };
+    // Trailing kTLS offload flag; absent in older snapshots ⇒ not offloaded.
+    const tx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
+    return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx_offloaded };
 }
 
 fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) std.mem.Allocator.Error!void {
@@ -202,6 +212,7 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
         .state = .{ .engine = .{ .tls13 = s13 }, .pending_recv = "\x17\x03\x03" },
         .pending_out = "queued-record",
         .certfp = "ab" ** 32,
+        .tx_offloaded = true,
     });
     defer allocator.free(bytes);
 
@@ -216,6 +227,12 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
     try testing.expectEqualStrings("\x17\x03\x03", got.state.pending_recv);
     try testing.expectEqualStrings("queued-record", got.pending_out);
     try testing.expectEqualStrings("ab" ** 32, got.certfp);
+    try testing.expect(got.tx_offloaded);
+
+    // Tolerant decode: a snapshot missing the trailing kTLS flag (an older
+    // encoder) decodes as not-offloaded rather than erroring.
+    const legacy = try decode(bytes[0 .. bytes.len - 1]);
+    try testing.expect(!legacy.tx_offloaded);
 }
 
 test "tls12 snapshot round-trips key material and seqs" {

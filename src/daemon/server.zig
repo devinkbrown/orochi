@@ -1571,6 +1571,11 @@ pub const Config = struct {
     /// Maximum 0-RTT early application bytes advertised in issued tickets.
     /// Zero disables early data while still allowing 1-RTT PSK resumption.
     tls_early_data_max_size: u32 = 0,
+    /// kTLS TX offload gate (roadmap 3.1): true only when `[tls] ktls=tx` AND the
+    /// running kernel offers the TLS ULP (resolved in main.zig). When true, a
+    /// completed TLS 1.3 client conn offloads server→client encryption to the
+    /// kernel once its send buffer drains. Default false ⇒ TLS stays in userspace.
+    tls_ktls_tx: bool = false,
     /// Optional hardened TLS 1.2 leg. When `tls12_signing_key` is set, the TLS
     /// listener accepts TLS 1.2 ECDHE-AEAD clients (routed by version-dispatch in
     /// tls_conn) presenting this ECDSA-P256 leaf; otherwise the listener is
@@ -1914,6 +1919,14 @@ pub const ConnState = struct {
     /// decrypted through this adapter and outbound bytes encrypted, transparently
     /// to the IRC layer. Heap-owned; freed in closeConn/deinit.
     tls: ?*tls_conn.TlsConn = null,
+    /// kTLS TX offload (roadmap 3.1). `tls_tx_offloaded` = the kernel now encrypts
+    /// this conn's server→client writes, so `appendSecuredToConn` hands it
+    /// plaintext (RX stays userspace). `ktls_attach_pending` = offload is
+    /// requested and attaches at the next fully-drained send point (after the
+    /// handshake flight + any NewSessionTicket flush). Both false unless
+    /// `[tls] ktls=tx` on a kTLS-capable kernel with a TLS 1.3 session.
+    tls_tx_offloaded: bool = false,
+    ktls_attach_pending: bool = false,
     /// Non-null for a `[listen] ws` WebSocket client: inbound (decrypted)
     /// bytes run the HTTP Upgrade then RFC 6455 deframing before the IRC line
     /// parser, and outbound IRC lines are wrapped in text frames before the
@@ -5518,6 +5531,9 @@ pub const LinuxServer = struct {
         }
 
         try self.armSendIfNeeded(conn);
+        // Once the send stream is fully drained (armSendIfNeeded above re-armed if
+        // the overflow still had data), a pending kTLS conn attaches TX offload.
+        self.maybeAttachKtlsTx(conn);
         if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
             try self.closeConn(event.token, conn.close_reason);
         }
@@ -6599,6 +6615,25 @@ pub const LinuxServer = struct {
                 conn.session.tls_exporter = conn.tls_exporter_buf;
             } else |_| {}
         }
+        // kTLS TX offload (roadmap 3.1): once a TLS 1.3 handshake completes and
+        // offload is enabled, mark it pending — the attach itself waits for the
+        // send buffer to fully drain (below / at send-completion) so the kernel
+        // only ever takes over a clean, already-flushed send stream.
+        if (self.config.tls_ktls_tx and conn.tls.?.handshakeDone() and
+            !conn.tls_tx_offloaded and !conn.ktls_attach_pending and
+            conn.tls.?.negotiatedVersion() == .tls13)
+        {
+            conn.ktls_attach_pending = true;
+        }
+        // A post-handshake TLS record (e.g. a KeyUpdate response) on an
+        // already-offloaded conn cannot be written as userspace ciphertext — the
+        // kernel would double-encrypt it. Phase 1 does not offload conns that need
+        // server-initiated post-handshake sends, so drop it (the client
+        // reconnects) rather than corrupt the stream.
+        if (conn.tls_tx_offloaded and outcome.handshake_bytes.len != 0) {
+            conn.closing = true;
+            return;
+        }
         if (outcome.handshake_bytes.len != 0) {
             // `handshake_bytes` are ALREADY-FORMED TLS records (the handshake
             // flight / post-handshake KeyUpdate) produced by the TLS engine, so
@@ -6623,6 +6658,33 @@ pub const LinuxServer = struct {
                 try self.feedBytes(id, conn, outcome.plaintext);
             }
         }
+        // If offload is pending and the send buffer is already drained (e.g. no
+        // NewSessionTicket to flush), attach now; otherwise the send-completion
+        // drain hook picks it up once the flight finishes.
+        self.maybeAttachKtlsTx(conn);
+    }
+
+    /// Attach kTLS TX offload when a pending conn's send path has fully drained
+    /// (inline `send_buf` emptied, no `send_overflow`, nothing armed), so the
+    /// kernel only ever takes over a clean send stream — never a ciphertext tail.
+    /// A failed attach silently leaves the conn on userspace TLS. Called at the
+    /// connected transition and on every send-completion drain.
+    fn maybeAttachKtlsTx(self: *LinuxServer, conn: *ConnState) void {
+        _ = self;
+        if (!conn.ktls_attach_pending) return;
+        if (conn.send_offset < conn.send_len) return; // inline bytes still queued
+        if (conn.send_overflow.items.len != 0) return; // overflow still queued
+        if (conn.send_armed) return; // a send is in flight
+        const t = conn.tls orelse {
+            conn.ktls_attach_pending = false;
+            return;
+        };
+        t.enableKtlsTx(conn.fd) catch {
+            conn.ktls_attach_pending = false; // stay in userspace TLS
+            return;
+        };
+        conn.ktls_attach_pending = false;
+        conn.tls_tx_offloaded = true;
     }
 
     /// Drive a WebSocket client's decrypted (or, in the gated plain-ws testing
@@ -14566,6 +14628,10 @@ pub const LinuxServer = struct {
                     .state = rs,
                     .pending_out = pending,
                     .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
+                    // For an offloaded conn `pending` is plaintext (the kernel
+                    // encrypts on send); the successor's inherited-fd kernel state
+                    // keeps encrypting, so it re-queues it as plaintext too.
+                    .tx_offloaded = e.value.tls_tx_offloaded,
                 }) catch continue;
             }
             var snap = e.value.session.snapshot();
@@ -14945,6 +15011,11 @@ pub const LinuxServer = struct {
         };
         conn.tls = t;
         conn.is_tls = true;
+        // kTLS: the predecessor's kernel TX state rides the inherited fd across
+        // execve, so re-attach nothing — just resume treating this conn as
+        // offloaded (its send seam hands the kernel plaintext, RX stays
+        // userspace). `pending_out` was carried as plaintext accordingly.
+        conn.tls_tx_offloaded = ts.tx_offloaded;
         // Re-bind the mTLS client-cert fingerprint (SASL EXTERNAL identity).
         if (ts.certfp.len == certfp.fingerprint_len) {
             @memcpy(&conn.certfp_buf, ts.certfp);
@@ -26654,6 +26725,10 @@ fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
 fn appendSecuredToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     if (conn.tls) |t| {
         if (t.handshakeDone()) {
+            // kTLS TX offload: the kernel encrypts server→client bytes on send(),
+            // so hand it the plaintext directly and skip the userspace AEAD. Only
+            // set once the offload has attached to a drained, TLS-1.3 conn.
+            if (conn.tls_tx_offloaded) return rawAppendToConn(conn, bytes);
             const ciphertext = t.write(bytes) catch return error.OutputTooSmall;
             return rawAppendToConn(conn, ciphertext);
         }
