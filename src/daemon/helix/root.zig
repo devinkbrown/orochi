@@ -22,6 +22,7 @@ pub const session_capsule = @import("session_capsule.zig");
 pub const session_snapshot = @import("session_snapshot.zig");
 pub const tls_snapshot = @import("tls_snapshot.zig");
 pub const ws_snapshot = @import("ws_snapshot.zig");
+pub const ticket_key_capsule = @import("ticket_key_capsule.zig");
 pub const s2s_snapshot = @import("s2s_snapshot.zig");
 pub const mesh_redial = @import("mesh_redial.zig");
 pub const session_migrate = @import("session_migrate.zig");

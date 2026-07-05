@@ -166,6 +166,7 @@ const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
 const ws_snapshot = @import("helix/ws_snapshot.zig");
+const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -14567,6 +14568,22 @@ pub const LinuxServer = struct {
         }
         var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
         defer pieces.deinit(self.allocator);
+        // Carry the process-global TLS session-ticket key(s) so tickets issued
+        // before the swap still open under the successor (which otherwise boots a
+        // fresh random key, killing every outstanding ticket). Emitted once, ahead
+        // of the per-client pieces; a decode/alloc failure just drops the piece and
+        // the successor keeps its freshly-minted key. `.bytes` is owned by `blobs`.
+        if (self.config.tls_enable_resumption) ticket: {
+            const tk = ticket_key_capsule.encode(self.allocator, .{
+                .current = self.tls_ticket_key,
+                .previous = self.tls_previous_ticket_key,
+            }) catch break :ticket;
+            blobs.append(self.allocator, tk) catch {
+                self.allocator.free(tk);
+                break :ticket;
+            };
+            pieces.append(self.allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch break :ticket;
+        }
         const carried_fds = try self.allocator.alloc(linux.fd_t, self.rx().clients.slots.items.len);
         defer self.allocator.free(carried_fds);
         var carried_fd_count: usize = 0;
@@ -14822,6 +14839,19 @@ pub const LinuxServer = struct {
         defer {
             for (caps) |*c| c.deinit(self.allocator);
             self.allocator.free(caps);
+        }
+
+        // Pass 0: adopt the process-global TLS ticket key(s), overriding the fresh
+        // key this successor minted at boot, so resumption tickets issued before the
+        // upgrade still open. A missing/undecodable capsule leaves the boot key in
+        // place (resumption still works; only pre-upgrade tickets miss). Singleton.
+        for (caps) |c| {
+            if (c.header.kind != .tls_ticket_keys) continue;
+            if (c.fields.len == 0) continue;
+            const tks = ticket_key_capsule.decode(c.fields[0].bytes) catch continue;
+            self.tls_ticket_key = tks.current;
+            self.tls_previous_ticket_key = tks.previous;
+            break;
         }
 
         // Pass 1: index the carried TLS engine states by socket fd (the join key
