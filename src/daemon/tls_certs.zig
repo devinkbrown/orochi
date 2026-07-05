@@ -163,7 +163,7 @@ fn loadFromDisk(allocator: std.mem.Allocator, io: std.Io, cert_path: []const u8,
 /// file order; a single raw-DER file yields a one-element chain. Presenting the
 /// intermediate lets clients build a path to the trust anchor without having it
 /// cached. The caller owns the returned slice and every element.
-fn loadCertChain(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![][]const u8 {
+pub fn loadCertChain(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![][]const u8 {
     const raw = try readFileOwned(allocator, io, path);
     defer allocator.free(raw);
 

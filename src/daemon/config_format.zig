@@ -63,6 +63,7 @@ pub const Config = struct {
     cloak: Cloak = .{},
     tls: Tls = .{},
     acme: Acme = .{},
+    ocsp: Ocsp = .{},
     webpush: Webpush = .{},
     sts: Sts = .{},
     dnsbl: Dnsbl = .{},
@@ -510,6 +511,17 @@ pub const Config = struct {
         check_interval_ms: u64 = 12 * 60 * 60 * 1000,
     };
 
+    /// Server-side OCSP stapling. When `enabled` and the `[tls]` leaf carries an
+    /// AIA OCSP responder URL, a background worker fetches, verifies, and caches a
+    /// staple that is attached to the leaf whenever a client offers status_request.
+    /// Off by default so handshakes stay byte-identical unless opted in.
+    pub const Ocsp = struct {
+        enabled: bool = false,
+        /// How often the worker wakes to check whether a (re)fetch is due. The
+        /// responder is only contacted when the cached staple is stale or missing.
+        check_interval_ms: u64 = 15 * 60 * 1000,
+    };
+
     /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
     /// the daemon advertises an `sts=` capability instructing clients to persist
     /// a secure-transport upgrade for `duration` seconds on the secure `port`.
@@ -862,6 +874,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("acme.contact"), &cfg.acme.contact);
     cfg.acme.renew_before_days = @intCast(try uintField(doc, "acme.renew_before_days", cfg.acme.renew_before_days, 1, 89));
     if (doc.getString("acme.check_interval")) |s| cfg.acme.check_interval_ms = try durationMs(s);
+
+    // [ocsp]
+    if (doc.getBool("ocsp.enabled")) |b| cfg.ocsp.enabled = b;
+    if (doc.getString("ocsp.check_interval")) |s| cfg.ocsp.check_interval_ms = try durationMs(s);
 
     // [webpush]
     if (doc.getBool("webpush.enabled")) |b| cfg.webpush.enabled = b;

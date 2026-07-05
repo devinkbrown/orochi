@@ -65,6 +65,7 @@ pub const node_identity = @import("node_identity.zig");
 pub const node_keyfile = @import("node_keyfile.zig");
 pub const oauth_jwt = @import("oauth_jwt.zig");
 pub const observe = @import("observe.zig");
+pub const ocsp_staple = @import("ocsp_staple.zig");
 pub const operator_groups = @import("operator_groups.zig");
 pub const oper = @import("oper.zig");
 pub const oper_override = @import("oper_override.zig");
@@ -194,6 +195,7 @@ test {
     _ = node_keyfile;
     _ = oauth_jwt;
     _ = observe;
+    _ = ocsp_staple;
     _ = operator_groups;
     _ = oper;
     _ = oper_override;

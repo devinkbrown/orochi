@@ -614,6 +614,37 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // ── OCSP staple fetcher ([ocsp] enabled + on-disk TLS cert) ─────────────
+    // A background worker fetches, verifies, and caches an OCSP response for the
+    // leaf and publishes it to the live TLS config; the leaf CertificateEntry
+    // (1.3) / CertificateStatus (1.2) then carries it when a client offers
+    // status_request. Needs a real cert file (self-signed bootstrap leaves have
+    // no AIA responder URL, so the worker simply no-ops there).
+    const OcspStapleService = if (builtin.os.tag == .linux) orochi.daemon.ocsp_staple.Service else void;
+    var ocsp_staple: ?*OcspStapleService = null;
+    defer if (comptime builtin.os.tag == .linux) {
+        if (ocsp_staple) |s| {
+            s.stop();
+            allocator.destroy(s);
+        }
+    };
+    if (held) |h| {
+        if (h.parsed.ocsp.enabled and h.parsed.tls.enabled and h.parsed.tls.cert_path != null) {
+            if (comptime builtin.os.tag == .linux) {
+                const svc = try allocator.create(OcspStapleService);
+                svc.* = OcspStapleService.init(allocator, init.io, &srv, &h.parsed.tls, .{
+                    .check_interval_ms = h.parsed.ocsp.check_interval_ms,
+                });
+                ocsp_staple = svc;
+                svc.start();
+            } else {
+                std.debug.print("orochi: [ocsp] enabled but staple fetching is Linux-only; disabled\n", .{});
+            }
+        } else if (h.parsed.ocsp.enabled) {
+            std.debug.print("orochi: [ocsp] enabled but requires [tls] with an on-disk cert_path; disabled\n", .{});
+        }
+    }
+
     // ── Web Push delivery worker ([webpush] enabled + account store) ────────
     // Offline DMs (tegami) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
