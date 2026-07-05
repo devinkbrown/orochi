@@ -724,6 +724,49 @@ test "ocsp verifyResponseSignature accepts direct issuer Ed25519 signature" {
     try std.testing.expect(!verifyResponseSignature(bad, spki));
 }
 
+test "buildRequest emits a well-formed single-CertID OCSP request" {
+    const allocator = std.testing.allocator;
+    const Sha1 = std.crypto.hash.Sha1;
+    // Issuer Name = SEQUENCE{ SET{ SEQUENCE{ OID cn, UTF8String "CA" }}}.
+    const issuer_name = "\x30\x0d\x31\x0b\x30\x09\x06\x03\x55\x04\x03\x0c\x02\x43\x41";
+    const issuer_key = "\x04\x11\x22\x33\x44\x55"; // fake raw public-key bytes
+    const serial = "\x12\x34\x56\x78";
+
+    const req = try buildRequest(allocator, .{
+        .issuer_name_der = issuer_name,
+        .issuer_key_bytes = issuer_key,
+        .serial_der = serial,
+    });
+    defer allocator.free(req);
+
+    // Outer OCSPRequest is a DER SEQUENCE whose length covers the whole buffer.
+    try std.testing.expectEqual(@as(u8, x509.Tag.sequence), req[0]);
+    try std.testing.expectEqual(@as(usize, req[1] + 2), req.len); // short-form len (< 128)
+
+    // The SHA-1 issuerNameHash, issuerKeyHash, the SHA-1 CertID OID, and the leaf
+    // serial contents all appear verbatim in the request.
+    var nh: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(issuer_name, &nh, .{});
+    var kh: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(issuer_key, &kh, .{});
+    try std.testing.expect(std.mem.indexOf(u8, req, &nh) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, &kh) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, &oid_sha1) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, serial) != null);
+
+    // Structurally re-parse the CertID nesting: SEQ{ SEQ{ SEQ{ SEQ{ CertID... }}}}.
+    var r = x509.DerReader{ .input = req };
+    const ocsp_req = try r.readExpected(x509.Tag.sequence);
+    var tbs_r = try r.child(ocsp_req);
+    const tbs = try tbs_r.readExpected(x509.Tag.sequence);
+    var list_r = try tbs_r.child(tbs);
+    const list = try list_r.readExpected(x509.Tag.sequence);
+    var one_r = try list_r.child(list);
+    const one = try one_r.readExpected(x509.Tag.sequence);
+    var cid_r = try one_r.child(one);
+    _ = try cid_r.readExpected(x509.Tag.sequence); // CertID SEQUENCE parses cleanly
+}
+
 fn testSignedOcspResponse(
     allocator: std.mem.Allocator,
     kp: Ed25519.KeyPair,
@@ -801,6 +844,57 @@ fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Inputs identifying the certificate an OCSP request asks about. All three are
+/// DER byte views the caller extracts from the leaf + issuer certificates:
+pub const CertIdInput = struct {
+    /// The issuer's full Name TLV (the `SEQUENCE` of RDNs, tag+len+value).
+    issuer_name_der: []const u8,
+    /// The issuer's subjectPublicKey BIT STRING value WITHOUT the leading
+    /// unused-bits octet (i.e. the raw public-key bytes).
+    issuer_key_bytes: []const u8,
+    /// The leaf certificate's serialNumber INTEGER contents (x509 `serial_der`).
+    serial_der: []const u8,
+};
+
+/// Build a DER `OCSPRequest` (RFC 6960 §4.1) with a single SHA-1 `CertID` and no
+/// optional signature or nonce. Caller owns the returned slice.
+///
+/// SHA-1 here is an *identifier* hash — the `CertID` responders key their
+/// pre-produced responses on (Let's Encrypt and virtually all responders). It is
+/// NOT a certificate or protocol signature, so it does not conflict with the
+/// modern-only ban on SHA-1 cert signatures.
+pub fn buildRequest(allocator: std.mem.Allocator, in: CertIdInput) std.mem.Allocator.Error![]u8 {
+    const Sha1 = std.crypto.hash.Sha1;
+    var name_hash: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(in.issuer_name_der, &name_hash, .{});
+    var key_hash: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(in.issuer_key_bytes, &key_hash, .{});
+
+    // CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+    var cert_id: std.ArrayList(u8) = .empty;
+    defer cert_id.deinit(allocator);
+    try appendAlgId(allocator, &cert_id, &oid_sha1, true);
+    try appendDerTlv(allocator, &cert_id, x509.Tag.octet_string, &name_hash);
+    try appendDerTlv(allocator, &cert_id, x509.Tag.octet_string, &key_hash);
+    try appendDerTlv(allocator, &cert_id, x509.Tag.integer, in.serial_der);
+
+    // Request ::= SEQUENCE { reqCert CertID } → requestList → TBSRequest → OCSPRequest.
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(allocator);
+    try appendDerSeq(allocator, &request, cert_id.items);
+    var request_list: std.ArrayList(u8) = .empty;
+    defer request_list.deinit(allocator);
+    try appendDerSeq(allocator, &request_list, request.items);
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
+    try appendDerSeq(allocator, &tbs, request_list.items);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, tbs.items);
     return out.toOwnedSlice(allocator);
 }
 
