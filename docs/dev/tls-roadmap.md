@@ -22,7 +22,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 | # | Item | Effort | Risk | Notes |
 |---|------|--------|------|-------|
 | 0.1 | **Wycheproof vectors → KAT harness** | M | Low | Google edge-case JSON vectors for ECDSA P-256/P-384, X25519, RSA-PSS, AES-GCM, ChaCha20-Poly1305, HKDF. Drops into existing `*_kat.zig` pattern. Finds signature-malleability / carry / edge bugs. |
-| 0.2 | **Fuzz harnesses** | M | Low | Zig built-in fuzzing over the attacker-facing parsers: TLS record, handshake messages, X.509. Highest defensive ROI. |
+| 0.2 | ✅ **DONE** — **Fuzz harnesses** (`tls_fuzz.zig`): deterministic random + structured + bit-flip robustness over x509/record/handshake parsers; ~44k inputs/run, no panics found. Follow-up: coverage-guided `--fuzz` (Smith). | M | Low | `tls_fuzz.zig` |
 | 0.3 | **BoGo shim + subset run** | L | Low | BoringSSL's protocol test runner against a shim. Design-spike first (which subset, shim wiring). |
 | 0.4 | **Constant-time verification** | M | Low | dudect/ctgrind-style timing checks on ECDSA/X25519/RSA to validate the "CT by construction" claim. |
 
@@ -32,7 +32,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 |---|------|--------|------|-------|
 | 1.1 | ✅ **DONE** — **Downgrade sentinel (RFC 8446 §4.1.3)**: 1.2 engine stamps `DOWNGRD\x01` into `server_random[24..32]` at construction (covers full + resumed ServerHello). Follow-up: have `tls12_client` check it. | S | Med | `tls12_server.zig` |
 | 1.2 | ✅ **DONE** — **Path-length basicConstraints enforcement**: `x509` retains `basic_constraints_path_len: ?u32`; validator rejects chains exceeding a CA's pathLen via the pure unit-tested `enforcePathLen` helper. | S | Med | `x509.zig`, `tls_client.zig`, `x509_selfsign.zig` |
-| 1.3 | **Validator + sig-alg consolidation** — collapse the two chain validators; align accepted sig set (RSA-PSS everywhere, SHA-384/512-RSA on the tls_client path) | M | Med | `x509_verify.zig`, `tls_client.zig` |
+| 1.3 | 🟡 **PARTIAL** — Added **RSA-PKCS1 SHA-384/512** to the production `tls_client` validator (real CAs use sha384WithRSA), no union change (avoids the wave-1 `oauth_jwt` break) + sha384 round-trip test. **Follow-up:** RSA-PSS SHA-384/512 (needs PSS-param parsing), align the non-production `x509_verify` simple validator. | M | Med | `tls_client.zig`, `x509_selfsign.zig` |
 | 1.4 | **Client-side PQ offering** — client never offers X25519MLKEM768 (server-only today) | S | Low | `tls_client.zig` |
 | 1.5 | **record_size_limit (RFC 8449)** — negotiate + enforce both legs | M | Med | `tls_server.zig`, `tls_client.zig`, `tls12*.zig` |
 | 1.6 | 🟡 **MECHANISM DONE** — **Ticket-key rotation**: `openTicketWithRotation` + `previous_ticket_key` on both TLS Configs (try current, then previous); unit-tested. **Follow-up:** daemon-level trigger (rotate on REHASH + carry `previous` across USR2). | M | Med | `tls_resumption.zig`, `tls12_server.zig`, `tls_server.zig` |
@@ -103,4 +103,8 @@ Design docs (wave 1): [0.3 BoGo](tls-design/bogo.md) · [2.1 server OCSP staplin
 
 - 2026-07-05: Roadmap created from the three-agent gap-analysis inventory.
 - 2026-07-05: Wave 1 — 4 designs landed; 1.1 downgrade sentinel LANDED; 7 impls triaged to wave 2 (stale-base + review findings above).
-- 2026-07-05: Wave 2 (re-implemented vs HEAD, not stale worktrees) — 1.2 path-length LANDED (pure `enforcePathLen` helper + parse/decode tests). Remaining surgical: 1.5 record_size_limit, 1.6 ticket-rotation (wire it), 1.4 client-PQ, 1.3 validator-consolidation (redo cleanly — the wave-1 patch had an `oauth_jwt.zig` union-exhaustiveness break).
+- 2026-07-05: Wave 2 (re-implemented vs HEAD, not stale worktrees) — landed **6 items**: 1.1 downgrade sentinel, 1.2 path-length, 1.3 (partial) RSA-SHA384/512 cert verify, 1.6 ticket-rotation mechanism, 0.2 fuzz harnesses, plus the roadmap + 4 design docs. All compile clean, tested, committed; **none deployed** (held for a full-suite + zig-review gate).
+  - **Surgical tier exhausted** for the cleanly-landable items. **Remaining, by size:**
+    - Small follow-ups: 1.3 PSS-384/512 (needs PSS-param parsing) + align `x509_verify`; 1.6 daemon rotation trigger (rotate-on-REHASH + carry `previous` across USR2); 1.4 client-PQ (low value); 0.1 adversarial crypto KATs.
+    - **Multi-file / larger:** 1.5 record_size_limit.
+    - **Multi-day features (scoped by the design docs, need dedicated sessions):** 2.1 server OCSP stapling, 2.2 server HRR, 2.3 cert compression, 2.4 SNI selection, 3.1 kTLS, 4.x wire-or-cut SCT/CRL/DTLS.
