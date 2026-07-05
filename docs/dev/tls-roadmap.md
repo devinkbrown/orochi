@@ -35,7 +35,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 | 1.3 | 🟡 **PARTIAL** — Added **RSA-PKCS1 SHA-384/512** to the production `tls_client` validator (real CAs use sha384WithRSA), no union change (avoids the wave-1 `oauth_jwt` break) + sha384 round-trip test. **Follow-up:** RSA-PSS SHA-384/512 (needs PSS-param parsing), align the non-production `x509_verify` simple validator. | M | Med | `tls_client.zig`, `x509_selfsign.zig` |
 | 1.4 | **Client-side PQ offering** — client never offers X25519MLKEM768 (server-only today) | S | Low | `tls_client.zig` |
 | 1.5 | **record_size_limit (RFC 8449)** — negotiate + enforce both legs | M | Med | `tls_server.zig`, `tls_client.zig`, `tls12*.zig` |
-| 1.6 | 🟡 **MECHANISM DONE** — **Ticket-key rotation**: `openTicketWithRotation` + `previous_ticket_key` on both TLS Configs (try current, then previous); unit-tested. **Follow-up:** daemon-level trigger (rotate on REHASH + carry `previous` across USR2). | M | Med | `tls_resumption.zig`, `tls12_server.zig`, `tls_server.zig` |
+| 1.6 | ✅ **DONE** — **Ticket-key rotation**: `openTicketWithRotation` + `previous_ticket_key` on both TLS Configs; daemon retains `tls_previous_ticket_key`, threads it in, and rotates on REHASH (`rotateTicketKey`). Unit-tested both layers. Minor follow-up: carry `previous` across USR2. | M | Med | `tls_resumption.zig`, `tls12_server.zig`, `tls_server.zig`, `daemon/server.zig` |
 
 ## Phase 2 — Server-facing protocol features
 
