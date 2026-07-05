@@ -490,6 +490,15 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
+                // Boot-time kTLS capability probe (roadmap 3.1 Phase 0): surface
+                // whether this kernel could offload TLS, so operators can see the
+                // deploy kernel's readiness before offload wiring lands. Purely
+                // informational — TLS is still terminated in userspace.
+                if (orochi.daemon.ktls.probeUlpSupport()) {
+                    std.debug.print("orochi: kTLS-capable kernel detected (TLS ULP present); offload not yet enabled\n", .{});
+                } else {
+                    std.debug.print("orochi: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
+                }
                 if (h.tls.enable_tls12) {
                     if (tls_loaded.?.key_kind == .ecdsa_p256) {
                         // The loaded ECDSA-P256 leaf serves the 1.2 leg natively.

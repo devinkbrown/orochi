@@ -29,6 +29,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
+const posix = std.posix;
 
 const native_endian = builtin.cpu.arch.endian();
 
@@ -195,6 +197,55 @@ pub fn tls13CryptoInfo(cipher: Cipher, static_iv: []const u8, key: []const u8, s
     };
 }
 
+// ── Boot-time capability probe (design Phase 0) ─────────────────────────────
+// A no-syscall-per-cipher check of whether the running kernel offers the TLS
+// ULP at all. The per-suite TLS_TX/RX acceptance probe + the setsockopt attach
+// primitives are Phase 1 (they need an ESTABLISHED socket and a deploy-kernel
+// round-trip), and are intentionally not here.
+
+/// Path the kernel exposes its available TCP ULPs at.
+pub const available_ulp_path = "/proc/sys/net/ipv4/tcp_available_ulp";
+
+/// True when the space/newline-separated ULP list (the contents of
+/// `available_ulp_path`) offers the `tls` ULP — i.e. the kernel has CONFIG_TLS
+/// and kTLS can be attached. Matches whole tokens, never a substring.
+pub fn ulpAvailable(available_ulp_contents: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, available_ulp_contents, " \t\r\n");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, ulp_name)) return true;
+    }
+    return false;
+}
+
+/// Boot-time probe: does the running kernel offer the TLS ULP? Reads
+/// `available_ulp_path`. Returns false on non-Linux or any read error (⇒ kTLS
+/// unavailable — the daemon simply keeps terminating TLS in userspace). This is
+/// the check that answers "is this deploy kernel kTLS-capable?" from the logs.
+pub fn probeUlpSupport() bool {
+    if (builtin.os.tag != .linux) return false;
+    const rc = linux.open(available_ulp_path, .{ .ACCMODE = .RDONLY }, 0);
+    if (posix.errno(rc) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer {
+        _ = linux.close(fd);
+    }
+    var buf: [256]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
+        switch (posix.errno(r)) {
+            .SUCCESS => {
+                const n: usize = @intCast(r);
+                if (n == 0) break;
+                total += n;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    return ulpAvailable(buf[0..total]);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -304,4 +355,16 @@ test "tls13CryptoInfo rejects a wrong IV or key length" {
     const key = [_]u8{0} ** 16;
     try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &[_]u8{0} ** 11, &key, 0));
     try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &[_]u8{0} ** 12, &[_]u8{0} ** 15, 0));
+}
+
+test "ulpAvailable matches the tls ULP token exactly" {
+    // The real /proc/sys/net/ipv4/tcp_available_ulp shape on a CONFIG_TLS kernel.
+    try testing.expect(ulpAvailable("espintcp mptcp tls\n"));
+    try testing.expect(ulpAvailable("tls"));
+    try testing.expect(ulpAvailable("tls mptcp"));
+    // No tls ULP.
+    try testing.expect(!ulpAvailable("espintcp mptcp\n"));
+    try testing.expect(!ulpAvailable(""));
+    // Whole-token match only — no substring false positives.
+    try testing.expect(!ulpAvailable("tlsx notls\n"));
 }
