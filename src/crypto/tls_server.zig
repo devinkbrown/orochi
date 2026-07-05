@@ -93,6 +93,7 @@ pub const Error = error{
     FinishedMismatch,
     NoCertificate,
     NoSigningKey,
+    LeafKeyMismatch,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
@@ -388,13 +389,18 @@ pub const Server = struct {
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
-        if (activeSigningKey(config) == null) return error.NoSigningKey;
-        // Every SNI cert must be independently presentable (chain + a signing key).
+        const default_key = activeSigningKey(config) orelse return error.NoSigningKey;
+        // Fail fast when the configured signing key's type can't match the leaf it
+        // must sign for — otherwise every handshake produces a CertificateVerify
+        // the client rejects (mismatched key vs presented leaf). A boot-time error
+        // is far clearer than a silent per-handshake failure.
+        if (!leafKeyKindMatches(config.cert_chain[0], default_key)) return error.LeafKeyMismatch;
+        // Every SNI cert must be independently presentable (chain + a signing key
+        // whose type matches its leaf's public key).
         for (config.sni_certs) |entry| {
             if (entry.cert_chain.len == 0) return error.NoCertificate;
-            if (entry.signing_key == null and entry.ecdsa_p256_signing_key == null and entry.rsa_signing_key == null) {
-                return error.NoSigningKey;
-            }
+            const entry_key = sniEntrySigningKey(entry) orelse return error.NoSigningKey;
+            if (!leafKeyKindMatches(entry.cert_chain[0], entry_key)) return error.LeafKeyMismatch;
         }
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
@@ -1833,6 +1839,31 @@ fn activeSigningKey(config: Config) ?SigningKey {
     if (config.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
     if (config.signing_key) |key| return .{ .ed25519 = key };
     return null;
+}
+
+/// The signing key an `SniCert` entry would present, with the same
+/// rsa › ecdsa › ed25519 precedence as `activeSigningKeyResolved`.
+fn sniEntrySigningKey(entry: SniCert) ?SigningKey {
+    if (entry.rsa_signing_key) |key| return .{ .rsa = key };
+    if (entry.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
+    if (entry.signing_key) |key| return .{ .ed25519 = key };
+    return null;
+}
+
+/// Whether `leaf_der`'s subjectPublicKey algorithm matches the type of `key`
+/// (the key that will produce this leaf's CertificateVerify). Conservative: if
+/// the leaf can't be parsed or its key type isn't recognized, returns true so a
+/// parser gap never blocks boot on an otherwise-valid cert — the point is only to
+/// catch a DEFINITE rsa/ecdsa/ed25519 mismatch early.
+fn leafKeyKindMatches(leaf_der: []const u8, key: SigningKey) bool {
+    const cert = x509.Certificate.parse(leaf_der) catch return true;
+    const pk = x509.extractPublicKey(cert.spki_der) catch return true;
+    const want: std.meta.Tag(x509.SubjectPublicKey) = switch (key) {
+        .rsa => .rsa,
+        .ecdsa_p256 => .ecdsa_p256,
+        .ed25519 => .ed25519,
+    };
+    return std.meta.activeTag(pk) == want;
 }
 
 /// True when `sni` matches any of `patterns` (case-insensitive). A `*.` prefix
@@ -3551,6 +3582,34 @@ test "sniDigest / sniDigestEql: presence and byte-exact equality" {
     // Case-sensitive on purpose: §4.1.2 requires a byte-identical ClientHello2,
     // so a case-flipped SNI is a (rejected) change, not a match.
     try std.testing.expect(!sniDigestEql(sniDigest("A.test"), sniDigest("a.test")));
+}
+
+test "init rejects a signing key whose type mismatches the leaf public key" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    // An Ed25519 leaf paired (wrongly) with an ECDSA-P256 signing key: every
+    // CertificateVerify would be produced by a key that doesn't match the
+    // presented leaf, so the server must refuse the config at init.
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    var buf: [1024]u8 = undefined;
+    const ed_leaf = try x509_selfsign.buildSelfSigned(&buf, .{
+        .common_name = "leaf.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = ed_kp,
+        .dns_names = &.{"leaf.test"},
+    });
+    const ecdsa_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    try std.testing.expectError(error.LeafKeyMismatch, Server.init(alloc, .{
+        .cert_chain = &.{ed_leaf},
+        .ecdsa_p256_signing_key = ecdsa_kp,
+    }));
+
+    // The matching pairing (Ed25519 leaf + Ed25519 key) initializes fine.
+    var ok = try Server.init(alloc, .{ .cert_chain = &.{ed_leaf}, .signing_key = ed_kp });
+    ok.deinit();
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {
