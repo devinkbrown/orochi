@@ -95,6 +95,9 @@ pub const Config = struct {
     /// `Config.previous_ticket_key`): new tickets seal under `ticket_key`; on
     /// open, a ticket failing under the current key is retried under this one.
     previous_ticket_key: ?tls_resumption.TicketKey = null,
+    /// DER OCSPResponse to staple via CertificateStatus (RFC 6066) when the
+    /// client offers status_request. Empty = no staple (byte-identical wire).
+    ocsp_staple: []const u8 = &.{},
     /// Single-use guard against ticket replay. Shared with the TLS 1.3 leg.
     replay_guard: ?*tls_resumption.ReplayGuard = null,
     /// Wall-clock seconds at handshake time (the crypto layer takes no clock).
@@ -159,6 +162,8 @@ pub const Server = struct {
     server_random: [32]u8,
     session_id: [32]u8 = [_]u8{0} ** 32,
     session_id_len: usize = 0,
+    /// The client offered status_request (wants an OCSP staple).
+    client_requested_ocsp: bool = false,
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
 
@@ -476,6 +481,7 @@ pub const Server = struct {
                     try g.expectEmpty();
                 },
                 0x0010 => try self.selectAlpn(body),
+                0x0005 => self.client_requested_ocsp = true, // status_request (OCSP)
                 ext_session_ticket => {
                     // RFC 5077: only honour the SessionTicket extension when the
                     // feature is enabled and a ticket key is configured. An empty
@@ -567,6 +573,10 @@ pub const Server = struct {
         // RFC 5077: when we will issue a ticket, echo an EMPTY SessionTicket
         // extension in ServerHello to announce the upcoming NewSessionTicket.
         if (self.issuingTicket()) try writeExtension(self.allocator, &exts, ext_session_ticket, "");
+        // RFC 6066: when we will staple, echo an EMPTY status_request in
+        // ServerHello to announce the upcoming CertificateStatus message.
+        const do_staple = self.client_requested_ocsp and self.config.ocsp_staple.len != 0;
+        if (do_staple) try writeExtension(self.allocator, &exts, 0x0005, "");
         try appendU16(self.allocator, &sh_body, @intCast(exts.items.len));
         try sh_body.appendSlice(self.allocator, exts.items);
         try writeHandshake(self.allocator, &hs, .server_hello, sh_body.items);
@@ -582,6 +592,17 @@ pub const Server = struct {
         try appendU24(self.allocator, &cert_body, @intCast(cert_list.items.len));
         try cert_body.appendSlice(self.allocator, cert_list.items);
         try writeHandshake(self.allocator, &hs, .certificate, cert_body.items);
+
+        // RFC 6066: CertificateStatus immediately follows Certificate when
+        // stapling. Body = status_type(1=ocsp) || u24 len || OCSPResponse.
+        if (do_staple) {
+            var cs: std.ArrayList(u8) = .empty;
+            defer cs.deinit(self.allocator);
+            try cs.append(self.allocator, 1); // status_type = ocsp
+            try appendU24(self.allocator, &cs, @intCast(self.config.ocsp_staple.len));
+            try cs.appendSlice(self.allocator, self.config.ocsp_staple);
+            try writeHandshake(self.allocator, &hs, .certificate_status, cs.items);
+        }
 
         const ske_body = try self.buildServerKeyExchange();
         defer self.allocator.free(ske_body);

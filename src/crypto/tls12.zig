@@ -59,6 +59,7 @@ pub const HandshakeType = enum(u8) {
     server_hello = 2,
     new_session_ticket = 4,
     certificate = 11,
+    certificate_status = 22,
     server_key_exchange = 12,
     certificate_request = 13,
     server_hello_done = 14,
