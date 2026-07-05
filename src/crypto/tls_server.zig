@@ -36,6 +36,7 @@ const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
 const cert_compression = @import("../proto/cert_compression.zig");
+const sni = @import("../proto/sni.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
 const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
@@ -164,6 +165,29 @@ pub const Config = struct {
     /// data is not accepted). The caller owns it and must serialize access if it
     /// is shared across threads. Null keeps the prior no-anti-replay behavior.
     replay_guard: ?*tls_resumption.ReplayGuard = null,
+    /// SNI-based additional certificates (RFC 6066). When a ClientHello's
+    /// `server_name` matches an entry, the server presents that entry's chain and
+    /// signs CertificateVerify with its key (and staples its OCSP response)
+    /// instead of the default top-level cert. First match wins; an absent or
+    /// unmatched SNI falls back to the default cert. Empty ⇒ SNI is not consulted
+    /// and the handshake is byte-identical to before.
+    sni_certs: []const SniCert = &.{},
+};
+
+/// One SNI-selectable certificate (see `Config.sni_certs`). The signing-key
+/// precedence mirrors the top-level Config: rsa › ecdsa_p256 › ed25519.
+pub const SniCert = struct {
+    /// Host names this entry answers to, matched case-insensitively. A leading
+    /// `*.` wildcard matches exactly one left-most label (RFC 6125 §6.4.3).
+    /// An empty list never matches.
+    server_names: []const []const u8,
+    /// DER certificates, leaf first (same shape as `Config.cert_chain`).
+    cert_chain: []const []const u8,
+    signing_key: ?Ed25519.KeyPair = null,
+    ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
+    rsa_signing_key: ?rsa_sign.PrivateKey = null,
+    /// Optional DER OCSPResponse to staple for this cert (like `Config.ocsp_staple`).
+    ocsp_staple: []const u8 = &.{},
 };
 
 pub const SigningKey = union(enum) {
@@ -351,10 +375,20 @@ pub const Server = struct {
     /// `config.enable_cert_compression`). Null ⇒ send a plain Certificate.
     /// Re-derived per ClientHello (so a HelloRetryRequest re-reads it).
     cert_compression: ?cert_compression.Algorithm = null,
+    /// Index into `config.sni_certs` selected by the ClientHello's server_name,
+    /// or null for the default top-level cert. Re-derived per ClientHello.
+    sni_cert: ?usize = null,
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
         if (activeSigningKey(config) == null) return error.NoSigningKey;
+        // Every SNI cert must be independently presentable (chain + a signing key).
+        for (config.sni_certs) |entry| {
+            if (entry.cert_chain.len == 0) return error.NoCertificate;
+            if (entry.signing_key == null and entry.ecdsa_p256_signing_key == null and entry.rsa_signing_key == null) {
+                return error.NoSigningKey;
+            }
+        }
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
         defer secureZero(&seed);
@@ -1008,6 +1042,7 @@ pub const Server = struct {
         if (!offered_tls13) return error.ProtocolVersion;
         self.selected_suite = full_suite;
         self.cert_compression = offered_cert_compression;
+        self.sni_cert = self.selectSniCert(raw);
         self.resumed = false;
         self.early_data_offered = offered_early_data;
         self.early_data_accepted = false;
@@ -1312,16 +1347,51 @@ pub const Server = struct {
         try self.appendTranscript(out.items[start..]);
     }
 
+    /// Choose the `config.sni_certs` index whose `server_names` matches the
+    /// ClientHello's SNI (RFC 6066), or null for the default cert. `raw` is the
+    /// ClientHello handshake message; `sni.extractOptional` bounds-checks it.
+    fn selectSniCert(self: *const Server, raw: []const u8) ?usize {
+        if (self.config.sni_certs.len == 0) return null;
+        const name = sni.extractOptional(raw) orelse return null;
+        for (self.config.sni_certs, 0..) |entry, i| {
+            if (serverNameMatches(entry.server_names, name)) return i;
+        }
+        return null;
+    }
+
+    /// The cert chain to present for this handshake (SNI-selected or default).
+    fn activeCertChain(self: *const Server) []const []const u8 {
+        if (self.sni_cert) |i| return self.config.sni_certs[i].cert_chain;
+        return self.config.cert_chain;
+    }
+
+    /// The OCSP staple to attach for this handshake (SNI-selected or default).
+    fn activeOcspStaple(self: *const Server) []const u8 {
+        if (self.sni_cert) |i| return self.config.sni_certs[i].ocsp_staple;
+        return self.config.ocsp_staple;
+    }
+
+    /// The signing key matching the presented leaf (SNI-selected or default),
+    /// with the same rsa › ecdsa › ed25519 precedence as `activeSigningKey`.
+    fn activeSigningKeyResolved(self: *const Server) ?SigningKey {
+        const i = self.sni_cert orelse return activeSigningKey(self.config);
+        const entry = self.config.sni_certs[i];
+        if (entry.rsa_signing_key) |key| return .{ .rsa = key };
+        if (entry.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
+        if (entry.signing_key) |key| return .{ .ed25519 = key };
+        return null;
+    }
+
     fn writeCertificate(self: *Server, out: *std.ArrayList(u8)) Error!void {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
         try body.append(self.allocator, 0); // certificate_request_context = empty
 
-        const staple = self.config.ocsp_staple;
+        const staple = self.activeOcspStaple();
         const do_staple = self.client_requested_ocsp and staple.len != 0;
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);
-        for (self.config.cert_chain, 0..) |der, i| {
+        for (self.activeCertChain(), 0..) |der, i| {
             try appendU24(self.allocator, &list, der.len);
             try list.appendSlice(self.allocator, der);
             if (i == 0 and do_staple) {
@@ -1374,7 +1444,7 @@ pub const Server = struct {
 
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
-        switch (activeSigningKey(self.config) orelse return error.NoSigningKey) {
+        switch (self.activeSigningKeyResolved() orelse return error.NoSigningKey) {
             .ed25519 => |key| {
                 const sig = (key.sign(input, null) catch return error.BadHandshake).toBytes();
                 try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
@@ -1688,6 +1758,28 @@ fn activeSigningKey(config: Config) ?SigningKey {
     if (config.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
     if (config.signing_key) |key| return .{ .ed25519 = key };
     return null;
+}
+
+/// True when `sni` matches any of `patterns` (case-insensitive). A `*.` prefix
+/// wildcard-matches exactly one left-most label (RFC 6125 §6.4.3): `*.a.com`
+/// matches `x.a.com` but neither `a.com` nor `x.y.a.com`.
+fn serverNameMatches(patterns: []const []const u8, host: []const u8) bool {
+    for (patterns) |pat| {
+        if (pat.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(pat, host)) return true;
+        if (pat.len > 2 and pat[0] == '*' and pat[1] == '.') {
+            const suffix = pat[1..]; // ".a.com"
+            if (host.len <= suffix.len) continue;
+            const host_suffix = host[host.len - suffix.len ..];
+            const label = host[0 .. host.len - suffix.len];
+            if (std.ascii.eqlIgnoreCase(host_suffix, suffix) and
+                label.len != 0 and std.mem.indexOfScalar(u8, label, '.') == null)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // --- record + handshake helpers (mirror tls_client.zig; kept local so the
@@ -3347,6 +3439,89 @@ test "loopback: RFC 8879 cert compression — server sends CompressedCertificate
     const got = try client.decrypt(s2c);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("compressed cert ok", got);
+}
+
+test "serverNameMatches: exact, case-insensitive, and single-label wildcard" {
+    try std.testing.expect(serverNameMatches(&.{"a.test"}, "a.test"));
+    try std.testing.expect(serverNameMatches(&.{"A.TEST"}, "a.test")); // case-insensitive
+    try std.testing.expect(serverNameMatches(&.{ "x.test", "a.test" }, "a.test")); // later entry
+    try std.testing.expect(!serverNameMatches(&.{"a.test"}, "b.test"));
+    try std.testing.expect(!serverNameMatches(&.{}, "a.test")); // empty list never matches
+    try std.testing.expect(!serverNameMatches(&.{""}, "a.test")); // empty pattern skipped
+    // "*." matches exactly one left-most label.
+    try std.testing.expect(serverNameMatches(&.{"*.a.com"}, "x.a.com"));
+    try std.testing.expect(!serverNameMatches(&.{"*.a.com"}, "a.com")); // no label
+    try std.testing.expect(!serverNameMatches(&.{"*.a.com"}, "x.y.a.com")); // two labels
+    try std.testing.expect(!serverNameMatches(&.{"*.a.com"}, "xa.com")); // suffix boundary
+}
+
+/// Drive a full loopback handshake with the SNI-capable `cfg`, verify the leaf
+/// against `server_name`/`trust`, round-trip app data, and return which
+/// `sni_certs` index the server selected (null = default cert).
+fn runSniHandshakeSelectedIndex(
+    alloc: std.mem.Allocator,
+    cfg: Config,
+    server_name: []const u8,
+    trust: []const []const u8,
+) !?usize {
+    const tls_client = @import("tls_client.zig");
+    var server = try Server.init(alloc, cfg);
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = server_name, .trust_anchors = trust });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    if (!client.handshakeDone()) return error.TestUnexpectedResult;
+    _ = try server.feed(cfin);
+    if (!server.handshakeDone()) return error.TestUnexpectedResult;
+
+    const s2c = try server.encrypt("sni ok");
+    defer alloc.free(s2c);
+    const got = try client.decrypt(s2c);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("sni ok", got);
+    return server.sni_cert;
+}
+
+test "loopback: SNI selects the matching certificate among multiple" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp0 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x90} ** Ed25519.KeyPair.seed_length);
+    const kpA = try Ed25519.KeyPair.generateDeterministic([_]u8{0x91} ** Ed25519.KeyPair.seed_length);
+    const kpB = try Ed25519.KeyPair.generateDeterministic([_]u8{0x92} ** Ed25519.KeyPair.seed_length);
+
+    var buf0: [1024]u8 = undefined;
+    var bufA: [1024]u8 = undefined;
+    var bufB: [1024]u8 = undefined;
+    const der0 = try x509_selfsign.buildSelfSigned(&buf0, .{ .common_name = "irc.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{0x01}, .key_pair = kp0, .dns_names = &.{"irc.test"}, .is_ca = true });
+    const derA = try x509_selfsign.buildSelfSigned(&bufA, .{ .common_name = "a.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{0x02}, .key_pair = kpA, .dns_names = &.{"a.test"}, .is_ca = true });
+    const derB = try x509_selfsign.buildSelfSigned(&bufB, .{ .common_name = "b.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{0x03}, .key_pair = kpB, .dns_names = &.{"b.test"}, .is_ca = true });
+
+    const sni_certs = [_]SniCert{
+        .{ .server_names = &.{"a.test"}, .cert_chain = &.{derA}, .signing_key = kpA },
+        .{ .server_names = &.{"b.test"}, .cert_chain = &.{derB}, .signing_key = kpB },
+    };
+    const cfg = Config{ .cert_chain = &.{der0}, .signing_key = kp0, .sni_certs = &sni_certs };
+
+    // Each handshake only completes if the server presented the cert valid for the
+    // client's server_name (SAN + trust anchor), so a green handshake *is* the
+    // proof of correct selection; the returned index corroborates it.
+    try std.testing.expectEqual(@as(?usize, 0), try runSniHandshakeSelectedIndex(alloc, cfg, "a.test", &.{derA}));
+    try std.testing.expectEqual(@as(?usize, 1), try runSniHandshakeSelectedIndex(alloc, cfg, "b.test", &.{derB}));
+    // Unmatched SNI falls back to the default cert.
+    try std.testing.expectEqual(@as(?usize, null), try runSniHandshakeSelectedIndex(alloc, cfg, "irc.test", &.{der0}));
 }
 
 test "loopback: client rejects an expired server certificate when a clock is supplied" {
