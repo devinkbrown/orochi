@@ -202,6 +202,7 @@ pub const TlsBootConfig = struct {
     enable_tls12: bool = false,
     enable_resumption: bool = false,
     early_data_max_size: u32 = 0,
+    ktls: config_format.Config.KtlsMode = .off,
 };
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
@@ -217,6 +218,7 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .enable_tls12 = cfg.tls.enable_tls12,
         .enable_resumption = cfg.tls.enable_resumption,
         .early_data_max_size = cfg.tls.early_data_max_size,
+        .ktls = cfg.tls.ktls,
     };
 }
 

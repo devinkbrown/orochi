@@ -490,12 +490,20 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
-                // Boot-time kTLS capability probe (roadmap 3.1 Phase 0): surface
-                // whether this kernel could offload TLS, so operators can see the
-                // deploy kernel's readiness before offload wiring lands. Purely
-                // informational — TLS is still terminated in userspace.
-                if (orochi.daemon.ktls.probeUlpSupport()) {
-                    std.debug.print("orochi: kTLS-capable kernel detected (TLS ULP present); offload not yet enabled\n", .{});
+                // Boot-time kTLS report (roadmap 3.1): cross the operator's
+                // configured `[tls] ktls` intent with the running kernel's TLS-ULP
+                // capability, so a misconfigured/unsupported request is visible at
+                // boot. Purely informational — the offload path is Phase 1, so TLS
+                // is still terminated in userspace regardless of the mode.
+                const ktls_capable = orochi.daemon.ktls.probeUlpSupport();
+                if (h.tls.ktls != .off) {
+                    if (ktls_capable) {
+                        std.debug.print("orochi: kTLS {s} requested; kernel is kTLS-capable — offload activates once Phase 1 wiring lands\n", .{@tagName(h.tls.ktls)});
+                    } else {
+                        std.debug.print("orochi: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
+                    }
+                } else if (ktls_capable) {
+                    std.debug.print("orochi: kTLS-capable kernel detected (TLS ULP present); set [tls] ktls=tx to opt in (Phase 1)\n", .{});
                 } else {
                     std.debug.print("orochi: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
                 }

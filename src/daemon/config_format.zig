@@ -457,6 +457,12 @@ pub const Config = struct {
     /// only describes intent. When `enabled` and no `cert_path`/`key_path` are
     /// given, the daemon bootstraps a self-signed Ed25519 leaf (see
     /// `tls_certs.loadOrBootstrap`) using `dns_name` as the CN/SAN.
+    /// kTLS (kernel TLS offload) mode (roadmap 3.1). `off` keeps TLS wholly in
+    /// userspace (the default and current behavior). `tx`/`txrx` opt into kernel
+    /// offload; the offload path is wired in Phase 1, so today these only widen
+    /// the boot-time capability report — no traffic is offloaded yet.
+    pub const KtlsMode = enum { off, tx, txrx };
+
     pub const Tls = struct {
         /// Whether to stand up a TLS listener at all.
         enabled: bool = false,
@@ -485,6 +491,8 @@ pub const Config = struct {
         /// Maximum accepted TLS 1.3 0-RTT early application bytes advertised in
         /// issued tickets. Zero disables early data while keeping PSK resumption.
         early_data_max_size: u32 = 0,
+        /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
+        ktls: KtlsMode = .off,
     };
 
     /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
@@ -866,6 +874,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("tls.enable_tls12")) |b| cfg.tls.enable_tls12 = b;
     if (doc.getBool("tls.enable_resumption")) |b| cfg.tls.enable_resumption = b;
     cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
+    if (doc.getString("tls.ktls")) |s| cfg.tls.ktls = parseKtlsMode(s) orelse return error.ParseError;
 
     // [acme]
     if (doc.getBool("acme.enabled")) |b| cfg.acme.enabled = b;
@@ -1113,6 +1122,14 @@ fn portField(doc: toml.Document, path: []const u8, current: u16) TomlError!u16 {
     const v = doc.getInt(path) orelse return current;
     if (v < 0 or v > 65535) return error.ParseError;
     return @intCast(v);
+}
+
+/// Map a `[tls] ktls` string to the mode enum, or null for an unknown value.
+fn parseKtlsMode(s: []const u8) ?Config.KtlsMode {
+    if (std.mem.eql(u8, s, "off")) return .off;
+    if (std.mem.eql(u8, s, "tx")) return .tx;
+    if (std.mem.eql(u8, s, "txrx")) return .txrx;
+    return null;
 }
 
 fn uintField(doc: toml.Document, path: []const u8, current: u64, min: u64, max: u64) TomlError!u64 {
@@ -1533,6 +1550,7 @@ test "parseToml: [tls] section projects onto Config" {
         \\enable_tls12 = true
         \\enable_resumption = true
         \\early_data_max_size = 16384
+        \\ktls = "tx"
         \\
     ;
 
@@ -1551,6 +1569,16 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expect(cfg.tls.enable_tls12);
     try testing.expect(cfg.tls.enable_resumption);
     try testing.expectEqual(@as(u32, 16384), cfg.tls.early_data_max_size);
+    try testing.expectEqual(Config.KtlsMode.tx, cfg.tls.ktls);
+}
+
+test "parseToml: ktls mode parses txrx and rejects an unknown value" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[tls]\nktls = \"txrx\"\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(Config.KtlsMode.txrx, cfg.tls.ktls);
+    // An unrecognized mode is a hard config error, not a silent fallback.
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[tls]\nktls = \"bogus\"\n", .{}));
 }
 
 test "parseToml: [tls] omitted keeps secure defaults" {
@@ -1568,6 +1596,7 @@ test "parseToml: [tls] omitted keeps secure defaults" {
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.cert_path);
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.key_path);
     try testing.expectEqualStrings("localhost", cfg.tls.dns_name);
+    try testing.expectEqual(Config.KtlsMode.off, cfg.tls.ktls);
 }
 
 test "parseToml: [acme] section projects onto Config" {
