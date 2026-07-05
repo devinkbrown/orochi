@@ -31,7 +31,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 | # | Item | Effort | Risk | Files |
 |---|------|--------|------|-------|
 | 1.1 | ✅ **DONE** — **Downgrade sentinel (RFC 8446 §4.1.3)**: 1.2 engine stamps `DOWNGRD\x01` into `server_random[24..32]` at construction (covers full + resumed ServerHello). Follow-up: have `tls12_client` check it. | S | Med | `tls12_server.zig` |
-| 1.2 | **Path-length basicConstraints enforcement** — `pathLenConstraint` is parsed then discarded | S | Med | `x509.zig`, `tls_client.zig` (verifyChainToTrustAnchors) |
+| 1.2 | ✅ **DONE** — **Path-length basicConstraints enforcement**: `x509` retains `basic_constraints_path_len: ?u32`; validator rejects chains exceeding a CA's pathLen via the pure unit-tested `enforcePathLen` helper. | S | Med | `x509.zig`, `tls_client.zig`, `x509_selfsign.zig` |
 | 1.3 | **Validator + sig-alg consolidation** — collapse the two chain validators; align accepted sig set (RSA-PSS everywhere, SHA-384/512-RSA on the tls_client path) | M | Med | `x509_verify.zig`, `tls_client.zig` |
 | 1.4 | **Client-side PQ offering** — client never offers X25519MLKEM768 (server-only today) | S | Low | `tls_client.zig` |
 | 1.5 | **record_size_limit (RFC 8449)** — negotiate + enforce both legs | M | Med | `tls_server.zig`, `tls_client.zig`, `tls12*.zig` |
@@ -103,3 +103,4 @@ Design docs (wave 1): [0.3 BoGo](tls-design/bogo.md) · [2.1 server OCSP staplin
 
 - 2026-07-05: Roadmap created from the three-agent gap-analysis inventory.
 - 2026-07-05: Wave 1 — 4 designs landed; 1.1 downgrade sentinel LANDED; 7 impls triaged to wave 2 (stale-base + review findings above).
+- 2026-07-05: Wave 2 (re-implemented vs HEAD, not stale worktrees) — 1.2 path-length LANDED (pure `enforcePathLen` helper + parse/decode tests). Remaining surgical: 1.5 record_size_limit, 1.6 ticket-rotation (wire it), 1.4 client-PQ, 1.3 validator-consolidation (redo cleanly — the wave-1 patch had an `oauth_jwt.zig` union-exhaustiveness break).
