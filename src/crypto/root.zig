@@ -55,6 +55,7 @@ pub const tsumugi_session = @import("tsumugi_session.zig");
 pub const vrf = @import("vrf.zig");
 pub const webauthn = @import("webauthn.zig");
 pub const webpush = @import("webpush.zig");
+pub const wycheproof_kat = @import("wycheproof_kat.zig");
 pub const x509_props = @import("x509_props.zig");
 pub const x509_verify = @import("x509_verify.zig");
 pub const x509 = @import("x509.zig");
@@ -116,6 +117,7 @@ test {
     _ = vrf;
     _ = webauthn;
     _ = webpush;
+    _ = wycheproof_kat;
     _ = x509_props;
     _ = x509_verify;
     _ = x509;
