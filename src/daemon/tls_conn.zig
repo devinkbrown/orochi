@@ -25,6 +25,8 @@ const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_record = @import("../crypto/tls_record.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
+const ktls = @import("ktls.zig");
+const linux = std.os.linux;
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("tls_conn requires a 64-bit target");
@@ -114,6 +116,42 @@ pub const TlsConn = struct {
             .tls13 => |*s| s.handshakeDone(),
             .tls12 => |*s| s.handshakeDone(),
         };
+    }
+
+    pub const KtlsError = error{
+        /// The engine isn't a connected TLS 1.3 session (1.2 offload is deferred).
+        KtlsUnsupportedEngine,
+    } || ktls.Error || ktls.AttachError;
+
+    /// Encode this session's server→client TX `crypto_info` into `out` (see
+    /// `ktls.CryptoInfo.encode`), ready for `setsockopt(TLS_TX)`. Only the TLS 1.3
+    /// engine is supported (1.2 kTLS derivation is deferred to a later phase);
+    /// returns `KtlsUnsupportedEngine` otherwise or before the handshake completes.
+    /// Pure (no syscalls): the byte transform half of `enableKtlsTx`.
+    pub fn buildKtlsTxCryptoInfo(self: *const TlsConn, out: []u8) KtlsError![]const u8 {
+        const params = switch (self.engine) {
+            .tls13 => |*s| s.ktlsTxParams() orelse return error.KtlsUnsupportedEngine,
+            .undecided, .tls12 => return error.KtlsUnsupportedEngine,
+        };
+        const cipher: ktls.Cipher = switch (params.cipher) {
+            .aes_128_gcm => .aes_gcm_128,
+            .aes_256_gcm => .aes_gcm_256,
+            .chacha20_poly1305 => .chacha20_poly1305,
+        };
+        const info = try ktls.tls13CryptoInfo(cipher, &params.iv, params.key, params.seq);
+        return info.encode(out);
+    }
+
+    /// Attach Linux kTLS TX offload to `fd` for the completed TLS 1.3 session, so
+    /// the kernel encrypts subsequent server→client writes. The caller MUST have
+    /// drained all userspace-sealed bytes (handshake flight + NewSessionTicket)
+    /// from the socket first and the socket must be ESTABLISHED, or the kernel
+    /// would encrypt the already-ciphertext tail. Only TLS 1.3 is supported.
+    pub fn enableKtlsTx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
+        var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        const encoded = try self.buildKtlsTxCryptoInfo(&buf);
+        try ktls.attachUlp(fd);
+        try ktls.attachTx(fd, encoded);
     }
 
     /// The negotiated protocol version, or null before the engine is chosen.
@@ -484,6 +522,43 @@ test "onInbound drives a full handshake against tls_client and streams app data 
     const got = try client.decrypt(cipher);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("hello client", got);
+}
+
+test "buildKtlsTxCryptoInfo produces a kernel-shaped TLS 1.3 crypto_info post-handshake" {
+    const alloc = std.testing.allocator;
+    const native = @import("builtin").cpu.arch.endian();
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    var buf: [ktls.max_crypto_info_len]u8 = undefined;
+    // No offload material before the handshake completes.
+    try std.testing.expectError(error.KtlsUnsupportedEngine, conn.buildKtlsTxCryptoInfo(&buf));
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // Real handshake keys → a well-formed AES-128-GCM crypto_info (40 bytes,
+    // version 0x0304, cipher_type 51) — the same shape the kernel accepted in
+    // ktls.zig's TLS_TX loopback test, now sourced from a live TlsConn session.
+    const encoded = try conn.buildKtlsTxCryptoInfo(&buf);
+    try std.testing.expectEqual(@as(usize, 40), encoded.len);
+    try std.testing.expectEqual(ktls.TLS_1_3_VERSION, std.mem.readInt(u16, encoded[0..2], native));
+    try std.testing.expectEqual(ktls.CipherType.aes_gcm_128.toInt(), std.mem.readInt(u16, encoded[2..4], native));
 }
 
 test "shared ticket key and replay guard resume across TlsConn instances" {
