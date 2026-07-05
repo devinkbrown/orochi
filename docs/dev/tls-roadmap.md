@@ -21,7 +21,7 @@ Risk: how dangerous a mistake is on the *live* stack.
 
 | # | Item | Effort | Risk | Notes |
 |---|------|--------|------|-------|
-| 0.1 | **Wycheproof vectors → KAT harness** | M | Low | Google edge-case JSON vectors for ECDSA P-256/P-384, X25519, RSA-PSS, AES-GCM, ChaCha20-Poly1305, HKDF. Drops into existing `*_kat.zig` pattern. Finds signature-malleability / carry / edge bugs. |
+| 0.1 | ✅ **DONE (rejection subset)** — **Adversarial crypto tests** (`wycheproof_kat.zig`): AEAD tamper (ct/tag/nonce/aad), X25519 all-zero low-order point, ECDSA r=0/s=0. Follow-up: positive independent-vector KATs (RSA-PSS, full curve set). | M | Low | `wycheproof_kat.zig` |
 | 0.2 | ✅ **DONE** — **Fuzz harnesses** (`tls_fuzz.zig`): deterministic random + structured + bit-flip robustness over x509/record/handshake parsers; ~44k inputs/run, no panics found. Follow-up: coverage-guided `--fuzz` (Smith). | M | Low | `tls_fuzz.zig` |
 | 0.3 | **BoGo shim + subset run** | L | Low | BoringSSL's protocol test runner against a shim. Design-spike first (which subset, shim wiring). |
 | 0.4 | **Constant-time verification** | M | Low | dudect/ctgrind-style timing checks on ECDSA/X25519/RSA to validate the "CT by construction" claim. |
