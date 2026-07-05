@@ -40,6 +40,7 @@ pub const Error = error{
 /// move between the wire u16 and this enum.
 pub const ExtensionType = enum(u16) {
     server_name = 0,
+    status_request = 5,
     supported_groups = 10,
     signature_algorithms = 13,
     alpn = 16,
@@ -67,6 +68,7 @@ pub const ExtensionType = enum(u16) {
     pub fn isKnown(value: u16) bool {
         return switch (fromInt(value)) {
             .server_name,
+            .status_request,
             .supported_groups,
             .signature_algorithms,
             .alpn,

@@ -116,6 +116,10 @@ pub const Config = struct {
     /// `previous_ticket_key` = the old `ticket_key`, install a new `ticket_key`)
     /// does not drop tickets still in flight. Mirrors cloak `previous_secret`.
     previous_ticket_key: ?tls_resumption.TicketKey = null,
+    /// A DER-encoded OCSPResponse to staple in the leaf CertificateEntry when the
+    /// client offers status_request (RFC 6066 / RFC 8446 §4.4.2.1). Empty = no
+    /// staple (the CertificateEntry stays byte-identical to the unstapled wire).
+    ocsp_staple: []const u8 = &.{},
     /// Lifetime advertised in NewSessionTicket.
     ticket_lifetime_seconds: u32 = 86_400,
     /// Maximum TLS 1.3 early data bytes advertised in NewSessionTicket and
@@ -299,6 +303,10 @@ pub const Server = struct {
     /// length it will accept. Default 2^14+1 = "no restriction beyond the protocol
     /// max". Outbound application records are fragmented to honor it.
     peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
+    /// The client offered the status_request extension (wants an OCSP staple).
+    /// When true AND `config.ocsp_staple` is non-empty, the leaf CertificateEntry
+    /// carries the staple.
+    client_requested_ocsp: bool = false,
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
@@ -833,6 +841,7 @@ pub const Server = struct {
                     }
                 },
                 .alpn => self.maybeSelectAlpn(ext.data),
+                .status_request => self.client_requested_ocsp = true,
                 .record_size_limit => {
                     // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
                     if (ext.data.len != 2) return error.BadHandshake;
@@ -1117,12 +1126,29 @@ pub const Server = struct {
         defer body.deinit(self.allocator);
         try body.append(self.allocator, 0); // certificate_request_context = empty
 
+        const staple = self.config.ocsp_staple;
+        const do_staple = self.client_requested_ocsp and staple.len != 0;
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);
-        for (self.config.cert_chain) |der| {
+        for (self.config.cert_chain, 0..) |der, i| {
             try appendU24(self.allocator, &list, der.len);
             try list.appendSlice(self.allocator, der);
-            try appendU16(self.allocator, &list, 0); // per-cert extensions = empty
+            if (i == 0 and do_staple) {
+                // Leaf CertificateEntry status_request extension (RFC 8446
+                // §4.4.2.1): ext_type(5) ‖ ext_len ‖ CertificateStatus, where
+                // CertificateStatus = status_type(1=ocsp) ‖ u24 len ‖ OCSPResponse.
+                var ext: std.ArrayList(u8) = .empty;
+                defer ext.deinit(self.allocator);
+                try appendU16(self.allocator, &ext, @intFromEnum(tls_extension.ExtensionType.status_request));
+                try appendU16(self.allocator, &ext, @intCast(1 + 3 + staple.len));
+                try ext.append(self.allocator, 1); // status_type = ocsp
+                try appendU24(self.allocator, &ext, staple.len);
+                try ext.appendSlice(self.allocator, staple);
+                try appendU16(self.allocator, &list, @intCast(ext.items.len));
+                try list.appendSlice(self.allocator, ext.items);
+            } else {
+                try appendU16(self.allocator, &list, 0); // per-cert extensions = empty
+            }
         }
         try appendU24(self.allocator, &body, list.items.len);
         try body.appendSlice(self.allocator, list.items);
@@ -2094,6 +2120,84 @@ test "loopback: X25519MLKEM768 post-quantum hybrid handshake (client offer + ser
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("pq hello server", got_s);
+}
+
+test "OCSP staple: leaf CertificateEntry carries status_request when client asked + staple set" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7b} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x7b, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    // The staple bytes are opaque here — this test checks the WIRE FRAMING the
+    // server produces (the client's parse + OCSP verification are tested
+    // separately). Real deployments configure a validly-signed OCSPResponse.
+    const staple = "\x30\x05\x0a\x01\x00\x02\x00"; // arbitrary DER-ish blob
+
+    const helper = struct {
+        fn leafExtLen(server: *Server, a: std.mem.Allocator) !struct { ext_len: usize, msg: []u8 } {
+            var out: std.ArrayList(u8) = .empty;
+            try server.writeCertificate(&out);
+            const m = try out.toOwnedSlice(a);
+            // handshake: type(1)+len(3); body: ctx_len(1)+ctx; cert_list_len(3);
+            // first entry: cert_len(3)+der + ext_len(2).
+            var p: usize = 4;
+            p += 1 + m[p]; // certificate_request_context
+            p += 3; // certificate_list length
+            const der_len = (@as(usize, m[p]) << 16) | (@as(usize, m[p + 1]) << 8) | m[p + 2];
+            p += 3 + der_len;
+            const ext_len = (@as(usize, m[p]) << 8) | m[p + 1];
+            return .{ .ext_len = ext_len, .msg = m };
+        }
+    };
+
+    // Configured staple + client asked → the leaf carries a status_request ext.
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .ocsp_staple = staple });
+        defer server.deinit();
+        server.client_requested_ocsp = true;
+        const r = try helper.leafExtLen(&server, alloc);
+        defer alloc.free(r.msg);
+        try std.testing.expect(r.ext_len > 0);
+        // Locate the extension: type(5), len, then CertificateStatus.
+        var p: usize = 4;
+        p += 1 + r.msg[p];
+        p += 3;
+        const der_len = (@as(usize, r.msg[p]) << 16) | (@as(usize, r.msg[p + 1]) << 8) | r.msg[p + 2];
+        p += 3 + der_len + 2; // skip cert + ext_len field
+        const ext_type = (@as(u16, r.msg[p]) << 8) | r.msg[p + 1];
+        try std.testing.expectEqual(@as(u16, 5), ext_type); // status_request
+        const data = r.msg[p + 4 ..][0 .. (@as(usize, r.msg[p + 2]) << 8) | r.msg[p + 3]];
+        try std.testing.expectEqual(@as(u8, 1), data[0]); // status_type = ocsp
+        const resp_len = (@as(usize, data[1]) << 16) | (@as(usize, data[2]) << 8) | data[3];
+        try std.testing.expectEqualSlices(u8, staple, data[4 .. 4 + resp_len]);
+    }
+
+    // No staple configured → the leaf extensions stay empty (byte-identical wire).
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer server.deinit();
+        server.client_requested_ocsp = true; // asked, but nothing to staple
+        const r = try helper.leafExtLen(&server, alloc);
+        defer alloc.free(r.msg);
+        try std.testing.expectEqual(@as(usize, 0), r.ext_len);
+    }
+
+    // Staple set but client did NOT ask → no staple (gated).
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .ocsp_staple = staple });
+        defer server.deinit();
+        const r = try helper.leafExtLen(&server, alloc);
+        defer alloc.free(r.msg);
+        try std.testing.expectEqual(@as(usize, 0), r.ext_len);
+    }
 }
 
 test "loopback: exportResume/resumeConnected carries a live session across Server instances" {
