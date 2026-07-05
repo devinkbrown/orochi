@@ -10,8 +10,10 @@
 //! Ed25519, ECDSA-P256, or RSA leaf certificate (CertificateVerify signed with
 //! the matching TLS 1.3 scheme), and the AES-128-GCM / ChaCha20-Poly1305 suites.
 //! Interop is pinned by loopback tests against the in-repo standards client
-//! `tls_client.Client`. HelloRetryRequest is intentionally out of scope here and
-//! rejected with a typed error.
+//! `tls_client.Client`. HelloRetryRequest (RFC 8446 §4.1.4) is supported: when a
+//! ClientHello offers no key_share the server can use but does advertise a group
+//! it supports, the server sends a single HRR requesting that group and folds the
+//! `message_hash` synthetic (§4.4.1) into the transcript before the retry.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,6 +34,7 @@ const max_hash_len = Sha384.hash_len;
 const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
+const supported_groups = @import("../proto/supported_groups.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
 const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
@@ -59,6 +62,23 @@ const hybrid_server_share_len = mlkem_ct_len + x25519_pub_len; // 1120
 /// Result of the TLS 1.3 (EC)DHE / hybrid key exchange: 32 bytes for a classical
 /// group (x25519 / secp256r1) or 64 bytes for X25519MLKEM768 (mlkem_ss || x25519_ss).
 const KexShared = struct { buf: [64]u8 = undefined, len: usize = 0 };
+
+/// Outcome of parsing a ClientHello: either we hold a usable (EC)DHE secret and
+/// build the server flight, or the client offered no key_share we can use and we
+/// must send a HelloRetryRequest asking it to retry with `retry` (RFC 8446 §4.1.4).
+const ClientHelloOutcome = union(enum) {
+    proceed: KexShared,
+    retry: tls_keyshare.NamedGroup,
+};
+
+/// RFC 8446 §4.1.3: the special ServerHello.random marking a message as a
+/// HelloRetryRequest — SHA-256 of the ASCII string "HelloRetryRequest".
+const hello_retry_request_random = [_]u8{
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+    0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+    0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
 
 pub const Error = error{
     BadState,
@@ -207,6 +227,9 @@ const CipherSuite = enum(u16) {
 const State = enum {
     idle,
     wait_client_hello,
+    // After a HelloRetryRequest: await the client's second ClientHello, which
+    // must carry a key_share for the group we requested (RFC 8446 §4.1.4).
+    wait_second_client_hello,
     // mTLS: the client's final flight is Certificate -> CertificateVerify ->
     // Finished. Without mTLS the server jumps straight to wait_client_finished.
     wait_client_cert,
@@ -240,6 +263,14 @@ pub const Server = struct {
     /// The server's X25519MLKEM768 key_share to emit (ml-kem ciphertext || x25519
     /// public key). Valid only when `selected_group == .x25519mlkem768`.
     hybrid_keyshare: [hybrid_server_share_len]u8 = undefined,
+    /// HelloRetryRequest state (RFC 8446 §4.1.4). `hrr_sent` guards against
+    /// issuing more than one HRR and selects the `message_hash` transcript path;
+    /// `hrr_group` is the group we asked the client to retry with — the second
+    /// ClientHello's key_share must supply exactly that group; `hrr_suite` is the
+    /// suite committed in the HRR, which ClientHello2 must not change.
+    hrr_sent: bool = false,
+    hrr_group: tls_keyshare.NamedGroup = .x25519,
+    hrr_suite: ?CipherSuite = null,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     resumed: bool = false,
@@ -439,6 +470,12 @@ pub const Server = struct {
             try self.appendTranscript(msg.raw);
             const reply = try self.buildServerFlight(msg.body, msg.raw);
             consumePrefix(&self.recv_buf, rec.wire_len);
+            if (self.hrr_sent) {
+                // We emitted a HelloRetryRequest; await ClientHello2. 0-RTT is
+                // impossible after HRR, so no early-data handling here.
+                self.state = .wait_second_client_hello;
+                return .{ .bytes_to_send = reply };
+            }
             if (self.early_data_accepted) {
                 try self.processAcceptedEarlyRecords();
             } else if (self.early_data_offered) {
@@ -446,6 +483,26 @@ pub const Server = struct {
             }
             // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
             // just the client Finished.
+            self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
+            return .{ .bytes_to_send = reply };
+        }
+
+        if (self.state == .wait_second_client_hello) {
+            while (true) {
+                const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+                if (rec.content_type != .change_cipher_spec) break;
+                consumePrefix(&self.recv_buf, rec.wire_len);
+            }
+            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            if (rec.content_type != .handshake) return error.BadRecord;
+            var off: usize = 0;
+            const msg = try parseHandshake(rec.fragment, &off);
+            if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
+            // ClientHello2 folds in after the message_hash synthetic + HRR that
+            // buildHelloRetryRequest already wrote to the transcript.
+            try self.appendTranscript(msg.raw);
+            const reply = try self.buildServerFlight(msg.body, msg.raw);
+            consumePrefix(&self.recv_buf, rec.wire_len);
             self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
             return .{ .bytes_to_send = reply };
         }
@@ -752,7 +809,10 @@ pub const Server = struct {
     }
 
     fn buildServerFlight(self: *Server, client_hello_body: []const u8, client_hello_raw: []const u8) Error![]u8 {
-        const shared = try self.processClientHello(client_hello_body, client_hello_raw);
+        const shared = switch (try self.processClientHello(client_hello_body, client_hello_raw)) {
+            .retry => |group| return try self.buildHelloRetryRequest(group),
+            .proceed => |s| s,
+        };
 
         // ServerHello (plaintext handshake record).
         var sh_hs: std.ArrayList(u8) = .empty;
@@ -794,7 +854,70 @@ pub const Server = struct {
         return out;
     }
 
-    fn processClientHello(self: *Server, body: []const u8, raw: []const u8) Error!KexShared {
+    /// Build a HelloRetryRequest flight (RFC 8446 §4.1.4): a ServerHello carrying
+    /// the magic random and a key_share naming the group the client must retry
+    /// with. Per §4.4.1 the transcript's ClientHello1 is first replaced by the
+    /// synthetic `message_hash` (handshake type 254), then the HRR is folded in.
+    /// Returns the plaintext HRR record followed by a compatibility
+    /// ChangeCipherSpec (caller owns).
+    fn buildHelloRetryRequest(self: *Server, group: tls_keyshare.NamedGroup) Error![]u8 {
+        self.selected_group = group;
+        self.hrr_group = group;
+        self.hrr_suite = self.selected_suite;
+        self.hrr_sent = true;
+
+        // At this point the transcript holds exactly ClientHello1, so
+        // transcriptHash() yields Hash(CH1). Replace it with the message_hash:
+        // 0xFE || uint24(Hash.length) || Hash(ClientHello1).
+        var ch1_hash: [max_hash_len]u8 = undefined;
+        const hlen = self.transcriptHash(&ch1_hash);
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.append(self.allocator, 0xFE);
+        try appendU24(self.allocator, &self.transcript, hlen);
+        try self.transcript.appendSlice(self.allocator, ch1_hash[0..hlen]);
+
+        var hrr_hs: std.ArrayList(u8) = .empty;
+        defer hrr_hs.deinit(self.allocator);
+        try self.writeHelloRetryRequest(&hrr_hs, group);
+        try self.appendTranscript(hrr_hs.items);
+
+        const hrr_record = try writePlainRecord(self.allocator, .handshake, hrr_hs.items);
+        defer self.allocator.free(hrr_record);
+        const ccs = [_]u8{ @intFromEnum(tls_record.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 };
+        var out = try self.allocator.alloc(u8, hrr_record.len + ccs.len);
+        @memcpy(out[0..hrr_record.len], hrr_record);
+        @memcpy(out[hrr_record.len..], &ccs);
+        return out;
+    }
+
+    /// Encode the HelloRetryRequest handshake message: a ServerHello whose random
+    /// is the magic HRR value, echoing the legacy_session_id, with only the
+    /// supported_versions (TLS 1.3) and a HRR key_share (the bare 2-byte group,
+    /// RFC 8446 §4.2.8) extensions.
+    fn writeHelloRetryRequest(self: *Server, out: *std.ArrayList(u8), group: tls_keyshare.NamedGroup) Error!void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        try appendU16(self.allocator, &body, tls_record.legacy_record_version);
+        try body.appendSlice(self.allocator, &hello_retry_request_random);
+        try body.append(self.allocator, @intCast(self.session_id_len));
+        try body.appendSlice(self.allocator, self.legacy_session_id[0..self.session_id_len]);
+        try appendU16(self.allocator, &body, @intFromEnum(self.selected_suite.?));
+        try body.append(self.allocator, 0); // null compression
+
+        var ext_storage: [64]u8 = undefined;
+        var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+        var ver_buf: [2]u8 = undefined;
+        try ext_builder.addTyped(.supported_versions, try tls_supported_versions.buildServer(&ver_buf, tls_supported_versions.tls13));
+        var ks_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &ks_buf, group.toInt(), .big);
+        try ext_builder.addTyped(.key_share, &ks_buf);
+        try body.appendSlice(self.allocator, try ext_builder.finish());
+
+        try writeHandshake(self.allocator, out, .server_hello, body.items);
+    }
+
+    fn processClientHello(self: *Server, body: []const u8, raw: []const u8) Error!ClientHelloOutcome {
         var c = Cursor.init(body);
         if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
         _ = try c.take(32); // client random (unused by the server key schedule)
@@ -819,6 +942,7 @@ pub const Server = struct {
         var x25519_share: ?[]const u8 = null;
         var p256_share: ?[]const u8 = null;
         var hybrid_share: ?[]const u8 = null; // X25519MLKEM768 (post-quantum)
+        var offered_groups: ?[]const u8 = null; // supported_groups body (for HRR)
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
@@ -828,6 +952,7 @@ pub const Server = struct {
                 .supported_versions => {
                     if (tls_supported_versions.clientOffers(ext.data, tls_supported_versions.tls13)) offered_tls13 = true;
                 },
+                .supported_groups => offered_groups = ext.data,
                 .key_share => {
                     var shares = tls_keyshare.parseClientShares(ext.data) catch continue;
                     while (shares.next() catch null) |entry| {
@@ -870,6 +995,53 @@ pub const Server = struct {
         self.early_data_done = !offered_early_data;
         self.accepted_early_data_limit = 0;
         self.accepted_psk_len = 0;
+
+        // HelloRetryRequest (RFC 8446 §4.1.4): if the client offered no key_share
+        // we can use but DID advertise a group we support, ask it to retry with
+        // that group rather than failing. Decided BEFORE PSK/0-RTT so we never
+        // accept early data on a hello we are about to bounce, and only once per
+        // connection — a second hello still lacking a usable share is fatal below.
+        const have_usable_share = x25519_share != null or p256_share != null or hybrid_share != null;
+        if (!have_usable_share and !self.hrr_sent) {
+            if (offered_groups) |groups| {
+                const server_prefs = [_]supported_groups.NamedGroup{ .x25519, .secp256r1, .x25519mlkem768 };
+                if (supported_groups.selectPreferred(groups, &server_prefs)) |g| {
+                    return ClientHelloOutcome{ .retry = tls_keyshare.NamedGroup.fromInt(g.toInt()) };
+                }
+            }
+        }
+
+        // On the second ClientHello the client MUST retry with exactly the group
+        // we requested (RFC 8446 §4.1.2). Ignore any share for a different group
+        // so the key exchange binds to `hrr_group`; if none remains, abort.
+        if (self.hrr_sent) {
+            // §4.1.2: the client MUST remove early_data in ClientHello2 — 0-RTT is
+            // not permitted after a HelloRetryRequest. Reject a peer that kept it.
+            if (offered_early_data) return error.BadHandshake;
+            // §4.1.4: ClientHello2 must keep the cipher suite the HRR committed to;
+            // a changed suite could switch the transcript hash out from under the
+            // message_hash synthetic. `hrr_suite` was stamped when the HRR was sent.
+            if (self.hrr_suite) |committed| {
+                if (committed != full_suite) return error.BadHandshake;
+            }
+            switch (self.hrr_group) {
+                .x25519 => {
+                    p256_share = null;
+                    hybrid_share = null;
+                },
+                .secp256r1 => {
+                    x25519_share = null;
+                    hybrid_share = null;
+                },
+                .x25519mlkem768 => {
+                    x25519_share = null;
+                    p256_share = null;
+                },
+                else => return error.BadHandshake,
+            }
+            if (x25519_share == null and p256_share == null and hybrid_share == null) return error.BadHandshake;
+        }
+
         if (psk_ext) |ext| {
             if (psk_modes_ok) {
                 if (try self.tryAcceptPsk(suites_block, raw, ext)) |suite| {
@@ -903,14 +1075,14 @@ pub const Server = struct {
             var out = KexShared{ .len = 32 };
             const ss = secret.declassify();
             @memcpy(out.buf[0..32], &ss);
-            return out;
+            return ClientHelloOutcome{ .proceed = out };
         }
         if (p256_share) |peer| {
             self.selected_group = .secp256r1;
             const ss = ecdh_p256.sharedSecret(self.p256_pair.secret, peer[0..ecdh_p256.public_length].*) catch return error.BadHandshake;
             var out = KexShared{ .len = 32 };
             @memcpy(out.buf[0..32], &ss);
-            return out;
+            return ClientHelloOutcome{ .proceed = out };
         }
         if (hybrid_share) |peer| {
             // X25519MLKEM768 (0x11ec): client share = ml-kem_ek(1184) || x25519_pk(32).
@@ -941,7 +1113,7 @@ pub const Server = struct {
             @memcpy(out.buf[0..32], &enc.shared_secret);
             const x_ss = x_secret.declassify();
             @memcpy(out.buf[32..64], &x_ss);
-            return out;
+            return ClientHelloOutcome{ .proceed = out };
         }
         return error.UnsupportedGroup;
     }
@@ -2990,6 +3162,92 @@ test "loopback: handshake completes over secp256r1 key exchange" {
     const got = try client.decrypt(s2c);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("p256 ok", got);
+}
+
+/// True when `flight` begins with a plaintext handshake record carrying a
+/// ServerHello whose random is the HelloRetryRequest magic value (RFC 8446).
+fn firstHandshakeIsHelloRetryRequest(flight: []const u8) bool {
+    const rec = completePlainRecord(flight) orelse return false;
+    if (rec.content_type != .handshake) return false;
+    var off: usize = 0;
+    const msg = parseHandshake(rec.fragment, &off) catch return false;
+    if (msg.typ != .server_hello or msg.body.len < 34) return false;
+    return std.mem.eql(u8, msg.body[2..34], &hello_retry_request_random);
+}
+
+test "loopback: server HelloRetryRequest recovers a client that withheld key_shares" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    // Advertise all groups but send an empty key_share, so the server must HRR.
+    client.offerNoSharesForTest();
+
+    // ClientHello1 (no shares) → server answers with a HelloRetryRequest.
+    const ch1 = try client.start();
+    defer alloc.free(ch1);
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    try std.testing.expect(firstHandshakeIsHelloRetryRequest(hrr));
+    try std.testing.expect(server.hrr_sent);
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519, server.hrr_group);
+    try std.testing.expectEqual(State.wait_second_client_hello, server.state);
+
+    // Client consumes the HRR and emits ClientHello2 with the x25519 share.
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(ch2);
+
+    // ClientHello2 → the real server flight; the exchange binds to x25519.
+    const sflight = switch (try server.feed(ch2)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519, server.selected_group);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    // Application data flows both ways over the post-HRR keys.
+    const s2c = try server.encrypt("hrr ok");
+    defer alloc.free(s2c);
+    const got = try client.decrypt(s2c);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("hrr ok", got);
+
+    const c2s = try client.encrypt("client after retry");
+    defer alloc.free(c2s);
+    const got2 = try server.decrypt(c2s);
+    defer alloc.free(got2);
+    try std.testing.expectEqualStrings("client after retry", got2);
 }
 
 test "loopback: client rejects an expired server certificate when a clock is supplied" {

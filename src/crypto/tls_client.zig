@@ -295,6 +295,10 @@ pub const Client = struct {
     cookie: ?[]const u8 = null,
     cookie_buf: [512]u8 = undefined,
     retry_hello: ?[]u8 = null,
+    /// Group a HelloRetryRequest asked us to retry with. When set, the second
+    /// ClientHello offers exactly one key_share — for this group (RFC 8446
+    /// §4.1.2). Null on the first ClientHello.
+    retry_key_share_group: ?supported_groups.NamedGroup = null,
 
     /// Post-handshake records the client must send back (a KeyUpdate response
     /// when the peer requested one). Drained by the caller via `takePendingSend`.
@@ -325,6 +329,10 @@ pub const Client = struct {
     /// post-quantum hybrid encaps/decaps path is exercised over the loopback (the
     /// server otherwise prefers classical x25519).
     force_hybrid_only_for_test: bool = false,
+    /// Test-only: advertise the full supported_groups but send an EMPTY key_share
+    /// list, forcing the server to answer with a HelloRetryRequest. The client
+    /// then retries with exactly the requested group's share.
+    force_no_shares_for_test: bool = false,
     /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite, so the
     /// SHA-384 key schedule is exercised end-to-end over the loopback.
     force_aes256_only_for_test: bool = false,
@@ -645,6 +653,34 @@ pub const Client = struct {
         self.force_aes256_only_for_test = true;
     }
 
+    /// Test-only: advertise the full group set but send no key_shares, forcing the
+    /// server to respond with a HelloRetryRequest.
+    pub fn offerNoSharesForTest(self: *Client) void {
+        self.force_no_shares_for_test = true;
+    }
+
+    /// Groups this client can complete a key exchange for. Kept in sync with the
+    /// supported_groups advertisement and the key_share builder in writeClientHello.
+    fn supportsGroup(self: *const Client, g: supported_groups.NamedGroup) bool {
+        _ = self;
+        return switch (g) {
+            .x25519, .secp256r1, .x25519mlkem768 => true,
+            else => false,
+        };
+    }
+
+    /// Whether ClientHello1 already carried a key_share for `g` — an HRR asking us
+    /// to retry with a group we already shared changes nothing and is illegal.
+    fn offeredShareFor(self: *const Client, g: supported_groups.NamedGroup) bool {
+        if (self.force_no_shares_for_test) return false;
+        if (self.force_p256_only_for_test) return g == .secp256r1;
+        if (self.force_hybrid_only_for_test) return g == .x25519mlkem768;
+        return switch (g) {
+            .x25519, .secp256r1, .x25519mlkem768 => true,
+            else => false,
+        };
+    }
+
     /// Raw (still-encrypted) record bytes received but not consumed by the
     /// handshake driver. After `handshakeDone()`, a one-shot caller should frame
     /// and `decryptApp` these *before* reading further from the socket, since a
@@ -895,7 +931,24 @@ pub const Client = struct {
 
         // Sized for the hybrid share (1216B) + x25519 (32B) + P-256 (65B) + headers.
         var keyshare_buf: [1400]u8 = undefined;
-        const keyshares = if (self.force_p256_only_for_test)
+        const keyshares = if (self.retry_key_share_group) |g|
+            // ClientHello2 after a HelloRetryRequest: exactly one share, for the
+            // group the server requested (RFC 8446 §4.1.2).
+            switch (g) {
+                .x25519 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                    .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
+                }),
+                .secp256r1 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                    .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+                }),
+                .x25519mlkem768 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                    .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
+                }),
+                else => return error.UnsupportedGroup,
+            }
+        else if (self.force_no_shares_for_test)
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{})
+        else if (self.force_p256_only_for_test)
             try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
                 .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
             })
@@ -1090,17 +1143,14 @@ pub const Client = struct {
         self.selected_suite = suite; // selects the transcript hash below
 
         // RFC 8446 §4.1.4: the requested group must be one we support AND did not
-        // already offer a key_share for. We always offer shares for every group we
-        // support (x25519mlkem768, x25519, secp256r1), so any group-change request
-        // is non-compliant.
+        // already offer a key_share for (a change-nothing HRR is illegal). By
+        // default we share every group we support, so any group-change request is
+        // non-compliant — but a test that withheld shares legitimately retries.
         if (hrr_group) |g| {
-            if (g == @intFromEnum(supported_groups.NamedGroup.x25519) or
-                g == @intFromEnum(supported_groups.NamedGroup.secp256r1) or
-                g == @intFromEnum(supported_groups.NamedGroup.x25519mlkem768))
-            {
-                return error.BadHandshake; // group already offered — illegal
-            }
-            return error.UnsupportedGroup; // group we cannot satisfy
+            const ng = supported_groups.NamedGroup.fromInt(g);
+            if (!self.supportsGroup(ng)) return error.UnsupportedGroup;
+            if (self.offeredShareFor(ng)) return error.BadHandshake; // no change — illegal
+            self.retry_key_share_group = ng;
         }
 
         if (cookie_bytes) |cb| {
@@ -1120,8 +1170,9 @@ pub const Client = struct {
         try self.appendTranscript(raw); // fold in the HelloRetryRequest itself
         self.hrr_seen = true;
 
-        // Build ClientHello2 (same random/session-id/key_shares, plus the cookie)
-        // and fold it into the transcript before sending.
+        // Build ClientHello2 (same random/session-id; key_share now the single
+        // requested group when the HRR changed groups, plus any cookie) and fold
+        // it into the transcript before sending.
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try self.writeClientHello(&hs);
