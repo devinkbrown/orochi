@@ -246,6 +246,35 @@ pub fn probeUlpSupport() bool {
     return ulpAvailable(buf[0..total]);
 }
 
+// ── Attach primitives (used by the Phase 1 send-seam; validated here) ────────
+
+pub const AttachError = error{
+    /// The kernel refused the TLS ULP (no CONFIG_TLS, or non-Linux).
+    KtlsUlpUnsupported,
+    /// The kernel refused the TX crypto state (unsupported suite/kernel, or the
+    /// socket was not ESTABLISHED).
+    KtlsTxUnsupported,
+};
+
+/// Attach the TLS ULP to `fd` (`setsockopt(SOL_TCP, TCP_ULP, "tls")`). One-way
+/// and permanent; the socket must be TCP. `TLS_TX`/`TLS_RX` additionally require
+/// it to be ESTABLISHED.
+pub fn attachUlp(fd: linux.fd_t) AttachError!void {
+    if (builtin.os.tag != .linux) return error.KtlsUlpUnsupported;
+    const rc = linux.setsockopt(fd, @intCast(SOL_TCP), TCP_ULP, ulp_name.ptr, @intCast(ulp_name.len));
+    if (posix.errno(rc) != .SUCCESS) return error.KtlsUlpUnsupported;
+}
+
+/// Install the server→client TX crypto state (`setsockopt(SOL_TLS, TLS_TX)`) from
+/// an already-encoded `crypto_info` (see `CryptoInfo.encode`). Requires
+/// `attachUlp` first and an ESTABLISHED socket; thereafter the kernel encrypts
+/// plaintext written to `fd`.
+pub fn attachTx(fd: linux.fd_t, crypto_info: []const u8) AttachError!void {
+    if (builtin.os.tag != .linux) return error.KtlsTxUnsupported;
+    const rc = linux.setsockopt(fd, @intCast(SOL_TLS), TLS_TX, crypto_info.ptr, @intCast(crypto_info.len));
+    if (posix.errno(rc) != .SUCCESS) return error.KtlsTxUnsupported;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -367,4 +396,61 @@ test "ulpAvailable matches the tls ULP token exactly" {
     try testing.expect(!ulpAvailable(""));
     // Whole-token match only — no substring false positives.
     try testing.expect(!ulpAvailable("tlsx notls\n"));
+}
+
+/// Establish an ESTABLISHED loopback TCP pair, attach the TLS ULP to the server
+/// end, and install our encoded TLS 1.3 `crypto_info` for `cipher` via TLS_TX —
+/// asserting the running kernel ACCEPTS the struct (a wrong size/version/
+/// cipher_type/field-order would EINVAL). Skips (not fails) when sockets or the
+/// TLS ULP are unavailable (sandbox / no CONFIG_TLS); a rejected but supported
+/// suite surfaces as `error.KtlsTxUnsupported`.
+fn tcpSocketOrSkip() !linux.fd_t {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM, linux.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    return @intCast(rc);
+}
+
+fn expectKernelAcceptsTx(cipher: Cipher, key_len: usize) !void {
+    const listen_fd = try tcpSocketOrSkip();
+    defer _ = linux.close(listen_fd);
+    var addr = linux.sockaddr.in{
+        .port = 0, // kernel-assigned ephemeral port
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001), // 127.0.0.1
+    };
+    if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+    // Read the assigned port back into `addr` for the client connect.
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+    addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+
+    const client_fd = try tcpSocketOrSkip();
+    defer _ = linux.close(client_fd);
+    if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+    const server_fd: linux.fd_t = @intCast(accept_rc);
+    defer _ = linux.close(server_fd);
+
+    attachUlp(server_fd) catch return error.SkipZigTest; // no CONFIG_TLS ⇒ skip
+
+    var static_iv = [_]u8{0xAB} ** 12;
+    var key = [_]u8{0xCD} ** 32;
+    const info = try tls13CryptoInfo(cipher, &static_iv, key[0..key_len], 0);
+    var enc: [max_crypto_info_len]u8 = undefined;
+    const encoded = try info.encode(&enc);
+    try attachTx(server_fd, encoded); // the kernel validates the struct here
+}
+
+test "kernel accepts our encoded crypto_info via TLS_TX (validates layout vs real kernel)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // AES-GCM-128 + TLS 1.3 is available on any kTLS-capable kernel (≥5.1); its
+    // acceptance validates the crypto_info header + field order + rec_seq layout.
+    // A rejection here is a real layout bug (not a missing cipher), so it fails.
+    try expectKernelAcceptsTx(.aes_gcm_128, 16);
+    // AES-GCM-256 (≥5.2) and ChaCha20-Poly1305 (≥5.11) may be absent on older
+    // kernels — validate their layout where supported, tolerate genuine absence.
+    expectKernelAcceptsTx(.aes_gcm_256, 32) catch |e| if (e != error.KtlsTxUnsupported) return e;
+    expectKernelAcceptsTx(.chacha20_poly1305, 32) catch |e| if (e != error.KtlsTxUnsupported) return e;
 }
