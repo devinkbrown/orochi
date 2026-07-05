@@ -376,8 +376,15 @@ pub const Server = struct {
     /// Re-derived per ClientHello (so a HelloRetryRequest re-reads it).
     cert_compression: ?cert_compression.Algorithm = null,
     /// Index into `config.sni_certs` selected by the ClientHello's server_name,
-    /// or null for the default top-level cert. Re-derived per ClientHello.
+    /// or null for the default top-level cert. Pinned on ClientHello1 and NOT
+    /// re-derived on ClientHello2 (a HelloRetryRequest must not change the cert).
     sni_cert: ?usize = null,
+    /// SHA-256 of the SNI host_name advertised in ClientHello1 (null ⇒ no
+    /// server_name was present). RFC 8446 §4.1.2 excludes SNI from the fields a
+    /// client may change across a HelloRetryRequest, so ClientHello2 must carry
+    /// the identical host_name; a mismatch is rejected (it would otherwise swap
+    /// the presented cert out from under the pinned `sni_cert`).
+    ch1_sni_digest: ?[32]u8 = null,
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
@@ -1099,7 +1106,18 @@ pub const Server = struct {
         if (!offered_tls13) return error.ProtocolVersion;
         self.selected_suite = full_suite;
         self.cert_compression = offered_cert_compression;
-        self.sni_cert = self.selectSniCert(raw);
+        // SNI (RFC 6066): pin the cert on ClientHello1. On ClientHello2 the SNI
+        // MUST be unchanged (RFC 8446 §4.1.2 — it is not among the fields a client
+        // may alter across a HelloRetryRequest), so verify CH2's host_name digest
+        // matches CH1's and keep the pinned `sni_cert`; a mismatch is a protocol
+        // violation (and a would-be cert-selection swap) and is fatal.
+        const sni_name = sni.extractOptional(raw);
+        if (self.hrr_sent) {
+            if (!sniDigestEql(self.ch1_sni_digest, sniDigest(sni_name))) return error.BadHandshake;
+        } else {
+            self.ch1_sni_digest = sniDigest(sni_name);
+            self.sni_cert = self.selectSniCert(sni_name);
+        }
         self.resumed = false;
         self.early_data_offered = offered_early_data;
         self.early_data_accepted = false;
@@ -1405,13 +1423,13 @@ pub const Server = struct {
     }
 
     /// Choose the `config.sni_certs` index whose `server_names` matches the
-    /// ClientHello's SNI (RFC 6066), or null for the default cert. `raw` is the
-    /// ClientHello handshake message; `sni.extractOptional` bounds-checks it.
-    fn selectSniCert(self: *const Server, raw: []const u8) ?usize {
+    /// advertised SNI host_name (RFC 6066), or null for the default cert. `name`
+    /// is the extracted host_name (null when the ClientHello carried no SNI).
+    fn selectSniCert(self: *const Server, name: ?[]const u8) ?usize {
         if (self.config.sni_certs.len == 0) return null;
-        const name = sni.extractOptional(raw) orelse return null;
+        const host = name orelse return null;
         for (self.config.sni_certs, 0..) |entry, i| {
-            if (serverNameMatches(entry.server_names, name)) return i;
+            if (serverNameMatches(entry.server_names, host)) return i;
         }
         return null;
     }
@@ -1837,6 +1855,26 @@ fn serverNameMatches(patterns: []const []const u8, host: []const u8) bool {
         }
     }
     return false;
+}
+
+/// SHA-256 of an advertised SNI host_name, or null when no server_name was
+/// present. Used to pin ClientHello1's SNI so a HelloRetryRequest's second
+/// ClientHello can be checked byte-exact (RFC 8446 §4.1.2) without retaining the
+/// variable-length name. The digest is over non-secret data (no timing concern).
+fn sniDigest(name: ?[]const u8) ?[32]u8 {
+    const host = name orelse return null;
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(host, &out, .{});
+    return out;
+}
+
+/// Whether two optional SNI digests match: both absent, or both present and
+/// byte-equal. RFC 8446 §4.1.2 requires ClientHello2's SNI to be identical to
+/// ClientHello1's (case included), so an exact compare is the intended check.
+fn sniDigestEql(a: ?[32]u8, b: ?[32]u8) bool {
+    const da = a orelse return b == null;
+    const db = b orelse return false;
+    return std.mem.eql(u8, &da, &db);
 }
 
 // --- record + handshake helpers (mirror tls_client.zig; kept local so the
@@ -3451,6 +3489,68 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     const got2 = try server.decrypt(c2s);
     defer alloc.free(got2);
     try std.testing.expectEqualStrings("client after retry", got2);
+}
+
+test "server rejects a ClientHello2 whose SNI differs from ClientHello1 (RFC 8446 §4.1.2)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x73} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x35 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    client.offerNoSharesForTest(); // force a HelloRetryRequest so CH2 exists
+
+    const ch1 = try client.start();
+    defer alloc.free(ch1);
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    try std.testing.expect(server.hrr_sent);
+    try std.testing.expect(server.ch1_sni_digest != null); // CH1's SNI was pinned.
+
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(ch2);
+
+    // Tamper: rewrite the (plaintext) SNI host_name in ClientHello2 so it no
+    // longer matches ClientHello1's. A conformant client sends a byte-identical
+    // SNI; a confusion attacker might swap it to coax a different cert. The server
+    // must reject at CH2 parse — "irc.test" appears only in the SNI here.
+    const at = std.mem.indexOf(u8, ch2, "irc.test") orelse return error.TestUnexpectedResult;
+    const tampered = try alloc.dupe(u8, ch2);
+    defer alloc.free(tampered);
+    tampered[at] = 'X'; // "Xrc.test" ⇒ different digest ⇒ rejection
+
+    try std.testing.expectError(error.BadHandshake, server.feed(tampered));
+}
+
+test "sniDigest / sniDigestEql: presence and byte-exact equality" {
+    try std.testing.expect(sniDigestEql(null, null));
+    try std.testing.expect(!sniDigestEql(sniDigest("a.test"), null));
+    try std.testing.expect(!sniDigestEql(null, sniDigest("a.test")));
+    try std.testing.expect(sniDigestEql(sniDigest("a.test"), sniDigest("a.test")));
+    try std.testing.expect(!sniDigestEql(sniDigest("a.test"), sniDigest("b.test")));
+    // Case-sensitive on purpose: §4.1.2 requires a byte-identical ClientHello2,
+    // so a case-flipped SNI is a (rejected) change, not a match.
+    try std.testing.expect(!sniDigestEql(sniDigest("A.test"), sniDigest("a.test")));
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {
