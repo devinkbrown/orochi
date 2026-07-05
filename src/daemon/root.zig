@@ -47,6 +47,7 @@ pub const helix = @import("helix/root.zig");
 pub const host_request = @import("host_request.zig");
 pub const http_fetch = @import("http_fetch.zig");
 pub const ip_reputation = @import("ip_reputation.zig");
+pub const ktls = @import("ktls.zig");
 pub const link_health = @import("link_health.zig");
 pub const mail_sender = @import("mail_sender.zig");
 pub const media_bridge = @import("media_bridge.zig");
@@ -177,6 +178,7 @@ test {
     _ = host_request;
     _ = http_fetch;
     _ = ip_reputation;
+    _ = ktls;
     _ = link_health;
     _ = mail_sender;
     _ = media_bridge;
