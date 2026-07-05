@@ -767,6 +767,38 @@ test "buildRequest emits a well-formed single-CertID OCSP request" {
     _ = try cid_r.readExpected(x509.Tag.sequence); // CertID SEQUENCE parses cleanly
 }
 
+test "buildRequestForCerts derives the CertID from parsed leaf + issuer certs" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6c} ** Ed25519.KeyPair.seed_length);
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&buf, .{
+        .common_name = "issuer.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6c, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"issuer.test"},
+        .is_ca = true,
+    });
+    const cert = try x509.parse(der);
+
+    // A self-signed cert is its own issuer — good enough to exercise the CertID
+    // wiring (leaf serial + issuer Name + issuer raw key).
+    const req = try buildRequestForCerts(allocator, cert, cert);
+    defer allocator.free(req);
+    try std.testing.expectEqual(@as(u8, x509.Tag.sequence), req[0]);
+
+    const Sha1 = std.crypto.hash.Sha1;
+    var nh: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(cert.subject_der, &nh, .{});
+    var kh: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(cert.subject_public_key, &kh, .{});
+    try std.testing.expect(std.mem.indexOf(u8, req, &nh) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, &kh) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, cert.serial_der) != null);
+}
+
 fn testSignedOcspResponse(
     allocator: std.mem.Allocator,
     kp: Ed25519.KeyPair,
@@ -896,6 +928,21 @@ pub fn buildRequest(allocator: std.mem.Allocator, in: CertIdInput) std.mem.Alloc
     errdefer out.deinit(allocator);
     try appendDerSeq(allocator, &out, tbs.items);
     return out.toOwnedSlice(allocator);
+}
+
+/// Build an OCSPRequest for a leaf certificate given its issuer, pulling the
+/// CertID inputs straight from the parsed certs (leaf serial + issuer Name +
+/// issuer raw public key). Caller owns the returned slice.
+pub fn buildRequestForCerts(
+    allocator: std.mem.Allocator,
+    leaf: x509.Certificate,
+    issuer: x509.Certificate,
+) std.mem.Allocator.Error![]u8 {
+    return buildRequest(allocator, .{
+        .issuer_name_der = issuer.subject_der,
+        .issuer_key_bytes = issuer.subject_public_key,
+        .serial_der = leaf.serial_der,
+    });
 }
 
 fn appendAlgId(allocator: std.mem.Allocator, out: *std.ArrayList(u8), oid: []const u8, with_null: bool) !void {

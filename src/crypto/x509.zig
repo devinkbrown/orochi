@@ -200,6 +200,12 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         serial_der: []const u8,
         spki_der: []const u8,
         spki_value: []const u8,
+        /// The subject `Name` TLV (full tag+len+value). When this cert is a CA,
+        /// this is the `issuer_name_der` an OCSP CertID hashes (RFC 6960).
+        subject_der: []const u8,
+        /// The raw subjectPublicKey BIT STRING value WITHOUT the leading
+        /// unused-bits octet — the `issuer_key_bytes` an OCSP CertID hashes.
+        subject_public_key: []const u8,
         not_before: Time,
         not_after: Time,
         signature_algorithm_oid: []const u8,
@@ -240,6 +246,8 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .serial_der = &.{},
                 .spki_der = &.{},
                 .spki_value = &.{},
+                .subject_der = &.{},
+                .subject_public_key = &.{},
                 .not_before = emptyTime(),
                 .not_after = emptyTime(),
                 .signature_algorithm_oid = &.{},
@@ -480,11 +488,20 @@ fn parseTbs(comptime CertType: type, cert: *CertType, parent: DerReader, tbs: Tl
     cert.not_after = try parseTime(try validity_reader.readTlv());
     try validity_reader.expectEmpty();
 
-    _ = try tbs_reader.readExpected(Tag.sequence); // subject
+    const subject = try tbs_reader.readExpected(Tag.sequence); // subject
+    cert.subject_der = subject.raw;
 
     const spki = try tbs_reader.readExpected(Tag.sequence);
     cert.spki_der = spki.raw;
     cert.spki_value = spki.value;
+    // Capture the raw subjectPublicKey bit-string value (minus the unused-bits
+    // octet) for the OCSP CertID issuerKeyHash.
+    {
+        var spki_reader = try tbs_reader.child(spki);
+        _ = try spki_reader.readExpected(Tag.sequence); // AlgorithmIdentifier
+        const bits = try spki_reader.readExpected(Tag.bit_string);
+        if (bits.value.len >= 1) cert.subject_public_key = bits.value[1..];
+    }
     try validateSpki(tbs_reader, spki);
 
     var saw_extensions = false;

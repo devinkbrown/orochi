@@ -753,6 +753,22 @@ test "basicConstraints pathLenConstraint round-trips through x509 parse" {
     try testing.expectEqual(@as(?u32, null), certn.basic_constraints_path_len);
 }
 
+test "x509 exposes subject_der + raw subject_public_key (OCSP CertID inputs)" {
+    const x509 = @import("../crypto/x509.zig");
+    var params = try testParams();
+    params.dns_names = &.{"ocsp.test"};
+    var out: [1024]u8 = undefined;
+    const cert = try x509.parse(try buildSelfSigned(&out, params));
+
+    // subject_der is the subject Name TLV — a DER SEQUENCE.
+    try testing.expect(cert.subject_der.len > 2);
+    try testing.expectEqual(@as(u8, 0x30), cert.subject_der[0]);
+
+    // For an Ed25519 cert the raw subjectPublicKey (BIT STRING value minus the
+    // unused-bits octet) is exactly the 32-byte public key.
+    try testing.expectEqualSlices(u8, &params.key_pair.public_key.toBytes(), cert.subject_public_key);
+}
+
 test "buildSelfSignedEcdsaP256 emits P-256 SPKI and ECDSA-SHA256 signature" {
     const x509 = @import("../crypto/x509.zig");
     const kp = ecdsa_p256.KeyPair.generate(testing.io);
