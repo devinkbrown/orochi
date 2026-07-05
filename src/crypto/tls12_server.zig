@@ -32,6 +32,16 @@ const sig_rsa_pkcs1_sha256: u16 = 0x0401;
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
 
+/// RFC 8446 §4.1.3 downgrade-protection sentinel ("DOWNGRD" + 0x01). A server
+/// that supports TLS 1.3 but negotiates TLS 1.2 MUST stamp the last 8 bytes of
+/// ServerHello.random with this value. This daemon ALWAYS supports TLS 1.3 (the
+/// 1.2 engine is only a fallback), so every 1.2 ServerHello carries it. A
+/// genuine TLS 1.3 client whose supported_versions was stripped by a MITM sees
+/// the sentinel and aborts the forced downgrade; the value is additionally
+/// covered by the ServerKeyExchange signature over both randoms, so an active
+/// attacker cannot rewrite it undetected.
+pub const tls13_downgrade_sentinel = [8]u8{ 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01 };
+
 pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     Allocator.Error || error{
     BadHandshake,
@@ -185,6 +195,13 @@ pub const Server = struct {
         if (activeCertificateAuth(config) == null) return error.NoSigningKey;
         var random: [32]u8 = undefined;
         try osEntropy(&random);
+        // RFC 8446 §4.1.3 downgrade protection: this daemon always supports TLS
+        // 1.3, so every ServerHello the 1.2 engine emits (full or resumed — both
+        // reuse this server_random) must carry the "DOWNGRD\x01" sentinel in the
+        // last 8 bytes of the 32-byte random. Stamp it here so it is present
+        // wherever server_random is written to the wire and signed into the
+        // ServerKeyExchange.
+        @memcpy(random[24..32], &tls13_downgrade_sentinel);
         return .{
             .allocator = allocator,
             .config = config,
@@ -1174,6 +1191,53 @@ fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
     const c_plain = try client.decrypt(s_app);
     defer allocator.free(c_plain);
     try std.testing.expectEqualSlices(u8, "server to client", c_plain);
+}
+
+test "TLS 1.2 ServerHello.random carries the RFC 8446 downgrade sentinel" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+    });
+    defer server.deinit();
+
+    // The sentinel is stamped at construction and reused for every ServerHello.
+    try std.testing.expectEqualSlices(u8, &tls13_downgrade_sentinel, server.server_random[24..32]);
+
+    // Drive the real first flight and confirm the sentinel lands on the wire in
+    // the emitted ServerHello.random (not just the in-memory field).
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const client_hello = try client.start();
+    defer allocator.free(client_hello);
+    const result = try server.feed(client_hello);
+    const flight = switch (result) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(flight);
+
+    // The first record is the plaintext handshake flight; ServerHello is its
+    // first message. Within the record fragment the 32-byte random begins after
+    // the handshake header (4) and legacy_version (2); the downgrade sentinel is
+    // the final 8 bytes of that random.
+    const rec = (try tls12.completeRecord(flight)) orelse return error.TestUnexpectedResult;
+    if (rec.content_type != .handshake) return error.TestUnexpectedResult;
+    if (rec.fragment.len < 38 or rec.fragment[0] != @intFromEnum(tls12.HandshakeType.server_hello)) {
+        return error.TestUnexpectedResult;
+    }
+    const sh_random = rec.fragment[6..38];
+    try std.testing.expectEqualSlices(u8, &tls13_downgrade_sentinel, sh_random[24..32]);
 }
 
 test "TLS 1.2 CertificateRequest wire format (mTLS)" {
