@@ -36,6 +36,17 @@ const rsa_verify = @import("rsa_verify.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const ed25519 = @import("sign.zig");
 
+/// std ECDSA over P-384 with SHA-384. Used only for the ecdsa-with-SHA384 chain
+/// branch, whose P-384 issuer key is parsed straight from the SPKI (see
+/// `verifyEcdsaP384`) — `x509.extractPublicKey`/`SubjectPublicKey` deliberately
+/// do not model P-384 (adding a union member has broad blast radius).
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+
+/// id-ecPublicKey (1.2.840.10045.2.1) — the SPKI algorithm OID for EC keys.
+const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+/// secp384r1 / ansip384r1 (1.3.132.0.34) — the EC named-curve parameter OID.
+const oid_secp384r1 = [_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x22 };
+
 pub const Digest = hash.Sha256.Digest;
 pub const digest_len = hash.Sha256.digest_len;
 
@@ -67,6 +78,8 @@ const SigOid = struct {
     const rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
     /// ecdsa-with-SHA256 (1.2.840.10045.4.3.2).
     const ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+    /// ecdsa-with-SHA384 (1.2.840.10045.4.3.3) — signed by a P-384 issuer key.
+    const ecdsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
     /// id-Ed25519 (1.3.101.112).
     const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 };
@@ -187,8 +200,9 @@ pub fn verifySimpleChain(chain_der: []const []const u8) Error!void {
 ///
 /// Public so external chain verifiers (e.g. the TLS 1.2/1.3 clients' trust-anchor
 /// checks) can delegate the signature primitive here and inherit the full sig-alg
-/// set — RSA PKCS#1 SHA-256/384/512, RSASSA-PSS, ECDSA P-256, Ed25519 — instead of
-/// re-implementing a narrower dispatch. Both `LinkInfo`s come from `linkInfo`.
+/// set — RSA PKCS#1 SHA-256/384/512, RSASSA-PSS, ECDSA P-256/P-384, Ed25519 —
+/// instead of re-implementing a narrower dispatch. Both `LinkInfo`s come from
+/// `linkInfo`.
 pub fn verifySignedBy(child: LinkInfo, issuer: LinkInfo) Error!void {
     try verifyCertSignature(child.tbs_der, child.signature_der, child.sig_alg_oid, child.sig_alg_params, issuer.spki_der);
 }
@@ -292,6 +306,7 @@ fn signatureBytes(tlv: x509.Tlv) x509.Error![]const u8 {
 ///   * id-RSASSA-PSS                    → RSASSA-PSS; hash/MGF/salt come from the
 ///                                        `sig_alg_params` (RSASSA-PSS-params)
 ///   * ecdsa-with-SHA256 (P-256)       → ECDSA/P-256/SHA-256
+///   * ecdsa-with-SHA384 (P-384)       → ECDSA/P-384/SHA-384
 ///   * id-Ed25519                       → Ed25519 (signs the TBS directly)
 ///
 /// `sig_alg_params` is the raw AlgorithmIdentifier `parameters` TLV from the
@@ -309,6 +324,15 @@ pub fn verifyCertSignature(
     sig_alg_params: ?[]const u8,
     issuer_spki: []const u8,
 ) Error!void {
+    // ecdsa-with-SHA384 verifies under a P-384 issuer key, which the shared
+    // x509.SubjectPublicKey union deliberately does not model (adding a member
+    // there has broad blast radius — e.g. the JWT verifier's exhaustive switch).
+    // Parse the P-384 point from the issuer SPKI locally, fail-closed — and do it
+    // BEFORE `extractPublicKey`, which would reject a P-384 SPKI as UnsupportedKey.
+    if (std.mem.eql(u8, sig_alg_oid, &SigOid.ecdsa_sha384)) {
+        return verifyEcdsaP384(issuer_spki, cert_tbs, sig_value);
+    }
+
     const key = try x509.extractPublicKey(issuer_spki);
 
     if (std.mem.eql(u8, sig_alg_oid, &SigOid.rsa_sha256)) {
@@ -553,6 +577,43 @@ fn verifyEcdsaP256(key: x509.SubjectPublicKey, tbs: []const u8, sig: []const u8)
     const pub_key = ecdsa_p256.parsePublicKeySec1(sec1) catch return error.BadSignature;
     const signature = ecdsa_p256.signatureFromDer(sig) catch return error.BadSignature;
     if (!ecdsa_p256.verify(signature, tbs, pub_key)) return error.BadSignature;
+}
+
+/// Verify an ecdsa-with-SHA384 signature under the P-384 issuer key carried in
+/// `issuer_spki`. `EcdsaP384.PublicKey.fromSec1` validates the point (length and
+/// on-curve); `.verify` hashes `tbs` with SHA-384 internally. Any structural or
+/// key-family mismatch fails closed as `BadSignature` — a P-384 signature can
+/// only have been produced by a P-384 key.
+fn verifyEcdsaP384(issuer_spki: []const u8, tbs: []const u8, sig: []const u8) Error!void {
+    const sec1 = try ecP384PointFromSpki(issuer_spki);
+    const pub_key = EcdsaP384.PublicKey.fromSec1(sec1) catch return error.BadSignature;
+    const signature = EcdsaP384.Signature.fromDer(sig) catch return error.BadSignature;
+    signature.verify(tbs, pub_key) catch return error.BadSignature;
+}
+
+/// Extract the SEC1 public-key point from a P-384 SubjectPublicKeyInfo
+/// (id-ecPublicKey + secp384r1). `x509.extractPublicKey` does not model P-384, so
+/// this narrow, fail-closed walk stands in only for the ecdsa-with-SHA384 branch.
+/// A non-P-384 issuer key is reported as `BadSignature` (a P-384 signature can
+/// only be verified by a P-384 key); malformed DER propagates as an `x509.Error`.
+fn ecP384PointFromSpki(spki_der: []const u8) Error![]const u8 {
+    var top = x509.DerReader.init(spki_der);
+    const seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(x509.Tag.sequence);
+    const key_bits = try spki.readExpected(x509.Tag.bit_string);
+    try spki.expectEmpty();
+
+    var alg = try spki.child(alg_seq);
+    const alg_oid = try alg.readExpected(x509.Tag.oid);
+    const curve_oid = try alg.readExpected(x509.Tag.oid);
+    try alg.expectEmpty();
+    if (!std.mem.eql(u8, alg_oid.value, &oid_ec_public_key)) return error.BadSignature;
+    if (!std.mem.eql(u8, curve_oid.value, &oid_secp384r1)) return error.BadSignature;
+
+    return signatureBytes(key_bits);
 }
 
 fn verifyEd25519(key: x509.SubjectPublicKey, tbs: []const u8, sig: []const u8) Error!void {
