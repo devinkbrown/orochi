@@ -178,7 +178,7 @@ fn runX25519(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
     // Fixed class: the all-zero secret (dudect's canonical fixed input). X25519
     // clamps it to a fixed scalar; against a normal peer point this yields a
     // valid, non-low-order shared secret.
-    const fixed_sk = kx.SecretKey.init([_]u8{0} ** 32);
+    const fixed_sk = kx.SecretKey.init(@as([32]u8, @splat(0)));
 
     // Random class: a fresh random secret scalar per measurement.
     const random_sks = try alloc.alloc(kx.SecretKey, count);
