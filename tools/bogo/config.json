@@ -1,0 +1,47 @@
+{
+  "//": "BoGo -shim-config for tools/bogo_shim.zig (roadmap 0.3). This is the",
+  "//_": "orochi-side integration surface for BoringSSL's ssl/test/runner, which",
+  "//__": "is an OUT-OF-REPO harness: `tools/bogo.sh` pins a BoringSSL checkout and",
+  "//___": "runs `go test` in ssl/test/runner with `-shim-config` pointed here.",
+  "//____": "DisabledTests encodes orochi's modern-only posture (families the shim",
+  "//_____": "intentionally does not implement ⇒ it exits 89, and -allow-unimplemented",
+  "//______": "skips them). ErrorMap maps BoringSSL error constants to substrings of",
+  "//_______": "the orochi error names the shim prints to stderr. Both are the",
+  "//________": "long-tail iteration surface — refine against the pinned revision.",
+
+  "DisabledTests": {
+    "SSL3-*": "modern-only: SSLv3 unsupported (min version TLS 1.2)",
+    "*TLS1-*": "modern-only: TLS 1.0 unsupported",
+    "*TLS11-*": "modern-only: TLS 1.1 unsupported",
+    "*DTLS*": "no DTLS stack",
+    "*-CBC-*": "AEAD-only: no CBC cipher suites",
+    "*3DES*": "AEAD-only: no 3DES",
+    "*RC4*": "AEAD-only: no RC4",
+    "*Renegotiate*": "renegotiation unsupported (deliberately cut)",
+    "*RSA-Key-Exchange*": "ECDHE-only: no static-RSA key exchange",
+    "*FFDHE*": "ECDHE-only: no finite-field DHE groups",
+    "*HelloRetryRequest*": "shim runs 1.3-only or dual with a usable key_share; server-forced HRR out of scope",
+    "*HRR*": "HelloRetryRequest out of scope for the shim subset",
+    "*P-384*": "groups limited to x25519 / secp256r1 / X25519MLKEM768",
+    "*P-521*": "groups limited to x25519 / secp256r1 / X25519MLKEM768",
+    "*Resume*": "resumption (1.3 PSK / 1.2 tickets) not yet driven by the shim (-resume-count ⇒ exit 89)",
+    "*EarlyData*": "0-RTT not yet driven by the shim",
+    "*ClientAuth*": "mTLS / client certificates not yet driven by the shim",
+    "*ECH*": "Encrypted ClientHello out of scope",
+    "*ChannelID*": "Channel ID unsupported",
+    "*DelegatedCredential*": "delegated credentials not driven by the shim"
+  },
+
+  "ErrorMap": {
+    ":UNEXPECTED_MESSAGE:": "BadHandshake",
+    ":DECODE_ERROR:": "DecodeError",
+    ":WRONG_VERSION_NUMBER:": "ProtocolVersion",
+    ":UNSUPPORTED_PROTOCOL:": "ProtocolVersion",
+    ":NO_SHARED_CIPHER:": "UnsupportedCipherSuite",
+    ":WRONG_CURVE:": "UnsupportedGroup",
+    ":DIGEST_CHECK_FAILED:": "FinishedMismatch",
+    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": "BadRecord",
+    ":CERTIFICATE_VERIFY_FAILED:": "BadSignature",
+    ":NO_APPLICATION_PROTOCOL:": "AlpnMismatch"
+  }
+}
