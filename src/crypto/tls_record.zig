@@ -128,6 +128,21 @@ pub fn recordContentLimit(peer_record_size_limit: usize) usize {
     return @min(max_plaintext_len, inner);
 }
 
+/// RFC 8449 for TLS 1.2 and earlier: the peer's advertised `record_size_limit`
+/// bounds `TLSPlaintext.fragment` directly. Unlike TLS 1.3 there is no inner
+/// content-type byte or padding in the plaintext, so no `- 1` adjustment
+/// applies — the fragment content limit is the advertised value itself, capped
+/// at the protocol max (2^14). The explicit nonce and AEAD tag are record
+/// protection overhead outside the fragment and are not counted. The default
+/// limit (2^14+1) yields exactly `max_plaintext_len` — no restriction.
+pub fn recordContentLimit12(peer_record_size_limit: usize) usize {
+    // `@max(1, …)` keeps the invariant local: a 0 limit (unreachable from the
+    // wire — parse enforces ≥64 — but settable directly, e.g. in tests) would
+    // otherwise make the caller's fragmentation loop emit zero-length records
+    // forever. Real limits are ≥64 so this is a no-op for them.
+    return @max(1, @min(max_plaintext_len, peer_record_size_limit));
+}
+
 /// RFC 8449 record_size_limit bounds: the smallest legal advertised value is 64;
 /// the largest is 2^14+1 (TLSInnerPlaintext including the content-type byte).
 pub const record_size_limit_min: u16 = 64;

@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const tls12 = @import("tls12.zig");
+const tls_record = @import("tls_record.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
@@ -162,6 +163,10 @@ pub const Client = struct {
     app_write_seq: u64 = 0,
     hs_read_seq: u64 = 0,
     hs_write_seq: u64 = 0,
+    /// RFC 8449 record_size_limit advertised by the server (max
+    /// TLSPlaintext.fragment it accepts). Default 2^14+1 = unrestricted; outbound
+    /// records are fragmented to honor a smaller value (see `encrypt`).
+    peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
 
     // ---- RFC 5077 stateless session resumption (opt-in) ----
     /// When true the ClientHello advertises an (empty) SessionTicket extension so
@@ -447,9 +452,26 @@ pub const Client = struct {
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata);
-        self.app_write_seq += 1;
-        return out;
+        const limit = tls_record.recordContentLimit12(self.peer_record_size_limit);
+        if (appdata.len <= limit) {
+            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata);
+            self.app_write_seq += 1;
+            return out;
+        }
+        // RFC 8449: fragment application data to the server's smaller record limit,
+        // one record per fragment, concatenated (seq bumped per record).
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var off: usize = 0;
+        while (off < appdata.len) {
+            const n = @min(limit, appdata.len - off);
+            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            defer self.allocator.free(rec);
+            try buf.appendSlice(self.allocator, rec);
+            self.app_write_seq += 1;
+            off += n;
+        }
+        return buf.toOwnedSlice(self.allocator);
     }
 
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
@@ -491,6 +513,7 @@ pub const Client = struct {
         try writeSignatureAlgorithmsExtension(self.allocator, &exts);
         try writeSupportedVersionsExtension(self.allocator, &exts);
         try self.writeAlpnExtension(&exts);
+        try writeRecordSizeLimitExtension(self.allocator, &exts);
         try self.writeSessionTicketExtension(&exts);
         try appendU16(self.allocator, out, @intCast(exts.items.len));
         try out.appendSlice(self.allocator, exts.items);
@@ -654,6 +677,14 @@ pub const Client = struct {
                 // — that is decided by whether a Certificate follows.
                 if (body.len != 0) return error.BadHandshake;
                 self.server_signaled_ticket = true;
+            } else if (typ == 0x001c) {
+                // RFC 8449 record_size_limit: a 2-byte value in [64, 2^14+1];
+                // anything else is illegal_parameter. Store it so our outbound
+                // records honor the server's limit.
+                if (body.len != 2) return error.BadHandshake;
+                const limit = std.mem.readInt(u16, body[0..2], .big);
+                if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                self.peer_record_size_limit = limit;
             } else if (typ == 0x002b) {
                 return error.ProtocolVersion; // supported_versions would select TLS 1.3.
             }
@@ -863,6 +894,16 @@ fn writeSupportedVersionsExtension(allocator: Allocator, out: *std.ArrayList(u8)
     body[0] = 2;
     std.mem.writeInt(u16, body[1..3], tls12.tls_version, .big);
     try writeExtension(allocator, out, 0x002b, &body);
+}
+
+/// RFC 8449 record_size_limit: advertise the largest TLSPlaintext.fragment we
+/// accept (the protocol max — our recv path handles full-size records). The
+/// server, if it supports the extension, echoes its own limit and we fragment
+/// outbound records to honor it.
+fn writeRecordSizeLimitExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+    var body: [2]u8 = undefined;
+    std.mem.writeInt(u16, &body, tls_record.record_size_limit_max, .big);
+    try writeExtension(allocator, out, 0x001c, &body);
 }
 
 fn writeSignatureAlgorithmsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
@@ -1245,4 +1286,29 @@ test "tls12 client downgrade sentinel (RFC 8446 4.1.3): inert for a 1.2-only cli
     try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls12_sentinel));
     try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls11_sentinel));
     try checkDowngradeSentinel(true, &normal_random);
+}
+
+test "TLS 1.2 client rejects an out-of-range server record_size_limit (RFC 8449)" {
+    const allocator = std.testing.allocator;
+    const anchors = [_][]const u8{};
+    var client = try Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+
+    // ServerHello extension bytes carrying record_size_limit (0x001c). 63 is one
+    // below the legal minimum of 64; anything out of [64, 2^14+1] is rejected.
+    const too_small = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x3f };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&too_small));
+
+    // 0x4002 = 16386 — one above the maximum (2^14+1 = 16385).
+    const too_large = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&too_large));
+
+    // A wrong-length body (1 byte) is rejected too.
+    const bad_len = [_]u8{ 0x00, 0x1c, 0x00, 0x01, 0x40 };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&bad_len));
+
+    // A valid value is accepted and drives outbound fragmentation.
+    const ok = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x40 }; // 64
+    try client.parseServerExtensions(&ok);
+    try std.testing.expectEqual(@as(usize, 64), client.peer_record_size_limit);
 }
