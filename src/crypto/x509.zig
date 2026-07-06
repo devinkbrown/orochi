@@ -346,10 +346,16 @@ const SpkiOid = struct {
     const prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
     /// id-Ed25519 (1.3.101.112).
     const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+    /// id-ML-DSA-65 (2.16.840.1.101.3.4.3.18) — the SPKI AlgorithmIdentifier OID
+    /// for a raw ML-DSA-65 public key (draft-ietf-lamps-dilithium-certificates).
+    /// Same OID identifies both the key and the signature algorithm.
+    const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
 };
 
 /// Length of an Ed25519 raw public key.
 pub const ed25519_public_key_len = 32;
+/// Length of a raw ML-DSA-65 public key (ρ ‖ t1), per FIPS 204.
+pub const ml_dsa_65_public_key_len = 1952;
 /// Length of an uncompressed SEC1 P-256 point (0x04 || X32 || Y32).
 pub const ec_p256_sec1_len = 65;
 
@@ -406,6 +412,39 @@ pub fn extractPublicKey(spki_der: []const u8) Error!SubjectPublicKey {
         return .{ .ed25519 = key_bytes };
     }
     return error.UnsupportedKey;
+}
+
+/// Extract the raw ML-DSA-65 public key (1952 bytes, ρ ‖ t1) from a
+/// SubjectPublicKeyInfo. The AlgorithmIdentifier OID must be exactly id-ML-DSA-65
+/// (2.16.840.1.101.3.4.3.18) with an ABSENT parameters field
+/// (draft-ietf-lamps-dilithium-certificates), and the key BIT STRING must hold
+/// exactly the raw key bytes with zero unused bits. Fails closed on any
+/// deviation. This is a separate entry point from `extractPublicKey` so the
+/// post-quantum path never widens the classical `SubjectPublicKey` union that
+/// many unrelated verifiers switch over.
+pub fn extractMlDsa65PublicKey(spki_der: []const u8) Error![]const u8 {
+    var top = DerReader.init(spki_der);
+    const seq = try top.readExpected(Tag.sequence);
+    try top.expectEmpty();
+
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(Tag.sequence);
+    const key_bits = try spki.readExpected(Tag.bit_string);
+    try spki.expectEmpty();
+
+    // AlgorithmIdentifier: exact-OID match, parameters MUST be absent.
+    var alg = try spki.child(alg_seq);
+    const oid = try alg.readExpected(Tag.oid);
+    try validateOid(oid.value);
+    if (!std.mem.eql(u8, oid.value, &SpkiOid.ml_dsa_65)) return error.UnsupportedKey;
+    try alg.expectEmpty();
+
+    // A raw key BIT STRING is byte-aligned: zero unused bits (parseBitString only
+    // rejects >7, so enforce the exact-0 requirement here for the PQ path).
+    if (key_bits.value.len == 0 or key_bits.value[0] != 0) return error.InvalidKey;
+    const key_bytes = try parseBitString(key_bits);
+    if (key_bytes.len != ml_dsa_65_public_key_len) return error.InvalidKey;
+    return key_bytes;
 }
 
 const SpkiAlgorithm = struct {

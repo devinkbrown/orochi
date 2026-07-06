@@ -35,6 +35,7 @@ const x509 = @import("x509.zig");
 const rsa_verify = @import("rsa_verify.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const ed25519 = @import("sign.zig");
+const ml_dsa = @import("ml_dsa.zig");
 
 pub const Digest = hash.Sha256.Digest;
 pub const digest_len = hash.Sha256.digest_len;
@@ -69,6 +70,11 @@ const SigOid = struct {
     const ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
     /// id-Ed25519 (1.3.101.112).
     const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+    /// id-ML-DSA-65 (2.16.840.1.101.3.4.3.18). Like Ed25519, this OID names no
+    /// hash/params — ML-DSA signs the message directly and the certificate's
+    /// signatureAlgorithm carries an absent parameters field
+    /// (draft-ietf-lamps-dilithium-certificates).
+    const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
 };
 
 pub const LinkInfo = struct {
@@ -309,6 +315,17 @@ pub fn verifyCertSignature(
     sig_alg_params: ?[]const u8,
     issuer_spki: []const u8,
 ) Error!void {
+    // ML-DSA-65 is a post-quantum scheme with a raw (non-union) public key, so it
+    // is dispatched before the classical `extractPublicKey` — the PQ path never
+    // touches the `SubjectPublicKey` union that unrelated verifiers switch over.
+    // The context string is empty for X.509 certificate signatures
+    // (draft-ietf-lamps-dilithium-certificates).
+    if (std.mem.eql(u8, sig_alg_oid, &SigOid.ml_dsa_65)) {
+        const pk = try x509.extractMlDsa65PublicKey(issuer_spki);
+        if (!ml_dsa.verify65(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
+        return;
+    }
+
     const key = try x509.extractPublicKey(issuer_spki);
 
     if (std.mem.eql(u8, sig_alg_oid, &SigOid.rsa_sha256)) {
