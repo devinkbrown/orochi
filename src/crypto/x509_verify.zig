@@ -93,11 +93,39 @@ const SigOid = struct {
     const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
     /// id-ML-DSA-87 (2.16.840.1.101.3.4.3.19). See id-ML-DSA-65 above.
     const ml_dsa_87 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13 };
-    /// id-slh-dsa-sha2-128s (2.16.840.1.101.3.4.3.20). Like ML-DSA, this OID
-    /// names no hash/params — SLH-DSA signs the message directly and the
-    /// certificate's signatureAlgorithm carries an absent parameters field
-    /// (draft-ietf-lamps-x509-slhdsa).
-    const slh_dsa_sha2_128s = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x14 };
+};
+
+/// One SLH-DSA parameter set for the certificate-signature dispatch table. Like
+/// ML-DSA, the id-slh-dsa-* OID names no hash/params — SLH-DSA signs the message
+/// directly and the certificate's signatureAlgorithm carries an absent parameters
+/// field (draft-ietf-lamps-x509-slhdsa). The verify context is empty for X.509.
+const SlhDsaSet = struct {
+    /// Full 9-byte OID, 2.16.840.1.101.3.4.3.{20..31}.
+    oid: [9]u8,
+    /// Raw public-key length (PK.seed ‖ PK.root = 2n).
+    pk_len: usize,
+    verify: *const fn (pk: []const u8, msg: []const u8, ctx: []const u8, sig: []const u8) bool,
+};
+
+fn slhOid(suffix: u8) [9]u8 {
+    return x509.slh_dsa_oid_prefix ++ [_]u8{suffix};
+}
+
+/// All 12 standardized SLH-DSA parameter sets (FIPS 205), verify-only,
+/// KAT-verified against independent NIST ACVP FIPS 205 sigVer vectors.
+const slh_dsa_sets = [_]SlhDsaSet{
+    .{ .oid = slhOid(0x14), .pk_len = 32, .verify = &slh_dsa.Sha2_128s.verify },
+    .{ .oid = slhOid(0x15), .pk_len = 32, .verify = &slh_dsa.Sha2_128f.verify },
+    .{ .oid = slhOid(0x16), .pk_len = 48, .verify = &slh_dsa.Sha2_192s.verify },
+    .{ .oid = slhOid(0x17), .pk_len = 48, .verify = &slh_dsa.Sha2_192f.verify },
+    .{ .oid = slhOid(0x18), .pk_len = 64, .verify = &slh_dsa.Sha2_256s.verify },
+    .{ .oid = slhOid(0x19), .pk_len = 64, .verify = &slh_dsa.Sha2_256f.verify },
+    .{ .oid = slhOid(0x1A), .pk_len = 32, .verify = &slh_dsa.Shake_128s.verify },
+    .{ .oid = slhOid(0x1B), .pk_len = 32, .verify = &slh_dsa.Shake_128f.verify },
+    .{ .oid = slhOid(0x1C), .pk_len = 48, .verify = &slh_dsa.Shake_192s.verify },
+    .{ .oid = slhOid(0x1D), .pk_len = 48, .verify = &slh_dsa.Shake_192f.verify },
+    .{ .oid = slhOid(0x1E), .pk_len = 64, .verify = &slh_dsa.Shake_256s.verify },
+    .{ .oid = slhOid(0x1F), .pk_len = 64, .verify = &slh_dsa.Shake_256f.verify },
 };
 
 pub const LinkInfo = struct {
@@ -362,13 +390,15 @@ pub fn verifyCertSignature(
         if (!ml_dsa.verify87(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
         return;
     }
-    // SLH-DSA-SHA2-128s: same PQ raw-key shape as ML-DSA, KAT-verified against
-    // independent NIST ACVP FIPS 205 sigVer vectors. Empty context for X.509
-    // certificate signatures (draft-ietf-lamps-x509-slhdsa).
-    if (std.mem.eql(u8, sig_alg_oid, &SigOid.slh_dsa_sha2_128s)) {
-        const pk = try x509.extractSlhDsaSha2_128sPublicKey(issuer_spki);
-        if (!slh_dsa.verify(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
-        return;
+    // SLH-DSA (all 12 FIPS 205 sets): same PQ raw-key shape as ML-DSA, each
+    // KAT-verified against independent NIST ACVP FIPS 205 sigVer vectors. Empty
+    // context for X.509 certificate signatures (draft-ietf-lamps-x509-slhdsa).
+    inline for (slh_dsa_sets) |set| {
+        if (std.mem.eql(u8, sig_alg_oid, &set.oid)) {
+            const pk = try x509.extractSlhDsaPublicKey(issuer_spki, &set.oid, set.pk_len);
+            if (!set.verify(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
+            return;
+        }
     }
     // ecdsa-with-SHA384 verifies under a P-384 issuer key, which the shared
     // x509.SubjectPublicKey union deliberately does not model (adding a member
