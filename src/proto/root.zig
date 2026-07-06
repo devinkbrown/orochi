@@ -91,6 +91,7 @@ pub const dtls_handshake = @import("dtls_handshake.zig");
 pub const dtls_keyexchange = @import("dtls_keyexchange.zig");
 pub const dtls_record = @import("dtls_record.zig");
 pub const dtls_srtp = @import("dtls_srtp.zig");
+pub const ech_config = @import("ech_config.zig");
 pub const ech = @import("ech.zig");
 pub const echo_message = @import("echo_message.zig");
 pub const ec_pkcs = @import("ec_pkcs.zig");
@@ -429,6 +430,7 @@ test {
     _ = dtls_keyexchange;
     _ = dtls_record;
     _ = dtls_srtp;
+    _ = ech_config;
     _ = ech;
     _ = echo_message;
     _ = ec_pkcs;

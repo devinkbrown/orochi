@@ -7,6 +7,18 @@
 //! Handles encode/decode and config selection only; HPKE sealing is left to
 //! the caller.  All allocations use a caller-supplied allocator; call `deinit`
 //! to release owned slices produced by `decode`.
+//!
+//! NOTE (2026-07-06, roadmap 5.1): the LIVE client-side ECH path does NOT use
+//! this module. It uses the zero-allocation `proto/ech_config.zig` (which
+//! retains each config's raw bytes for the HPKE `info`, skips unknown-version
+//! entries, and validates the public_name / KEM / mandatory extensions) plus
+//! `crypto/ech_seal.zig` for the seal + acceptance confirmation. This module
+//! remains an unwired encode/decode library. When server-side ECH lands (it
+//! needs owned decodes to hold private keys), reconcile the two onto a single
+//! parser that also exposes a borrowed `raw: []const u8` per entry — see
+//! `ech_config.zig`'s header. Also note `ECHClientHello` here is missing the
+//! current-draft outer fields (`type` + `HpkeSymmetricCipherSuite`); the live
+//! outer extension is built in `ech_seal.writeOuterExtBody`.
 
 const std = @import("std");
 const mem = std.mem;
