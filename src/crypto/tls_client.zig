@@ -28,6 +28,7 @@ const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
+const delegated_credential = @import("../proto/delegated_credential.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
 const cert_compression = @import("../proto/cert_compression.zig");
 const sni = @import("../proto/sni.zig");
@@ -37,6 +38,7 @@ const tls_psk = @import("../proto/tls_psk.zig");
 const tls_session_ticket = @import("../proto/tls_session_ticket.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
 const toml = @import("../proto/toml.zig");
+const x509_selfsign = @import("../proto/x509_selfsign.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = hkdf_tls13.Sha256;
@@ -75,6 +77,27 @@ pub const Error = error{
     CertificateNameMismatch,
     CertificateRevoked,
     DecodeError,
+    /// RFC 9345: the delegation (leaf) certificate lacks the id-ce-delegationUsage
+    /// extension, so it may not authorize a delegated credential.
+    DelegatedCredentialNoDelegationUsage,
+    /// RFC 9345: the delegation certificate lacks the digitalSignature KeyUsage.
+    DelegatedCredentialKeyUsage,
+    /// RFC 9345: the current time is past notBefore + valid_time.
+    DelegatedCredentialExpired,
+    /// RFC 9345 §4.1.3 check 2: the credential's expiry time (notBefore +
+    /// valid_time) is more than 7 days past now — its remaining lifetime exceeds
+    /// the maximum validity period.
+    DelegatedCredentialLifetimeTooLong,
+    /// RFC 9345 §4.1.3 check 2: the credential's expiry time is not strictly
+    /// before the delegation certificate's own notAfter — the DC would outlive
+    /// the certificate that authorized it.
+    DelegatedCredentialOutlivesCertificate,
+    /// RFC 9345: no wall-clock was supplied, so the DC validity window cannot be
+    /// enforced — fail closed rather than trust an unbounded credential.
+    DelegatedCredentialNoClock,
+    /// RFC 9345 §4: CertificateVerify.algorithm must equal the DC's
+    /// dc_cert_verify_algorithm.
+    DelegatedCredentialSchemeMismatch,
     EmptyCertificateChain,
     FinishedMismatch,
     HelloRetryRequestUnsupported,
@@ -96,7 +119,8 @@ pub const Error = error{
     tls_signature_scheme.Error || supported_groups.Error || tls_alpn.Error ||
     tls_alert.ParseError || rsa_verify.Error || sign.VerifyError ||
     tls_psk.Error || tls_session_ticket.ParseError || tls_session_ticket.EncodeError ||
-    tls_resumption.Error || ocsp.Error || cert_compression.Error;
+    tls_resumption.Error || ocsp.Error || cert_compression.Error ||
+    delegated_credential.Error;
 
 pub const Options = struct {
     server_name: []const u8,
@@ -351,6 +375,28 @@ pub const Client = struct {
     /// the outbound (ACME) TLS surface unchanged until explicitly opted in —
     /// symmetric with the server's `enable_cert_compression`.
     offer_cert_compression: bool = false,
+    /// RFC 9345: when true, advertise `delegated_credential` (type 34) and, if the
+    /// server presents a DC in its leaf CertificateEntry, verify it and bind the
+    /// handshake's CertificateVerify to the DC's public key. Default false ⇒ the
+    /// ClientHello is byte-identical and any server-sent DC is ignored (normal
+    /// cert-key CertificateVerify path), keeping the outbound TLS surface
+    /// unchanged until explicitly opted in.
+    offer_delegated_credential: bool = false,
+    /// A validated delegated credential's public key (RFC 9345). When set, the
+    /// server CertificateVerify is verified with THIS key instead of the leaf
+    /// certificate's key. Populated by `verifyDelegatedCredential` only after the
+    /// DC's own signature (made by the leaf key), its DelegationUsage, and its
+    /// validity window all pass.
+    dc_verified_key: ?LeafPublicKey = null,
+    /// The DC's `dc_cert_verify_algorithm`; CertificateVerify.algorithm MUST equal
+    /// it (RFC 9345 §4). Only meaningful when `dc_verified_key` is set.
+    dc_expected_scheme: ?u16 = null,
+    /// Owned storage for a DC RSA key's modulus/exponent — the DC's SPKI bytes
+    /// live in the consumed handshake buffer, so an RSA DC key would dangle by
+    /// CertificateVerify time (mirrors `leaf_rsa_n`/`leaf_rsa_e`). EC/Ed25519 DC
+    /// keys are value types and need no copy.
+    dc_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
+    dc_rsa_e: [16]u8 = undefined,
     /// When true, the server certificate's chain-to-trust-anchor and DNS-name
     /// checks are skipped (the leaf key is still parsed so the server
     /// CertificateVerify signature is verified). Used only by the tls_server
@@ -713,6 +759,15 @@ pub const Client = struct {
         self.offer_cert_compression = true;
     }
 
+    /// Opt into RFC 9345 delegated credentials: advertise the `delegated_credential`
+    /// extension and, when the server presents a DC in its leaf CertificateEntry,
+    /// verify it (leaf-key signature, DelegationUsage, validity window) and bind
+    /// CertificateVerify to the DC key. A trustworthy clock (`Options.now_unix_seconds`)
+    /// is required to accept a DC — without one the DC is rejected, not trusted.
+    pub fn offerDelegatedCredentials(self: *Client) void {
+        self.offer_delegated_credential = true;
+    }
+
     /// Test-only: emit a post-handshake KeyUpdate — a TLS 1.3 *control* record
     /// (inner content_type = handshake). Drain it via `takePendingSend`. Used to
     /// exercise how a kTLS-RX peer surfaces a non-application-data record.
@@ -1058,6 +1113,16 @@ pub const Client = struct {
                 .x509,
             });
             try ext_builder.addTyped(.server_certificate_type, ct_body);
+        }
+
+        // RFC 9345 delegated_credential: a SignatureSchemeList naming the schemes
+        // we accept for the DC's dc_cert_verify_algorithm (i.e. the schemes we can
+        // verify the DC-key CertificateVerify with). Opt-in so the ClientHello is
+        // byte-identical by default.
+        if (self.offer_delegated_credential) {
+            var dc_buf: [16]u8 = undefined;
+            const dc_body = try tls_signature_scheme.build(&dc_buf, &dc_accepted_schemes);
+            try ext_builder.add(delegated_credential.extension_type, dc_body);
         }
 
         // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
@@ -1534,6 +1599,10 @@ pub const Client = struct {
         var chain_buf: [16][]const u8 = undefined;
         var count: usize = 0;
         var leaf_ocsp_staple: ?[]const u8 = null;
+        // RFC 9345: raw DelegatedCredential from the leaf entry's extensions, only
+        // captured when we advertised the extension (a server MUST NOT send one
+        // otherwise; if it does we ignore it and take the normal cert-key path).
+        var leaf_dc_raw: ?[]const u8 = null;
         var certs = Cursor.init(list);
         while (certs.remaining() != 0) {
             if (count == chain_buf.len) return error.BadCertificate;
@@ -1544,6 +1613,10 @@ pub const Client = struct {
                 while (try eit.next()) |entry_ext| {
                     if (count == 0 and entry_ext.ext_type == ext_status_request) {
                         leaf_ocsp_staple = try parseCertificateStatusOcsp(entry_ext.data);
+                    } else if (count == 0 and self.offer_delegated_credential and
+                        entry_ext.ext_type == delegated_credential.extension_type)
+                    {
+                        leaf_dc_raw = entry_ext.data;
                     }
                 }
             }
@@ -1569,6 +1642,13 @@ pub const Client = struct {
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         try self.ownLeafRsaKey();
+
+        // RFC 9345: if the server delegated to a credential, verify it now (while
+        // the leaf key and DC bytes are still live) and arm the DC key for
+        // CertificateVerify. Fails closed — a bad DC rejects the handshake.
+        if (leaf_dc_raw) |dc_raw| {
+            try self.verifyDelegatedCredential(chain[0], dc_raw);
+        }
     }
 
     /// After `leaf_key` is parsed from SPKI bytes that alias `hs_plain`, copy any
@@ -1617,6 +1697,74 @@ pub const Client = struct {
         try self.ownLeafRsaKey();
     }
 
+    /// RFC 9345 §4.1.3/§4.2: validate a server-presented delegated credential and,
+    /// on success, arm `dc_verified_key`/`dc_expected_scheme` so CertificateVerify
+    /// is bound to the DC's public key instead of the leaf certificate's. Every
+    /// defect (bad framing, missing DelegationUsage/KeyUsage, un-accepted scheme,
+    /// expired, remaining lifetime > 7 days, expiry ≥ the cert's notAfter, or a
+    /// forged DC signature) rejects the handshake.
+    fn verifyDelegatedCredential(self: *Client, leaf_der: []const u8, dc_raw: []const u8) Error!void {
+        const dc = try delegated_credential.parse(dc_raw);
+
+        // (1) The delegation (leaf) certificate MUST carry id-ce-delegationUsage
+        // and assert the digitalSignature KeyUsage (RFC 9345 §4.2).
+        const leaf = try x509.parse(leaf_der);
+        if (!leaf.delegation_usage) return error.DelegatedCredentialNoDelegationUsage;
+        if (!leaf.key_usage_digital_signature) return error.DelegatedCredentialKeyUsage;
+
+        // (2) Scheme allowed for DCs (RFC 9345 §4.1.3 check 3, first clause): we
+        // only accept a dc_cert_verify_algorithm we advertised. (The match to the
+        // CertificateVerify scheme is enforced at CertVerify time.)
+        if (!dcSchemeAccepted(dc.dc_cert_verify_algorithm)) return error.UnsupportedSignatureScheme;
+
+        // (3) Validity window (RFC 9345 §4.1.3 checks 1–2), anchored on the
+        // "expiry time" = the leaf's notBefore + valid_time. Enforcing it needs a
+        // trustworthy clock; without one, fail closed. NOTE: the 7-day maximum
+        // bounds the *remaining* lifetime (expiry ≤ now + 7d), NOT the raw
+        // valid_time field — a DC on a cert issued weeks ago legitimately has a
+        // valid_time far larger than 7 days.
+        const now = self.verify_time orelse return error.DelegatedCredentialNoClock;
+        const expiry = leaf.not_before.epoch_seconds + @as(i64, dc.valid_time);
+        // check 1: current time within the credential's validity interval.
+        if (now > expiry) return error.DelegatedCredentialExpired;
+        // check 2a: remaining validity ≤ the 7-day maximum.
+        if (expiry > now + @as(i64, delegated_credential.max_valid_time_seconds)) {
+            return error.DelegatedCredentialLifetimeTooLong;
+        }
+        // check 2b: the credential must not outlive the delegation certificate.
+        if (expiry >= leaf.not_after.epoch_seconds) return error.DelegatedCredentialOutlivesCertificate;
+
+        // (4) The DC signature is made by the LEAF certificate's public key over
+        // the RFC 9345 §4.1.3 content, using DelegatedCredential.algorithm. A
+        // forged/tampered signature fails here (error.BadSignature).
+        const leaf_key = self.leaf_key orelse return error.BadCertificate;
+        const msg_len = delegated_credential.signedMessageLen(leaf_der.len, dc.signed_portion.len);
+        const msg = try self.allocator.alloc(u8, msg_len);
+        defer self.allocator.free(msg);
+        const signed = try delegated_credential.writeSignedMessage(msg, leaf_der, dc.signed_portion);
+        try verifySignatureScheme(
+            leaf_key,
+            tls_signature_scheme.SignatureScheme.fromInt(dc.algorithm),
+            signed,
+            dc.signature,
+        );
+
+        // (5) Bind CertificateVerify to the DC public key. The DC's SPKI aliases
+        // the soon-consumed handshake buffer, so copy any RSA key material into
+        // owned storage (mirrors the leaf-key copy above); EC/Ed25519 are values.
+        var dc_key = try parsePublicKeyFromSpki(dc.spki);
+        if (dc_key == .rsa) {
+            const n = dc_key.rsa.n;
+            const e = dc_key.rsa.e;
+            if (n.len > self.dc_rsa_n.len or e.len > self.dc_rsa_e.len) return error.BadCertificate;
+            @memcpy(self.dc_rsa_n[0..n.len], n);
+            @memcpy(self.dc_rsa_e[0..e.len], e);
+            dc_key = .{ .rsa = .{ .n = self.dc_rsa_n[0..n.len], .e = self.dc_rsa_e[0..e.len] } };
+        }
+        self.dc_verified_key = dc_key;
+        self.dc_expected_scheme = dc.dc_cert_verify_algorithm;
+    }
+
     fn verifyCertificateVerify(self: *Client, body: []const u8) Error!void {
         if (body.len < 4) return error.BadHandshake;
         const scheme = tls_signature_scheme.SignatureScheme.fromInt(std.mem.readInt(u16, body[0..2], .big));
@@ -1627,8 +1775,15 @@ pub const Client = struct {
         const th_len = self.transcriptHash(&th);
         var in_buf: [cert_verify_input_max]u8 = undefined;
         const input = buildCertVerifyInput(&in_buf, certificate_verify_context, th[0..th_len]);
-        const leaf = self.leaf_key orelse return error.BadCertificate;
-        try verifySignatureScheme(leaf, scheme, input, sig_bytes);
+        // RFC 9345 §4: when a delegated credential was validated, verify with the
+        // DC key and require the CertVerify scheme to equal the DC's
+        // dc_cert_verify_algorithm. Otherwise use the leaf certificate's key.
+        const key = if (self.dc_verified_key) |dc_key| blk: {
+            const expected = self.dc_expected_scheme orelse return error.BadState;
+            if (scheme.toInt() != expected) return error.DelegatedCredentialSchemeMismatch;
+            break :blk dc_key;
+        } else self.leaf_key orelse return error.BadCertificate;
+        try verifySignatureScheme(key, scheme, input, sig_bytes);
     }
 
     fn verifyFinished(self: *Client, body: []const u8) Error!void {
@@ -2265,6 +2420,27 @@ const Cursor = struct {
 
 const certificate_verify_context = "TLS 1.3, server CertificateVerify";
 const client_certificate_verify_context = "TLS 1.3, client CertificateVerify";
+
+/// RFC 9345: the SignatureSchemes we accept for a delegated credential's
+/// `dc_cert_verify_algorithm`. Advertised in the ClientHello `delegated_credential`
+/// extension AND required of any DC we validate (§4.1.3 check 3: the algorithm
+/// must be "allowed for use with delegated credentials"). These are exactly the
+/// TLS 1.3 handshake-signature schemes `verifySignatureScheme` can verify.
+const dc_accepted_schemes = [_]tls_signature_scheme.SignatureScheme{
+    .ecdsa_secp256r1_sha256,
+    .ecdsa_secp384r1_sha384,
+    .ed25519,
+    .rsa_pss_rsae_sha256,
+};
+
+/// True when `scheme` (a raw wire code) is one we accept for a delegated
+/// credential's `dc_cert_verify_algorithm`.
+fn dcSchemeAccepted(scheme: u16) bool {
+    for (dc_accepted_schemes) |s| {
+        if (s.toInt() == scheme) return true;
+    }
+    return false;
+}
 /// 64 spaces + the longest context + 1 separator + the longest transcript hash.
 const cert_verify_input_max = 64 + client_certificate_verify_context.len + 1 + max_hash_len;
 
@@ -3524,4 +3700,548 @@ test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
     defer a.free(spki);
     const stale = parsed.next_update.?.epoch_seconds;
     try checkCrlRevocation(der, spki, &[_]u8{0x2A}, stale);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9345 Delegated Credentials (client side).
+// ---------------------------------------------------------------------------
+
+/// Standard SubjectPublicKeyInfo prefix for a P-256 key: SEQUENCE { AlgId
+/// {ecPublicKey, prime256v1}, BIT STRING { 0x00 || <65-byte SEC1 point> } }.
+/// The 65 uncompressed SEC1 bytes follow this 26-byte prefix.
+const dc_test_p256_spki_prefix = [_]u8{
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
+    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+};
+
+/// Build a P-256 SubjectPublicKeyInfo into `out` from a keypair's SEC1 point.
+fn dcTestP256Spki(out: *[dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8, kp: ecdsa_p256.KeyPair) []const u8 {
+    @memcpy(out[0..dc_test_p256_spki_prefix.len], &dc_test_p256_spki_prefix);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    @memcpy(out[dc_test_p256_spki_prefix.len..], &sec1);
+    return out[0..];
+}
+
+/// Serialize a DelegatedCredential signed by `leaf_kp` (P-256). When `tamper`,
+/// the last signature byte is flipped so the DER stays well-formed but the
+/// signature no longer verifies. Returns a slice into `out`.
+fn dcTestBuildWire(
+    out: []u8,
+    leaf_der: []const u8,
+    dc_spki: []const u8,
+    valid_time: u32,
+    leaf_kp: ecdsa_p256.KeyPair,
+    tamper: bool,
+) ![]const u8 {
+    const cred: delegated_credential.Credential = .{
+        .valid_time = valid_time,
+        .dc_cert_verify_algorithm = tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt(),
+        .spki = dc_spki,
+    };
+    const algorithm = tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt();
+
+    var portion_buf: [256]u8 = undefined;
+    const portion = try delegated_credential.writeSignedPortion(&portion_buf, cred, algorithm);
+
+    var msg_buf: [2048]u8 = undefined;
+    const msg = try delegated_credential.writeSignedMessage(&msg_buf, leaf_der, portion);
+
+    const sig = try ecdsa_p256.sign(msg, leaf_kp);
+    var sig_der_buf: [80]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+    if (tamper) sig_der_buf[sig_der.len - 1] ^= 0xFF;
+
+    return delegated_credential.serialize(out, cred, algorithm, sig_der);
+}
+
+/// Assemble a TLS 1.3 Certificate message body carrying a single leaf entry,
+/// with `dc_wire` (when non-null) as the leaf entry's delegated_credential
+/// extension. Returns a slice into `out`.
+fn dcTestCertMessage(out: []u8, leaf_der: []const u8, dc_wire: ?[]const u8) []const u8 {
+    // Leaf entry extension block.
+    var ext_block_len: usize = 0;
+    if (dc_wire) |dw| ext_block_len = 4 + dw.len;
+    const entry_len = 3 + leaf_der.len + 2 + ext_block_len;
+    const list_len = entry_len;
+
+    var pos: usize = 0;
+    out[pos] = 0; // empty certificate_request_context
+    pos += 1;
+    std.mem.writeInt(u24, out[pos..][0..3], @intCast(list_len), .big);
+    pos += 3;
+    // CertificateEntry: cert_data<1..2^24-1>
+    std.mem.writeInt(u24, out[pos..][0..3], @intCast(leaf_der.len), .big);
+    pos += 3;
+    @memcpy(out[pos..][0..leaf_der.len], leaf_der);
+    pos += leaf_der.len;
+    // extensions<0..2^16-1>
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(ext_block_len), .big);
+    pos += 2;
+    if (dc_wire) |dw| {
+        std.mem.writeInt(u16, out[pos..][0..2], delegated_credential.extension_type, .big);
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], @intCast(dw.len), .big);
+        pos += 2;
+        @memcpy(out[pos..][0..dw.len], dw);
+        pos += dw.len;
+    }
+    return out[0..pos];
+}
+
+const DcLeaf = struct {
+    kp: ecdsa_p256.KeyPair,
+    der: []const u8,
+    not_before: i64,
+    not_after: i64,
+};
+
+const dc_test_one_year: i64 = 365 * 24 * 60 * 60;
+
+/// Build a self-signed P-256 leaf cert into `out` with a 1-year validity window,
+/// optionally carrying the id-ce-delegationUsage and digitalSignature-KeyUsage
+/// extensions.
+fn dcTestLeaf(out: []u8, delegation_usage: bool, key_usage: bool, not_before: i64) !DcLeaf {
+    return dcTestLeafWindow(out, delegation_usage, key_usage, not_before, not_before + dc_test_one_year);
+}
+
+/// Like `dcTestLeaf` but with an explicit notAfter (to exercise the DC-outlives-
+/// certificate check).
+fn dcTestLeafWindow(out: []u8, delegation_usage: bool, key_usage: bool, not_before: i64, not_after: i64) !DcLeaf {
+    const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(out, .{
+        .common_name = "dc-leaf.example",
+        .not_before = not_before,
+        .not_after = not_after,
+        .serial = &[_]u8{0x2A},
+        .key_pair = kp,
+        .delegation_usage = delegation_usage,
+        .key_usage_digital_signature = key_usage,
+    });
+    return .{ .kp = kp, .der = der, .not_before = not_before, .not_after = not_after };
+}
+
+test "delegated_credential: ClientHello omits the extension by default and carries it when opted in" {
+    const allocator = std.testing.allocator;
+
+    // Off (default): no delegated_credential extension on the wire.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+        defer client.deinit();
+        const record = try client.start();
+        defer allocator.free(record);
+        var off: usize = 0;
+        const ch = try parseHandshake(record[tls_record.record_header_len..], &off);
+        const ext_block = clientHelloExtensions(ch.body).?;
+        var it = tls_extension.Iterator.init(ext_block);
+        while (try it.next()) |ext| {
+            try std.testing.expect(ext.ext_type != delegated_credential.extension_type);
+        }
+    }
+
+    // On: exactly one delegated_credential extension whose body is the
+    // SignatureSchemeList we accept for a DC.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+        defer client.deinit();
+        client.offerDelegatedCredentials();
+        const record = try client.start();
+        defer allocator.free(record);
+        var off: usize = 0;
+        const ch = try parseHandshake(record[tls_record.record_header_len..], &off);
+        const ext_block = clientHelloExtensions(ch.body).?;
+        var it = tls_extension.Iterator.init(ext_block);
+        var found: ?[]const u8 = null;
+        var count: usize = 0;
+        while (try it.next()) |ext| {
+            if (ext.ext_type == delegated_credential.extension_type) {
+                found = ext.data;
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+        const body = found.?;
+        try std.testing.expect(tls_signature_scheme.offers(body, .ecdsa_secp256r1_sha256));
+        try std.testing.expect(tls_signature_scheme.offers(body, .ecdsa_secp384r1_sha384));
+        try std.testing.expect(tls_signature_scheme.offers(body, .ed25519));
+        try std.testing.expect(tls_signature_scheme.offers(body, .rsa_pss_rsae_sha256));
+    }
+}
+
+test "delegated_credential: a valid DC is accepted and CertificateVerify uses the DC key" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200; // 2024-01-01
+    const now: i64 = not_before + 3600; // one hour in — inside the window
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, 86400, leaf.kp, false);
+
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    // The DC verifies: leaf key signed it, DelegationUsage present, in window.
+    try client.parseAndVerifyCertificate(cert_msg);
+    try std.testing.expect(client.dc_verified_key != null);
+    try std.testing.expectEqual(
+        @as(?u16, tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt()),
+        client.dc_expected_scheme,
+    );
+
+    // CertificateVerify must now verify under the DC key, not the leaf key.
+    try client.transcript.appendSlice(allocator, &[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    var th: [max_hash_len]u8 = undefined;
+    const th_len = client.transcriptHash(&th);
+    var in_buf: [cert_verify_input_max]u8 = undefined;
+    const input = buildCertVerifyInput(&in_buf, certificate_verify_context, th[0..th_len]);
+
+    // Signed by the DC key → accepted.
+    {
+        const sig = try ecdsa_p256.sign(input, dc_kp);
+        var der: [80]u8 = undefined;
+        const sig_der = try ecdsa_p256.signatureToDer(sig, &der);
+        var body: [96]u8 = undefined;
+        std.mem.writeInt(u16, body[0..2], tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt(), .big);
+        std.mem.writeInt(u16, body[2..4], @intCast(sig_der.len), .big);
+        @memcpy(body[4..][0..sig_der.len], sig_der);
+        try client.verifyCertificateVerify(body[0 .. 4 + sig_der.len]);
+    }
+
+    // Signed by the LEAF key → rejected (proves the DC key is what's bound).
+    {
+        const sig = try ecdsa_p256.sign(input, leaf.kp);
+        var der: [80]u8 = undefined;
+        const sig_der = try ecdsa_p256.signatureToDer(sig, &der);
+        var body: [96]u8 = undefined;
+        std.mem.writeInt(u16, body[0..2], tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt(), .big);
+        std.mem.writeInt(u16, body[2..4], @intCast(sig_der.len), .big);
+        @memcpy(body[4..][0..sig_der.len], sig_der);
+        try std.testing.expectError(error.BadSignature, client.verifyCertificateVerify(body[0 .. 4 + sig_der.len]));
+    }
+}
+
+test "delegated_credential: CertificateVerify scheme must equal dc_cert_verify_algorithm" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+    const now: i64 = not_before + 3600;
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, 86400, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+    try client.parseAndVerifyCertificate(cert_msg);
+
+    // A CertificateVerify claiming ed25519 while the DC binds P-256 is rejected
+    // BEFORE any signature math (RFC 9345 §4).
+    var body: [8]u8 = undefined;
+    std.mem.writeInt(u16, body[0..2], tls_signature_scheme.SignatureScheme.ed25519.toInt(), .big);
+    std.mem.writeInt(u16, body[2..4], 2, .big);
+    body[4] = 0;
+    body[5] = 0;
+    try std.testing.expectError(error.DelegatedCredentialSchemeMismatch, client.verifyCertificateVerify(body[0..6]));
+}
+
+test "delegated_credential: absent DC leaves the normal cert-key path (dc_verified_key null)" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, null); // no DC extension
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = not_before + 3600,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials(); // opted in, but the server sent no DC
+    client.skipServerCertVerifyForTest();
+
+    try client.parseAndVerifyCertificate(cert_msg);
+    try std.testing.expect(client.dc_verified_key == null);
+    try std.testing.expect(client.leaf_key != null); // normal leaf-key path armed
+}
+
+test "delegated_credential: reject when the leaf lacks the DelegationUsage extension" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+
+    var leaf_buf: [1024]u8 = undefined;
+    // digitalSignature KeyUsage present, but NO DelegationUsage.
+    const leaf = try dcTestLeaf(&leaf_buf, false, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, 86400, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = not_before + 3600,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.DelegatedCredentialNoDelegationUsage, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: reject a tampered DC signature" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, 86400, leaf.kp, true); // tamper
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = not_before + 3600,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.BadSignature, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: reject an expired credential" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+    const valid_time: u32 = 86400; // 1 day; expiry = not_before + 86400
+    const now: i64 = not_before + 86400 + 1; // one second past expiry
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, valid_time, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.DelegatedCredentialExpired, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: accept a large valid_time whose REMAINING lifetime is within 7 days" {
+    // Regression for RFC 9345 §4.1.3 check 2: the 7-day bound is on the remaining
+    // lifetime (expiry - now), NOT the raw valid_time field. A DC on a cert issued
+    // 30 days ago with a 1-day remaining window has valid_time = 31 days (well over
+    // 7) yet MUST be accepted.
+    const allocator = std.testing.allocator;
+    const now: i64 = 1_704_067_200;
+    const day: i64 = 24 * 60 * 60;
+    const not_before: i64 = now - 30 * day; // cert issued 30 days ago
+    const valid_time: u32 = @intCast(31 * day); // expiry = now + 1 day; remaining 1 day
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, valid_time, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try client.parseAndVerifyCertificate(cert_msg); // accepted despite valid_time = 31 days
+    try std.testing.expect(client.dc_verified_key != null);
+}
+
+test "delegated_credential: reject when the REMAINING lifetime exceeds the 7-day maximum" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+    const day: i64 = 24 * 60 * 60;
+    const now: i64 = not_before; // fresh cert
+    const valid_time: u32 = @intCast(8 * day); // expiry = now + 8 days > now + 7 days
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, valid_time, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.DelegatedCredentialLifetimeTooLong, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: reject when the DC would outlive the delegation certificate" {
+    // RFC 9345 §4.1.3 check 2, second clause: expiry MUST be < the cert's notAfter.
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+    const day: i64 = 24 * 60 * 60;
+    const not_after: i64 = not_before + 3 * day; // short-lived cert
+    const now: i64 = not_before + day; // cert still valid
+    const valid_time: u32 = @intCast(5 * day); // expiry = not_before + 5d > notAfter (3d); remaining 4d ≤ 7d
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeafWindow(&leaf_buf, true, true, not_before, not_after);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, valid_time, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = now,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.DelegatedCredentialOutlivesCertificate, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: reject a dc_cert_verify_algorithm we did not advertise" {
+    // RFC 9345 §4.1.3 check 3: the algorithm must be one allowed for DCs. We build
+    // a DC whose dc_cert_verify_algorithm is rsa_pkcs1_sha256 (not in our accepted
+    // set — PKCS#1 is not a TLS 1.3 handshake-signature scheme).
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+
+    // Hand-build a DC whose dc_cert_verify_algorithm is the un-accepted scheme.
+    const bad_scheme = tls_signature_scheme.SignatureScheme.rsa_pkcs1_sha256.toInt();
+    const cred: delegated_credential.Credential = .{
+        .valid_time = 86400,
+        .dc_cert_verify_algorithm = bad_scheme,
+        .spki = dc_spki,
+    };
+    const algorithm = tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256.toInt();
+    var portion_buf: [256]u8 = undefined;
+    const portion = try delegated_credential.writeSignedPortion(&portion_buf, cred, algorithm);
+    var msg_buf: [2048]u8 = undefined;
+    const msg = try delegated_credential.writeSignedMessage(&msg_buf, leaf.der, portion);
+    const sig = try ecdsa_p256.sign(msg, leaf.kp);
+    var sig_der_buf: [80]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try delegated_credential.serialize(&dc_wire_buf, cred, algorithm, sig_der);
+
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        .now_unix_seconds = not_before + 3600,
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.UnsupportedSignatureScheme, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
+}
+
+test "delegated_credential: reject when no clock is available to enforce the window" {
+    const allocator = std.testing.allocator;
+    const not_before: i64 = 1_704_067_200;
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try dcTestLeaf(&leaf_buf, true, true, not_before);
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestBuildWire(&dc_wire_buf, leaf.der, dc_spki, 86400, leaf.kp, false);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_msg = dcTestCertMessage(&cert_buf, leaf.der, dc_wire);
+
+    var client = try Client.init(allocator, .{
+        .server_name = "dc-leaf.example",
+        .trust_anchors = &.{},
+        // now_unix_seconds left null → no clock.
+    });
+    defer client.deinit();
+    client.offerDelegatedCredentials();
+    client.skipServerCertVerifyForTest();
+
+    try std.testing.expectError(error.DelegatedCredentialNoClock, client.parseAndVerifyCertificate(cert_msg));
+    try std.testing.expect(client.dc_verified_key == null);
 }

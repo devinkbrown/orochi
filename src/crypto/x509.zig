@@ -91,6 +91,9 @@ const Oid = struct {
     const tls_feature = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
     // cRLDistributionPoints (2.5.29.31) — where to fetch the issuer's CRL.
     const crl_distribution_points = [_]u8{ 0x55, 0x1D, 0x1F };
+    // id-ce-delegationUsage (1.3.6.1.4.1.44363.44) — RFC 9345 §4.2: an end-entity
+    // certificate MUST carry this extension to authorize delegated credentials.
+    const delegation_usage = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xDA, 0x4B, 0x2C };
 };
 
 pub const TimeKind = enum { utc, generalized };
@@ -222,6 +225,10 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         /// True when the cert carries the TLS Feature (id-pe-tlsfeature) extension
         /// listing status_request(5) — OCSP must-staple.
         must_staple: bool,
+        /// True when the cert carries the id-ce-delegationUsage extension
+        /// (1.3.6.1.4.1.44363.44). RFC 9345 §4.2: a delegated credential MUST be
+        /// rejected unless the delegation (end-entity) certificate has it.
+        delegation_usage: bool,
         not_before: Time,
         not_after: Time,
         signature_algorithm_oid: []const u8,
@@ -269,6 +276,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .subject_public_key = &.{},
                 .aia_ocsp_url = &.{},
                 .must_staple = false,
+                .delegation_usage = false,
                 .not_before = emptyTime(),
                 .not_after = emptyTime(),
                 .signature_algorithm_oid = &.{},
@@ -702,6 +710,10 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
             try parseAuthorityInfoAccess(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.tls_feature)) {
             try parseTlsFeature(CertType, cert, one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.delegation_usage)) {
+            // RFC 9345 §4.2: presence authorizes delegated credentials. The
+            // extension value is an empty/NULL body carrying no data we act on.
+            cert.delegation_usage = true;
         }
     }
 }

@@ -75,6 +75,7 @@ pub const ctcp = @import("ctcp.zig");
 pub const ctcp_props = @import("ctcp_props.zig");
 pub const dcep = @import("dcep.zig");
 pub const deadline_queue = @import("deadline_queue.zig");
+pub const delegated_credential = @import("delegated_credential.zig");
 pub const der_oid = @import("der_oid.zig");
 pub const dns0x20 = @import("dns0x20.zig");
 pub const dns_bailiwick = @import("dns_bailiwick.zig");
@@ -412,6 +413,7 @@ test {
     _ = ctcp_props;
     _ = dcep;
     _ = deadline_queue;
+    _ = delegated_credential;
     _ = der_oid;
     _ = dns0x20;
     _ = dns_bailiwick;

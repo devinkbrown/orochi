@@ -68,6 +68,13 @@ pub const EcdsaP256Params = struct {
     /// Emit an ExtendedKeyUsage extension listing id-kp-OCSPSigning — marks the
     /// cert as a delegated OCSP responder (RFC 6960 §4.2.2.2). Off by default.
     eku_ocsp_signing: bool = false,
+    /// Emit the id-ce-delegationUsage extension (RFC 9345 §4.2) — authorizes this
+    /// cert to sign delegated credentials. Off by default.
+    delegation_usage: bool = false,
+    /// Emit a critical KeyUsage extension asserting the digitalSignature bit
+    /// (RFC 5280 §4.2.1.3) — required alongside delegationUsage for a DC leaf.
+    /// Off by default.
+    key_usage_digital_signature: bool = false,
 };
 
 pub const RsaParams = struct {
@@ -134,7 +141,9 @@ const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
 const oid_extended_key_usage = [_]u8{ 0x55, 0x1d, 0x25 }; // 2.5.29.37
+const oid_key_usage = [_]u8{ 0x55, 0x1d, 0x0f }; // 2.5.29.15
 const oid_eku_ocsp_signing = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09 }; // 1.3.6.1.5.5.7.3.9
+const oid_delegation_usage = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xda, 0x4b, 0x2c }; // 1.3.6.1.4.1.44363.44
 const oid_authority_info_access = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 };
 const oid_id_ad_ocsp = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
 const oid_tls_feature = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
@@ -312,6 +321,12 @@ fn buildTbs(out: []u8, params: anytype, signature_algorithm: SignatureAlgorithm,
     if (comptime @hasField(@TypeOf(params), "eku_ocsp_signing")) {
         if (params.eku_ocsp_signing) want_ext = true;
     }
+    if (comptime @hasField(@TypeOf(params), "delegation_usage")) {
+        if (params.delegation_usage) want_ext = true;
+    }
+    if (comptime @hasField(@TypeOf(params), "key_usage_digital_signature")) {
+        if (params.key_usage_digital_signature) want_ext = true;
+    }
     if (want_ext) try writeExtensions(&body, params);
 
     var tbs = DerWriter.init(out);
@@ -378,6 +393,27 @@ fn writeExtensions(w: *DerWriter, params: anytype) !void {
             var eku_seq = DerWriter.init(&eku_seq_buf);
             try eku_seq.tlv(tag_sequence, eku.bytes());
             try writeExtension(&seq, &oid_extended_key_usage, false, eku_seq.bytes());
+        }
+    }
+
+    if (comptime @hasField(@TypeOf(params), "key_usage_digital_signature")) {
+        if (params.key_usage_digital_signature) {
+            // KeyUsage ::= BIT STRING; digitalSignature is bit 0 (0x80 in the
+            // first content byte, 7 unused bits). Marked critical per RFC 5280.
+            var ku_buf: [8]u8 = undefined;
+            var ku = DerWriter.init(&ku_buf);
+            try ku.tlv(tag_bit_string, &[_]u8{ 0x07, 0x80 });
+            try writeExtension(&seq, &oid_key_usage, true, ku.bytes());
+        }
+    }
+
+    if (comptime @hasField(@TypeOf(params), "delegation_usage")) {
+        if (params.delegation_usage) {
+            // DelegationUsage ::= NULL (RFC 9345 §4.2); non-critical.
+            var du_buf: [4]u8 = undefined;
+            var du = DerWriter.init(&du_buf);
+            try du.tlv(tag_null, &.{});
+            try writeExtension(&seq, &oid_delegation_usage, false, du.bytes());
         }
     }
 
