@@ -397,32 +397,39 @@ fn parseRecordTypeCmsg(msg: *const linux.msghdr) ?u8 {
 /// `record_type` (handshake(22) for a KeyUpdate, alert(21) for close_notify).
 /// `flags` should include `MSG.DONTWAIT` on the non-blocking reactor path.
 pub fn recvmsgRecordType(fd: linux.fd_t, buf: []u8, flags: u32) RecvError!RecordRead {
-    var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
-    var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = undefined;
-    while (true) {
-        var msg = linux.msghdr{
-            .name = null,
-            .namelen = 0,
-            .iov = &iov,
-            .iovlen = 1,
-            .control = &cbuf,
-            .controllen = cbuf.len,
-            .flags = 0,
-        };
-        const rc = linux.recvmsg(fd, &msg, flags);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return error.Eof;
-                const rt = parseRecordTypeCmsg(&msg) orelse @intFromEnum(RecordType.application_data);
-                return .{ .record_type = rt, .plaintext = buf[0..n] };
-            },
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .KEYEXPIRED => return error.NeedsRekey,
-            else => return error.RecvFailed,
+    // kTLS RX is Linux-only. The body references linux cmsg/recvmsg APIs and the
+    // `EKEYEXPIRED` errno, neither of which exists on foreign targets, so gate the
+    // whole body at comptime: on Linux it is analyzed and runs exactly as before;
+    // on a cross-compiled test build it is compile-gated out. (Reached only by the
+    // kTLS RX drive path, which is itself Linux-only.)
+    if (comptime builtin.os.tag == .linux) {
+        var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
+        var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        while (true) {
+            var msg = linux.msghdr{
+                .name = null,
+                .namelen = 0,
+                .iov = &iov,
+                .iovlen = 1,
+                .control = &cbuf,
+                .controllen = cbuf.len,
+                .flags = 0,
+            };
+            const rc = linux.recvmsg(fd, &msg, flags);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.Eof;
+                    const rt = parseRecordTypeCmsg(&msg) orelse @intFromEnum(RecordType.application_data);
+                    return .{ .record_type = rt, .plaintext = buf[0..n] };
+                },
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .KEYEXPIRED => return error.NeedsRekey,
+                else => return error.RecvFailed,
+            }
         }
-    }
+    } else return error.RecvFailed;
 }
 
 // ---------------------------------------------------------------------------

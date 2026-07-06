@@ -28118,16 +28118,18 @@ fn saslOAuthBearerPrelude(fd: linux.fd_t, token: []const u8) ServerError!void {
 }
 
 fn connectLoopback(port: u16) ServerError!linux.fd_t {
-    const fd = try socketTcp();
-    errdefer closeFd(fd);
-    var addr = try sockaddrIn("127.0.0.1", port);
-    const rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-    switch (posix.errno(rc)) {
-        .SUCCESS => return fd,
-        .CONNREFUSED => return error.ConnectionRefused,
-        .ACCES, .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    }
+    if (comptime builtin.os.tag == .linux) {
+        const fd = try socketTcp();
+        errdefer closeFd(fd);
+        var addr = try sockaddrIn("127.0.0.1", port);
+        const rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return fd,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .ACCES, .PERM => return error.PermissionDenied,
+            else => return error.Unexpected,
+        }
+    } else return error.Unsupported;
 }
 
 fn writeAllFd(fd: linux.fd_t, bytes: []const u8) ServerError!void {
@@ -28210,14 +28212,16 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 }
 
 fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !client_model.ClientId {
-    const id = try server.rx().clients.alloc(ConnState.init(-1));
-    const conn = server.rx().clients.get(id).?;
-    conn.token = try tokenFromId(id);
-    try conn.session.setNick(nick);
-    if (account) |acct| conn.session.loginAs(acct);
-    try server.world.registerNick(nick, worldIdFromClient(id));
-    if (account != null) server.trackSession(id, conn);
-    return id;
+    if (comptime builtin.os.tag == .linux) {
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.token = try tokenFromId(id);
+        try conn.session.setNick(nick);
+        if (account) |acct| conn.session.loginAs(acct);
+        try server.world.registerNick(nick, worldIdFromClient(id));
+        if (account != null) server.trackSession(id, conn);
+        return id;
+    } else return error.SkipZigTest;
 }
 
 const LiveClient = struct {
@@ -28226,19 +28230,21 @@ const LiveClient = struct {
     len: usize = 0,
 
     fn readAvailable(self: *LiveClient) ServerError!void {
-        while (true) {
-            var fds = [_]posix.pollfd{.{
-                .fd = self.fd,
-                .events = linux.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = posix.poll(&fds, 0) catch return error.Unexpected;
-            if (ready == 0 or (fds[0].revents & linux.POLL.IN) == 0) return;
-            if (self.len == self.buf.len) return error.OutputTooSmall;
-            const n = try readFd(self.fd, self.buf[self.len..]);
-            if (n == 0) return;
-            self.len += n;
-        }
+        if (comptime builtin.os.tag == .linux) {
+            while (true) {
+                var fds = [_]posix.pollfd{.{
+                    .fd = self.fd,
+                    .events = linux.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = posix.poll(&fds, 0) catch return error.Unexpected;
+                if (ready == 0 or (fds[0].revents & linux.POLL.IN) == 0) return;
+                if (self.len == self.buf.len) return error.OutputTooSmall;
+                const n = try readFd(self.fd, self.buf[self.len..]);
+                if (n == 0) return;
+                self.len += n;
+            }
+        } else return error.Unsupported;
     }
 
     fn written(self: *const LiveClient) []const u8 {
@@ -28518,225 +28524,233 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
 }
 
 test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const id = try addTestLocalClient(&server, "user", null);
-    const conn = server.connFor(id).?;
-    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+        const id = try addTestLocalClient(&server, "user", null);
+        const conn = server.connFor(id).?;
+        conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
 
-    // No resolver configured → never refuses.
-    try std.testing.expect(!server.enforceDnsbl(conn));
+        // No resolver configured → never refuses.
+        try std.testing.expect(!server.enforceDnsbl(conn));
 
-    // Resolver configured, but the IP has no stored verdict yet (pending/absent):
-    // a blocklist must FAIL OPEN — never refuse a client we have not confirmed
-    // as listed.
-    var res = try dnsbl_resolver.Resolver.init(std.testing.allocator, &.{"zen.example.org"});
-    defer res.deinit();
-    server.config.dnsbl = &res;
-    try std.testing.expect(!server.enforceDnsbl(conn));
+        // Resolver configured, but the IP has no stored verdict yet (pending/absent):
+        // a blocklist must FAIL OPEN — never refuse a client we have not confirmed
+        // as listed.
+        var res = try dnsbl_resolver.Resolver.init(std.testing.allocator, &.{"zen.example.org"});
+        defer res.deinit();
+        server.config.dnsbl = &res;
+        try std.testing.expect(!server.enforceDnsbl(conn));
 
-    // Operators are exempt even if a verdict existed.
-    conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
-    try std.testing.expect(!server.enforceDnsbl(conn));
+        // Operators are exempt even if a verdict existed.
+        conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
+        try std.testing.expect(!server.enforceDnsbl(conn));
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: multi-reactor (num_shards=4) survives concurrent clients" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 4 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    // The clamp must actually honor num_shards now (coarse-lock Phase B).
-    try std.testing.expectEqual(@as(usize, 4), server.reactors.len);
-    const port = try server.boundPort();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 4 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        // The clamp must actually honor num_shards now (coarse-lock Phase B).
+        try std.testing.expectEqual(@as(usize, 4), server.reactors.len);
+        const port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        // Nudge every reactor (SO_REUSEPORT spreads these) so each observes the stop.
-        var k: usize = 0;
-        while (k < 8) : (k += 1) {
-            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            // Nudge every reactor (SO_REUSEPORT spreads these) so each observes the stop.
+            var k: usize = 0;
+            while (k < 8) : (k += 1) {
+                if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+            }
+            thr.join();
         }
-        thr.join();
-    }
 
-    const Worker = struct {
-        fn client(p: u16, idx: usize, ok: *std.atomic.Value(u32)) void {
-            const fd = connectLoopback(p) catch return;
-            defer closeFd(fd);
-            var c = LiveClient{ .fd = fd };
-            var nbuf: [24]u8 = undefined;
-            const nick = std.fmt.bufPrint(&nbuf, "stress{d}", .{idx}) catch return;
-            var reg: [96]u8 = undefined;
-            const regl = std.fmt.bufPrint(&reg, "NICK {s}\r\nUSER {s} 0 * :S\r\n", .{ nick, nick }) catch return;
-            writeAllFd(fd, regl) catch return;
-            recvUntil(&c, " 001 ", 3000) catch return;
-            // Concurrent world mutation: every client joins the SAME channel, so the
-            // 4 reactors race membership inserts + cross-shard JOIN fan-out, all
-            // serialized under the single world.lockWrite. A race corrupts the
-            // roster (NAMES never ends) or crashes; a deadlock starves the reply.
-            writeAllFd(fd, "JOIN #stress\r\n") catch return;
-            recvUntil(&c, " 366 ", 3000) catch return; // RPL_ENDOFNAMES
-            var pm: [96]u8 = undefined;
-            const pml = std.fmt.bufPrint(&pm, "PRIVMSG #stress :hi from {s}\r\n", .{nick}) catch return;
-            writeAllFd(fd, pml) catch return;
-            _ = ok.fetchAdd(1, .monotonic);
+        const Worker = struct {
+            fn client(p: u16, idx: usize, ok: *std.atomic.Value(u32)) void {
+                const fd = connectLoopback(p) catch return;
+                defer closeFd(fd);
+                var c = LiveClient{ .fd = fd };
+                var nbuf: [24]u8 = undefined;
+                const nick = std.fmt.bufPrint(&nbuf, "stress{d}", .{idx}) catch return;
+                var reg: [96]u8 = undefined;
+                const regl = std.fmt.bufPrint(&reg, "NICK {s}\r\nUSER {s} 0 * :S\r\n", .{ nick, nick }) catch return;
+                writeAllFd(fd, regl) catch return;
+                recvUntil(&c, " 001 ", 3000) catch return;
+                // Concurrent world mutation: every client joins the SAME channel, so the
+                // 4 reactors race membership inserts + cross-shard JOIN fan-out, all
+                // serialized under the single world.lockWrite. A race corrupts the
+                // roster (NAMES never ends) or crashes; a deadlock starves the reply.
+                writeAllFd(fd, "JOIN #stress\r\n") catch return;
+                recvUntil(&c, " 366 ", 3000) catch return; // RPL_ENDOFNAMES
+                var pm: [96]u8 = undefined;
+                const pml = std.fmt.bufPrint(&pm, "PRIVMSG #stress :hi from {s}\r\n", .{nick}) catch return;
+                writeAllFd(fd, pml) catch return;
+                _ = ok.fetchAdd(1, .monotonic);
+            }
+        };
+
+        var ok = std.atomic.Value(u32).init(0);
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        for (&threads, 0..) |*t, i| {
+            t.* = std.Thread.spawn(.{}, Worker.client, .{ port, i, &ok }) catch break;
+            spawned += 1;
         }
-    };
+        for (threads[0..spawned]) |t| t.join();
 
-    var ok = std.atomic.Value(u32).init(0);
-    var threads: [16]std.Thread = undefined;
-    var spawned: usize = 0;
-    for (&threads, 0..) |*t, i| {
-        t.* = std.Thread.spawn(.{}, Worker.client, .{ port, i, &ok }) catch break;
-        spawned += 1;
-    }
-    for (threads[0..spawned]) |t| t.join();
-
-    // Every client completed register + join-same-channel + send across 4
-    // concurrent reactors without the server deadlocking or corrupting state.
-    try std.testing.expectEqual(@as(u32, @intCast(spawned)), ok.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 16), spawned);
+        // Every client completed register + join-same-channel + send across 4
+        // concurrent reactors without the server deadlocking or corrupting state.
+        try std.testing.expectEqual(@as(u32, @intCast(spawned)), ok.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 16), spawned);
+    } else return error.SkipZigTest;
 }
 
 test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE" {
-    const ct = @import("../crypto/totp.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-life.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
+    if (comptime builtin.os.tag == .linux) {
+        const ct = @import("../crypto/totp.zig");
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-life.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const id = try addTestLocalClient(&server, "kain", "kain"); // logged in to account "kain"
-    const conn = server.connFor(id).?;
-    conn.is_tls = true; // ENROLL requires a secure link (the secret crosses it)
+        const id = try addTestLocalClient(&server, "kain", "kain"); // logged in to account "kain"
+        const conn = server.connFor(id).?;
+        conn.is_tls = true; // ENROLL requires a secure link (the secret crosses it)
 
-    const totp = struct {
-        fn call(s: *Server, c: *ConnState, sub: []const u8, arg: ?[]const u8) !void {
-            c.send_len = 0;
-            var lv = irc_line.LineView{ .raw = "", .command = "TOTP" };
-            lv.params[0] = sub;
-            lv.param_count = 1;
-            if (arg) |a| {
-                lv.params[1] = a;
-                lv.param_count = 2;
+        const totp = struct {
+            fn call(s: *Server, c: *ConnState, sub: []const u8, arg: ?[]const u8) !void {
+                c.send_len = 0;
+                var lv = irc_line.LineView{ .raw = "", .command = "TOTP" };
+                lv.params[0] = sub;
+                lv.param_count = 1;
+                if (arg) |a| {
+                    lv.params[1] = a;
+                    lv.param_count = 2;
+                }
+                try s.handleTotp(c, &lv);
             }
-            try s.handleTotp(c, &lv);
-        }
-    };
+        };
 
-    // STATUS: disabled initially.
-    try totp.call(&server, conn, "STATUS", null);
-    try expectContains(conn.send_buf[0..conn.send_len], "is disabled");
+        // STATUS: disabled initially.
+        try totp.call(&server, conn, "STATUS", null);
+        try expectContains(conn.send_buf[0..conn.send_len], "is disabled");
 
-    // ENROLL mints a secret + otpauth URI; the enrollment is now pending.
-    try totp.call(&server, conn, "ENROLL", null);
-    try expectContains(conn.send_buf[0..conn.send_len], "TOTP: secret ");
-    try expectContains(conn.send_buf[0..conn.send_len], "otpauth://totp/");
-    try totp.call(&server, conn, "STATUS", null);
-    try expectContains(conn.send_buf[0..conn.send_len], "pending");
-    try std.testing.expect(!services.totpEnrolled("kain")); // pending is NOT persisted
+        // ENROLL mints a secret + otpauth URI; the enrollment is now pending.
+        try totp.call(&server, conn, "ENROLL", null);
+        try expectContains(conn.send_buf[0..conn.send_len], "TOTP: secret ");
+        try expectContains(conn.send_buf[0..conn.send_len], "otpauth://totp/");
+        try totp.call(&server, conn, "STATUS", null);
+        try expectContains(conn.send_buf[0..conn.send_len], "pending");
+        try std.testing.expect(!services.totpEnrolled("kain")); // pending is NOT persisted
 
-    // Compute the live code for the minted secret and CONFIRM.
-    const b32 = server.totp.secretB32("kain").?;
-    const raw = try ct.decodeBase32(std.testing.allocator, b32);
-    defer std.testing.allocator.free(raw);
-    const now_s = @divFloor(platform.realtimeMillis(), 1000);
-    const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
-    var codebuf: [6]u8 = undefined;
-    _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
-    try totp.call(&server, conn, "CONFIRM", &codebuf);
-    try expectContains(conn.send_buf[0..conn.send_len], "now ACTIVE");
-    try std.testing.expect(services.totpEnrolled("kain")); // confirmed secret IS persisted
+        // Compute the live code for the minted secret and CONFIRM.
+        const b32 = server.totp.secretB32("kain").?;
+        const raw = try ct.decodeBase32(std.testing.allocator, b32);
+        defer std.testing.allocator.free(raw);
+        const now_s = @divFloor(platform.realtimeMillis(), 1000);
+        const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
+        var codebuf: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
+        try totp.call(&server, conn, "CONFIRM", &codebuf);
+        try expectContains(conn.send_buf[0..conn.send_len], "now ACTIVE");
+        try std.testing.expect(services.totpEnrolled("kain")); // confirmed secret IS persisted
 
-    // Lazy reload: clear the in-memory store (simulating a restart) — the
-    // persisted secret is restored on the next active check.
-    _ = server.totp.disable("kain");
-    try std.testing.expect(!server.totp.isEnrolled("kain")); // gone from memory
-    try std.testing.expect(server.totpActiveForAccount("kain")); // reloaded from .props
-    try std.testing.expect(server.totp.isEnrolled("kain"));
+        // Lazy reload: clear the in-memory store (simulating a restart) — the
+        // persisted secret is restored on the next active check.
+        _ = server.totp.disable("kain");
+        try std.testing.expect(!server.totp.isEnrolled("kain")); // gone from memory
+        try std.testing.expect(server.totpActiveForAccount("kain")); // reloaded from .props
+        try std.testing.expect(server.totp.isEnrolled("kain"));
 
-    // DISABLE clears both memory and persistence.
-    try totp.call(&server, conn, "DISABLE", null);
-    try expectContains(conn.send_buf[0..conn.send_len], "disabled");
-    try std.testing.expect(!services.totpEnrolled("kain"));
-    try std.testing.expect(!server.totpActiveForAccount("kain"));
+        // DISABLE clears both memory and persistence.
+        try totp.call(&server, conn, "DISABLE", null);
+        try expectContains(conn.send_buf[0..conn.send_len], "disabled");
+        try std.testing.expect(!services.totpEnrolled("kain"));
+        try std.testing.expect(!server.totpActiveForAccount("kain"));
+    } else return error.SkipZigTest;
 }
 
 test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked on enable" {
-    const ct = @import("../crypto/totp.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-enf.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
+    if (comptime builtin.os.tag == .linux) {
+        const ct = @import("../crypto/totp.zig");
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-enf.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var scratch: [1024]u8 = undefined;
-    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
-    const secret_b32 = "MZXW6YTBOI======";
-    try services.totpSecretPut("kain", secret_b32); // 2FA active
-    const raw = try ct.decodeBase32(std.testing.allocator, secret_b32);
-    defer std.testing.allocator.free(raw);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+        const secret_b32 = "MZXW6YTBOI======";
+        try services.totpSecretPut("kain", secret_b32); // 2FA active
+        const raw = try ct.decodeBase32(std.testing.allocator, secret_b32);
+        defer std.testing.allocator.free(raw);
 
-    const id = try addTestLocalClient(&server, "guest", null);
-    const conn = server.connFor(id).?;
+        const id = try addTestLocalClient(&server, "guest", null);
+        const conn = server.connFor(id).?;
 
-    // IDENTIFY without a code → refused; conn stays logged out.
-    conn.send_len = 0;
-    var lv = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
-    lv.params[0] = "kain";
-    lv.params[1] = "correct horse battery staple";
-    lv.param_count = 2;
-    try server.handleIdentify(conn, &lv);
-    try std.testing.expect(conn.session.account() == null);
-    try expectContains(conn.send_buf[0..conn.send_len], "TOTP_REQUIRED");
+        // IDENTIFY without a code → refused; conn stays logged out.
+        conn.send_len = 0;
+        var lv = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+        lv.params[0] = "kain";
+        lv.params[1] = "correct horse battery staple";
+        lv.param_count = 2;
+        try server.handleIdentify(conn, &lv);
+        try std.testing.expect(conn.session.account() == null);
+        try expectContains(conn.send_buf[0..conn.send_len], "TOTP_REQUIRED");
 
-    // IDENTIFY with the correct code → logged in.
-    const now_s = @divFloor(platform.realtimeMillis(), 1000);
-    const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
-    var codebuf: [6]u8 = undefined;
-    _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
-    lv.params[2] = &codebuf;
-    lv.param_count = 3;
-    try server.handleIdentify(conn, &lv);
-    try std.testing.expectEqualStrings("kain", conn.session.account().?);
+        // IDENTIFY with the correct code → logged in.
+        const now_s = @divFloor(platform.realtimeMillis(), 1000);
+        const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
+        var codebuf: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
+        lv.params[2] = &codebuf;
+        lv.param_count = 3;
+        try server.handleIdentify(conn, &lv);
+        try std.testing.expectEqualStrings("kain", conn.session.account().?);
 
-    // SASL via IRCX AUTH: every knowledge-factor package is refused (PLAIN AND
-    // SCRAM — the SCRAM case is the bypass a prior review caught). A fresh,
-    // logged-out connection stays logged out.
-    for ([_]ircx_auth.Package{ .plain, .scram_sha_256, .scram_sha_512_plus }, 0..) |pkg, i| {
-        var nick_buf: [8]u8 = undefined;
-        const nick = std.fmt.bufPrint(&nick_buf, "g{d}", .{i}) catch unreachable;
-        const cid = try addTestLocalClient(&server, nick, null);
-        const c = server.connFor(cid).?;
-        try server.completeIrcxAuth(cid, c, pkg, .{ .account = "kain" });
-        try std.testing.expect(c.session.account() == null);
-    }
+        // SASL via IRCX AUTH: every knowledge-factor package is refused (PLAIN AND
+        // SCRAM — the SCRAM case is the bypass a prior review caught). A fresh,
+        // logged-out connection stays logged out.
+        for ([_]ircx_auth.Package{ .plain, .scram_sha_256, .scram_sha_512_plus }, 0..) |pkg, i| {
+            var nick_buf: [8]u8 = undefined;
+            const nick = std.fmt.bufPrint(&nick_buf, "g{d}", .{i}) catch unreachable;
+            const cid = try addTestLocalClient(&server, nick, null);
+            const c = server.connFor(cid).?;
+            try server.completeIrcxAuth(cid, c, pkg, .{ .account = "kain" });
+            try std.testing.expect(c.session.account() == null);
+        }
 
-    // EXTERNAL/SESSION-TOKEN are not knowledge factors — not gated.
-    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.external));
-    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.session_token));
-    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.oauthbearer));
-    try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.plain));
-    try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.scram_sha_256));
+        // EXTERNAL/SESSION-TOKEN are not knowledge factors — not gated.
+        try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.external));
+        try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.session_token));
+        try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.oauthbearer));
+        try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.plain));
+        try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.scram_sha_256));
+    } else return error.SkipZigTest;
 }
 
 test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
@@ -28758,99 +28772,103 @@ test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
 }
 
 test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-setpass-cert.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
-    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
-    defer binds.deinit();
-    services.attachCertfpBinds(&binds);
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-setpass-cert.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+        defer binds.deinit();
+        services.attachCertfpBinds(&binds);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var scratch: [1024]u8 = undefined;
-    _ = try services.registerAccount("kain", "old-password-123", &scratch);
-    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"; // 64 hex
-    try services.bindCertfp("kain", fp);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("kain", "old-password-123", &scratch);
+        const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"; // 64 hex
+        try services.bindCertfp("kain", fp);
 
-    const id = try addTestLocalClient(&server, "kain", "kain"); // logged in
-    const conn = server.connFor(id).?;
-    var lv = irc_line.LineView{ .raw = "", .command = "SETPASS" };
-    lv.params[0] = "new-password-456";
-    lv.param_count = 1;
+        const id = try addTestLocalClient(&server, "kain", "kain"); // logged in
+        const conn = server.connFor(id).?;
+        var lv = irc_line.LineView{ .raw = "", .command = "SETPASS" };
+        lv.params[0] = "new-password-456";
+        lv.param_count = 1;
 
-    // No client cert on the connection → the 1-arg reset is refused, and the old
-    // password still works.
-    conn.send_len = 0;
-    try server.handleSetpass(conn, &lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "RESET_NOT_AUTHORIZED");
-    _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
+        // No client cert on the connection → the 1-arg reset is refused, and the old
+        // password still works.
+        conn.send_len = 0;
+        try server.handleSetpass(conn, &lv);
+        try expectContains(conn.send_buf[0..conn.send_len], "RESET_NOT_AUTHORIZED");
+        _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
 
-    // With the bound cert presented → the reset succeeds; the new password works
-    // and the old one no longer does.
-    conn.session.tls_certfp = fp;
-    conn.send_len = 0;
-    try server.handleSetpass(conn, &lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "verified by client certificate");
-    _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
-    if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+        // With the bound cert presented → the reset succeeds; the new password works
+        // and the old one no longer does.
+        conn.session.tls_certfp = fp;
+        conn.send_len = 0;
+        try server.handleSetpass(conn, &lv);
+        try expectContains(conn.send_buf[0..conn.send_len], "verified by client certificate");
+        _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
+        if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+    } else return error.SkipZigTest;
 }
 
 test "RESETPASS confirm: valid emailed code sets a new password; wrong code is rejected" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-resetpass.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-resetpass.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var scratch: [1024]u8 = undefined;
-    _ = try services.registerAccount("kain", "old-password-123", &scratch);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("kain", "old-password-123", &scratch);
 
-    // The token is normally emailed; the request path is exercised separately. Here
-    // we seed a known 32-hex code straight into the store and drive the confirm path.
-    const code = "0123456789abcdef0123456789abcdef";
-    const now_u: u64 = @intCast(@max(0, server.nowMs()));
-    try server.reset_store.issue("kain", code, now_u);
+        // The token is normally emailed; the request path is exercised separately. Here
+        // we seed a known 32-hex code straight into the store and drive the confirm path.
+        const code = "0123456789abcdef0123456789abcdef";
+        const now_u: u64 = @intCast(@max(0, server.nowMs()));
+        try server.reset_store.issue("kain", code, now_u);
 
-    const id = try addTestLocalClient(&server, "guest", null); // logged OUT — forgot password
-    const conn = server.connFor(id).?;
+        const id = try addTestLocalClient(&server, "guest", null); // logged OUT — forgot password
+        const conn = server.connFor(id).?;
 
-    // Wrong code: rejected, password unchanged, the pending request survives.
-    var lv = irc_line.LineView{ .raw = "", .command = "RESETPASS" };
-    lv.params[0] = "kain";
-    lv.params[1] = "ffffffffffffffffffffffffffffffff";
-    lv.params[2] = "new-password-456";
-    lv.param_count = 3;
-    conn.send_len = 0;
-    try server.handleResetpass(conn, &lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "BAD_CODE");
-    _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
-    try std.testing.expect(server.reset_store.isPending("kain"));
+        // Wrong code: rejected, password unchanged, the pending request survives.
+        var lv = irc_line.LineView{ .raw = "", .command = "RESETPASS" };
+        lv.params[0] = "kain";
+        lv.params[1] = "ffffffffffffffffffffffffffffffff";
+        lv.params[2] = "new-password-456";
+        lv.param_count = 3;
+        conn.send_len = 0;
+        try server.handleResetpass(conn, &lv);
+        try expectContains(conn.send_buf[0..conn.send_len], "BAD_CODE");
+        _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
+        try std.testing.expect(server.reset_store.isPending("kain"));
 
-    // Correct code: succeeds, new password works, old one does not, code consumed.
-    lv.params[1] = code;
-    conn.send_len = 0;
-    try server.handleResetpass(conn, &lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "RESETPASS SUCCESS");
-    _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
-    if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
-    try std.testing.expect(!server.reset_store.isPending("kain"));
+        // Correct code: succeeds, new password works, old one does not, code consumed.
+        lv.params[1] = code;
+        conn.send_len = 0;
+        try server.handleResetpass(conn, &lv);
+        try expectContains(conn.send_buf[0..conn.send_len], "RESETPASS SUCCESS");
+        _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
+        if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+        try std.testing.expect(!server.reset_store.isPending("kain"));
 
-    // Code is single-use: replaying it now reports no pending request.
-    conn.send_len = 0;
-    try server.handleResetpass(conn, &lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "NO_REQUEST");
+        // Code is single-use: replaying it now reports no pending request.
+        conn.send_len = 0;
+        try server.handleResetpass(conn, &lv);
+        try expectContains(conn.send_buf[0..conn.send_len], "NO_REQUEST");
+    } else return error.SkipZigTest;
 }
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {
@@ -28968,245 +28986,253 @@ test "session-sync unit: single-session account has no sibling copies" {
 }
 
 test "relay direct messages honor local +R SILENCE and recipient session-sync" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const sibling_id = try addTestLocalClient(&server, "Sibling", "targetacct");
-    const target = server.connFor(target_id).?;
-    const sibling = server.connFor(sibling_id).?;
-    _ = target.session.setUmode(.regonly_pm, true);
-    sibling.session.addCap(.orochi_session_sync);
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const sibling_id = try addTestLocalClient(&server, "Sibling", "targetacct");
+        const target = server.connFor(target_id).?;
+        const sibling = server.connFor(sibling_id).?;
+        _ = target.session.setUmode(.regonly_pm, true);
+        sibling.session.addCap(.orochi_session_sync);
 
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@host",
-        .account = "",
-        .tags = "",
-        .text = "blocked by +R",
-        .origin_node = 99,
-        .hlc = 1,
-    });
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
-    try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@host",
+            .account = "",
+            .tags = "",
+            .text = "blocked by +R",
+            .origin_node = 99,
+            .hlc = 1,
+        });
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
 
-    _ = target.session.setUmode(.regonly_pm, false);
-    _ = try server.silence.add("Target", "Remote!*@host");
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@host",
-        .account = "remoteacct",
-        .tags = "",
-        .text = "blocked by silence",
-        .origin_node = 99,
-        .hlc = 2,
-    });
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
-    try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+        _ = target.session.setUmode(.regonly_pm, false);
+        _ = try server.silence.add("Target", "Remote!*@host");
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@host",
+            .account = "remoteacct",
+            .tags = "",
+            .text = "blocked by silence",
+            .origin_node = 99,
+            .hlc = 2,
+        });
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
 
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@elsewhere",
-        .account = "remoteacct",
-        .tags = "",
-        .text = "delivered",
-        .origin_node = 99,
-        .hlc = 3,
-    });
-    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
-    try expectContains(sibling.send_buf[0..sibling.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "PRIVMSG Target :delivered"));
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@elsewhere",
+            .account = "remoteacct",
+            .tags = "",
+            .text = "delivered",
+            .origin_node = 99,
+            .hlc = 3,
+        });
+        try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
+        try expectContains(sibling.send_buf[0..sibling.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "PRIVMSG Target :delivered"));
+    } else return error.SkipZigTest;
 }
 
 test "relay direct messages honor local +C and +g callerid policy" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const target = server.connFor(target_id).?;
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const target = server.connFor(target_id).?;
 
-    _ = target.session.setUmode(.no_ctcp, true);
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@host",
-        .account = "remoteacct",
-        .tags = "",
-        .text = "\x01VERSION\x01",
-        .origin_node = 99,
-        .hlc = 11,
-    });
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        _ = target.session.setUmode(.no_ctcp, true);
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@host",
+            .account = "remoteacct",
+            .tags = "",
+            .text = "\x01VERSION\x01",
+            .origin_node = 99,
+            .hlc = 11,
+        });
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
 
-    _ = target.session.setUmode(.no_ctcp, false);
-    _ = target.session.setUmode(.callerid, true);
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@host",
-        .account = "remoteacct",
-        .tags = "",
-        .text = "blocked by callerid",
-        .origin_node = 99,
-        .hlc = 12,
-    });
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        _ = target.session.setUmode(.no_ctcp, false);
+        _ = target.session.setUmode(.callerid, true);
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@host",
+            .account = "remoteacct",
+            .tags = "",
+            .text = "blocked by callerid",
+            .origin_node = 99,
+            .hlc = 12,
+        });
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
 
-    try server.accepts.add("Target", "Remote");
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@host",
-        .account = "remoteacct",
-        .tags = "",
-        .text = "accepted",
-        .origin_node = 99,
-        .hlc = 13,
-    });
-    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@host PRIVMSG Target :accepted\r\n");
+        try server.accepts.add("Target", "Remote");
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@host",
+            .account = "remoteacct",
+            .tags = "",
+            .text = "accepted",
+            .origin_node = 99,
+            .hlc = 13,
+        });
+        try expectContains(target.send_buf[0..target.send_len], ":Remote!r@host PRIVMSG Target :accepted\r\n");
+    } else return error.SkipZigTest;
 }
 
 test "relay channel speech gate mirrors local +C +T +U and status sender policy" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    const remote_id = try addTestLocalClient(&server, "Remote", null);
-    _ = try server.world.join("#relay", worldIdFromClient(founder_id));
-    _ = try server.world.join("#relay", worldIdFromClient(remote_id));
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        const remote_id = try addTestLocalClient(&server, "Remote", null);
+        _ = try server.world.join("#relay", worldIdFromClient(founder_id));
+        _ = try server.world.join("#relay", worldIdFromClient(remote_id));
 
-    _ = try server.world.setChannelFlag("#relay", .no_ctcp, true);
-    try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
-        "#relay",
-        "Remote",
-        "Remote!r@host",
-        "",
-        "\x01VERSION\x01",
-        false,
-        0,
-    ));
+        _ = try server.world.setChannelFlag("#relay", .no_ctcp, true);
+        try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
+            "#relay",
+            "Remote",
+            "Remote!r@host",
+            "",
+            "\x01VERSION\x01",
+            false,
+            0,
+        ));
 
-    _ = try server.world.setChannelFlag("#relay", .no_ctcp, false);
-    _ = try server.world.setChannelFlag("#relay", .no_notice, true);
-    try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
-        "#relay",
-        "Remote",
-        "Remote!r@host",
-        "",
-        "notice",
-        true,
-        0,
-    ));
+        _ = try server.world.setChannelFlag("#relay", .no_ctcp, false);
+        _ = try server.world.setChannelFlag("#relay", .no_notice, true);
+        try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
+            "#relay",
+            "Remote",
+            "Remote!r@host",
+            "",
+            "notice",
+            true,
+            0,
+        ));
 
-    _ = try server.world.setChannelFlag("#relay", .no_notice, false);
-    _ = try server.world.setChannelFlag("#relay", .moderated, true);
-    _ = try server.world.setChannelExtFlag("#relay", .opmoderate, true);
-    try std.testing.expectEqual(.opmoderate, server.relayChannelSpeechGate(
-        "#relay",
-        "Remote",
-        "Remote!r@host",
-        "",
-        "held",
-        false,
-        0,
-    ));
+        _ = try server.world.setChannelFlag("#relay", .no_notice, false);
+        _ = try server.world.setChannelFlag("#relay", .moderated, true);
+        _ = try server.world.setChannelExtFlag("#relay", .opmoderate, true);
+        try std.testing.expectEqual(.opmoderate, server.relayChannelSpeechGate(
+            "#relay",
+            "Remote",
+            "Remote!r@host",
+            "",
+            "held",
+            false,
+            0,
+        ));
 
-    _ = try server.world.setChannelFlag("#relay", .moderated, false);
-    try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
-        "#relay",
-        "Remote",
-        "Remote!r@host",
-        "",
-        "ops only",
-        false,
-        2,
-    ));
-    _ = try server.world.setMemberMode("#relay", worldIdFromClient(remote_id), .voice, true);
-    try std.testing.expectEqual(.allow, server.relayChannelSpeechGate(
-        "#relay",
-        "Remote",
-        "Remote!r@host",
-        "",
-        "ops only",
-        false,
-        2,
-    ));
+        _ = try server.world.setChannelFlag("#relay", .moderated, false);
+        try std.testing.expectEqual(.deny, server.relayChannelSpeechGate(
+            "#relay",
+            "Remote",
+            "Remote!r@host",
+            "",
+            "ops only",
+            false,
+            2,
+        ));
+        _ = try server.world.setMemberMode("#relay", worldIdFromClient(remote_id), .voice, true);
+        try std.testing.expectEqual(.allow, server.relayChannelSpeechGate(
+            "#relay",
+            "Remote",
+            "Remote!r@host",
+            "",
+            "ops only",
+            false,
+            2,
+        ));
+    } else return error.SkipZigTest;
 }
 
 test "relayed channel message is recorded into CHATHISTORY for cross-node read-back" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const member_id = try addTestLocalClient(&server, "Local", null);
-    _ = try server.world.join("#hist", worldIdFromClient(member_id));
-    // A new channel defaults to +nt; clear +n so the relayed EXTERNAL sender (a
-    // peer member not present in this unit's local/remote roster) is not dropped
-    // by the no-external speech gate. The +n gate has its own dedicated test
-    // ("relayed channel message is gated by +n …"); here we isolate the
-    // CHATHISTORY-on-relay path.
-    _ = try server.world.setChannelFlag("#hist", .no_external, false);
+        const member_id = try addTestLocalClient(&server, "Local", null);
+        _ = try server.world.join("#hist", worldIdFromClient(member_id));
+        // A new channel defaults to +nt; clear +n so the relayed EXTERNAL sender (a
+        // peer member not present in this unit's local/remote roster) is not dropped
+        // by the no-external speech gate. The +n gate has its own dedicated test
+        // ("relayed channel message is gated by +n …"); here we isolate the
+        // CHATHISTORY-on-relay path.
+        _ = try server.world.setChannelFlag("#hist", .no_external, false);
 
-    // A message authored on a peer (origin_node != ours) is relayed in. It must
-    // both deliver to the local member AND land in this node's history ring so a
-    // later CHATHISTORY read returns it.
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "#hist",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@peer",
-        .account = "",
-        .tags = "",
-        .text = "hello from a peer",
-        .origin_node = 4242,
-        .hlc = 7,
-    });
-    const member = server.connFor(member_id).?;
-    try expectContains(member.send_buf[0..member.send_len], ":Remote!r@peer PRIVMSG #hist :hello from a peer\r\n");
+        // A message authored on a peer (origin_node != ours) is relayed in. It must
+        // both deliver to the local member AND land in this node's history ring so a
+        // later CHATHISTORY read returns it.
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "#hist",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@peer",
+            .account = "",
+            .tags = "",
+            .text = "hello from a peer",
+            .origin_node = 4242,
+            .hlc = 7,
+        });
+        const member = server.connFor(member_id).?;
+        try expectContains(member.send_buf[0..member.send_len], ":Remote!r@peer PRIVMSG #hist :hello from a peer\r\n");
 
-    var hbuf: [8]lotus.Message = undefined;
-    const recorded = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 1), recorded.len);
-    try std.testing.expectEqualStrings("Remote!r@peer", recorded[0].sender);
-    try std.testing.expectEqualStrings("hello from a peer", recorded[0].text);
-    try std.testing.expectEqualStrings("PRIVMSG", recorded[0].command);
+        var hbuf: [8]lotus.Message = undefined;
+        const recorded = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
+        try std.testing.expectEqual(@as(usize, 1), recorded.len);
+        try std.testing.expectEqualStrings("Remote!r@peer", recorded[0].sender);
+        try std.testing.expectEqualStrings("hello from a peer", recorded[0].text);
+        try std.testing.expectEqualStrings("PRIVMSG", recorded[0].command);
 
-    // A status-prefixed (min_rank > 0) relayed message is delivered but NOT
-    // recorded — mirroring the locally-originated gate (`min_rank == 0`).
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "#hist",
-        .min_rank = 2,
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@peer",
-        .account = "",
-        .tags = "",
-        .text = "ops only",
-        .origin_node = 4242,
-        .hlc = 8,
-    });
-    const after = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 1), after.len); // still just the first
+        // A status-prefixed (min_rank > 0) relayed message is delivered but NOT
+        // recorded — mirroring the locally-originated gate (`min_rank == 0`).
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "#hist",
+            .min_rank = 2,
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@peer",
+            .account = "",
+            .tags = "",
+            .text = "ops only",
+            .origin_node = 4242,
+            .hlc = 8,
+        });
+        const after = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
+        try std.testing.expectEqual(@as(usize, 1), after.len); // still just the first
+    } else return error.SkipZigTest;
 }
 
 test "pinned messages: PINS prop value validation" {
@@ -29230,114 +29256,124 @@ test "pinned messages: PINS prop value validation" {
 }
 
 test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the generic prop" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#pins" };
-    // Valid → not_handled (falls through to the persisted, mesh-propagated store).
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "msg1,msg2", false), .not_handled);
-    // Malformed → bad_value.
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "bad token", false), .bad_value);
-    // Round-trips through the generic store.
-    _ = try server.props.setProp(chan, "PINS", "msg1,msg2", .{ .id = "op", .access = .owner });
-    const ev = try server.props.getProp(chan, "PINS");
-    try std.testing.expectEqualStrings("msg1,msg2", ev.value);
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#pins" };
+        // Valid → not_handled (falls through to the persisted, mesh-propagated store).
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "msg1,msg2", false), .not_handled);
+        // Malformed → bad_value.
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "bad token", false), .bad_value);
+        // Round-trips through the generic store.
+        _ = try server.props.setProp(chan, "PINS", "msg1,msg2", .{ .id = "op", .access = .owner });
+        const ev = try server.props.getProp(chan, "PINS");
+        try std.testing.expectEqualStrings("msg1,msg2", ev.value);
+    } else return error.SkipZigTest;
 }
 
 test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
-    // Out-of-range and non-numeric values are rejected; 0 (disable) and an
-    // in-range TTL fall through to the generic store (`.not_handled`).
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "5", false), .bad_value);
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "nope", false), .bad_value);
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "9999999999", false), .bad_value);
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "3600", false), .not_handled);
-    try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "0", false), .not_handled);
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+        // Out-of-range and non-numeric values are rejected; 0 (disable) and an
+        // in-range TTL fall through to the generic store (`.not_handled`).
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "5", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "nope", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "9999999999", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "3600", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "EPHEMERAL", "0", false), .not_handled);
+    } else return error.SkipZigTest;
 }
 
 test "ephemeral room: TTL reader parses the prop; DMs never expire" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // No prop → not ephemeral.
-    try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("#plain"));
+        // No prop → not ephemeral.
+        try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("#plain"));
 
-    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
-    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
-    try std.testing.expectEqual(@as(u64, 3_600_000), server.channelEphemeralTtlMs("#eph"));
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+        _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(@as(u64, 3_600_000), server.channelEphemeralTtlMs("#eph"));
 
-    // A DM target (non-#/&) is never treated as ephemeral even if a prop leaks.
-    try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("someuser"));
+        // A DM target (non-#/&) is never treated as ephemeral even if a prop leaks.
+        try std.testing.expectEqual(@as(u64, 0), server.channelEphemeralTtlMs("someuser"));
+    } else return error.SkipZigTest;
 }
 
 test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const member_id = try addTestLocalClient(&server, "Reader", null);
-    const member = server.connFor(member_id).?;
+        const member_id = try addTestLocalClient(&server, "Reader", null);
+        const member = server.connFor(member_id).?;
 
-    const now: u64 = @intCast(platform.realtimeMillis());
-    const two_hours: u64 = 2 * 60 * 60 * 1000;
-    const one_min: u64 = 60 * 1000;
-    _ = server.history.append("#eph", .{ .msgid = "old1", .sender = "a!u@h", .text = "ancient", .timestamp = now - two_hours }) catch {};
-    _ = server.history.append("#eph", .{ .msgid = "new1", .sender = "b!u@h", .text = "recent", .timestamp = now - one_min }) catch {};
+        const now: u64 = @intCast(platform.realtimeMillis());
+        const two_hours: u64 = 2 * 60 * 60 * 1000;
+        const one_min: u64 = 60 * 1000;
+        _ = server.history.append("#eph", .{ .msgid = "old1", .sender = "a!u@h", .text = "ancient", .timestamp = now - two_hours }) catch {};
+        _ = server.history.append("#eph", .{ .msgid = "new1", .sender = "b!u@h", .text = "recent", .timestamp = now - one_min }) catch {};
 
-    // Without the prop, both replay.
-    var out_buf: [4096]u8 = undefined;
-    var hbuf: [8]lotus.Message = undefined;
-    const all = server.history.latest("#eph", hbuf.len, &hbuf) catch &.{};
-    const before_prop = try server.renderHistoryReplay(member, &out_buf, "t", "#eph", all);
-    try expectContains(before_prop, "ancient");
-    try expectContains(before_prop, "recent");
+        // Without the prop, both replay.
+        var out_buf: [4096]u8 = undefined;
+        var hbuf: [8]lotus.Message = undefined;
+        const all = server.history.latest("#eph", hbuf.len, &hbuf) catch &.{};
+        const before_prop = try server.renderHistoryReplay(member, &out_buf, "t", "#eph", all);
+        try expectContains(before_prop, "ancient");
+        try expectContains(before_prop, "recent");
 
-    // With a 1-hour TTL, the 2-hour-old message is filtered; the 1-min one stays.
-    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
-    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
-    var out_buf2: [4096]u8 = undefined;
-    const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all);
-    try std.testing.expect(std.mem.indexOf(u8, after_prop, "ancient") == null);
-    try expectContains(after_prop, "recent");
+        // With a 1-hour TTL, the 2-hour-old message is filtered; the 1-min one stays.
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+        _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+        var out_buf2: [4096]u8 = undefined;
+        const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all);
+        try std.testing.expect(std.mem.indexOf(u8, after_prop, "ancient") == null);
+        try expectContains(after_prop, "recent");
+    } else return error.SkipZigTest;
 }
 
 test "status.json: emits node health + mesh peers for the public status page" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // Seed a live peer and a downed one, then build the JSON in memory.
-    server.markPeerHealth("ircx.us", .established);
-    server.markPeerHealth("stale.node", .down);
+        // Seed a live peer and a downed one, then build the JSON in memory.
+        server.markPeerHealth("ircx.us", .established);
+        server.markPeerHealth("stale.node", .down);
 
-    var buf: [8192]u8 = undefined;
-    const text = server.buildStatusJson(&buf);
+        var buf: [8192]u8 = undefined;
+        const text = server.buildStatusJson(&buf);
 
-    // Node identity + health envelope.
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
-    // Both peers present, with correct up/state.
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+        // Node identity + health envelope.
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
+        // Both peers present, with correct up/state.
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+    } else return error.SkipZigTest;
 }
 
 test "oper-prefix dedup: collapses repeat +Y within the window, allows real transitions" {
@@ -29365,62 +29401,66 @@ test "status.json: peerStatusString maps every link state" {
 }
 
 test "ephemeral room: messages are not recorded into durable chanstats" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    // chanstats only records when a dir is configured; point it somewhere.
-    server.config.chanstats_dir = "/tmp";
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        // chanstats only records when a dir is configured; point it somewhere.
+        server.config.chanstats_dir = "/tmp";
 
-    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
-    _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
+        _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
 
-    // An ephemeral channel's message is skipped; a plain channel's is recorded.
-    server.chanstatsMessage("#eph", "nick!u@h", "PRIVMSG", "secret");
-    server.chanstatsMessage("#plain", "nick!u@h", "PRIVMSG", "public");
-    try std.testing.expectEqual(@as(usize, 0), server.chanstats.channelMessageCount("#eph"));
-    try std.testing.expect(server.chanstats.channelMessageCount("#plain") >= 1);
+        // An ephemeral channel's message is skipped; a plain channel's is recorded.
+        server.chanstatsMessage("#eph", "nick!u@h", "PRIVMSG", "secret");
+        server.chanstatsMessage("#plain", "nick!u@h", "PRIVMSG", "public");
+        try std.testing.expectEqual(@as(usize, 0), server.chanstats.channelMessageCount("#eph"));
+        try std.testing.expect(server.chanstats.channelMessageCount("#plain") >= 1);
+    } else return error.SkipZigTest;
 }
 
 test "mesh WARD applies and removes via applyRemoteWard" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), server.warden.count());
+        try std.testing.expectEqual(@as(usize, 0), server.warden.count());
 
-    // A received mesh-WARD add is enforced locally as a mesh-scope ward.
-    server.applyRemoteWard(.{
-        .op = .add,
-        .match = .mask,
-        .pattern = "*!*@*.evil.example",
-        .action = .expel,
-        .reason = "spam ring",
-        .set_by = "oper!~o@peer",
-        .created_ms = 1,
-        .expires_ms = 0,
-    });
-    try std.testing.expectEqual(@as(usize, 1), server.warden.count());
-    const hit = server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100).?;
-    try std.testing.expectEqual(warden.Scope.mesh, hit.scope);
-    try std.testing.expectEqual(warden.Action.expel, hit.action);
+        // A received mesh-WARD add is enforced locally as a mesh-scope ward.
+        server.applyRemoteWard(.{
+            .op = .add,
+            .match = .mask,
+            .pattern = "*!*@*.evil.example",
+            .action = .expel,
+            .reason = "spam ring",
+            .set_by = "oper!~o@peer",
+            .created_ms = 1,
+            .expires_ms = 0,
+        });
+        try std.testing.expectEqual(@as(usize, 1), server.warden.count());
+        const hit = server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100).?;
+        try std.testing.expectEqual(warden.Scope.mesh, hit.scope);
+        try std.testing.expectEqual(warden.Action.expel, hit.action);
 
-    // A received mesh-WARD remove forgets it (only op/match/pattern load-bearing).
-    server.applyRemoteWard(.{
-        .op = .remove,
-        .match = .mask,
-        .pattern = "*!*@*.evil.example",
-        .action = .expel,
-        .reason = "",
-        .set_by = "",
-        .created_ms = 0,
-        .expires_ms = 0,
-    });
-    try std.testing.expectEqual(@as(usize, 0), server.warden.count());
-    try std.testing.expect(server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100) == null);
+        // A received mesh-WARD remove forgets it (only op/match/pattern load-bearing).
+        server.applyRemoteWard(.{
+            .op = .remove,
+            .match = .mask,
+            .pattern = "*!*@*.evil.example",
+            .action = .expel,
+            .reason = "",
+            .set_by = "",
+            .created_ms = 0,
+            .expires_ms = 0,
+        });
+        try std.testing.expectEqual(@as(usize, 0), server.warden.count());
+        try std.testing.expect(server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100) == null);
+    } else return error.SkipZigTest;
 }
 
 test "rotatable cloak key: a ward on the old-key cloak misses the new-key cloak" {
@@ -29484,128 +29524,138 @@ fn buildSignedRelay(
 const sign_mod = @import("../crypto/sign.zig");
 
 test "deliverRelay accepts a correctly signed origin message" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const target = server.connFor(target_id).?;
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x21)));
-    defer kp.deinit();
-    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
-    var sig_buf: [message_relay.sig_len]u8 = undefined;
-    const msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "signed and delivered", 1, &pk_buf, &sig_buf);
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x21)));
+        defer kp.deinit();
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        const msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "signed and delivered", 1, &pk_buf, &sig_buf);
 
-    server.deliverRelay(msg);
-    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :signed and delivered\r\n");
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        server.deliverRelay(msg);
+        try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :signed and delivered\r\n");
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "deliverRelay rejects a forged signature: not delivered, counted" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const target = server.connFor(target_id).?;
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x31)));
-    defer kp.deinit();
-    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
-    var sig_buf: [message_relay.sig_len]u8 = undefined;
-    var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "forged body", 2, &pk_buf, &sig_buf);
-    // Tamper the text AFTER signing: structure is valid, signature no longer is.
-    msg.text = "tampered body the origin never authored";
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x31)));
+        defer kp.deinit();
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "forged body", 2, &pk_buf, &sig_buf);
+        // Tamper the text AFTER signing: structure is valid, signature no longer is.
+        msg.text = "tampered body the origin never authored";
 
-    server.deliverRelay(msg);
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
-    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+        server.deliverRelay(msg);
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "deliverRelay rejects a pubkey whose originShortId != origin_node" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const target = server.connFor(target_id).?;
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x41)));
-    defer kp.deinit();
-    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
-    var sig_buf: [message_relay.sig_len]u8 = undefined;
-    var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "claims a different origin", 3, &pk_buf, &sig_buf);
-    // Claim an origin id the carried key does not self-certify.
-    msg.origin_node = message_relay.originShortId(kp.public_key) ^ 0x1;
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x41)));
+        defer kp.deinit();
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "claims a different origin", 3, &pk_buf, &sig_buf);
+        // Claim an origin id the carried key does not self-certify.
+        msg.origin_node = message_relay.originShortId(kp.public_key) ^ 0x1;
 
-    server.deliverRelay(msg);
-    try std.testing.expectEqual(@as(usize, 0), target.send_len);
-    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+        server.deliverRelay(msg);
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
-    const target = server.connFor(target_id).?;
+        const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+        const target = server.connFor(target_id).?;
 
-    // No origin_pubkey/origin_sig: the legacy unsigned path, unchanged.
-    server.deliverRelay(.{
-        .verb = .privmsg,
-        .target = "Target",
-        .source_nick = "Remote",
-        .source_prefix = "Remote!r@elsewhere",
-        .account = "",
-        .tags = "",
-        .text = "legacy unsigned still flows",
-        .origin_node = 99,
-        .hlc = 7,
-    });
-    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :legacy unsigned still flows\r\n");
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        // No origin_pubkey/origin_sig: the legacy unsigned path, unchanged.
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@elsewhere",
+            .account = "",
+            .tags = "",
+            .text = "legacy unsigned still flows",
+            .origin_node = 99,
+            .hlc = 7,
+        });
+        try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :legacy unsigned still flows\r\n");
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "deliverRelay re-forward preserves the signature for the next hop" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // No local recipient for #relay here: deliverRelay's job is the re-forward
-    // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
-    // original signature, by re-verifying the encoded copy at std-allocator level.
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
-    defer kp.deinit();
-    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
-    var sig_buf: [message_relay.sig_len]u8 = undefined;
-    const msg = try buildSignedRelay(&kp, "#relay", "Remote!r@elsewhere", "multi-hop authored once", 9, &pk_buf, &sig_buf);
+        // No local recipient for #relay here: deliverRelay's job is the re-forward
+        // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
+        // original signature, by re-verifying the encoded copy at std-allocator level.
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
+        defer kp.deinit();
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        const msg = try buildSignedRelay(&kp, "#relay", "Remote!r@elsewhere", "multi-hop authored once", 9, &pk_buf, &sig_buf);
 
-    // The relayed clean_msg copies origin_pubkey/origin_sig verbatim; an encode
-    // round-trip (what a real re-forward does over the wire) still verifies as the
-    // ORIGINAL origin at the next hop.
-    const wire = try message_relay.encode(std.testing.allocator, msg);
-    defer std.testing.allocator.free(wire);
-    var hop2 = try message_relay.decode(std.testing.allocator, wire);
-    defer hop2.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(u8, msg.origin_pubkey, hop2.msg.origin_pubkey);
-    try std.testing.expectEqualSlices(u8, msg.origin_sig, hop2.msg.origin_sig);
-    try std.testing.expectEqual(message_relay.VerifyOutcome.verified, try message_relay.verifyOrigin(std.testing.allocator, hop2.msg));
+        // The relayed clean_msg copies origin_pubkey/origin_sig verbatim; an encode
+        // round-trip (what a real re-forward does over the wire) still verifies as the
+        // ORIGINAL origin at the next hop.
+        const wire = try message_relay.encode(std.testing.allocator, msg);
+        defer std.testing.allocator.free(wire);
+        var hop2 = try message_relay.decode(std.testing.allocator, wire);
+        defer hop2.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, msg.origin_pubkey, hop2.msg.origin_pubkey);
+        try std.testing.expectEqualSlices(u8, msg.origin_sig, hop2.msg.origin_sig);
+        try std.testing.expectEqual(message_relay.VerifyOutcome.verified, try message_relay.verifyOrigin(std.testing.allocator, hop2.msg));
 
-    // And deliverRelay itself accepts (does not count a rejection) for a signed msg.
-    server.deliverRelay(msg);
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        // And deliverRelay itself accepts (does not count a rejection) for a signed msg.
+        server.deliverRelay(msg);
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 // ---------------------------------------------------------------------------
@@ -29665,182 +29715,192 @@ fn buildSignedProp(
 }
 
 test "channel prop: a locally-authored fact is signed and verifies against its origin" {
-    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
-    defer ident.deinit();
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
+        defer ident.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
-    const ps = server.signLocalChannelProp(true, "#room", "TOPICLOCK", "1", "alice", 100, &pk_buf, &sig_buf);
-    try std.testing.expectEqual(ident.shortId(), ps.node);
-    try std.testing.expectEqual(@as(usize, channel_prop_event.pubkey_len), ps.pubkey.len);
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const ps = server.signLocalChannelProp(true, "#room", "TOPICLOCK", "1", "alice", 100, &pk_buf, &sig_buf);
+        try std.testing.expectEqual(ident.shortId(), ps.node);
+        try std.testing.expectEqual(@as(usize, channel_prop_event.pubkey_len), ps.pubkey.len);
 
-    // Store + read back; the stored signature self-certifies the local origin.
-    try std.testing.expect(server.recordChannelPropClock("#room", "TOPICLOCK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
-    const clock = server.channelPropClock("#room", "TOPICLOCK").?;
-    const ev = channel_prop_event.ChannelPropEvent{
-        .present = true,
-        .origin_node = clock.origin_node,
-        .hlc = clock.hlc,
-        .channel = "#room",
-        .key = "TOPICLOCK",
-        .value = "1",
-        .owner = "alice",
-        .origin_pubkey = clock.origin_pubkey,
-        .origin_sig = clock.origin_sig,
-    };
-    try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, ev));
+        // Store + read back; the stored signature self-certifies the local origin.
+        try std.testing.expect(server.recordChannelPropClock("#room", "TOPICLOCK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
+        const clock = server.channelPropClock("#room", "TOPICLOCK").?;
+        const ev = channel_prop_event.ChannelPropEvent{
+            .present = true,
+            .origin_node = clock.origin_node,
+            .hlc = clock.hlc,
+            .channel = "#room",
+            .key = "TOPICLOCK",
+            .value = "1",
+            .owner = "alice",
+            .origin_pubkey = clock.origin_pubkey,
+            .origin_sig = clock.origin_sig,
+        };
+        try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, ev));
+    } else return error.SkipZigTest;
 }
 
 test "channel prop: an inbound signed fact verifies, applies, and is stored for re-broadcast" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x82)));
-    defer kp.deinit();
-    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
-    const fact = try buildSignedProp(&kp, "#mesh", "SUBJECT", "hello", "remoteacct", 500, true, &pk_buf, &sig_buf);
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x82)));
+        defer kp.deinit();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const fact = try buildSignedProp(&kp, "#mesh", "SUBJECT", "hello", "remoteacct", 500, true, &pk_buf, &sig_buf);
 
-    try std.testing.expect(server.applyRemoteChannelProp(fact));
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        try std.testing.expect(server.applyRemoteChannelProp(fact));
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
 
-    // The ORIGINAL author's origin + signature were stored verbatim (NOT this
-    // node's), so a re-broadcast/burst re-emits the original author's signature.
-    const clock = server.channelPropClock("#mesh", "SUBJECT").?;
-    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
-    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+        // The ORIGINAL author's origin + signature were stored verbatim (NOT this
+        // node's), so a re-broadcast/burst re-emits the original author's signature.
+        const clock = server.channelPropClock("#mesh", "SUBJECT").?;
+        try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+        try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
 
-    // burstPropOrigin re-derives the emit attribution and, because the live tuple
-    // still matches the signed one, re-emits the ORIGINAL author's (pubkey, sig).
-    const origin = server.burstPropOrigin(clock, true, "hello", "remoteacct");
-    try std.testing.expectEqual(fact.origin_node, origin.node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
-    try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+        // burstPropOrigin re-derives the emit attribution and, because the live tuple
+        // still matches the signed one, re-emits the ORIGINAL author's (pubkey, sig).
+        const origin = server.burstPropOrigin(clock, true, "hello", "remoteacct");
+        try std.testing.expectEqual(fact.origin_node, origin.node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+        try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+    } else return error.SkipZigTest;
 }
 
 test "channel prop: a forged inbound fact is rejected, counted, and not applied" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x83)));
-    defer kp.deinit();
-    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x83)));
+        defer kp.deinit();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
 
-    // (1) Tampered value after signing: structure valid, signature is not.
-    var tampered = try buildSignedProp(&kp, "#mesh", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
-    tampered.value = "tampered value the origin never authored";
-    try std.testing.expect(!server.applyRemoteChannelProp(tampered));
-    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
-    try std.testing.expect(server.channelPropClock("#mesh", "K") == null);
+        // (1) Tampered value after signing: structure valid, signature is not.
+        var tampered = try buildSignedProp(&kp, "#mesh", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
+        tampered.value = "tampered value the origin never authored";
+        try std.testing.expect(!server.applyRemoteChannelProp(tampered));
+        try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+        try std.testing.expect(server.channelPropClock("#mesh", "K") == null);
 
-    // (2) A pubkey whose originShortId does not self-certify the claimed origin.
-    var bad_origin = try buildSignedProp(&kp, "#mesh", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
-    bad_origin.origin_node = channel_prop_event.originShortId(kp.public_key) ^ 0x1;
-    try std.testing.expect(!server.applyRemoteChannelProp(bad_origin));
-    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
-    try std.testing.expect(server.channelPropClock("#mesh", "K2") == null);
+        // (2) A pubkey whose originShortId does not self-certify the claimed origin.
+        var bad_origin = try buildSignedProp(&kp, "#mesh", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
+        bad_origin.origin_node = channel_prop_event.originShortId(kp.public_key) ^ 0x1;
+        try std.testing.expect(!server.applyRemoteChannelProp(bad_origin));
+        try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
+        try std.testing.expect(server.channelPropClock("#mesh", "K2") == null);
 
-    // (3) Tampered owner/channel/key each break verification too.
-    inline for (.{ "owner", "channel", "key" }) |field| {
-        var t = try buildSignedProp(&kp, "#mesh", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
-        @field(t, field) = "HIJACKED";
-        try std.testing.expect(!server.applyRemoteChannelProp(t));
-        try std.testing.expect(server.channelPropClock("#mesh", "K3") == null);
-    }
-    try std.testing.expectEqual(@as(u64, 5), server.rejected_relay_signatures);
+        // (3) Tampered owner/channel/key each break verification too.
+        inline for (.{ "owner", "channel", "key" }) |field| {
+            var t = try buildSignedProp(&kp, "#mesh", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
+            @field(t, field) = "HIJACKED";
+            try std.testing.expect(!server.applyRemoteChannelProp(t));
+            try std.testing.expect(server.channelPropClock("#mesh", "K3") == null);
+        }
+        try std.testing.expectEqual(@as(u64, 5), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "channel prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    // A THIRD node authored the fact; THIS node is a relay with its own identity.
-    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x84)), "relay");
-    defer ident.deinit();
-    server.config.node_id = ident.shortId();
-    server.config.node_identity = &ident;
+        // A THIRD node authored the fact; THIS node is a relay with its own identity.
+        var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x84)), "relay");
+        defer ident.deinit();
+        server.config.node_id = ident.shortId();
+        server.config.node_identity = &ident;
 
-    var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x90)));
-    defer author.deinit();
-    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
-    const fact = try buildSignedProp(&author, "#mesh", "OWNERKEY", "v", "carol", 700, true, &pk_buf, &sig_buf);
-    // Sanity: the author is NOT this relay node.
-    try std.testing.expect(fact.origin_node != ident.shortId());
+        var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x90)));
+        defer author.deinit();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const fact = try buildSignedProp(&author, "#mesh", "OWNERKEY", "v", "carol", 700, true, &pk_buf, &sig_buf);
+        // Sanity: the author is NOT this relay node.
+        try std.testing.expect(fact.origin_node != ident.shortId());
 
-    try std.testing.expect(server.applyRemoteChannelProp(fact));
-    const clock = server.channelPropClock("#mesh", "OWNERKEY").?;
+        try std.testing.expect(server.applyRemoteChannelProp(fact));
+        const clock = server.channelPropClock("#mesh", "OWNERKEY").?;
 
-    // The re-broadcast attribution is the AUTHOR's, not the relay's: a receiver
-    // self-certifies `originShortId(pubkey) == origin_node` (the author), which is
-    // the whole point of multi-hop CRDT signing.
-    const origin = server.burstPropOrigin(clock, true, "v", "carol");
-    try std.testing.expectEqual(fact.origin_node, origin.node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
-    const reemit = channel_prop_event.ChannelPropEvent{
-        .present = true,
-        .origin_node = origin.node,
-        .hlc = clock.hlc,
-        .channel = "#mesh",
-        .key = "OWNERKEY",
-        .value = "v",
-        .owner = "carol",
-        .origin_pubkey = origin.pubkey,
-        .origin_sig = origin.sig,
-    };
-    try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, reemit));
+        // The re-broadcast attribution is the AUTHOR's, not the relay's: a receiver
+        // self-certifies `originShortId(pubkey) == origin_node` (the author), which is
+        // the whole point of multi-hop CRDT signing.
+        const origin = server.burstPropOrigin(clock, true, "v", "carol");
+        try std.testing.expectEqual(fact.origin_node, origin.node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+        const reemit = channel_prop_event.ChannelPropEvent{
+            .present = true,
+            .origin_node = origin.node,
+            .hlc = clock.hlc,
+            .channel = "#mesh",
+            .key = "OWNERKEY",
+            .value = "v",
+            .owner = "carol",
+            .origin_pubkey = origin.pubkey,
+            .origin_sig = origin.sig,
+        };
+        try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, reemit));
+    } else return error.SkipZigTest;
 }
 
 test "channel prop: a legacy unsigned inbound fact still applies (backward compat)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    // No origin_pubkey/origin_sig: the legacy unsigned path, applied unchanged.
-    const fact = TestPropFact{
-        .channel = "#mesh",
-        .key = "LEGACY",
-        .value = "unsigned still flows",
-        .owner = "dave",
-        .hlc = 800,
-        .present = true,
-        .origin_node = 99,
-    };
-    try std.testing.expect(server.applyRemoteChannelProp(fact));
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
-    const clock = server.channelPropClock("#mesh", "LEGACY").?;
-    try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
-    try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
-    // An unsigned clock re-emits an unsigned origin (legacy LWW at the receiver).
-    const origin = server.burstPropOrigin(clock, true, "unsigned still flows", "dave");
-    try std.testing.expectEqual(@as(u64, 99), origin.node);
-    try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+        // No origin_pubkey/origin_sig: the legacy unsigned path, applied unchanged.
+        const fact = TestPropFact{
+            .channel = "#mesh",
+            .key = "LEGACY",
+            .value = "unsigned still flows",
+            .owner = "dave",
+            .hlc = 800,
+            .present = true,
+            .origin_node = 99,
+        };
+        try std.testing.expect(server.applyRemoteChannelProp(fact));
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        const clock = server.channelPropClock("#mesh", "LEGACY").?;
+        try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
+        try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
+        // An unsigned clock re-emits an unsigned origin (legacy LWW at the receiver).
+        const origin = server.burstPropOrigin(clock, true, "unsigned still flows", "dave");
+        try std.testing.expectEqual(@as(u64, 99), origin.node);
+        try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+    } else return error.SkipZigTest;
 }
 
 // ---------------------------------------------------------------------------
@@ -29903,333 +29963,353 @@ fn buildSignedEntityProp(
 }
 
 test "entity prop: a local user prop and member prop are signed and verify against their origin" {
-    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
-    defer ident.deinit();
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-
-    inline for (.{
-        .{ entity_prop_event.EntityKind.user, "alice", "alice" },
-        .{ entity_prop_event.EntityKind.member, "#room:alice", "#room:alice" },
-    }) |spec| {
-        const kind = spec[0];
-        const entity = spec[1];
-        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
-        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
-        const ps = server.signLocalEntityProp(true, kind, entity, "MARK", "1", "alice", 100, &pk_buf, &sig_buf);
-        try std.testing.expectEqual(ident.shortId(), ps.node);
-        try std.testing.expectEqual(@as(usize, entity_prop_event.pubkey_len), ps.pubkey.len);
-
-        try std.testing.expect(server.recordEntityPropClock(kind, entity, "MARK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
-        const clock = server.entityPropClock(kind, entity, "MARK").?;
-        const ev = entity_prop_event.EntityPropEvent{
-            .present = true,
-            .kind = kind,
-            .origin_node = clock.origin_node,
-            .hlc = clock.hlc,
-            .entity = entity,
-            .key = "MARK",
-            .value = "1",
-            .owner = "alice",
-            .origin_pubkey = clock.origin_pubkey,
-            .origin_sig = clock.origin_sig,
+    if (comptime builtin.os.tag == .linux) {
+        var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
+        defer ident.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
         };
-        try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, ev));
-    }
+        defer server.deinit();
+
+        inline for (.{
+            .{ entity_prop_event.EntityKind.user, "alice", "alice" },
+            .{ entity_prop_event.EntityKind.member, "#room:alice", "#room:alice" },
+        }) |spec| {
+            const kind = spec[0];
+            const entity = spec[1];
+            var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+            var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+            const ps = server.signLocalEntityProp(true, kind, entity, "MARK", "1", "alice", 100, &pk_buf, &sig_buf);
+            try std.testing.expectEqual(ident.shortId(), ps.node);
+            try std.testing.expectEqual(@as(usize, entity_prop_event.pubkey_len), ps.pubkey.len);
+
+            try std.testing.expect(server.recordEntityPropClock(kind, entity, "MARK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
+            const clock = server.entityPropClock(kind, entity, "MARK").?;
+            const ev = entity_prop_event.EntityPropEvent{
+                .present = true,
+                .kind = kind,
+                .origin_node = clock.origin_node,
+                .hlc = clock.hlc,
+                .entity = entity,
+                .key = "MARK",
+                .value = "1",
+                .owner = "alice",
+                .origin_pubkey = clock.origin_pubkey,
+                .origin_sig = clock.origin_sig,
+            };
+            try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, ev));
+        }
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: an inbound signed user fact verifies, applies, and is stored for re-broadcast" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x62)));
-    defer kp.deinit();
-    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
-    const fact = try buildSignedEntityProp(&kp, .user, "carol", "STATUS", "busy", "carol", 500, true, &pk_buf, &sig_buf);
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x62)));
+        defer kp.deinit();
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        const fact = try buildSignedEntityProp(&kp, .user, "carol", "STATUS", "busy", "carol", 500, true, &pk_buf, &sig_buf);
 
-    try std.testing.expect(server.applyRemoteEntityProp(fact));
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        try std.testing.expect(server.applyRemoteEntityProp(fact));
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
 
-    // The value landed in the store and is answerable via PROP GET.
-    const stored = try server.props.getProp(.{ .kind = .user, .id = "carol" }, "STATUS");
-    try std.testing.expectEqualStrings("busy", stored.value);
+        // The value landed in the store and is answerable via PROP GET.
+        const stored = try server.props.getProp(.{ .kind = .user, .id = "carol" }, "STATUS");
+        try std.testing.expectEqualStrings("busy", stored.value);
 
-    // The ORIGINAL author's origin + signature were stored verbatim.
-    const clock = server.entityPropClock(.user, "carol", "STATUS").?;
-    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
-    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+        // The ORIGINAL author's origin + signature were stored verbatim.
+        const clock = server.entityPropClock(.user, "carol", "STATUS").?;
+        try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+        try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
 
-    const origin = server.burstEntityPropOrigin(clock, true, "busy", "carol");
-    try std.testing.expectEqual(fact.origin_node, origin.node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
-    try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+        const origin = server.burstEntityPropOrigin(clock, true, "busy", "carol");
+        try std.testing.expectEqual(fact.origin_node, origin.node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+        try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: an inbound signed member fact verifies and applies" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x63)));
-    defer kp.deinit();
-    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
-    const fact = try buildSignedEntityProp(&kp, .member, "#mesh:dave", "ROLE", "mod", "founder", 510, true, &pk_buf, &sig_buf);
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x63)));
+        defer kp.deinit();
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        const fact = try buildSignedEntityProp(&kp, .member, "#mesh:dave", "ROLE", "mod", "founder", 510, true, &pk_buf, &sig_buf);
 
-    try std.testing.expect(server.applyRemoteEntityProp(fact));
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
-    const stored = try server.props.getProp(.{ .kind = .member, .id = "#mesh:dave" }, "ROLE");
-    try std.testing.expectEqualStrings("mod", stored.value);
+        try std.testing.expect(server.applyRemoteEntityProp(fact));
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        const stored = try server.props.getProp(.{ .kind = .member, .id = "#mesh:dave" }, "ROLE");
+        try std.testing.expectEqualStrings("mod", stored.value);
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: a forged inbound fact is rejected, counted, and not applied" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x64)));
-    defer kp.deinit();
-    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x64)));
+        defer kp.deinit();
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
 
-    // (1) Tampered value after signing.
-    var tampered = try buildSignedEntityProp(&kp, .user, "alice", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
-    tampered.value = "tampered value the origin never authored";
-    try std.testing.expect(!server.applyRemoteEntityProp(tampered));
-    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
-    try std.testing.expect(server.entityPropClock(.user, "alice", "K") == null);
+        // (1) Tampered value after signing.
+        var tampered = try buildSignedEntityProp(&kp, .user, "alice", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
+        tampered.value = "tampered value the origin never authored";
+        try std.testing.expect(!server.applyRemoteEntityProp(tampered));
+        try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+        try std.testing.expect(server.entityPropClock(.user, "alice", "K") == null);
 
-    // (2) A pubkey whose originShortId does not self-certify the claimed origin.
-    var bad_origin = try buildSignedEntityProp(&kp, .user, "alice", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
-    bad_origin.origin_node = entity_prop_event.originShortId(kp.public_key) ^ 0x1;
-    try std.testing.expect(!server.applyRemoteEntityProp(bad_origin));
-    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
-    try std.testing.expect(server.entityPropClock(.user, "alice", "K2") == null);
+        // (2) A pubkey whose originShortId does not self-certify the claimed origin.
+        var bad_origin = try buildSignedEntityProp(&kp, .user, "alice", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
+        bad_origin.origin_node = entity_prop_event.originShortId(kp.public_key) ^ 0x1;
+        try std.testing.expect(!server.applyRemoteEntityProp(bad_origin));
+        try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
+        try std.testing.expect(server.entityPropClock(.user, "alice", "K2") == null);
 
-    // (3) Reclassifying the kind (user -> member) breaks the signature.
-    var reclassified = try buildSignedEntityProp(&kp, .user, "alice", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
-    reclassified.kind = .member;
-    try std.testing.expect(!server.applyRemoteEntityProp(reclassified));
-    try std.testing.expectEqual(@as(u64, 3), server.rejected_relay_signatures);
+        // (3) Reclassifying the kind (user -> member) breaks the signature.
+        var reclassified = try buildSignedEntityProp(&kp, .user, "alice", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
+        reclassified.kind = .member;
+        try std.testing.expect(!server.applyRemoteEntityProp(reclassified));
+        try std.testing.expectEqual(@as(u64, 3), server.rejected_relay_signatures);
 
-    // (4) Tampered owner/entity/key each break verification too.
-    inline for (.{ "owner", "entity", "key" }) |field| {
-        var t = try buildSignedEntityProp(&kp, .user, "alice", "K4", "v", "alice", 603, true, &pk_buf, &sig_buf);
-        @field(t, field) = "HIJACKED";
-        try std.testing.expect(!server.applyRemoteEntityProp(t));
-        try std.testing.expect(server.entityPropClock(.user, "alice", "K4") == null);
-    }
-    try std.testing.expectEqual(@as(u64, 6), server.rejected_relay_signatures);
+        // (4) Tampered owner/entity/key each break verification too.
+        inline for (.{ "owner", "entity", "key" }) |field| {
+            var t = try buildSignedEntityProp(&kp, .user, "alice", "K4", "v", "alice", 603, true, &pk_buf, &sig_buf);
+            @field(t, field) = "HIJACKED";
+            try std.testing.expect(!server.applyRemoteEntityProp(t));
+            try std.testing.expect(server.entityPropClock(.user, "alice", "K4") == null);
+        }
+        try std.testing.expectEqual(@as(u64, 6), server.rejected_relay_signatures);
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // A THIRD node authored the fact; THIS node is a relay with its own identity.
-    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x65)), "relay");
-    defer ident.deinit();
-    server.config.node_id = ident.shortId();
-    server.config.node_identity = &ident;
+        // A THIRD node authored the fact; THIS node is a relay with its own identity.
+        var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x65)), "relay");
+        defer ident.deinit();
+        server.config.node_id = ident.shortId();
+        server.config.node_identity = &ident;
 
-    var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x91)));
-    defer author.deinit();
-    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
-    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
-    const fact = try buildSignedEntityProp(&author, .user, "erin", "STATUS", "away", "erin", 700, true, &pk_buf, &sig_buf);
-    try std.testing.expect(fact.origin_node != ident.shortId());
+        var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x91)));
+        defer author.deinit();
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        const fact = try buildSignedEntityProp(&author, .user, "erin", "STATUS", "away", "erin", 700, true, &pk_buf, &sig_buf);
+        try std.testing.expect(fact.origin_node != ident.shortId());
 
-    try std.testing.expect(server.applyRemoteEntityProp(fact));
-    const clock = server.entityPropClock(.user, "erin", "STATUS").?;
+        try std.testing.expect(server.applyRemoteEntityProp(fact));
+        const clock = server.entityPropClock(.user, "erin", "STATUS").?;
 
-    const origin = server.burstEntityPropOrigin(clock, true, "away", "erin");
-    try std.testing.expectEqual(fact.origin_node, origin.node);
-    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
-    const reemit = entity_prop_event.EntityPropEvent{
-        .present = true,
-        .kind = .user,
-        .origin_node = origin.node,
-        .hlc = clock.hlc,
-        .entity = "erin",
-        .key = "STATUS",
-        .value = "away",
-        .owner = "erin",
-        .origin_pubkey = origin.pubkey,
-        .origin_sig = origin.sig,
-    };
-    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, reemit));
+        const origin = server.burstEntityPropOrigin(clock, true, "away", "erin");
+        try std.testing.expectEqual(fact.origin_node, origin.node);
+        try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+        const reemit = entity_prop_event.EntityPropEvent{
+            .present = true,
+            .kind = .user,
+            .origin_node = origin.node,
+            .hlc = clock.hlc,
+            .entity = "erin",
+            .key = "STATUS",
+            .value = "away",
+            .owner = "erin",
+            .origin_pubkey = origin.pubkey,
+            .origin_sig = origin.sig,
+        };
+        try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, reemit));
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: a legacy unsigned inbound fact still applies (backward compat)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const fact = TestEntityPropFact{
-        .kind = .user,
-        .entity = "frank",
-        .key = "LEGACY",
-        .value = "unsigned still flows",
-        .owner = "frank",
-        .hlc = 800,
-        .present = true,
-        .origin_node = 99,
-    };
-    try std.testing.expect(server.applyRemoteEntityProp(fact));
-    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
-    const clock = server.entityPropClock(.user, "frank", "LEGACY").?;
-    try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
-    try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
-    const origin = server.burstEntityPropOrigin(clock, true, "unsigned still flows", "frank");
-    try std.testing.expectEqual(@as(u64, 99), origin.node);
-    try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+        const fact = TestEntityPropFact{
+            .kind = .user,
+            .entity = "frank",
+            .key = "LEGACY",
+            .value = "unsigned still flows",
+            .owner = "frank",
+            .hlc = 800,
+            .present = true,
+            .origin_node = 99,
+        };
+        try std.testing.expect(server.applyRemoteEntityProp(fact));
+        try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+        const clock = server.entityPropClock(.user, "frank", "LEGACY").?;
+        try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
+        try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
+        const origin = server.burstEntityPropOrigin(clock, true, "unsigned still flows", "frank");
+        try std.testing.expectEqual(@as(u64, 99), origin.node);
+        try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+    } else return error.SkipZigTest;
 }
 
 test "entity prop: newer hlc wins, older is ignored (LWW for user and member)" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    inline for (.{
-        .{ entity_prop_event.EntityKind.user, "grace" },
-        .{ entity_prop_event.EntityKind.member, "#g:grace" },
-    }) |spec| {
-        const kind = spec[0];
-        const entity = spec[1];
-        // hlc 200 applies.
-        const newer = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "new", .owner = "x", .hlc = 200, .present = true, .origin_node = 5 };
-        try std.testing.expect(server.applyRemoteEntityProp(newer));
-        try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
+        inline for (.{
+            .{ entity_prop_event.EntityKind.user, "grace" },
+            .{ entity_prop_event.EntityKind.member, "#g:grace" },
+        }) |spec| {
+            const kind = spec[0];
+            const entity = spec[1];
+            // hlc 200 applies.
+            const newer = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "new", .owner = "x", .hlc = 200, .present = true, .origin_node = 5 };
+            try std.testing.expect(server.applyRemoteEntityProp(newer));
+            try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
 
-        // An older hlc 100 is rejected by LWW and does not overwrite.
-        const older = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "old", .owner = "j", .hlc = 100, .present = true, .origin_node = 6 };
-        try std.testing.expect(!server.applyRemoteEntityProp(older));
-        const stored = try server.props.getProp(.{ .kind = kind.toStoreKind(), .id = entity }, "K");
-        try std.testing.expectEqualStrings("new", stored.value);
-        try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
-    }
+            // An older hlc 100 is rejected by LWW and does not overwrite.
+            const older = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "old", .owner = "j", .hlc = 100, .present = true, .origin_node = 6 };
+            try std.testing.expect(!server.applyRemoteEntityProp(older));
+            const stored = try server.props.getProp(.{ .kind = kind.toStoreKind(), .id = entity }, "K");
+            try std.testing.expectEqualStrings("new", stored.value);
+            try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
+        }
+    } else return error.SkipZigTest;
 }
 
 test "remote aggregate channel mode flags cannot clear local +nt policy" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#policy", worldIdFromClient(founder_id));
-    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
-    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#policy", worldIdFromClient(founder_id));
+        try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+        try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
 
-    server.setChannelModeFlagBits("#policy", 0);
-    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
-    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
-    try std.testing.expect(!server.world.channelHasFlag("#policy", .moderated));
+        server.setChannelModeFlagBits("#policy", 0);
+        try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+        try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+        try std.testing.expect(!server.world.channelHasFlag("#policy", .moderated));
 
-    server.setChannelModeFlagBits("#policy", 1 << 1);
-    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
-    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
-    try std.testing.expect(server.world.channelHasFlag("#policy", .moderated));
+        server.setChannelModeFlagBits("#policy", 1 << 1);
+        try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+        try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+        try std.testing.expect(server.world.channelHasFlag("#policy", .moderated));
+    } else return error.SkipZigTest;
 }
 
 test "remote channel mode state applies params and respects local MLOCK" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const founder_id = try addTestLocalClient(&server, "Founder", null);
-    _ = try server.world.join("#param", worldIdFromClient(founder_id));
+        const founder_id = try addTestLocalClient(&server, "Founder", null);
+        _ = try server.world.join("#param", worldIdFromClient(founder_id));
 
-    const delta = .{
-        .channel = "#param",
-        .private = true,
-        .hidden = true,
-        .ext_bits = @as(u32, 0),
-        .key = @as(?[]const u8, "sekret"),
-        .limit = @as(?u32, 42),
-        .throttle_joins = @as(u16, 3),
-        .throttle_secs = @as(u32, 20),
-        .forward = @as(?[]const u8, "#next"),
-    };
-    var before: Server.ChannelModeStateSnapshot = undefined;
-    var after: Server.ChannelModeStateSnapshot = undefined;
-    try std.testing.expect(server.applyRemoteChannelModeState(delta, &before, &after));
-    try std.testing.expect(server.world.isPrivate("#param"));
-    try std.testing.expect(server.world.isHidden("#param"));
-    try std.testing.expectEqualStrings("sekret", server.world.channelKey("#param").?);
-    try std.testing.expectEqual(@as(?u32, 42), server.world.channelLimit("#param"));
-    try std.testing.expectEqual(@as(u16, 3), server.world.throttleOf("#param").?.joins);
-    try std.testing.expectEqual(@as(u32, 20), server.world.throttleOf("#param").?.secs);
-    try std.testing.expectEqualStrings("#next", server.world.forwardOf("#param").?);
+        const delta = .{
+            .channel = "#param",
+            .private = true,
+            .hidden = true,
+            .ext_bits = @as(u32, 0),
+            .key = @as(?[]const u8, "sekret"),
+            .limit = @as(?u32, 42),
+            .throttle_joins = @as(u16, 3),
+            .throttle_secs = @as(u32, 20),
+            .forward = @as(?[]const u8, "#next"),
+        };
+        var before: Server.ChannelModeStateSnapshot = undefined;
+        var after: Server.ChannelModeStateSnapshot = undefined;
+        try std.testing.expect(server.applyRemoteChannelModeState(delta, &before, &after));
+        try std.testing.expect(server.world.isPrivate("#param"));
+        try std.testing.expect(server.world.isHidden("#param"));
+        try std.testing.expectEqualStrings("sekret", server.world.channelKey("#param").?);
+        try std.testing.expectEqual(@as(?u32, 42), server.world.channelLimit("#param"));
+        try std.testing.expectEqual(@as(u16, 3), server.world.throttleOf("#param").?.joins);
+        try std.testing.expectEqual(@as(u32, 20), server.world.throttleOf("#param").?.secs);
+        try std.testing.expectEqualStrings("#next", server.world.forwardOf("#param").?);
 
-    const locked = .{
-        .channel = "#param",
-        .private = false,
-        .hidden = false,
-        .ext_bits = @as(u32, 0),
-        .key = @as(?[]const u8, "blocked"),
-        .limit = @as(?u32, 7),
-        .throttle_joins = @as(u16, 0),
-        .throttle_secs = @as(u32, 0),
-        .forward = @as(?[]const u8, null),
-    };
-    try server.mlocks.put(
-        server.allocator,
-        try server.allocator.dupe(u8, "#param"),
-        try server.allocator.dupe(u8, "+nt-k"),
-    );
-    try std.testing.expect(!server.applyRemoteChannelModeState(locked, &before, &after));
-    try std.testing.expect(server.world.isPrivate("#param"));
-    try std.testing.expectEqualStrings("sekret", server.world.channelKey("#param").?);
-    try std.testing.expectEqual(@as(?u32, 42), server.world.channelLimit("#param"));
+        const locked = .{
+            .channel = "#param",
+            .private = false,
+            .hidden = false,
+            .ext_bits = @as(u32, 0),
+            .key = @as(?[]const u8, "blocked"),
+            .limit = @as(?u32, 7),
+            .throttle_joins = @as(u16, 0),
+            .throttle_secs = @as(u32, 0),
+            .forward = @as(?[]const u8, null),
+        };
+        try server.mlocks.put(
+            server.allocator,
+            try server.allocator.dupe(u8, "#param"),
+            try server.allocator.dupe(u8, "+nt-k"),
+        );
+        try std.testing.expect(!server.applyRemoteChannelModeState(locked, &before, &after));
+        try std.testing.expect(server.world.isPrivate("#param"));
+        try std.testing.expectEqualStrings("sekret", server.world.channelKey("#param").?);
+        try std.testing.expectEqual(@as(?u32, 42), server.world.channelLimit("#param"));
+    } else return error.SkipZigTest;
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
 /// test instead of hanging). Accumulates into `client` and returns when `needle`
 /// is present, or errors after ~3s.
 fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
-    // Use a WALL-CLOCK deadline rather than a fixed poll count: under heavy
-    // parallel-test CPU contention the reactor thread can be briefly starved, so
-    // a count-based budget (poll returns early on data, burning iterations)
-    // produced spurious TestTimeouts. `max_polls` now sets a lower bound on the
-    // budget; we wait at least that long but cap at a generous 20s so genuine
-    // bugs still fail in bounded time.
-    const budget_ms: i64 = @max(@as(i64, @intCast(max_polls)) * 25, 20_000);
-    const deadline = platform.monotonicMillis() + budget_ms;
-    while (true) {
-        if (std.mem.indexOf(u8, client.written(), needle) != null) return;
-        if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
-        var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, 50) catch return error.Unexpected;
-        if (ready == 0) continue;
-        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
-        if (client.len == client.buf.len) return error.OutputTooSmall;
-        const n = try readFd(client.fd, client.buf[client.len..]);
-        if (n == 0) return error.ConnectionReset;
-        client.len += n;
-    }
+    if (comptime builtin.os.tag == .linux) {
+        // Use a WALL-CLOCK deadline rather than a fixed poll count: under heavy
+        // parallel-test CPU contention the reactor thread can be briefly starved, so
+        // a count-based budget (poll returns early on data, burning iterations)
+        // produced spurious TestTimeouts. `max_polls` now sets a lower bound on the
+        // budget; we wait at least that long but cap at a generous 20s so genuine
+        // bugs still fail in bounded time.
+        const budget_ms: i64 = @max(@as(i64, @intCast(max_polls)) * 25, 20_000);
+        const deadline = platform.monotonicMillis() + budget_ms;
+        while (true) {
+            if (std.mem.indexOf(u8, client.written(), needle) != null) return;
+            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 50) catch return error.Unexpected;
+            if (ready == 0) continue;
+            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            if (client.len == client.buf.len) return error.OutputTooSmall;
+            const n = try readFd(client.fd, client.buf[client.len..]);
+            if (n == 0) return error.ConnectionReset;
+            client.len += n;
+        }
+    } else return error.SkipZigTest;
 }
 
 fn extractMsgid(bytes: []const u8) ?[]const u8 {
@@ -30915,49 +30995,51 @@ test "threaded server: a joining network operator announces the derived +Y prefi
 }
 
 test "server services replay restores registered channels mlocks akicks and wards" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-services-replay.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
-    var scratch: [1024]u8 = undefined;
-    _ = try services.registerAccount("admin", "correcthorse", &scratch);
-    _ = try services.registerChannel("#c", "admin", &scratch);
-    _ = try services.setChannel("#c", "admin", .{ .mlock = "+nt-k" }, &scratch);
-    _ = try services.channelAkick("#c", "admin", "Bad!*@*", .add, "no bad", &scratch);
-    try services.persistWard(.{
-        .match = "mask",
-        .pattern = "Bad!*@*",
-        .scope = "node",
-        .action = "expel",
-        .reason = "spam",
-        .setter = "admin",
-        .created_ms = 1,
-        .expires_ms = 0,
-    }, &scratch);
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-services-replay.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("admin", "correcthorse", &scratch);
+        _ = try services.registerChannel("#c", "admin", &scratch);
+        _ = try services.setChannel("#c", "admin", .{ .mlock = "+nt-k" }, &scratch);
+        _ = try services.channelAkick("#c", "admin", "Bad!*@*", .add, "no bad", &scratch);
+        try services.persistWard(.{
+            .match = "mask",
+            .pattern = "Bad!*@*",
+            .scope = "node",
+            .action = "expel",
+            .reason = "spam",
+            .setter = "admin",
+            .created_ms = 1,
+            .expires_ms = 0,
+        }, &scratch);
 
-    var server = Server.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .account_services = &services,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    server.replayServicesLiveState(&services);
+        server.replayServicesLiveState(&services);
 
-    try std.testing.expect(server.world.channelHasExtFlag("#c", .registered));
-    try std.testing.expectEqualStrings("+nt-k", server.mlocks.get("#c").?);
-    const akick = server.chan_akick.matchOnJoin("#c", "Bad!bad@host", null, server.nowMs()) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("bad!*@*", akick.mask);
-    try std.testing.expectEqualStrings("no bad", akick.reason);
-    const ward = server.warden.check(.{ .mask = "Bad!bad@host" }, server.nowMs()) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(warden.Match.mask, ward.match);
-    try std.testing.expectEqualStrings("Bad!*@*", ward.pattern);
-    try std.testing.expectEqualStrings("spam", ward.reason);
+        try std.testing.expect(server.world.channelHasExtFlag("#c", .registered));
+        try std.testing.expectEqualStrings("+nt-k", server.mlocks.get("#c").?);
+        const akick = server.chan_akick.matchOnJoin("#c", "Bad!bad@host", null, server.nowMs()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("bad!*@*", akick.mask);
+        try std.testing.expectEqualStrings("no bad", akick.reason);
+        const ward = server.warden.check(.{ .mask = "Bad!bad@host" }, server.nowMs()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(warden.Match.mask, ward.match);
+        try std.testing.expectEqualStrings("Bad!*@*", ward.pattern);
+        try std.testing.expectEqualStrings("spam", ward.reason);
+    } else return error.SkipZigTest;
 }
 
 // GAP 2: SACCESS entries persist to the durable store and replay into the live
@@ -30965,76 +31047,80 @@ test "server services replay restores registered channels mlocks akicks and ward
 // handle and replaying into a freshly-initialized server, asserting the
 // restored entries are present and enforce (matchHostmask).
 test "server services replay restores persisted SACCESS entries" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-replay.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
-    var scratch: [1024]u8 = undefined;
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-replay.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var scratch: [1024]u8 = undefined;
 
-    // Persist a DENY (with duration + reason), a GAG, and a GRANT.
-    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "bad!*@*", .duration = 60, .reason = "abuse" }, &scratch);
-    try services.persistSaccess(.{ .entry_type = "GAG", .mask = "noisy!*@*" }, &scratch);
-    try services.persistSaccess(.{ .entry_type = "GRANT", .mask = "trusted!*@*" }, &scratch);
-    // A deleted entry must NOT come back after replay.
-    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "temp!*@*" }, &scratch);
-    try services.deleteSaccess("DENY", "temp!*@*", &scratch);
+        // Persist a DENY (with duration + reason), a GAG, and a GRANT.
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "bad!*@*", .duration = 60, .reason = "abuse" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "GAG", .mask = "noisy!*@*" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "GRANT", .mask = "trusted!*@*" }, &scratch);
+        // A deleted entry must NOT come back after replay.
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "temp!*@*" }, &scratch);
+        try services.deleteSaccess("DENY", "temp!*@*", &scratch);
 
-    var server = Server.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .account_services = &services,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    server.replayServicesLiveState(&services);
+        server.replayServicesLiveState(&services);
 
-    const deny = server.saccess.matchHostmask(.deny, "bad!user@host") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("bad!*@*", deny.mask);
-    try std.testing.expectEqual(@as(?u64, 60), deny.duration);
-    try std.testing.expectEqualStrings("abuse", deny.reason.?);
-    try std.testing.expect(server.saccess.matchHostmask(.gag, "noisy!x@j") != null);
-    try std.testing.expect(server.saccess.matchHostmask(.grant, "trusted!x@j") != null);
-    // The deleted DENY did not survive.
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "temp!x@j") == null);
+        const deny = server.saccess.matchHostmask(.deny, "bad!user@host") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("bad!*@*", deny.mask);
+        try std.testing.expectEqual(@as(?u64, 60), deny.duration);
+        try std.testing.expectEqualStrings("abuse", deny.reason.?);
+        try std.testing.expect(server.saccess.matchHostmask(.gag, "noisy!x@j") != null);
+        try std.testing.expect(server.saccess.matchHostmask(.grant, "trusted!x@j") != null);
+        // The deleted DENY did not survive.
+        try std.testing.expect(server.saccess.matchHostmask(.deny, "temp!x@j") == null);
+    } else return error.SkipZigTest;
 }
 
 // GAP 2: a CLEAR mutation is durable. After clearing one type, replay restores
 // only the surviving types.
 test "server services replay honors persisted SACCESS clear" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-clear.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
-    var scratch: [1024]u8 = undefined;
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-clear.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var scratch: [1024]u8 = undefined;
 
-    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "a!*@*" }, &scratch);
-    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "b!*@*" }, &scratch);
-    try services.persistSaccess(.{ .entry_type = "GAG", .mask = "c!*@*" }, &scratch);
-    // Clear only DENY; the GAG must remain.
-    try services.clearSaccess("DENY");
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "a!*@*" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "b!*@*" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "GAG", .mask = "c!*@*" }, &scratch);
+        // Clear only DENY; the GAG must remain.
+        try services.clearSaccess("DENY");
 
-    var server = Server.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .account_services = &services,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    server.replayServicesLiveState(&services);
+        server.replayServicesLiveState(&services);
 
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "a!x@j") == null);
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "b!x@j") == null);
-    try std.testing.expect(server.saccess.matchHostmask(.gag, "c!x@j") != null);
+        try std.testing.expect(server.saccess.matchHostmask(.deny, "a!x@j") == null);
+        try std.testing.expect(server.saccess.matchHostmask(.deny, "b!x@j") == null);
+        try std.testing.expect(server.saccess.matchHostmask(.gag, "c!x@j") != null);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
@@ -31352,61 +31438,63 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
 }
 
 test "threaded server: VERIFY accepts account argument and legacy code form" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    if (comptime builtin.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-verify-account-arg.wal");
-    defer store.deinit();
-    var services = services_mod.Services.init(&store, null);
-    var scratch: [1024]u8 = undefined;
-    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-verify-account-arg.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("bob", "correcthorse", &scratch);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const now_u: u64 = @intCast(@max(0, server.nowMs()));
-    var alice_bytes = @as([16]u8, @splat(0x11));
-    const alice_token = try server.account_verifies.issue("alice", "alice@example.test", &alice_bytes, now_u);
-    var alice_verify_buf: [128]u8 = undefined;
-    const alice_verify = try std.fmt.bufPrint(&alice_verify_buf, "VERIFY alice {s}\r\n", .{alice_token});
+        const now_u: u64 = @intCast(@max(0, server.nowMs()));
+        var alice_bytes = @as([16]u8, @splat(0x11));
+        const alice_token = try server.account_verifies.issue("alice", "alice@example.test", &alice_bytes, now_u);
+        var alice_verify_buf: [128]u8 = undefined;
+        const alice_verify = try std.fmt.bufPrint(&alice_verify_buf, "VERIFY alice {s}\r\n", .{alice_token});
 
-    var bob_bytes = @as([16]u8, @splat(0x22));
-    const bob_token = try server.account_verifies.issue("bob", "bob@example.test", &bob_bytes, now_u);
-    var bob_verify_buf: [128]u8 = undefined;
-    const bob_verify = try std.fmt.bufPrint(&bob_verify_buf, "VERIFY {s}\r\n", .{bob_token});
+        var bob_bytes = @as([16]u8, @splat(0x22));
+        const bob_token = try server.account_verifies.issue("bob", "bob@example.test", &bob_bytes, now_u);
+        var bob_verify_buf: [128]u8 = undefined;
+        const bob_verify = try std.fmt.bufPrint(&bob_verify_buf, "VERIFY {s}\r\n", .{bob_token});
 
-    const port = try server.boundPort();
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        const port = try server.boundPort();
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_a);
-    var alice = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK Verifier\r\nUSER verifier 0 * :Verifier\r\n");
-    try recvUntil(&alice, " 001 Verifier ", 200);
-    alice.reset();
-    try writeAllFd(fd_a, alice_verify);
-    try recvUntil(&alice, "VERIFY: your account email is now verified", 200);
+        const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        var alice = LiveClient{ .fd = fd_a };
+        try writeAllFd(fd_a, "NICK Verifier\r\nUSER verifier 0 * :Verifier\r\n");
+        try recvUntil(&alice, " 001 Verifier ", 200);
+        alice.reset();
+        try writeAllFd(fd_a, alice_verify);
+        try recvUntil(&alice, "VERIFY: your account email is now verified", 200);
 
-    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_b);
-    var bob = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_b, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
-    try recvUntil(&bob, " 001 Bob ", 200);
-    bob.reset();
-    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
-    try recvUntil(&bob, "You are now identified as bob", 200);
-    bob.reset();
-    try writeAllFd(fd_b, bob_verify);
-    try recvUntil(&bob, "VERIFY: your account email is now verified", 200);
+        const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_b);
+        var bob = LiveClient{ .fd = fd_b };
+        try writeAllFd(fd_b, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
+        try recvUntil(&bob, " 001 Bob ", 200);
+        bob.reset();
+        try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+        try recvUntil(&bob, "You are now identified as bob", 200);
+        bob.reset();
+        try writeAllFd(fd_b, bob_verify);
+        try recvUntil(&bob, "VERIFY: your account email is now verified", 200);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: GHOST rejects caller account for non-account nick" {
@@ -31459,157 +31547,161 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
-    // Two reactor threads, SO_REUSEPORT listeners — the kernel may place each
-    // client on either reactor. Several clients in one channel raise the odds two
-    // of them land on DIFFERENT shards; a PRIVMSG must still reach every member,
-    // which exercises the cross-shard fabric handoff end to end. Repeated rounds
-    // make a race-driven drop/dup fail rather than slip through.
-    var server = Server.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .num_shards = 2,
-    }) catch |err| switch (err) {
-        // No io_uring / no perms / no SO_REUSEPORT in this sandbox: skip, don't fail.
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    // A single reactor (clamped, or fabric/pool unavailable) cannot test cross
-    // shard; skip so this only asserts when the multi-reactor topology is live.
-    if (server.reactors.len < 2) return error.SkipZigTest;
-    const port = try server.boundPort();
-
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        // Clear the flag AND wake every reactor's wake eventfd. A SO_REUSEPORT
-        // throwaway connection only nudges whichever reactor the kernel routes it
-        // to; the other worker would stay blocked in submitAndWait forever and
-        // pool.join() would hang. wakeAllReactors makes every blocked loop return,
-        // observe run==false, and exit so the join (and this thread) completes.
-        server.requestStop(&run);
-        thr.join();
-    }
-
-    // Connect a handful of clients; with round-robin kernel placement across two
-    // reactors this all-but-guarantees the channel spans both shards.
-    const n_clients = 6;
-    var fds: [n_clients]linux.fd_t = undefined;
-    var clients: [n_clients]LiveClient = undefined;
-    var connected: usize = 0;
-    defer for (fds[0..connected]) |fd| closeFd(fd);
-    for (0..n_clients) |i| {
-        fds[i] = connectLoopback(port) catch |err| switch (err) {
-            error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+    if (comptime builtin.os.tag == .linux) {
+        // Two reactor threads, SO_REUSEPORT listeners — the kernel may place each
+        // client on either reactor. Several clients in one channel raise the odds two
+        // of them land on DIFFERENT shards; a PRIVMSG must still reach every member,
+        // which exercises the cross-shard fabric handoff end to end. Repeated rounds
+        // make a race-driven drop/dup fail rather than slip through.
+        var server = Server.init(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .num_shards = 2,
+        }) catch |err| switch (err) {
+            // No io_uring / no perms / no SO_REUSEPORT in this sandbox: skip, don't fail.
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
         };
-        connected += 1;
-        clients[i] = LiveClient{ .fd = fds[i] };
-    }
+        defer server.deinit();
+        // A single reactor (clamped, or fabric/pool unavailable) cannot test cross
+        // shard; skip so this only asserts when the multi-reactor topology is live.
+        if (server.reactors.len < 2) return error.SkipZigTest;
+        const port = try server.boundPort();
 
-    // Register each client with a distinct nick and join the shared channel.
-    var nick_buf: [n_clients][8]u8 = undefined;
-    for (0..n_clients) |i| {
-        const nick = std.fmt.bufPrint(&nick_buf[i], "U{d}", .{i}) catch unreachable;
-        var reg_buf: [64]u8 = undefined;
-        const reg = std.fmt.bufPrint(&reg_buf, "NICK {s}\r\nUSER u{d} 0 * :User {d}\r\n", .{ nick, i, i }) catch unreachable;
-        try writeAllFd(fds[i], reg);
-    }
-    for (0..n_clients) |i| {
-        var need: [12]u8 = undefined;
-        const needle = std.fmt.bufPrint(&need, " 001 U{d} ", .{i}) catch unreachable;
-        try recvUntil(&clients[i], needle, 400);
-    }
-    for (0..n_clients) |i| {
-        try writeAllFd(fds[i], "JOIN #shard\r\n");
-        var need: [20]u8 = undefined;
-        const needle = std.fmt.bufPrint(&need, " 366 U{d} #shard ", .{i}) catch unreachable;
-        try recvUntil(&clients[i], needle, 400);
-    }
-
-    // Several rounds: each round a different sender messages the channel; every
-    // OTHER client must receive it. A line that crossed shards rode the fabric.
-    const rounds = 4;
-    for (0..rounds) |r| {
-        const sender = r % n_clients;
-        for (0..n_clients) |i| clients[i].reset();
-        var line_buf: [48]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
-        try writeAllFd(fds[sender], line);
-
-        var exp_buf: [40]u8 = undefined;
-        const expected = std.fmt.bufPrint(&exp_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
-        for (0..n_clients) |i| {
-            if (i == sender) continue;
-            // Whether U{i} shares the sender's reactor or not, the message must
-            // arrive — proving local AND cross-shard delivery in one assertion.
-            try recvUntil(&clients[i], expected, 400);
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            // Clear the flag AND wake every reactor's wake eventfd. A SO_REUSEPORT
+            // throwaway connection only nudges whichever reactor the kernel routes it
+            // to; the other worker would stay blocked in submitAndWait forever and
+            // pool.join() would hang. wakeAllReactors makes every blocked loop return,
+            // observe run==false, and exit so the join (and this thread) completes.
+            server.requestStop(&run);
+            thr.join();
         }
-    }
+
+        // Connect a handful of clients; with round-robin kernel placement across two
+        // reactors this all-but-guarantees the channel spans both shards.
+        const n_clients = 6;
+        var fds: [n_clients]linux.fd_t = undefined;
+        var clients: [n_clients]LiveClient = undefined;
+        var connected: usize = 0;
+        defer for (fds[0..connected]) |fd| closeFd(fd);
+        for (0..n_clients) |i| {
+            fds[i] = connectLoopback(port) catch |err| switch (err) {
+                error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+                else => return err,
+            };
+            connected += 1;
+            clients[i] = LiveClient{ .fd = fds[i] };
+        }
+
+        // Register each client with a distinct nick and join the shared channel.
+        var nick_buf: [n_clients][8]u8 = undefined;
+        for (0..n_clients) |i| {
+            const nick = std.fmt.bufPrint(&nick_buf[i], "U{d}", .{i}) catch unreachable;
+            var reg_buf: [64]u8 = undefined;
+            const reg = std.fmt.bufPrint(&reg_buf, "NICK {s}\r\nUSER u{d} 0 * :User {d}\r\n", .{ nick, i, i }) catch unreachable;
+            try writeAllFd(fds[i], reg);
+        }
+        for (0..n_clients) |i| {
+            var need: [12]u8 = undefined;
+            const needle = std.fmt.bufPrint(&need, " 001 U{d} ", .{i}) catch unreachable;
+            try recvUntil(&clients[i], needle, 400);
+        }
+        for (0..n_clients) |i| {
+            try writeAllFd(fds[i], "JOIN #shard\r\n");
+            var need: [20]u8 = undefined;
+            const needle = std.fmt.bufPrint(&need, " 366 U{d} #shard ", .{i}) catch unreachable;
+            try recvUntil(&clients[i], needle, 400);
+        }
+
+        // Several rounds: each round a different sender messages the channel; every
+        // OTHER client must receive it. A line that crossed shards rode the fabric.
+        const rounds = 4;
+        for (0..rounds) |r| {
+            const sender = r % n_clients;
+            for (0..n_clients) |i| clients[i].reset();
+            var line_buf: [48]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
+            try writeAllFd(fds[sender], line);
+
+            var exp_buf: [40]u8 = undefined;
+            const expected = std.fmt.bufPrint(&exp_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
+            for (0..n_clients) |i| {
+                if (i == sender) continue;
+                // Whether U{i} shares the sender's reactor or not, the message must
+                // arrive — proving local AND cross-shard delivery in one assertion.
+                try recvUntil(&clients[i], expected, 400);
+            }
+        }
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shards=2" {
-    // Exercises the multi-reactor oper-event path: several SASL-admin opers (all
-    // auto-subscribed on elevation), one broadcasts, and EVERY oper must receive
-    // it. publishOperEvent delivers locally AND fans the event to other shards'
-    // inboxes; each reactor delivers to its own subscribers on its own thread.
-    // NOTE: this sandbox's SO_REUSEPORT routes all loopback accepts to one shard,
-    // so the cross-shard RECEIVE side is mechanism-verified by instrumentation
-    // rather than guaranteed exercised here; what this test does guarantee is that
-    // the fan-out code path runs without breaking local delivery, and that an oper
-    // reliably receives its own and a sibling's announce under sharding.
-    var cfg = operTestConfig(0);
-    cfg.num_shards = 2;
-    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    if (server.reactors.len < 2) return error.SkipZigTest;
-    const port = try server.boundPort();
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        server.requestStop(&run);
-        thr.join();
-    }
-
-    const n_opers = 4;
-    var fds: [n_opers]linux.fd_t = undefined;
-    var clients: [n_opers]LiveClient = undefined;
-    var connected: usize = 0;
-    defer for (fds[0..connected]) |fd| closeFd(fd);
-    for (0..n_opers) |i| {
-        fds[i] = connectLoopback(port) catch |err| switch (err) {
-            error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+    if (comptime builtin.os.tag == .linux) {
+        // Exercises the multi-reactor oper-event path: several SASL-admin opers (all
+        // auto-subscribed on elevation), one broadcasts, and EVERY oper must receive
+        // it. publishOperEvent delivers locally AND fans the event to other shards'
+        // inboxes; each reactor delivers to its own subscribers on its own thread.
+        // NOTE: this sandbox's SO_REUSEPORT routes all loopback accepts to one shard,
+        // so the cross-shard RECEIVE side is mechanism-verified by instrumentation
+        // rather than guaranteed exercised here; what this test does guarantee is that
+        // the fan-out code path runs without breaking local delivery, and that an oper
+        // reliably receives its own and a sibling's announce under sharding.
+        var cfg = operTestConfig(0);
+        cfg.num_shards = 2;
+        var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
         };
-        connected += 1;
-        clients[i] = LiveClient{ .fd = fds[i] };
-        try saslAdminPrelude(fds[i]);
-        var reg_buf: [48]u8 = undefined;
-        const reg = try std.fmt.bufPrint(&reg_buf, "NICK O{d}\r\nUSER u{d} 0 * :O{d}\r\n", .{ i, i, i });
-        try writeAllFd(fds[i], reg);
-    }
-    for (0..n_opers) |i| {
-        var need_buf: [16]u8 = undefined;
-        const need = try std.fmt.bufPrint(&need_buf, " 381 O{d} ", .{i});
-        try recvUntil(&clients[i], need, 400);
-    }
+        defer server.deinit();
+        if (server.reactors.len < 2) return error.SkipZigTest;
+        const port = try server.boundPort();
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            server.requestStop(&run);
+            thr.join();
+        }
 
-    // O0 opts into IRCX (EVENT is IRCX-gated) and broadcasts.
-    try writeAllFd(fds[0], "IRCX\r\n");
-    try recvUntil(&clients[0], " 800 O0 ", 300);
-    for (0..n_opers) |i| clients[i].reset();
-    try writeAllFd(fds[0], "EVENT BROADCAST :crossshard\r\n");
+        const n_opers = 4;
+        var fds: [n_opers]linux.fd_t = undefined;
+        var clients: [n_opers]LiveClient = undefined;
+        var connected: usize = 0;
+        defer for (fds[0..connected]) |fd| closeFd(fd);
+        for (0..n_opers) |i| {
+            fds[i] = connectLoopback(port) catch |err| switch (err) {
+                error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+                else => return err,
+            };
+            connected += 1;
+            clients[i] = LiveClient{ .fd = fds[i] };
+            try saslAdminPrelude(fds[i]);
+            var reg_buf: [48]u8 = undefined;
+            const reg = try std.fmt.bufPrint(&reg_buf, "NICK O{d}\r\nUSER u{d} 0 * :O{d}\r\n", .{ i, i, i });
+            try writeAllFd(fds[i], reg);
+        }
+        for (0..n_opers) |i| {
+            var need_buf: [16]u8 = undefined;
+            const need = try std.fmt.bufPrint(&need_buf, " 381 O{d} ", .{i});
+            try recvUntil(&clients[i], need, 400);
+        }
 
-    // Every oper receives the announce. The chatsvc line is
-    // `:<srv> EVENT <oper-nick> <sender-mask>: <message>`, so match the raw EVENT
-    // wrapper and the message text separately (the target + mask sit between them).
-    for (0..n_opers) |i| {
-        try recvUntil(&clients[i], " EVENT ", 500);
-        try recvUntil(&clients[i], "crossshard", 500);
-    }
+        // O0 opts into IRCX (EVENT is IRCX-gated) and broadcasts.
+        try writeAllFd(fds[0], "IRCX\r\n");
+        try recvUntil(&clients[0], " 800 O0 ", 300);
+        for (0..n_opers) |i| clients[i].reset();
+        try writeAllFd(fds[0], "EVENT BROADCAST :crossshard\r\n");
+
+        // Every oper receives the announce. The chatsvc line is
+        // `:<srv> EVENT <oper-nick> <sender-mask>: <message>`, so match the raw EVENT
+        // wrapper and the message text separately (the target + mask sit between them).
+        for (0..n_opers) |i| {
+            try recvUntil(&clients[i], " EVENT ", 500);
+            try recvUntil(&clients[i], "crossshard", 500);
+        }
+    } else return error.SkipZigTest;
 }
 
 test "event routing: IRCX type subscriptions are token-routed with no category cross-talk" {
@@ -33248,644 +33340,658 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
 }
 
 test "threaded server: external wakeReactor drives the running reactor loop" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    if (server.rx().wake == null) return error.SkipZigTest; // eventfd unavailable
-    const plain_port = try server.boundPort();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        if (server.rx().wake == null) return error.SkipZigTest; // eventfd unavailable
+        const plain_port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    // From this (foreign) thread, wake the reactor; the in-flight wake poll
-    // completes, the loop runs, and onWakePoll bumps the counter.
-    server.wakeReactor();
-    var spins: usize = 0;
-    while (server.rx().wake_count.load(.monotonic) == 0) : (spins += 1) {
-        if (spins > 5_000_000) return error.TestUnexpectedResult;
-        std.Thread.yield() catch {};
-    }
-    try std.testing.expect(server.rx().wake_count.load(.monotonic) >= 1);
+        // From this (foreign) thread, wake the reactor; the in-flight wake poll
+        // completes, the loop runs, and onWakePoll bumps the counter.
+        server.wakeReactor();
+        var spins: usize = 0;
+        while (server.rx().wake_count.load(.monotonic) == 0) : (spins += 1) {
+            if (spins > 5_000_000) return error.TestUnexpectedResult;
+            std.Thread.yield() catch {};
+        }
+        try std.testing.expect(server.rx().wake_count.load(.monotonic) >= 1);
+    } else return error.SkipZigTest;
 }
 
 test "ring: poll op fires a completion when a watched eventfd becomes readable" {
-    var ring = RingCore.init(8, .{}) catch |err| {
-        if (ringlane.isUnsupportedInitError(err)) return error.SkipZigTest;
-        return err;
-    };
-    defer ring.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var ring = RingCore.init(8, .{}) catch |err| {
+            if (ringlane.isUnsupportedInitError(err)) return error.SkipZigTest;
+            return err;
+        };
+        defer ring.deinit();
 
-    const efd_rc = linux.eventfd(0, 0);
-    if (posix.errno(efd_rc) != .SUCCESS) return error.SkipZigTest;
-    const efd: linux.fd_t = @intCast(efd_rc);
-    defer closeFd(efd);
+        const efd_rc = linux.eventfd(0, 0);
+        if (posix.errno(efd_rc) != .SUCCESS) return error.SkipZigTest;
+        const efd: linux.fd_t = @intCast(efd_rc);
+        defer closeFd(efd);
 
-    const tok = RingFdToken{ .slot = 7, .gen = 3 };
-    try ring.submitPollAdd(tok, efd, linux.POLL.IN);
+        const tok = RingFdToken{ .slot = 7, .gen = 3 };
+        try ring.submitPollAdd(tok, efd, linux.POLL.IN);
 
-    // Make the eventfd readable, then reap: the poll completion must fire.
-    var one: u64 = 1;
-    _ = linux.write(efd, std.mem.asBytes(&one), @sizeOf(u64));
+        // Make the eventfd readable, then reap: the poll completion must fire.
+        var one: u64 = 1;
+        _ = linux.write(efd, std.mem.asBytes(&one), @sizeOf(u64));
 
-    const Sink = struct {
-        got: bool = false,
-        slot: u32 = 0,
-        res: i32 = 0,
-        fn onCompletion(self: *@This(), c: ringlane.Completion) void {
-            switch (c) {
-                .poll => |e| {
-                    self.got = true;
-                    self.slot = e.token.slot;
-                    self.res = e.res;
-                },
-                else => {},
+        const Sink = struct {
+            got: bool = false,
+            slot: u32 = 0,
+            res: i32 = 0,
+            fn onCompletion(self: *@This(), c: ringlane.Completion) void {
+                switch (c) {
+                    .poll => |e| {
+                        self.got = true;
+                        self.slot = e.token.slot;
+                        self.res = e.res;
+                    },
+                    else => {},
+                }
             }
-        }
-    };
-    var sink = Sink{};
-    _ = try ring.submitAndWait(1);
-    var cqes: [8]linux.io_uring_cqe = undefined;
-    try ring.reapCompletions(&cqes, 0, &sink);
+        };
+        var sink = Sink{};
+        _ = try ring.submitAndWait(1);
+        var cqes: [8]linux.io_uring_cqe = undefined;
+        try ring.reapCompletions(&cqes, 0, &sink);
 
-    try std.testing.expect(sink.got);
-    try std.testing.expectEqual(@as(u32, 7), sink.slot);
-    try std.testing.expect(sink.res >= 0); // poll res carries the ready mask
+        try std.testing.expect(sink.got);
+        try std.testing.expectEqual(@as(u32, 7), sink.slot);
+        try std.testing.expect(sink.res >= 0); // poll res carries the ready mask
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: implicit-TLS client handshakes + registers over the wire" {
-    const Ed25519 = std.crypto.sign.Ed25519;
-    const tls_client = @import("../crypto/tls_client.zig");
-    const x509_selfsign = @import("../proto/x509_selfsign.zig");
-    const alloc = std.testing.allocator;
+    if (comptime builtin.os.tag == .linux) {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const tls_client = @import("../crypto/tls_client.zig");
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const alloc = std.testing.allocator;
 
-    // Bootstrap a self-signed Ed25519 leaf with a SAN the client will accept.
-    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
-    var cert_buf: [1024]u8 = undefined;
-    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
-        .common_name = "irc.test",
-        .not_before = 1_704_067_200,
-        .not_after = 4_102_444_800,
-        .serial = &.{ 0x51, 0x01 },
-        .key_pair = kp,
-        .dns_names = &.{"irc.test"},
-        .is_ca = true,
-    });
-    const chain = [_][]const u8{der};
+        // Bootstrap a self-signed Ed25519 leaf with a SAN the client will accept.
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
+        var cert_buf: [1024]u8 = undefined;
+        const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x51, 0x01 },
+            .key_pair = kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const chain = [_][]const u8{der};
 
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .tls_port = 0,
-        .tls_cert_chain = &chain,
-        .tls_signing_key = kp,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const tls_port = try server.tlsBoundPort();
-    const plain_port = try server.boundPort();
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = kp,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const tls_port = try server.tlsBoundPort();
+        const plain_port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
-
-    const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
-
-    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
-    defer client.deinit();
-
-    // TLS 1.3 handshake driven over the live socket.
-    const ch = try client.start();
-    defer alloc.free(ch);
-    try writeAllFd(fd, ch);
-    var rbuf: [4096]u8 = undefined;
-    var guard: usize = 0;
-    while (!client.handshakeDone()) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        switch (try client.feed(rbuf[0..n])) {
-            .bytes_to_send => |b| {
-                defer alloc.free(b);
-                try writeAllFd(fd, b);
-            },
-            .need_more => {},
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
         }
-    }
 
-    try std.testing.expect(client.handshakeDone());
+        const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
 
-    // Registration over the encrypted channel: send NICK/USER, then read the
-    // welcome burst back, framing + decrypting TLS records until RPL_WELCOME.
-    const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\n");
-    defer alloc.free(reg);
-    try writeAllFd(fd, reg);
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+        defer client.deinit();
 
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(alloc);
-    var cipher: std.ArrayList(u8) = .empty;
-    defer cipher.deinit(alloc);
-    guard = 0;
-    while (std.mem.indexOf(u8, plain.items, " 001 T ") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try cipher.appendSlice(alloc, rbuf[0..n]);
-        // Drain every complete TLS record (5-byte header + big-endian length).
-        while (cipher.items.len >= 5) {
-            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
-            const wire_len = 5 + @as(usize, body_len);
-            if (cipher.items.len < wire_len) break;
-            switch (try client.decryptApp(cipher.items[0..wire_len])) {
-                .application_data => |pt| {
-                    defer alloc.free(pt);
-                    try plain.appendSlice(alloc, pt);
+        // TLS 1.3 handshake driven over the live socket.
+        const ch = try client.start();
+        defer alloc.free(ch);
+        try writeAllFd(fd, ch);
+        var rbuf: [4096]u8 = undefined;
+        var guard: usize = 0;
+        while (!client.handshakeDone()) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            switch (try client.feed(rbuf[0..n])) {
+                .bytes_to_send => |b| {
+                    defer alloc.free(b);
+                    try writeAllFd(fd, b);
                 },
-                .control => {},
+                .need_more => {},
             }
-            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
-            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
         }
-    }
-    try expectContains(plain.items, " 001 T ");
+
+        try std.testing.expect(client.handshakeDone());
+
+        // Registration over the encrypted channel: send NICK/USER, then read the
+        // welcome burst back, framing + decrypting TLS records until RPL_WELCOME.
+        const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\n");
+        defer alloc.free(reg);
+        try writeAllFd(fd, reg);
+
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        var cipher: std.ArrayList(u8) = .empty;
+        defer cipher.deinit(alloc);
+        guard = 0;
+        while (std.mem.indexOf(u8, plain.items, " 001 T ") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(alloc, rbuf[0..n]);
+            // Drain every complete TLS record (5-byte header + big-endian length).
+            while (cipher.items.len >= 5) {
+                const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+                const wire_len = 5 + @as(usize, body_len);
+                if (cipher.items.len < wire_len) break;
+                switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                    .application_data => |pt| {
+                        defer alloc.free(pt);
+                        try plain.appendSlice(alloc, pt);
+                    },
+                    .control => {},
+                }
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+            }
+        }
+        try expectContains(plain.items, " 001 T ");
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 276)" {
-    const Ed25519 = std.crypto.sign.Ed25519;
-    const tls_client = @import("../crypto/tls_client.zig");
-    const sign = @import("../crypto/sign.zig");
-    const x509_selfsign = @import("../proto/x509_selfsign.zig");
-    const proto_certfp = @import("../proto/certfp.zig");
-    const alloc = std.testing.allocator;
+    if (comptime builtin.os.tag == .linux) {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const tls_client = @import("../crypto/tls_client.zig");
+        const sign = @import("../crypto/sign.zig");
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const proto_certfp = @import("../proto/certfp.zig");
+        const alloc = std.testing.allocator;
 
-    const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
-    const client_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x62));
-    const client_kp = try Ed25519.KeyPair.generateDeterministic(client_seed);
-    const client_sign = try sign.KeyPair.fromSeed(client_seed);
+        const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
+        const client_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x62));
+        const client_kp = try Ed25519.KeyPair.generateDeterministic(client_seed);
+        const client_sign = try sign.KeyPair.fromSeed(client_seed);
 
-    var server_cert_buf: [1024]u8 = undefined;
-    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
-        .common_name = "irc.test",
-        .not_before = 1_704_067_200,
-        .not_after = 4_102_444_800,
-        .serial = &.{ 0x61, 0x01 },
-        .key_pair = server_kp,
-        .dns_names = &.{"irc.test"},
-        .is_ca = true,
-    });
-    var client_cert_buf: [1024]u8 = undefined;
-    const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
-        .common_name = "client.test",
-        .not_before = 1_704_067_200,
-        .not_after = 4_102_444_800,
-        .serial = &.{ 0x62, 0x01 },
-        .key_pair = client_kp,
-    });
-    var expected_fp: proto_certfp.Fingerprint = undefined;
-    proto_certfp.computeHex(client_der, &expected_fp);
+        var server_cert_buf: [1024]u8 = undefined;
+        const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x61, 0x01 },
+            .key_pair = server_kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        var client_cert_buf: [1024]u8 = undefined;
+        const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
+            .common_name = "client.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x62, 0x01 },
+            .key_pair = client_kp,
+        });
+        var expected_fp: proto_certfp.Fingerprint = undefined;
+        proto_certfp.computeHex(client_der, &expected_fp);
 
-    const chain = [_][]const u8{server_der};
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .tls_port = 0,
-        .tls_cert_chain = &chain,
-        .tls_signing_key = server_kp,
-        .tls_request_client_cert = true,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const tls_port = try server.tlsBoundPort();
-    const plain_port = try server.boundPort();
+        const chain = [_][]const u8{server_der};
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = server_kp,
+            .tls_request_client_cert = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const tls_port = try server.tlsBoundPort();
+        const plain_port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
-
-    const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
-
-    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
-    defer client.deinit();
-    client.setClientCertForTest(client_der, client_sign);
-
-    // mTLS handshake over the live socket: the daemon's CertificateRequest must
-    // be well-formed and the client's Certificate/CertificateVerify accepted.
-    const ch = try client.start();
-    defer alloc.free(ch);
-    try writeAllFd(fd, ch);
-    var rbuf: [4096]u8 = undefined;
-    var guard: usize = 0;
-    while (!client.handshakeDone()) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        switch (try client.feed(rbuf[0..n])) {
-            .bytes_to_send => |b| {
-                defer alloc.free(b);
-                try writeAllFd(fd, b);
-            },
-            .need_more => {},
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
         }
-    }
 
-    // Register, then WHOIS self: RPL_WHOISCERTFP (276) must surface the exact
-    // fingerprint SASL EXTERNAL matches (session.tls_certfp).
-    const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\nWHOIS T\r\n");
-    defer alloc.free(reg);
-    try writeAllFd(fd, reg);
+        const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
 
-    var expected_line_buf: [128]u8 = undefined;
-    const expected_line = try std.fmt.bufPrint(
-        &expected_line_buf,
-        " 276 T T :has client certificate fingerprint {s}",
-        .{expected_fp[0..]},
-    );
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+        defer client.deinit();
+        client.setClientCertForTest(client_der, client_sign);
 
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(alloc);
-    var cipher: std.ArrayList(u8) = .empty;
-    defer cipher.deinit(alloc);
-    guard = 0;
-    while (std.mem.indexOf(u8, plain.items, expected_line) == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try cipher.appendSlice(alloc, rbuf[0..n]);
-        while (cipher.items.len >= 5) {
-            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
-            const wire_len = 5 + @as(usize, body_len);
-            if (cipher.items.len < wire_len) break;
-            switch (try client.decryptApp(cipher.items[0..wire_len])) {
-                .application_data => |pt| {
-                    defer alloc.free(pt);
-                    try plain.appendSlice(alloc, pt);
+        // mTLS handshake over the live socket: the daemon's CertificateRequest must
+        // be well-formed and the client's Certificate/CertificateVerify accepted.
+        const ch = try client.start();
+        defer alloc.free(ch);
+        try writeAllFd(fd, ch);
+        var rbuf: [4096]u8 = undefined;
+        var guard: usize = 0;
+        while (!client.handshakeDone()) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            switch (try client.feed(rbuf[0..n])) {
+                .bytes_to_send => |b| {
+                    defer alloc.free(b);
+                    try writeAllFd(fd, b);
                 },
-                .control => {},
+                .need_more => {},
             }
-            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
-            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
         }
-    }
-    try expectContains(plain.items, expected_line);
+
+        // Register, then WHOIS self: RPL_WHOISCERTFP (276) must surface the exact
+        // fingerprint SASL EXTERNAL matches (session.tls_certfp).
+        const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\nWHOIS T\r\n");
+        defer alloc.free(reg);
+        try writeAllFd(fd, reg);
+
+        var expected_line_buf: [128]u8 = undefined;
+        const expected_line = try std.fmt.bufPrint(
+            &expected_line_buf,
+            " 276 T T :has client certificate fingerprint {s}",
+            .{expected_fp[0..]},
+        );
+
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        var cipher: std.ArrayList(u8) = .empty;
+        defer cipher.deinit(alloc);
+        guard = 0;
+        while (std.mem.indexOf(u8, plain.items, expected_line) == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(alloc, rbuf[0..n]);
+            while (cipher.items.len >= 5) {
+                const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+                const wire_len = 5 + @as(usize, body_len);
+                if (cipher.items.len < wire_len) break;
+                switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                    .application_data => |pt| {
+                        defer alloc.free(pt);
+                        try plain.appendSlice(alloc, pt);
+                    },
+                    .control => {},
+                }
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+            }
+        }
+        try expectContains(plain.items, expected_line);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: ws upgrade + framed registration (plain testing mode)" {
-    const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .ws_enabled = true,
-        .ws_port = 0,
-        .ws_allow_plain = true,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const ws_port = try server.wsBoundPort();
-    const plain_port = try server.boundPort();
-
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
-
-    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
-
-    // HTTP/1.1 Upgrade with the canonical RFC 6455 sample key, so the expected
-    // Sec-WebSocket-Accept value is the well-known constant.
-    try writeAllFd(fd, "GET /irc HTTP/1.1\r\n" ++
-        "Host: irc.test:8080\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n");
-
-    var rbuf: [4096]u8 = undefined;
-    var head: std.ArrayList(u8) = .empty;
-    defer head.deinit(alloc);
-    var guard: usize = 0;
-    while (std.mem.indexOf(u8, head.items, "\r\n\r\n") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try head.appendSlice(alloc, rbuf[0..n]);
-    }
-    try expectContains(head.items, "HTTP/1.1 101 Switching Protocols");
-    try expectContains(head.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-
-    // Registration framed one-message-per-frame WITHOUT a trailing CRLF (the
-    // IRCv3 WebSocket convention; the server synthesizes the terminator) and
-    // masked, as clients MUST mask.
-    var fbuf: [256]u8 = undefined;
-    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 1, 2, 3, 4 } }, "NICK WS", &fbuf));
-    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 5, 6, 7, 8 } }, "USER w 0 * :Web Tester", &fbuf));
-
-    // The welcome burst must come back FRAMED: unmasked server text frames
-    // whose concatenated payloads contain the 001.
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(alloc);
-    try wire.appendSlice(alloc, head.items[std.mem.indexOf(u8, head.items, "\r\n\r\n").? + 4 ..]);
-    var lines: std.ArrayList(u8) = .empty;
-    defer lines.deinit(alloc);
-    guard = 0;
-    outer: while (true) : (guard += 1) {
-        if (guard > 256) return error.TestUnexpectedResult;
-        while (true) {
-            const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
-                error.Truncated => break,
-                else => return err,
-            };
-            try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
-            try std.testing.expect(!res.frame.masked); // servers MUST NOT mask
-            try lines.appendSlice(alloc, res.frame.payload);
-            try lines.append(alloc, '\n');
-            std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
-            wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
-            if (std.mem.indexOf(u8, lines.items, " 001 WS ") != null) break :outer;
-        }
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try wire.appendSlice(alloc, rbuf[0..n]);
-    }
-    try expectContains(lines.items, " 001 WS ");
-
-    // Control plane: a masked client ping is answered with an unmasked pong
-    // echoing the payload (RFC 6455 §5.5.2/§5.5.3).
-    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .ping, .mask_key = .{ 9, 9, 9, 9 } }, "hb", &fbuf));
-    guard = 0;
-    while (true) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
-            error.Truncated => {
-                const n = try readFd(fd, &rbuf);
-                if (n == 0) return error.TestUnexpectedResult;
-                try wire.appendSlice(alloc, rbuf[0..n]);
-                continue;
-            },
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .ws_enabled = true,
+            .ws_port = 0,
+            .ws_allow_plain = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
-        const got_pong = res.frame.opcode == .pong;
-        if (got_pong) try std.testing.expectEqualStrings("hb", res.frame.payload);
-        std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
-        wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
-        if (got_pong) break;
-    }
+        defer server.deinit();
+        const ws_port = try server.wsBoundPort();
+        const plain_port = try server.boundPort();
+
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
+
+        const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
+
+        // HTTP/1.1 Upgrade with the canonical RFC 6455 sample key, so the expected
+        // Sec-WebSocket-Accept value is the well-known constant.
+        try writeAllFd(fd, "GET /irc HTTP/1.1\r\n" ++
+            "Host: irc.test:8080\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+
+        var rbuf: [4096]u8 = undefined;
+        var head: std.ArrayList(u8) = .empty;
+        defer head.deinit(alloc);
+        var guard: usize = 0;
+        while (std.mem.indexOf(u8, head.items, "\r\n\r\n") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try head.appendSlice(alloc, rbuf[0..n]);
+        }
+        try expectContains(head.items, "HTTP/1.1 101 Switching Protocols");
+        try expectContains(head.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+        // Registration framed one-message-per-frame WITHOUT a trailing CRLF (the
+        // IRCv3 WebSocket convention; the server synthesizes the terminator) and
+        // masked, as clients MUST mask.
+        var fbuf: [256]u8 = undefined;
+        try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 1, 2, 3, 4 } }, "NICK WS", &fbuf));
+        try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 5, 6, 7, 8 } }, "USER w 0 * :Web Tester", &fbuf));
+
+        // The welcome burst must come back FRAMED: unmasked server text frames
+        // whose concatenated payloads contain the 001.
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(alloc);
+        try wire.appendSlice(alloc, head.items[std.mem.indexOf(u8, head.items, "\r\n\r\n").? + 4 ..]);
+        var lines: std.ArrayList(u8) = .empty;
+        defer lines.deinit(alloc);
+        guard = 0;
+        outer: while (true) : (guard += 1) {
+            if (guard > 256) return error.TestUnexpectedResult;
+            while (true) {
+                const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+                    error.Truncated => break,
+                    else => return err,
+                };
+                try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
+                try std.testing.expect(!res.frame.masked); // servers MUST NOT mask
+                try lines.appendSlice(alloc, res.frame.payload);
+                try lines.append(alloc, '\n');
+                std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+                wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+                if (std.mem.indexOf(u8, lines.items, " 001 WS ") != null) break :outer;
+            }
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try wire.appendSlice(alloc, rbuf[0..n]);
+        }
+        try expectContains(lines.items, " 001 WS ");
+
+        // Control plane: a masked client ping is answered with an unmasked pong
+        // echoing the payload (RFC 6455 §5.5.2/§5.5.3).
+        try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .ping, .mask_key = .{ 9, 9, 9, 9 } }, "hb", &fbuf));
+        guard = 0;
+        while (true) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+                error.Truncated => {
+                    const n = try readFd(fd, &rbuf);
+                    if (n == 0) return error.TestUnexpectedResult;
+                    try wire.appendSlice(alloc, rbuf[0..n]);
+                    continue;
+                },
+                else => return err,
+            };
+            const got_pong = res.frame.opcode == .pong;
+            if (got_pong) try std.testing.expectEqualStrings("hb", res.frame.payload);
+            std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+            wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+            if (got_pong) break;
+        }
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" {
-    const Ed25519 = std.crypto.sign.Ed25519;
-    const tls_client = @import("../crypto/tls_client.zig");
-    const x509_selfsign = @import("../proto/x509_selfsign.zig");
-    const alloc = std.testing.allocator;
+    if (comptime builtin.os.tag == .linux) {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const tls_client = @import("../crypto/tls_client.zig");
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const alloc = std.testing.allocator;
 
-    // Self-signed Ed25519 leaf, exactly like the implicit-TLS listener test:
-    // the wss listener must serve the SAME certificate material.
-    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x52)));
-    var cert_buf: [1024]u8 = undefined;
-    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
-        .common_name = "irc.test",
-        .not_before = 1_704_067_200,
-        .not_after = 4_102_444_800,
-        .serial = &.{ 0x52, 0x01 },
-        .key_pair = kp,
-        .dns_names = &.{"irc.test"},
-        .is_ca = true,
-    });
-    const chain = [_][]const u8{der};
+        // Self-signed Ed25519 leaf, exactly like the implicit-TLS listener test:
+        // the wss listener must serve the SAME certificate material.
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x52)));
+        var cert_buf: [1024]u8 = undefined;
+        const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x52, 0x01 },
+            .key_pair = kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const chain = [_][]const u8{der};
 
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .tls_port = 0,
-        .tls_cert_chain = &chain,
-        .tls_signing_key = kp,
-        .ws_enabled = true,
-        .ws_port = 0,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const ws_port = try server.wsBoundPort();
-    const plain_port = try server.boundPort();
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = kp,
+            .ws_enabled = true,
+            .ws_port = 0,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const ws_port = try server.wsBoundPort();
+        const plain_port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
-
-    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
-
-    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
-    defer client.deinit();
-
-    // TLS 1.3 handshake on the ws port — the same engine as the TLS listener.
-    const ch = try client.start();
-    defer alloc.free(ch);
-    try writeAllFd(fd, ch);
-    var rbuf: [4096]u8 = undefined;
-    var guard: usize = 0;
-    while (!client.handshakeDone()) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        switch (try client.feed(rbuf[0..n])) {
-            .bytes_to_send => |b| {
-                defer alloc.free(b);
-                try writeAllFd(fd, b);
-            },
-            .need_more => {},
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
         }
-    }
 
-    // HTTP/1.1 WebSocket upgrade THROUGH the encrypted channel (genuine wss).
-    const upgrade = try client.encrypt("GET /irc HTTP/1.1\r\n" ++
-        "Host: irc.test:8080\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n");
-    defer alloc.free(upgrade);
-    try writeAllFd(fd, upgrade);
+        const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
 
-    // Read + decrypt records until the 101 head completes.
-    var plain: std.ArrayList(u8) = .empty;
-    defer plain.deinit(alloc);
-    var cipher: std.ArrayList(u8) = .empty;
-    defer cipher.deinit(alloc);
-    guard = 0;
-    while (std.mem.indexOf(u8, plain.items, "\r\n\r\n") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try cipher.appendSlice(alloc, rbuf[0..n]);
-        // Drain every complete TLS record (5-byte header + big-endian length).
-        while (cipher.items.len >= 5) {
-            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
-            const wire_len = 5 + @as(usize, body_len);
-            if (cipher.items.len < wire_len) break;
-            switch (try client.decryptApp(cipher.items[0..wire_len])) {
-                .application_data => |pt| {
-                    defer alloc.free(pt);
-                    try plain.appendSlice(alloc, pt);
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+        defer client.deinit();
+
+        // TLS 1.3 handshake on the ws port — the same engine as the TLS listener.
+        const ch = try client.start();
+        defer alloc.free(ch);
+        try writeAllFd(fd, ch);
+        var rbuf: [4096]u8 = undefined;
+        var guard: usize = 0;
+        while (!client.handshakeDone()) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            switch (try client.feed(rbuf[0..n])) {
+                .bytes_to_send => |b| {
+                    defer alloc.free(b);
+                    try writeAllFd(fd, b);
                 },
-                .control => {},
+                .need_more => {},
             }
-            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
-            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
         }
-    }
-    try expectContains(plain.items, "HTTP/1.1 101 Switching Protocols");
-    try expectContains(plain.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 
-    // Registration as a masked client text frame carrying CRLF-framed lines
-    // (the other inbound style; the plain-ws test covers frame-per-message).
-    var fbuf: [256]u8 = undefined;
-    const reg_frame = try websocket.encodeFrame(
-        256,
-        .{ .opcode = .text, .mask_key = .{ 0xa, 0xb, 0xc, 0xd } },
-        "NICK WSS\r\nUSER w 0 * :Web Tester\r\n",
-        &fbuf,
-    );
-    const reg = try client.encrypt(reg_frame);
-    defer alloc.free(reg);
-    try writeAllFd(fd, reg);
+        // HTTP/1.1 WebSocket upgrade THROUGH the encrypted channel (genuine wss).
+        const upgrade = try client.encrypt("GET /irc HTTP/1.1\r\n" ++
+            "Host: irc.test:8080\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+        defer alloc.free(upgrade);
+        try writeAllFd(fd, upgrade);
 
-    // Decrypt + deframe until the framed 001 arrives.
-    const head_len = std.mem.indexOf(u8, plain.items, "\r\n\r\n").? + 4;
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(alloc);
-    try wire.appendSlice(alloc, plain.items[head_len..]);
-    var lines: std.ArrayList(u8) = .empty;
-    defer lines.deinit(alloc);
-    guard = 0;
-    outer: while (true) : (guard += 1) {
-        if (guard > 256) return error.TestUnexpectedResult;
-        while (true) {
-            const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
-                error.Truncated => break,
-                else => return err,
-            };
-            try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
-            try std.testing.expect(!res.frame.masked);
-            try lines.appendSlice(alloc, res.frame.payload);
-            try lines.append(alloc, '\n');
-            std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
-            wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
-            if (std.mem.indexOf(u8, lines.items, " 001 WSS ") != null) break :outer;
-        }
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try cipher.appendSlice(alloc, rbuf[0..n]);
-        while (cipher.items.len >= 5) {
-            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
-            const wire_len = 5 + @as(usize, body_len);
-            if (cipher.items.len < wire_len) break;
-            switch (try client.decryptApp(cipher.items[0..wire_len])) {
-                .application_data => |pt| {
-                    defer alloc.free(pt);
-                    try wire.appendSlice(alloc, pt);
-                },
-                .control => {},
+        // Read + decrypt records until the 101 head completes.
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        var cipher: std.ArrayList(u8) = .empty;
+        defer cipher.deinit(alloc);
+        guard = 0;
+        while (std.mem.indexOf(u8, plain.items, "\r\n\r\n") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(alloc, rbuf[0..n]);
+            // Drain every complete TLS record (5-byte header + big-endian length).
+            while (cipher.items.len >= 5) {
+                const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+                const wire_len = 5 + @as(usize, body_len);
+                if (cipher.items.len < wire_len) break;
+                switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                    .application_data => |pt| {
+                        defer alloc.free(pt);
+                        try plain.appendSlice(alloc, pt);
+                    },
+                    .control => {},
+                }
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
             }
-            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
-            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
         }
-    }
-    try expectContains(lines.items, " 001 WSS ");
+        try expectContains(plain.items, "HTTP/1.1 101 Switching Protocols");
+        try expectContains(plain.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+        // Registration as a masked client text frame carrying CRLF-framed lines
+        // (the other inbound style; the plain-ws test covers frame-per-message).
+        var fbuf: [256]u8 = undefined;
+        const reg_frame = try websocket.encodeFrame(
+            256,
+            .{ .opcode = .text, .mask_key = .{ 0xa, 0xb, 0xc, 0xd } },
+            "NICK WSS\r\nUSER w 0 * :Web Tester\r\n",
+            &fbuf,
+        );
+        const reg = try client.encrypt(reg_frame);
+        defer alloc.free(reg);
+        try writeAllFd(fd, reg);
+
+        // Decrypt + deframe until the framed 001 arrives.
+        const head_len = std.mem.indexOf(u8, plain.items, "\r\n\r\n").? + 4;
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(alloc);
+        try wire.appendSlice(alloc, plain.items[head_len..]);
+        var lines: std.ArrayList(u8) = .empty;
+        defer lines.deinit(alloc);
+        guard = 0;
+        outer: while (true) : (guard += 1) {
+            if (guard > 256) return error.TestUnexpectedResult;
+            while (true) {
+                const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+                    error.Truncated => break,
+                    else => return err,
+                };
+                try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
+                try std.testing.expect(!res.frame.masked);
+                try lines.appendSlice(alloc, res.frame.payload);
+                try lines.append(alloc, '\n');
+                std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+                wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+                if (std.mem.indexOf(u8, lines.items, " 001 WSS ") != null) break :outer;
+            }
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(alloc, rbuf[0..n]);
+            while (cipher.items.len >= 5) {
+                const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+                const wire_len = 5 + @as(usize, body_len);
+                if (cipher.items.len < wire_len) break;
+                switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                    .application_data => |pt| {
+                        defer alloc.free(pt);
+                        try wire.appendSlice(alloc, pt);
+                    },
+                    .control => {},
+                }
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+            }
+        }
+        try expectContains(lines.items, " 001 WSS ");
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: ws listener rejects a non-upgrade HTTP request" {
-    const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .ws_enabled = true,
-        .ws_port = 0,
-        .ws_allow_plain = true,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const ws_port = try server.wsBoundPort();
-    const plain_port = try server.boundPort();
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .ws_enabled = true,
+            .ws_port = 0,
+            .ws_allow_plain = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const ws_port = try server.wsBoundPort();
+        const plain_port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    // A plain GET without the WebSocket headers gets a clean 426 + close, and
-    // the server keeps running (a fresh client can still register: the
-    // per-connection error firewall held).
-    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
-    try writeAllFd(fd, "GET / HTTP/1.1\r\nHost: irc.test\r\n\r\n");
-    var rbuf: [1024]u8 = undefined;
-    var got: std.ArrayList(u8) = .empty;
-    defer got.deinit(alloc);
-    var guard: usize = 0;
-    while (std.mem.indexOf(u8, got.items, "\r\n\r\n") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd, &rbuf);
-        if (n == 0) break; // server may close right after the refusal
-        try got.appendSlice(alloc, rbuf[0..n]);
-    }
-    try expectContains(got.items, "HTTP/1.1 426 Upgrade Required");
-    try expectContains(got.items, "Upgrade: websocket");
+        // A plain GET without the WebSocket headers gets a clean 426 + close, and
+        // the server keeps running (a fresh client can still register: the
+        // per-connection error firewall held).
+        const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
+        try writeAllFd(fd, "GET / HTTP/1.1\r\nHost: irc.test\r\n\r\n");
+        var rbuf: [1024]u8 = undefined;
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(alloc);
+        var guard: usize = 0;
+        while (std.mem.indexOf(u8, got.items, "\r\n\r\n") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) break; // server may close right after the refusal
+            try got.appendSlice(alloc, rbuf[0..n]);
+        }
+        try expectContains(got.items, "HTTP/1.1 426 Upgrade Required");
+        try expectContains(got.items, "Upgrade: websocket");
 
-    // The reactor survived: a second, well-formed upgrade still works.
-    const fd2 = connectLoopback(ws_port) catch return error.SkipZigTest;
-    defer closeFd(fd2);
-    try writeAllFd(fd2, "GET /irc HTTP/1.1\r\n" ++
-        "Host: irc.test\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n");
-    var head2: std.ArrayList(u8) = .empty;
-    defer head2.deinit(alloc);
-    guard = 0;
-    while (std.mem.indexOf(u8, head2.items, "\r\n\r\n") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(fd2, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try head2.appendSlice(alloc, rbuf[0..n]);
-    }
-    try expectContains(head2.items, "HTTP/1.1 101 Switching Protocols");
+        // The reactor survived: a second, well-formed upgrade still works.
+        const fd2 = connectLoopback(ws_port) catch return error.SkipZigTest;
+        defer closeFd(fd2);
+        try writeAllFd(fd2, "GET /irc HTTP/1.1\r\n" ++
+            "Host: irc.test\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+        var head2: std.ArrayList(u8) = .empty;
+        defer head2.deinit(alloc);
+        guard = 0;
+        while (std.mem.indexOf(u8, head2.items, "\r\n\r\n") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd2, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try head2.appendSlice(alloc, rbuf[0..n]);
+        }
+        try expectContains(head2.items, "HTTP/1.1 101 Switching Protocols");
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
@@ -35137,51 +35243,53 @@ test "threaded server: LISTX filters on real channel SUBJECT from the PROP store
 }
 
 test "threaded server: LISTX emits PICS 813 after channel entries" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const port = try server.boundPort();
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        const port = try server.boundPort();
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_a);
-    var a = LiveClient{ .fd = fd_a };
+        const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        var a = LiveClient{ .fd = fd_a };
 
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
-    try recvUntil(&a, " 001 A ", 200);
-    try writeAllFd(fd_a, "IRCX\r\n");
-    try recvUntil(&a, " 800 A 1 0 ", 200);
-    try writeAllFd(fd_a, "JOIN #alpha\r\n");
-    try recvUntil(&a, " 366 A #alpha ", 200);
-    // Seed PICS AFTER the creating JOIN: channel creation clearChannel-purges any
-    // pre-seeded IRCX state, so seeding before would be wiped before LISTX.
-    _ = try server.props.setProp(
-        try ircx_prop_store.Entity.fromId("#alpha"),
-        "PICS",
-        "rated-safe",
-        .{ .id = "server", .access = .server },
-    );
-    try writeAllFd(fd_a, "JOIN #beta\r\n");
-    try recvUntil(&a, " 366 A #beta ", 200);
+        try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+        try recvUntil(&a, " 001 A ", 200);
+        try writeAllFd(fd_a, "IRCX\r\n");
+        try recvUntil(&a, " 800 A 1 0 ", 200);
+        try writeAllFd(fd_a, "JOIN #alpha\r\n");
+        try recvUntil(&a, " 366 A #alpha ", 200);
+        // Seed PICS AFTER the creating JOIN: channel creation clearChannel-purges any
+        // pre-seeded IRCX state, so seeding before would be wiped before LISTX.
+        _ = try server.props.setProp(
+            try ircx_prop_store.Entity.fromId("#alpha"),
+            "PICS",
+            "rated-safe",
+            .{ .id = "server", .access = .server },
+        );
+        try writeAllFd(fd_a, "JOIN #beta\r\n");
+        try recvUntil(&a, " 366 A #beta ", 200);
 
-    a.reset();
-    try writeAllFd(fd_a, "LISTX\r\n");
-    try recvUntil(&a, " 817 ", 200);
+        a.reset();
+        try writeAllFd(fd_a, "LISTX\r\n");
+        try recvUntil(&a, " 817 ", 200);
 
-    const written = a.written();
-    const entry_index = std.mem.indexOf(u8, written, " 812 A #alpha ") orelse return error.TestExpectedEqual;
-    const pics_index = std.mem.indexOf(u8, written, " 813 A #alpha :rated-safe\r\n") orelse return error.TestExpectedEqual;
-    try std.testing.expect(pics_index > entry_index);
-    try std.testing.expect(std.mem.indexOf(u8, written, " 813 A #beta ") == null);
+        const written = a.written();
+        const entry_index = std.mem.indexOf(u8, written, " 812 A #alpha ") orelse return error.TestExpectedEqual;
+        const pics_index = std.mem.indexOf(u8, written, " 813 A #alpha :rated-safe\r\n") orelse return error.TestExpectedEqual;
+        try std.testing.expect(pics_index > entry_index);
+        try std.testing.expect(std.mem.indexOf(u8, written, " 813 A #beta ") == null);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: PROP set/get gated by channel-op" {
@@ -36304,68 +36412,70 @@ fn installPropGeoTestDatabases(server: *LinuxServer) !void {
 }
 
 test "threaded server: PROP user geo fields are self-or-oper only" {
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    try installPropGeoTestDatabases(&server);
-    const port = try server.boundPort();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        try installPropGeoTestDatabases(&server);
+        const port = try server.boundPort();
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_a);
-    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_b);
-    const fd_oper = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_oper);
-    var a = LiveClient{ .fd = fd_a };
-    var b = LiveClient{ .fd = fd_b };
-    var oper = LiveClient{ .fd = fd_oper };
+        const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_b);
+        const fd_oper = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_oper);
+        var a = LiveClient{ .fd = fd_a };
+        var b = LiveClient{ .fd = fd_b };
+        var oper = LiveClient{ .fd = fd_oper };
 
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
-    try saslAdminPrelude(fd_oper);
-    try writeAllFd(fd_oper, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
-    try recvUntil(&a, " 001 A ", 200);
-    try recvUntil(&b, " 001 B ", 200);
-    try recvUntil(&oper, " 381 Oper ", 200);
+        try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+        try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+        try saslAdminPrelude(fd_oper);
+        try writeAllFd(fd_oper, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+        try recvUntil(&a, " 001 A ", 200);
+        try recvUntil(&b, " 001 B ", 200);
+        try recvUntil(&oper, " 381 Oper ", 200);
 
-    try writeAllFd(fd_a, "IRCX\r\n");
-    try writeAllFd(fd_b, "IRCX\r\n");
-    try writeAllFd(fd_oper, "IRCX\r\n");
-    try recvUntil(&a, " 800 A 1 0 ", 200);
-    try recvUntil(&b, " 800 B 1 0 ", 200);
-    try recvUntil(&oper, " 800 Oper 1 0 ", 200);
+        try writeAllFd(fd_a, "IRCX\r\n");
+        try writeAllFd(fd_b, "IRCX\r\n");
+        try writeAllFd(fd_oper, "IRCX\r\n");
+        try recvUntil(&a, " 800 A 1 0 ", 200);
+        try recvUntil(&b, " 800 B 1 0 ", 200);
+        try recvUntil(&oper, " 800 Oper 1 0 ", 200);
 
-    b.reset();
-    try writeAllFd(fd_b, "PROP A GET CITY,ASN\r\n");
-    try recvUntil(&b, " 819 B A ", 200);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "Testopolis") == null);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "64512") == null);
+        b.reset();
+        try writeAllFd(fd_b, "PROP A GET CITY,ASN\r\n");
+        try recvUntil(&b, " 819 B A ", 200);
+        try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, b.written(), "Testopolis") == null);
+        try std.testing.expect(std.mem.indexOf(u8, b.written(), "64512") == null);
 
-    // Self and oper PASS the gate: they receive the 818 CITY line (a non-oper,
-    // non-self requester gets no 818 at all — asserted above). The value is empty
-    // for a loopback test client whose 127.0.0.1 has no GeoIP record; in production
-    // it carries the resolved city. The access *decision* is what this asserts;
-    // value rendering is covered by the ircx_prop_providers unit tests.
-    a.reset();
-    try writeAllFd(fd_a, "PROP A GET CITY\r\n");
-    try recvUntil(&a, " 818 A A CITY ", 200);
-    try recvUntil(&a, " 819 A A ", 200);
+        // Self and oper PASS the gate: they receive the 818 CITY line (a non-oper,
+        // non-self requester gets no 818 at all — asserted above). The value is empty
+        // for a loopback test client whose 127.0.0.1 has no GeoIP record; in production
+        // it carries the resolved city. The access *decision* is what this asserts;
+        // value rendering is covered by the ircx_prop_providers unit tests.
+        a.reset();
+        try writeAllFd(fd_a, "PROP A GET CITY\r\n");
+        try recvUntil(&a, " 818 A A CITY ", 200);
+        try recvUntil(&a, " 819 A A ", 200);
 
-    oper.reset();
-    try writeAllFd(fd_oper, "PROP A GET CITY\r\n");
-    try recvUntil(&oper, " 818 Oper A CITY ", 200);
-    try recvUntil(&oper, " 819 Oper A ", 200);
+        oper.reset();
+        try writeAllFd(fd_oper, "PROP A GET CITY\r\n");
+        try recvUntil(&oper, " 818 Oper A CITY ", 200);
+        try recvUntil(&oper, " 819 Oper A ", 200);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: HOSTKEY grants op on keyed join (not disclosed at join; op may read it per-tier)" {
@@ -36782,23 +36892,25 @@ test "override user mode letter does not collide with advertised mode catalogs" 
 }
 
 test "migrated override user mode is gated by oper_override privilege" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    var plain = ConnState.init(-1);
-    try plain.session.setNick("Plain");
-    server.applyMigratedUmodes(&plain, "+ij");
-    try std.testing.expect(plain.session.hasUmode(.invisible));
-    try std.testing.expect(!plain.session.hasUmode(.override));
+        var plain = ConnState.init(-1);
+        try plain.session.setNick("Plain");
+        server.applyMigratedUmodes(&plain, "+ij");
+        try std.testing.expect(plain.session.hasUmode(.invisible));
+        try std.testing.expect(!plain.session.hasUmode(.override));
 
-    var privileged = ConnState.init(-1);
-    try privileged.session.setNick("Priv");
-    privileged.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
-    server.applyMigratedUmodes(&privileged, "+j");
-    try std.testing.expect(privileged.session.hasUmode(.override));
+        var privileged = ConnState.init(-1);
+        try privileged.session.setNick("Priv");
+        privileged.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+        server.applyMigratedUmodes(&privileged, "+j");
+        try std.testing.expect(privileged.session.hasUmode(.override));
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: narrowing live GRANT clears armed override" {
@@ -38057,49 +38169,51 @@ test "threaded server: +p private + +h hidden channel flags" {
 }
 
 test "LIST C and T filters use channel creation and topic ages" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const id = try addTestLocalClient(&server, "Lister", null);
-    const conn = server.connFor(id).?;
-    const now_seconds = @divFloor(platform.realtimeMillis(), 1000);
+        const id = try addTestLocalClient(&server, "Lister", null);
+        const conn = server.connFor(id).?;
+        const now_seconds = @divFloor(platform.realtimeMillis(), 1000);
 
-    server.world.clock_unix = now_seconds - 7200;
-    _ = try server.world.join("#old", worldIdFromClient(id));
-    try server.world.setTopic("#old", "old topic", "setter", now_seconds - 5400);
+        server.world.clock_unix = now_seconds - 7200;
+        _ = try server.world.join("#old", worldIdFromClient(id));
+        try server.world.setTopic("#old", "old topic", "setter", now_seconds - 5400);
 
-    server.world.clock_unix = now_seconds - 60;
-    _ = try server.world.join("#new", worldIdFromClient(id));
-    try server.world.setTopic("#new", "new topic", "setter", now_seconds - 30);
+        server.world.clock_unix = now_seconds - 60;
+        _ = try server.world.join("#new", worldIdFromClient(id));
+        try server.world.setTopic("#new", "new topic", "setter", now_seconds - 30);
 
-    var parsed = try irc_line.parseLine("LIST C>3600");
-    try server.handleList(conn, &parsed);
-    try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #old ");
-    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #new ") == null);
+        var parsed = try irc_line.parseLine("LIST C>3600");
+        try server.handleList(conn, &parsed);
+        try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #old ");
+        try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #new ") == null);
 
-    conn.send_len = 0;
-    conn.send_offset = 0;
-    parsed = try irc_line.parseLine("LIST C<120");
-    try server.handleList(conn, &parsed);
-    try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #new ");
-    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #old ") == null);
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        parsed = try irc_line.parseLine("LIST C<120");
+        try server.handleList(conn, &parsed);
+        try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #new ");
+        try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #old ") == null);
 
-    conn.send_len = 0;
-    conn.send_offset = 0;
-    parsed = try irc_line.parseLine("LIST T>3600");
-    try server.handleList(conn, &parsed);
-    try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #old ");
-    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #new ") == null);
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        parsed = try irc_line.parseLine("LIST T>3600");
+        try server.handleList(conn, &parsed);
+        try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #old ");
+        try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #new ") == null);
 
-    conn.send_len = 0;
-    conn.send_offset = 0;
-    parsed = try irc_line.parseLine("LIST T<120");
-    try server.handleList(conn, &parsed);
-    try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #new ");
-    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #old ") == null);
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        parsed = try irc_line.parseLine("LIST T<120");
+        try server.handleList(conn, &parsed);
+        try expectContains(conn.send_buf[0..conn.send_len], " 322 Lister #new ");
+        try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 322 Lister #old ") == null);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: CREATE makes founder channel" {
@@ -39308,293 +39422,301 @@ test "threaded server: MONITOR online fanout flushes beyond fixed sink size" {
 }
 
 test "threaded server: live S2S listener completes a peer handshake" {
-    // Non-default mesh identity exercises the config-driven SID/node id path.
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42, .num_shards = 2 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const s2s_port = server.s2sBoundPort() catch return error.SkipZigTest;
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        server.requestStop(&run);
-        thr.join();
-    }
+    if (comptime builtin.os.tag == .linux) {
+        // Non-default mesh identity exercises the config-driven SID/node id path.
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42, .num_shards = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const s2s_port = server.s2sBoundPort() catch return error.SkipZigTest;
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            server.requestStop(&run);
+            thr.join();
+        }
 
-    // Connect to the S2S port as a remote peer and drive a real S2sLink over the
-    // socket until our side reports the link established.
-    const fd = connectLoopback(s2s_port) catch return error.SkipZigTest;
-    defer closeFd(fd);
+        // Connect to the S2S port as a remote peer and drive a real S2sLink over the
+        // socket until our side reports the link established.
+        const fd = connectLoopback(s2s_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
 
-    const alloc = std.testing.allocator;
-    const peer = try alloc.create(s2s_link.S2sLink);
-    defer alloc.destroy(peer);
-    try peer.init(.{
-        .allocator = alloc,
-        .local_node_id = 2,
-        .remote_node_id = 1,
-        .local_epoch_ms = 2000,
-        .server_name = "peer.test",
-    });
-    defer peer.deinit();
+        const alloc = std.testing.allocator;
+        const peer = try alloc.create(s2s_link.S2sLink);
+        defer alloc.destroy(peer);
+        try peer.init(.{
+            .allocator = alloc,
+            .local_node_id = 2,
+            .remote_node_id = 1,
+            .local_epoch_ms = 2000,
+            .server_name = "peer.test",
+        });
+        defer peer.deinit();
 
-    var now: u64 = 1;
-    // The connecting side opens the handshake.
-    try peer.start(now);
-    if (peer.outbound().len != 0) {
-        try writeAllFd(fd, peer.outbound());
-        peer.clearOutbound();
-    }
-
-    var rx: [4096]u8 = undefined;
-    var polls: usize = 0;
-    while (polls < 200 and !peer.established()) : (polls += 1) {
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
-        if (ready == 0) continue;
-        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
-        const n = try readFd(fd, &rx);
-        if (n == 0) return error.ConnectionReset;
-        now += 1;
-        try peer.feed(rx[0..n], now, 5);
+        var now: u64 = 1;
+        // The connecting side opens the handshake.
+        try peer.start(now);
         if (peer.outbound().len != 0) {
             try writeAllFd(fd, peer.outbound());
             peer.clearOutbound();
         }
-    }
-    try std.testing.expect(peer.established());
-    try std.testing.expect(peer.knownServers() >= 2);
 
-    // A local client's LINKS now reflects the established S2S peer by its name.
-    const fd_c = connectLoopback(server.boundPort() catch 0) catch return error.SkipZigTest;
-    defer closeFd(fd_c);
-    var c = LiveClient{ .fd = fd_c };
-    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
-    try recvUntil(&c, " 001 C ", 200);
-    c.reset();
-    try writeAllFd(fd_c, "LINKS\r\n");
-    try recvUntil(&c, " 365 ", 200);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "peer.test") != null);
+        var rx: [4096]u8 = undefined;
+        var polls: usize = 0;
+        while (polls < 200 and !peer.established()) : (polls += 1) {
+            var fds = [_]posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+            if (ready == 0) continue;
+            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            const n = try readFd(fd, &rx);
+            if (n == 0) return error.ConnectionReset;
+            now += 1;
+            try peer.feed(rx[0..n], now, 5);
+            if (peer.outbound().len != 0) {
+                try writeAllFd(fd, peer.outbound());
+                peer.clearOutbound();
+            }
+        }
+        try std.testing.expect(peer.established());
+        try std.testing.expect(peer.knownServers() >= 2);
+
+        // A local client's LINKS now reflects the established S2S peer by its name.
+        const fd_c = connectLoopback(server.boundPort() catch 0) catch return error.SkipZigTest;
+        defer closeFd(fd_c);
+        var c = LiveClient{ .fd = fd_c };
+        try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+        try recvUntil(&c, " 001 C ", 200);
+        c.reset();
+        try writeAllFd(fd_c, "LINKS\r\n");
+        try recvUntil(&c, " 365 ", 200);
+        try std.testing.expect(std.mem.indexOf(u8, c.written(), "peer.test") != null);
+    } else return error.SkipZigTest;
 }
 
 test "squit lookup finds secured peer entries" {
-    const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const inner = try alloc.create(s2s_link.S2sLink);
-    try inner.init(.{
-        .allocator = alloc,
-        .local_node_id = 1,
-        .remote_node_id = 2,
-        .local_epoch_ms = 1000,
-        .server_name = "local.test",
-    });
-    inner.peer.remote_name = try alloc.dupe(u8, "secured.test");
+        const inner = try alloc.create(s2s_link.S2sLink);
+        try inner.init(.{
+            .allocator = alloc,
+            .local_node_id = 1,
+            .remote_node_id = 2,
+            .local_epoch_ms = 1000,
+            .server_name = "local.test",
+        });
+        inner.peer.remote_name = try alloc.dupe(u8, "secured.test");
 
-    const secured = try alloc.create(secured_s2s_link.SecuredLink);
-    secured.* = undefined;
-    secured.allocator = alloc;
-    secured.session = null;
-    secured.inner = inner;
-    secured.inbuf = .empty;
-    secured.out = .empty;
-    secured.rec_inbuf = .empty;
+        const secured = try alloc.create(secured_s2s_link.SecuredLink);
+        secured.* = undefined;
+        secured.allocator = alloc;
+        secured.session = null;
+        secured.inner = inner;
+        secured.inbuf = .empty;
+        secured.out = .empty;
+        secured.rec_inbuf = .empty;
 
-    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
-    const peer = server.rx().clients.get(peer_id).?;
-    peer.token = try tokenFromId(peer_id);
-    peer.s2s_secured = secured;
+        const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const peer = server.rx().clients.get(peer_id).?;
+        peer.token = try tokenFromId(peer_id);
+        peer.s2s_secured = secured;
 
-    const found = server.findSquitVictim("SECURED.TEST") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(peer_id.shard, found.id.shard);
-    try std.testing.expectEqual(peer.token.slot, found.token.slot);
-    try std.testing.expectEqual(peer.token.gen, found.token.gen);
+        const found = server.findSquitVictim("SECURED.TEST") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(peer_id.shard, found.id.shard);
+        try std.testing.expectEqual(peer.token.slot, found.token.slot);
+        try std.testing.expectEqual(peer.token.gen, found.token.gen);
+    } else return error.SkipZigTest;
 }
 
 test "squit lookup finds reactor-zero peer from another shard" {
-    const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    if (server.reactors.len < 2) return error.SkipZigTest;
-    defer current_reactor = null;
-    current_reactor = &server.reactors[1];
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        if (server.reactors.len < 2) return error.SkipZigTest;
+        defer current_reactor = null;
+        current_reactor = &server.reactors[1];
 
-    const inner = try alloc.create(s2s_link.S2sLink);
-    try inner.init(.{
-        .allocator = alloc,
-        .local_node_id = 1,
-        .remote_node_id = 2,
-        .local_epoch_ms = 1000,
-        .server_name = "local.test",
-    });
-    inner.peer.remote_name = try alloc.dupe(u8, "shard0.test");
+        const inner = try alloc.create(s2s_link.S2sLink);
+        try inner.init(.{
+            .allocator = alloc,
+            .local_node_id = 1,
+            .remote_node_id = 2,
+            .local_epoch_ms = 1000,
+            .server_name = "local.test",
+        });
+        inner.peer.remote_name = try alloc.dupe(u8, "shard0.test");
 
-    const secured = try alloc.create(secured_s2s_link.SecuredLink);
-    secured.* = undefined;
-    secured.allocator = alloc;
-    secured.session = null;
-    secured.inner = inner;
-    secured.inbuf = .empty;
-    secured.out = .empty;
-    secured.rec_inbuf = .empty;
+        const secured = try alloc.create(secured_s2s_link.SecuredLink);
+        secured.* = undefined;
+        secured.allocator = alloc;
+        secured.session = null;
+        secured.inner = inner;
+        secured.inbuf = .empty;
+        secured.out = .empty;
+        secured.rec_inbuf = .empty;
 
-    const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
-    const peer = server.reactors[0].clients.get(peer_id).?;
-    peer.token = try tokenFromId(peer_id);
-    peer.s2s_secured = secured;
+        const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+        const peer = server.reactors[0].clients.get(peer_id).?;
+        peer.token = try tokenFromId(peer_id);
+        peer.s2s_secured = secured;
 
-    const found = server.findSquitVictim("SHARD0.TEST") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(peer_id.shard, found.id.shard);
-    try std.testing.expectEqual(@as(u12, 0), found.id.shard);
-    try std.testing.expectEqual(peer.token.slot, found.token.slot);
-    try std.testing.expectEqual(peer.token.gen, found.token.gen);
+        const found = server.findSquitVictim("SHARD0.TEST") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(peer_id.shard, found.id.shard);
+        try std.testing.expectEqual(@as(u12, 0), found.id.shard);
+        try std.testing.expectEqual(peer.token.slot, found.token.slot);
+        try std.testing.expectEqual(peer.token.gen, found.token.gen);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: oper CONNECT opens an outbound S2S link" {
-    // A test-owned listener stands in for the remote peer; the server dials it.
-    const listen_fd = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
-    defer closeFd(listen_fd);
-    const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        // A test-owned listener stands in for the remote peer; the server dials it.
+        const listen_fd = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
+        defer closeFd(listen_fd);
+        const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
 
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    const port = try server.boundPort();
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        run.store(false, .release);
-        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
-        thr.join();
-    }
+        var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const port = try server.boundPort();
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
 
-    // Oper client SASL-authenticates as the admin oper account, then CONNECTs.
-    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
-    defer closeFd(fd_a);
-    var a = LiveClient{ .fd = fd_a };
-    try saslAdminPrelude(fd_a);
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
-    try recvUntil(&a, " 001 A ", 200);
-    try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
-    var cmd_buf: [64]u8 = undefined;
-    const cmd = try std.fmt.bufPrint(&cmd_buf, "CONNECT 127.0.0.1 {d}\r\n", .{remote_port});
-    try writeAllFd(fd_a, cmd);
+        // Oper client SASL-authenticates as the admin oper account, then CONNECTs.
+        const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        var a = LiveClient{ .fd = fd_a };
+        try saslAdminPrelude(fd_a);
+        try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+        try recvUntil(&a, " 001 A ", 200);
+        try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
+        var cmd_buf: [64]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "CONNECT 127.0.0.1 {d}\r\n", .{remote_port});
+        try writeAllFd(fd_a, cmd);
 
-    // Accept the server's outbound connection on the test listener.
-    var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
-    var waited: usize = 0;
-    while (waited < 200) : (waited += 1) {
-        const r = posix.poll(&poll_listen, 25) catch return error.Unexpected;
-        if (r != 0 and (poll_listen[0].revents & linux.POLL.IN) != 0) break;
-    }
-    const accept_rc = linux.accept4(listen_fd, null, null, 0);
-    const peer_fd: linux.fd_t = switch (posix.errno(accept_rc)) {
-        .SUCCESS => @intCast(accept_rc),
-        else => return error.SkipZigTest,
-    };
-    defer closeFd(peer_fd);
+        // Accept the server's outbound connection on the test listener.
+        var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
+        var waited: usize = 0;
+        while (waited < 200) : (waited += 1) {
+            const r = posix.poll(&poll_listen, 25) catch return error.Unexpected;
+            if (r != 0 and (poll_listen[0].revents & linux.POLL.IN) != 0) break;
+        }
+        const accept_rc = linux.accept4(listen_fd, null, null, 0);
+        const peer_fd: linux.fd_t = switch (posix.errno(accept_rc)) {
+            .SUCCESS => @intCast(accept_rc),
+            else => return error.SkipZigTest,
+        };
+        defer closeFd(peer_fd);
 
-    // Drive a responding S2sLink (no start — the server opened the handshake).
-    const alloc = std.testing.allocator;
-    const peer = try alloc.create(s2s_link.S2sLink);
-    defer alloc.destroy(peer);
-    try peer.init(.{
-        .allocator = alloc,
-        .local_node_id = 2,
-        .remote_node_id = 1,
-        .local_epoch_ms = 3000,
-        .server_name = "remote.test",
-    });
-    defer peer.deinit();
+        // Drive a responding S2sLink (no start — the server opened the handshake).
+        const alloc = std.testing.allocator;
+        const peer = try alloc.create(s2s_link.S2sLink);
+        defer alloc.destroy(peer);
+        try peer.init(.{
+            .allocator = alloc,
+            .local_node_id = 2,
+            .remote_node_id = 1,
+            .local_epoch_ms = 3000,
+            .server_name = "remote.test",
+        });
+        defer peer.deinit();
 
-    var rx: [4096]u8 = undefined;
-    var now: u64 = 1;
-    var polls: usize = 0;
-    while (polls < 200 and !peer.established()) : (polls += 1) {
-        var fds = [_]posix.pollfd{.{ .fd = peer_fd, .events = linux.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
-        if (ready == 0) continue;
-        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
-        const n = try readFd(peer_fd, &rx);
-        if (n == 0) return error.ConnectionReset;
-        now += 1;
-        try peer.feed(rx[0..n], now, 3);
+        var rx: [4096]u8 = undefined;
+        var now: u64 = 1;
+        var polls: usize = 0;
+        while (polls < 200 and !peer.established()) : (polls += 1) {
+            var fds = [_]posix.pollfd{.{ .fd = peer_fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+            if (ready == 0) continue;
+            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            const n = try readFd(peer_fd, &rx);
+            if (n == 0) return error.ConnectionReset;
+            now += 1;
+            try peer.feed(rx[0..n], now, 3);
+            if (peer.outbound().len != 0) {
+                try writeAllFd(peer_fd, peer.outbound());
+                peer.clearOutbound();
+            }
+        }
+        try std.testing.expect(peer.established());
+        try std.testing.expect(peer.knownServers() >= 2);
+
+        // SERVER_LINK Event Spine mirror: the oper A (auto-subscribed to every
+        // category on elevation) receives an `EVENT A SERVER LINK <peer>` when the peer link
+        // comes up, alongside the mesh_event_log entry. The peer named itself
+        // "remote.test", so that is the link subject. Asserted before the reset below.
+        try recvUntil(&a, "EVENT A SERVER LINK remote.test", 400);
+
+        // Deterministic readiness gate (no timing race): LINKS is idempotent and only
+        // lists ESTABLISHED, handshake-NAMED peers. Poll it until 'remote.test'
+        // appears — that is the observable signal the server learned the peer — THEN
+        // SQUIT exactly once and require success. (Protocol convergence itself is
+        // proven by the deterministic byte-loopback tests; this is the socket/reactor
+        // integration smoke test, made non-flaky by gating on observable readiness.)
+        var learned = false;
+        var probes: usize = 0;
+        while (probes < 60 and !learned) : (probes += 1) {
+            a.reset();
+            try writeAllFd(fd_a, "LINKS\r\n");
+            recvUntil(&a, " 365 ", 80) catch {};
+            if (std.mem.indexOf(u8, a.written(), "remote.test") != null) learned = true;
+        }
+        try std.testing.expect(learned);
+
+        // Remote WHOIS via the mesh projection: the fake peer announces a channel
+        // member (with its real propagated identity) on its side of the link; once
+        // the MEMBERSHIP frame lands, the server answers WHOIS for that nick from
+        // the converged roster — 311 with the PROPAGATED username + cloaked host
+        // (not the mesh@<server> placeholder) and 312 naming the member's actual
+        // home server (remote.test), not the local server.
+        try peer.sendMembership("#mesh", "Zed", 0b0100, now + 1, true, .{
+            .username = "zed",
+            .realname = "Zed Remote",
+            .host = "cloak-zed.users.test",
+        }, "");
         if (peer.outbound().len != 0) {
             try writeAllFd(peer_fd, peer.outbound());
             peer.clearOutbound();
         }
-    }
-    try std.testing.expect(peer.established());
-    try std.testing.expect(peer.knownServers() >= 2);
-
-    // SERVER_LINK Event Spine mirror: the oper A (auto-subscribed to every
-    // category on elevation) receives an `EVENT A SERVER LINK <peer>` when the peer link
-    // comes up, alongside the mesh_event_log entry. The peer named itself
-    // "remote.test", so that is the link subject. Asserted before the reset below.
-    try recvUntil(&a, "EVENT A SERVER LINK remote.test", 400);
-
-    // Deterministic readiness gate (no timing race): LINKS is idempotent and only
-    // lists ESTABLISHED, handshake-NAMED peers. Poll it until 'remote.test'
-    // appears — that is the observable signal the server learned the peer — THEN
-    // SQUIT exactly once and require success. (Protocol convergence itself is
-    // proven by the deterministic byte-loopback tests; this is the socket/reactor
-    // integration smoke test, made non-flaky by gating on observable readiness.)
-    var learned = false;
-    var probes: usize = 0;
-    while (probes < 60 and !learned) : (probes += 1) {
-        a.reset();
-        try writeAllFd(fd_a, "LINKS\r\n");
-        recvUntil(&a, " 365 ", 80) catch {};
-        if (std.mem.indexOf(u8, a.written(), "remote.test") != null) learned = true;
-    }
-    try std.testing.expect(learned);
-
-    // Remote WHOIS via the mesh projection: the fake peer announces a channel
-    // member (with its real propagated identity) on its side of the link; once
-    // the MEMBERSHIP frame lands, the server answers WHOIS for that nick from
-    // the converged roster — 311 with the PROPAGATED username + cloaked host
-    // (not the mesh@<server> placeholder) and 312 naming the member's actual
-    // home server (remote.test), not the local server.
-    try peer.sendMembership("#mesh", "Zed", 0b0100, now + 1, true, .{
-        .username = "zed",
-        .realname = "Zed Remote",
-        .host = "cloak-zed.users.test",
-    }, "");
-    if (peer.outbound().len != 0) {
-        try writeAllFd(peer_fd, peer.outbound());
-        peer.clearOutbound();
-    }
-    var whois_seen = false;
-    probes = 0;
-    while (probes < 60 and !whois_seen) : (probes += 1) {
-        a.reset();
-        try writeAllFd(fd_a, "WHOIS Zed\r\n");
-        // " A Zed" arrives on BOTH outcomes (401 A Zed / 311 A Zed), so a miss
-        // cycles quickly instead of riding out the full recvUntil budget.
-        recvUntil(&a, " A Zed", 200) catch {};
-        if (std.mem.indexOf(u8, a.written(), " 311 A Zed ") != null) {
-            recvUntil(&a, " 318 A Zed", 200) catch {};
-            const got = a.written();
-            if (std.mem.indexOf(u8, got, " 311 A Zed zed cloak-zed.users.test ") != null and
-                std.mem.indexOf(u8, got, ":Zed Remote") != null and
-                std.mem.indexOf(u8, got, " 312 A Zed remote.test ") != null) whois_seen = true;
+        var whois_seen = false;
+        probes = 0;
+        while (probes < 60 and !whois_seen) : (probes += 1) {
+            a.reset();
+            try writeAllFd(fd_a, "WHOIS Zed\r\n");
+            // " A Zed" arrives on BOTH outcomes (401 A Zed / 311 A Zed), so a miss
+            // cycles quickly instead of riding out the full recvUntil budget.
+            recvUntil(&a, " A Zed", 200) catch {};
+            if (std.mem.indexOf(u8, a.written(), " 311 A Zed ") != null) {
+                recvUntil(&a, " 318 A Zed", 200) catch {};
+                const got = a.written();
+                if (std.mem.indexOf(u8, got, " 311 A Zed zed cloak-zed.users.test ") != null and
+                    std.mem.indexOf(u8, got, ":Zed Remote") != null and
+                    std.mem.indexOf(u8, got, " 312 A Zed remote.test ") != null) whois_seen = true;
+            }
         }
-    }
-    try std.testing.expect(whois_seen);
+        try std.testing.expect(whois_seen);
 
-    a.reset();
-    try writeAllFd(fd_a, "SQUIT remote.test\r\n");
-    try recvUntil(&a, "SQUIT complete", 200);
+        a.reset();
+        try writeAllFd(fd_a, "SQUIT remote.test\r\n");
+        try recvUntil(&a, "SQUIT complete", 200);
+    } else return error.SkipZigTest;
 }
 
 test "parseHostPort: host:port split, bad port rejected, IPv6 brackets" {
@@ -39628,125 +39750,131 @@ test "parseHostPort: host:port split, bad port rejected, IPv6 brackets" {
 }
 
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
-    // Deterministic, execve-safe: drive the handler directly (it only stores the
-    // flag) and consume it the same way `onTimerTick` does — never installs a
-    // process signal handler and never runs a reactor, so there is no path to an
-    // actual re-exec inside the test binary.
-    upgrade_signal_requested.store(false, .seq_cst);
-    onUpgradeSignal(posix.SIG.USR2);
-    try std.testing.expect(upgrade_signal_requested.load(.seq_cst));
-    // First consume observes the request and clears it.
-    try std.testing.expect(upgrade_signal_requested.swap(false, .seq_cst));
-    // A second consume sees nothing — exactly one upgrade per signal.
-    try std.testing.expect(!upgrade_signal_requested.swap(false, .seq_cst));
+    if (comptime builtin.os.tag == .linux) {
+        // Deterministic, execve-safe: drive the handler directly (it only stores the
+        // flag) and consume it the same way `onTimerTick` does — never installs a
+        // process signal handler and never runs a reactor, so there is no path to an
+        // actual re-exec inside the test binary.
+        upgrade_signal_requested.store(false, .seq_cst);
+        onUpgradeSignal(posix.SIG.USR2);
+        try std.testing.expect(upgrade_signal_requested.load(.seq_cst));
+        // First consume observes the request and clears it.
+        try std.testing.expect(upgrade_signal_requested.swap(false, .seq_cst));
+        // A second consume sees nothing — exactly one upgrade per signal.
+        try std.testing.expect(!upgrade_signal_requested.swap(false, .seq_cst));
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: [mesh].connect auto-links two nodes without an oper" {
-    const alloc = std.testing.allocator;
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
 
-    // Node 2 (the dial target) boots first so its ephemeral S2S port is known
-    // before node 1's config is built.
-    var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = 0,
-        .node_id = 2,
-        .server_name = "node2.test",
-        .num_shards = 2,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node2.deinit();
-    const s2s_port = node2.s2sBoundPort() catch return error.SkipZigTest;
-    var run2 = std.atomic.Value(bool).init(true);
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
-    defer {
-        node2.requestStop(&run2);
-        thr2.join();
-    }
-
-    // Node 1 carries node 2 in [mesh].connect — NO oper session, no CONNECT
-    // command: the boot pass must dial and link on its own.
-    var spec_buf: [32]u8 = undefined;
-    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{s2s_port});
-    const peers = [_][]const u8{spec};
-    var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = 0,
-        .node_id = 1,
-        .server_name = "node1.test",
-        .mesh_connect = &peers,
-        .num_shards = 2,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node1.deinit();
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
-    var run1 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
-    defer {
-        node1.requestStop(&run1);
-        thr1.join();
-    }
-
-    // Observable readiness gate (same shape as the oper CONNECT test): a plain
-    // client on node 1 polls LINKS until node 2's handshake-learned name shows,
-    // proving the auto-dialed S2S link established without any oper command.
-    const fd_c = connectLoopback(port1) catch return error.SkipZigTest;
-    defer closeFd(fd_c);
-    var c = LiveClient{ .fd = fd_c };
-    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
-    try recvUntil(&c, " 001 C ", 200);
-
-    var linked = false;
-    var probes: usize = 0;
-    while (probes < 120 and !linked) : (probes += 1) {
-        c.reset();
-        try writeAllFd(fd_c, "LINKS\r\n");
-        recvUntil(&c, " 365 ", 80) catch {};
-        if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
-    }
-    try std.testing.expect(linked);
-
-    // Remote WHOIS via the mesh projection: D joins a channel on node 2; once
-    // the membership gossip lands, node 1 answers WHOIS D from the converged
-    // roster — 311 with the placeholder identity (user "mesh", host = origin)
-    // and 312 naming D's actual home server, not the local one.
-    const fd_d = connectLoopback(node2.boundPort() catch 0) catch return error.SkipZigTest;
-    defer closeFd(fd_d);
-    var d = LiveClient{ .fd = fd_d };
-    try writeAllFd(fd_d, "NICK D\r\nUSER dave 0 * :Dave\r\n");
-    try recvUntil(&d, " 001 D ", 200);
-    try writeAllFd(fd_d, "JOIN #mesh\r\n");
-    try recvUntil(&d, "JOIN", 200);
-
-    var whois_seen = false;
-    probes = 0;
-    while (probes < 120 and !whois_seen) : (probes += 1) {
-        c.reset();
-        try writeAllFd(fd_c, "WHOIS D\r\n");
-        // " C D " arrives on BOTH outcomes (401 C D / 311 C D), so a miss
-        // cycles quickly instead of riding out the full recvUntil budget.
-        recvUntil(&c, " C D ", 200) catch {};
-        if (std.mem.indexOf(u8, c.written(), " 311 C D ") != null) {
-            recvUntil(&c, " 318 C D ", 200) catch {};
-            const got = c.written();
-            if (std.mem.indexOf(u8, got, " 311 C D mesh node2.test ") != null and
-                std.mem.indexOf(u8, got, " 312 C D node2.test ") != null) whois_seen = true;
+        // Node 2 (the dial target) boots first so its ephemeral S2S port is known
+        // before node 1's config is built.
+        var node2 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = 0,
+            .node_id = 2,
+            .server_name = "node2.test",
+            .num_shards = 2,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node2.deinit();
+        const s2s_port = node2.s2sBoundPort() catch return error.SkipZigTest;
+        var run2 = std.atomic.Value(bool).init(true);
+        var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+        defer {
+            node2.requestStop(&run2);
+            thr2.join();
         }
-    }
-    try std.testing.expect(whois_seen);
+
+        // Node 1 carries node 2 in [mesh].connect — NO oper session, no CONNECT
+        // command: the boot pass must dial and link on its own.
+        var spec_buf: [32]u8 = undefined;
+        const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{s2s_port});
+        const peers = [_][]const u8{spec};
+        var node1 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = 0,
+            .node_id = 1,
+            .server_name = "node1.test",
+            .mesh_connect = &peers,
+            .num_shards = 2,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node1.deinit();
+        const port1 = node1.boundPort() catch return error.SkipZigTest;
+        var run1 = std.atomic.Value(bool).init(true);
+        var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+        defer {
+            node1.requestStop(&run1);
+            thr1.join();
+        }
+
+        // Observable readiness gate (same shape as the oper CONNECT test): a plain
+        // client on node 1 polls LINKS until node 2's handshake-learned name shows,
+        // proving the auto-dialed S2S link established without any oper command.
+        const fd_c = connectLoopback(port1) catch return error.SkipZigTest;
+        defer closeFd(fd_c);
+        var c = LiveClient{ .fd = fd_c };
+        try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+        try recvUntil(&c, " 001 C ", 200);
+
+        var linked = false;
+        var probes: usize = 0;
+        while (probes < 120 and !linked) : (probes += 1) {
+            c.reset();
+            try writeAllFd(fd_c, "LINKS\r\n");
+            recvUntil(&c, " 365 ", 80) catch {};
+            if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
+        }
+        try std.testing.expect(linked);
+
+        // Remote WHOIS via the mesh projection: D joins a channel on node 2; once
+        // the membership gossip lands, node 1 answers WHOIS D from the converged
+        // roster — 311 with the placeholder identity (user "mesh", host = origin)
+        // and 312 naming D's actual home server, not the local one.
+        const fd_d = connectLoopback(node2.boundPort() catch 0) catch return error.SkipZigTest;
+        defer closeFd(fd_d);
+        var d = LiveClient{ .fd = fd_d };
+        try writeAllFd(fd_d, "NICK D\r\nUSER dave 0 * :Dave\r\n");
+        try recvUntil(&d, " 001 D ", 200);
+        try writeAllFd(fd_d, "JOIN #mesh\r\n");
+        try recvUntil(&d, "JOIN", 200);
+
+        var whois_seen = false;
+        probes = 0;
+        while (probes < 120 and !whois_seen) : (probes += 1) {
+            c.reset();
+            try writeAllFd(fd_c, "WHOIS D\r\n");
+            // " C D " arrives on BOTH outcomes (401 C D / 311 C D), so a miss
+            // cycles quickly instead of riding out the full recvUntil budget.
+            recvUntil(&c, " C D ", 200) catch {};
+            if (std.mem.indexOf(u8, c.written(), " 311 C D ") != null) {
+                recvUntil(&c, " 318 C D ", 200) catch {};
+                const got = c.written();
+                if (std.mem.indexOf(u8, got, " 311 C D mesh node2.test ") != null and
+                    std.mem.indexOf(u8, got, " 312 C D node2.test ") != null) whois_seen = true;
+            }
+        }
+        try std.testing.expect(whois_seen);
+    } else return error.SkipZigTest;
 }
 
 fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
-    const fd1 = try createListener("127.0.0.1", 0, 8);
-    defer closeFd(fd1);
-    const fd2 = try createListener("127.0.0.1", 0, 8);
-    defer closeFd(fd2);
-    return .{ try socketPort(fd1), try socketPort(fd2) };
+    if (comptime builtin.os.tag == .linux) {
+        const fd1 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd1);
+        const fd2 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd2);
+        return .{ try socketPort(fd1), try socketPort(fd2) };
+    } else return error.Unsupported;
 }
 
 fn testSleepMs(ms: isize) void {
@@ -39758,25 +39886,27 @@ fn testSleepMs(ms: isize) void {
 }
 
 fn expectMeshPeerVisible(client: *LiveClient, peer_name: []const u8, max_probes: usize) !void {
-    var probes: usize = 0;
-    while (probes < max_probes) : (probes += 1) {
-        client.reset();
-        try writeAllFd(client.fd, "LINKS\r\nLUSERS\r\n");
-        const deadline = platform.monotonicMillis() + 250;
-        while (platform.monotonicMillis() < deadline) {
-            var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, 20) catch return error.Unexpected;
-            if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
-            const got_now = client.written();
-            if (std.mem.indexOf(u8, got_now, " 365 ") != null and
-                std.mem.indexOf(u8, got_now, " 255 ") != null) break;
+    if (comptime builtin.os.tag == .linux) {
+        var probes: usize = 0;
+        while (probes < max_probes) : (probes += 1) {
+            client.reset();
+            try writeAllFd(client.fd, "LINKS\r\nLUSERS\r\n");
+            const deadline = platform.monotonicMillis() + 250;
+            while (platform.monotonicMillis() < deadline) {
+                var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+                const ready = posix.poll(&fds, 20) catch return error.Unexpected;
+                if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
+                const got_now = client.written();
+                if (std.mem.indexOf(u8, got_now, " 365 ") != null and
+                    std.mem.indexOf(u8, got_now, " 255 ") != null) break;
+            }
+            const got = client.written();
+            if (std.mem.indexOf(u8, got, peer_name) != null and
+                std.mem.indexOf(u8, got, " on 2 servers") != null) return;
+            testSleepMs(25);
         }
-        const got = client.written();
-        if (std.mem.indexOf(u8, got, peer_name) != null and
-            std.mem.indexOf(u8, got, " on 2 servers") != null) return;
-        testSleepMs(25);
-    }
-    return error.TestTimeout;
+        return error.TestTimeout;
+    } else return error.SkipZigTest;
 }
 
 fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
@@ -39789,88 +39919,90 @@ fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
 }
 
 fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
-    const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
-    const s2s_port1 = s2s_ports[0];
-    const s2s_port2 = s2s_ports[1];
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        const s2s_port1 = s2s_ports[0];
+        const s2s_port2 = s2s_ports[1];
 
-    var spec1_buf: [32]u8 = undefined;
-    var spec2_buf: [32]u8 = undefined;
-    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_port1});
-    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_port2});
-    const node1_peers = [_][]const u8{node2_spec};
-    const node2_peers = [_][]const u8{node1_spec};
+        var spec1_buf: [32]u8 = undefined;
+        var spec2_buf: [32]u8 = undefined;
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_port1});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_port2});
+        const node1_peers = [_][]const u8{node2_spec};
+        const node2_peers = [_][]const u8{node1_spec};
 
-    var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_port1,
-        .node_id = 1,
-        .server_name = "node1.test",
-        .mesh_connect = &node1_peers,
-        .num_shards = shards1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node1.deinit();
+        var node1 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_port1,
+            .node_id = 1,
+            .server_name = "node1.test",
+            .mesh_connect = &node1_peers,
+            .num_shards = shards1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node1.deinit();
 
-    var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_port2,
-        .node_id = 2,
-        .server_name = "node2.test",
-        .mesh_connect = &node2_peers,
-        .num_shards = shards2,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node2.deinit();
+        var node2 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_port2,
+            .node_id = 2,
+            .server_name = "node2.test",
+            .mesh_connect = &node2_peers,
+            .num_shards = shards2,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node2.deinit();
 
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
-    const port2 = node2.boundPort() catch return error.SkipZigTest;
+        const port1 = node1.boundPort() catch return error.SkipZigTest;
+        const port2 = node2.boundPort() catch return error.SkipZigTest;
 
-    var run1 = std.atomic.Value(bool).init(true);
-    var run2 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
-    defer {
-        node1.requestStop(&run1);
-        node2.requestStop(&run2);
-        thr1.join();
-        thr2.join();
-    }
+        var run1 = std.atomic.Value(bool).init(true);
+        var run2 = std.atomic.Value(bool).init(true);
+        var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+        var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+        defer {
+            node1.requestStop(&run1);
+            node2.requestStop(&run2);
+            thr1.join();
+            thr2.join();
+        }
 
-    const fd1 = connectLoopback(port1) catch return error.SkipZigTest;
-    defer closeFd(fd1);
-    const fd2 = connectLoopback(port2) catch return error.SkipZigTest;
-    defer closeFd(fd2);
-    var c1 = LiveClient{ .fd = fd1 };
-    var c2 = LiveClient{ .fd = fd2 };
-    try writeAllFd(fd1, "NICK C1\r\nUSER c1 0 * :Client One\r\n");
-    try writeAllFd(fd2, "NICK C2\r\nUSER c2 0 * :Client Two\r\n");
-    try recvUntil(&c1, " 001 C1 ", 200);
-    try recvUntil(&c2, " 001 C2 ", 200);
+        const fd1 = connectLoopback(port1) catch return error.SkipZigTest;
+        defer closeFd(fd1);
+        const fd2 = connectLoopback(port2) catch return error.SkipZigTest;
+        defer closeFd(fd2);
+        var c1 = LiveClient{ .fd = fd1 };
+        var c2 = LiveClient{ .fd = fd2 };
+        try writeAllFd(fd1, "NICK C1\r\nUSER c1 0 * :Client One\r\n");
+        try writeAllFd(fd2, "NICK C2\r\nUSER c2 0 * :Client Two\r\n");
+        try recvUntil(&c1, " 001 C1 ", 200);
+        try recvUntil(&c2, " 001 C2 ", 200);
 
-    try expectMeshPeerVisible(&c1, "node2.test", 160);
-    try expectMeshPeerVisible(&c2, "node1.test", 160);
-    const node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
-    const node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+        try expectMeshPeerVisible(&c1, "node2.test", 160);
+        try expectMeshPeerVisible(&c2, "node1.test", 160);
+        const node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
+        const node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
 
-    // Hold through several accelerated auto-connect sweeps. A reciprocal mesh
-    // used to establish, hit the next redial/collision pass, and then disappear.
-    var checks: usize = 0;
-    while (checks < 12) : (checks += 1) {
-        testSleepMs(150);
-        try expectMeshPeerVisible(&c1, "node2.test", 8);
-        try expectMeshPeerVisible(&c2, "node1.test", 8);
-    }
-    try std.testing.expectEqual(node1_collapses, countMeshLogDetail(&node1, "duplicate link collapsed"));
-    try std.testing.expectEqual(node2_collapses, countMeshLogDetail(&node2, "duplicate link collapsed"));
+        // Hold through several accelerated auto-connect sweeps. A reciprocal mesh
+        // used to establish, hit the next redial/collision pass, and then disappear.
+        var checks: usize = 0;
+        while (checks < 12) : (checks += 1) {
+            testSleepMs(150);
+            try expectMeshPeerVisible(&c1, "node2.test", 8);
+            try expectMeshPeerVisible(&c2, "node1.test", 8);
+        }
+        try std.testing.expectEqual(node1_collapses, countMeshLogDetail(&node1, "duplicate link collapsed"));
+        try std.testing.expectEqual(node2_collapses, countMeshLogDetail(&node2, "duplicate link collapsed"));
+    } else return error.SkipZigTest;
 }
 
 /// Parse the user count out of a LUSERS 251 line ("There are N users ...").
@@ -39895,105 +40027,107 @@ fn parseLusersUserCount(buf: []const u8) ?u64 {
 // the server count (2) and the user count. Asymmetric 4<->1 mirrors the live
 // topology (eshmaki 8 cores, ircx.us 1 core).
 fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
-    const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
-    var spec1_buf: [32]u8 = undefined;
-    var spec2_buf: [32]u8 = undefined;
-    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
-    const node1_peers = [_][]const u8{node2_spec};
-    const node2_peers = [_][]const u8{node1_spec};
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        var spec1_buf: [32]u8 = undefined;
+        var spec2_buf: [32]u8 = undefined;
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_peers = [_][]const u8{node2_spec};
+        const node2_peers = [_][]const u8{node1_spec};
 
-    var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[0],
-        .node_id = 1,
-        .server_name = "node1.test",
-        .mesh_connect = &node1_peers,
-        .num_shards = shards1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node1.deinit();
-    var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[1],
-        .node_id = 2,
-        .server_name = "node2.test",
-        .mesh_connect = &node2_peers,
-        .num_shards = shards2,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node2.deinit();
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
+        var node1 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[0],
+            .node_id = 1,
+            .server_name = "node1.test",
+            .mesh_connect = &node1_peers,
+            .num_shards = shards1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node1.deinit();
+        var node2 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[1],
+            .node_id = 2,
+            .server_name = "node2.test",
+            .mesh_connect = &node2_peers,
+            .num_shards = shards2,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node2.deinit();
+        const port1 = node1.boundPort() catch return error.SkipZigTest;
 
-    var run1 = std.atomic.Value(bool).init(true);
-    var run2 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
-    defer {
-        node1.requestStop(&run1);
-        node2.requestStop(&run2);
-        thr1.join();
-        thr2.join();
-    }
-
-    // Establish the mesh first (probe connection), so reactor 0 has published a
-    // peer count of 1 before we fan out.
-    const probe_fd = connectLoopback(port1) catch return error.SkipZigTest;
-    var probe = LiveClient{ .fd = probe_fd };
-    try writeAllFd(probe_fd, "NICK P\r\nUSER p 0 * :Probe\r\n");
-    try recvUntil(&probe, " 001 P ", 200);
-    try expectMeshPeerVisible(&probe, "node2.test", 200);
-    closeFd(probe_fd);
-
-    // Fan out: many connections spread across node1's shards by SO_REUSEPORT.
-    const N = 16;
-    var fds: [N]linux.fd_t = undefined;
-    var clients: [N]LiveClient = undefined;
-    var opened: usize = 0;
-    defer for (fds[0..opened]) |fd| closeFd(fd);
-    for (0..N) |i| {
-        const fd = connectLoopback(port1) catch return error.SkipZigTest;
-        fds[i] = fd;
-        clients[i] = LiveClient{ .fd = fd };
-        opened += 1;
-        var rb: [48]u8 = undefined;
-        const reg = try std.fmt.bufPrint(&rb, "NICK U{d}\r\nUSER u{d} 0 * :User\r\n", .{ i, i });
-        try writeAllFd(fd, reg);
-    }
-    for (0..N) |i| {
-        var nb: [16]u8 = undefined;
-        const needle = try std.fmt.bufPrint(&nb, " 001 U{d} ", .{i});
-        try recvUntil(&clients[i], needle, 200);
-    }
-
-    // Every connection's LUSERS must agree: same server count (2) and same user
-    // count, regardless of which shard answered it.
-    var first_users: ?u64 = null;
-    for (0..N) |i| {
-        clients[i].reset();
-        try writeAllFd(fds[i], "LUSERS\r\n");
-        try recvUntil(&clients[i], " 255 ", 200);
-        const out = clients[i].written();
-        if (std.mem.indexOf(u8, out, "2 servers") == null) {
-            srvLog("conn {d} LUSERS missing '2 servers': {s}\n", .{ i, out });
-            return error.TestUnexpectedResult;
+        var run1 = std.atomic.Value(bool).init(true);
+        var run2 = std.atomic.Value(bool).init(true);
+        var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+        var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+        defer {
+            node1.requestStop(&run1);
+            node2.requestStop(&run2);
+            thr1.join();
+            thr2.join();
         }
-        const uc = parseLusersUserCount(out) orelse return error.TestUnexpectedResult;
-        // At least the N fanned-out users are registered network-wide.
-        try std.testing.expect(uc >= N);
-        if (first_users) |fu| {
-            try std.testing.expectEqual(fu, uc);
-        } else first_users = uc;
-    }
+
+        // Establish the mesh first (probe connection), so reactor 0 has published a
+        // peer count of 1 before we fan out.
+        const probe_fd = connectLoopback(port1) catch return error.SkipZigTest;
+        var probe = LiveClient{ .fd = probe_fd };
+        try writeAllFd(probe_fd, "NICK P\r\nUSER p 0 * :Probe\r\n");
+        try recvUntil(&probe, " 001 P ", 200);
+        try expectMeshPeerVisible(&probe, "node2.test", 200);
+        closeFd(probe_fd);
+
+        // Fan out: many connections spread across node1's shards by SO_REUSEPORT.
+        const N = 16;
+        var fds: [N]linux.fd_t = undefined;
+        var clients: [N]LiveClient = undefined;
+        var opened: usize = 0;
+        defer for (fds[0..opened]) |fd| closeFd(fd);
+        for (0..N) |i| {
+            const fd = connectLoopback(port1) catch return error.SkipZigTest;
+            fds[i] = fd;
+            clients[i] = LiveClient{ .fd = fd };
+            opened += 1;
+            var rb: [48]u8 = undefined;
+            const reg = try std.fmt.bufPrint(&rb, "NICK U{d}\r\nUSER u{d} 0 * :User\r\n", .{ i, i });
+            try writeAllFd(fd, reg);
+        }
+        for (0..N) |i| {
+            var nb: [16]u8 = undefined;
+            const needle = try std.fmt.bufPrint(&nb, " 001 U{d} ", .{i});
+            try recvUntil(&clients[i], needle, 200);
+        }
+
+        // Every connection's LUSERS must agree: same server count (2) and same user
+        // count, regardless of which shard answered it.
+        var first_users: ?u64 = null;
+        for (0..N) |i| {
+            clients[i].reset();
+            try writeAllFd(fds[i], "LUSERS\r\n");
+            try recvUntil(&clients[i], " 255 ", 200);
+            const out = clients[i].written();
+            if (std.mem.indexOf(u8, out, "2 servers") == null) {
+                srvLog("conn {d} LUSERS missing '2 servers': {s}\n", .{ i, out });
+                return error.TestUnexpectedResult;
+            }
+            const uc = parseLusersUserCount(out) orelse return error.TestUnexpectedResult;
+            // At least the N fanned-out users are registered network-wide.
+            try std.testing.expect(uc >= N);
+            if (first_users) |fu| {
+                try std.testing.expectEqual(fu, uc);
+            } else first_users = uc;
+        }
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: LUSERS counts are consistent across shards" {
@@ -40021,277 +40155,281 @@ test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
 // per-node and only converge on the 30s anti-entropy cadence, so the asymmetry
 // is stable for the test's lifetime when A sets -n/-t before B materializes #c.
 test "threaded server: inbound relay re-enforces local +n / +t against a remote actor" {
-    const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
-    var spec1_buf: [32]u8 = undefined;
-    var spec2_buf: [32]u8 = undefined;
-    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
-    const node1_peers = [_][]const u8{node2_spec};
-    const node2_peers = [_][]const u8{node1_spec};
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        var spec1_buf: [32]u8 = undefined;
+        var spec2_buf: [32]u8 = undefined;
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_peers = [_][]const u8{node2_spec};
+        const node2_peers = [_][]const u8{node1_spec};
 
-    var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[0],
-        .node_id = 1,
-        .server_name = "node1.test",
-        .mesh_connect = &node1_peers,
-        .num_shards = 1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node1.deinit();
-    var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[1],
-        .node_id = 2,
-        .server_name = "node2.test",
-        .mesh_connect = &node2_peers,
-        .num_shards = 1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node2.deinit();
+        var node1 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[0],
+            .node_id = 1,
+            .server_name = "node1.test",
+            .mesh_connect = &node1_peers,
+            .num_shards = 1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node1.deinit();
+        var node2 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[1],
+            .node_id = 2,
+            .server_name = "node2.test",
+            .mesh_connect = &node2_peers,
+            .num_shards = 1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node2.deinit();
 
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
-    const port2 = node2.boundPort() catch return error.SkipZigTest;
+        const port1 = node1.boundPort() catch return error.SkipZigTest;
+        const port2 = node2.boundPort() catch return error.SkipZigTest;
 
-    var run1 = std.atomic.Value(bool).init(true);
-    var run2 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
-    defer {
-        node1.requestStop(&run1);
-        node2.requestStop(&run2);
-        thr1.join();
-        thr2.join();
-    }
+        var run1 = std.atomic.Value(bool).init(true);
+        var run2 = std.atomic.Value(bool).init(true);
+        var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+        var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+        defer {
+            node1.requestStop(&run1);
+            node2.requestStop(&run2);
+            thr1.join();
+            thr2.join();
+        }
 
-    // BMem on node 2 founds #c (+n/+t default) and stays. AMember on node 1 joins
-    // #c (becomes A's founder) and sets it -n -t BEFORE BMem exists on B is not
-    // possible (BMem founds B's #c); instead we set A's modes and rely on the
-    // per-node default split: B's #c is +n/+t, A's #c is -n/-t.
-    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
-    defer closeFd(fd_b);
-    var bmem = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_b, "NICK BMem\r\nUSER bmem 0 * :B Member\r\n");
-    try recvUntil(&bmem, " 001 BMem ", 400);
+        // BMem on node 2 founds #c (+n/+t default) and stays. AMember on node 1 joins
+        // #c (becomes A's founder) and sets it -n -t BEFORE BMem exists on B is not
+        // possible (BMem founds B's #c); instead we set A's modes and rely on the
+        // per-node default split: B's #c is +n/+t, A's #c is -n/-t.
+        const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+        defer closeFd(fd_b);
+        var bmem = LiveClient{ .fd = fd_b };
+        try writeAllFd(fd_b, "NICK BMem\r\nUSER bmem 0 * :B Member\r\n");
+        try recvUntil(&bmem, " 001 BMem ", 400);
 
-    // A's founder establishes #c on node 1 and relaxes it to -n -t so node 1's
-    // local gate permits a non-member/non-op to speak / set topic and relay.
-    const fd_af = connectLoopback(port1) catch return error.SkipZigTest;
-    defer closeFd(fd_af);
-    var afounder = LiveClient{ .fd = fd_af };
-    try writeAllFd(fd_af, "NICK AFounder\r\nUSER af 0 * :A Founder\r\n");
-    try recvUntil(&afounder, " 001 AFounder ", 400);
-    try writeAllFd(fd_af, "JOIN #c\r\n");
-    try recvUntil(&afounder, " 366 AFounder #c ", 400);
-    try writeAllFd(fd_af, "MODE #c -n\r\n");
-    try writeAllFd(fd_af, "MODE #c -t\r\n");
-    // Wait for the mesh to link both directions before BMem joins B's #c.
-    try expectMeshPeerVisible(&afounder, "node2.test", 200);
-    try expectMeshPeerVisible(&bmem, "node1.test", 200);
+        // A's founder establishes #c on node 1 and relaxes it to -n -t so node 1's
+        // local gate permits a non-member/non-op to speak / set topic and relay.
+        const fd_af = connectLoopback(port1) catch return error.SkipZigTest;
+        defer closeFd(fd_af);
+        var afounder = LiveClient{ .fd = fd_af };
+        try writeAllFd(fd_af, "NICK AFounder\r\nUSER af 0 * :A Founder\r\n");
+        try recvUntil(&afounder, " 001 AFounder ", 400);
+        try writeAllFd(fd_af, "JOIN #c\r\n");
+        try recvUntil(&afounder, " 366 AFounder #c ", 400);
+        try writeAllFd(fd_af, "MODE #c -n\r\n");
+        try writeAllFd(fd_af, "MODE #c -t\r\n");
+        // Wait for the mesh to link both directions before BMem joins B's #c.
+        try expectMeshPeerVisible(&afounder, "node2.test", 200);
+        try expectMeshPeerVisible(&bmem, "node1.test", 200);
 
-    // BMem joins #c on node 2 (founds B's copy with default +n/+t).
-    bmem.reset();
-    try writeAllFd(fd_b, "JOIN #c\r\n");
-    try recvUntil(&bmem, " 366 BMem #c ", 400);
+        // BMem joins #c on node 2 (founds B's copy with default +n/+t).
+        bmem.reset();
+        try writeAllFd(fd_b, "JOIN #c\r\n");
+        try recvUntil(&bmem, " 366 BMem #c ", 400);
 
-    // --- Positive control: AFounder (a real member, gossiped into B's roster)
-    // PRIVMSGs #c; BMem must receive it (the gate allows legit members). ---
-    bmem.reset();
-    var member_ok = false;
-    var probes: usize = 0;
-    while (probes < 80 and !member_ok) : (probes += 1) {
-        try writeAllFd(fd_af, "PRIVMSG #c :from member\r\n");
-        recvUntil(&bmem, "PRIVMSG #c :from member", 120) catch {};
-        if (std.mem.indexOf(u8, bmem.written(), "PRIVMSG #c :from member") != null) member_ok = true;
-    }
-    try std.testing.expect(member_ok);
+        // --- Positive control: AFounder (a real member, gossiped into B's roster)
+        // PRIVMSGs #c; BMem must receive it (the gate allows legit members). ---
+        bmem.reset();
+        var member_ok = false;
+        var probes: usize = 0;
+        while (probes < 80 and !member_ok) : (probes += 1) {
+            try writeAllFd(fd_af, "PRIVMSG #c :from member\r\n");
+            recvUntil(&bmem, "PRIVMSG #c :from member", 120) catch {};
+            if (std.mem.indexOf(u8, bmem.written(), "PRIVMSG #c :from member") != null) member_ok = true;
+        }
+        try std.testing.expect(member_ok);
 
-    // --- Negative (+n): ANon, NOT a member of #c, speaks on node 1 (which is -n,
-    // so node 1 permits it) and node 1 relays to node 2. Node 2's #c is +n and
-    // ANon is not in B's roster, so the receiver gate must DROP it: BMem must NOT
-    // receive ANon's line within a generous window. ---
-    const fd_an = connectLoopback(port1) catch return error.SkipZigTest;
-    defer closeFd(fd_an);
-    var anon = LiveClient{ .fd = fd_an };
-    try writeAllFd(fd_an, "NICK ANon\r\nUSER anon 0 * :A NonMember\r\n");
-    try recvUntil(&anon, " 001 ANon ", 400);
-    bmem.reset();
-    // Fire several times to be sure the relay had every chance to arrive.
-    var n: usize = 0;
-    while (n < 10) : (n += 1) {
-        try writeAllFd(fd_an, "PRIVMSG #c :external blocked\r\n");
-        testSleepMs(20);
-    }
-    testSleepMs(150);
-    try bmem.readAvailable();
-    try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "external blocked") == null);
+        // --- Negative (+n): ANon, NOT a member of #c, speaks on node 1 (which is -n,
+        // so node 1 permits it) and node 1 relays to node 2. Node 2's #c is +n and
+        // ANon is not in B's roster, so the receiver gate must DROP it: BMem must NOT
+        // receive ANon's line within a generous window. ---
+        const fd_an = connectLoopback(port1) catch return error.SkipZigTest;
+        defer closeFd(fd_an);
+        var anon = LiveClient{ .fd = fd_an };
+        try writeAllFd(fd_an, "NICK ANon\r\nUSER anon 0 * :A NonMember\r\n");
+        try recvUntil(&anon, " 001 ANon ", 400);
+        bmem.reset();
+        // Fire several times to be sure the relay had every chance to arrive.
+        var n: usize = 0;
+        while (n < 10) : (n += 1) {
+            try writeAllFd(fd_an, "PRIVMSG #c :external blocked\r\n");
+            testSleepMs(20);
+        }
+        testSleepMs(150);
+        try bmem.readAvailable();
+        try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "external blocked") == null);
 
-    // --- Negative (+t): ANonOp, a non-op member of #c on node 1 (-t there), sets
-    // the topic; node 1 relays it to node 2 where #c is +t. Node 2 must REJECT it
-    // (topic unchanged / not echoed). We assert BMem does not see ANonOp's topic.
-    // First make ANon a member of #c on node 1 (it is -t, so a non-op can TOPIC).
-    try writeAllFd(fd_an, "JOIN #c\r\n");
-    try recvUntil(&anon, " 366 ANon #c ", 400);
-    bmem.reset();
-    n = 0;
-    while (n < 10) : (n += 1) {
-        try writeAllFd(fd_an, "TOPIC #c :hijacked topic\r\n");
-        testSleepMs(20);
-    }
-    testSleepMs(150);
-    try bmem.readAvailable();
-    try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "hijacked topic") == null);
+        // --- Negative (+t): ANonOp, a non-op member of #c on node 1 (-t there), sets
+        // the topic; node 1 relays it to node 2 where #c is +t. Node 2 must REJECT it
+        // (topic unchanged / not echoed). We assert BMem does not see ANonOp's topic.
+        // First make ANon a member of #c on node 1 (it is -t, so a non-op can TOPIC).
+        try writeAllFd(fd_an, "JOIN #c\r\n");
+        try recvUntil(&anon, " 366 ANon #c ", 400);
+        bmem.reset();
+        n = 0;
+        while (n < 10) : (n += 1) {
+            try writeAllFd(fd_an, "TOPIC #c :hijacked topic\r\n");
+            testSleepMs(20);
+        }
+        testSleepMs(150);
+        try bmem.readAvailable();
+        try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "hijacked topic") == null);
 
-    // --- Positive control (+t): AFounder (op on node 1) sets the topic; node 2
-    // must APPLY+echo it to BMem (the +t gate allows ops). ---
-    bmem.reset();
-    var topic_ok = false;
-    probes = 0;
-    while (probes < 80 and !topic_ok) : (probes += 1) {
-        try writeAllFd(fd_af, "TOPIC #c :legit topic\r\n");
-        recvUntil(&bmem, "TOPIC #c :legit topic", 120) catch {};
-        if (std.mem.indexOf(u8, bmem.written(), "TOPIC #c :legit topic") != null) topic_ok = true;
-    }
-    try std.testing.expect(topic_ok);
+        // --- Positive control (+t): AFounder (op on node 1) sets the topic; node 2
+        // must APPLY+echo it to BMem (the +t gate allows ops). ---
+        bmem.reset();
+        var topic_ok = false;
+        probes = 0;
+        while (probes < 80 and !topic_ok) : (probes += 1) {
+            try writeAllFd(fd_af, "TOPIC #c :legit topic\r\n");
+            recvUntil(&bmem, "TOPIC #c :legit topic", 120) catch {};
+            if (std.mem.indexOf(u8, bmem.written(), "TOPIC #c :legit topic") != null) topic_ok = true;
+        }
+        try std.testing.expect(topic_ok);
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: WHISPER and DATA relay to a remote-shard channel co-member" {
-    const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
-    var spec1_buf: [32]u8 = undefined;
-    var spec2_buf: [32]u8 = undefined;
-    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
-    const node1_peers = [_][]const u8{node2_spec};
-    const node2_peers = [_][]const u8{node1_spec};
+    if (comptime builtin.os.tag == .linux) {
+        const alloc = std.testing.allocator;
+        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        var spec1_buf: [32]u8 = undefined;
+        var spec2_buf: [32]u8 = undefined;
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_peers = [_][]const u8{node2_spec};
+        const node2_peers = [_][]const u8{node1_spec};
 
-    var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[0],
-        .node_id = 1,
-        .server_name = "node1.test",
-        .mesh_connect = &node1_peers,
-        .num_shards = 1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node1.deinit();
-    var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .s2s_port = s2s_ports[1],
-        .node_id = 2,
-        .server_name = "node2.test",
-        .mesh_connect = &node2_peers,
-        .num_shards = 1,
-        .sweep_interval_ms = 100,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
-    };
-    defer node2.deinit();
+        var node1 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[0],
+            .node_id = 1,
+            .server_name = "node1.test",
+            .mesh_connect = &node1_peers,
+            .num_shards = 1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node1.deinit();
+        var node2 = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .s2s_port = s2s_ports[1],
+            .node_id = 2,
+            .server_name = "node2.test",
+            .mesh_connect = &node2_peers,
+            .num_shards = 1,
+            .sweep_interval_ms = 100,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer node2.deinit();
 
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
-    const port2 = node2.boundPort() catch return error.SkipZigTest;
+        const port1 = node1.boundPort() catch return error.SkipZigTest;
+        const port2 = node2.boundPort() catch return error.SkipZigTest;
 
-    var run1 = std.atomic.Value(bool).init(true);
-    var run2 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
-    defer {
-        node1.requestStop(&run1);
-        node2.requestStop(&run2);
-        thr1.join();
-        thr2.join();
-    }
+        var run1 = std.atomic.Value(bool).init(true);
+        var run2 = std.atomic.Value(bool).init(true);
+        var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+        var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+        defer {
+            node1.requestStop(&run1);
+            node2.requestStop(&run2);
+            thr1.join();
+            thr2.join();
+        }
 
-    // Alice on node 1 (IRCX-enabled, so she may WHISPER/DATA) joins #x.
-    const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
-    defer closeFd(fd_a);
-    var alice = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK Alice\r\nUSER al 0 * :Alice\r\n");
-    try recvUntil(&alice, " 001 Alice ", 400);
-    try writeAllFd(fd_a, "IRCX\r\n");
-    try recvUntil(&alice, " 800 Alice 1 0 ", 400);
-    try writeAllFd(fd_a, "JOIN #x\r\n");
-    try recvUntil(&alice, " 366 Alice #x ", 400);
+        // Alice on node 1 (IRCX-enabled, so she may WHISPER/DATA) joins #x.
+        const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        var alice = LiveClient{ .fd = fd_a };
+        try writeAllFd(fd_a, "NICK Alice\r\nUSER al 0 * :Alice\r\n");
+        try recvUntil(&alice, " 001 Alice ", 400);
+        try writeAllFd(fd_a, "IRCX\r\n");
+        try recvUntil(&alice, " 800 Alice 1 0 ", 400);
+        try writeAllFd(fd_a, "JOIN #x\r\n");
+        try recvUntil(&alice, " 366 Alice #x ", 400);
 
-    // Bob on node 2 joins #x; the mesh must converge both rosters before we send.
-    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
-    defer closeFd(fd_b);
-    var bob = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_b, "NICK Bob\r\nUSER bo 0 * :Bob\r\n");
-    try recvUntil(&bob, " 001 Bob ", 400);
-    try writeAllFd(fd_b, "JOIN #x\r\n");
-    try recvUntil(&bob, " 366 Bob #x ", 400);
+        // Bob on node 2 joins #x; the mesh must converge both rosters before we send.
+        const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+        defer closeFd(fd_b);
+        var bob = LiveClient{ .fd = fd_b };
+        try writeAllFd(fd_b, "NICK Bob\r\nUSER bo 0 * :Bob\r\n");
+        try recvUntil(&bob, " 001 Bob ", 400);
+        try writeAllFd(fd_b, "JOIN #x\r\n");
+        try recvUntil(&bob, " 366 Bob #x ", 400);
 
-    try expectMeshPeerVisible(&alice, "node2.test", 200);
-    try expectMeshPeerVisible(&bob, "node1.test", 200);
+        try expectMeshPeerVisible(&alice, "node2.test", 200);
+        try expectMeshPeerVisible(&bob, "node1.test", 200);
 
-    // Wait until node 1 sees Bob's remote membership of #x land in the roster
-    // (a remote JOIN is surfaced to local members of #x).
-    var saw_bob = false;
-    var jp: usize = 0;
-    while (jp < 80 and !saw_bob) : (jp += 1) {
-        alice.readAvailable() catch {};
-        if (std.mem.indexOf(u8, alice.written(), "Bob") != null and
-            std.mem.indexOf(u8, alice.written(), "JOIN") != null) saw_bob = true;
-        if (!saw_bob) testSleepMs(25);
-    }
+        // Wait until node 1 sees Bob's remote membership of #x land in the roster
+        // (a remote JOIN is surfaced to local members of #x).
+        var saw_bob = false;
+        var jp: usize = 0;
+        while (jp < 80 and !saw_bob) : (jp += 1) {
+            alice.readAvailable() catch {};
+            if (std.mem.indexOf(u8, alice.written(), "Bob") != null and
+                std.mem.indexOf(u8, alice.written(), "JOIN") != null) saw_bob = true;
+            if (!saw_bob) testSleepMs(25);
+        }
 
-    // --- Cross-shard WHISPER: Alice (node 1) whispers Bob (node 2) on #x. The
-    // old bug returned ERR_NOSUCHNICK because Bob is not a LOCAL nick; the relay
-    // must now reach Bob. Fire several times to defeat any residual convergence
-    // lag, then assert Bob received the WHISPER and Alice got NO 401. ---
-    bob.reset();
-    alice.reset();
-    var whisper_ok = false;
-    var wp: usize = 0;
-    while (wp < 80 and !whisper_ok) : (wp += 1) {
-        try writeAllFd(fd_a, "WHISPER #x Bob :psst over the mesh\r\n");
-        recvUntil(&bob, ":Alice!al@", 120) catch {};
-        if (std.mem.indexOf(u8, bob.written(), "WHISPER #x Bob :psst over the mesh") != null) whisper_ok = true;
-    }
-    try std.testing.expect(whisper_ok);
-    try alice.readAvailable();
-    // No ERR_NOSUCHNICK (401) for the relayed WHISPER.
-    try std.testing.expect(std.mem.indexOf(u8, alice.written(), " 401 ") == null);
+        // --- Cross-shard WHISPER: Alice (node 1) whispers Bob (node 2) on #x. The
+        // old bug returned ERR_NOSUCHNICK because Bob is not a LOCAL nick; the relay
+        // must now reach Bob. Fire several times to defeat any residual convergence
+        // lag, then assert Bob received the WHISPER and Alice got NO 401. ---
+        bob.reset();
+        alice.reset();
+        var whisper_ok = false;
+        var wp: usize = 0;
+        while (wp < 80 and !whisper_ok) : (wp += 1) {
+            try writeAllFd(fd_a, "WHISPER #x Bob :psst over the mesh\r\n");
+            recvUntil(&bob, ":Alice!al@", 120) catch {};
+            if (std.mem.indexOf(u8, bob.written(), "WHISPER #x Bob :psst over the mesh") != null) whisper_ok = true;
+        }
+        try std.testing.expect(whisper_ok);
+        try alice.readAvailable();
+        // No ERR_NOSUCHNICK (401) for the relayed WHISPER.
+        try std.testing.expect(std.mem.indexOf(u8, alice.written(), " 401 ") == null);
 
-    // --- Negative: WHISPER to a nick that is NOT a member of #x anywhere must
-    // still yield 401 (the relay fails closed, never floods peers). ---
-    alice.reset();
-    var got_401 = false;
-    var np: usize = 0;
-    while (np < 40 and !got_401) : (np += 1) {
-        try writeAllFd(fd_a, "WHISPER #x Ghost :anyone there\r\n");
-        recvUntil(&alice, " 401 ", 120) catch {};
-        if (std.mem.indexOf(u8, alice.written(), " 401 ") != null) got_401 = true;
-    }
-    try std.testing.expect(got_401);
+        // --- Negative: WHISPER to a nick that is NOT a member of #x anywhere must
+        // still yield 401 (the relay fails closed, never floods peers). ---
+        alice.reset();
+        var got_401 = false;
+        var np: usize = 0;
+        while (np < 40 and !got_401) : (np += 1) {
+            try writeAllFd(fd_a, "WHISPER #x Ghost :anyone there\r\n");
+            recvUntil(&alice, " 401 ", 120) catch {};
+            if (std.mem.indexOf(u8, alice.written(), " 401 ") != null) got_401 = true;
+        }
+        try std.testing.expect(got_401);
 
-    // --- Cross-shard DATA: Alice sends a channel-targeted DATA to #x; Bob (the
-    // remote co-member) must receive the typed line. ---
-    bob.reset();
-    var data_ok = false;
-    var dp: usize = 0;
-    while (dp < 80 and !data_ok) : (dp += 1) {
-        try writeAllFd(fd_a, "DATA #x Mood :comic-frame-payload\r\n");
-        recvUntil(&bob, "DATA #x Mood :comic-frame-payload", 120) catch {};
-        if (std.mem.indexOf(u8, bob.written(), "DATA #x Mood :comic-frame-payload") != null) data_ok = true;
-    }
-    try std.testing.expect(data_ok);
+        // --- Cross-shard DATA: Alice sends a channel-targeted DATA to #x; Bob (the
+        // remote co-member) must receive the typed line. ---
+        bob.reset();
+        var data_ok = false;
+        var dp: usize = 0;
+        while (dp < 80 and !data_ok) : (dp += 1) {
+            try writeAllFd(fd_a, "DATA #x Mood :comic-frame-payload\r\n");
+            recvUntil(&bob, "DATA #x Mood :comic-frame-payload", 120) catch {};
+            if (std.mem.indexOf(u8, bob.written(), "DATA #x Mood :comic-frame-payload") != null) data_ok = true;
+        }
+        try std.testing.expect(data_ok);
+    } else return error.SkipZigTest;
 }
 
 test "wsCleanBoundary: only an idle, open, residue-free adapter is carriable" {
@@ -40608,278 +40746,288 @@ fn rehashTmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, name: []
 }
 
 test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs" {
-    const allocator = std.testing.allocator;
-    const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
-    const pem = @import("../proto/pem.zig");
+    if (comptime builtin.os.tag == .linux) {
+        const allocator = std.testing.allocator;
+        const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+        const pem = @import("../proto/pem.zig");
 
-    // Boot generation (main-owned analogue): cert A lives on this test's stack and
-    // is NEVER freed by the server — the server must only ever free its own reload
-    // generation. Run under the testing allocator so any double-free/leak fails.
-    var a_buf: [1024]u8 = undefined;
-    const a = try mintRehashTlsLeaf(&a_buf, 0x71, "a.test");
-    const boot_chain = [_][]const u8{a.der};
+        // Boot generation (main-owned analogue): cert A lives on this test's stack and
+        // is NEVER freed by the server — the server must only ever free its own reload
+        // generation. Run under the testing allocator so any double-free/leak fails.
+        var a_buf: [1024]u8 = undefined;
+        const a = try mintRehashTlsLeaf(&a_buf, 0x71, "a.test");
+        const boot_chain = [_][]const u8{a.der};
 
-    var server = Server.init(allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .tls_port = 0,
-        .tls_cert_chain = &boot_chain,
-        .tls_signing_key = a.kp,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &boot_chain,
+            .tls_signing_key = a.kp,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // Pre-reload: the live chain is the boot (stack-owned) cert A; no reload gen.
-    try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
-    try std.testing.expect(server.reload_tls == null);
+        // Pre-reload: the live chain is the boot (stack-owned) cert A; no reload gen.
+        try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
+        try std.testing.expect(server.reload_tls == null);
 
-    // Write a rotated cert B + its Ed25519 key (both PEM) to a temp dir.
-    var b_buf: [1024]u8 = undefined;
-    const b = try mintRehashTlsLeaf(&b_buf, 0x72, "b.test");
-    const b_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x72));
-    var b_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
-    const b_key_der = try ed25519_pkcs8.encode(&b_key_der_buf, b_seed);
+        // Write a rotated cert B + its Ed25519 key (both PEM) to a temp dir.
+        var b_buf: [1024]u8 = undefined;
+        const b = try mintRehashTlsLeaf(&b_buf, 0x72, "b.test");
+        const b_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x72));
+        var b_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+        const b_key_der = try ed25519_pkcs8.encode(&b_key_der_buf, b_seed);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var cert_pem_buf: [4096]u8 = undefined;
-    const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", b.der);
-    var key_pem_buf: [4096]u8 = undefined;
-    const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", b_key_der);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.pem", .data = cert_pem });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.key", .data = key_pem });
-    const b_cert_path = try rehashTmpPath(allocator, tmp, "b.pem");
-    defer allocator.free(b_cert_path);
-    const b_key_path = try rehashTmpPath(allocator, tmp, "b.key");
-    defer allocator.free(b_key_path);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cert_pem_buf: [4096]u8 = undefined;
+        const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", b.der);
+        var key_pem_buf: [4096]u8 = undefined;
+        const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", b_key_der);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.pem", .data = cert_pem });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.key", .data = key_pem });
+        const b_cert_path = try rehashTmpPath(allocator, tmp, "b.pem");
+        defer allocator.free(b_cert_path);
+        const b_key_path = try rehashTmpPath(allocator, tmp, "b.key");
+        defer allocator.free(b_key_path);
 
-    // Drive the cert-reload leg of REHASH directly (no socket needed): the live
-    // chain must now be cert B, owned by the server's reload generation.
-    const tls_b = config_format.Config.Tls{
-        .enabled = true,
-        .cert_path = b_cert_path,
-        .key_path = b_key_path,
-        .dns_name = "b.test",
-    };
-    const outcome_b = try server.reloadTlsCerts(std.testing.io, &tls_b);
-    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, outcome_b);
-    try std.testing.expectEqualSlices(u8, b.der, server.config.tls_cert_chain[0]);
-    try std.testing.expect(server.reload_tls != null);
-    // Boot cert A is untouched: its stack bytes are unchanged (the swap pointed the
-    // live chain at the server-owned reload gen and never freed the boot bytes —
-    // the testing allocator doesn't even own `a.der`, so any free attempt aborts).
-    var a_check_buf: [1024]u8 = undefined;
-    const a_again = try mintRehashTlsLeaf(&a_check_buf, 0x71, "a.test");
-    try std.testing.expectEqualSlices(u8, a_again.der, a.der);
-    // The new live signing key must match cert B's leaf, not boot cert A's.
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &server.config.tls_signing_key.?.public_key.toBytes(),
-        &a.kp.public_key.toBytes(),
-    ));
-    try std.testing.expectEqualSlices(
-        u8,
-        &b.kp.public_key.toBytes(),
-        &server.config.tls_signing_key.?.public_key.toBytes(),
-    );
+        // Drive the cert-reload leg of REHASH directly (no socket needed): the live
+        // chain must now be cert B, owned by the server's reload generation.
+        const tls_b = config_format.Config.Tls{
+            .enabled = true,
+            .cert_path = b_cert_path,
+            .key_path = b_key_path,
+            .dns_name = "b.test",
+        };
+        const outcome_b = try server.reloadTlsCerts(std.testing.io, &tls_b);
+        try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, outcome_b);
+        try std.testing.expectEqualSlices(u8, b.der, server.config.tls_cert_chain[0]);
+        try std.testing.expect(server.reload_tls != null);
+        // Boot cert A is untouched: its stack bytes are unchanged (the swap pointed the
+        // live chain at the server-owned reload gen and never freed the boot bytes —
+        // the testing allocator doesn't even own `a.der`, so any free attempt aborts).
+        var a_check_buf: [1024]u8 = undefined;
+        const a_again = try mintRehashTlsLeaf(&a_check_buf, 0x71, "a.test");
+        try std.testing.expectEqualSlices(u8, a_again.der, a.der);
+        // The new live signing key must match cert B's leaf, not boot cert A's.
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &server.config.tls_signing_key.?.public_key.toBytes(),
+            &a.kp.public_key.toBytes(),
+        ));
+        try std.testing.expectEqualSlices(
+            u8,
+            &b.kp.public_key.toBytes(),
+            &server.config.tls_signing_key.?.public_key.toBytes(),
+        );
 
-    // Second reload to cert C: the PRIOR reload generation (B) must be freed and
-    // replaced; under the testing allocator a leak or double-free here fails. The
-    // boot cert A must STILL never be freed (only the server-owned gen rotates).
-    var c_buf: [1024]u8 = undefined;
-    const c = try mintRehashTlsLeaf(&c_buf, 0x73, "c.test");
-    const c_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x73));
-    var c_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
-    const c_key_der = try ed25519_pkcs8.encode(&c_key_der_buf, c_seed);
-    var c_cert_pem_buf: [4096]u8 = undefined;
-    const c_cert_pem = try pem.encode(&c_cert_pem_buf, "CERTIFICATE", c.der);
-    var c_key_pem_buf: [4096]u8 = undefined;
-    const c_key_pem = try pem.encode(&c_key_pem_buf, "PRIVATE KEY", c_key_der);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.pem", .data = c_cert_pem });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.key", .data = c_key_pem });
-    const c_cert_path = try rehashTmpPath(allocator, tmp, "c.pem");
-    defer allocator.free(c_cert_path);
-    const c_key_path = try rehashTmpPath(allocator, tmp, "c.key");
-    defer allocator.free(c_key_path);
+        // Second reload to cert C: the PRIOR reload generation (B) must be freed and
+        // replaced; under the testing allocator a leak or double-free here fails. The
+        // boot cert A must STILL never be freed (only the server-owned gen rotates).
+        var c_buf: [1024]u8 = undefined;
+        const c = try mintRehashTlsLeaf(&c_buf, 0x73, "c.test");
+        const c_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x73));
+        var c_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+        const c_key_der = try ed25519_pkcs8.encode(&c_key_der_buf, c_seed);
+        var c_cert_pem_buf: [4096]u8 = undefined;
+        const c_cert_pem = try pem.encode(&c_cert_pem_buf, "CERTIFICATE", c.der);
+        var c_key_pem_buf: [4096]u8 = undefined;
+        const c_key_pem = try pem.encode(&c_key_pem_buf, "PRIVATE KEY", c_key_der);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.pem", .data = c_cert_pem });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.key", .data = c_key_pem });
+        const c_cert_path = try rehashTmpPath(allocator, tmp, "c.pem");
+        defer allocator.free(c_cert_path);
+        const c_key_path = try rehashTmpPath(allocator, tmp, "c.key");
+        defer allocator.free(c_key_path);
 
-    const tls_c = config_format.Config.Tls{
-        .enabled = true,
-        .cert_path = c_cert_path,
-        .key_path = c_key_path,
-        .dns_name = "c.test",
-    };
-    _ = try server.reloadTlsCerts(std.testing.io, &tls_c);
-    try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
-    // Cross-completion UAF fix (deferred-free by one generation): the just-replaced
-    // generation B is RETAINED as `reload_tls_prev` rather than freed inline, so an
-    // in-flight handshake that captured B's cert slice can't read freed bytes.
-    try std.testing.expect(server.reload_tls_prev != null);
-    try std.testing.expectEqualSlices(u8, b.der, server.reload_tls_prev.?.cert_chain[0]);
+        const tls_c = config_format.Config.Tls{
+            .enabled = true,
+            .cert_path = c_cert_path,
+            .key_path = c_key_path,
+            .dns_name = "c.test",
+        };
+        _ = try server.reloadTlsCerts(std.testing.io, &tls_c);
+        try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
+        // Cross-completion UAF fix (deferred-free by one generation): the just-replaced
+        // generation B is RETAINED as `reload_tls_prev` rather than freed inline, so an
+        // in-flight handshake that captured B's cert slice can't read freed bytes.
+        try std.testing.expect(server.reload_tls_prev != null);
+        try std.testing.expectEqualSlices(u8, b.der, server.reload_tls_prev.?.cert_chain[0]);
 
-    // Third reload to cert D: this is what actually fires the deferred-free branch
-    // on the live reload path — B (now two generations old) is freed here, C is
-    // retained as the new `reload_tls_prev`. Under the testing allocator a leak or
-    // double-free of B fails; the boot cert A is still never freed.
-    var d_buf: [1024]u8 = undefined;
-    const d = try mintRehashTlsLeaf(&d_buf, 0x77, "d.test");
-    const d_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x77));
-    var d_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
-    const d_key_der = try ed25519_pkcs8.encode(&d_key_der_buf, d_seed);
-    var d_cert_pem_buf: [4096]u8 = undefined;
-    const d_cert_pem = try pem.encode(&d_cert_pem_buf, "CERTIFICATE", d.der);
-    var d_key_pem_buf: [4096]u8 = undefined;
-    const d_key_pem = try pem.encode(&d_key_pem_buf, "PRIVATE KEY", d_key_der);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.pem", .data = d_cert_pem });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.key", .data = d_key_pem });
-    const d_cert_path = try rehashTmpPath(allocator, tmp, "d.pem");
-    defer allocator.free(d_cert_path);
-    const d_key_path = try rehashTmpPath(allocator, tmp, "d.key");
-    defer allocator.free(d_key_path);
-    const tls_d = config_format.Config.Tls{
-        .enabled = true,
-        .cert_path = d_cert_path,
-        .key_path = d_key_path,
-        .dns_name = "d.test",
-    };
-    _ = try server.reloadTlsCerts(std.testing.io, &tls_d);
-    try std.testing.expectEqualSlices(u8, d.der, server.config.tls_cert_chain[0]);
-    // C is now the retained previous generation (B was freed by this reload).
-    try std.testing.expect(server.reload_tls_prev != null);
-    try std.testing.expectEqualSlices(u8, c.der, server.reload_tls_prev.?.cert_chain[0]);
+        // Third reload to cert D: this is what actually fires the deferred-free branch
+        // on the live reload path — B (now two generations old) is freed here, C is
+        // retained as the new `reload_tls_prev`. Under the testing allocator a leak or
+        // double-free of B fails; the boot cert A is still never freed.
+        var d_buf: [1024]u8 = undefined;
+        const d = try mintRehashTlsLeaf(&d_buf, 0x77, "d.test");
+        const d_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x77));
+        var d_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+        const d_key_der = try ed25519_pkcs8.encode(&d_key_der_buf, d_seed);
+        var d_cert_pem_buf: [4096]u8 = undefined;
+        const d_cert_pem = try pem.encode(&d_cert_pem_buf, "CERTIFICATE", d.der);
+        var d_key_pem_buf: [4096]u8 = undefined;
+        const d_key_pem = try pem.encode(&d_key_pem_buf, "PRIVATE KEY", d_key_der);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.pem", .data = d_cert_pem });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d.key", .data = d_key_pem });
+        const d_cert_path = try rehashTmpPath(allocator, tmp, "d.pem");
+        defer allocator.free(d_cert_path);
+        const d_key_path = try rehashTmpPath(allocator, tmp, "d.key");
+        defer allocator.free(d_key_path);
+        const tls_d = config_format.Config.Tls{
+            .enabled = true,
+            .cert_path = d_cert_path,
+            .key_path = d_key_path,
+            .dns_name = "d.test",
+        };
+        _ = try server.reloadTlsCerts(std.testing.io, &tls_d);
+        try std.testing.expectEqualSlices(u8, d.der, server.config.tls_cert_chain[0]);
+        // C is now the retained previous generation (B was freed by this reload).
+        try std.testing.expect(server.reload_tls_prev != null);
+        try std.testing.expectEqualSlices(u8, c.der, server.reload_tls_prev.?.cert_chain[0]);
+    } else return error.SkipZigTest;
 }
 
 test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" {
-    const allocator = std.testing.allocator;
+    if (comptime builtin.os.tag == .linux) {
+        const allocator = std.testing.allocator;
 
-    var a_buf: [1024]u8 = undefined;
-    const a = try mintRehashTlsLeaf(&a_buf, 0x74, "a.test");
-    const boot_chain = [_][]const u8{a.der};
+        var a_buf: [1024]u8 = undefined;
+        const a = try mintRehashTlsLeaf(&a_buf, 0x74, "a.test");
+        const boot_chain = [_][]const u8{a.der};
 
-    var server = Server.init(allocator, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .tls_port = 0,
-        .tls_cert_chain = &boot_chain,
-        .tls_signing_key = a.kp,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+        var server = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &boot_chain,
+            .tls_signing_key = a.kp,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // A nonexistent cert path must surface an error and leave the live certs (and
-    // the absent reload generation) exactly as they were — failure keeps current.
-    const tls_bad = config_format.Config.Tls{
-        .enabled = true,
-        .cert_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.pem",
-        .key_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.key",
-        .dns_name = "a.test",
-    };
-    try std.testing.expectError(error.FileNotFound, server.reloadTlsCerts(std.testing.io, &tls_bad));
-    try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
-    try std.testing.expect(server.reload_tls == null);
-    try std.testing.expectEqualSlices(
-        u8,
-        &a.kp.public_key.toBytes(),
-        &server.config.tls_signing_key.?.public_key.toBytes(),
-    );
+        // A nonexistent cert path must surface an error and leave the live certs (and
+        // the absent reload generation) exactly as they were — failure keeps current.
+        const tls_bad = config_format.Config.Tls{
+            .enabled = true,
+            .cert_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.pem",
+            .key_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.key",
+            .dns_name = "a.test",
+        };
+        try std.testing.expectError(error.FileNotFound, server.reloadTlsCerts(std.testing.io, &tls_bad));
+        try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
+        try std.testing.expect(server.reload_tls == null);
+        try std.testing.expectEqualSlices(
+            u8,
+            &a.kp.public_key.toBytes(),
+            &server.config.tls_signing_key.?.public_key.toBytes(),
+        );
+    } else return error.SkipZigTest;
 }
 
 test "REHASH cert hot-reload: not configured when TLS is absent" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        const allocator = std.testing.allocator;
+        var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    // No cert chain loaded at boot: the reload leg is a no-op (not_configured),
-    // regardless of `enabled`, and never touches the (empty) live cert fields.
-    const tls = config_format.Config.Tls{ .enabled = true, .dns_name = "x.test" };
-    const outcome = try server.reloadTlsCerts(std.testing.io, &tls);
-    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.not_configured, outcome);
-    try std.testing.expect(server.reload_tls == null);
-    try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
+        // No cert chain loaded at boot: the reload leg is a no-op (not_configured),
+        // regardless of `enabled`, and never touches the (empty) live cert fields.
+        const tls = config_format.Config.Tls{ .enabled = true, .dns_name = "x.test" };
+        const outcome = try server.reloadTlsCerts(std.testing.io, &tls);
+        try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.not_configured, outcome);
+        try std.testing.expect(server.reload_tls == null);
+        try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
+    } else return error.SkipZigTest;
 }
 
 test "rotateTicketKey moves current to previous and generates a fresh key" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        const allocator = std.testing.allocator;
+        var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
 
-    const key_a = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0xAA));
-    server.tls_ticket_key = key_a;
-    server.tls_previous_ticket_key = null;
+        const key_a = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0xAA));
+        server.tls_ticket_key = key_a;
+        server.tls_previous_ticket_key = null;
 
-    // First rotation: A becomes previous, a fresh current is generated.
-    server.rotateTicketKey();
-    try std.testing.expect(server.tls_previous_ticket_key != null);
-    try std.testing.expectEqualSlices(u8, &key_a, &server.tls_previous_ticket_key.?);
-    try std.testing.expect(!std.mem.eql(u8, &key_a, &server.tls_ticket_key));
+        // First rotation: A becomes previous, a fresh current is generated.
+        server.rotateTicketKey();
+        try std.testing.expect(server.tls_previous_ticket_key != null);
+        try std.testing.expectEqualSlices(u8, &key_a, &server.tls_previous_ticket_key.?);
+        try std.testing.expect(!std.mem.eql(u8, &key_a, &server.tls_ticket_key));
 
-    // Second rotation: A is fully retired; the first-generated key becomes previous.
-    const key_b = server.tls_ticket_key;
-    server.rotateTicketKey();
-    try std.testing.expectEqualSlices(u8, &key_b, &server.tls_previous_ticket_key.?);
-    try std.testing.expect(!std.mem.eql(u8, &key_b, &server.tls_ticket_key));
+        // Second rotation: A is fully retired; the first-generated key becomes previous.
+        const key_b = server.tls_ticket_key;
+        server.rotateTicketKey();
+        try std.testing.expectEqualSlices(u8, &key_b, &server.tls_previous_ticket_key.?);
+        try std.testing.expect(!std.mem.eql(u8, &key_b, &server.tls_ticket_key));
+    } else return error.SkipZigTest;
 }
 
 test "REHASH applyReloadedLimits: swaps class registry + throttle without double-free" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit(); // testing allocator fails on any leak / double-free below
+    if (comptime builtin.os.tag == .linux) {
+        const allocator = std.testing.allocator;
+        var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit(); // testing allocator fails on any leak / double-free below
 
-    try std.testing.expect(server.conn_throttle == null);
+        try std.testing.expect(server.conn_throttle == null);
 
-    // First reload: enable the throttle + a custom class with a per-account cap.
-    // node.id + listen.irc are required for parseToml to validate.
-    const toml1 =
-        \\[node]
-        \\id = 1
-        \\[listen]
-        \\irc = 6680
-        \\[limits]
-        \\throttle_connects = 5
-        \\throttle_window = "10s"
-        \\[class.vip]
-        \\match_account = true
-        \\max_per_account = 3
-        \\
-    ;
-    var p1 = try config_format.parseToml(allocator, toml1, .{});
-    server.applyReloadedLimits(&p1);
-    p1.deinit(allocator); // the registry duped everything; freeing parsed is safe
-    try std.testing.expect(server.conn_throttle != null);
-    try std.testing.expectEqual(@as(u32, 5), server.config.throttle_connects);
-    try std.testing.expect(server.reload_class_registry != null);
-    try std.testing.expectEqual(@as(u32, 3), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
+        // First reload: enable the throttle + a custom class with a per-account cap.
+        // node.id + listen.irc are required for parseToml to validate.
+        const toml1 =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[limits]
+            \\throttle_connects = 5
+            \\throttle_window = "10s"
+            \\[class.vip]
+            \\match_account = true
+            \\max_per_account = 3
+            \\
+        ;
+        var p1 = try config_format.parseToml(allocator, toml1, .{});
+        server.applyReloadedLimits(&p1);
+        p1.deinit(allocator); // the registry duped everything; freeing parsed is safe
+        try std.testing.expect(server.conn_throttle != null);
+        try std.testing.expectEqual(@as(u32, 5), server.config.throttle_connects);
+        try std.testing.expect(server.reload_class_registry != null);
+        try std.testing.expectEqual(@as(u32, 3), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
 
-    // Second reload: disable the throttle + change the class — frees gen 1.
-    const toml2 =
-        \\[node]
-        \\id = 1
-        \\[listen]
-        \\irc = 6680
-        \\[limits]
-        \\throttle_connects = 0
-        \\[class.vip]
-        \\match_account = true
-        \\max_per_account = 7
-        \\
-    ;
-    var p2 = try config_format.parseToml(allocator, toml2, .{});
-    server.applyReloadedLimits(&p2);
-    p2.deinit(allocator);
-    try std.testing.expect(server.conn_throttle == null); // throttle disabled
-    try std.testing.expectEqual(@as(u32, 7), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
+        // Second reload: disable the throttle + change the class — frees gen 1.
+        const toml2 =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[limits]
+            \\throttle_connects = 0
+            \\[class.vip]
+            \\match_account = true
+            \\max_per_account = 7
+            \\
+        ;
+        var p2 = try config_format.parseToml(allocator, toml2, .{});
+        server.applyReloadedLimits(&p2);
+        p2.deinit(allocator);
+        try std.testing.expect(server.conn_throttle == null); // throttle disabled
+        try std.testing.expectEqual(@as(u32, 7), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
+    } else return error.SkipZigTest;
 }
 
 test {

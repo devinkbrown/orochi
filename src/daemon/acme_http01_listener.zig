@@ -13,6 +13,7 @@
 //! serving everything else. This listener never binds a public interface.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const http01 = @import("acme_http01_server.zig");
 const toml = @import("../proto/toml.zig");
@@ -137,12 +138,16 @@ pub const ChallengeServer = struct {
     }
 
     fn acceptLoop(self: *ChallengeServer) void {
-        while (!self.stop_flag.load(.acquire)) {
-            const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
-            switch (posix.errno(rc)) {
-                .SUCCESS => self.serveConn(@intCast(rc)),
-                .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
-                else => return, // listener closed (shutdown) or fatal: exit thread
+        // Linux-only accept loop (`accept4`/`SOCK_CLOEXEC`). Gate at comptime so
+        // foreign-target test builds compile; byte-identical on Linux.
+        if (comptime builtin.os.tag == .linux) {
+            while (!self.stop_flag.load(.acquire)) {
+                const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => self.serveConn(@intCast(rc)),
+                    .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
+                    else => return, // listener closed (shutdown) or fatal: exit thread
+                }
             }
         }
     }
@@ -170,11 +175,15 @@ pub const ChallengeServer = struct {
 // ---------------------------------------------------------------------------
 
 fn socketTcp() ListenerError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => error.SocketUnavailable,
-    };
+    // Linux-only (`SOCK_CLOEXEC`); force-referenced by `refAllDecls` in the test
+    // build, so gate the body at comptime. Byte-identical on Linux.
+    if (comptime builtin.os.tag == .linux) {
+        const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => error.SocketUnavailable,
+        };
+    } else return error.SocketUnavailable;
 }
 
 fn boundPort(fd: linux.fd_t) ListenerError!u16 {

@@ -17,6 +17,7 @@
 //! certificate) are supplied by the caller — this module pins nothing implicitly.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dlog = @import("dlog.zig");
 
 const tls_client = @import("../crypto/tls_client.zig");
@@ -573,20 +574,28 @@ fn connectAddr(addr: net.IpAddress) Error!linux.fd_t {
     }
 }
 
+// Linux-only socket helpers (SOCK_CLOEXEC). `refAllDecls` in the test build
+// force-references these module-level decls, so gate the bodies at comptime for
+// foreign-target compiles. On Linux they are analyzed and run exactly as before;
+// the live ACME runner is Linux-only.
 fn socketTcp() Error!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => error.SocketUnavailable,
-    };
+    if (comptime builtin.os.tag == .linux) {
+        const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => error.SocketUnavailable,
+        };
+    } else return error.SocketUnavailable;
 }
 
 fn udpSocket(family: u32) Error!linux.fd_t {
-    const rc = linux.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => error.SocketUnavailable,
-    };
+    if (comptime builtin.os.tag == .linux) {
+        const rc = linux.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => error.SocketUnavailable,
+        };
+    } else return error.SocketUnavailable;
 }
 
 fn closeFd(fd: linux.fd_t) void {
@@ -801,85 +810,87 @@ test "udpSocket opens an AF_INET6 datagram socket" {
 }
 
 test "queryOneServer6 round-trips an A record against a ::1 DNS responder" {
-    // End-to-end proof the v6 path opens a socket, connects, sends the query,
-    // and parses the reply — exercising exactly queryOneServer6 -> exchangeQuery.
-    // A real UDP/IPv6 loopback responder answers with one A record. If the
-    // sandbox has no usable IPv6 loopback, skip rather than fail.
-    const srv = udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
-    defer closeFd(srv);
+    if (comptime builtin.os.tag == .linux) {
+        // End-to-end proof the v6 path opens a socket, connects, sends the query,
+        // and parses the reply — exercising exactly queryOneServer6 -> exchangeQuery.
+        // A real UDP/IPv6 loopback responder answers with one A record. If the
+        // sandbox has no usable IPv6 loopback, skip rather than fail.
+        const srv = udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
+        defer closeFd(srv);
 
-    var bind_sa = linux.sockaddr.in6{
-        .port = 0, // ephemeral
-        .flowinfo = 0,
-        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, // ::1
-        .scope_id = 0,
-    };
-    if (posix.errno(linux.bind(srv, @ptrCast(&bind_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
-        return error.SkipZigTest; // no IPv6 loopback in this environment
+        var bind_sa = linux.sockaddr.in6{
+            .port = 0, // ephemeral
+            .flowinfo = 0,
+            .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, // ::1
+            .scope_id = 0,
+        };
+        if (posix.errno(linux.bind(srv, @ptrCast(&bind_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
+            return error.SkipZigTest; // no IPv6 loopback in this environment
 
-    // Recover the kernel-assigned ephemeral port.
-    var name_sa: linux.sockaddr.in6 = undefined;
-    var name_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
-    if (posix.errno(linux.getsockname(srv, @ptrCast(&name_sa), &name_len)) != .SUCCESS)
-        return error.SkipZigTest;
-    const bound_port = std.mem.bigToNative(u16, name_sa.port);
+        // Recover the kernel-assigned ephemeral port.
+        var name_sa: linux.sockaddr.in6 = undefined;
+        var name_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+        if (posix.errno(linux.getsockname(srv, @ptrCast(&name_sa), &name_len)) != .SUCCESS)
+            return error.SkipZigTest;
+        const bound_port = std.mem.bigToNative(u16, name_sa.port);
 
-    // Build the client query the same way systemResolveA does.
-    var query_buf: [dns.max_message_len]u8 = undefined;
-    const query = try dns.encodeQuery(&query_buf, 0x4242, "host.test", .a);
+        // Build the client query the same way systemResolveA does.
+        var query_buf: [dns.max_message_len]u8 = undefined;
+        const query = try dns.encodeQuery(&query_buf, 0x4242, "host.test", .a);
 
-    // Pre-stage the canned A-record response so we can reply the moment the
-    // query lands (single-threaded: receive, then send, then parse).
-    var resp_buf: [dns.max_message_len]u8 = undefined;
-    const answers = [_]dns.Answer{.{
-        .name = "host.test",
-        .rr_type = .a,
-        .ttl = 60,
-        .data = .{ .a = .{ 203, 0, 113, 7 } },
-    }};
-    const questions = [_]dns.Query{.{ .name = "host.test", .qtype = .a }};
-    const response = try dns.encodeMessage(&resp_buf, .{
-        .id = 0x4242,
-        .response = true,
-        .recursion_available = true,
-        .questions = &questions,
-        .answers = &answers,
-    });
+        // Pre-stage the canned A-record response so we can reply the moment the
+        // query lands (single-threaded: receive, then send, then parse).
+        var resp_buf: [dns.max_message_len]u8 = undefined;
+        const answers = [_]dns.Answer{.{
+            .name = "host.test",
+            .rr_type = .a,
+            .ttl = 60,
+            .data = .{ .a = .{ 203, 0, 113, 7 } },
+        }};
+        const questions = [_]dns.Query{.{ .name = "host.test", .qtype = .a }};
+        const response = try dns.encodeMessage(&resp_buf, .{
+            .id = 0x4242,
+            .response = true,
+            .recursion_available = true,
+            .questions = &questions,
+            .answers = &answers,
+        });
 
-    // Client side: connected UDP/IPv6 socket to our responder, send query.
-    const cli = try udpSocket(posix.AF.INET6);
-    defer closeFd(cli);
-    var dst_sa = linux.sockaddr.in6{
-        .port = std.mem.nativeToBig(u16, bound_port),
-        .flowinfo = 0,
-        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-        .scope_id = 0,
-    };
-    if (posix.errno(linux.connect(cli, @ptrCast(&dst_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
-        return error.SkipZigTest;
-    if (posix.errno(linux.write(cli, query.ptr, query.len)) != .SUCCESS) return error.SkipZigTest;
+        // Client side: connected UDP/IPv6 socket to our responder, send query.
+        const cli = try udpSocket(posix.AF.INET6);
+        defer closeFd(cli);
+        var dst_sa = linux.sockaddr.in6{
+            .port = std.mem.nativeToBig(u16, bound_port),
+            .flowinfo = 0,
+            .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            .scope_id = 0,
+        };
+        if (posix.errno(linux.connect(cli, @ptrCast(&dst_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
+            return error.SkipZigTest;
+        if (posix.errno(linux.write(cli, query.ptr, query.len)) != .SUCCESS) return error.SkipZigTest;
 
-    // Server side: receive the query, reply to the sender with the A record.
-    var in_buf: [dns.max_message_len]u8 = undefined;
-    var from_sa: linux.sockaddr.in6 = undefined;
-    var from_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
-    const rc = linux.recvfrom(srv, &in_buf, in_buf.len, 0, @ptrCast(&from_sa), &from_len);
-    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
-    if (posix.errno(linux.sendto(srv, response.ptr, response.len, 0, @ptrCast(&from_sa), from_len)) != .SUCCESS)
-        return error.SkipZigTest;
+        // Server side: receive the query, reply to the sender with the A record.
+        var in_buf: [dns.max_message_len]u8 = undefined;
+        var from_sa: linux.sockaddr.in6 = undefined;
+        var from_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+        const rc = linux.recvfrom(srv, &in_buf, in_buf.len, 0, @ptrCast(&from_sa), &from_len);
+        if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        if (posix.errno(linux.sendto(srv, response.ptr, response.len, 0, @ptrCast(&from_sa), from_len)) != .SUCCESS)
+            return error.SkipZigTest;
 
-    // Client reads + parses the reply exactly like exchangeQuery does.
-    var reply_buf: [dns.max_message_len]u8 = undefined;
-    const n_rc = linux.read(cli, &reply_buf, reply_buf.len);
-    try std.testing.expectEqual(linux.E.SUCCESS, posix.errno(n_rc));
-    const n: usize = @intCast(n_rc);
-    const msg = try dns.parseMessage(1, dns.max_cache_addrs, reply_buf[0..n]);
-    var found: ?[4]u8 = null;
-    for (msg.answerSlice()) |rr| switch (rr.data) {
-        .a => |ipv4| found = ipv4,
-        else => {},
-    };
-    try std.testing.expectEqual(@as(?[4]u8, .{ 203, 0, 113, 7 }), found);
+        // Client reads + parses the reply exactly like exchangeQuery does.
+        var reply_buf: [dns.max_message_len]u8 = undefined;
+        const n_rc = linux.read(cli, &reply_buf, reply_buf.len);
+        try std.testing.expectEqual(linux.E.SUCCESS, posix.errno(n_rc));
+        const n: usize = @intCast(n_rc);
+        const msg = try dns.parseMessage(1, dns.max_cache_addrs, reply_buf[0..n]);
+        var found: ?[4]u8 = null;
+        for (msg.answerSlice()) |rr| switch (rr.data) {
+            .a => |ipv4| found = ipv4,
+            else => {},
+        };
+        try std.testing.expectEqual(@as(?[4]u8, .{ 203, 0, 113, 7 }), found);
+    } else return error.SkipZigTest;
 }
 
 test {

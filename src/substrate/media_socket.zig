@@ -11,6 +11,7 @@
 //! I/O is hot and self-contained, so a dedicated UDP socket is simpler and does
 //! not perturb the client/S2S event loop.
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
@@ -37,15 +38,20 @@ pub const MediaSocket = struct {
     /// Create and bind a UDP socket. `bind_addr_be` is an IPv4 address already in
     /// network byte order (use `loopback_be` / `any_be`); `port` 0 = ephemeral.
     pub fn bind(bind_addr_be: u32, port: u16) Error!MediaSocket {
-        const rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
-        if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
-        const fd: linux.fd_t = @intCast(rc);
-        errdefer _ = linux.close(fd);
+        // Linux-only: uses `SOCK_CLOEXEC` and the linux socket ABI. Gate the body
+        // at comptime so foreign-target test builds compile (this UDP media socket
+        // only ever runs on the Linux daemon). On Linux it is byte-identical.
+        if (comptime builtin.os.tag == .linux) {
+            const rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+            if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
+            const fd: linux.fd_t = @intCast(rc);
+            errdefer _ = linux.close(fd);
 
-        var addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = bind_addr_be };
-        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
-            return error.BindFailed;
-        return .{ .fd = fd };
+            var addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = bind_addr_be };
+            if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+                return error.BindFailed;
+            return .{ .fd = fd };
+        } else return error.SocketUnavailable;
     }
 
     pub fn deinit(self: *MediaSocket) void {
