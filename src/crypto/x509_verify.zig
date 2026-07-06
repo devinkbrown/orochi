@@ -184,7 +184,12 @@ pub fn verifySimpleChain(chain_der: []const []const u8) Error!void {
 }
 
 /// Verify that `child`'s TBS bytes were signed by the holder of `issuer`'s key.
-fn verifySignedBy(child: LinkInfo, issuer: LinkInfo) Error!void {
+///
+/// Public so external chain verifiers (e.g. the TLS 1.2/1.3 clients' trust-anchor
+/// checks) can delegate the signature primitive here and inherit the full sig-alg
+/// set — RSA PKCS#1 SHA-256/384/512, RSASSA-PSS, ECDSA P-256, Ed25519 — instead of
+/// re-implementing a narrower dispatch. Both `LinkInfo`s come from `linkInfo`.
+pub fn verifySignedBy(child: LinkInfo, issuer: LinkInfo) Error!void {
     try verifyCertSignature(child.tbs_der, child.signature_der, child.sig_alg_oid, child.sig_alg_params, issuer.spki_der);
 }
 

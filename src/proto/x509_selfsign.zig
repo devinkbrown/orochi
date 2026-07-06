@@ -95,6 +95,11 @@ pub const RsaParams = struct {
     /// Sign with sha384WithRSAEncryption instead of sha256 (for exercising the
     /// SHA-384 RSA cert-verification path). Off by default.
     sig_sha384: bool = false,
+    /// Sign with id-RSASSA-PSS (SHA-256 / MGF1-SHA-256 / saltLength 32) instead of
+    /// the PKCS#1 v1.5 default, emitting an RSASSA-PSS-params signatureAlgorithm
+    /// (for exercising the PSS cert-verification path). Takes precedence over
+    /// `sig_sha384`. Off by default.
+    sig_pss: bool = false,
 };
 
 const tag_integer: u8 = 0x02;
@@ -107,6 +112,8 @@ const tag_set: u8 = 0x31;
 const tag_utc_time: u8 = 0x17;
 const tag_generalized_time: u8 = 0x18;
 const tag_context_0_constructed: u8 = 0xa0;
+const tag_context_1_constructed: u8 = 0xa1;
+const tag_context_2_constructed: u8 = 0xa2;
 
 const max_common_name_len = 64;
 const max_serial_len = 20;
@@ -118,6 +125,11 @@ const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }
 const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
 const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
+const oid_rsassa_pss = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a }; // 1.2.840.113549.1.1.10
+const oid_mgf1 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08 }; // 1.2.840.113549.1.1.8
+const oid_sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 }; // 2.16.840.1.101.3.4.2.1
+/// RSASSA-PSS saltLength minted here: equal to the SHA-256 digest length.
+const rsa_pss_salt_len: u8 = 32;
 const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
@@ -137,6 +149,8 @@ const SignatureAlgorithm = enum {
     ecdsa_p256_sha256,
     rsa_sha256,
     rsa_sha384,
+    /// id-RSASSA-PSS with SHA-256 / MGF1-SHA-256 / saltLength 32.
+    rsa_pss_sha256,
 };
 
 const RsaPublicKey = struct {
@@ -224,20 +238,36 @@ pub fn buildSelfSignedRsa(out: []u8, params: RsaParams) ![]const u8 {
     if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
     try validateParams(params);
 
-    const alg: SignatureAlgorithm = if (params.sig_sha384) .rsa_sha384 else .rsa_sha256;
+    const alg: SignatureAlgorithm = if (params.sig_pss)
+        .rsa_pss_sha256
+    else if (params.sig_sha384)
+        .rsa_sha384
+    else
+        .rsa_sha256;
     var tbs_buf: [2048]u8 = undefined;
     const tbs = try buildTbs(&tbs_buf, params, alg, .{
         .rsa = .{ .modulus = params.public_modulus, .exponent = params.public_exponent },
     });
     var sig_buf: [512]u8 = undefined;
-    const sig = if (params.sig_sha384) blk: {
-        var digest: [48]u8 = undefined;
-        Sha384.hash(tbs, &digest, .{});
-        break :blk try rsa_sign.signPkcs1v15(params.private_key, .sha384, &digest, &sig_buf);
-    } else blk: {
-        var digest: [32]u8 = undefined;
-        Sha256.hash(tbs, &digest, .{});
-        break :blk try rsa_sign.signPkcs1v15(params.private_key, .sha256, &digest, &sig_buf);
+    const sig = switch (alg) {
+        .rsa_pss_sha256 => blk: {
+            var digest: [32]u8 = undefined;
+            Sha256.hash(tbs, &digest, .{});
+            // A fixed 32-byte salt keeps the minted cert deterministic; PSS verify
+            // recovers the salt from the signature, so the value is immaterial.
+            const salt: [rsa_pss_salt_len]u8 = @splat(0xAB);
+            break :blk try rsa_sign.signPss(params.private_key, .sha256, &digest, &salt, &sig_buf);
+        },
+        .rsa_sha384 => blk: {
+            var digest: [48]u8 = undefined;
+            Sha384.hash(tbs, &digest, .{});
+            break :blk try rsa_sign.signPkcs1v15(params.private_key, .sha384, &digest, &sig_buf);
+        },
+        else => blk: {
+            var digest: [32]u8 = undefined;
+            Sha256.hash(tbs, &digest, .{});
+            break :blk try rsa_sign.signPkcs1v15(params.private_key, .sha256, &digest, &sig_buf);
+        },
     };
 
     var cert_body_buf: [3072]u8 = undefined;
@@ -408,7 +438,8 @@ fn writeSerial(w: *DerWriter, serial: []const u8) !void {
 }
 
 fn writeSignatureAlgorithmIdentifier(w: *DerWriter, algorithm: SignatureAlgorithm) !void {
-    var body_buf: [16]u8 = undefined;
+    // Large enough for the widest case: id-RSASSA-PSS OID + RSASSA-PSS-params.
+    var body_buf: [96]u8 = undefined;
     var body = DerWriter.init(&body_buf);
     switch (algorithm) {
         .ed25519 => try body.tlv(tag_oid, &oid_ed25519),
@@ -421,8 +452,49 @@ fn writeSignatureAlgorithmIdentifier(w: *DerWriter, algorithm: SignatureAlgorith
             try body.tlv(tag_oid, &oid_sha384_rsa);
             try body.tlv(tag_null, "");
         },
+        .rsa_pss_sha256 => {
+            try body.tlv(tag_oid, &oid_rsassa_pss);
+            try writeRsaPssSha256Params(&body);
+        },
     }
     try w.tlv(tag_sequence, body.bytes());
+}
+
+/// Append the RSASSA-PSS-params SEQUENCE (SHA-256 / MGF1-SHA-256 / saltLength 32,
+/// trailerField defaulted) that follows id-RSASSA-PSS in the signatureAlgorithm
+/// (RFC 4055 §3.1). The hash AlgorithmIdentifiers omit the optional NULL, which
+/// the verifier accepts.
+fn writeRsaPssSha256Params(w: *DerWriter) !void {
+    // SHA-256 AlgorithmIdentifier: SEQUENCE { OID id-sha256 }.
+    var sha_alg_buf: [16]u8 = undefined;
+    var sha_alg = DerWriter.init(&sha_alg_buf);
+    {
+        var oid_buf: [12]u8 = undefined;
+        var oid_w = DerWriter.init(&oid_buf);
+        try oid_w.tlv(tag_oid, &oid_sha256);
+        try sha_alg.tlv(tag_sequence, oid_w.bytes());
+    }
+
+    var params_buf: [96]u8 = undefined;
+    var params = DerWriter.init(&params_buf);
+    // hashAlgorithm [0] EXPLICIT AlgorithmIdentifier.
+    try params.tlv(tag_context_0_constructed, sha_alg.bytes());
+    // maskGenAlgorithm [1] EXPLICIT { OID id-mgf1, <SHA-256 AlgorithmIdentifier> }.
+    var mgf_buf: [48]u8 = undefined;
+    var mgf = DerWriter.init(&mgf_buf);
+    try mgf.tlv(tag_oid, &oid_mgf1);
+    try mgf.write(sha_alg.bytes());
+    var mgf_alg_buf: [48]u8 = undefined;
+    var mgf_alg = DerWriter.init(&mgf_alg_buf);
+    try mgf_alg.tlv(tag_sequence, mgf.bytes());
+    try params.tlv(tag_context_1_constructed, mgf_alg.bytes());
+    // saltLength [2] EXPLICIT INTEGER 32.
+    var salt_buf: [8]u8 = undefined;
+    var salt_w = DerWriter.init(&salt_buf);
+    try salt_w.tlv(tag_integer, &[_]u8{rsa_pss_salt_len});
+    try params.tlv(tag_context_2_constructed, salt_w.bytes());
+
+    try w.tlv(tag_sequence, params.bytes());
 }
 
 fn writeRsaPublicKeyAlgorithmIdentifier(w: *DerWriter) !void {
@@ -1032,6 +1104,49 @@ test "buildSelfSignedRsa with sig_sha384 emits sha384WithRSA + verifies under SH
     var digest: [48]u8 = undefined;
     Sha384.hash(tbs.full, &digest, .{});
     try testing.expect(rsa_verify.verifyPkcs1v15(.{ .n = &rsa_n, .e = &rsa_e }, .sha384, &digest, sig_bits.value[1..]));
+}
+
+test "buildSelfSignedRsa with sig_pss emits id-RSASSA-PSS and verifies through x509_verify" {
+    const x509 = @import("../crypto/x509.zig");
+    const x509_verify = @import("../crypto/x509_verify.zig");
+    const rsa_n = hexToBytes("a0bd1304a87f0a69b8ef18eaa1da15522c221b1e9b1efaee23bea1faa7eaaefe1e09eba390ec9334aea9457530d40c6a6b89c039865e98dd9d7491ea57288debf370f796fe05904a589027272fc9bd803fcf9d228c5552da7ff4f2a25c1606b3a4794f4ffa5bd94ab2150026dbcd31c4f4a5755d449a7aaf41861ff069fa455563cb22de14114aff8085fc3d3c07bc929d761f6449c1a13975738c9876319599f88bd3676230802d76b7292ad0759dad8fc70ee18fded69e32216a7f52833f1138caa7f90307c236500c3aa1a6cd082097fc3e28609b8d33514f16d6687bed504aee82775a41e4b125eba9ca544dc375c29c19d20f10900301eea8e68be3b3d7");
+    const rsa_e = hexToBytes("010001");
+    const rsa_d = hexToBytes("12036e6cb0b76002de1b49770e01632f4ccbdbaf2fe2266be6ac97f97fb4f0bc80c04adc8f42bbf284fa6a52ca50913da1e4939abec0be2fe3d3eb0050993662716b410bf656c84754aa7f00c8bdba93735340805d2ab8b8cceb35ffd50310e833eff65ff7a630714b08c876125eea0b710153e84a6667865978fefe51da1ec7d7cfc1afb96c4223b187b49cb6305be1a2eccbb8d07ed016bc257908bec7daf322658bda2dc4abd3671ffa6919da8b86ecbefa2658c3c01bacee5c9cff02f1cbac3f05feb2d68c61ef9a5427f73edb1949f776350bd63475c3cb78c5605b094d5043756e894bf538e811903212b6990a75153e261a36630657f8b91dfdadf45d");
+    const rsa_p = hexToBytes("e03b0d999233d320ae90bb8fa28ba36ad8c0bedeea9bc1218f65f1aac329e0c921a6aaf62a56719c6bd01c33ff119a657005eb500c33aa52e6d2fb6a55723f6fc2076fb8d30df12801dca523515992cad6ad628d180947e846fa3a3a3046c84c25266faf9079f44022bd4b5600d98a8ee4cbda9fddf01e9efb5d7eb62f7edb5d");
+    const rsa_q = hexToBytes("b7832256daec3eb9c325d1cdd4b3e2036723d02daa96e029518640c40d87bde9df147bd8488031df85caa449ec42735cbfd1125f843027352d396e7e9024b76335a98148a553d31872f32275582897d1e8f2b1460f1a3bd0375fe8a884f2372e716d51a4b71043c9730d74a7263476362d502496c19f6a45a615517b4a7f4cc3");
+    const rsa_dp = hexToBytes("1a1be62e7e8e9843d2efb95735370b3532bde6bbb017a8ba4ea731279007fd4b8e2688fb96dc6fe825c99aaf174126782f3e113345e87229ab04e00f769991f762615949ed114f86380948153fb0ad5dfef73b65706a0c3c689f544e5836b5b5e01184a9ada9f59dce2dba6aee386660d31545849de40abcba4a1da9fb07cb65");
+    const rsa_dq = hexToBytes("90779aabf7b2adfabda763507fd790e10eec41b201aebf0fa80f61a335e79bd9a675d0bd46ee2cd503d5b09a457556ae388f95c03e274e666d90ddeca2fb54a7b49219a620092a90ffc56a66289de44f2aed0c23d435d9caa41d4be286aecc4432a555f5aeec0e016422bea7ebcab71915791724db8eed31a17afce76b9165d3");
+    const rsa_qinv = hexToBytes("c4cae178938b60717e4d0484c144c548b275f87dd2723cfe1b6a5ba68305b154d1c86c894716bd9d5b4f974f51ad98942fa26005188896931a73206b778b946f96c6443f67bbb1861ce8a2e9d438befdb6cb1b7f413edc5b155b436660320f3cd26b0f65a9f586f957257b81e7c410856150abf4bb8f691beabecf7e428a2f8c");
+    const priv = rsa_sign.PrivateKey{ .n = &rsa_n, .e = &rsa_e, .d = &rsa_d, .p = &rsa_p, .q = &rsa_q, .dp = &rsa_dp, .dq = &rsa_dq, .qinv = &rsa_qinv };
+    var out: [2048]u8 = undefined;
+    const der = try buildSelfSignedRsa(&out, .{
+        .common_name = "rsapss.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x52, 0x03 },
+        .public_modulus = &rsa_n,
+        .public_exponent = &rsa_e,
+        .private_key = priv,
+        .dns_names = &.{"rsapss.test"},
+        .sig_pss = true,
+    });
+
+    // The parsed cert advertises id-RSASSA-PSS.
+    const cert = try x509.parse(der);
+    try testing.expectEqualSlices(u8, &oid_rsassa_pss, cert.signature_algorithm_oid);
+
+    // The self-signature verifies through the shared verifier's PSS branch, which
+    // parses the RSASSA-PSS-params carried in sig_alg_params — proving the minted
+    // params SEQUENCE is well-formed and the salt/hash/MGF match the signature.
+    const info = try x509_verify.linkInfo(der);
+    try x509_verify.verifyCertSignature(info.tbs_der, info.signature_der, info.sig_alg_oid, info.sig_alg_params, info.spki_der);
+
+    // A flipped signature byte is rejected by the same PSS path.
+    var tampered: [2048]u8 = undefined;
+    @memcpy(tampered[0..der.len], der);
+    tampered[der.len - 1] ^= 0x01;
+    const bad = try x509_verify.linkInfo(tampered[0..der.len]);
+    try testing.expectError(error.BadSignature, x509_verify.verifyCertSignature(bad.tbs_der, bad.signature_der, bad.sig_alg_oid, bad.sig_alg_params, bad.spki_der));
 }
 
 test "buildSelfSigned rejects malformed SAN dnsNames" {
