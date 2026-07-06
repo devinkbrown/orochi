@@ -283,16 +283,18 @@ pub const TlsConn = struct {
     }
 
     /// A fatal TLS alert record to send for the handshake error `err` before
-    /// closing (RFC 8446 §6). Only produced before a ServerHello (plaintext, no
-    /// keys): the TLS 1.3 engine gates on its own state; an `undecided` engine
-    /// (version-detect / init failure) has sent nothing either, so a plaintext
-    /// alert is likewise correct. The 1.2 leg has no encoder yet ⇒ null (bare
-    /// close, the prior behavior). Caller owns the returned buffer.
-    pub fn takeAlert(self: *const TlsConn, err: anyerror) ?[]u8 {
+    /// closing (RFC 8446 §6). Each engine picks the correct encoding for its
+    /// state: the TLS 1.3 engine emits a plaintext alert before its ServerHello
+    /// and an encrypted one (under the active write keys) afterward; the TLS 1.2
+    /// engine emits plaintext before it sends its ChangeCipherSpec and encrypted
+    /// after. An `undecided` engine (version-detect / init failure) has sent
+    /// nothing, so a plaintext alert is correct. Either engine returns null for a
+    /// state where no alert is warranted (bare close). Caller owns the buffer.
+    pub fn takeAlert(self: *TlsConn, err: anyerror) ?[]u8 {
         return switch (self.engine) {
             .tls13 => |*s| s.takeAlert(err),
             .undecided => tls_server.alertRecordForError(self.allocator, err),
-            .tls12 => null,
+            .tls12 => |*s| s.takeAlert(err),
         };
     }
 

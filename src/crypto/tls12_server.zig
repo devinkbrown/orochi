@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 
 const tls12 = @import("tls12.zig");
 const tls12_client = @import("tls12_client.zig");
+const tls_server = @import("tls_server.zig");
 const tls_record = @import("tls_record.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
@@ -243,6 +244,46 @@ pub const Server = struct {
 
     pub fn handshakeDone(self: *const Server) bool {
         return self.state == .connected;
+    }
+
+    /// A fatal TLS alert (RFC 5246 §7.2) to send for the handshake error `err`
+    /// BEFORE closing, so the peer learns why instead of seeing a bare reset. The
+    /// §6 AlertDescription mapping is shared with the TLS 1.3 leg
+    /// (`tls_server.alertDescriptionForError`); the record encoding depends on
+    /// whether the server has already sent its ChangeCipherSpec:
+    ///   * Full-handshake wait states + the initial ClientHello wait
+    ///     (`wait_client_hello`, `wait_client_certificate`,
+    ///     `wait_client_certificate_verify`, `wait_client_key_exchange`,
+    ///     `wait_client_ccs`, `wait_client_finished`) — the server's CCS is only
+    ///     emitted in its final flight (which advances straight to `connected`),
+    ///     so its write is still in the clear ⇒ a PLAINTEXT alert (content_type 21).
+    ///   * Resumed/abbreviated wait states (`wait_resumed_client_ccs`,
+    ///     `wait_resumed_client_finished`) — the server already sent CCS +
+    ///     Finished in `buildResumedServerFlight`, so its write cipher is active
+    ///     ⇒ the alert is sealed under `keys.server_write` at the next-unused
+    ///     write seq (`hs_write_seq`), which is then bumped so the nonce is never
+    ///     reused.
+    ///   * `connected` — a post-handshake record fault is out of this path's
+    ///     scope ⇒ null (bare close). Caller owns the returned buffer.
+    pub fn takeAlert(self: *Server, err: anyerror) ?[]u8 {
+        const desc = tls_server.alertDescriptionForError(err) orelse return null;
+        const body = [_]u8{ @intFromEnum(tls_server.AlertLevel.fatal), @intFromEnum(desc) };
+        switch (self.state) {
+            .wait_resumed_client_ccs, .wait_resumed_client_finished => {
+                const suite = self.selected_suite orelse return null;
+                const rec = tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_write_seq, .alert, &body) catch return null;
+                self.hs_write_seq += 1;
+                return rec;
+            },
+            .wait_client_hello,
+            .wait_client_certificate,
+            .wait_client_certificate_verify,
+            .wait_client_key_exchange,
+            .wait_client_ccs,
+            .wait_client_finished,
+            => return tls12.writePlainRecord(self.allocator, .alert, &body) catch null,
+            .connected => return null,
+        }
     }
 
     /// The presented client leaf DER whose CertificateVerify possession proof
@@ -2003,6 +2044,123 @@ test "TLS 1.2 presenting a ticket performs the abbreviated handshake and exchang
     const c_plain = try client.decrypt(s_app);
     defer allocator.free(c_plain);
     try std.testing.expectEqualSlices(u8, "resumed server to client", c_plain);
+}
+
+test "TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCipherSpec" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    // Case A: a fresh server (wait_client_hello) — nothing sent, plaintext.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const rec = server.takeAlert(error.ProtocolVersion) orelse return error.BadHandshake;
+        defer allocator.free(rec);
+        // [content_type=21][03 03][len=0x0002][level=fatal(2)][desc=protocol_version(70)]
+        try std.testing.expectEqual(@as(usize, 7), rec.len);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rec[3..5], .big));
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.protocol_version)), rec[6]);
+
+        // OutOfMemory maps to no description ⇒ no alert.
+        try std.testing.expect(server.takeAlert(error.OutOfMemory) == null);
+    }
+
+    // Case B: mid full handshake (wait_client_key_exchange) — the server has sent
+    // only its plaintext flight (SH/Cert/SKE/SHD), not its CCS ⇒ still plaintext.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+        });
+        defer client.deinit();
+
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        allocator.free(sf);
+        try std.testing.expectEqual(State.wait_client_key_exchange, server.state);
+        try std.testing.expectEqual(@as(u64, 0), server.hs_write_seq);
+
+        const rec = server.takeAlert(error.BadHandshake) orelse return error.BadHandshake;
+        defer allocator.free(rec);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.decode_error)), rec[6]);
+        // No write seq consumed on the plaintext path.
+        try std.testing.expectEqual(@as(u64, 0), server.hs_write_seq);
+    }
+}
+
+test "TLS 1.2 takeAlert seals an ENCRYPTED fatal alert after the resumed server ChangeCipherSpec" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // Resume: the abbreviated server flight sends ServerHello, CCS, and an
+    // encrypted Finished up front, so once it is emitted the server's write
+    // cipher is active and it waits in `wait_resumed_client_ccs`.
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.setSessionTicket(stored);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    allocator.free(sf);
+    try std.testing.expectEqual(State.wait_resumed_client_ccs, server.state);
+    // The abbreviated flight sealed its Finished at seq 0, so the next unused
+    // server write seq is 1.
+    try std.testing.expectEqual(@as(u64, 1), server.hs_write_seq);
+
+    const suite = server.selected_suite orelse return error.BadHandshake;
+    const rec = server.takeAlert(error.FinishedMismatch) orelse return error.BadHandshake;
+    defer allocator.free(rec);
+    // The nonce/seq is consumed so it can never be reused.
+    try std.testing.expectEqual(@as(u64, 2), server.hs_write_seq);
+    // TLS 1.2 does not hide the content type: the OUTER record is alert (21).
+    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+    // It decrypts under the server write keys at the seq used (1), to
+    // [fatal(2)][decrypt_error(51)].
+    const opened = try tls12.openRecordAlloc(allocator, suite, &server.keys.server_write, 1, rec);
+    defer allocator.free(opened.plaintext);
+    try std.testing.expectEqual(tls12.ContentType.alert, opened.content_type);
+    try std.testing.expectEqualSlices(u8, &.{
+        @intFromEnum(tls_server.AlertLevel.fatal),
+        @intFromEnum(tls_server.AlertDescription.decrypt_error),
+    }, opened.plaintext);
 }
 
 test "TLS 1.2 tampered ticket falls back to a full handshake and still connects" {

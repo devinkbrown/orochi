@@ -228,7 +228,7 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         error.ProtocolVersion => .protocol_version,
         error.MissingExtension => .missing_extension,
         error.UnsupportedGroup, error.UnsupportedCipherSuite => .handshake_failure,
-        error.FinishedMismatch => .decrypt_error, // (post-ServerHello ⇒ gated to null here)
+        error.FinishedMismatch => .decrypt_error, // (post-ServerHello ⇒ sent encrypted, see takeAlert)
         error.NoCertificate, error.NoSigningKey, error.LeafKeyMismatch => .internal_error,
         // Malformed handshake bytes or a wrong first-record content type: the peer
         // sent something we couldn't decode.
@@ -246,6 +246,26 @@ pub fn alertRecordForError(allocator: Allocator, err: anyerror) ?[]u8 {
     const desc = alertDescriptionForError(err) orelse return null;
     const body = [_]u8{ @intFromEnum(AlertLevel.fatal), @intFromEnum(desc) };
     return writePlainRecord(allocator, .alert, &body) catch null;
+}
+
+/// Encode a fatal-alert ENCRYPTED record for `err` (RFC 8446 §6), or null when
+/// no alert should be sent. The alert travels as a TLSInnerPlaintext with inner
+/// content_type `alert` (21) sealed under `keys`/`seq`, so the record's OUTER
+/// content_type on the wire is application_data (23). Correct only AFTER the
+/// ServerHello, when handshake/application keys exist. The caller MUST pass the
+/// connection's currently-active server write keys + the next-unused write seq
+/// for its state and must not reuse `seq` afterward (see `Server.takeAlert`).
+/// Caller owns the returned buffer.
+fn alertRecordEncrypted(
+    allocator: Allocator,
+    err: anyerror,
+    suite: CipherSuite,
+    keys: *const TrafficKeys,
+    seq: u64,
+) ?[]u8 {
+    const desc = alertDescriptionForError(err) orelse return null;
+    const body = [_]u8{ @intFromEnum(AlertLevel.fatal), @intFromEnum(desc) };
+    return sealRecordAlloc(allocator, suite, keys, seq, .alert, &body) catch null;
 }
 
 const CipherSuite = enum(u16) {
@@ -503,17 +523,32 @@ pub const Server = struct {
     /// A fatal TLS alert (RFC 8446 §6) to send for the handshake error `err`
     /// BEFORE closing, so the peer learns why instead of seeing a bare reset.
     ///
-    /// Only emitted while still awaiting a (first or retried) ClientHello — before
-    /// any ServerHello, so no handshake keys exist and a PLAINTEXT alert is
-    /// correct. After the ServerHello the alert would have to be encrypted under
-    /// the handshake/application keys (a documented follow-up); there we return
-    /// null and the caller closes bare. Caller owns the returned buffer.
-    pub fn takeAlert(self: *const Server, err: anyerror) ?[]u8 {
+    /// The record encoding depends on where the state machine is:
+    ///   * `wait_client_hello` / `wait_second_client_hello` — before any
+    ///     ServerHello, so no keys exist ⇒ a PLAINTEXT alert (content_type 21).
+    ///   * `wait_client_cert` / `wait_client_cert_verify` / `wait_client_finished`
+    ///     — the server has already sent its Finished under the handshake keys and
+    ///     switched its write to the APPLICATION traffic keys (0.5-RTT semantics,
+    ///     RFC 8446 §A.1). An alert here MUST be sealed under
+    ///     `server_app_keys`/`app_write_seq` (outer content_type 23); a FinishedMismatch
+    ///     (wait_client_finished) or a bad client Certificate/CertificateVerify
+    ///     (wait_client_cert/_verify) surface in exactly these states. The write
+    ///     seq is bumped so the nonce is never reused.
+    ///   * `idle` (never fed) / `connected` (post-handshake; a record-layer fault
+    ///     there is out of this path's scope) ⇒ null, caller closes bare.
+    ///
+    /// Caller owns the returned buffer.
+    pub fn takeAlert(self: *Server, err: anyerror) ?[]u8 {
         switch (self.state) {
-            .wait_client_hello, .wait_second_client_hello => {},
-            else => return null,
+            .wait_client_hello, .wait_second_client_hello => return alertRecordForError(self.allocator, err),
+            .wait_client_cert, .wait_client_cert_verify, .wait_client_finished => {
+                const suite = self.selected_suite orelse return null;
+                const rec = alertRecordEncrypted(self.allocator, err, suite, &self.server_app_keys, self.app_write_seq) orelse return null;
+                self.app_write_seq += 1;
+                return rec;
+            },
+            .idle, .connected => return null,
         }
-        return alertRecordForError(self.allocator, err);
     }
 
     /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
@@ -3715,10 +3750,100 @@ test "takeAlert emits a fatal plaintext alert only before the ServerHello" {
     // OutOfMemory ⇒ no alert even before ServerHello.
     try std.testing.expect(server.takeAlert(error.OutOfMemory) == null);
 
-    // Past the ClientHello wait, a plaintext alert would be wrong (keys exist) ⇒
-    // null (bare close; encrypted alerts are a follow-up).
+    // A plaintext alert would be wrong past the ClientHello wait (keys exist).
+    // `connected` is a completed handshake (a record-layer fault there is out of
+    // this path's scope) ⇒ null (bare close). The post-ServerHello *handshake*
+    // states emit an ENCRYPTED alert instead — see the next test.
     server.state = .connected;
     try std.testing.expect(server.takeAlert(error.BadHandshake) == null);
+}
+
+test "takeAlert seals an ENCRYPTED fatal alert for post-ServerHello handshake errors" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x53} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x07},
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    // ── Case 1: FinishedMismatch while awaiting the client Finished ──────────
+    // Drive a real handshake up to (not through) the client Finished: after the
+    // server emits its flight it is in `wait_client_finished` with the server
+    // application write keys derived and `app_write_seq == 0`.
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer server.deinit();
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer client.deinit();
+
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sflight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        alloc.free(sflight);
+        // The server has sent its Finished and switched its write to the app keys.
+        try std.testing.expectEqual(State.wait_client_finished, server.state);
+        try std.testing.expectEqual(@as(u64, 0), server.app_write_seq);
+
+        const suite = server.selected_suite orelse return error.TestUnexpectedResult;
+        const rec = server.takeAlert(error.FinishedMismatch) orelse return error.TestUnexpectedResult;
+        defer alloc.free(rec);
+        // The nonce/seq is consumed so it can never be reused.
+        try std.testing.expectEqual(@as(u64, 1), server.app_write_seq);
+        // On the wire a TLS 1.3 encrypted record has outer content_type 23.
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_record.ContentType.application_data)), rec[0]);
+        // It decrypts under the server application write keys at the seq used (0),
+        // to an inner alert(21) carrying [fatal(2)][decrypt_error(51)].
+        const opened = try openRecordAlloc(alloc, suite, &server.server_app_keys, 0, rec);
+        defer alloc.free(opened.content);
+        try std.testing.expectEqual(tls_record.ContentType.alert, opened.content_type);
+        try std.testing.expectEqualSlices(u8, &.{
+            @intFromEnum(AlertLevel.fatal),
+            @intFromEnum(AlertDescription.decrypt_error),
+        }, opened.content);
+    }
+
+    // ── Case 2: bad client Certificate while awaiting it (mTLS) ──────────────
+    // With request_client_cert the server jumps to `wait_client_cert` right after
+    // its flight; the write keys are the same application keys (seq 0).
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .request_client_cert = true });
+        defer server.deinit();
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer client.deinit();
+
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sflight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        alloc.free(sflight);
+        try std.testing.expectEqual(State.wait_client_cert, server.state);
+
+        const suite = server.selected_suite orelse return error.TestUnexpectedResult;
+        const rec = server.takeAlert(error.BadHandshake) orelse return error.TestUnexpectedResult;
+        defer alloc.free(rec);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_record.ContentType.application_data)), rec[0]);
+        const opened = try openRecordAlloc(alloc, suite, &server.server_app_keys, 0, rec);
+        defer alloc.free(opened.content);
+        try std.testing.expectEqual(tls_record.ContentType.alert, opened.content_type);
+        try std.testing.expectEqualSlices(u8, &.{
+            @intFromEnum(AlertLevel.fatal),
+            @intFromEnum(AlertDescription.decode_error),
+        }, opened.content);
+    }
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {

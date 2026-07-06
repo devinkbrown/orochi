@@ -6740,9 +6740,10 @@ pub const LinuxServer = struct {
     fn driveTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !void {
         const outcome = conn.tls.?.onInbound(chunk) catch |err| {
             // RFC 8446 §6: send a fatal alert so the peer learns WHY the handshake
-            // failed instead of seeing a bare reset. Only pre-ServerHello errors
-            // yield a (plaintext) alert; it rides the normal drain-then-close path
-            // (armSendIfNeeded after this returns flushes it, then the conn closes).
+            // failed instead of seeing a bare reset. `takeAlert` returns a plaintext
+            // alert pre-ServerHello and an encrypted one afterward (or null when it
+            // can't); it rides the normal drain-then-close path (armSendIfNeeded
+            // after this returns flushes it, then the conn closes).
             if (conn.tls.?.takeAlert(err)) |alert_rec| {
                 defer self.allocator.free(alert_rec);
                 rawAppendToConn(conn, alert_rec) catch {};
