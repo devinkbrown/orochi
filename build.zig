@@ -286,6 +286,30 @@ pub fn build(b: *std.Build) void {
     const ct_check_step = b.step("ct-check", "Run the opt-in dudect-style constant-time verification harness (roadmap 0.4)");
     ct_check_step.dependOn(&ct_check_run.step);
 
+    // `zig build fuzz` — the coverage-guided fuzz targets (roadmap 0.2 follow-up).
+    // These are the `cov-fuzz:` tests in src/crypto/tls_fuzz.zig: one
+    // `std.testing.fuzz` target per attacker-facing wire parser (X.509, TLS
+    // record, OCSP, ClientHello/handshake, cert-compression inflate, SNI).
+    //
+    // Two modes, one step:
+    //   * `zig build fuzz`         — replay each target's seed corpus once
+    //                                (bounded, fast: a compile-and-no-crash gate).
+    //   * `zig build fuzz --fuzz`  — drive the SAME targets coverage-guided via
+    //                                Zig 0.16's builtin fuzzer (runs until stopped).
+    //
+    // Kept SEPARATE from `zig build test` (which still runs these targets, but
+    // only in bounded corpus-replay mode) so the fuzz filter never perturbs the
+    // full ~6100-test suite, mirroring the ct-check step above. The test filter
+    // scopes the artifact to just the `cov-fuzz:` targets so `--fuzz` fuzzes the
+    // TLS parsers in isolation rather than every fuzz test in the tree.
+    const fuzz_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{"cov-fuzz:"},
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run the coverage-guided TLS-parser fuzz targets (roadmap 0.2); add --fuzz to drive them coverage-guided");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
     // `zig build quic-interop-server` — a standalone test harness binary that
     // stands up the real `WebTransportListener` (QUIC/HTTP3) on an ephemeral UDP
     // port with a self-signed cert and blocks, so `tools/quic_interop.sh` can run
