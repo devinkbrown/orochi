@@ -10,7 +10,7 @@ const fuzz_iterations: usize = 4000;
 const escape_iterations: usize = 3000;
 const generated_iterations: usize = 1200;
 
-const Caps = @typeInfo(@TypeOf(msgtags.composeOutbound)).@"fn".params[1].type.?;
+const Caps = @typeInfo(@TypeOf(msgtags.composeOutbound)).@"fn".param_types[1].?;
 
 test "composeOutbound returns only slices or typed errors for bounded random tags" {
     var prng = std.Random.DefaultPrng.init(0x4d53_4754_4147_1600);

@@ -182,7 +182,7 @@ pub fn engage(
     const until = std.math.add(i64, now, ttl_ms) catch std.math.maxInt(i64);
     return .{
         .active_until_ms = until,
-        .allowed = allowed orelse std.EnumSet(Restriction).initFull(),
+        .allowed = allowed orelse std.EnumSet(Restriction).full,
     };
 }
 
@@ -363,7 +363,7 @@ test "engaged session expires exactly at its boundary" {
 
 test "mayBypass gates per restriction and by time" {
     // Arrange: a session permitting only ban and key bypasses.
-    var allowed = std.EnumSet(Restriction).initEmpty();
+    var allowed = std.EnumSet(Restriction).empty;
     allowed.insert(.ban);
     allowed.insert(.key);
     const state = try engage(true, "alice", 0, 1_000, allowed, .{});
@@ -420,7 +420,7 @@ test "record stores audited bypasses and rejects inactive sessions" {
     try testing.expectEqual(Restriction.invite_only, listed[1].restriction);
 
     // A bypass not permitted by the session is refused and not recorded.
-    var only_key = std.EnumSet(Restriction).initEmpty();
+    var only_key = std.EnumSet(Restriction).empty;
     only_key.insert(.key);
     const narrow = try engine.engageFor(true, "alice", 0, 1_000, only_key);
     try testing.expectError(error.NotEngaged, engine.record(narrow, "alice", .ban, "#mod", 300));

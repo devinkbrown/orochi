@@ -124,8 +124,8 @@ pub const Drbg = struct {
         const info = @typeInfo(T).int;
         const bits = info.bits;
         const byte_len = comptime (bits + 7) / 8;
-        const Unsigned = std.meta.Int(.unsigned, bits);
-        const ByteAligned = std.meta.Int(.unsigned, byte_len * 8);
+        const Unsigned = @Int(.unsigned, bits);
+        const ByteAligned = @Int(.unsigned, byte_len * 8);
 
         var bytes: [byte_len]u8 = undefined;
         defer secureZero(&bytes);
@@ -154,7 +154,7 @@ pub const Drbg = struct {
         }
         if (upper_bound == 1) return 0;
 
-        const Unsigned = std.meta.Int(.unsigned, info.bits);
+        const Unsigned = @Int(.unsigned, info.bits);
         const bound: Unsigned = @intCast(upper_bound);
         const threshold: Unsigned = (0 -% bound) % bound;
 
@@ -173,7 +173,7 @@ pub const Drbg = struct {
 
         const info = @typeInfo(T).int;
         if (info.signedness == .signed) {
-            const Unsigned = std.meta.Int(.unsigned, info.bits);
+            const Unsigned = @Int(.unsigned, info.bits);
             const lo: Unsigned = @bitCast(at_least);
             const hi: Unsigned = @bitCast(less_than);
             const offset = try self.boundedInt(Unsigned, hi -% lo);

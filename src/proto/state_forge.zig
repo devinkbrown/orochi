@@ -137,8 +137,8 @@ pub fn Machine(comptime State: type, comptime Event: type) type {
             var missing: StateSet = .{};
             errdefer missing.deinit(allocator);
 
-            inline for (std.meta.fields(State)) |field| {
-                const state: State = @field(State, field.name);
+            inline for (@typeInfo(State).@"enum".field_names) |field_name| {
+                const state: State = @field(State, field_name);
                 if (!reached.contains(state)) {
                     _ = try missing.add(allocator, state);
                 }
@@ -160,7 +160,7 @@ pub fn Machine(comptime State: type, comptime Event: type) type {
 fn requireExhaustiveEnum(comptime T: type, comptime label: []const u8) void {
     switch (@typeInfo(T)) {
         .@"enum" => |info| {
-            if (!info.is_exhaustive) {
+            if (info.mode != .exhaustive) {
                 @compileError(label ++ " must be an exhaustive enum");
             }
         },

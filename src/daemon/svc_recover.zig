@@ -328,7 +328,7 @@ test "namesEqual rejects over-length names" {
 }
 
 test "every decision variant is reachable from decide" {
-    var seen = std.EnumSet(Decision).initEmpty();
+    var seen = std.EnumSet(Decision).empty;
     seen.insert(decide(.{ .command = .recover, .nick_is_registered = false, .requester_owns_account = true, .holder_present = false, .holder_authenticated_to_owner = false, .reservation_held = false }));
     seen.insert(decide(.{ .command = .recover, .nick_is_registered = true, .requester_owns_account = false, .holder_present = false, .holder_authenticated_to_owner = false, .reservation_held = false }));
     seen.insert(decide(.{ .command = .recover, .nick_is_registered = true, .requester_owns_account = true, .holder_present = false, .holder_authenticated_to_owner = false, .reservation_held = false }));

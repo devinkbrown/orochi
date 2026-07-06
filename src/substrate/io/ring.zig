@@ -460,8 +460,8 @@ test "encode/decode user_data round-trips for every op kind" {
         .{ .slot = 12345, .gen = 67890 },
         .{ .slot = SlotMax, .gen = GenMax },
     };
-    inline for (std.meta.fields(OpKind)) |f| {
-        const kind: OpKind = @enumFromInt(f.value);
+    inline for (@typeInfo(OpKind).@"enum".field_values) |f_value| {
+        const kind: OpKind = @enumFromInt(f_value);
         for (tokens) |tok| {
             const raw = try encodeUserData(kind, tok);
             const ud = try decodeUserData(raw);

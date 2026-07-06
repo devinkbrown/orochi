@@ -468,12 +468,12 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
         plan.commit(allocator) catch {};
         linux.exit(127);
     }
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.wait4(pid, &status, 0, null);
     // Exited cleanly via the execve'd /bin/true (low 7 bits 0, exit code 0),
     // not the 127 exec-failed fallback.
-    try std.testing.expectEqual(@as(u32, 0), status & 0x7f); // WIFEXITED
-    try std.testing.expectEqual(@as(u32, 0), (status >> 8) & 0xff); // exit code
+    try std.testing.expectEqual(@as(i32, 0), status & 0x7f); // WIFEXITED
+    try std.testing.expectEqual(@as(i32, 0), (status >> 8) & 0xff); // exit code
 }
 
 test "arena+listener exec plan carries both fds, no control" {

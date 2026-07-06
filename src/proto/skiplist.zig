@@ -294,13 +294,15 @@ test "get and remove find existing keys and ignore missing keys" {
     _ = try map.insert(prng.random(), 11, 110);
 
     // Act.
-    const before = map.get(3);
+    // Read the value while node 3 is still live: `remove` frees the node, so
+    // dereferencing the `get` pointer afterward would be a use-after-free.
+    const before = map.get(3).?.*;
     const removed = map.remove(3);
     const after = map.get(3);
     const missing = map.remove(99);
 
     // Assert.
-    try testing.expectEqual(@as(u64, 30), before.?.*);
+    try testing.expectEqual(@as(u64, 30), before);
     try testing.expectEqual(@as(?u64, 30), removed);
     try testing.expectEqual(@as(?*const u64, null), after);
     try testing.expectEqual(@as(?u64, null), missing);
