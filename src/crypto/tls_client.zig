@@ -3084,19 +3084,24 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
     }
     try enforcePathLen(facts_buf[0..fn_count]);
 
+    // Anchor the chain tip: its issuer DN (or, for a self-issued tip, its own
+    // subject DN) must match a configured anchor's subject, and its signature must
+    // verify under that anchor's public key. A malformed anchor or a failed
+    // match/verify falls through to the next anchor — the search never aborts on
+    // one. The signature primitive delegates to `x509_verify.verifySignedBy`,
+    // which covers the full sig-alg set (RSA PKCS#1 SHA-256/384/512, RSASSA-PSS,
+    // ECDSA P-256/P-384, Ed25519), so real CA links signed with sha384WithRSA,
+    // RSASSA-PSS, or ecdsa-with-SHA384 anchor correctly.
     const last = chain[chain.len - 1];
-    const last_parts = try extractCertParts(last);
+    const last_info = try x509_verify.linkInfo(last);
     for (anchors) |anchor_der| {
-        const anchor_parts = extractCertParts(anchor_der) catch continue;
-        // Match the chain tip to a trust anchor by DN: either the tip is issued by
-        // the anchor (tip.issuer == anchor.subject), or the tip *is* the anchor
-        // (self-included root). Then verify the tip's signature with the anchor.
-        if (!std.mem.eql(u8, last_parts.issuer_der, anchor_parts.subject_der) and
-            !std.mem.eql(u8, last_parts.subject_der, anchor_parts.subject_der))
+        const anchor_info = x509_verify.linkInfo(anchor_der) catch continue;
+        if (!std.mem.eql(u8, last_info.issuer_der, anchor_info.subject_der) and
+            !std.mem.eql(u8, last_info.subject_der, anchor_info.subject_der))
         {
             continue;
         }
-        verifyCertSignature(last_parts, anchor_der) catch |err| {
+        x509_verify.verifySignedBy(last_info, anchor_info) catch |err| {
             dbg("trust-anchor DN matched but signature check failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -3106,10 +3111,11 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
 }
 
 fn verifyIssuedBy(child_der: []const u8, issuer_der: []const u8) Error!void {
-    const child = try extractCertParts(child_der);
-    const issuer = try extractCertParts(issuer_der);
+    const child = try x509_verify.linkInfo(child_der);
+    const issuer = try x509_verify.linkInfo(issuer_der);
     if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return error.BadCertificate;
-    try verifyCertSignature(child, issuer_der);
+    // Full sig-alg set via x509_verify (see verifyChainToTrustAnchors).
+    try x509_verify.verifySignedBy(child, issuer);
 }
 
 /// One certificate's inputs to path-length checking. `path_len` is its
@@ -3167,78 +3173,6 @@ test "enforcePathLen: pathLenConstraint bounds intermediates below a CA" {
         .{ .path_len = null, .self_issued = true },
         .{ .path_len = 0, .self_issued = false },
     });
-}
-
-fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {
-    const issuer = try extractCertParts(issuer_der);
-    const key = try parsePublicKeyFromSpki(issuer.spki_der);
-    if (oidEq(cert.signature_algorithm_oid, &oid_ecdsa_sha256)) {
-        try verifySignatureScheme(key, .ecdsa_secp256r1_sha256, cert.tbs_der, cert.signature);
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_ecdsa_sha384)) {
-        try verifySignatureScheme(key, .ecdsa_secp384r1_sha384, cert.tbs_der, cert.signature);
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha256_rsa)) {
-        const pk = switch (key) {
-            .rsa => |pk| pk,
-            else => return error.UnsupportedPublicKey,
-        };
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(cert.tbs_der, &digest, .{});
-        if (!rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, cert.signature)) return error.BadSignature;
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha384_rsa)) {
-        // sha384WithRSAEncryption — common on real CA intermediate/leaf certs.
-        const pk = switch (key) {
-            .rsa => |pk| pk,
-            else => return error.UnsupportedPublicKey,
-        };
-        var digest: [48]u8 = undefined;
-        std.crypto.hash.sha2.Sha384.hash(cert.tbs_der, &digest, .{});
-        if (!rsa_verify.verifyPkcs1v15(pk, .sha384, &digest, cert.signature)) return error.BadSignature;
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha512_rsa)) {
-        const pk = switch (key) {
-            .rsa => |pk| pk,
-            else => return error.UnsupportedPublicKey,
-        };
-        var digest: [64]u8 = undefined;
-        std.crypto.hash.sha2.Sha512.hash(cert.tbs_der, &digest, .{});
-        if (!rsa_verify.verifyPkcs1v15(pk, .sha512, &digest, cert.signature)) return error.BadSignature;
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_rsassa_pss)) {
-        const pk = switch (key) {
-            .rsa => |pk| pk,
-            else => return error.UnsupportedPublicKey,
-        };
-        // id-RSASSA-PSS: the hash/MGF/salt are NOT in the OID — decode and
-        // validate them (fail-closed) from the signatureAlgorithm parameters
-        // instead of assuming SHA-256/salt-32.
-        try verifyCertPss(pk, cert.signature_algorithm_params, cert.tbs_der, cert.signature);
-    } else if (oidEq(cert.signature_algorithm_oid, &oid_ed25519)) {
-        try verifySignatureScheme(key, .ed25519, cert.tbs_der, cert.signature);
-    } else {
-        return error.UnsupportedSignatureScheme;
-    }
-}
-
-/// Verify an RSASSA-PSS certificate signature whose hash/MGF/salt are declared in
-/// the `RSASSA-PSS-params` (raw parameters TLV). Delegates parameter validation
-/// to `x509_verify.parsePssParams`, which fails closed on SHA-1 defaults, an
-/// MGF/hash mismatch, an oversized salt, or malformed DER.
-fn verifyCertPss(
-    pk: rsa_verify.PublicKey,
-    params_der: ?[]const u8,
-    tbs: []const u8,
-    sig: []const u8,
-) Error!void {
-    const params = x509_verify.parsePssParams(params_der orelse return error.BadSignature) catch
-        return error.BadSignature;
-    var digest: [64]u8 = undefined;
-    const digest_slice = digest[0..params.hash.digestLen()];
-    switch (params.hash) {
-        .sha256 => std.crypto.hash.sha2.Sha256.hash(tbs, digest[0..32], .{}),
-        .sha384 => std.crypto.hash.sha2.Sha384.hash(tbs, digest[0..48], .{}),
-        .sha512 => std.crypto.hash.sha2.Sha512.hash(tbs, digest[0..64], .{}),
-    }
-    if (!rsa_verify.verifyPss(pk, params.hash, digest_slice, sig, params.salt_len)) {
-        return error.BadSignature;
-    }
 }
 
 fn dnsNameMatchesCert(server_name: []const u8, cert: x509.Certificate) bool {
@@ -3450,15 +3384,9 @@ fn oidEq(a: []const u8, b: []const u8) bool {
 }
 
 const oid_rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
-const oid_sha256_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
-const oid_sha384_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C };
-const oid_sha512_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
-const oid_rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
 const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
 const oid_secp384r1 = [_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x22 };
-const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
-const oid_ecdsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
 const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 
 fn secureZero(buf: []u8) void {
@@ -5332,4 +5260,170 @@ test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x07 }, client.ct_logs[0].key_spki_der);
     try std.testing.expect(client.ct_logs[0].key_spki_der.ptr != src_spki.ptr);
     client.deinit(); // the testing allocator flags any leak or double-free here
+}
+
+// ===========================================================================
+// Certificate-chain signature-algorithm coverage (roadmap 1.3, #46 follow-up).
+//
+// verifyChainToTrustAnchors / verifyIssuedBy delegate their signature primitive
+// to x509_verify.verifySignedBy, so the production TLS 1.3 client now anchors CA
+// links across the FULL sig-alg set (RSA PKCS#1 SHA-256/384/512, RSASSA-PSS,
+// ECDSA P-256/P-384, Ed25519) — the single, independently-tested x509_verify
+// implementation — instead of a duplicated local dispatch. Each cert below is
+// minted self-signed with a SAN and used as its OWN trust anchor: the anchor
+// loop matches the tip's subject DN, then verifies the tip's signature under the
+// anchor's public key — precisely the code path a real intermediate->root link
+// drives, exercised once per algorithm. `now = null` skips the validity window;
+// the certs carry no EKU, so the serverAuth gate passes.
+// ===========================================================================
+
+const chain_test_san = "leaf.tls13.orochi.test";
+
+fn hexConst(comptime hex: []const u8) [hex.len / 2]u8 {
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+fn verifySelfAnchored(der: []const u8) Error!void {
+    const chain = [_][]const u8{der};
+    const anchors = [_][]const u8{der};
+    return verifyChainToTrustAnchors(&chain, &anchors, chain_test_san, null);
+}
+
+// A real RSA-2048 private key (the same vector x509_selfsign's own tests use) for
+// minting RSA-signed test certs.
+const chain_test_rsa_n = hexConst("a0bd1304a87f0a69b8ef18eaa1da15522c221b1e9b1efaee23bea1faa7eaaefe1e09eba390ec9334aea9457530d40c6a6b89c039865e98dd9d7491ea57288debf370f796fe05904a589027272fc9bd803fcf9d228c5552da7ff4f2a25c1606b3a4794f4ffa5bd94ab2150026dbcd31c4f4a5755d449a7aaf41861ff069fa455563cb22de14114aff8085fc3d3c07bc929d761f6449c1a13975738c9876319599f88bd3676230802d76b7292ad0759dad8fc70ee18fded69e32216a7f52833f1138caa7f90307c236500c3aa1a6cd082097fc3e28609b8d33514f16d6687bed504aee82775a41e4b125eba9ca544dc375c29c19d20f10900301eea8e68be3b3d7");
+const chain_test_rsa_e = hexConst("010001");
+const chain_test_rsa_d = hexConst("12036e6cb0b76002de1b49770e01632f4ccbdbaf2fe2266be6ac97f97fb4f0bc80c04adc8f42bbf284fa6a52ca50913da1e4939abec0be2fe3d3eb0050993662716b410bf656c84754aa7f00c8bdba93735340805d2ab8b8cceb35ffd50310e833eff65ff7a630714b08c876125eea0b710153e84a6667865978fefe51da1ec7d7cfc1afb96c4223b187b49cb6305be1a2eccbb8d07ed016bc257908bec7daf322658bda2dc4abd3671ffa6919da8b86ecbefa2658c3c01bacee5c9cff02f1cbac3f05feb2d68c61ef9a5427f73edb1949f776350bd63475c3cb78c5605b094d5043756e894bf538e811903212b6990a75153e261a36630657f8b91dfdadf45d");
+const chain_test_rsa_p = hexConst("e03b0d999233d320ae90bb8fa28ba36ad8c0bedeea9bc1218f65f1aac329e0c921a6aaf62a56719c6bd01c33ff119a657005eb500c33aa52e6d2fb6a55723f6fc2076fb8d30df12801dca523515992cad6ad628d180947e846fa3a3a3046c84c25266faf9079f44022bd4b5600d98a8ee4cbda9fddf01e9efb5d7eb62f7edb5d");
+const chain_test_rsa_q = hexConst("b7832256daec3eb9c325d1cdd4b3e2036723d02daa96e029518640c40d87bde9df147bd8488031df85caa449ec42735cbfd1125f843027352d396e7e9024b76335a98148a553d31872f32275582897d1e8f2b1460f1a3bd0375fe8a884f2372e716d51a4b71043c9730d74a7263476362d502496c19f6a45a615517b4a7f4cc3");
+const chain_test_rsa_dp = hexConst("1a1be62e7e8e9843d2efb95735370b3532bde6bbb017a8ba4ea731279007fd4b8e2688fb96dc6fe825c99aaf174126782f3e113345e87229ab04e00f769991f762615949ed114f86380948153fb0ad5dfef73b65706a0c3c689f544e5836b5b5e01184a9ada9f59dce2dba6aee386660d31545849de40abcba4a1da9fb07cb65");
+const chain_test_rsa_dq = hexConst("90779aabf7b2adfabda763507fd790e10eec41b201aebf0fa80f61a335e79bd9a675d0bd46ee2cd503d5b09a457556ae388f95c03e274e666d90ddeca2fb54a7b49219a620092a90ffc56a66289de44f2aed0c23d435d9caa41d4be286aecc4432a555f5aeec0e016422bea7ebcab71915791724db8eed31a17afce76b9165d3");
+const chain_test_rsa_qinv = hexConst("c4cae178938b60717e4d0484c144c548b275f87dd2723cfe1b6a5ba68305b154d1c86c894716bd9d5b4f974f51ad98942fa26005188896931a73206b778b946f96c6443f67bbb1861ce8a2e9d438befdb6cb1b7f413edc5b155b436660320f3cd26b0f65a9f586f957257b81e7c410856150abf4bb8f691beabecf7e428a2f8c");
+
+fn chainTestRsaKey() rsa_sign.PrivateKey {
+    return .{
+        .n = &chain_test_rsa_n,
+        .e = &chain_test_rsa_e,
+        .d = &chain_test_rsa_d,
+        .p = &chain_test_rsa_p,
+        .q = &chain_test_rsa_q,
+        .dp = &chain_test_rsa_dp,
+        .dq = &chain_test_rsa_dq,
+        .qinv = &chain_test_rsa_qinv,
+    };
+}
+
+const RsaSigVariant = struct { sig_sha384: bool = false, sig_pss: bool = false };
+
+fn buildRsaChainCert(out: []u8, serial: u8, variant: RsaSigVariant) ![]const u8 {
+    return x509_selfsign.buildSelfSignedRsa(out, .{
+        .common_name = "orochi tls13 rsa test",
+        .not_before = 1_704_067_200, // 2024-01-01
+        .not_after = 1_924_991_999, // 2030-12-31
+        .serial = &.{ 0x53, serial },
+        .public_modulus = &chain_test_rsa_n,
+        .public_exponent = &chain_test_rsa_e,
+        .private_key = chainTestRsaKey(),
+        .dns_names = &.{chain_test_san},
+        .sig_sha384 = variant.sig_sha384,
+        .sig_pss = variant.sig_pss,
+    });
+}
+
+test "TLS 1.3 client anchors an RSA PKCS#1 SHA-256 self-signed chain (regression)" {
+    var buf: [2048]u8 = undefined;
+    const der = try buildRsaChainCert(&buf, 0x01, .{});
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client anchors an RSA PKCS#1 SHA-384 self-signed chain (sha384WithRSA)" {
+    var buf: [2048]u8 = undefined;
+    const der = try buildRsaChainCert(&buf, 0x02, .{ .sig_sha384 = true });
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client anchors an RSASSA-PSS self-signed chain (params threaded through)" {
+    var buf: [2048]u8 = undefined;
+    const der = try buildRsaChainCert(&buf, 0x03, .{ .sig_pss = true });
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client anchors an ECDSA P-256 SHA-256 self-signed chain (regression)" {
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x2c)));
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(&buf, .{
+        .common_name = "orochi tls13 ecdsa test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x53, 0x04 },
+        .key_pair = kp,
+        .dns_names = &.{chain_test_san},
+    });
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client anchors an ECDSA P-384 SHA-384 self-signed chain (ecdsa-with-SHA384)" {
+    const kp = try EcdsaP384.KeyPair.generateDeterministic(@as([EcdsaP384.KeyPair.seed_length]u8, @splat(0x2e)));
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP384(&buf, .{
+        .common_name = "orochi tls13 p384 test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x53, 0x06 },
+        .key_pair = kp,
+        .dns_names = &.{chain_test_san},
+    });
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client anchors an Ed25519 self-signed chain (regression)" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x2d)));
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&buf, .{
+        .common_name = "orochi tls13 ed25519 test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x53, 0x05 },
+        .key_pair = kp,
+        .dns_names = &.{chain_test_san},
+    });
+    try verifySelfAnchored(der);
+}
+
+test "TLS 1.3 client rejects a self-signed chain whose signature byte was flipped (isolates the sig check)" {
+    var buf: [2048]u8 = undefined;
+    const der = try buildRsaChainCert(&buf, 0x0a, .{ .sig_pss = true });
+    // Baseline: the untampered RSASSA-PSS self-signature anchors.
+    try verifySelfAnchored(der);
+
+    // Flip one bit in the trailing signature BIT STRING; every other byte — name,
+    // validity, SPKI, DN linkage — is byte-identical, so only the signature check
+    // can be what now rejects. The anchor loop's `catch continue` turns the failed
+    // verify into UnknownCa (no other anchor to try).
+    var tampered: [2048]u8 = undefined;
+    @memcpy(tampered[0..der.len], der);
+    tampered[der.len - 1] ^= 0x01;
+    try std.testing.expectError(error.UnknownCa, verifySelfAnchored(tampered[0..der.len]));
+}
+
+test "TLS 1.3 client rejects a P-384 self-signed chain whose signature byte was flipped" {
+    const kp = try EcdsaP384.KeyPair.generateDeterministic(@as([EcdsaP384.KeyPair.seed_length]u8, @splat(0x2e)));
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP384(&buf, .{
+        .common_name = "orochi tls13 p384 tamper",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x53, 0x07 },
+        .key_pair = kp,
+        .dns_names = &.{chain_test_san},
+    });
+    try verifySelfAnchored(der);
+
+    var tampered: [1024]u8 = undefined;
+    @memcpy(tampered[0..der.len], der);
+    tampered[der.len - 1] ^= 0x01;
+    try std.testing.expectError(error.UnknownCa, verifySelfAnchored(tampered[0..der.len]));
 }

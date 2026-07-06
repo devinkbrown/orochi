@@ -9,6 +9,7 @@ const rsa_verify = @import("../crypto/rsa_verify.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 
 pub const Error = error{
     NoSpaceLeft,
@@ -77,6 +78,24 @@ pub const EcdsaP256Params = struct {
     key_usage_digital_signature: bool = false,
 };
 
+pub const EcdsaP384Params = struct {
+    common_name: []const u8,
+    not_before: i64,
+    not_after: i64,
+    serial: []const u8,
+    key_pair: EcdsaP384.KeyPair,
+    /// SubjectAltName dNSName entries. Standards TLS clients (RFC 6125) ignore
+    /// the CN and match the hostname against the SAN, so a server cert MUST
+    /// carry at least one. Empty keeps the legacy (extension-less) output.
+    dns_names: []const []const u8 = &.{},
+    /// SubjectAltName iPAddress entries, encoded as raw IPv4 (4-byte) or IPv6
+    /// (16-byte) address octets.
+    ip_addresses: []const []const u8 = &.{},
+    /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
+    /// own trust anchor (self-signed root). Off by default.
+    is_ca: bool = false,
+};
+
 pub const RsaParams = struct {
     common_name: []const u8,
     not_before: i64,
@@ -128,7 +147,9 @@ const max_dns_name_len = 253;
 const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
 const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 }; // 1.3.132.0.34
 const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+const oid_ecdsa_sha384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
 const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
 const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
@@ -156,6 +177,9 @@ const tag_san_ip_address: u8 = 0x87; // GeneralName [7] iPAddress (context, prim
 const SignatureAlgorithm = enum {
     ed25519,
     ecdsa_p256_sha256,
+    /// ecdsa-with-SHA384 (P-384 issuer key). Exercises the SHA-384 ECDSA
+    /// cert-verification path.
+    ecdsa_p384_sha384,
     rsa_sha256,
     rsa_sha384,
     /// id-RSASSA-PSS with SHA-256 / MGF1-SHA-256 / saltLength 32.
@@ -170,6 +194,7 @@ const RsaPublicKey = struct {
 const SubjectPublicKey = union(enum) {
     ed25519: [Ed25519.PublicKey.encoded_length]u8,
     ecdsa_p256_sec1: [ecdsa_p256.sec1_uncompressed_length]u8,
+    ecdsa_p384_sec1: [EcdsaP384.PublicKey.uncompressed_sec1_encoded_length]u8,
     rsa: RsaPublicKey,
 };
 
@@ -208,6 +233,31 @@ pub fn buildSelfSignedEcdsaP256(out: []u8, params: EcdsaP256Params) ![]const u8 
     var cert_body = DerWriter.init(&cert_body_buf);
     try cert_body.write(tbs);
     try writeSignatureAlgorithmIdentifier(&cert_body, .ecdsa_p256_sha256);
+    try writeSignatureBitString(&cert_body, sig_der);
+
+    var cert = DerWriter.init(out);
+    try cert.tlv(tag_sequence, cert_body.bytes());
+    return cert.bytes();
+}
+
+/// Mint a self-signed ECDSA P-384 certificate (ecdsa-with-SHA384). Mirrors
+/// `buildSelfSignedEcdsaP256` for the P-384 curve, exercising the SHA-384 ECDSA
+/// cert-verification path. `out` receives the DER; the returned slice aliases it.
+pub fn buildSelfSignedEcdsaP384(out: []u8, params: EcdsaP384Params) ![]const u8 {
+    if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
+    try validateParams(params);
+
+    var tbs_buf: [1400]u8 = undefined;
+    const public_sec1 = params.key_pair.public_key.toUncompressedSec1();
+    const tbs = try buildTbs(&tbs_buf, params, .ecdsa_p384_sha384, .{ .ecdsa_p384_sec1 = public_sec1 });
+    const sig = try params.key_pair.sign(tbs, null);
+    var sig_der_buf: [EcdsaP384.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&sig_der_buf);
+
+    var cert_body_buf: [1600]u8 = undefined;
+    var cert_body = DerWriter.init(&cert_body_buf);
+    try cert_body.write(tbs);
+    try writeSignatureAlgorithmIdentifier(&cert_body, .ecdsa_p384_sha384);
     try writeSignatureBitString(&cert_body, sig_der);
 
     var cert = DerWriter.init(out);
@@ -480,6 +530,7 @@ fn writeSignatureAlgorithmIdentifier(w: *DerWriter, algorithm: SignatureAlgorith
     switch (algorithm) {
         .ed25519 => try body.tlv(tag_oid, &oid_ed25519),
         .ecdsa_p256_sha256 => try body.tlv(tag_oid, &oid_ecdsa_sha256),
+        .ecdsa_p384_sha384 => try body.tlv(tag_oid, &oid_ecdsa_sha384),
         .rsa_sha256 => {
             try body.tlv(tag_oid, &oid_sha256_rsa);
             try body.tlv(tag_null, "");
@@ -549,6 +600,14 @@ fn writeEcPublicKeyAlgorithmIdentifier(w: *DerWriter) !void {
     try w.tlv(tag_sequence, body.bytes());
 }
 
+fn writeEcP384PublicKeyAlgorithmIdentifier(w: *DerWriter) !void {
+    var body_buf: [24]u8 = undefined;
+    var body = DerWriter.init(&body_buf);
+    try body.tlv(tag_oid, &oid_ec_public_key);
+    try body.tlv(tag_oid, &oid_secp384r1);
+    try w.tlv(tag_sequence, body.bytes());
+}
+
 fn writeName(w: *DerWriter, common_name: []const u8) !void {
     var attr_body_buf: [80]u8 = undefined;
     var attr_body = DerWriter.init(&attr_body_buf);
@@ -594,6 +653,13 @@ fn writeSubjectPublicKeyInfo(w: *DerWriter, public_key: SubjectPublicKey) !void 
         .ecdsa_p256_sec1 => |sec1| {
             try writeEcPublicKeyAlgorithmIdentifier(&body);
             var bit_string: [1 + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+            bit_string[0] = 0;
+            @memcpy(bit_string[1..], &sec1);
+            try body.tlv(tag_bit_string, &bit_string);
+        },
+        .ecdsa_p384_sec1 => |sec1| {
+            try writeEcP384PublicKeyAlgorithmIdentifier(&body);
+            var bit_string: [1 + EcdsaP384.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined;
             bit_string[0] = 0;
             @memcpy(bit_string[1..], &sec1);
             try body.tlv(tag_bit_string, &bit_string);
@@ -1183,6 +1249,59 @@ test "buildSelfSignedRsa with sig_pss emits id-RSASSA-PSS and verifies through x
     tampered[der.len - 1] ^= 0x01;
     const bad = try x509_verify.linkInfo(tampered[0..der.len]);
     try testing.expectError(error.BadSignature, x509_verify.verifyCertSignature(bad.tbs_der, bad.signature_der, bad.sig_alg_oid, bad.sig_alg_params, bad.spki_der));
+}
+
+test "buildSelfSignedEcdsaP384 emits ecdsa-with-SHA384 over a P-384 key and verifies through x509_verify" {
+    const x509 = @import("../crypto/x509.zig");
+    const x509_verify = @import("../crypto/x509_verify.zig");
+    const kp = try EcdsaP384.KeyPair.generateDeterministic(@as([EcdsaP384.KeyPair.seed_length]u8, @splat(0x3d)));
+    var out: [1024]u8 = undefined;
+    const der = try buildSelfSignedEcdsaP384(&out, .{
+        .common_name = "p384.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x52, 0x06 },
+        .key_pair = kp,
+        .dns_names = &.{"p384.test"},
+    });
+
+    // The parsed cert advertises ecdsa-with-SHA384.
+    const cert = try x509.parse(der);
+    try testing.expectEqualSlices(u8, &oid_ecdsa_sha384, cert.signature_algorithm_oid);
+
+    // The self-signature verifies through the shared verifier's P-384 branch,
+    // which parses the P-384 issuer point straight from the SPKI (x509's
+    // SubjectPublicKey union does not model P-384).
+    const info = try x509_verify.linkInfo(der);
+    try x509_verify.verifyCertSignature(info.tbs_der, info.signature_der, info.sig_alg_oid, info.sig_alg_params, info.spki_der);
+
+    // A flipped signature byte is rejected by the same P-384 path.
+    var tampered: [1024]u8 = undefined;
+    @memcpy(tampered[0..der.len], der);
+    tampered[der.len - 1] ^= 0x01;
+    const bad = try x509_verify.linkInfo(tampered[0..der.len]);
+    try testing.expectError(error.BadSignature, x509_verify.verifyCertSignature(bad.tbs_der, bad.signature_der, bad.sig_alg_oid, bad.sig_alg_params, bad.spki_der));
+}
+
+test "x509_verify rejects ecdsa-with-SHA384 over a non-P-384 (P-256) issuer key, fail-closed" {
+    const x509_verify = @import("../crypto/x509_verify.zig");
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x2c)));
+    var out: [1024]u8 = undefined;
+    const der = try buildSelfSignedEcdsaP256(&out, .{
+        .common_name = "p256.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x52, 0x07 },
+        .key_pair = kp,
+        .dns_names = &.{"p256.test"},
+    });
+    const info = try x509_verify.linkInfo(der);
+    // The issuer SPKI is a P-256 key; claiming ecdsa-with-SHA384 must NOT verify —
+    // the P-384 branch rejects the non-secp384r1 curve fail-closed as BadSignature.
+    try testing.expectError(
+        error.BadSignature,
+        x509_verify.verifyCertSignature(info.tbs_der, info.signature_der, &oid_ecdsa_sha384, null, info.spki_der),
+    );
 }
 
 test "buildSelfSigned rejects malformed SAN dnsNames" {
