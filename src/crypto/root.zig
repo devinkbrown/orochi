@@ -12,6 +12,7 @@ pub const argon2_kdf = @import("argon2_kdf.zig");
 pub const cose = @import("cose.zig");
 pub const crl = @import("crl.zig");
 pub const ecdh_p256 = @import("ecdh_p256.zig");
+pub const ecdsa_kat = @import("ecdsa_kat.zig");
 pub const ecdsa_p256 = @import("ecdsa_p256.zig");
 pub const ed25519_batch = @import("ed25519_batch.zig");
 pub const hash = @import("hash.zig");
@@ -74,6 +75,7 @@ test {
     _ = cose;
     _ = crl;
     _ = ecdh_p256;
+    _ = ecdsa_kat;
     _ = ecdsa_p256;
     _ = ed25519_batch;
     _ = hash;

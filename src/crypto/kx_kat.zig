@@ -43,6 +43,42 @@ test "RFC 7748 section 5.2 X25519 scalar multiplication vectors" {
     }
 }
 
+test "RFC 7748 section 5.2 X25519 iterative test vectors (1 and 1000 iterations)" {
+    // RFC 7748 §5.2 iterated procedure: both k (scalar) and u (u-coordinate)
+    // start at the encoded byte string 0x09 followed by 31 zero bytes. Each
+    // round computes result = X25519(k, u), then sets u = k and k = result.
+    // The scalar clamping mandated by RFC 7748 happens inside X25519 itself.
+    var k: [32]u8 = [_]u8{0} ** 32;
+    k[0] = 9;
+    var u: [32]u8 = k;
+
+    // Independent published answers from RFC 7748 §5.2.
+    const after_1 = hex("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    const after_1000 = hex("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var scalar = kx.SecretKey.init(k);
+        defer scalar.wipe();
+
+        var shared = try kx.X25519Kx.sharedSecret(&scalar, u);
+        defer shared.wipe();
+        const result = shared.declassify();
+
+        u = k;
+        k = result;
+
+        if (i == 0) {
+            try std.testing.expectEqualSlices(u8, &after_1, &k);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, &after_1000, &k);
+
+    // The RFC also gives a 1,000,000-iteration answer
+    // (7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424);
+    // it is intentionally omitted here as far too slow for the unit suite.
+}
+
 test "X25519Kx derives the same shared secret on both sides" {
     var alice = try kx.X25519Kx.generateDeterministic(hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"));
     defer alice.wipe();
