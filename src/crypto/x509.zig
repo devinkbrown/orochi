@@ -89,6 +89,8 @@ const Oid = struct {
     const id_ad_ocsp = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 };
     // id-pe-tlsfeature (1.3.6.1.5.5.7.1.24) — OCSP must-staple carrier.
     const tls_feature = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18 };
+    // cRLDistributionPoints (2.5.29.31) — where to fetch the issuer's CRL.
+    const crl_distribution_points = [_]u8{ 0x55, 0x1D, 0x1F };
 };
 
 pub const TimeKind = enum { utc, generalized };
@@ -459,6 +461,102 @@ pub fn writeHex(bytes: []const u8, out: []u8) Error![]const u8 {
         out[i * 2 + 1] = digits[byte & 0x0F];
     }
     return out[0 .. bytes.len * 2];
+}
+
+// ---------------------------------------------------------------------------
+// Embedded SCT (Certificate Transparency) extension.
+//
+// These are deliberately standalone from the `parseExtensions` state machine
+// above: they neither read nor mutate the `ParsedCertificate` extension fields,
+// so adding SCT support cannot perturb chain/certfp parsing. They only unwrap
+// the extension's DER envelope into the raw TLS SignedCertificateTimestampList
+// bytes; decoding the individual SCTs is `crypto/sct.zig`'s job.
+// ---------------------------------------------------------------------------
+
+/// OID 1.3.6.1.4.1.11129.2.4.2 — the X.509 `SignedCertificateTimestampList`
+/// extension (RFC 6962 §3.3) carrying SCTs embedded in a certificate.
+pub const sct_list_extension_oid = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x02 };
+
+/// Unwrap an SCT extension's value into the raw TLS `SignedCertificateTimestampList`.
+///
+/// `extn_value` is the CONTENT of the extension's `extnValue` OCTET STRING — the
+/// bytes a DER extension reader yields after stripping the outer OCTET STRING
+/// wrapper every X.509 extension carries (exactly the `value.value` the other
+/// per-extension parsers here receive). For the SCT extension that content is
+/// itself a DER OCTET STRING (`SignedCertificateTimestampList ::= OCTET STRING`)
+/// wrapping the TLS-encoded list; this peels that inner OCTET STRING and returns
+/// the raw TLS bytes, ready for `sct.parseList`. Between this and the generic
+/// extension reader, both OCTET STRING wrappers are peeled. Fails closed on any
+/// malformed or non-canonical DER, or trailing bytes.
+pub fn parseSctList(extn_value: []const u8) Error![]const u8 {
+    var r = DerReader.init(extn_value);
+    const inner = try r.readExpected(Tag.octet_string);
+    try r.expectEmpty();
+    return inner.value;
+}
+
+/// Locate the embedded SCT extension in a certificate and return the raw TLS
+/// `SignedCertificateTimestampList` bytes (ready for `sct.parseList`), or `null`
+/// when the certificate carries no SCT extension.
+///
+/// Walks the certificate structurally to its extensions; it does NOT otherwise
+/// validate the certificate (use `parse` for that). Standalone from
+/// `parseExtensions`. Fails closed on malformed DER.
+pub fn findSctListExtension(cert_der: []const u8) Error!?[]const u8 {
+    if (cert_der.len == 0) return error.EmptyInput;
+    if (cert_der.len > MaxDerLen) return error.Oversize;
+
+    var top = DerReader.init(cert_der);
+    const cert_seq = try top.readExpected(Tag.sequence);
+    try top.expectEmpty();
+
+    var body = try top.child(cert_seq);
+    const tbs = try body.readExpected(Tag.sequence);
+    // signatureAlgorithm and signatureValue are not needed to find extensions.
+
+    var tbs_reader = try body.child(tbs);
+    if (tbs_reader.hasRemaining() and try tbs_reader.peekTag() == Tag.context_0_constructed) {
+        _ = try tbs_reader.readTlv(); // [0] EXPLICIT version
+    }
+    _ = try tbs_reader.readExpected(Tag.integer); // serialNumber
+    _ = try tbs_reader.readExpected(Tag.sequence); // signature
+    _ = try tbs_reader.readExpected(Tag.sequence); // issuer
+    _ = try tbs_reader.readExpected(Tag.sequence); // validity
+    _ = try tbs_reader.readExpected(Tag.sequence); // subject
+    _ = try tbs_reader.readExpected(Tag.sequence); // subjectPublicKeyInfo
+
+    while (tbs_reader.hasRemaining()) {
+        const tag = try tbs_reader.peekTag();
+        switch (tag) {
+            0x81, 0x82 => _ = try tbs_reader.readTlv(), // issuer/subject UniqueID
+            Tag.context_3_constructed => return scanExtensionsForSct(tbs_reader, try tbs_reader.readTlv()),
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn scanExtensionsForSct(parent: DerReader, ext_tlv: Tlv) Error!?[]const u8 {
+    var explicit = try parent.child(ext_tlv);
+    const seq_tlv = try explicit.readExpected(Tag.sequence);
+    try explicit.expectEmpty();
+
+    var extensions = try explicit.child(seq_tlv);
+    while (extensions.hasRemaining()) {
+        const one_tlv = try extensions.readExpected(Tag.sequence);
+        var one = try extensions.child(one_tlv);
+        const oid_tlv = try one.readExpected(Tag.oid);
+        try validateOid(oid_tlv.value);
+        if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
+            _ = try parseBoolean(try one.readTlv());
+        }
+        const value = try one.readExpected(Tag.octet_string);
+        try one.expectEmpty();
+        if (std.mem.eql(u8, oid_tlv.value, &sct_list_extension_oid)) {
+            return try parseSctList(value.value);
+        }
+    }
+    return null;
 }
 
 fn parseInto(comptime CertType: type, cert: *CertType, der: []const u8) Error!void {
@@ -1080,4 +1178,418 @@ test "extractPublicKey rejects a truncated SPKI" {
     const der = try pemToDer(TestPem, &der_buf);
     const cert = try parse(der);
     try std.testing.expectError(error.Truncated, extractPublicKey(cert.spki_der[0 .. cert.spki_der.len - 1]));
+}
+
+// -- SCT extension unwrap tests ---------------------------------------------
+
+/// Append a DER TLV (short-form length only; `value.len` must be < 128) as an
+/// arena-owned slice. Sufficient for the small synthetic certificates below.
+fn derTlv(a: std.mem.Allocator, tag: u8, value: []const u8) []u8 {
+    std.debug.assert(value.len < 128);
+    const out = a.alloc(u8, 2 + value.len) catch unreachable;
+    out[0] = tag;
+    out[1] = @intCast(value.len);
+    @memcpy(out[2..], value);
+    return out;
+}
+
+test "parseSctList peels the inner OCTET STRING to the raw TLS list bytes" {
+    // Arrange: extnValue content = OCTET STRING wrapping the TLS list bytes.
+    const tls_list = [_]u8{ 0x00, 0x04, 0x00, 0x02, 0xAB, 0xCD };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extn_value = derTlv(a, Tag.octet_string, &tls_list);
+
+    // Act
+    const raw = try parseSctList(extn_value);
+
+    // Assert
+    try std.testing.expectEqualSlices(u8, &tls_list, raw);
+}
+
+test "parseSctList rejects a non-OCTET-STRING wrapper and trailing bytes" {
+    // A SEQUENCE where an OCTET STRING is required.
+    try std.testing.expectError(error.InvalidTag, parseSctList(&[_]u8{ 0x30, 0x02, 0xAB, 0xCD }));
+    // A valid inner OCTET STRING followed by a surplus byte.
+    try std.testing.expectError(error.TrailingData, parseSctList(&[_]u8{ 0x04, 0x01, 0xAA, 0x00 }));
+    // Truncated length.
+    try std.testing.expectError(error.Truncated, parseSctList(&[_]u8{0x04}));
+}
+
+/// Build a minimal, structurally-walkable certificate carrying exactly the
+/// extensions in `ext_der` ([3] EXPLICIT SEQUENCE OF Extension). Not a valid
+/// certificate for `parse` (issuer/validity/spki are empty), but enough for
+/// `findSctListExtension`, which only navigates structure to the extensions.
+fn buildCertWithExtensions(a: std.mem.Allocator, ext_der: []const u8) []u8 {
+    const empty_seq = derTlv(a, Tag.sequence, "");
+    const serial = derTlv(a, Tag.integer, &[_]u8{0x01});
+    const extensions_wrapper = derTlv(a, Tag.context_3_constructed, ext_der);
+
+    var tbs_body: std.ArrayList(u8) = .empty;
+    tbs_body.appendSlice(a, serial) catch unreachable; // serialNumber
+    tbs_body.appendSlice(a, empty_seq) catch unreachable; // signature
+    tbs_body.appendSlice(a, empty_seq) catch unreachable; // issuer
+    tbs_body.appendSlice(a, empty_seq) catch unreachable; // validity
+    tbs_body.appendSlice(a, empty_seq) catch unreachable; // subject
+    tbs_body.appendSlice(a, empty_seq) catch unreachable; // subjectPublicKeyInfo
+    tbs_body.appendSlice(a, extensions_wrapper) catch unreachable; // [3] extensions
+    const tbs = derTlv(a, Tag.sequence, tbs_body.items);
+
+    var cert_body: std.ArrayList(u8) = .empty;
+    cert_body.appendSlice(a, tbs) catch unreachable;
+    cert_body.appendSlice(a, empty_seq) catch unreachable; // signatureAlgorithm
+    cert_body.appendSlice(a, derTlv(a, Tag.bit_string, &[_]u8{0x00})) catch unreachable; // signatureValue
+    return derTlv(a, Tag.sequence, cert_body.items);
+}
+
+test "findSctListExtension returns the TLS list bytes for an embedded SCT extension" {
+    // Arrange: extension { OID sct, extnValue = OCTET STRING { OCTET STRING { tls } } }.
+    const tls_list = [_]u8{ 0x00, 0x08, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const inner_octet = derTlv(a, Tag.octet_string, &tls_list);
+    const extn_value = derTlv(a, Tag.octet_string, inner_octet);
+    var one_ext: std.ArrayList(u8) = .empty;
+    one_ext.appendSlice(a, derTlv(a, Tag.oid, &sct_list_extension_oid)) catch unreachable;
+    one_ext.appendSlice(a, extn_value) catch unreachable;
+    const extension = derTlv(a, Tag.sequence, one_ext.items);
+    const ext_seq = derTlv(a, Tag.sequence, extension); // SEQUENCE OF Extension
+    const cert = buildCertWithExtensions(a, ext_seq);
+
+    // Act
+    const found = try findSctListExtension(cert);
+
+    // Assert
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualSlices(u8, &tls_list, found.?);
+}
+
+test "findSctListExtension returns null when the SCT extension is absent" {
+    // The embedded fixture carries SAN/basicConstraints/keyUsage/SKI, no SCT.
+    var der_buf: [512]u8 = undefined;
+    const der = try pemToDer(TestPem, &der_buf);
+    try std.testing.expectEqual(@as(?[]const u8, null), try findSctListExtension(der));
+
+    // A different extension OID (basicConstraints) also yields null.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var one_ext: std.ArrayList(u8) = .empty;
+    one_ext.appendSlice(a, derTlv(a, Tag.oid, &[_]u8{ 0x55, 0x1D, 0x13 })) catch unreachable; // basicConstraints
+    one_ext.appendSlice(a, derTlv(a, Tag.octet_string, derTlv(a, Tag.sequence, ""))) catch unreachable;
+    const extension = derTlv(a, Tag.sequence, one_ext.items);
+    const ext_seq = derTlv(a, Tag.sequence, extension);
+    const cert = buildCertWithExtensions(a, ext_seq);
+    try std.testing.expectEqual(@as(?[]const u8, null), try findSctListExtension(cert));
+}
+
+test "findSctListExtension fails closed on malformed certificate DER" {
+    try std.testing.expectError(error.EmptyInput, findSctListExtension(""));
+    // A truncated SEQUENCE header.
+    try std.testing.expectError(error.Truncated, findSctListExtension(&[_]u8{0x30}));
+    // Well-formed outer SEQUENCE but the TBS is cut off before extensions.
+    try std.testing.expectError(error.Truncated, findSctListExtension(&[_]u8{ 0x30, 0x02, 0x30, 0x00 }));
+}
+pub const MaxCrlDistributionPointUrls = 8;
+
+/// URLs extracted from a certificate's cRLDistributionPoints extension. The
+/// slices point into the caller-owned certificate DER; the struct owns no
+/// memory of its own.
+pub const CrlDistributionPoints = struct {
+    buf: [MaxCrlDistributionPointUrls][]const u8 = undefined,
+    len: usize = 0,
+
+    /// The extracted distribution-point URLs, in certificate order (possibly
+    /// empty). Each slice is a `uniformResourceIdentifier` GeneralName value.
+    pub fn urls(self: *const CrlDistributionPoints) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Extract the cRLDistributionPoints URI(s) from `cert_der` (RFC 5280
+/// §4.2.1.13, OID 2.5.29.31).
+///
+/// Collects every `GeneralName` of type uniformResourceIdentifier (`[6]`) found
+/// in each DistributionPoint's `fullName`. `nameRelativeToCRLIssuer`, `reasons`,
+/// and `cRLIssuer` are ignored — URI retrieval is the only supported fetch.
+///
+/// Allocation-free: returned URL slices point into `cert_der`. Returns an empty
+/// set when the extension is absent; errors only on malformed DER.
+pub fn parseCrlDistributionPoint(cert_der: []const u8) Error!CrlDistributionPoints {
+    var result = CrlDistributionPoints{};
+    const ext_value = (try findExtensionValue(cert_der, &Oid.crl_distribution_points)) orelse return result;
+    try collectCrlUrls(ext_value, &result);
+    return result;
+}
+
+/// Walk `cert_der` → tbsCertificate → extensions and return the raw extnValue
+/// OCTET STRING content for `oid`, or null when the extension (or the entire
+/// extensions block) is absent.
+fn findExtensionValue(cert_der: []const u8, oid: []const u8) Error!?[]const u8 {
+    if (cert_der.len == 0) return error.EmptyInput;
+    if (cert_der.len > MaxDerLen) return error.Oversize;
+
+    var top = DerReader.init(cert_der);
+    const cert_seq = try top.readExpected(Tag.sequence);
+    try top.expectEmpty();
+
+    var body = try top.child(cert_seq);
+    const tbs = try body.readExpected(Tag.sequence);
+    var tbs_reader = try body.child(tbs);
+
+    if (tbs_reader.hasRemaining() and try tbs_reader.peekTag() == Tag.context_0_constructed) {
+        _ = try tbs_reader.readTlv(); // version [0] EXPLICIT
+    }
+    _ = try tbs_reader.readExpected(Tag.integer); // serialNumber
+    _ = try tbs_reader.readExpected(Tag.sequence); // signature
+    _ = try tbs_reader.readExpected(Tag.sequence); // issuer
+    _ = try tbs_reader.readExpected(Tag.sequence); // validity
+    _ = try tbs_reader.readExpected(Tag.sequence); // subject
+    _ = try tbs_reader.readExpected(Tag.sequence); // subjectPublicKeyInfo
+
+    while (tbs_reader.hasRemaining()) {
+        const tag = try tbs_reader.peekTag();
+        switch (tag) {
+            0x81, 0x82 => _ = try tbs_reader.readTlv(), // issuer/subject UniqueID
+            Tag.context_3_constructed => return try scanExtensionsFor(tbs_reader, try tbs_reader.readTlv(), oid),
+            else => return error.InvalidTag,
+        }
+    }
+    return null;
+}
+
+fn scanExtensionsFor(parent: DerReader, ext_tlv: Tlv, oid: []const u8) Error!?[]const u8 {
+    var explicit = try parent.child(ext_tlv);
+    const seq_tlv = try explicit.readExpected(Tag.sequence);
+    try explicit.expectEmpty();
+
+    var extensions = try explicit.child(seq_tlv);
+    while (extensions.hasRemaining()) {
+        const one_tlv = try extensions.readExpected(Tag.sequence);
+        var one = try extensions.child(one_tlv);
+        const oid_tlv = try one.readExpected(Tag.oid);
+        try validateOid(oid_tlv.value);
+        if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
+            _ = try parseBoolean(try one.readTlv());
+        }
+        const value = try one.readExpected(Tag.octet_string);
+        try one.expectEmpty();
+        if (std.mem.eql(u8, oid_tlv.value, oid)) return value.value;
+    }
+    return null;
+}
+
+/// Parse a cRLDistributionPoints extnValue: `SEQUENCE OF DistributionPoint`.
+fn collectCrlUrls(ext_value: []const u8, out: *CrlDistributionPoints) Error!void {
+    var reader = DerReader.init(ext_value);
+    const dps_tlv = try reader.readExpected(Tag.sequence);
+    try reader.expectEmpty();
+
+    var dps = try reader.child(dps_tlv);
+    while (dps.hasRemaining()) {
+        const dp_tlv = try dps.readExpected(Tag.sequence); // DistributionPoint
+        var dp = try dps.child(dp_tlv);
+        // distributionPoint [0] EXPLICIT DistributionPointName (a CHOICE, so the
+        // [0] tag is explicit). reasons [1] / cRLIssuer [2] are ignored.
+        if (dp.hasRemaining() and try dp.peekTag() == Tag.context_0_constructed) {
+            try collectDistributionPointName(dp, try dp.readTlv(), out);
+        }
+    }
+}
+
+fn collectDistributionPointName(parent: DerReader, dpn_tlv: Tlv, out: *CrlDistributionPoints) Error!void {
+    var dpn = try parent.child(dpn_tlv);
+    while (dpn.hasRemaining()) {
+        const tag = try dpn.peekTag();
+        const tlv = try dpn.readTlv();
+        // fullName [0] IMPLICIT GeneralNames (the SEQUENCE tag becomes 0xA0).
+        // nameRelativeToCRLIssuer [1] and anything else is skipped.
+        if (tag == Tag.context_0_constructed) {
+            try collectUriGeneralNames(dpn, tlv, out);
+        }
+    }
+}
+
+fn collectUriGeneralNames(parent: DerReader, names_tlv: Tlv, out: *CrlDistributionPoints) Error!void {
+    var names = try parent.child(names_tlv);
+    while (names.hasRemaining()) {
+        const gn = try names.readTlv();
+        // uniformResourceIdentifier [6] IMPLICIT IA5String → context-primitive 0x86.
+        if (gn.tag == 0x86 and out.len < out.buf.len) {
+            out.buf[out.len] = gn.value;
+            out.len += 1;
+        }
+    }
+}
+
+test "parseCrlDistributionPoint extracts fullName URI GeneralNames" {
+    const a = std.testing.allocator;
+    const url1 = "http://crl.example.com/root.crl";
+    const url2 = "http://backup.example.com/root.crl";
+    const url3 = "http://crl2.example.com/root.crl";
+
+    // DistributionPoint #1: fullName holds two URIs.
+    var gnames1: std.ArrayList(u8) = .empty;
+    defer gnames1.deinit(a);
+    try cdpTestTlv(a, &gnames1, 0x86, url1);
+    try cdpTestTlv(a, &gnames1, 0x86, url2);
+    var full1: std.ArrayList(u8) = .empty;
+    defer full1.deinit(a);
+    try cdpTestTlv(a, &full1, Tag.context_0_constructed, gnames1.items); // fullName [0]
+    var dist1: std.ArrayList(u8) = .empty;
+    defer dist1.deinit(a);
+    try cdpTestTlv(a, &dist1, Tag.context_0_constructed, full1.items); // distributionPoint [0] EXPLICIT
+    var dp1: std.ArrayList(u8) = .empty;
+    defer dp1.deinit(a);
+    try cdpTestTlv(a, &dp1, Tag.sequence, dist1.items);
+
+    // DistributionPoint #2: fullName holds one URI.
+    var gnames2: std.ArrayList(u8) = .empty;
+    defer gnames2.deinit(a);
+    try cdpTestTlv(a, &gnames2, 0x86, url3);
+    var full2: std.ArrayList(u8) = .empty;
+    defer full2.deinit(a);
+    try cdpTestTlv(a, &full2, Tag.context_0_constructed, gnames2.items);
+    var dist2: std.ArrayList(u8) = .empty;
+    defer dist2.deinit(a);
+    try cdpTestTlv(a, &dist2, Tag.context_0_constructed, full2.items);
+    var dp2: std.ArrayList(u8) = .empty;
+    defer dp2.deinit(a);
+    try cdpTestTlv(a, &dp2, Tag.sequence, dist2.items);
+
+    var dps: std.ArrayList(u8) = .empty; // CRLDistributionPoints
+    defer dps.deinit(a);
+    try dps.appendSlice(a, dp1.items);
+    try dps.appendSlice(a, dp2.items);
+    var crl_dps: std.ArrayList(u8) = .empty;
+    defer crl_dps.deinit(a);
+    try cdpTestTlv(a, &crl_dps, Tag.sequence, dps.items);
+
+    var extn_value: std.ArrayList(u8) = .empty;
+    defer extn_value.deinit(a);
+    try cdpTestTlv(a, &extn_value, Tag.octet_string, crl_dps.items);
+
+    var ext_body: std.ArrayList(u8) = .empty;
+    defer ext_body.deinit(a);
+    try cdpTestTlv(a, &ext_body, Tag.oid, &Oid.crl_distribution_points);
+    try ext_body.appendSlice(a, extn_value.items);
+    var ext: std.ArrayList(u8) = .empty;
+    defer ext.deinit(a);
+    try cdpTestTlv(a, &ext, Tag.sequence, ext_body.items);
+    var exts: std.ArrayList(u8) = .empty;
+    defer exts.deinit(a);
+    try cdpTestTlv(a, &exts, Tag.sequence, ext.items);
+    var ext3: std.ArrayList(u8) = .empty;
+    defer ext3.deinit(a);
+    try cdpTestTlv(a, &ext3, Tag.context_3_constructed, exts.items); // extensions [3]
+
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(a);
+    try cdpTestSkeletonFields(a, &tbs_body);
+    try tbs_body.appendSlice(a, ext3.items);
+
+    var cert: std.ArrayList(u8) = .empty;
+    defer cert.deinit(a);
+    try cdpTestCert(a, &cert, tbs_body.items);
+
+    const cdp = try parseCrlDistributionPoint(cert.items);
+    const got = cdp.urls();
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings(url1, got[0]);
+    try std.testing.expectEqualStrings(url2, got[1]);
+    try std.testing.expectEqualStrings(url3, got[2]);
+}
+
+test "parseCrlDistributionPoint returns empty when the extension is absent" {
+    const a = std.testing.allocator;
+    // A TBS with no extensions block at all.
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(a);
+    try cdpTestSkeletonFields(a, &tbs_body);
+
+    var cert: std.ArrayList(u8) = .empty;
+    defer cert.deinit(a);
+    try cdpTestCert(a, &cert, tbs_body.items);
+
+    const cdp = try parseCrlDistributionPoint(cert.items);
+    try std.testing.expectEqual(@as(usize, 0), cdp.urls().len);
+}
+
+test "parseCrlDistributionPoint ignores unrelated extensions" {
+    const a = std.testing.allocator;
+    // An extensions block that carries only basicConstraints (2.5.29.19).
+    var ext_body: std.ArrayList(u8) = .empty;
+    defer ext_body.deinit(a);
+    try cdpTestTlv(a, &ext_body, Tag.oid, &Oid.basic_constraints);
+    try cdpTestTlv(a, &ext_body, Tag.octet_string, &[_]u8{ 0x30, 0x00 }); // empty BasicConstraints SEQ
+    var ext: std.ArrayList(u8) = .empty;
+    defer ext.deinit(a);
+    try cdpTestTlv(a, &ext, Tag.sequence, ext_body.items);
+    var exts: std.ArrayList(u8) = .empty;
+    defer exts.deinit(a);
+    try cdpTestTlv(a, &exts, Tag.sequence, ext.items);
+    var ext3: std.ArrayList(u8) = .empty;
+    defer ext3.deinit(a);
+    try cdpTestTlv(a, &ext3, Tag.context_3_constructed, exts.items);
+
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(a);
+    try cdpTestSkeletonFields(a, &tbs_body);
+    try tbs_body.appendSlice(a, ext3.items);
+
+    var cert: std.ArrayList(u8) = .empty;
+    defer cert.deinit(a);
+    try cdpTestCert(a, &cert, tbs_body.items);
+
+    const cdp = try parseCrlDistributionPoint(cert.items);
+    try std.testing.expectEqual(@as(usize, 0), cdp.urls().len);
+}
+fn cdpTestLen(a: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) !void {
+    if (len < 128) {
+        try out.append(a, @intCast(len));
+        return;
+    }
+    var tmp: [@sizeOf(usize)]u8 = undefined;
+    var n = len;
+    var count: usize = 0;
+    while (n != 0) : (n >>= 8) {
+        tmp[tmp.len - 1 - count] = @intCast(n & 0xff);
+        count += 1;
+    }
+    try out.append(a, 0x80 | @as(u8, @intCast(count)));
+    try out.appendSlice(a, tmp[tmp.len - count ..]);
+}
+
+fn cdpTestTlv(a: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, value: []const u8) !void {
+    try out.append(a, tag);
+    try cdpTestLen(a, out, value.len);
+    try out.appendSlice(a, value);
+}
+
+/// Wrap `tbs_body` (the bytes inside tbsCertificate) into a minimal
+/// `SEQUENCE { tbsCertificate, sigAlg, signature }` shell. Only the
+/// tbsCertificate is meaningful to `parseCrlDistributionPoint`.
+fn cdpTestCert(a: std.mem.Allocator, out: *std.ArrayList(u8), tbs_body: []const u8) !void {
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(a);
+    try cdpTestTlv(a, &tbs, Tag.sequence, tbs_body);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, tbs.items);
+    // Trivial (unread) sigAlg + signature to keep a cert-shaped structure.
+    try cdpTestTlv(a, &body, Tag.sequence, &Oid.crl_distribution_points);
+    try cdpTestTlv(a, &body, Tag.bit_string, &[_]u8{0x00});
+
+    try cdpTestTlv(a, out, Tag.sequence, body.items);
+}
+
+/// Five empty placeholder SEQUENCEs: signature, issuer, validity, subject, spki.
+fn cdpTestSkeletonFields(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    try cdpTestTlv(a, out, Tag.integer, &[_]u8{0x01}); // serialNumber
+    var i: usize = 0;
+    while (i < 5) : (i += 1) try cdpTestTlv(a, out, Tag.sequence, "");
 }

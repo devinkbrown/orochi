@@ -5,15 +5,48 @@
 //!
 //! This module parses the RFC 5280 §5 `CertificateList` structure and exposes
 //! issuer/update metadata plus an on-demand iterator over revoked certificate
-//! serial numbers. It deliberately does not verify the CRL signature; callers
-//! must authenticate the CRL through their certificate-path policy before
-//! trusting revocation results.
+//! serial numbers. Parsing itself is allocation-free and does no crypto.
+//!
+//! ## Authenticating and using a CRL
+//!
+//! Revocation results are only trustworthy once the CRL has been authenticated
+//! against the *issuing CA*. The intended integration flow (the fetch and
+//! policy live in the caller, e.g. `tls_client.zig`) is:
+//!
+//!   1. Extract the distribution-point URL(s) from the leaf/CA cert with
+//!      `x509.parseCrlDistributionPoint`.
+//!   2. Fetch the CRL DER from a distribution-point URL (caller's transport).
+//!   3. `verifyCrlSignature(crl_der, issuer_spki_der)` — SECURITY GATE. Reject
+//!      any CRL whose outer signature does not verify under the issuing CA.
+//!   4. `crlIsCurrent(parsed, now)` — reject stale/expired CRLs.
+//!   5. `isSerialRevoked(parsed, leaf_serial_der)` — if true, reject the peer.
+//!
+//! ### Fail-open vs fail-closed
+//!
+//! CRLs are large and their distribution points are frequently unreachable, so
+//! the recommended default is **soft-fail (fail-open)**: if the CRL cannot be
+//! fetched, parsed, or authenticated, proceed WITHOUT a revocation verdict
+//! rather than dropping the connection. A definitive `isSerialRevoked == true`
+//! from an authenticated, current CRL is always fail-closed (reject). Deployments
+//! that require hard-fail (e.g. a `mustRevoke`/pinned high-assurance path)
+//! should treat steps 2–4 failing as a connection failure instead. Crucially,
+//! a signature-verification failure in step 3 is NOT a soft "unavailable" — a
+//! CRL that fails `verifyCrlSignature` must be discarded (treated as no CRL),
+//! never trusted, because an unauthenticated CRL can forge or withhold
+//! revocations.
 const std = @import("std");
 const x509 = @import("x509.zig");
-const ocsp = @import("ocsp.zig");
+const x509_verify = @import("x509_verify.zig");
+const ecdsa_p256 = @import("ecdsa_p256.zig");
 
 pub const Error = x509.Error;
 pub const Time = x509.Time;
+
+/// Error set for CRL signature verification. Extends `x509_verify.Error` (which
+/// already includes every `x509.Error` DER-parse variant plus the signature
+/// dispatch outcomes `BadSignature` / `UnsupportedSigAlg`) with the RFC 5280
+/// §5.1.1.2 inner/outer algorithm-identifier agreement check.
+pub const VerifyError = x509_verify.Error || error{AlgorithmMismatch};
 
 /// Parsed CRL data. All slices point into caller-owned `der`.
 pub const CertificateRevocationList = struct {
@@ -98,31 +131,93 @@ pub fn parse(der: []const u8) Error!CertificateRevocationList {
     return parsed;
 }
 
-/// Return true when `serial` exactly matches a revoked `userCertificate` value.
-pub fn isRevoked(parsed: CertificateRevocationList, serial: []const u8) bool {
+/// Return true when `serial_der` exactly matches a revoked `userCertificate`
+/// serial number. `serial_der` is the DER INTEGER *contents* (value bytes,
+/// including any DER sign-padding 0x00) of the leaf certificate's serial — i.e.
+/// exactly `x509.Certificate.serial_der`. The comparison is a raw byte compare
+/// against each revoked entry's serial, which is well-defined because both
+/// sides are canonical DER INTEGER encodings of the same magnitude.
+///
+/// A `false` result means "not listed in THIS CRL"; it is only a revocation
+/// verdict once the CRL has been authenticated (`verifyCrlSignature`) and is
+/// current (`crlIsCurrent`).
+pub fn isSerialRevoked(parsed: CertificateRevocationList, serial_der: []const u8) bool {
     var serials = parsed.revokedSerials();
     while (true) {
         const revoked = serials.next() catch return false;
         const candidate = revoked orelse return false;
-        if (std.mem.eql(u8, candidate, serial)) return true;
+        if (std.mem.eql(u8, candidate, serial_der)) return true;
     }
 }
 
-/// Verify the CertificateList signature with the issuer certificate's SPKI.
+/// Backward-compatible alias for `isSerialRevoked`.
+pub fn isRevoked(parsed: CertificateRevocationList, serial: []const u8) bool {
+    return isSerialRevoked(parsed, serial);
+}
+
+/// Return true when `now_epoch_seconds` falls inside the CRL validity window
+/// `thisUpdate <= now < nextUpdate` (RFC 5280 §5.1.2.4 / §5.1.2.5).
 ///
-/// CRL issuer authorization and distribution-point policy are the caller's
-/// responsibility. This function authenticates only the RFC 5280
-/// `tbsCertList` bytes against `signatureValue`, using the same direct issuer
-/// signature schemes accepted for OCSP.
-pub fn verifySignature(parsed: CertificateRevocationList, issuer_spki_der: []const u8) bool {
-    if (!std.mem.eql(u8, parsed.tbs_signature_algorithm_oid, parsed.signature_algorithm_oid)) return false;
-    if (parsed.tbs_der.len == 0 or parsed.signature_value.len == 0) return false;
-    return ocsp.verifyDerSignature(
-        parsed.signature_algorithm_oid,
-        issuer_spki_der,
+/// A CRL outside this window is stale and MUST NOT be trusted for revocation
+/// decisions: before `thisUpdate` it may predate the issuer's clock; at or
+/// after `nextUpdate` a newer CRL has superseded it and could list serials this
+/// one omits. `nextUpdate` is technically OPTIONAL in RFC 5280 but SHOULD be
+/// present; this function treats an ABSENT `nextUpdate` as *not current*
+/// (returns false) because such a CRL carries no freshness bound. An integrator
+/// that must accept `nextUpdate`-less CRLs should instead apply its own max-age
+/// policy against `parsed.this_update.epoch_seconds`.
+pub fn crlIsCurrent(parsed: CertificateRevocationList, now_epoch_seconds: i64) bool {
+    if (now_epoch_seconds < parsed.this_update.epoch_seconds) return false;
+    const next = parsed.next_update orelse return false;
+    return now_epoch_seconds < next.epoch_seconds;
+}
+
+/// SECURITY GATE — verify the CertificateList's outer signature against the
+/// ISSUING CA's public key.
+///
+/// Parses `crl_der`, enforces that the inner (`tbsCertList.signature`) and
+/// outer (`signatureAlgorithm`) algorithm identifiers agree (RFC 5280
+/// §5.1.1.2), then cryptographically verifies the `tbsCertList` bytes against
+/// `signatureValue` under the CA public key in `issuer_spki_der` via
+/// `x509_verify.verifyCertSignature` (RSA PKCS#1 v1.5 / ECDSA P-256 / Ed25519).
+///
+/// A CRL whose signature does not verify under the issuing CA MUST be rejected:
+/// an unauthenticated CRL can withhold revocations (e.g. an attacker-supplied
+/// empty CRL) or forge them. On success returns `{}`, meaning the CRL is
+/// authentic for `issuer_spki_der`. Failure modes:
+///   * `error.AlgorithmMismatch` — inner/outer algorithm OIDs disagree,
+///   * `error.BadSignature`      — signature invalid or key/scheme mismatch,
+///   * `error.UnsupportedSigAlg` — scheme outside the supported dispatch set,
+///   * any `x509.Error`          — the CRL DER was malformed.
+pub fn verifyCrlSignature(crl_der: []const u8, issuer_spki_der: []const u8) VerifyError!void {
+    const parsed = try parse(crl_der);
+    return verifyParsedCrlSignature(parsed, issuer_spki_der);
+}
+
+/// Parsed-CRL form of `verifyCrlSignature` for callers that already ran
+/// `parse` (avoids re-parsing). Identical security contract.
+pub fn verifyParsedCrlSignature(parsed: CertificateRevocationList, issuer_spki_der: []const u8) VerifyError!void {
+    if (!std.mem.eql(u8, parsed.tbs_signature_algorithm_oid, parsed.signature_algorithm_oid))
+        return error.AlgorithmMismatch;
+    if (parsed.tbs_der.len == 0 or parsed.signature_value.len == 0) return error.MissingField;
+    return x509_verify.verifyCertSignature(
         parsed.tbs_der,
         parsed.signature_value,
+        parsed.signature_algorithm_oid,
+        // No PSS params to thread: CRLs are signed with RSA-PKCS1 v1.5 / ECDSA /
+        // Ed25519 in the supported set (a PSS-signed CRL fails closed).
+        null,
+        issuer_spki_der,
     );
+}
+
+/// Boolean convenience wrapper over `verifyParsedCrlSignature`: returns true iff
+/// the CRL signature authenticates under `issuer_spki_der`. Prefer
+/// `verifyCrlSignature` / `verifyParsedCrlSignature` when the failure reason
+/// matters (distinguishing an unsupported scheme from a bad signature).
+pub fn verifySignature(parsed: CertificateRevocationList, issuer_spki_der: []const u8) bool {
+    verifyParsedCrlSignature(parsed, issuer_spki_der) catch return false;
+    return true;
 }
 
 fn parseTbs(parsed: *CertificateRevocationList, parent: x509.DerReader, tbs_tlv: x509.Tlv) Error!void {
@@ -495,6 +590,99 @@ test "crl verifySignature accepts direct issuer Ed25519 signature" {
     try std.testing.expect(!verifySignature(bad, spki));
 }
 
+test "crl verifyCrlSignature rejects a CRL signed by a non-issuer key" {
+    const allocator = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const issuer_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
+    const attacker_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x2C} ** Ed25519.KeyPair.seed_length);
+
+    // The CRL is signed by the ISSUER key only.
+    const der = try testSignedCrl(allocator, issuer_kp);
+    defer allocator.free(der);
+
+    // Positive: authenticates under the genuine issuing-CA SPKI.
+    const issuer_spki = try testEd25519Spki(allocator, issuer_kp.public_key.toBytes());
+    defer allocator.free(issuer_spki);
+    try verifyCrlSignature(der, issuer_spki);
+
+    // LOAD-BEARING NEGATIVE: a CRL that is NOT signed by the presented issuer
+    // must be rejected. Without this gate an attacker could serve a CRL signed
+    // by any key and either forge or withhold revocations.
+    const attacker_spki = try testEd25519Spki(allocator, attacker_kp.public_key.toBytes());
+    defer allocator.free(attacker_spki);
+    try std.testing.expectError(error.BadSignature, verifyCrlSignature(der, attacker_spki));
+}
+
+test "crl verifyCrlSignature reports typed tamper and algorithm-mismatch failures" {
+    const allocator = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const der = try testSignedCrl(allocator, kp);
+    defer allocator.free(der);
+
+    // Flipping a signature byte must surface as BadSignature, never a silent accept.
+    var tampered = try allocator.dupe(u8, der);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    try std.testing.expectError(error.BadSignature, verifyCrlSignature(tampered, spki));
+
+    // Inner (tbsCertList.signature) vs outer (signatureAlgorithm) OID mismatch
+    // is rejected before any crypto (RFC 5280 §5.1.1.2).
+    const parsed = try parse(der);
+    var mismatched = parsed;
+    mismatched.signature_algorithm_oid = &oid_ecdsa_sha256; // differs from the Ed25519 tbs OID
+    try std.testing.expectError(error.AlgorithmMismatch, verifyParsedCrlSignature(mismatched, spki));
+}
+
+test "crl verifyCrlSignature accepts an ECDSA P-256 issuer and rejects a wrong key" {
+    const allocator = std.testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const spki = try testEcSpki(allocator, kp.public_key);
+    defer allocator.free(spki);
+    const der = try testEcdsaSignedCrl(allocator, kp);
+    defer allocator.free(der);
+
+    // Positive: authenticates under the genuine ECDSA issuer SPKI.
+    try verifyCrlSignature(der, spki);
+
+    // Negative: an unrelated ECDSA key must not authenticate this CRL.
+    const wrong = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const wrong_spki = try testEcSpki(allocator, wrong.public_key);
+    defer allocator.free(wrong_spki);
+    try std.testing.expectError(error.BadSignature, verifyCrlSignature(der, wrong_spki));
+}
+
+test "crl isSerialRevoked matches revoked serials and misses others" {
+    const parsed = try parse(&MinimalCrlWithRevoked);
+    try std.testing.expect(isSerialRevoked(parsed, &[_]u8{0x05}));
+    try std.testing.expect(isSerialRevoked(parsed, &[_]u8{ 0x00, 0x80 }));
+    try std.testing.expect(!isSerialRevoked(parsed, &[_]u8{0x06}));
+    try std.testing.expect(!isSerialRevoked(parsed, &[_]u8{ 0x01, 0x02 }));
+
+    // A CRL with no revokedCertificates revokes nothing.
+    const empty = try parse(&MinimalCrlWithoutRevoked);
+    try std.testing.expect(!isSerialRevoked(empty, &[_]u8{0x05}));
+}
+
+test "crl crlIsCurrent enforces the thisUpdate..nextUpdate window" {
+    const parsed = try parse(&MinimalCrlWithRevoked);
+    const this_u = parsed.this_update.epoch_seconds;
+    const next_u = parsed.next_update.?.epoch_seconds;
+
+    try std.testing.expect(crlIsCurrent(parsed, this_u)); // lower bound inclusive
+    try std.testing.expect(crlIsCurrent(parsed, this_u + 1)); // in-window
+    try std.testing.expect(crlIsCurrent(parsed, next_u - 1)); // in-window
+    try std.testing.expect(!crlIsCurrent(parsed, this_u - 1)); // before thisUpdate
+    try std.testing.expect(!crlIsCurrent(parsed, next_u)); // upper bound exclusive (superseded)
+    try std.testing.expect(!crlIsCurrent(parsed, next_u + 100)); // expired
+
+    // A CRL lacking nextUpdate has no freshness bound → treated as not current.
+    const no_next = try parse(&MinimalCrlWithoutRevoked);
+    try std.testing.expect(!crlIsCurrent(no_next, no_next.this_update.epoch_seconds + 1));
+}
+
 fn testSignedCrl(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
@@ -525,6 +713,49 @@ fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [std.crypto.sign.Ed
     defer body.deinit(allocator);
     try appendAlgId(allocator, &body, &oid_ed25519, false);
     try appendDerBitString(allocator, &body, &public_key);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn testEcdsaSignedCrl(allocator: std.mem.Allocator, kp: ecdsa_p256.KeyPair) ![]u8 {
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(allocator);
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.integer, &[_]u8{1});
+    try appendAlgId(allocator, &tbs_body, &oid_ecdsa_sha256, false);
+    try appendDerSeq(allocator, &tbs_body, "");
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.utc_time, "260101000000Z");
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
+    try appendDerSeq(allocator, &tbs, tbs_body.items);
+    const sig = try ecdsa_p256.sign(tbs.items, kp);
+    var sig_der_buf: [80]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, tbs.items);
+    try appendAlgId(allocator, &body, &oid_ecdsa_sha256, false);
+    try appendDerBitString(allocator, &body, sig_der);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn testEcSpki(allocator: std.mem.Allocator, public_key: ecdsa_p256.PublicKey) ![]u8 {
+    const sec1 = public_key.toUncompressedSec1();
+    var alg: std.ArrayList(u8) = .empty;
+    defer alg.deinit(allocator);
+    try appendDerTlv(allocator, &alg, x509.Tag.oid, &oid_ec_public_key);
+    try appendDerTlv(allocator, &alg, x509.Tag.oid, &oid_prime256v1);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendDerSeq(allocator, &body, alg.items);
+    try appendDerBitString(allocator, &body, &sec1);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try appendDerSeq(allocator, &out, body.items);
@@ -574,3 +805,6 @@ fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usiz
 }
 
 const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };

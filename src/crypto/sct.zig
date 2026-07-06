@@ -43,14 +43,65 @@
 //! and a truncated or malformed block yields a typed error rather than reading
 //! past the slice.
 //!
+//! ## Verification pipeline and the pinned-log registry
+//!
+//! Beyond parsing, this module verifies an SCT signature against a
+//! CALLER-PROVIDED set of pinned CT logs (`[]const CtLog`). Orochi bundles NO
+//! log list; a deployment that wants CT enforcement supplies the logs it trusts
+//! from configuration. Each `CtLog` pairs a log's DER SubjectPublicKeyInfo with
+//! its RFC 6962 `log_id` (SHA-256 of that SPKI — derive it with `logIdFromSpki`
+//! so an operator need only configure the key). Supported log key algorithms are
+//! the RFC 6962 pair — ECDSA P-256 (`ecdsa_secp256r1_sha256`) and RSA
+//! (`rsa_pkcs1_sha256`); Ed25519 also verifies but is not an RFC 6962 log type.
+//!
+//! `verifySctAgainstLogs` / `verifyList` return a `VerifyResult`:
+//!   * `.valid`             — a pinned log matched and the signature checked out.
+//!   * `.no_applicable_log` — no pinned log matched the SCT's `log_id` (empty
+//!                            registry, or an SCT from a log this deployment does
+//!                            not pin). NOT an authentication failure.
+//!   * `.invalid`           — a pinned log matched but verification failed
+//!                            (bad signature, malformed SCT/key, algorithm
+//!                            mismatch, or a future-dated SCT). Always a reject.
+//!
+//! ### Intended tls_client integration (the integrator wires this; see report)
+//!
+//!   * CALL SITE: after the X.509 chain is verified. SCT verification is an
+//!     ADDITIONAL assurance that the leaf was publicly logged, not a substitute
+//!     for chain validation; if the chain fails, never reach this code.
+//!   * SCT SOURCES: embedded X.509 extension (parsed via `x509.parseSctList` /
+//!     `x509.findSctListExtension`), the TLS `signed_certificate_timestamp`
+//!     extension (18), and OCSP. Only the X.509-extension source is wired here;
+//!     the TLS-extension and OCSP sources are follow-ups (they reuse the same
+//!     `parseList` + `verifySctAgainstLogs` path once their SCT bytes are in
+//!     hand).
+//!   * ENTRY TYPE: SCTs EMBEDDED in the certificate sign over the PRECERTIFICATE
+//!     (`precert_entry`): the leaf's TBSCertificate with the CT poison extension
+//!     and the SCT-list extension removed, prefixed by the issuer key hash (use
+//!     `buildPrecertEntry`). SCTs delivered over the TLS extension or OCSP sign
+//!     over the FINAL certificate (`x509_entry`: the leaf DER). The caller sets
+//!     `CertContext.entry_type`/`signed_entry` accordingly; assembling the
+//!     precert TBS (extension stripping) is the caller's responsibility.
+//!   * FAIL-OPEN vs FAIL-CLOSED (recommendation): a plain TLS client with no CT
+//!     configured should treat `.no_applicable_log` as fail-OPEN (do not regress
+//!     connectivity when CT is not deployed), while `.invalid` is ALWAYS a hard
+//!     reject. A deployment that explicitly enables CT enforcement with a
+//!     non-empty pinned set and a policy (e.g. "≥1 valid SCT", or a Chrome-style
+//!     "≥2 SCTs from distinct pinned logs") should treat failure to meet that
+//!     policy as fail-CLOSED. This module returns only the primitive result; the
+//!     tls_client owns the open/closed policy decision.
+//!
 //! OUT OF SCOPE for this module (by design):
-//!   * Shipping or matching a CT log list / public keys. The caller must map a
-//!     parsed `log_id` to the correct log SubjectPublicKeyInfo before calling
-//!     `verifySct`.
+//!   * Shipping or fabricating a real CT log list / public keys — the registry
+//!     is always caller-provided.
 //!   * DER decoding of the X.509 extension envelope (handled by `x509.zig`).
+//!   * Assembling the precert TBSCertificate (poison/SCT extension stripping)
+//!     for `precert_entry` — the caller supplies `CertContext.signed_entry`.
+//!   * The fail-open vs fail-closed policy decision (the tls_client owns it).
 const std = @import("std");
 const x509 = @import("x509.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
+const rsa_verify = @import("rsa_verify.zig");
+const hash = @import("hash.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -389,29 +440,243 @@ pub fn buildPrecertEntry(out: []u8, issuer_key_hash: [log_id_len]u8, tbs: []cons
     return out[0..total];
 }
 
+// TLS 1.2 SignatureAndHashAlgorithm codes (RFC 5246 §7.4.1.4.1) as they appear
+// in an SCT's trailing `digitally-signed` struct. RFC 6962 §2.1.4 restricts CT
+// logs to ECDSA-P256 (`ecdsa_secp256r1_sha256`, hash sha256 + sig ecdsa) or RSA
+// (`rsa_pkcs1_sha256`, hash sha256 + sig rsa). Ed25519 (intrinsic hash + sig
+// ed25519, RFC 8422) is not an RFC 6962 log type but is accepted if a caller
+// pins such a key.
+const hash_sha256: u8 = 4; // HashAlgorithm.sha256
+const hash_intrinsic: u8 = 8; // Ed25519 signs the message directly
+const sig_rsa: u8 = 1; // SignatureAlgorithm.rsa
+const sig_ecdsa: u8 = 3; // SignatureAlgorithm.ecdsa
+const sig_ed25519: u8 = 7; // ed25519 (RFC 8422)
+
 /// Verify an SCT's digitally-signed value against a CT log public key.
 ///
-/// `signed_data` must be the exact `CertificateTimestamp` byte string returned
-/// by `buildSignedData` for the certificate or precertificate entry being
-/// checked. This function authenticates the SCT signature only; selecting the
-/// correct CT log key from `sct.log_id` and the public CT log list is the
-/// caller's responsibility.
+/// `log_public_key_spki_der` is the log's DER SubjectPublicKeyInfo (the same
+/// bytes hashed to form its `log_id`). `signed_data` must be the exact
+/// `CertificateTimestamp` byte string returned by `buildSignedData` for the
+/// certificate or precertificate entry being checked. This function
+/// authenticates the SCT signature only; selecting the correct CT log key from
+/// `sct.log_id` and the pinned CT log set is the caller's responsibility (see
+/// `verifySctAgainstLogs`).
+///
+/// The SPKI is parsed with the shared `x509.extractPublicKey`, so the log key
+/// may be ECDSA P-256, RSA, or Ed25519. The SCT's advertised
+/// `SignatureAndHashAlgorithm` must match the key family (SHA-256 throughout);
+/// any mismatch, malformed key, malformed signature, or verification failure
+/// returns `false` (fail closed).
 pub fn verifySct(sct: Sct, log_public_key_spki_der: []const u8, signed_data: []const u8) bool {
-    const key = parseLogPublicKeyFromSpki(log_public_key_spki_der) catch return false;
+    const key = x509.extractPublicKey(log_public_key_spki_der) catch return false;
     switch (key) {
-        .ecdsa_p256 => |pk| {
+        .ecdsa_p256 => |sec1| {
             if (sct.sig_hash_alg != hash_sha256 or sct.sig_signature_alg != sig_ecdsa) return false;
+            const pk = ecdsa_p256.parsePublicKeySec1(sec1) catch return false;
             const decoded = ecdsa_p256.signatureFromDer(sct.signature) catch return false;
             return ecdsa_p256.verify(decoded, signed_data, pk);
         },
-        .ed25519 => |pk| {
+        .rsa => |rsa_key| {
+            if (sct.sig_hash_alg != hash_sha256 or sct.sig_signature_alg != sig_rsa) return false;
+            const digest = hash.Sha256.hash(signed_data);
+            const pk = rsa_verify.PublicKey{ .n = rsa_key.modulus, .e = rsa_key.exponent };
+            return rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, sct.signature);
+        },
+        .ed25519 => |raw| {
             if (sct.sig_hash_alg != hash_intrinsic or sct.sig_signature_alg != sig_ed25519) return false;
             if (sct.signature.len != Ed25519.Signature.encoded_length) return false;
+            if (raw.len != Ed25519.PublicKey.encoded_length) return false;
+            const pk = Ed25519.PublicKey.fromBytes(raw[0..Ed25519.PublicKey.encoded_length].*) catch return false;
             const decoded = Ed25519.Signature.fromBytes(sct.signature[0..Ed25519.Signature.encoded_length].*);
             decoded.verify(signed_data, pk) catch return false;
             return true;
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned-log registry and verification entrypoints.
+//
+// Orochi ships NO built-in CT log list. A deployment supplies its own pinned
+// logs (from config) as a `[]const CtLog`. An empty set — or an SCT from an
+// unpinned log — yields `.no_applicable_log`; the caller's fail-open/closed
+// policy decides what that means. This module never fabricates a trusted log
+// and never makes the open/closed decision.
+// ---------------------------------------------------------------------------
+
+/// One pinned Certificate Transparency log.
+pub const CtLog = struct {
+    /// RFC 6962 §3.2 LogID: SHA-256 over the log key's DER SubjectPublicKeyInfo.
+    /// Derive it from `key_spki_der` with `logIdFromSpki`.
+    log_id: [log_id_len]u8,
+    /// The log's public key as a DER SubjectPublicKeyInfo (the full SEQUENCE),
+    /// aliased not copied. ECDSA P-256 and RSA are the RFC 6962 log key types.
+    key_spki_der: []const u8,
+};
+
+/// Compute the RFC 6962 LogID (SHA-256 of the DER SubjectPublicKeyInfo) for a
+/// log key. A caller building a `CtLog` from a configured SPKI uses this so it
+/// need not also hardcode the id; the result equals the `log_id` carried by
+/// SCTs the log issues.
+pub fn logIdFromSpki(spki_der: []const u8) [log_id_len]u8 {
+    return hash.Sha256.hash(spki_der);
+}
+
+/// Outcome of verifying an SCT against a pinned log set. See the module docs for
+/// the fail-open vs fail-closed recommendation the tls_client applies to these.
+pub const VerifyResult = enum {
+    /// A pinned log matched the SCT's `log_id`, its signature verified over the
+    /// reconstructed `CertificateTimestamp`, and (when a clock was supplied) the
+    /// timestamp was not in the future. The SCT is authentic.
+    valid,
+    /// No pinned log matched the SCT's `log_id` — the set was empty, or the SCT
+    /// came from a log this deployment does not pin. NOT an authentication
+    /// failure; the caller's policy decides whether to accept.
+    no_applicable_log,
+    /// A pinned log matched but verification failed: bad signature, malformed
+    /// SCT/key, an unsupported/mismatched algorithm, an oversized certified
+    /// entry, or a future-dated SCT. Always a hard reject.
+    invalid,
+};
+
+/// What the log signed over: the certified entry (RFC 6962 §3.2).
+pub const CertContext = struct {
+    entry_type: LogEntryType,
+    /// The `signed_entry` bytes exactly as the log hashes them:
+    ///   * `x509_entry`   — the leaf certificate DER (`ASN.1Cert`). Use for SCTs
+    ///     delivered over the TLS `signed_certificate_timestamp` extension or
+    ///     OCSP, which sign over the FINAL certificate.
+    ///   * `precert_entry` — the pre-framed `PreCert` blob
+    ///     (`issuer_key_hash[32] || TBSCertificate<1..2^24-1>`) from
+    ///     `buildPrecertEntry`. Use for SCTs EMBEDDED in the X.509 SCT extension,
+    ///     which sign over the PRECERTIFICATE (its TBS with the SCT-list and CT
+    ///     poison extensions removed). Assembling that TBS is the caller's job.
+    signed_entry: []const u8,
+};
+
+/// Clock-skew tolerance for the future-timestamp check: an SCT timestamp up to
+/// this many milliseconds ahead of the supplied `now_ms` is still accepted.
+/// RFC 6962 §5.2 says a log must not issue future-dated SCTs; this margin only
+/// absorbs modest local clock skew.
+pub const future_skew_ms: u64 = 5 * 60 * 1000;
+
+/// Upper bound on the certified-entry (`signed_entry`) size that `verifyOneSct`,
+/// `verifySctAgainstLogs`, and `verifyList` will frame in their internal
+/// stack buffer. Comfortably covers real leaf certs and precert TBS; a larger
+/// entry yields `.invalid` (fail closed). A deployment with atypically large
+/// certificates can build the signed data itself and call
+/// `verifySignedDataAgainstLogs`, which imposes no such bound.
+pub const max_internal_signed_entry: usize = 16 * 1024;
+
+/// Internal signed-data buffer size: the `CertificateTimestamp` fixed header
+/// (14 bytes) plus the x509 entry's 24-bit length prefix plus the certified
+/// entry. `CtExtensions` are effectively always empty for CT SCTs; a non-empty
+/// extension that would overflow this yields `error.NoSpaceLeft` → `.invalid`.
+const internal_signed_data_buf_len: usize = 14 + u24_prefix_len + max_internal_signed_entry;
+
+fn findLog(target: [log_id_len]u8, logs: []const CtLog) ?CtLog {
+    for (logs) |log| {
+        if (std.mem.eql(u8, &log.log_id, &target)) return log;
+    }
+    return null;
+}
+
+/// Frame the `CertificateTimestamp` a log signs for `sct` over `ctx` into `buf`.
+fn frameSignedData(buf: []u8, sct: Sct, ctx: CertContext) Error![]const u8 {
+    return buildSignedData(buf, .{
+        .version = sct.version,
+        .timestamp = sct.timestamp,
+        .entry_type = ctx.entry_type,
+        .signed_entry = ctx.signed_entry,
+        .extensions = sct.extensions,
+    });
+}
+
+/// Match `sct` to a pinned log, enforce the future-timestamp rule, then verify
+/// the SCT signature over an already-reconstructed `signed_data`.
+///
+/// `signed_data` must be the exact `CertificateTimestamp` for `sct`'s entry (as
+/// `buildSignedData` produces). When `now_ms` is non-null, an SCT dated more
+/// than `future_skew_ms` ahead of it is rejected as `.invalid`; pass null to
+/// skip the temporal check (e.g. when no trusted clock is available). This is
+/// the buffer-free core: callers holding large certificates build `signed_data`
+/// themselves and avoid the internal-buffer bound of `verifyOneSct`.
+pub fn verifySignedDataAgainstLogs(
+    sct: Sct,
+    signed_data: []const u8,
+    logs: []const CtLog,
+    now_ms: ?u64,
+) VerifyResult {
+    const log = findLog(sct.log_id, logs) orelse return .no_applicable_log;
+    if (now_ms) |now| {
+        if (sct.timestamp > now and sct.timestamp - now > future_skew_ms) return .invalid;
+    }
+    return if (verifySct(sct, log.key_spki_der, signed_data)) .valid else .invalid;
+}
+
+/// Verify one parsed SCT against a pinned CT log set.
+///
+/// Reconstructs the signed `CertificateTimestamp` for `ctx` into an internal
+/// buffer (bounded by `max_internal_signed_entry`; an oversized entry fails
+/// closed to `.invalid`) and delegates to `verifySignedDataAgainstLogs`.
+pub fn verifyOneSct(sct: Sct, ctx: CertContext, logs: []const CtLog, now_ms: ?u64) VerifyResult {
+    var buf: [internal_signed_data_buf_len]u8 = undefined;
+    const signed = frameSignedData(&buf, sct, ctx) catch return .invalid;
+    return verifySignedDataAgainstLogs(sct, signed, logs, now_ms);
+}
+
+/// Verify one serialized SCT (a single `serialized_sct` body — the per-item
+/// length prefix already stripped, as `x509.parseSctList` + list framing yield)
+/// against a pinned CT log set.
+///
+/// Parses the SCT (fail-closed to `.invalid` on malformed bytes) and delegates
+/// to `verifyOneSct`. This is the entrypoint the tls_client calls once per SCT
+/// it extracts from the certificate, the TLS extension, or an OCSP response.
+pub fn verifySctAgainstLogs(
+    sct_der: []const u8,
+    ctx: CertContext,
+    logs: []const CtLog,
+    now_ms: ?u64,
+) VerifyResult {
+    const sct = parseSct(sct_der) catch return .invalid;
+    return verifyOneSct(sct, ctx, logs, now_ms);
+}
+
+/// Tally of `verifyList` outcomes across a `SignedCertificateTimestampList`.
+/// The tls_client applies its policy to these counts (e.g. require `valid >= 1`,
+/// or a distinct-log quorum) and decides fail-open vs fail-closed.
+pub const ListSummary = struct {
+    valid: usize = 0,
+    no_applicable_log: usize = 0,
+    invalid: usize = 0,
+};
+
+/// Parse a `SignedCertificateTimestampList` and verify every SCT it carries
+/// against the pinned log set, returning a `ListSummary`. Propagates a parse
+/// error (malformed list framing / too many SCTs) so the caller treats a
+/// structurally broken list as a hard failure. Per-SCT verification failures are
+/// tallied, not raised, so one bad SCT does not mask the others.
+pub fn verifyList(
+    list_bytes: []const u8,
+    ctx: CertContext,
+    logs: []const CtLog,
+    now_ms: ?u64,
+) Error!ListSummary {
+    const list = try parseList(list_bytes);
+    var buf: [internal_signed_data_buf_len]u8 = undefined;
+    var summary: ListSummary = .{};
+    for (list.slice()) |sct| {
+        const signed = frameSignedData(&buf, sct, ctx) catch {
+            summary.invalid += 1;
+            continue;
+        };
+        switch (verifySignedDataAgainstLogs(sct, signed, logs, now_ms)) {
+            .valid => summary.valid += 1,
+            .no_applicable_log => summary.no_applicable_log += 1,
+            .invalid => summary.invalid += 1,
+        }
+    }
+    return summary;
 }
 
 /// Write a big-endian 24-bit length into the first three bytes of `out`
@@ -428,67 +693,12 @@ fn writeU24(out: []u8, value: u24) void {
 
 const testing = std.testing;
 
-/// TLS HashAlgorithm.sha256 / SignatureAlgorithm.ecdsa (RFC 5246 §7.4.1.4.1),
-/// i.e. the legacy pair that combines to the 0x0403 ecdsa_secp256r1_sha256
-/// SignatureScheme code.
-const hash_sha256: u8 = 4;
-const hash_intrinsic: u8 = 8;
-const sig_ecdsa: u8 = 3;
-const sig_ed25519: u8 = 7;
-
-const LogPublicKey = union(enum) {
-    ecdsa_p256: ecdsa_p256.PublicKey,
-    ed25519: Ed25519.PublicKey,
-};
-
-fn parseLogPublicKeyFromSpki(spki_der: []const u8) !LogPublicKey {
-    var top = x509.DerReader.init(spki_der);
-    const seq = try top.readExpected(x509.Tag.sequence);
-    try top.expectEmpty();
-    var spki = try top.child(seq);
-    const alg_seq = try spki.readExpected(x509.Tag.sequence);
-    const key_bits = try spki.readExpected(x509.Tag.bit_string);
-    try spki.expectEmpty();
-
-    var alg = try spki.child(alg_seq);
-    const oid = try alg.readExpected(x509.Tag.oid);
-    try validateOid(oid.value);
-    var params: ?[]const u8 = null;
-    if (alg.hasRemaining()) {
-        const p = try alg.readTlv();
-        if (p.tag == x509.Tag.oid) params = p.value;
-    }
-    try alg.expectEmpty();
-
-    if (key_bits.value.len == 0 or key_bits.value[0] != 0) return error.InvalidBitString;
-    const key_bytes = key_bits.value[1..];
-    if (std.mem.eql(u8, oid.value, &oid_ec_public_key)) {
-        const curve = params orelse return error.UnsupportedPublicKey;
-        if (!std.mem.eql(u8, curve, &oid_prime256v1)) return error.UnsupportedPublicKey;
-        return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
-    }
-    if (std.mem.eql(u8, oid.value, &oid_ed25519)) {
-        if (key_bytes.len != Ed25519.PublicKey.encoded_length) return error.UnsupportedPublicKey;
-        return .{ .ed25519 = Ed25519.PublicKey.fromBytes(key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return error.UnsupportedPublicKey };
-    }
-    return error.UnsupportedPublicKey;
-}
-
-fn validateOid(value: []const u8) !void {
-    if (value.len == 0) return error.InvalidOid;
-    var at_arc_start = true;
-    var ended_arc = false;
-    for (value) |byte| {
-        if (at_arc_start and byte == 0x80) return error.InvalidOid;
-        ended_arc = (byte & 0x80) == 0;
-        at_arc_start = ended_arc;
-    }
-    if (!ended_arc) return error.InvalidOid;
-}
-
+/// id-Ed25519 (1.3.101.112), for hand-building an Ed25519 log SPKI in tests.
+const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+/// id-ecPublicKey (1.2.840.10045.2.1) and prime256v1 (1.2.840.10045.3.1.7),
+/// for hand-building an ECDSA-P256 log SPKI in tests.
 const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
-const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 
 /// Hand-build a `serialized_sct` body for one v1 SCT.
 fn buildOneSctBody(
@@ -946,6 +1156,347 @@ fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usiz
     }
     try out.append(allocator, 0x80 | @as(u8, @intCast(count)));
     try out.appendSlice(allocator, tmp[tmp.len - count ..]);
+}
+
+/// rsaEncryption (1.2.840.113549.1.1.1), for a hand-built RSA log SPKI.
+const oid_rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+
+/// Append a DER INTEGER with `magnitude` as a big-endian unsigned value: strips
+/// leading zeros to the minimal form, then adds a single 0x00 sign byte when the
+/// leading content byte's high bit is set (X.690 positivity).
+fn appendDerInteger(allocator: std.mem.Allocator, out: *std.ArrayList(u8), magnitude: []const u8) !void {
+    var v = magnitude;
+    while (v.len > 1 and v[0] == 0) v = v[1..];
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    if (v.len == 0 or (v[0] & 0x80) != 0) try body.append(allocator, 0);
+    try body.appendSlice(allocator, v);
+    try appendDerTlv(allocator, out, x509.Tag.integer, body.items);
+}
+
+/// Build an ECDSA-P256 log SPKI: SEQUENCE { SEQUENCE { OID ecPublicKey, OID
+/// prime256v1 }, BIT STRING { 0x00 || sec1 } }.
+fn testEcdsaSpki(allocator: std.mem.Allocator, sec1: [ecdsa_p256.sec1_uncompressed_length]u8) ![]u8 {
+    var alg_body: std.ArrayList(u8) = .empty;
+    defer alg_body.deinit(allocator);
+    try appendDerTlv(allocator, &alg_body, x509.Tag.oid, &oid_ec_public_key);
+    try appendDerTlv(allocator, &alg_body, x509.Tag.oid, &oid_prime256v1);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendDerSeq(allocator, &body, alg_body.items);
+    try appendDerBitString(allocator, &body, &sec1);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build an RSA log SPKI: SEQUENCE { SEQUENCE { OID rsaEncryption, NULL },
+/// BIT STRING { 0x00 || SEQUENCE { INTEGER n, INTEGER e } } }.
+fn testRsaSpki(allocator: std.mem.Allocator, n: []const u8, e: []const u8) ![]u8 {
+    var rsa_body: std.ArrayList(u8) = .empty;
+    defer rsa_body.deinit(allocator);
+    try appendDerInteger(allocator, &rsa_body, n);
+    try appendDerInteger(allocator, &rsa_body, e);
+
+    var rsa_seq: std.ArrayList(u8) = .empty;
+    defer rsa_seq.deinit(allocator);
+    try appendDerSeq(allocator, &rsa_seq, rsa_body.items);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendAlgId(allocator, &body, &oid_rsa_encryption, true);
+    try appendDerBitString(allocator, &body, rsa_seq.items);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+// M521 = 2^521-1 (a Mersenne PRIME) with e = d = n-2 ≡ -1 (mod n-1): a
+// self-signing RSA key needing no key generation or modular inverse, mirroring
+// the trick `rsa_verify.zig` uses for its own KAT. It exercises the RSA branch
+// of `verifySct` with our own signer. 521 bits = 66 bytes (0x01 then 65×0xFF);
+// n-2 flips the low byte to 0xFD.
+const m521_n = blk: {
+    var n: [66]u8 = [_]u8{0xFF} ** 66;
+    n[0] = 0x01;
+    break :blk n;
+};
+const m521_ed = blk: {
+    var e: [66]u8 = [_]u8{0xFF} ** 66;
+    e[0] = 0x01;
+    e[65] = 0xFD;
+    break :blk e;
+};
+/// DER DigestInfo prefix for SHA-256 (RFC 8017 §9.2), for the PKCS1 KAT below.
+const sha256_digest_info_prefix = [_]u8{ 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
+
+test "verify accepts an ECDSA-P256 log signature (self-consistency KAT)" {
+    // NOTE: the log key is a fresh test keypair we control — this is a
+    // self-consistency check of the reconstruction + verify path, not an
+    // external RFC 6962 CT vector.
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x07 };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 0x0000_0193_4d2e_a1f0;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+    const sig = try ecdsa_p256.sign(signed, kp);
+    var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_sig = try ecdsa_p256.signatureToDer(sig, &der_buf);
+    const sct = Sct{
+        .version = .v1,
+        .log_id = log.log_id,
+        .timestamp = ts,
+        .extensions = &.{},
+        .sig_hash_alg = hash_sha256,
+        .sig_signature_alg = sig_ecdsa,
+        .signature = der_sig,
+    };
+
+    // Direct signature check and both registry entrypoints accept it.
+    try testing.expect(verifySct(sct, spki, signed));
+    try testing.expectEqual(VerifyResult.valid, verifyOneSct(sct, ctx, &.{log}, ts));
+    try testing.expectEqual(VerifyResult.valid, verifySignedDataAgainstLogs(sct, signed, &.{log}, null));
+
+    // No pinned log matches a different id, and an empty registry never matches.
+    const other = CtLog{ .log_id = [_]u8{0x00} ** log_id_len, .key_spki_der = spki };
+    try testing.expectEqual(VerifyResult.no_applicable_log, verifyOneSct(sct, ctx, &.{other}, null));
+    try testing.expectEqual(VerifyResult.no_applicable_log, verifyOneSct(sct, ctx, &.{}, null));
+
+    // Tampering the signed data flips the outcome to a hard reject.
+    signed_buf[0] ^= 1;
+    try testing.expectEqual(VerifyResult.invalid, verifySignedDataAgainstLogs(sct, signed, &.{log}, null));
+}
+
+test "verifySctAgainstLogs verifies an ECDSA SCT from its serialized bytes" {
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x0b };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 42;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+    const sig = try ecdsa_p256.sign(signed, kp);
+    var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_sig = try ecdsa_p256.signatureToDer(sig, &der_buf);
+    var body_buf: [256]u8 = undefined;
+    const body = buildOneSctBody(&body_buf, log.log_id, ts, &.{}, der_sig);
+
+    // Valid over the wire bytes.
+    try testing.expectEqual(VerifyResult.valid, verifySctAgainstLogs(body, ctx, &.{log}, null));
+    // Unknown log and empty registry.
+    const other = CtLog{ .log_id = [_]u8{0x00} ** log_id_len, .key_spki_der = spki };
+    try testing.expectEqual(VerifyResult.no_applicable_log, verifySctAgainstLogs(body, ctx, &.{other}, null));
+    try testing.expectEqual(VerifyResult.no_applicable_log, verifySctAgainstLogs(body, ctx, &.{}, null));
+    // Flipping the trailing signature byte → hard reject.
+    var tampered: [256]u8 = undefined;
+    @memcpy(tampered[0..body.len], body);
+    tampered[body.len - 1] ^= 0x01;
+    try testing.expectEqual(VerifyResult.invalid, verifySctAgainstLogs(tampered[0..body.len], ctx, &.{log}, null));
+    // Malformed (truncated) SCT bytes → invalid, never a match.
+    try testing.expectEqual(VerifyResult.invalid, verifySctAgainstLogs(body[0..5], ctx, &.{log}, null));
+}
+
+test "verifyOneSct accepts an RSA-PKCS1-SHA256 log signature (self-consistency KAT)" {
+    // The RSA log key is the self-signing M521 key we control (see above): this
+    // exercises verifySct's RSA branch, not an external CT vector.
+    const allocator = testing.allocator;
+    const spki = try testRsaSpki(allocator, &m521_n, &m521_ed);
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x2a };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 0x0000_0193_0000_0001;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+
+    // Encode EM = 00 01 FF.. 00 || DigestInfo(sha256) || SHA256(signed), then
+    // self-sign s = EM^d mod n with our controlled M521 private exponent.
+    const digest = hash.Sha256.hash(signed);
+    const k = m521_n.len; // 66
+    const t_len = sha256_digest_info_prefix.len + digest.len; // 51
+    var em: [66]u8 = undefined;
+    em[0] = 0x00;
+    em[1] = 0x01;
+    const ps_len = k - t_len - 3; // 12
+    @memset(em[2 .. 2 + ps_len], 0xFF);
+    em[2 + ps_len] = 0x00;
+    @memcpy(em[3 + ps_len ..][0..sha256_digest_info_prefix.len], &sha256_digest_info_prefix);
+    @memcpy(em[3 + ps_len + sha256_digest_info_prefix.len ..][0..digest.len], &digest);
+    var sig: [66]u8 = undefined;
+    try rsa_verify.modExp(&em, &m521_ed, &m521_n, &sig);
+
+    const sct = Sct{
+        .version = .v1,
+        .log_id = log.log_id,
+        .timestamp = ts,
+        .extensions = &.{},
+        .sig_hash_alg = hash_sha256,
+        .sig_signature_alg = sig_rsa,
+        .signature = &sig,
+    };
+
+    try testing.expect(verifySct(sct, spki, signed));
+    try testing.expectEqual(VerifyResult.valid, verifyOneSct(sct, ctx, &.{log}, null));
+
+    // A flipped signature byte → invalid.
+    var bad_sig = sig;
+    bad_sig[10] ^= 0x01;
+    var bad_sct = sct;
+    bad_sct.signature = &bad_sig;
+    try testing.expectEqual(VerifyResult.invalid, verifyOneSct(bad_sct, ctx, &.{log}, null));
+
+    // Algorithm mismatch (SCT claims ECDSA over an RSA key) → invalid.
+    var mism = sct;
+    mism.sig_signature_alg = sig_ecdsa;
+    try testing.expectEqual(VerifyResult.invalid, verifyOneSct(mism, ctx, &.{log}, null));
+}
+
+test "verifyOneSct rejects a future-dated SCT when a clock is supplied" {
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x01 };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 10_000_000_000;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+    const sig = try ecdsa_p256.sign(signed, kp);
+    var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_sig = try ecdsa_p256.signatureToDer(sig, &der_buf);
+    const sct = Sct{
+        .version = .v1,
+        .log_id = log.log_id,
+        .timestamp = ts,
+        .extensions = &.{},
+        .sig_hash_alg = hash_sha256,
+        .sig_signature_alg = sig_ecdsa,
+        .signature = der_sig,
+    };
+
+    // A clock well before the SCT timestamp (beyond skew) rejects it.
+    try testing.expectEqual(VerifyResult.invalid, verifyOneSct(sct, ctx, &.{log}, ts - future_skew_ms - 1000));
+    // Within the skew window, exactly at the timestamp, or with no clock: accept.
+    try testing.expectEqual(VerifyResult.valid, verifyOneSct(sct, ctx, &.{log}, ts - future_skew_ms + 1000));
+    try testing.expectEqual(VerifyResult.valid, verifyOneSct(sct, ctx, &.{log}, ts));
+    try testing.expectEqual(VerifyResult.valid, verifyOneSct(sct, ctx, &.{log}, null));
+}
+
+test "verifyList tallies valid and no_applicable_log outcomes" {
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x03 };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+
+    // SCT 1: valid, from the pinned log.
+    const ts1: u64 = 100;
+    var sbuf1: [128]u8 = undefined;
+    const s1 = try buildSignedData(&sbuf1, .{
+        .timestamp = ts1,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+    const sig1 = try ecdsa_p256.sign(s1, kp);
+    var db1: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const dsig1 = try ecdsa_p256.signatureToDer(sig1, &db1);
+    var bb1: [256]u8 = undefined;
+    const body1 = buildOneSctBody(&bb1, log.log_id, ts1, &.{}, dsig1);
+
+    // SCT 2: from a log this deployment does not pin (signature irrelevant).
+    const junk = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 };
+    var bb2: [256]u8 = undefined;
+    const body2 = buildOneSctBody(&bb2, [_]u8{0x00} ** log_id_len, 200, &.{}, &junk);
+
+    var list_buf: [768]u8 = undefined;
+    const list_bytes = buildList(&list_buf, &.{ body1, body2 });
+
+    // Act
+    const summary = try verifyList(list_bytes, ctx, &.{log}, null);
+
+    // Assert
+    try testing.expectEqual(@as(usize, 1), summary.valid);
+    try testing.expectEqual(@as(usize, 1), summary.no_applicable_log);
+    try testing.expectEqual(@as(usize, 0), summary.invalid);
+
+    // A structurally broken list is a hard failure, not a summary.
+    try testing.expectError(error.LengthMismatch, verifyList(&[_]u8{ 0x00, 0x08, 0x00, 0x01, 0x00, 0x02 }, ctx, &.{log}, null));
+}
+
+test "verifyOneSct fails closed when the certified entry exceeds the internal buffer" {
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
+
+    // A signed_entry one byte past the internal cap forces buildSignedData to
+    // run out of room; verifyOneSct maps that to .invalid rather than reading
+    // uninitialized memory.
+    const big = try allocator.alloc(u8, max_internal_signed_entry + 1);
+    defer allocator.free(big);
+    @memset(big, 0x00);
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = big };
+    const sct = Sct{
+        .version = .v1,
+        .log_id = log.log_id,
+        .timestamp = 1,
+        .extensions = &.{},
+        .sig_hash_alg = hash_sha256,
+        .sig_signature_alg = sig_ecdsa,
+        .signature = &[_]u8{0x00},
+    };
+    try testing.expectEqual(VerifyResult.invalid, verifyOneSct(sct, ctx, &.{log}, null));
+}
+
+test "logIdFromSpki equals the SHA-256 of the SPKI DER" {
+    const allocator = testing.allocator;
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki = try testEcdsaSpki(allocator, kp.public_key.toUncompressedSec1());
+    defer allocator.free(spki);
+    try testing.expectEqualSlices(u8, &hash.Sha256.hash(spki), &logIdFromSpki(spki));
 }
 
 test {
