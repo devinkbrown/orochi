@@ -887,7 +887,7 @@ test "ocsp covers cert status tag bytes" {
 
 test "ocsp verifyResponseSignature accepts direct issuer Ed25519 signature" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5A} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5A)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
     const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, "20260202030405Z");
@@ -950,7 +950,7 @@ test "buildRequest emits a well-formed single-CertID OCSP request" {
 test "buildRequestForCerts derives the CertID from parsed leaf + issuer certs" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6c} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6c)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&buf, .{
         .common_name = "issuer.test",
@@ -981,7 +981,7 @@ test "buildRequestForCerts derives the CertID from parsed leaf + issuer certs" {
 
 test "isStapleServable accepts a good, signed, in-window response" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7B} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7B)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
     const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good, "20260202030405Z");
@@ -1005,7 +1005,7 @@ test "isStapleServable accepts a good, signed, in-window response" {
 
 test "isStapleServable rejects revoked, wrong-serial, and tampered responses" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7C} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7C)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
     const in_window = try x509.generalizedTimeToEpoch("20260115030405Z");
@@ -1028,7 +1028,7 @@ test "isStapleServable rejects revoked, wrong-serial, and tampered responses" {
     try std.testing.expect(!isStapleServable(tampered, spki, &[_]u8{0x44}, in_window, 0));
 
     // A different issuer key fails verification even for a pristine good response.
-    const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x2D} ** Ed25519.KeyPair.seed_length);
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x2D)));
     const other_spki = try testEd25519Spki(allocator, other.public_key.toBytes());
     defer allocator.free(other_spki);
     try std.testing.expect(!isStapleServable(good, other_spki, &[_]u8{0x44}, in_window, 0));
@@ -1051,7 +1051,7 @@ fn testSignedOcspResponse(
 ) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
-    try appendDerTlv(allocator, &tbs_body, Asn1Tag.context_2_primitive, &([_]u8{0xA5} ** 20));
+    try appendDerTlv(allocator, &tbs_body, Asn1Tag.context_2_primitive, &(@as([20]u8, @splat(0xA5))));
     try appendDerTlv(allocator, &tbs_body, x509.Tag.generalized_time, "20260102030405Z");
 
     var responses_body: std.ArrayList(u8) = .empty;
@@ -1061,8 +1061,8 @@ fn testSignedOcspResponse(
     var cert_id_body: std.ArrayList(u8) = .empty;
     defer cert_id_body.deinit(allocator);
     try appendAlgId(allocator, &cert_id_body, &oid_sha1, true);
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x11} ** 20));
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x22} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x11))));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x22))));
     try appendDerTlv(allocator, &cert_id_body, x509.Tag.integer, serial);
     try appendDerSeq(allocator, &single_body, cert_id_body.items);
     switch (status) {
@@ -1142,8 +1142,8 @@ fn testDelegatedOcspResponse(
     var cert_id_body: std.ArrayList(u8) = .empty;
     defer cert_id_body.deinit(allocator);
     try appendAlgId(allocator, &cert_id_body, &oid_sha1, true);
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x11} ** 20));
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x22} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x11))));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x22))));
     try appendDerTlv(allocator, &cert_id_body, x509.Tag.integer, serial);
     try appendDerSeq(allocator, &single_body, cert_id_body.items);
     try appendDerTlv(allocator, &single_body, Asn1Tag.context_0_primitive, ""); // certStatus good

@@ -460,8 +460,8 @@ pub const Token = struct {
 pub const ReplayCache = struct {
     /// 16-byte fingerprints (the token's AEAD tag is a strong, fixed-size
     /// summary of the whole token; we use it as the replay key).
-    entries: [capacity][tag_len]u8 = [_][tag_len]u8{[_]u8{0} ** tag_len} ** capacity,
-    valid: [capacity]bool = [_]bool{false} ** capacity,
+    entries: [capacity][tag_len]u8 = @splat(@as([tag_len]u8, @splat(0))),
+    valid: [capacity]bool = @splat(false),
     next: usize = 0,
 
     pub const capacity: usize = 256;
@@ -620,7 +620,7 @@ test "encodeRetry produces a packet whose tag verifies against the pseudo-packet
 }
 
 test "Retry token round-trips: seal then verify for the same IP and DCID" {
-    const secret = Secret.fromSeed([_]u8{0x5a} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x5a)));
     const client_ip = [_]u8{ 192, 0, 2, 33 };
     const odcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
     const now: u64 = 1_000_000_000;
@@ -637,7 +637,7 @@ test "Retry token round-trips: seal then verify for the same IP and DCID" {
 }
 
 test "Retry token verify — rejects a different client IP (AddressMismatch)" {
-    const secret = Secret.fromSeed([_]u8{0x5a} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x5a)));
     const client_ip = [_]u8{ 192, 0, 2, 33 };
     const wrong_ip = [_]u8{ 198, 51, 100, 7 };
     const odcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 };
@@ -654,7 +654,7 @@ test "Retry token verify — rejects a different client IP (AddressMismatch)" {
 }
 
 test "Retry token verify — rejects an expired token" {
-    const secret = Secret.fromSeed([_]u8{0x77} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x77)));
     const client_ip = [_]u8{ 10, 0, 0, 1 };
     const odcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     const now: u64 = 1_000_000_000;
@@ -672,7 +672,7 @@ test "Retry token verify — rejects an expired token" {
 }
 
 test "Retry token verify — rejects a forged tag; recovers the bound DCID intact" {
-    const secret = Secret.fromSeed([_]u8{0x33} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x33)));
     const client_ip = [_]u8{ 10, 0, 0, 1 };
     const odcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     const now: u64 = 1_000_000_000;
@@ -698,7 +698,7 @@ test "Retry token verify — rejects a forged tag; recovers the bound DCID intac
 }
 
 test "ReplayCache — a token is accepted once and rejected on replay" {
-    const secret = Secret.fromSeed([_]u8{0x12} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x12)));
     const client_ip = [_]u8{ 203, 0, 113, 9 };
     const odcid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const now: u64 = 1_000_000_000;
@@ -741,15 +741,15 @@ test "Version Negotiation — encodes 0x00000000 version and lists v1, swaps CID
 
 test "Version Negotiation never amplifies relative to a 1200-byte trigger" {
     // A client Initial is padded to ≥1200 bytes; the VN reply must be far smaller.
-    const dcid = [_]u8{0xaa} ** 8;
-    const scid = [_]u8{0xbb} ** 8;
+    const dcid = @as([8]u8, @splat(0xaa));
+    const scid = @as([8]u8, @splat(0xbb));
     var out: [64]u8 = undefined;
     const n = try encodeVersionNegotiation(&out, &dcid, &scid);
     try testing.expect(n < 1200);
 }
 
 test "statelessResetToken — deterministic per key+CID, differs across CIDs and keys" {
-    const secret = Secret.fromSeed([_]u8{0x99} ** 64);
+    const secret = Secret.fromSeed(@as([64]u8, @splat(0x99)));
     const cid_a = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const cid_b = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 };
 
@@ -760,13 +760,13 @@ test "statelessResetToken — deterministic per key+CID, differs across CIDs and
     const t3 = statelessResetToken(&secret, &cid_b);
     try testing.expect(!std.mem.eql(u8, &t1, &t3)); // CID-sensitive
 
-    const other = Secret.fromSeed([_]u8{0x11} ** 64);
+    const other = Secret.fromSeed(@as([64]u8, @splat(0x11)));
     const t4 = statelessResetToken(&other, &cid_a);
     try testing.expect(!std.mem.eql(u8, &t1, &t4)); // key-sensitive
 }
 
 test "encodeStatelessReset embeds the token in the trailing 16 bytes and looks 1-RTT" {
-    const token = [_]u8{0xab} ** stateless_reset_token_len;
+    const token = @as([stateless_reset_token_len]u8, @splat(0xab));
     var out: [40]u8 = undefined;
     const n = try encodeStatelessReset(&out, token);
     try testing.expectEqual(@as(usize, 40), n);

@@ -391,7 +391,7 @@ test "transport_param decode rejects an over-long connection id" {
     defer buf.deinit(allocator);
     try quic_frame.appendVarInt(&buf, allocator, ParamId.initial_source_connection_id.toInt());
     try quic_frame.appendVarInt(&buf, allocator, max_connection_id_len + 1);
-    try buf.appendSlice(allocator, &([_]u8{0xab} ** (max_connection_id_len + 1)));
+    try buf.appendSlice(allocator, &(@as([(max_connection_id_len + 1)]u8, @splat(0xab))));
     try testing.expectError(Error.Malformed, decode(buf.items));
 }
 
@@ -399,7 +399,7 @@ test "transport_param encode rejects an over-long connection id" {
     const allocator = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const big = [_]u8{0xcd} ** (max_connection_id_len + 1);
+    const big = @as([(max_connection_id_len + 1)]u8, @splat(0xcd));
     try testing.expectError(
         Error.Malformed,
         encode(&buf, allocator, .{ .initial_source_connection_id = &big }),

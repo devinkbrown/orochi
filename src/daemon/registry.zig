@@ -648,7 +648,7 @@ fn moduleIndex(comptime mods: []const Module, id: []const u8) ?usize {
 fn findDependencyCycle(comptime mods: []const Module) ?ValidationError {
     const n = mods.len;
     // 0 = unvisited (white), 1 = on stack (gray), 2 = done (black).
-    var color = [_]u8{0} ** n;
+    var color = @as([n]u8, @splat(0));
 
     for (mods, 0..) |_, start| {
         if (color[start] != 0) continue;

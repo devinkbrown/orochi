@@ -1454,7 +1454,7 @@ const WtLoopback = struct {
     fn init(alloc: Allocator) !*WtLoopback {
         const lb = try alloc.create(WtLoopback);
         errdefer alloc.destroy(lb);
-        lb.kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+        lb.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
         lb.cert = try mintCert(&lb.cert_buf, lb.kp);
         lb.cert_chain = .{lb.cert};
 
@@ -1464,8 +1464,8 @@ const WtLoopback = struct {
             .alpn_protocols = &test_alpn,
             .transport_params = server_params,
             .local_cid = &test_server_cid,
-            .x25519_seed = [_]u8{0x21} ** 32,
-            .server_random = [_]u8{0x55} ** 32,
+            .x25519_seed = @as([32]u8, @splat(0x21)),
+            .server_random = @as([32]u8, @splat(0x55)),
         });
         errdefer lb.server.deinit();
         lb.client = try quic_conn.Conn.initClient(alloc, .{
@@ -1473,8 +1473,8 @@ const WtLoopback = struct {
             .transport_params = client_params,
             .local_cid = &test_client_cid,
             .initial_dcid = &test_initial_dcid,
-            .x25519_seed = [_]u8{0x42} ** 32,
-            .client_random = [_]u8{0x11} ** 32,
+            .x25519_seed = @as([32]u8, @splat(0x42)),
+            .client_random = @as([32]u8, @splat(0x11)),
         });
         return lb;
     }

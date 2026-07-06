@@ -56,7 +56,7 @@ const RcuTlsEntry = struct {
     participant: ?*ebr.Participant = null,
 };
 
-threadlocal var rcu_tls_entries: [rcu_tls_slot_count]RcuTlsEntry = [_]RcuTlsEntry{.{}} ** rcu_tls_slot_count;
+threadlocal var rcu_tls_entries: [rcu_tls_slot_count]RcuTlsEntry = @splat(.{});
 var rcu_generation = std.atomic.Value(usize).init(1);
 
 fn nextRcuGeneration() usize {

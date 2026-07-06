@@ -164,9 +164,9 @@ test "trailing bytes rejected" {
 }
 
 test "over-long fields rejected by encode" {
-    const big_origin = "x" ** (max_origin_len + 1);
+    const big_origin = &@as([(max_origin_len + 1)]u8, @splat('x'));
     try testing.expectError(error.NameTooLong, encodedLen(.{ .category = 0, .severity = 0, .origin_server = big_origin, .message = "m" }));
-    const big_msg = "y" ** (max_message_len + 1);
+    const big_msg = &@as([(max_message_len + 1)]u8, @splat('y'));
     try testing.expectError(error.NameTooLong, encodedLen(.{ .category = 0, .severity = 0, .origin_server = "n", .message = big_msg }));
 }
 

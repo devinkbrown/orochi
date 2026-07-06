@@ -323,7 +323,7 @@ test "namesEqual folds ASCII case" {
 }
 
 test "namesEqual rejects over-length names" {
-    const long = "x" ** (max_name_len + 1);
+    const long = &@as([(max_name_len + 1)]u8, @splat('x'));
     try t.expect(!namesEqual(long, long));
 }
 

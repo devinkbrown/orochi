@@ -107,7 +107,7 @@ const gesture_specs = [_]GestureSpec{
 };
 
 comptime {
-    if (gesture_specs.len != @typeInfo(Gesture).@"enum".fields.len) {
+    if (gesture_specs.len != @typeInfo(Gesture).@"enum".field_names.len) {
         @compileError("gesture token table must cover every gesture");
     }
 }

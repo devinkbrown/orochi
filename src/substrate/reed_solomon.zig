@@ -29,7 +29,7 @@ fn buildTables() Tables {
     @setEvalBranchQuota(4096);
 
     var exp: [512]u8 = undefined;
-    var log = [_]u8{0} ** 256;
+    var log = @as([256]u8, @splat(0));
 
     var x: u8 = 1;
     for (0..255) |i| {

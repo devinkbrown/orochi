@@ -117,7 +117,7 @@ test "channel mode flags event rejects truncated and trailing input" {
 }
 
 test "channel mode flags event validates bounds" {
-    const big = "#" ++ ("x" ** max_channel_len);
+    const big = "#" ++ (&@as([max_channel_len]u8, @splat('x')));
     try testing.expectError(error.NameTooLong, encodedLen(.{ .flags = 0, .origin_node = 1, .hlc = 1, .channel = big }));
     try testing.expectError(error.InvalidFlags, encodedLen(.{ .flags = max_flag_bits + 1, .origin_node = 1, .hlc = 1, .channel = "#c" }));
 

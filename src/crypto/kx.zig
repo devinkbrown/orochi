@@ -338,7 +338,7 @@ test "X25519 all-zero shared secret is rejected" {
 
     try std.testing.expectError(
         error.LowOrderPoint,
-        X25519Kx.sharedSecret(&alice.secret_key, [_]u8{0} ** 32),
+        X25519Kx.sharedSecret(&alice.secret_key, @as([32]u8, @splat(0))),
     );
 }
 

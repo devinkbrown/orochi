@@ -239,7 +239,7 @@ pub const SessionStore = struct {
 const testing = std.testing;
 
 fn tok(b: u8) Token {
-    return [_]u8{b} ** 16;
+    return @as([16]u8, @splat(b));
 }
 
 test "attach lists a multi-device account; idempotent re-attach" {

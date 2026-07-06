@@ -451,7 +451,7 @@ test "ECHConfig encode/decode round-trip" {
         .version = ECH_VERSION,
         .config_id = 0x42,
         .kem_id = .dhkem_x25519_hkdf_sha256,
-        .public_key = &[_]u8{0xAB} ** 32,
+        .public_key = &@as([32]u8, @splat(0xAB)),
         .cipher_suites = &suites,
         .maximum_name_length = 64,
         .public_name = "example.com",
@@ -485,7 +485,7 @@ test "ECHConfig with extensions encode/decode" {
         .version = ECH_VERSION,
         .config_id = 0x01,
         .kem_id = .dhkem_p256_hkdf_sha256,
-        .public_key = &[_]u8{0xCC} ** 65,
+        .public_key = &@as([65]u8, @splat(0xCC)),
         .cipher_suites = &suites,
         .maximum_name_length = 128,
         .public_name = "tls.example",
@@ -510,7 +510,7 @@ test "ECHConfigList multiple configs encode/decode" {
             .version = ECH_VERSION,
             .config_id = 0x01,
             .kem_id = .dhkem_x25519_hkdf_sha256,
-            .public_key = &[_]u8{0x11} ** 32,
+            .public_key = &@as([32]u8, @splat(0x11)),
             .cipher_suites = &suites1,
             .maximum_name_length = 64,
             .public_name = "alpha.example",
@@ -520,7 +520,7 @@ test "ECHConfigList multiple configs encode/decode" {
             .version = ECH_VERSION,
             .config_id = 0x02,
             .kem_id = .dhkem_p256_hkdf_sha256,
-            .public_key = &[_]u8{0x22} ** 65,
+            .public_key = &@as([65]u8, @splat(0x22)),
             .cipher_suites = &suites2,
             .maximum_name_length = 100,
             .public_name = "beta.example",
@@ -552,7 +552,7 @@ test "selectConfig picks supported suite" {
             .version = ECH_VERSION,
             .config_id = 0xAA,
             .kem_id = .dhkem_x25519_hkdf_sha256,
-            .public_key = &[_]u8{0x55} ** 32,
+            .public_key = &@as([32]u8, @splat(0x55)),
             .cipher_suites = &suites_a,
             .maximum_name_length = 64,
             .public_name = "first.example",
@@ -562,7 +562,7 @@ test "selectConfig picks supported suite" {
             .version = ECH_VERSION,
             .config_id = 0xBB,
             .kem_id = .dhkem_p256_hkdf_sha256,
-            .public_key = &[_]u8{0x66} ** 65,
+            .public_key = &@as([65]u8, @splat(0x66)),
             .cipher_suites = &suites_b,
             .maximum_name_length = 64,
             .public_name = "second.example",
@@ -582,7 +582,7 @@ test "selectConfig rejects when no suite matches" {
         .version = ECH_VERSION,
         .config_id = 0x01,
         .kem_id = .dhkem_x25519_hkdf_sha256,
-        .public_key = &[_]u8{0x77} ** 32,
+        .public_key = &@as([32]u8, @splat(0x77)),
         .cipher_suites = &suites,
         .maximum_name_length = 64,
         .public_name = "only.example",
@@ -600,7 +600,7 @@ test "selectConfig picks first matching config in order" {
             .version = ECH_VERSION,
             .config_id = 0x01,
             .kem_id = .dhkem_x25519_hkdf_sha256,
-            .public_key = &[_]u8{0x11} ** 32,
+            .public_key = &@as([32]u8, @splat(0x11)),
             .cipher_suites = &suites_common,
             .maximum_name_length = 64,
             .public_name = "first.example",
@@ -610,7 +610,7 @@ test "selectConfig picks first matching config in order" {
             .version = ECH_VERSION,
             .config_id = 0x02,
             .kem_id = .dhkem_x25519_hkdf_sha256,
-            .public_key = &[_]u8{0x22} ** 32,
+            .public_key = &@as([32]u8, @splat(0x22)),
             .cipher_suites = &suites_common,
             .maximum_name_length = 64,
             .public_name = "second.example",
@@ -625,8 +625,8 @@ test "selectConfig picks first matching config in order" {
 
 test "ECHClientHello encode/decode round-trip" {
     const alloc = std.testing.allocator;
-    const enc_data = [_]u8{0xDE} ** 32;
-    const payload_data = [_]u8{0xAD} ** 64;
+    const enc_data = @as([32]u8, @splat(0xDE));
+    const payload_data = @as([64]u8, @splat(0xAD));
     const hello = ECHClientHello{ .config_id = 0x42, .enc = &enc_data, .payload = &payload_data };
     var buf: [256]u8 = undefined;
     const written = try hello.encode(&buf);
@@ -675,7 +675,7 @@ test "ECHConfigList decode rejects trailing bytes" {
         .version = ECH_VERSION,
         .config_id = 0x01,
         .kem_id = .dhkem_x25519_hkdf_sha256,
-        .public_key = &[_]u8{0x99} ** 32,
+        .public_key = &@as([32]u8, @splat(0x99)),
         .cipher_suites = &suites,
         .maximum_name_length = 64,
         .public_name = "trail.example",
@@ -692,8 +692,8 @@ test "ECHClientHello decode rejects trailing bytes" {
     const alloc = std.testing.allocator;
     const hello = ECHClientHello{
         .config_id = 0x01,
-        .enc = &[_]u8{0xAA} ** 4,
-        .payload = &[_]u8{0xBB} ** 4,
+        .enc = &@as([4]u8, @splat(0xAA)),
+        .payload = &@as([4]u8, @splat(0xBB)),
     };
     var buf: [64]u8 = undefined;
     const written = try hello.encode(&buf);
@@ -707,7 +707,7 @@ test "determinism: repeated encodes produce identical bytes" {
         .version = ECH_VERSION,
         .config_id = 0x07,
         .kem_id = .dhkem_x25519_hkdf_sha256,
-        .public_key = &[_]u8{0x42} ** 32,
+        .public_key = &@as([32]u8, @splat(0x42)),
         .cipher_suites = &suites,
         .maximum_name_length = 50,
         .public_name = "det.example",

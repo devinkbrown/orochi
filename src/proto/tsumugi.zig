@@ -461,11 +461,11 @@ const SkippedSlot = struct {
     present: bool = false,
     generation: u32 = 0,
     counter: u32 = 0,
-    key: MessageKey = MessageKey.init([_]u8{0} ** key_len),
+    key: MessageKey = MessageKey.init(@as([key_len]u8, @splat(0))),
 };
 
 const SkippedKeys = struct {
-    slots: [max_skip]SkippedSlot = [_]SkippedSlot{.{}} ** max_skip,
+    slots: [max_skip]SkippedSlot = @splat(.{}),
     next_evict: usize = 0,
 
     fn wipe(self: *SkippedKeys) void {
@@ -511,7 +511,7 @@ const SkippedKeys = struct {
 };
 
 const StagedSkipped = struct {
-    entries: [max_skip]SkippedSlot = [_]SkippedSlot{.{}} ** max_skip,
+    entries: [max_skip]SkippedSlot = @splat(.{}),
     len: usize = 0,
 
     fn append(self: *StagedSkipped, generation: u32, counter: u32, key: MessageKey) void {
@@ -545,11 +545,11 @@ const StagedSkipped = struct {
 const testing = std.testing;
 
 fn rootSecret(byte: u8) [key_len]u8 {
-    return [_]u8{byte} ** key_len;
+    return @as([key_len]u8, @splat(byte));
 }
 
 fn nonceBase(byte: u8) [nonce_base_len]u8 {
-    return [_]u8{byte} ** nonce_base_len;
+    return @as([nonce_base_len]u8, @splat(byte));
 }
 
 fn testOuterHeader() [frame.header_len]u8 {

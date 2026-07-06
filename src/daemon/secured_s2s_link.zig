@@ -971,9 +971,9 @@ fn feedMaybeSplit(link: *SecuredLink, bytes: []const u8, now: u64, split: bool) 
 }
 
 fn runScenario(split: bool) !void {
-    var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
     defer ida.deinit();
-    var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
     defer idb.deinit();
     const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
     const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
@@ -1031,9 +1031,9 @@ const EstablishedPair = struct {
     b: SecuredLink,
 
     fn init() !EstablishedPair {
-        var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+        var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
         errdefer ida.deinit();
-        var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+        var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
         errdefer idb.deinit();
         const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
         const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
@@ -1140,9 +1140,9 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
 }
 
 test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
-    var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
     defer ida.deinit();
-    var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
     defer idb.deinit();
     const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
     const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
@@ -1232,9 +1232,9 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
 }
 
 test "a trust-pin mismatch rejects the peer prekey" {
-    var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
     defer ida.deinit();
-    var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
     defer idb.deinit();
     const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
     const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
@@ -1249,7 +1249,7 @@ test "a trust-pin mismatch rejects the peer prekey" {
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
         .server_name = "a.orochi",
-        .expected_remote = [_]u8{0xFF} ** 20,
+        .expected_remote = @as([20]u8, @splat(0xFF)),
     });
     defer a.deinit();
     var b = try SecuredLink.init(.{

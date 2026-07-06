@@ -25,7 +25,7 @@ pub fn CertFpStore(comptime max_clients: usize) type {
     if (max_clients == 0) @compileError("CertFpStore requires at least one client slot");
 
     return struct {
-        entries: [max_clients]Entry = [_]Entry{Entry{}} ** max_clients,
+        entries: [max_clients]Entry = @splat(Entry{}),
         count: usize = 0,
 
         const Self = @This();
@@ -33,7 +33,7 @@ pub fn CertFpStore(comptime max_clients: usize) type {
         const Entry = struct {
             client: ClientId = 0,
             active: bool = false,
-            fingerprint: Fingerprint = [_]u8{0} ** fingerprint_len,
+            fingerprint: Fingerprint = @splat(0),
 
             fn slice(self: *const Entry) []const u8 {
                 return self.fingerprint[0..];

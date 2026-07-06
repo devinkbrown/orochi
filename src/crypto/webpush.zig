@@ -220,9 +220,9 @@ test "RFC 8291 Appendix A — full known-answer vector" {
 }
 
 test "encrypt rejects oversized plaintext and bad subscription keys" {
-    const as_keys = try ecdh.generateDeterministic([_]u8{7} ** 32);
-    const salt = [_]u8{1} ** 16;
-    const auth = [_]u8{2} ** 16;
+    const as_keys = try ecdh.generateDeterministic(@as([32]u8, @splat(7)));
+    const salt = @as([16]u8, @splat(1));
+    const auth = @as([16]u8, @splat(2));
 
     // Oversized payload.
     const big = try testing.allocator.alloc(u8, max_plaintext + 1);
@@ -233,7 +233,7 @@ test "encrypt rejects oversized plaintext and bad subscription keys" {
     );
 
     // Not a curve point (all-zero "public key").
-    const junk = [_]u8{0} ** 65;
+    const junk = @as([65]u8, @splat(0));
     try testing.expectError(
         error.InvalidSubscriptionKey,
         encrypt(testing.allocator, junk, auth, as_keys, salt, "hi"),

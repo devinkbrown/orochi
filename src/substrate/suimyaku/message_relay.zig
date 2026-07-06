@@ -616,7 +616,7 @@ test "seen set detects repeats and evicts oldest" {
 // ---------------------------------------------------------------------------
 
 fn testKeyPair(seed_byte: u8) !sign.KeyPair {
-    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+    return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
 }
 
 /// Build a base relay message whose `origin_node` is the self-certified short id
@@ -780,8 +780,8 @@ test "mutable fields (min_rank, tags, msgid) do not invalidate the signature" {
 test "decode rejects a wrong-width origin_pubkey" {
     const allocator = std.testing.allocator;
     // Hand-build a CoilPack map with a 31-byte pubkey (one short of 32).
-    var bad_pubkey = [_]u8{0xAB} ** 31;
-    var bad_sig = [_]u8{0xCD} ** sig_len;
+    var bad_pubkey = @as([31]u8, @splat(0xAB));
+    var bad_sig = @as([sig_len]u8, @splat(0xCD));
     var entries = [_]cpv.MapEntry{
         .{ .key = "account", .value = .{ .string = "" } },
         .{ .key = "data_tag", .value = .{ .string = "" } },

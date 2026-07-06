@@ -49,7 +49,7 @@ pub const CapId = enum(u6) {
     orochi_suimyaku_media,
 };
 
-pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".fields.len;
+pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".field_names.len;
 
 comptime {
     if (CAP_COUNT > 64) @compileError("CapSet stores bits in u64");

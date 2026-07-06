@@ -298,7 +298,7 @@ const BitsetContainer = struct {
 
     fn empty() BitsetContainer {
         return .{
-            .words = [_]u64{0} ** bitset_words,
+            .words = @as([bitset_words]u64, @splat(0)),
             .count = 0,
         };
     }

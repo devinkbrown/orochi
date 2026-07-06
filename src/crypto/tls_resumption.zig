@@ -73,7 +73,7 @@ pub const ReplayGuard = struct {
 
     mutex: std.atomic.Mutex = .unlocked,
     entries: [capacity][max_binder_len]u8 = undefined,
-    lens: [capacity]u8 = [_]u8{0} ** capacity,
+    lens: [capacity]u8 = @splat(0),
     next: usize = 0,
     wrapped: bool = false,
 
@@ -110,8 +110,8 @@ pub const ReplayGuard = struct {
 
 test "ReplayGuard reports repeats and bounds memory" {
     var g = ReplayGuard{};
-    const a = [_]u8{0xAA} ** 32;
-    const b = [_]u8{0xBB} ** 48;
+    const a = @as([32]u8, @splat(0xAA));
+    const b = @as([48]u8, @splat(0xBB));
     try std.testing.expect(g.checkAndRecord(&a)); // fresh
     try std.testing.expect(!g.checkAndRecord(&a)); // replay
     try std.testing.expect(g.checkAndRecord(&b)); // different
@@ -326,7 +326,7 @@ test "stored client session round-trips" {
         .ticket_lifetime = 86_400,
         .ticket_age_add = 0x1122_3344,
         .ticket = "opaque-ticket",
-        .psk = &([_]u8{0xaa} ** 32),
+        .psk = &(@as([32]u8, @splat(0xaa))),
         .max_early_data_size = 4096,
     });
     defer allocator.free(encoded);
@@ -336,15 +336,15 @@ test "stored client session round-trips" {
     try std.testing.expectEqual(@as(u32, 86_400), parsed.ticket_lifetime);
     try std.testing.expectEqual(@as(u32, 0x1122_3344), parsed.ticket_age_add);
     try std.testing.expectEqualSlices(u8, "opaque-ticket", parsed.ticket);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xaa} ** 32), parsed.psk);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xaa))), parsed.psk);
     try std.testing.expectEqual(@as(u32, 4096), parsed.max_early_data_size);
 }
 
 test "sealed server ticket opens with the same key" {
     const allocator = std.testing.allocator;
-    const key = [_]u8{0x11} ** ChaCha20Poly1305.key_length;
-    const nonce = [_]u8{0x22} ** ChaCha20Poly1305.nonce_length;
-    const psk = [_]u8{0x33} ** 32;
+    const key = @as([ChaCha20Poly1305.key_length]u8, @splat(0x11));
+    const nonce = @as([ChaCha20Poly1305.nonce_length]u8, @splat(0x22));
+    const psk = @as([32]u8, @splat(0x33));
     const ticket = try sealTicket(allocator, key, nonce, 0x1301, &psk, "nonce", 1234, 8192);
     defer allocator.free(ticket);
 
@@ -359,10 +359,10 @@ test "sealed server ticket opens with the same key" {
 
 test "openTicketWithRotation accepts current and previous keys, rejects retired" {
     const allocator = std.testing.allocator;
-    const key_a = [_]u8{0xaa} ** ChaCha20Poly1305.key_length;
-    const key_b = [_]u8{0xbb} ** ChaCha20Poly1305.key_length;
-    const nonce = [_]u8{0x22} ** ChaCha20Poly1305.nonce_length;
-    const psk = [_]u8{0x33} ** 32;
+    const key_a = @as([ChaCha20Poly1305.key_length]u8, @splat(0xaa));
+    const key_b = @as([ChaCha20Poly1305.key_length]u8, @splat(0xbb));
+    const nonce = @as([ChaCha20Poly1305.nonce_length]u8, @splat(0x22));
+    const psk = @as([32]u8, @splat(0x33));
 
     // A ticket sealed under the OLD key A.
     const ticket_a = try sealTicket(allocator, key_a, nonce, 0x1301, &psk, "n", 1, 0);

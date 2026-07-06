@@ -196,7 +196,7 @@ pub fn computeZcr(frame: []const i16) f32 {
 test "pure silence produces no speech" {
     var vad = Vad.init(.{});
     // 100 frames of all-zero samples => always silence.
-    const frame = [_]i16{0} ** 160;
+    const frame = @as([160]i16, @splat(0));
     for (0..100) |_| {
         const speech = vad.process(&frame);
         try std.testing.expect(!speech);
@@ -210,7 +210,7 @@ test "loud tone burst triggers speech onset" {
     var vad = Vad.init(.{});
 
     // Feed some silence first so the noise floor settles low.
-    const silence = [_]i16{0} ** 160;
+    const silence = @as([160]i16, @splat(0));
     for (0..20) |_| _ = vad.process(&silence);
 
     // Build a loud frame (amplitude 8000, well above noise floor).
@@ -233,7 +233,7 @@ test "hangover keeps speech active through a short gap" {
     var vad = Vad.init(cfg);
 
     // Prime with silence so noise floor is minimal.
-    const silence = [_]i16{0} ** 160;
+    const silence = @as([160]i16, @splat(0));
     for (0..20) |_| _ = vad.process(&silence);
 
     // Create loud frame (RMS ~5657).
@@ -260,7 +260,7 @@ test "hangover expires after long enough gap" {
     cfg.hangover_frames = 4;
     var vad = Vad.init(cfg);
 
-    const silence = [_]i16{0} ** 160;
+    const silence = @as([160]i16, @splat(0));
     for (0..20) |_| _ = vad.process(&silence);
 
     var loud: [160]i16 = undefined;
@@ -340,7 +340,7 @@ test "ZCR discounts noisy-looking high-ZCR frame below onset" {
     var vad = Vad.init(cfg);
 
     // Silence first so noise floor stays at minimum.
-    const silence = [_]i16{0} ** 160;
+    const silence = @as([160]i16, @splat(0));
     for (0..20) |_| _ = vad.process(&silence);
 
     // High-ZCR frame at amplitude 50 (raw RMS=50, effective=10 after discount).
@@ -370,7 +370,7 @@ test "ZCR discounts noisy-looking high-ZCR frame below onset" {
 test "snrDb returns non-negative value during speech" {
     var vad = Vad.init(.{});
 
-    const silence = [_]i16{0} ** 160;
+    const silence = @as([160]i16, @splat(0));
     for (0..20) |_| _ = vad.process(&silence);
 
     var loud: [160]i16 = undefined;
@@ -410,13 +410,13 @@ test "computeRms: empty frame returns zero" {
 
 test "computeRms: constant amplitude frame" {
     // All samples at 1000 => RMS == 1000.
-    const frame = [_]i16{1000} ** 64;
+    const frame = @as([64]i16, @splat(1000));
     const rms = computeRms(&frame);
     try std.testing.expectApproxEqAbs(rms, 1000.0, 0.5);
 }
 
 test "computeZcr: constant positive frame has zero crossings" {
-    const frame = [_]i16{500} ** 64;
+    const frame = @as([64]i16, @splat(500));
     const zcr = computeZcr(&frame);
     try std.testing.expectApproxEqAbs(zcr, 0.0, 1e-6);
 }

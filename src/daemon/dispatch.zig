@@ -50,7 +50,7 @@ const MAX_HOST_BYTES: usize = 255;
 const MAX_EVENT_MASK_BYTES: usize = 256;
 /// Number of Event Spine categories — the length of the per-session per-category
 /// subject-mask array. Derived from the enum so it tracks new categories.
-const EVENT_CATEGORY_COUNT: usize = @typeInfo(event_spine.EventCategory).@"enum".fields.len;
+const EVENT_CATEGORY_COUNT: usize = @typeInfo(event_spine.EventCategory).@"enum".field_names.len;
 
 /// ISUPPORT CHANMODES token. Every advertised letter MUST be enforced by the
 /// channel-MODE handler (see `server.zig` handleChannelMode); this is the single
@@ -73,7 +73,7 @@ const MAX_LABEL_BYTES: usize = labeled_response.MAX_LABEL_LEN;
 /// except `label_store` which owns the unescaped inbound `@label` value.
 pub const LineView = struct {
     command: []const u8,
-    params: [MAX_PARAMS][]const u8 = [_][]const u8{""} ** MAX_PARAMS,
+    params: [MAX_PARAMS][]const u8 = @splat(""),
     param_count: usize = 0,
     /// Unescaped `@label=<x>` tag value captured from the client, or null.
     /// Backed by `label_store`; never borrows from the input buffer because the
@@ -186,7 +186,7 @@ fn formatCode(numeric: Numeric, buf: []u8) []const u8 {
 
 fn FixedString(comptime capacity: usize) type {
     return struct {
-        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        bytes: [capacity]u8 = @splat(0),
         len: usize = 0,
 
         fn slice(self: *const @This()) []const u8 {
@@ -895,13 +895,13 @@ pub const ClientSession = struct {
     /// only when its subject glob-matches `event_subject_masks[@intFromEnum(C)]`
     /// (mirrors Ophion's per-event-type `masks[EVENT_MAX_TYPES][256]`). Owned
     /// in-struct (FixedString), so there is nothing to free on clear/deinit.
-    event_subject_masks: [EVENT_CATEGORY_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = [_]FixedString(MAX_EVENT_MASK_BYTES){.{}} ** EVENT_CATEGORY_COUNT,
+    event_subject_masks: [EVENT_CATEGORY_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = @splat(.{}),
     /// IRCX EVENT subscriptions in Ophion wire terms. This state is separate from
     /// the daemon-native Event Spine category mask so `EVENT ADD CHANNEL`, `LIST`,
     /// duplicate checks, and missing-subscription errors behave like Ophion even
     /// when an operator is already subscribed to daemon oper notices.
     ircx_event_mask: event_spine.IrcxEventMask = .{},
-    ircx_event_subject_masks: [event_spine.IRCX_EVENT_TYPE_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = [_]FixedString(MAX_EVENT_MASK_BYTES){.{}} ** event_spine.IRCX_EVENT_TYPE_COUNT,
+    ircx_event_subject_masks: [event_spine.IRCX_EVENT_TYPE_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = @splat(.{}),
 
     pub fn init() ClientSession {
         return .{};
@@ -2516,7 +2516,7 @@ test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
 
     // Over-length masks are rejected and leave the prior value intact.
     try s.setEventSubjectMask(chan, "#keepme*");
-    const too_long = "#" ++ ("x" ** MAX_EVENT_MASK_BYTES);
+    const too_long = "#" ++ (&@as([MAX_EVENT_MASK_BYTES]u8, @splat('x')));
     try std.testing.expectError(error.TextTooLong, s.setEventSubjectMask(chan, too_long));
     try std.testing.expectEqualStrings("#keepme*", s.eventSubjectMask(chan));
 
@@ -3110,7 +3110,7 @@ test "sasl CAP and 908 gate SESSION-TOKEN OAUTHBEARER ANONYMOUS and SCRAM-SHA-51
     session.sasl_scram512 = .{ .ptr = &db, .lookupFn = TestScram512Db.lookup };
     session.sasl_server_nonce = "SERVERNONCE";
     try std.testing.expect(std.mem.indexOf(u8, (writeSaslCapValue(&session, &cap_buf) orelse ""), "SCRAM-SHA-512-PLUS") == null);
-    session.tls_exporter = [_]u8{0x42} ** scram512_server.tls_exporter_len;
+    session.tls_exporter = @as([scram512_server.tls_exporter_len]u8, @splat(0x42));
     const plus_cap = writeSaslCapValue(&session, &cap_buf) orelse return error.TestUnexpectedResult;
     const plus_908 = writeSaslMechanismList(&session, &mech_buf) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, plus_cap, "SCRAM-SHA-512-PLUS") != null);

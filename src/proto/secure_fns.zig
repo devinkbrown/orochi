@@ -252,7 +252,7 @@ test "ctEq treats two empty slices as equal" {
 
 test "secureZero clears every byte of a buffer" {
     // Arrange
-    var buf = [_]u8{0xAA} ** 64;
+    var buf = @as([64]u8, @splat(0xAA));
 
     // Act
     secureZero(buf[0..]);

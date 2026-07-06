@@ -208,8 +208,8 @@ pub const OpenedRecord = struct {
 };
 
 pub const DirectionKeys = struct {
-    key: [ChaCha20Poly1305.key_length]u8 = [_]u8{0} ** ChaCha20Poly1305.key_length,
-    iv: [ChaCha20Poly1305.nonce_length]u8 = [_]u8{0} ** ChaCha20Poly1305.nonce_length,
+    key: [ChaCha20Poly1305.key_length]u8 = @splat(0),
+    iv: [ChaCha20Poly1305.nonce_length]u8 = @splat(0),
 
     pub fn wipe(self: *DirectionKeys) void {
         std.crypto.secureZero(u8, &self.key);
@@ -486,7 +486,7 @@ pub fn openRecordAlloc(
 }
 
 fn makeNonce(suite: CipherSuite, fixed_iv: [12]u8, seq: u64) [12]u8 {
-    var nonce: [12]u8 = [_]u8{0} ** 12;
+    var nonce: [12]u8 = @splat(0);
     switch (suite.aead()) {
         .aes_128_gcm, .aes_256_gcm => {
             @memcpy(nonce[0..4], fixed_iv[0..4]);
@@ -494,7 +494,7 @@ fn makeNonce(suite: CipherSuite, fixed_iv: [12]u8, seq: u64) [12]u8 {
         },
         .chacha20_poly1305 => {
             nonce = fixed_iv;
-            var seq_bytes: [12]u8 = [_]u8{0} ** 12;
+            var seq_bytes: [12]u8 = @splat(0);
             std.mem.writeInt(u64, seq_bytes[4..12], seq, .big);
             for (&nonce, seq_bytes) |*dst, rhs| dst.* ^= rhs;
         },

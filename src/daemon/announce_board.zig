@@ -417,9 +417,9 @@ test "publish rejects invalid fields" {
     defer board.deinit();
 
     const now: i64 = 1_000;
-    const big_category = "x" ** (default_max_category_len + 1);
-    const big_title = "y" ** (default_max_title_len + 1);
-    const big_body = "z" ** (default_max_body_len + 1);
+    const big_category = &@as([(default_max_category_len + 1)]u8, @splat('x'));
+    const big_title = &@as([(default_max_title_len + 1)]u8, @splat('y'));
+    const big_body = &@as([(default_max_body_len + 1)]u8, @splat('z'));
 
     try std.testing.expectError(error.AnnouncementInvalid, board.publish("", "c", "t", "b", "bot", .normal, now, 0));
     try std.testing.expectError(error.AnnouncementInvalid, board.publish("*", "", "t", "b", "bot", .normal, now, 0));

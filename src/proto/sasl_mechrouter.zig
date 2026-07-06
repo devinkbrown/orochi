@@ -646,7 +646,7 @@ test "SCRAM PLUS mechanisms require tls exporter through router" {
     try std.testing.expectEqual(Failure.unavailable, router.start("SCRAM-SHA-256-PLUS").fail);
     try std.testing.expectEqual(Failure.unavailable, router.start("SCRAM-SHA-512-PLUS").fail);
 
-    router.tls_exporter = [_]u8{0x42} ** scram512.tls_exporter_len;
+    router.tls_exporter = @as([scram512.tls_exporter_len]u8, @splat(0x42));
     try std.testing.expectEqualStrings("+", router.start("SCRAM-SHA-256-PLUS").continue_);
     try std.testing.expectEqualStrings("+", router.start("SCRAM-SHA-512-PLUS").continue_);
 }

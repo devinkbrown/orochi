@@ -246,7 +246,7 @@ test "channel list event rejects malformed input" {
     const wire = try encode(ev, &buf);
     try testing.expectError(error.Truncated, decode(wire[0 .. wire.len - 1]));
 
-    var bad = [_]u8{0} ** 32;
+    var bad = @as([32]u8, @splat(0));
     bad[1] = 99;
     try testing.expectError(error.BadKind, decode(&bad));
 
@@ -257,7 +257,7 @@ test "channel list event rejects malformed input" {
 }
 
 test "channel list event enforces bounds" {
-    const big_mask = "x" ** (max_mask_len + 1);
+    const big_mask = &@as([(max_mask_len + 1)]u8, @splat('x'));
     const ev = ChannelListEvent{ .present = true, .kind = .ban, .origin_node = 1, .hlc = 1, .set_at = 1, .channel = "#c", .mask = big_mask, .setter = "s" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }

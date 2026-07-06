@@ -22,7 +22,7 @@ pub const AuditTrail = struct {
     pub fn init(allocator: std.mem.Allocator) AuditTrail {
         return .{
             .allocator = allocator,
-            .records = [_]?Record{null} ** cap,
+            .records = @as([cap]?Record, @splat(null)),
             .start = 0,
             .count = 0,
             .next_seq = 1,

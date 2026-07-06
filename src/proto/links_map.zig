@@ -539,6 +539,6 @@ test "a single line cannot exceed the protocol limit even with a large scratch" 
     var buf: [4096]u8 = undefined;
     const ctx = ReplyContext{ .server_name = "orochi.local", .requester = "alice" };
     // 256-byte info + indent pushes the line past 512 -> LineTooLong, not a giant line.
-    const info = [_]u8{'x'} ** 256;
-    try std.testing.expectError(error.LineTooLong, writeMapNodeWith(.{}, &buf, ctx, .{ .name = &([_]u8{'n'} ** 200), .hops = DEFAULT_MAX_HOPS, .peers = 1, .info = &info }, true));
+    const info = @as([256]u8, @splat('x'));
+    try std.testing.expectError(error.LineTooLong, writeMapNodeWith(.{}, &buf, ctx, .{ .name = &(@as([200]u8, @splat('n'))), .hops = DEFAULT_MAX_HOPS, .peers = 1, .info = &info }, true));
 }

@@ -239,7 +239,7 @@ pub const SignedPrekey = struct {
             .usage_bits = usage_bits,
             .supported_bands = supported_bands,
             .supported_features = supported_features,
-            .sig = [_]u8{0} ** sign.signature_len,
+            .sig = @as([sign.signature_len]u8, @splat(0)),
         };
         const digest = prekeyDigest(&out);
         out.sig = try node.signCtx(prekey_domain, &digest);
@@ -820,11 +820,11 @@ fn makeFixture(allocator: Allocator) !struct {
         self.r_kem.wipe();
     }
 } {
-    const realm = [_]u8{0xA1} ** 32;
-    var i_node = try sign.KeyPair.fromSeed([_]u8{0x11} ** 32);
-    var r_node = try sign.KeyPair.fromSeed([_]u8{0x22} ** 32);
-    var i_kem = try xwing.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
-    var r_kem = try xwing.KeyPair.generateDeterministic([_]u8{0x44} ** 32);
+    const realm = @as([32]u8, @splat(0xA1));
+    var i_node = try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x11)));
+    var r_node = try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x22)));
+    var i_kem = try xwing.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
+    var r_kem = try xwing.KeyPair.generateDeterministic(@as([32]u8, @splat(0x44)));
     const bands: u128 = 0b1111;
     const features: u128 = 0b101;
     return .{

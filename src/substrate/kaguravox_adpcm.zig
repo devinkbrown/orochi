@@ -170,7 +170,7 @@ test "round-trips a sine wave within ADPCM error bounds" {
 
 test "encoder and decoder stay in lockstep (decode of encode tracks input energy)" {
     // A quiet/silent signal must stay near zero through the codec.
-    var pcm = [_]i16{0} ** 64;
+    var pcm = @as([64]i16, @splat(0));
     var es = State{};
     var buf: [32]u8 = undefined;
     _ = encode(&es, &pcm, &buf);

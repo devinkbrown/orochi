@@ -246,8 +246,8 @@ test "parse accepts uppercase input and format canonicalizes lowercase" {
 test "generation sets version and variant bits for v4 and v7" {
     // Arrange.
     _ = std.testing.allocator;
-    const v4_random = [_]u8{0xff} ** 16;
-    const v7_random = [_]u8{0xff} ** 10;
+    const v4_random = @as([16]u8, @splat(0xff));
+    const v7_random = @as([10]u8, @splat(0xff));
 
     // Act.
     const random_uuid = try generateV4(v4_random[0..]);
@@ -299,8 +299,8 @@ test "parse rejects malformed canonical text" {
 test "generation rejects wrong random byte counts and oversized v7 timestamp" {
     // Arrange.
     _ = std.testing.allocator;
-    const short_random = [_]u8{0x00} ** 9;
-    const v7_random = [_]u8{0x00} ** 10;
+    const short_random = @as([9]u8, @splat(0x00));
+    const v7_random = @as([10]u8, @splat(0x00));
 
     // Act and assert.
     try std.testing.expectError(error.InvalidRandomBytes, generateV4(short_random[0..]));
@@ -311,9 +311,9 @@ test "generation rejects wrong random byte counts and oversized v7 timestamp" {
 test "format returns output too small without writing past caller storage" {
     // Arrange.
     _ = std.testing.allocator;
-    const random_bytes = [_]u8{0x11} ** 16;
+    const random_bytes = @as([16]u8, @splat(0x11));
     const uuid = try generateV4(random_bytes[0..]);
-    var out: [35]u8 = [_]u8{0xaa} ** 35;
+    var out: [35]u8 = @splat(0xaa);
 
     // Act and assert.
     try std.testing.expectError(error.OutputTooSmall, uuid.format(out[0..]));

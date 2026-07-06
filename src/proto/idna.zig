@@ -278,14 +278,14 @@ test "normalize: space rejected" {
 }
 
 test "normalize: label of exactly 63 octets accepted" {
-    const label = "a" ** MAX_LABEL_LEN;
+    const label = &@as([MAX_LABEL_LEN]u8, @splat('a'));
     var buf: [MAX_HOST_LEN]u8 = undefined;
     const got = try normalize(label ++ ".com", &buf);
     try testing.expectEqualStrings(label ++ ".com", got);
 }
 
 test "normalize: label of 64 octets rejected" {
-    const label = "a" ** (MAX_LABEL_LEN + 1);
+    const label = &@as([(MAX_LABEL_LEN + 1)]u8, @splat('a'));
     var buf: [MAX_HOST_LEN]u8 = undefined;
     try testing.expectError(NormalizeError.LabelTooLong, normalize(label ++ ".com", &buf));
 }
@@ -293,7 +293,7 @@ test "normalize: label of 64 octets rejected" {
 test "normalize: host of exactly 255 octets accepted" {
     // Build "aaaa....a" repeated as 63-octet labels separated by dots to hit 255.
     // 63 + 1 + 63 + 1 + 63 + 1 + 62 = 254, add a 1-char label -> shape to 255.
-    const seg = "a" ** MAX_LABEL_LEN;
+    const seg = &@as([MAX_LABEL_LEN]u8, @splat('a'));
     // 63*4 = 252, plus 3 dots = 255 exactly.
     const host = seg ++ "." ++ seg ++ "." ++ seg ++ "." ++ seg;
     try testing.expectEqual(@as(usize, MAX_HOST_LEN), host.len);
@@ -303,7 +303,7 @@ test "normalize: host of exactly 255 octets accepted" {
 }
 
 test "normalize: host over 255 octets rejected" {
-    const seg = "a" ** MAX_LABEL_LEN;
+    const seg = &@as([MAX_LABEL_LEN]u8, @splat('a'));
     // 63*4 + 3 dots = 255; append ".a" to exceed.
     const host = seg ++ "." ++ seg ++ "." ++ seg ++ "." ++ seg ++ ".a";
     var buf: [MAX_HOST_LEN + 8]u8 = undefined;
@@ -344,7 +344,7 @@ test "normalize: xn-- tail with hyphen-only is structurally allowed" {
 
 test "validateLabel: rejects empty and oversized" {
     try testing.expectError(NormalizeError.LabelTooShort, validateLabel(""));
-    const big = "a" ** (MAX_LABEL_LEN + 1);
+    const big = &@as([(MAX_LABEL_LEN + 1)]u8, @splat('a'));
     try testing.expectError(NormalizeError.LabelTooLong, validateLabel(big));
 }
 

@@ -193,13 +193,13 @@ const Fixture = struct {
     cfg_r: Config,
 
     fn make(_: std.mem.Allocator) !Fixture {
-        const realm: hs.RealmId = [_]u8{0xA1} ** 32;
+        const realm: hs.RealmId = @splat(0xA1);
         const bands: u128 = 0b1111;
         const features: u128 = 0b101;
-        const i_node = try sign.KeyPair.fromSeed([_]u8{0x11} ** 32);
-        const r_node = try sign.KeyPair.fromSeed([_]u8{0x22} ** 32);
-        const i_kem = try xwing.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
-        const r_kem = try xwing.KeyPair.generateDeterministic([_]u8{0x44} ** 32);
+        const i_node = try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x11)));
+        const r_node = try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x22)));
+        const i_kem = try xwing.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
+        const r_kem = try xwing.KeyPair.generateDeterministic(@as([32]u8, @splat(0x44)));
         const i_pre = try SignedPrekey.create(&i_node, &i_kem, realm, 1, 10, 1000, 1, bands, features);
         const r_pre = try SignedPrekey.create(&r_node, &r_kem, realm, 2, 10, 1000, 1, bands, features);
         return .{

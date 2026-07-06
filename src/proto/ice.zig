@@ -28,7 +28,7 @@ pub const CandidateType = enum {
 };
 
 pub const TransportAddress = struct {
-    ip: [16]u8 = [_]u8{0} ** 16,
+    ip: [16]u8 = @splat(0),
     ip_len: u8 = 0,
     port: u16 = 0,
 

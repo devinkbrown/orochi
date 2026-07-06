@@ -139,7 +139,7 @@ test "encodeTokenBase64 encodes 16 byte token with standard padding" {
 
 test "encodeTokenBase64 rejects short buffer" {
     var buf: [token_b64_len - 1]u8 = undefined;
-    const token = [_]u8{0xaa} ** token_len;
+    const token = @as([token_len]u8, @splat(0xaa));
 
     try std.testing.expectError(error.BufferTooSmall, encodeTokenBase64(&buf, &token));
 }

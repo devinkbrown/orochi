@@ -140,7 +140,7 @@ test "currentPid is stable within a process" {
 }
 
 test "fillOsEntropy yields non-zero bytes" {
-    var buf: [48]u8 = [_]u8{0} ** 48;
+    var buf: [48]u8 = @splat(0);
     try fillOsEntropy(&buf);
     var any: bool = false;
     for (buf) |x| any = any or x != 0;

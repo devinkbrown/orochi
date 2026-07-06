@@ -77,7 +77,7 @@ pub const Header = struct {
 };
 
 pub const Name = struct {
-    bytes: [max_domain_text_len]u8 = [_]u8{0} ** max_domain_text_len,
+    bytes: [max_domain_text_len]u8 = @splat(0),
     len: usize = 0,
 
     pub fn fromSlice(text: []const u8) EncodeError!Name {
@@ -98,7 +98,7 @@ pub const Address = union(enum) {
     ipv6: [16]u8,
 
     fn key(self: Address) AddressKey {
-        var out = AddressKey{ .family = .ipv4, .bytes = [_]u8{0} ** 16 };
+        var out = AddressKey{ .family = .ipv4, .bytes = @as([16]u8, @splat(0)) };
         switch (self) {
             .ipv4 => |bytes| {
                 out.family = .ipv4;
@@ -174,7 +174,7 @@ pub const max_txt_rdata_len: usize = max_message_len;
 pub const max_txt_character_string_len: usize = 255;
 
 pub const Txt = struct {
-    bytes: [max_txt_rdata_len]u8 = [_]u8{0} ** max_txt_rdata_len,
+    bytes: [max_txt_rdata_len]u8 = @splat(0),
     len: usize = 0,
     string_count: usize = 0,
 
@@ -661,7 +661,7 @@ fn encodeName(w: *Writer, raw_name: []const u8) EncodeError!void {
 fn decodeName(packet: []const u8, start: usize, out: *Name) DecodeError!usize {
     if (start >= packet.len) return error.TruncatedMessage;
 
-    var seen = [_]bool{false} ** max_message_len;
+    var seen = @as([max_message_len]bool, @splat(false));
     var cursor = start;
     var next_offset: ?usize = null;
     var wire_len: usize = 0;
@@ -1256,7 +1256,7 @@ test "tolerates additional/authority records after the answer section" {
 test "rejects truncated and oversize messages" {
     try std.testing.expectError(error.TruncatedMessage, parseMessage(1, 1, &[_]u8{ 1, 2, 3 }));
 
-    var oversize = [_]u8{0} ** (max_message_len + 1);
+    var oversize = @as([(max_message_len + 1)]u8, @splat(0));
     try std.testing.expectError(error.OversizeMessage, parseMessage(1, 1, &oversize));
 
     const bad_name = [_]u8{

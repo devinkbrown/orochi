@@ -232,13 +232,13 @@ test "normalize respects buffer bounds" {
 test "matchGlob pathological no catastrophic backtracking" {
     // Patterns crafted to defeat naive backtracking matchers. These must
     // resolve quickly via the iterative single-anchor algorithm.
-    const text = "a" ** 64;
+    const text = &@as([64]u8, @splat('a'));
     try std.testing.expect(matchGlob("a*a*a*a*a*a*a*a*a*a*", text));
     // Long run of stars followed by a final literal that is absent.
     try std.testing.expect(!matchGlob("a*a*a*a*a*a*a*a*a*b", text));
     // Many stars and questions interleaved.
     try std.testing.expect(matchGlob("*a*a?a*a*", "aaaaaaaa"));
     // Pattern of pure stars matches anything including empty.
-    try std.testing.expect(matchGlob("*" ** 32, text));
-    try std.testing.expect(matchGlob("*" ** 32, ""));
+    try std.testing.expect(matchGlob(&@as([32]u8, @splat('*')), text));
+    try std.testing.expect(matchGlob(&@as([32]u8, @splat('*')), ""));
 }

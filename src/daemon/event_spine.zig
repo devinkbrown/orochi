@@ -33,8 +33,8 @@ pub const EventCategory = enum(u6) {
     /// which are the separate token-routed IRCX plane and must not fold back
     /// into the category mask. Returns null for an unknown token.
     pub fn parse(raw: []const u8) ?EventCategory {
-        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
-            const cat: EventCategory = @field(EventCategory, field.name);
+        inline for (@typeInfo(EventCategory).@"enum".field_names) |field_name| {
+            const cat: EventCategory = @field(EventCategory, field_name);
             if (std.ascii.eqlIgnoreCase(raw, cat.code()) or std.ascii.eqlIgnoreCase(raw, cat.token()))
                 return cat;
         }
@@ -77,8 +77,8 @@ pub const EventSeverity = enum {
     /// alias "warning"→warn). Returns null for an unknown token.
     pub fn parse(raw: []const u8) ?EventSeverity {
         if (std.ascii.eqlIgnoreCase(raw, "warning")) return .warn;
-        inline for (@typeInfo(EventSeverity).@"enum".fields) |field| {
-            if (std.ascii.eqlIgnoreCase(raw, field.name)) return @field(EventSeverity, field.name);
+        inline for (@typeInfo(EventSeverity).@"enum".field_names) |field_name| {
+            if (std.ascii.eqlIgnoreCase(raw, field_name)) return @field(EventSeverity, field_name);
         }
         return null;
     }
@@ -94,8 +94,8 @@ pub const CategoryMask = struct {
 
     pub fn all() CategoryMask {
         var out = CategoryMask.empty();
-        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
-            out.add(@field(EventCategory, field.name));
+        inline for (@typeInfo(EventCategory).@"enum".field_names) |field_name| {
+            out.add(@field(EventCategory, field_name));
         }
         return out;
     }
@@ -153,15 +153,15 @@ pub fn categoryMaskFromTokens(tokens: []const []const u8) CategoryMask {
             mask = mask.include(CategoryMask.all());
             continue;
         }
-        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
-            const cat: EventCategory = @field(EventCategory, field.name);
+        inline for (@typeInfo(EventCategory).@"enum".field_names) |field_name| {
+            const cat: EventCategory = @field(EventCategory, field_name);
             if (std.ascii.eqlIgnoreCase(tok, cat.token())) mask.add(cat);
         }
     }
     return mask;
 }
 
-pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".fields.len;
+pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".field_names.len;
 
 /// IRCX EVENT subscription types supported by Ophion's client-facing command.
 /// These are intentionally distinct from Orochi's EventCategory taxonomy:
@@ -187,8 +187,8 @@ pub const IrcxEventType = enum(u3) {
     }
 
     pub fn parse(raw: []const u8) ?IrcxEventType {
-        inline for (@typeInfo(IrcxEventType).@"enum".fields) |field| {
-            const typ: IrcxEventType = @enumFromInt(field.value);
+        inline for (@typeInfo(IrcxEventType).@"enum".field_values) |field_value| {
+            const typ: IrcxEventType = @enumFromInt(field_value);
             if (std.ascii.eqlIgnoreCase(raw, typ.wireName())) return typ;
         }
         return null;
@@ -594,7 +594,7 @@ test "IRCX event mask tracks distinct subscription bits" {
 }
 
 test "multi-subscriber fan-out preserves subscription order" {
-    var subscribers: [4]Subscriber = [_]Subscriber{.{}} ** 4;
+    var subscribers: [4]Subscriber = @splat(.{});
     var spine = EventSpine.init(&subscribers);
 
     try spine.subscribe("oper-a", CategoryMask.fromCategories(&.{ .connect, .flood }));
@@ -618,7 +618,7 @@ test "multi-subscriber fan-out preserves subscription order" {
 }
 
 test "unsubscribe removes selected categories and drops empty subscribers" {
-    var subscribers: [3]Subscriber = [_]Subscriber{.{}} ** 3;
+    var subscribers: [3]Subscriber = @splat(.{});
     var spine = EventSpine.init(&subscribers);
 
     try spine.subscribe("oper-a", CategoryMask.fromCategories(&.{ .connect, .flood }));
@@ -669,7 +669,7 @@ test "render carries a structured body with a trailing reason verbatim" {
 }
 
 test "publish with no matching subscribers returns empty selection" {
-    var subscribers: [2]Subscriber = [_]Subscriber{.{}} ** 2;
+    var subscribers: [2]Subscriber = @splat(.{});
     var spine = EventSpine.init(&subscribers);
 
     try spine.subscribe("oper-a", CategoryMask.only(.debug));
@@ -688,7 +688,7 @@ test "publish with no matching subscribers returns empty selection" {
 }
 
 test "publish reports too-small sinks before partial fan-out" {
-    var subscribers: [2]Subscriber = [_]Subscriber{.{}} ** 2;
+    var subscribers: [2]Subscriber = @splat(.{});
     var spine = EventSpine.init(&subscribers);
 
     try spine.subscribe("oper-a", CategoryMask.only(.announce));

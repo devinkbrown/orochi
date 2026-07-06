@@ -140,7 +140,7 @@ pub const EpochSecrets = struct {
 /// PSK secret themselves and pass it here.
 fn pskOrZero(psk_secret: ?*const [Nh]u8) [Nh]u8 {
     if (psk_secret) |p| return p.*;
-    return [_]u8{0} ** Nh;
+    return @as([Nh]u8, @splat(0));
 }
 
 /// RFC 9420 §8.1 — derive all epoch secrets.
@@ -265,7 +265,7 @@ test "encodeKdfLabel basic structure" {
 }
 
 test "expandWithLabel output length correctness" {
-    const secret = [_]u8{0xAB} ** Nh;
+    const secret = @as([Nh]u8, @splat(0xAB));
     var out16: [16]u8 = undefined;
     var out32: [32]u8 = undefined;
     var out64: [64]u8 = undefined;
@@ -280,8 +280,8 @@ test "expandWithLabel output length correctness" {
     try std.testing.expectEqual(@as(usize, 64), out64.len);
 
     // Outputs for different requested lengths must all be non-zero (not degenerate).
-    const zero16 = [_]u8{0} ** 16;
-    const zero32 = [_]u8{0} ** 32;
+    const zero16 = @as([16]u8, @splat(0));
+    const zero32 = @as([32]u8, @splat(0));
     try std.testing.expect(!mem.eql(u8, &out16, &zero16));
     try std.testing.expect(!mem.eql(u8, &out32, &zero32));
 
@@ -292,7 +292,7 @@ test "expandWithLabel output length correctness" {
 }
 
 test "expandWithLabel determinism" {
-    const secret = [_]u8{0x42} ** Nh;
+    const secret = @as([Nh]u8, @splat(0x42));
     var a: [Nh]u8 = undefined;
     var b: [Nh]u8 = undefined;
 
@@ -303,7 +303,7 @@ test "expandWithLabel determinism" {
 }
 
 test "expandWithLabel label separation" {
-    const secret = [_]u8{0x01} ** Nh;
+    const secret = @as([Nh]u8, @splat(0x01));
     var a: [Nh]u8 = undefined;
     var b: [Nh]u8 = undefined;
 
@@ -314,7 +314,7 @@ test "expandWithLabel label separation" {
 }
 
 test "expandWithLabel context separation" {
-    const secret = [_]u8{0x02} ** Nh;
+    const secret = @as([Nh]u8, @splat(0x02));
     var a: [Nh]u8 = undefined;
     var b: [Nh]u8 = undefined;
 
@@ -325,7 +325,7 @@ test "expandWithLabel context separation" {
 }
 
 test "deriveSecret determinism and Nh-length output" {
-    const secret = [_]u8{0xFF} ** Nh;
+    const secret = @as([Nh]u8, @splat(0xFF));
     const a = deriveSecret(&secret, "encryption");
     const b = deriveSecret(&secret, "encryption");
     try std.testing.expectEqualSlices(u8, &a, &b);
@@ -333,15 +333,15 @@ test "deriveSecret determinism and Nh-length output" {
 }
 
 test "deriveSecret label separation" {
-    const secret = [_]u8{0x10} ** Nh;
+    const secret = @as([Nh]u8, @splat(0x10));
     const a = deriveSecret(&secret, "init");
     const b = deriveSecret(&secret, "member");
     try std.testing.expect(!mem.eql(u8, &a, &b));
 }
 
 test "epoch derivation is deterministic" {
-    const init = [_]u8{0x00} ** Nh;
-    const commit = [_]u8{0x11} ** Nh;
+    const init = @as([Nh]u8, @splat(0x00));
+    const commit = @as([Nh]u8, @splat(0x11));
     const gc = "group-context-v1";
 
     const e1 = deriveEpochSecrets(&init, &commit, gc, null);
@@ -360,8 +360,8 @@ test "epoch derivation is deterministic" {
 }
 
 test "all named epoch secrets are distinct" {
-    const init = [_]u8{0x00} ** Nh;
-    const commit = [_]u8{0x22} ** Nh;
+    const init = @as([Nh]u8, @splat(0x00));
+    const commit = @as([Nh]u8, @splat(0x22));
     const gc = "group-context-separation";
 
     const e = deriveEpochSecrets(&init, &commit, gc, null);
@@ -386,9 +386,9 @@ test "all named epoch secrets are distinct" {
 }
 
 test "different commit_secret produces different epoch_secret" {
-    const init = [_]u8{0x00} ** Nh;
-    const commit_a = [_]u8{0x33} ** Nh;
-    const commit_b = [_]u8{0x44} ** Nh;
+    const init = @as([Nh]u8, @splat(0x00));
+    const commit_a = @as([Nh]u8, @splat(0x33));
+    const commit_b = @as([Nh]u8, @splat(0x44));
     const gc = "group-context";
 
     const ea = deriveEpochSecrets(&init, &commit_a, gc, null);
@@ -398,9 +398,9 @@ test "different commit_secret produces different epoch_secret" {
 }
 
 test "different init_secret produces different epoch_secret" {
-    const init_a = [_]u8{0xAA} ** Nh;
-    const init_b = [_]u8{0xBB} ** Nh;
-    const commit = [_]u8{0x55} ** Nh;
+    const init_a = @as([Nh]u8, @splat(0xAA));
+    const init_b = @as([Nh]u8, @splat(0xBB));
+    const commit = @as([Nh]u8, @splat(0x55));
     const gc = "group-context";
 
     const ea = deriveEpochSecrets(&init_a, &commit, gc, null);
@@ -410,11 +410,11 @@ test "different init_secret produces different epoch_secret" {
 }
 
 test "PSK changes epoch_secret" {
-    const init = [_]u8{0x00} ** Nh;
-    const commit = [_]u8{0x66} ** Nh;
+    const init = @as([Nh]u8, @splat(0x00));
+    const commit = @as([Nh]u8, @splat(0x66));
     const gc = "psk-test";
 
-    const psk = [_]u8{0x77} ** Nh;
+    const psk = @as([Nh]u8, @splat(0x77));
 
     const e_no_psk = deriveEpochSecrets(&init, &commit, gc, null);
     const e_psk = deriveEpochSecrets(&init, &commit, gc, &psk);
@@ -423,9 +423,9 @@ test "PSK changes epoch_secret" {
 }
 
 test "epoch chaining: init_secret of epoch N feeds epoch N+1" {
-    const init0 = [_]u8{0x00} ** Nh;
-    const commit0 = [_]u8{0xC0} ** Nh;
-    const commit1 = [_]u8{0xC1} ** Nh;
+    const init0 = @as([Nh]u8, @splat(0x00));
+    const commit0 = @as([Nh]u8, @splat(0xC0));
+    const commit1 = @as([Nh]u8, @splat(0xC1));
     const gc = "chain-test";
 
     const e0 = deriveEpochSecrets(&init0, &commit0, gc, null);
@@ -442,10 +442,10 @@ test "epoch chaining: init_secret of epoch N feeds epoch N+1" {
 }
 
 test "epoch chaining is sensitive to commit_secret at each epoch" {
-    const init0 = [_]u8{0x00} ** Nh;
-    const commit0 = [_]u8{0xD0} ** Nh;
-    const commit1_a = [_]u8{0xD1} ** Nh;
-    const commit1_b = [_]u8{0xD2} ** Nh;
+    const init0 = @as([Nh]u8, @splat(0x00));
+    const commit0 = @as([Nh]u8, @splat(0xD0));
+    const commit1_a = @as([Nh]u8, @splat(0xD1));
+    const commit1_b = @as([Nh]u8, @splat(0xD2));
     const gc = "chain-sensitivity";
 
     const e0 = deriveEpochSecrets(&init0, &commit0, gc, null);
@@ -456,7 +456,7 @@ test "epoch chaining is sensitive to commit_secret at each epoch" {
 }
 
 test "exporter is deterministic" {
-    const es = [_]u8{0x88} ** Nh;
+    const es = @as([Nh]u8, @splat(0x88));
     var out_a: [32]u8 = undefined;
     var out_b: [32]u8 = undefined;
 
@@ -467,7 +467,7 @@ test "exporter is deterministic" {
 }
 
 test "exporter label separation" {
-    const es = [_]u8{0x99} ** Nh;
+    const es = @as([Nh]u8, @splat(0x99));
     var out_a: [32]u8 = undefined;
     var out_b: [32]u8 = undefined;
 
@@ -478,7 +478,7 @@ test "exporter label separation" {
 }
 
 test "exporter context separation" {
-    const es = [_]u8{0xAA} ** Nh;
+    const es = @as([Nh]u8, @splat(0xAA));
     var out_a: [32]u8 = undefined;
     var out_b: [32]u8 = undefined;
 
@@ -489,7 +489,7 @@ test "exporter context separation" {
 }
 
 test "exporter variable output lengths" {
-    const es = [_]u8{0xBB} ** Nh;
+    const es = @as([Nh]u8, @splat(0xBB));
     var out16: [16]u8 = undefined;
     var out48: [48]u8 = undefined;
 
@@ -501,8 +501,8 @@ test "exporter variable output lengths" {
     try std.testing.expectEqual(@as(usize, 48), out48.len);
 
     // Outputs must be non-degenerate.
-    const zero16 = [_]u8{0} ** 16;
-    const zero48 = [_]u8{0} ** 48;
+    const zero16 = @as([16]u8, @splat(0));
+    const zero48 = @as([48]u8, @splat(0));
     try std.testing.expect(!mem.eql(u8, &out16, &zero16));
     try std.testing.expect(!mem.eql(u8, &out48, &zero48));
 
@@ -513,8 +513,8 @@ test "exporter variable output lengths" {
 }
 
 test "exporter uses epoch exporter_secret correctly" {
-    const init = [_]u8{0x00} ** Nh;
-    const commit = [_]u8{0xEE} ** Nh;
+    const init = @as([Nh]u8, @splat(0x00));
+    const commit = @as([Nh]u8, @splat(0xEE));
     const gc = "exporter-epoch-test";
 
     const epoch = deriveEpochSecrets(&init, &commit, gc, null);
@@ -529,7 +529,7 @@ test "exporter uses epoch exporter_secret correctly" {
     try std.testing.expectEqualSlices(u8, &out, &out2);
 
     // Using a different epoch's exporter_secret must produce a different value
-    const init2 = [_]u8{0x01} ** Nh;
+    const init2 = @as([Nh]u8, @splat(0x01));
     const epoch2 = deriveEpochSecrets(&init2, &commit, gc, null);
 
     var out3: [Nh]u8 = undefined;

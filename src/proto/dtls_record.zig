@@ -273,7 +273,7 @@ pub const AntiReplay = struct {
 ///   The sequence number is placed in the rightmost bytes of a 12-byte field,
 ///   zero-padded on the left, then XORed with the 12-byte write IV.
 pub fn buildNonce(write_iv: [12]u8, seq: u64) [12]u8 {
-    var padded = [_]u8{0} ** 12;
+    var padded = @as([12]u8, @splat(0));
     // seq big-endian in the last 8 bytes.
     padded[4] = @truncate(seq >> 56);
     padded[5] = @truncate(seq >> 48);
@@ -558,7 +558,7 @@ test "anti-replay — large jump clears window" {
 
 test "buildNonce — known vector" {
     const t = std.testing;
-    const iv = [_]u8{0} ** 12;
+    const iv = @as([12]u8, @splat(0));
     // With all-zero IV the nonce should equal the padded seq.
     const nonce = buildNonce(iv, 0x0102030405060708);
     const expected = [_]u8{ 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
@@ -578,8 +578,8 @@ test "buildNonce — XOR with IV" {
 test "AEAD seal/open round-trip" {
     const t = std.testing;
 
-    const key = [_]u8{0x42} ** 32;
-    const iv = [_]u8{0x00} ** 12;
+    const key = @as([32]u8, @splat(0x42));
+    const iv = @as([12]u8, @splat(0x00));
     const seq: u64 = 7;
     const aad = "dtls-header";
     const plaintext = "hello, dtls 1.3 record layer";
@@ -596,8 +596,8 @@ test "AEAD seal/open round-trip" {
 test "AEAD — tampered ciphertext rejected" {
     const t = std.testing;
 
-    const key = [_]u8{0x11} ** 32;
-    const iv = [_]u8{0x22} ** 12;
+    const key = @as([32]u8, @splat(0x11));
+    const iv = @as([12]u8, @splat(0x22));
     const seq: u64 = 99;
     const aad = "aad";
     const plaintext = "secret message";
@@ -615,8 +615,8 @@ test "AEAD — tampered ciphertext rejected" {
 test "AEAD — tampered tag rejected" {
     const t = std.testing;
 
-    const key = [_]u8{0x33} ** 32;
-    const iv = [_]u8{0x44} ** 12;
+    const key = @as([32]u8, @splat(0x33));
+    const iv = @as([12]u8, @splat(0x44));
     const seq: u64 = 0;
     const aad = "hdr";
     const plaintext = "payload";
@@ -634,8 +634,8 @@ test "AEAD — tampered tag rejected" {
 test "AEAD — wrong AAD rejected" {
     const t = std.testing;
 
-    const key = [_]u8{0x55} ** 32;
-    const iv = [_]u8{0x66} ** 12;
+    const key = @as([32]u8, @splat(0x55));
+    const iv = @as([12]u8, @splat(0x66));
     const seq: u64 = 1;
     const plaintext = "data";
 
@@ -649,8 +649,8 @@ test "AEAD — wrong AAD rejected" {
 test "AEAD — wrong seq (nonce mismatch) rejected" {
     const t = std.testing;
 
-    const key = [_]u8{0x77} ** 32;
-    const iv = [_]u8{0x88} ** 12;
+    const key = @as([32]u8, @splat(0x77));
+    const iv = @as([12]u8, @splat(0x88));
     const aad = "hdr";
     const plaintext = "nonce test";
 
@@ -664,8 +664,8 @@ test "AEAD — wrong seq (nonce mismatch) rejected" {
 test "AEAD — deterministic (same inputs, same output)" {
     const t = std.testing;
 
-    const key = [_]u8{0x99} ** 32;
-    const iv = [_]u8{0xAA} ** 12;
+    const key = @as([32]u8, @splat(0x99));
+    const iv = @as([12]u8, @splat(0xAA));
     const aad = "deterministic";
     const plaintext = "same every time";
 

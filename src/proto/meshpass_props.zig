@@ -48,7 +48,7 @@ fn expectDecodeError(err: meshpass.DecodeError) void {
 }
 
 fn fixedKey(byte: u8) !Ed25519.KeyPair {
-    return Ed25519.KeyPair.generateDeterministic([_]u8{byte} ** 32);
+    return Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(byte)));
 }
 
 fn randomKey(random: std.Random) !Ed25519.KeyPair {

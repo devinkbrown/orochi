@@ -48,7 +48,7 @@ test "RFC 7748 section 5.2 X25519 iterative test vectors (1 and 1000 iterations)
     // start at the encoded byte string 0x09 followed by 31 zero bytes. Each
     // round computes result = X25519(k, u), then sets u = k and k = result.
     // The scalar clamping mandated by RFC 7748 happens inside X25519 itself.
-    var k: [32]u8 = [_]u8{0} ** 32;
+    var k: [32]u8 = @splat(0);
     k[0] = 9;
     var u: [32]u8 = k;
 
@@ -96,7 +96,7 @@ test "X25519Kx derives the same shared secret on both sides" {
 }
 
 test "HybridKx deterministic encapsulation and shared-secret agreement" {
-    var responder_seed: [kx.HybridKx.seed_len]u8 = [_]u8{0} ** kx.HybridKx.seed_len;
+    var responder_seed: [kx.HybridKx.seed_len]u8 = @splat(0);
     for (&responder_seed, 0..) |*byte, i| {
         byte.* = @intCast((i * 17 + 0x31) & 0xff);
     }
@@ -106,7 +106,7 @@ test "HybridKx deterministic encapsulation and shared-secret agreement" {
     var initiator_x = try kx.X25519Kx.generateDeterministic(hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"));
     defer initiator_x.wipe();
 
-    var encaps_seed: [kx.HybridKx.encaps_seed_len]u8 = [_]u8{0} ** kx.HybridKx.encaps_seed_len;
+    var encaps_seed: [kx.HybridKx.encaps_seed_len]u8 = @splat(0);
     for (&encaps_seed, 0..) |*byte, i| {
         byte.* = @intCast((i * 29 + 0x47) & 0xff);
     }

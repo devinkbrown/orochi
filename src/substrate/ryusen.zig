@@ -447,10 +447,10 @@ fn consumePrefix(comptime T: type, list: *std.ArrayList(T), count: usize) void {
 
 const DeterminismTrace = struct {
     send_count: usize = 0,
-    send_bytes: [32]usize = [_]usize{0} ** 32,
-    send_status: [32]SendCompletion.Status = [_]SendCompletion.Status{.sent} ** 32,
+    send_bytes: [32]usize = @splat(0),
+    send_status: [32]SendCompletion.Status = @splat(.sent),
     recv_len: usize = 0,
-    recv_bytes: [128]u8 = [_]u8{0} ** 128,
+    recv_bytes: [128]u8 = @splat(0),
 };
 
 fn runDeterminismTrace(allocator: std.mem.Allocator, seed: u64) !DeterminismTrace {

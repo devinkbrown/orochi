@@ -55,7 +55,7 @@ const Key = struct {
     }
 
     fn build(family: Family, src: []const u8, len: usize) Key {
-        var key = Key{ .family = family, .len = @intCast(len), .bytes = [_]u8{0} ** 16 };
+        var key = Key{ .family = family, .len = @intCast(len), .bytes = @as([16]u8, @splat(0)) };
         @memcpy(key.bytes[0..len], src[0..len]);
         return key;
     }
@@ -299,7 +299,7 @@ test "release of an unknown address is a no-op" {
 
     // Act
     limiter.release(v4(10, 0, 0, 1));
-    limiter.release(v6([_]u8{0} ** 8, [_]u8{0} ** 8));
+    limiter.release(v6(@as([8]u8, @splat(0)), @as([8]u8, @splat(0))));
 
     // Assert
     try std.testing.expectEqual(@as(u32, 0), limiter.countForIp(v4(10, 0, 0, 1)));

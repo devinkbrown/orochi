@@ -684,7 +684,7 @@ fn signChannelDelta(kp: *const signed_delta.KeyPair, op_bytes: []const u8, hlc: 
 
 test "overlapping divergent stores converge through bounded pump loop" {
     const allocator = std.testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x51} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x51)));
     test_pubkey = kp.public_key.toBytes();
 
     var state_a = channel_crdt.ChannelCrdt.init(allocator, 1);
@@ -765,7 +765,7 @@ test "identical stores exchange zero bytes" {
 
 test "invalid signed delta is rejected and not applied" {
     const allocator = std.testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x52} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x52)));
     test_pubkey = kp.public_key.toBytes();
 
     var source = channel_crdt.ChannelCrdt.init(allocator, 1);
@@ -786,7 +786,7 @@ test "invalid signed delta is rejected and not applied" {
 
 test "signed channel delta survives a wire crossing and applies on the peer" {
     const allocator = std.testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x71} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x71)));
     test_pubkey = kp.public_key.toBytes();
 
     // Origin builds a membership change locally and signs the canonical delta.
@@ -815,7 +815,7 @@ test "signed channel delta survives a wire crossing and applies on the peer" {
 
     // A delta carrying the same payload but signed by a different key fails the
     // public-key->origin binding and is never applied.
-    const evil = try signed_delta.KeyPair.generateDeterministic([_]u8{0x7e} ** signed_delta.seed_len);
+    const evil = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x7e)));
     const forged = try signChannelDelta(&evil, op, join.hlc.toU64());
     var forged_wire: [2048]u8 = undefined;
     const forged_bytes = try signed_delta.encodeSigned(forged, &forged_wire);

@@ -111,7 +111,7 @@ pub fn fromConfig(secret_hex: []const u8, realm: []const u8) Error!NodeIdentity 
 const testing = std.testing;
 
 test "fromSeed is deterministic and yields a usable, verifiable prekey" {
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(0x42));
     var id1 = try fromSeed(seed, "local");
     defer id1.deinit();
     var id2 = try fromSeed(seed, "local");
@@ -128,24 +128,30 @@ test "fromSeed is deterministic and yields a usable, verifiable prekey" {
 }
 
 test "distinct seeds give distinct node ids; distinct realms give distinct realm ids" {
-    var a = try fromSeed([_]u8{1} ** 32, "local");
+    var a = try fromSeed(@as([32]u8, @splat(1)), "local");
     defer a.deinit();
-    var b = try fromSeed([_]u8{2} ** 32, "local");
+    var b = try fromSeed(@as([32]u8, @splat(2)), "local");
     defer b.deinit();
     try testing.expect(!std.mem.eql(u8, &a.node_id, &b.node_id));
 
-    var c = try fromSeed([_]u8{1} ** 32, "other-realm");
+    var c = try fromSeed(@as([32]u8, @splat(1)), "other-realm");
     defer c.deinit();
     try testing.expectEqualSlices(u8, &a.node_id, &c.node_id); // same seed -> same node id
     try testing.expect(!std.mem.eql(u8, &a.realm, &c.realm)); // different realm
 }
 
 test "fromConfig parses a hex seed and rejects bad input" {
-    const hex = "42" ** 32; // 64 hex chars
+    const hex = &repeatBytes("42", 32); // 64 hex chars
     var id = try fromConfig(hex, "local");
     defer id.deinit();
-    try testing.expectEqual((try fromSeed([_]u8{0x42} ** 32, "local")).shortId(), id.shortId());
+    try testing.expectEqual((try fromSeed(@as([32]u8, @splat(0x42)), "local")).shortId(), id.shortId());
 
     try testing.expectError(error.BadSeed, fromConfig("abcd", "local")); // too short
-    try testing.expectError(error.BadSeed, fromConfig("zz" ** 32, "local")); // non-hex
+    try testing.expectError(error.BadSeed, fromConfig(&repeatBytes("zz", 32), "local")); // non-hex
+}
+
+fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    var b: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+    return b;
 }

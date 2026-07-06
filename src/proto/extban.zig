@@ -106,7 +106,7 @@ pub fn Matcher(comptime max_nodes: usize) type {
     return struct {
         const Self = @This();
 
-        nodes: [max_nodes]Node = [_]Node{.{ .hostmask = "" }} ** max_nodes,
+        nodes: [max_nodes]Node = @splat(.{ .hostmask = "" }),
         node_count: usize = 0,
         root: usize = 0,
 
@@ -442,7 +442,7 @@ test "parses patterned certfp secure extban" {
     try std.testing.expectError(error.EmptyPattern, parse("$z:"));
 
     // Pattern length is bounded.
-    const oversize = "z" ** (MAX_CERTFP_PATTERN_BYTES + 1);
+    const oversize = &@as([(MAX_CERTFP_PATTERN_BYTES + 1)]u8, @splat('z'));
     try std.testing.expectError(error.OversizeMask, parse("$z:" ++ oversize));
 }
 

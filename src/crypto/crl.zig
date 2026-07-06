@@ -574,7 +574,7 @@ test "crl rejects malformed input" {
 test "crl verifySignature accepts direct issuer Ed25519 signature" {
     const allocator = std.testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6B)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
     const der = try testSignedCrl(allocator, kp);
@@ -593,8 +593,8 @@ test "crl verifySignature accepts direct issuer Ed25519 signature" {
 test "crl verifyCrlSignature rejects a CRL signed by a non-issuer key" {
     const allocator = std.testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const issuer_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
-    const attacker_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x2C} ** Ed25519.KeyPair.seed_length);
+    const issuer_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6B)));
+    const attacker_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x2C)));
 
     // The CRL is signed by the ISSUER key only.
     const der = try testSignedCrl(allocator, issuer_kp);
@@ -616,7 +616,7 @@ test "crl verifyCrlSignature rejects a CRL signed by a non-issuer key" {
 test "crl verifyCrlSignature reports typed tamper and algorithm-mismatch failures" {
     const allocator = std.testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6B)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
     const der = try testSignedCrl(allocator, kp);

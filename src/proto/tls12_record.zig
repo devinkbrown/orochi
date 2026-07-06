@@ -271,8 +271,8 @@ const expectError = std.testing.expectError;
 
 test "AES-GCM round-trip recovers plaintext for both key sizes" {
     // Arrange.
-    inline for (.{ Aes128Gcm, Aes256Gcm }, .{ 16, 32 }) |Suite, klen| {
-        const key: Suite.Key = [_]u8{0x11} ** klen;
+    inline for (.{ Aes128Gcm, Aes256Gcm }, .{ 16, 32 }) |Suite, _| {
+        const key: Suite.Key = @splat(0x11);
         const salt: Suite.Salt = .{ 0xaa, 0xbb, 0xcc, 0xdd };
         const plaintext = "the quick brown fox jumps over the lazy dog";
         const seq: u64 = 7;
@@ -290,7 +290,7 @@ test "AES-GCM round-trip recovers plaintext for both key sizes" {
 
 test "AES-128-GCM explicit-nonce framing is correct" {
     // Arrange.
-    const key: Aes128Gcm.Key = [_]u8{0x22} ** 16;
+    const key: Aes128Gcm.Key = @splat(0x22);
     const salt: Aes128Gcm.Salt = .{ 1, 2, 3, 4 };
     const plaintext = "framing";
     const seq: u64 = 0x0102030405060708;
@@ -309,7 +309,7 @@ test "AES-128-GCM explicit-nonce framing is correct" {
 
 test "AES-128-GCM tampered tag yields AuthFailed" {
     // Arrange.
-    const key: Aes128Gcm.Key = [_]u8{0x33} ** 16;
+    const key: Aes128Gcm.Key = @splat(0x33);
     const salt: Aes128Gcm.Salt = .{ 9, 8, 7, 6 };
     const plaintext = "do not tamper";
     const seq: u64 = 3;
@@ -327,7 +327,7 @@ test "AES-128-GCM tampered tag yields AuthFailed" {
 
 test "AES-128-GCM sequence-number mismatch yields AuthFailed" {
     // Arrange.
-    const key: Aes128Gcm.Key = [_]u8{0x44} ** 16;
+    const key: Aes128Gcm.Key = @splat(0x44);
     const salt: Aes128Gcm.Salt = .{ 4, 4, 4, 4 };
     const plaintext = "seq must match";
     var sealed: [128]u8 = undefined;
@@ -343,8 +343,8 @@ test "AES-128-GCM sequence-number mismatch yields AuthFailed" {
 
 test "ChaCha20-Poly1305 round-trip with no explicit nonce on the wire" {
     // Arrange.
-    const key: ChaCha.Key = [_]u8{0x66} ** 32;
-    const iv: ChaCha.WriteIv = [_]u8{0x77} ** 12;
+    const key: ChaCha.Key = @splat(0x66);
+    const iv: ChaCha.WriteIv = @splat(0x77);
     const plaintext = "rfc 7905 chacha record";
     const seq: u64 = 42;
     var sealed: [128]u8 = undefined;
@@ -361,8 +361,8 @@ test "ChaCha20-Poly1305 round-trip with no explicit nonce on the wire" {
 
 test "ChaCha20-Poly1305 content-type mismatch yields AuthFailed" {
     // Arrange.
-    const key: ChaCha.Key = [_]u8{0x88} ** 32;
-    const iv: ChaCha.WriteIv = [_]u8{0x99} ** 12;
+    const key: ChaCha.Key = @splat(0x88);
+    const iv: ChaCha.WriteIv = @splat(0x99);
     const plaintext = "aad binds content type";
     const seq: u64 = 5;
     var sealed: [128]u8 = undefined;
@@ -380,7 +380,7 @@ test "nonce derivation: AES-GCM is salt||explicit and ChaCha is IV xor seq" {
     // Arrange.
     const salt: [salt_len]u8 = .{ 0x01, 0x02, 0x03, 0x04 };
     const explicit: [explicit_nonce_len]u8 = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
-    const iv: [chacha_iv_len]u8 = [_]u8{0} ** 12;
+    const iv: [chacha_iv_len]u8 = @splat(0);
 
     // Act.
     const gcm_nonce = aesGcmNonce(salt, explicit);
@@ -389,7 +389,7 @@ test "nonce derivation: AES-GCM is salt||explicit and ChaCha is IV xor seq" {
     // Assert.
     const want_gcm = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
     try expectEqualSlices(u8, &want_gcm, &gcm_nonce);
-    var want_cc = [_]u8{0} ** 12;
+    var want_cc = @as([12]u8, @splat(0));
     want_cc[11] = 0xff;
     try expectEqualSlices(u8, &want_cc, &cc_nonce);
 }

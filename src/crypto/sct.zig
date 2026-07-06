@@ -774,7 +774,7 @@ test "parseList decodes a single v1 SCT with every field intact" {
 
 test "parseList preserves non-empty CtExtensions" {
     // Arrange
-    const log_id = [_]u8{0xAB} ** log_id_len;
+    const log_id = @as([log_id_len]u8, @splat(0xAB));
     const extensions = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     const signature = [_]u8{ 0x01, 0x02 };
 
@@ -793,8 +793,8 @@ test "parseList preserves non-empty CtExtensions" {
 
 test "parseList decodes two SCTs in wire order" {
     // Arrange
-    const log_id_a = [_]u8{0x11} ** log_id_len;
-    const log_id_b = [_]u8{0x22} ** log_id_len;
+    const log_id_a = @as([log_id_len]u8, @splat(0x11));
+    const log_id_b = @as([log_id_len]u8, @splat(0x22));
     const sig_a = [_]u8{0xaa};
     const sig_b = [_]u8{ 0xbb, 0xbb };
 
@@ -878,7 +878,7 @@ test "parseSct rejects a truncated SCT (LogID cut short)" {
 
 test "parseSct rejects surplus bytes after the signature" {
     // Arrange: a valid SCT body with one extra trailing byte appended.
-    const log_id = [_]u8{0x07} ** log_id_len;
+    const log_id = @as([log_id_len]u8, @splat(0x07));
     const signature = [_]u8{ 0x09, 0x0a };
     var body_buf: [256]u8 = undefined;
     const body = buildOneSctBody(&body_buf, log_id, 99, &.{}, &signature);
@@ -915,7 +915,7 @@ test "parseSct rejects a signature length that overruns the body" {
 
 test "parseList surfaces version even for an unknown version byte" {
     // Arrange: an SCT whose version byte is 9 (not v1).
-    const log_id = [_]u8{0x01} ** log_id_len;
+    const log_id = @as([log_id_len]u8, @splat(0x01));
     const signature = [_]u8{0x00};
     var body_buf: [256]u8 = undefined;
     const body = buildOneSctBody(&body_buf, log_id, 0, &.{}, &signature);
@@ -938,7 +938,7 @@ test "parseList surfaces version even for an unknown version byte" {
 
 test "parseList rejects more than max_scts entries" {
     // Arrange: build max_scts + 1 minimal SCTs.
-    const log_id = [_]u8{0x00} ** log_id_len;
+    const log_id = @as([log_id_len]u8, @splat(0x00));
     const signature = [_]u8{0x00};
     var bodies_storage: [max_scts + 1][128]u8 = undefined;
     var bodies: [max_scts + 1][]const u8 = undefined;
@@ -998,7 +998,7 @@ test "buildSignedData includes non-empty extensions" {
 
 test "buildSignedData writes a precert entry verbatim" {
     // Arrange: precert signed_entry is issuer_key_hash[32] || tbs<1..2^24-1>.
-    const issuer_key_hash = [_]u8{0x33} ** log_id_len;
+    const issuer_key_hash = @as([log_id_len]u8, @splat(0x33));
     const tbs = [_]u8{ 0x30, 0x01, 0x00 };
     var entry_buf: [64]u8 = undefined;
     const entry = try buildPrecertEntry(&entry_buf, issuer_key_hash, &tbs);
@@ -1038,7 +1038,7 @@ test "buildSignedData reports NoSpaceLeft when out is too small" {
 
 test "buildSignedData output round-trips the parsed SCT timestamp" {
     // Arrange: parse an SCT, then rebuild signed data using its timestamp.
-    const log_id = [_]u8{0x5a} ** log_id_len;
+    const log_id = @as([log_id_len]u8, @splat(0x5a));
     const ts: u64 = 0x0000_018f_aa00_1234;
     const signature = [_]u8{ 0x30, 0x02, 0x05, 0x00 };
     var body_buf: [256]u8 = undefined;
@@ -1066,7 +1066,7 @@ test "buildSignedData output round-trips the parsed SCT timestamp" {
 
 test "buildPrecertEntry reports NoSpaceLeft when out is too small" {
     // Arrange
-    const issuer_key_hash = [_]u8{0x00} ** log_id_len;
+    const issuer_key_hash = @as([log_id_len]u8, @splat(0x00));
     const tbs = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     var tiny: [16]u8 = undefined; // needs 32 + 3 + 4
 
@@ -1076,7 +1076,7 @@ test "buildPrecertEntry reports NoSpaceLeft when out is too small" {
 
 test "verifySct accepts Ed25519 log signature over built signed data" {
     const allocator = testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7C} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7C)));
     const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
     defer allocator.free(spki);
 
@@ -1092,7 +1092,7 @@ test "verifySct accepts Ed25519 log signature over built signed data" {
     const sig_bytes = sig.toBytes();
     const sct = Sct{
         .version = .v1,
-        .log_id = [_]u8{0xAA} ** log_id_len,
+        .log_id = @as([log_id_len]u8, @splat(0xAA)),
         .timestamp = 0x0102_0304_0506_0708,
         .extensions = &.{},
         .sig_hash_alg = hash_intrinsic,
@@ -1222,12 +1222,12 @@ fn testRsaSpki(allocator: std.mem.Allocator, n: []const u8, e: []const u8) ![]u8
 // of `verifySct` with our own signer. 521 bits = 66 bytes (0x01 then 65×0xFF);
 // n-2 flips the low byte to 0xFD.
 const m521_n = blk: {
-    var n: [66]u8 = [_]u8{0xFF} ** 66;
+    var n: [66]u8 = @splat(0xFF);
     n[0] = 0x01;
     break :blk n;
 };
 const m521_ed = blk: {
-    var e: [66]u8 = [_]u8{0xFF} ** 66;
+    var e: [66]u8 = @splat(0xFF);
     e[0] = 0x01;
     e[65] = 0xFD;
     break :blk e;
@@ -1274,7 +1274,7 @@ test "verify accepts an ECDSA-P256 log signature (self-consistency KAT)" {
     try testing.expectEqual(VerifyResult.valid, verifySignedDataAgainstLogs(sct, signed, &.{log}, null));
 
     // No pinned log matches a different id, and an empty registry never matches.
-    const other = CtLog{ .log_id = [_]u8{0x00} ** log_id_len, .key_spki_der = spki };
+    const other = CtLog{ .log_id = @as([log_id_len]u8, @splat(0x00)), .key_spki_der = spki };
     try testing.expectEqual(VerifyResult.no_applicable_log, verifyOneSct(sct, ctx, &.{other}, null));
     try testing.expectEqual(VerifyResult.no_applicable_log, verifyOneSct(sct, ctx, &.{}, null));
 
@@ -1309,7 +1309,7 @@ test "verifySctAgainstLogs verifies an ECDSA SCT from its serialized bytes" {
     // Valid over the wire bytes.
     try testing.expectEqual(VerifyResult.valid, verifySctAgainstLogs(body, ctx, &.{log}, null));
     // Unknown log and empty registry.
-    const other = CtLog{ .log_id = [_]u8{0x00} ** log_id_len, .key_spki_der = spki };
+    const other = CtLog{ .log_id = @as([log_id_len]u8, @splat(0x00)), .key_spki_der = spki };
     try testing.expectEqual(VerifyResult.no_applicable_log, verifySctAgainstLogs(body, ctx, &.{other}, null));
     try testing.expectEqual(VerifyResult.no_applicable_log, verifySctAgainstLogs(body, ctx, &.{}, null));
     // Flipping the trailing signature byte → hard reject.
@@ -1448,7 +1448,7 @@ test "verifyList tallies valid and no_applicable_log outcomes" {
     // SCT 2: from a log this deployment does not pin (signature irrelevant).
     const junk = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 };
     var bb2: [256]u8 = undefined;
-    const body2 = buildOneSctBody(&bb2, [_]u8{0x00} ** log_id_len, 200, &.{}, &junk);
+    const body2 = buildOneSctBody(&bb2, @as([log_id_len]u8, @splat(0x00)), 200, &.{}, &junk);
 
     var list_buf: [768]u8 = undefined;
     const list_bytes = buildList(&list_buf, &.{ body1, body2 });

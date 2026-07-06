@@ -23,7 +23,7 @@ const AtomicU64 = std.atomic.Value(u64);
 
 const Slot = struct {
     /// Inline uppercased verb. `name_len == 0` means the slot is free.
-    name: [MAX_NAME]u8 = [_]u8{0} ** MAX_NAME,
+    name: [MAX_NAME]u8 = @splat(0),
     name_len: usize = 0,
     count: AtomicU64 = .init(0),
     bytes: AtomicU64 = .init(0),
@@ -35,7 +35,7 @@ const Slot = struct {
 
 /// Fixed-capacity command-usage table. Embed one in the server.
 pub const CommandUsage = struct {
-    slots: [MAX_COMMANDS]Slot = [_]Slot{.{}} ** MAX_COMMANDS,
+    slots: [MAX_COMMANDS]Slot = @splat(.{}),
     /// Number of claimed slots. Read locklessly for iteration bounds; only
     /// advanced under `claim_lock`.
     used: AtomicU64 = .init(0),

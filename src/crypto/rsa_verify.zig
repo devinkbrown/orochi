@@ -97,7 +97,7 @@ inline fn mulAddWord(a: u64, b: u64, acc: u64, carry: u64) Wide {
 // ---------------------------------------------------------------------------
 
 pub const Big = struct {
-    limbs: [max_limbs]u64 = [_]u64{0} ** max_limbs,
+    limbs: [max_limbs]u64 = @splat(0),
     len: usize = 0, // number of significant limbs (no trailing zero limb)
 
     pub fn normalize(self: *Big) void {
@@ -447,13 +447,13 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
 // generation, NO modular inverse, and NO external tooling — only our own
 // modExp. n is 521 bits = 66 bytes: 0x01 followed by 65 × 0xFF.
 const m521_n = blk: {
-    var n: [66]u8 = [_]u8{0xFF} ** 66;
+    var n: [66]u8 = @splat(0xFF);
     n[0] = 0x01;
     break :blk n;
 };
 // n - 2: low byte 0xFF -> 0xFD, all else identical to n.
 const m521_ed = blk: {
-    var e: [66]u8 = [_]u8{0xFF} ** 66;
+    var e: [66]u8 = @splat(0xFF);
     e[0] = 0x01;
     e[65] = 0xFD;
     break :blk e;
@@ -532,7 +532,7 @@ test "verifyPss round-trips a self-encoded EM and rejects tampering" {
     const h_len: usize = 32;
     const salt_len: usize = 16;
     const em_len: usize = 65; // ceil((521-1)/8)
-    const salt = [_]u8{0xA7} ** salt_len;
+    const salt = @as([salt_len]u8, @splat(0xA7));
 
     // M' = 0x00*8 || mHash || salt; H = SHA-256(M').
     var mprime: [8 + 32 + 16]u8 = undefined;

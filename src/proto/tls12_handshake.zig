@@ -385,7 +385,7 @@ test "parseClientHello aliases vectors and iterates suites and extensions" {
     // Arrange.
     const body = [_]u8{
         0x03, 0x03,
-    } ++ [_]u8{0xaa} ** random_len ++ [_]u8{
+    } ++ @as([random_len]u8, @splat(0xaa)) ++ [_]u8{
         0x02, 0x11, 0x22,
         0x00, 0x04, 0xc0,
         0x2f, 0x00, 0x9c,
@@ -415,7 +415,7 @@ test "parseClientHello aliases vectors and iterates suites and extensions" {
 
 test "encodeServerHello round trips through parser and extension iterator" {
     // Arrange.
-    const random = [_]u8{0x5a} ** random_len;
+    const random = @as([random_len]u8, @splat(0x5a));
     const session_id = [_]u8{ 1, 2, 3, 4 };
     const extensions = [_]u8{ 0x00, 0x0b, 0x00, 0x01, 0x02 };
     var out: [128]u8 = undefined;
@@ -528,12 +528,12 @@ test "parsers reject truncation, trailing bytes, and malformed vector lengths" {
     const trailing_header = [_]u8{ 1, 0, 0, 0, 0 };
     const odd_suites = [_]u8{
         0x03, 0x03,
-    } ++ [_]u8{0} ** random_len ++ [_]u8{
+    } ++ @as([random_len]u8, @splat(0)) ++ [_]u8{
         0x00, 0x00, 0x01, 0xff, 0x01, 0x00, 0x00, 0x00,
     };
     const long_session = [_]u8{
         0x03, 0x03,
-    } ++ [_]u8{0} ** random_len ++ [_]u8{33} ++ [_]u8{0} ** 33;
+    } ++ @as([random_len]u8, @splat(0)) ++ [_]u8{33} ++ @as([33]u8, @splat(0));
     const bad_ext = [_]u8{ 0x00, 0x0d, 0x00, 0x04, 0x01 };
     var ext_it = ExtensionIterator{ .body = &bad_ext };
 
@@ -549,8 +549,8 @@ test "parsers reject truncation, trailing bytes, and malformed vector lengths" {
 
 test "encoders report NoSpaceLeft and oversize inputs" {
     // Arrange.
-    const random = [_]u8{0} ** random_len;
-    const long_session = [_]u8{0} ** (max_session_id_len + 1);
+    const random = @as([random_len]u8, @splat(0));
+    const long_session = @as([(max_session_id_len + 1)]u8, @splat(0));
     const cert = [_]u8{0xaa};
     const chain = [_][]const u8{&cert};
     var short_out: [2]u8 = undefined;
@@ -562,6 +562,6 @@ test "encoders report NoSpaceLeft and oversize inputs" {
     try testing.expectError(error.SessionIdTooLong, encodeServerHello(&short_out, 0x0303, &random, &long_session, 0x1301, 0, ""));
     try testing.expectError(error.NoSpaceLeft, encodeCertificate(&short_out, &chain));
     try testing.expectError(error.CertificateTooLarge, encodeCertificate(&short_out, &.{max_cert}));
-    try testing.expectError(error.NoSpaceLeft, encodeFinished(&short_out, &([_]u8{0} ** finished_verify_data_len)));
+    try testing.expectError(error.NoSpaceLeft, encodeFinished(&short_out, &(@as([finished_verify_data_len]u8, @splat(0)))));
     try testing.expectError(error.NoSpaceLeft, wrapHandshake(&short_out, client_hello_msg_type, &cert));
 }

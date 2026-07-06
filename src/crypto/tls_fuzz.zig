@@ -113,7 +113,7 @@ test "wire parsers never panic on structured length-prefixed noise" {
 test "x509.parse never panics on bit-flipped valid certificates" {
     // A real, structurally-valid cert mutated one byte at a time reaches parser
     // paths pure random never does (valid outer TLV, corrupt inner fields).
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7c} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x7c)));
     var der_buf: [1024]u8 = undefined;
     const base = try x509_selfsign.buildSelfSigned(&der_buf, .{
         .common_name = "fuzz.test",
@@ -281,7 +281,7 @@ fn oneSni(_: void, smith: *std.testing.Smith) anyerror!void {
 test "cov-fuzz: x509.parse never traps on arbitrary DER" {
     // Seed with a real self-signed certificate so the fuzzer starts from a
     // structurally-valid TLV tree and mutates inward.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3a} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x3a)));
     var der_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&der_buf, .{
         .common_name = "cov.fuzz.test",
@@ -317,7 +317,7 @@ test "cov-fuzz: ocsp.parse never traps on arbitrary DER" {
 test "cov-fuzz: tls12 handshake parsers never trap on arbitrary bytes" {
     // A minimal but structurally-valid ClientHello body (no handshake header:
     // `parseClientHello` consumes the body directly).
-    const ch_body = [_]u8{ 0x03, 0x03 } ++ [_]u8{0} ** 32 ++ // version + random
+    const ch_body = [_]u8{ 0x03, 0x03 } ++ @as([32]u8, @splat(0)) ++ // version + random
         [_]u8{0x00} ++ // session_id length
         [_]u8{ 0x00, 0x02, 0x00, 0x2f } ++ // cipher_suites: len + TLS_RSA_WITH_AES_128_CBC_SHA
         [_]u8{ 0x01, 0x00 } ++ // compression_methods: len + null
@@ -349,7 +349,7 @@ test "cov-fuzz: sni.extract never traps on arbitrary bytes" {
     // extension for "a" — the deepest reachable path in the SNI walker.
     const sni_ext_data = [_]u8{ 0x00, 0x04, 0x00, 0x00, 0x01, 'a' }; // list_len + name_type + name_len + name
     const sni_ext = [_]u8{ 0x00, 0x00, 0x00, @as(u8, @intCast(sni_ext_data.len)) } ++ sni_ext_data;
-    const ch_body = [_]u8{ 0x03, 0x03 } ++ [_]u8{0} ** 32 ++
+    const ch_body = [_]u8{ 0x03, 0x03 } ++ @as([32]u8, @splat(0)) ++
         [_]u8{0x00} ++ // session_id length
         [_]u8{ 0x00, 0x02, 0x00, 0x2f } ++ // cipher_suites
         [_]u8{ 0x01, 0x00 } ++ // compression_methods

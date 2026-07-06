@@ -58,7 +58,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
                     .key = key,
                     .value = value,
                     .height = height,
-                    .next = .{null} ** params.max_level,
+                    .next = @splat(null),
                 };
             }
         };
@@ -87,7 +87,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .heads = .{null} ** params.max_level,
+                .heads = @splat(null),
                 .active_levels = 1,
                 .count = 0,
             };
@@ -107,7 +107,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
                 self.allocator.destroy(node);
             }
 
-            self.heads = .{null} ** params.max_level;
+            self.heads = @splat(null);
             self.active_levels = 1;
             self.count = 0;
         }
@@ -127,7 +127,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
         /// Returns the previous value when `key` already existed, or null when
         /// a new owned node was inserted.
         pub fn insert(self: *Self, random: std.Random, key: u64, value: Value) Error!?Value {
-            var update: [params.max_level]?*Node = .{null} ** params.max_level;
+            var update: [params.max_level]?*Node = @splat(null);
             if (self.findUpdate(key, &update)) |node| {
                 const old = node.value;
                 node.value = value;
@@ -166,7 +166,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
 
         /// Remove `key` and return its value, or null when absent.
         pub fn remove(self: *Self, key: u64) ?Value {
-            var update: [params.max_level]?*Node = .{null} ** params.max_level;
+            var update: [params.max_level]?*Node = @splat(null);
             const node = self.findUpdate(key, &update) orelse return null;
 
             var level: usize = 0;
@@ -232,7 +232,7 @@ pub fn SkipList(comptime Value: type, comptime params: Params) type {
         }
 
         fn findNodeMut(self: *Self, key: u64) ?*Node {
-            var update: [params.max_level]?*Node = .{null} ** params.max_level;
+            var update: [params.max_level]?*Node = @splat(null);
             return self.findUpdate(key, &update);
         }
 

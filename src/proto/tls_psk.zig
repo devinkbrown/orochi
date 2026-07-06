@@ -360,7 +360,7 @@ test "buildClientPsk reports caller buffer and vector size errors" {
     const binders = [_][]const u8{&binder};
     var small_out: [11]u8 = undefined;
     var too_large_identity: [max_identity_len + 1]u8 = undefined;
-    const too_large_binder = [_]u8{0} ** (max_binder_len + 1);
+    const too_large_binder = @as([(max_binder_len + 1)]u8, @splat(0));
 
     // Act and assert.
     try testing.expectError(error.NoSpaceLeft, buildClientPsk(&small_out, &identity, &binders));
@@ -378,7 +378,7 @@ test "buildClientPsk reports aggregate identity and binder list overflow" {
     // Arrange.
     var large_identity: [max_identity_len - 5]u8 = undefined;
     const one_byte = [_]u8{0xaa};
-    const large_binder = [_]u8{0xbb} ** max_binder_len;
+    const large_binder = @as([max_binder_len]u8, @splat(0xbb));
     var many_binders: [257][]const u8 = undefined;
     for (&many_binders) |*slot| {
         slot.* = &large_binder;

@@ -136,7 +136,7 @@ pub const SortSpec = struct {
 
 pub const Query = struct {
     filter: Filter = .{},
-    sort: [max_sort_keys]SortSpec = [_]SortSpec{.{}} ** max_sort_keys,
+    sort: [max_sort_keys]SortSpec = @splat(.{}),
     sort_len: usize = 1,
 
     pub fn sortSpecs(self: *const Query) []const SortSpec {
@@ -574,7 +574,7 @@ test "parse rejects unknown and unbounded input" {
     try testing.expectError(error.UnknownSortKey, parseFilter("sort=nope"));
     try testing.expectError(error.InvalidNumber, parseFilter("limit=not-a-number"));
 
-    const long = "x" ** (max_filter_bytes + 1);
+    const long = &@as([(max_filter_bytes + 1)]u8, @splat('x'));
     try testing.expectError(error.FilterTooLong, parseFilter(long));
 }
 

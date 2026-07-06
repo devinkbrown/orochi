@@ -606,7 +606,7 @@ test "verifyAssertion: wrong rpIdHash rejected" {
     buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose_buf);
     const cpk = try parseCoseKey(&cose_buf);
 
-    const result = verifyAssertion(&auth_data, client_data_json, &[_]u8{0} ** 64, .{
+    const result = verifyAssertion(&auth_data, client_data_json, &@as([64]u8, @splat(0)), .{
         .rp_id = rp_id,
         .credential_public_key = cpk,
         .stored_sign_count = 0,
@@ -628,7 +628,7 @@ test "verifyAssertion: UP flag absent rejected" {
     buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose_buf);
     const cpk = try parseCoseKey(&cose_buf);
 
-    const result = verifyAssertion(&auth_data, client_data_json, &[_]u8{0} ** 64, .{
+    const result = verifyAssertion(&auth_data, client_data_json, &@as([64]u8, @splat(0)), .{
         .rp_id = rp_id,
         .credential_public_key = cpk,
         .stored_sign_count = 0,
@@ -650,7 +650,7 @@ test "verifyAssertion: counter regression rejected" {
     buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose_buf);
     const cpk = try parseCoseKey(&cose_buf);
 
-    const result = verifyAssertion(&auth_data, client_data_json, &[_]u8{0} ** 64, .{
+    const result = verifyAssertion(&auth_data, client_data_json, &@as([64]u8, @splat(0)), .{
         .rp_id = rp_id,
         .credential_public_key = cpk,
         .stored_sign_count = 5,
@@ -743,7 +743,7 @@ test "verifyAssertion: counter equal to stored rejected" {
     buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose_buf);
     const cpk = try parseCoseKey(&cose_buf);
 
-    const result = verifyAssertion(&auth_data, client_data_json, &[_]u8{0} ** 64, .{
+    const result = verifyAssertion(&auth_data, client_data_json, &@as([64]u8, @splat(0)), .{
         .rp_id = rp_id,
         .credential_public_key = cpk,
         .stored_sign_count = 7,

@@ -401,7 +401,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_limit: u32)
         const Self = @This();
         const RingSlot = Slot(max_payload);
 
-        ring: [window_limit]RingSlot = [_]RingSlot{.{}} ** window_limit,
+        ring: [window_limit]RingSlot = @splat(.{}),
         next_seq: u32 = 0,
         anchored: bool = false,
         /// Highest buffered sequence; bounds gap scanning in reportGaps.
@@ -413,7 +413,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_limit: u32)
         duplicate_count: u64 = 0,
         gap_count: u64 = 0,
         // Bitset: recovered[offset] = FEC has synthesised next_seq+offset.
-        recovered_bits: [window_limit / 8 + 1]u8 = [_]u8{0} ** (window_limit / 8 + 1),
+        recovered_bits: [window_limit / 8 + 1]u8 = @splat(0),
 
         pub fn init(cfg: ReassemblyConfig) Self {
             std.debug.assert(cfg.window > 0 and cfg.window <= window_limit);
@@ -782,7 +782,7 @@ test "decode trailing bytes rejected" {
 }
 
 test "native media MAC compute and verify accepts a tagged datagram" {
-    const key = [_]u8{0x42} ** 16;
+    const key = @as([16]u8, @splat(0x42));
     const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .kaguravox_audio, "voice");
 
     var frame_buf: [128]u8 = undefined;
@@ -798,7 +798,7 @@ test "native media MAC compute and verify accepts a tagged datagram" {
 }
 
 test "native media MAC rejects tampered payload and tag" {
-    const key = [_]u8{0x24} ** 16;
+    const key = @as([16]u8, @splat(0x24));
     const frame = testFrame(64, 0x0102_0304, 8, 123, false, .kaguravis_video, "video");
 
     var frame_buf: [128]u8 = undefined;
@@ -816,7 +816,7 @@ test "native media MAC rejects tampered payload and tag" {
 }
 
 test "native media MAC transition mode accepts untagged only when not required" {
-    const key = [_]u8{0x11} ** 16;
+    const key = @as([16]u8, @splat(0x11));
     const frame = testFrame(64, 9, 1, 2, false, .raw, "x");
 
     var frame_buf: [128]u8 = undefined;
@@ -831,7 +831,7 @@ test "native media MAC transition mode accepts untagged only when not required" 
 }
 
 test "native media MAC constant-time compare covers full tag" {
-    const a = [_]u8{0xA5} ** MAC_TAG_BYTES;
+    const a = @as([MAC_TAG_BYTES]u8, @splat(0xA5));
     var first_diff = a;
     var last_diff = a;
     first_diff[0] ^= 0x01;

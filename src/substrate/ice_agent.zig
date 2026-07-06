@@ -226,7 +226,7 @@ fn pairHigherPriority(_: void, a: CandidatePair, b: CandidatePair) bool {
 }
 
 fn ip4(a: u8, b: u8, c: u8, d: u8) [16]u8 {
-    var out: [16]u8 = .{0} ** 16;
+    var out: [16]u8 = @splat(0);
     out[0] = a;
     out[1] = b;
     out[2] = c;

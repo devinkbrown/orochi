@@ -259,7 +259,7 @@ fn zeroAfter(key: *Key, bit_index: u8) void {
 }
 
 fn keyFromByte(byte: u8) Key {
-    var key: Key = [_]u8{0} ** 32;
+    var key: Key = @splat(0);
     key[31] = byte;
     return key;
 }

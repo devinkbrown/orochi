@@ -536,12 +536,12 @@ const rsa_qinv = [_]u8{ 0xc4, 0xca, 0xe1, 0x78, 0x93, 0x8b, 0x60, 0x71, 0x7e, 0x
 // n = M521 = 2^521 - 1, e = d = n - 2. Since M521 is prime, exponent -1 is its
 // own inverse modulo n - 1, so sign/verify round-trips without external vectors.
 const m521_n = blk: {
-    var n: [66]u8 = [_]u8{0xff} ** 66;
+    var n: [66]u8 = @splat(0xff);
     n[0] = 0x01;
     break :blk n;
 };
 const m521_ed = blk: {
-    var ed: [66]u8 = [_]u8{0xff} ** 66;
+    var ed: [66]u8 = @splat(0xff);
     ed[0] = 0x01;
     ed[65] = 0xfd;
     break :blk ed;

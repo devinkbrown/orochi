@@ -411,7 +411,7 @@ pub const OroStore = struct {
     }
 };
 
-const family_count = @typeInfo(Family).@"enum".fields.len;
+const family_count = @typeInfo(Family).@"enum".field_names.len;
 const families = std.enums.values(Family);
 
 fn familyIndex(store_family: Family) usize {

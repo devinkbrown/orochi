@@ -47,8 +47,8 @@ pub const Action = enum(u8) {
 
     /// Parse a case-insensitive action token, or null if unknown.
     pub fn parse(raw: []const u8) ?Action {
-        inline for (@typeInfo(Action).@"enum".fields) |f| {
-            const a: Action = @enumFromInt(f.value);
+        inline for (@typeInfo(Action).@"enum".field_values) |f_value| {
+            const a: Action = @enumFromInt(f_value);
             if (std.ascii.eqlIgnoreCase(raw, a.token())) return a;
         }
         return null;
@@ -58,8 +58,8 @@ pub const Action = enum(u8) {
 /// Bitset value covering every action (the default subscription scope).
 pub const all_actions: u16 = blk: {
     var m: u16 = 0;
-    for (@typeInfo(Action).@"enum".fields) |f| {
-        const a: Action = @enumFromInt(f.value);
+    for (@typeInfo(Action).@"enum".field_values) |f_value| {
+        const a: Action = @enumFromInt(f_value);
         m |= a.bit();
     }
     break :blk m;
@@ -206,8 +206,8 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
 }
 
 test "action token round-trips and bits are distinct" {
-    inline for (@typeInfo(Action).@"enum".fields) |f| {
-        const a: Action = @enumFromInt(f.value);
+    inline for (@typeInfo(Action).@"enum".field_values) |f_value| {
+        const a: Action = @enumFromInt(f_value);
         try std.testing.expectEqual(a, Action.parse(a.token()).?);
     }
     try std.testing.expect(Action.connect.bit() != Action.quit.bit());

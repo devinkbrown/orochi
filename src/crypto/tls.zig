@@ -275,7 +275,7 @@ pub const AadMax = [13]u8;
 /// TLS 1.3 per-record nonce: static IV XOR (0x00000000 || seq_be64).
 pub fn nonce13(iv: Nonce96, seq: u64) Nonce96 {
     var nonce = iv;
-    var seq_bytes: Nonce96 = [_]u8{0} ** 12;
+    var seq_bytes: Nonce96 = @splat(0);
     std.mem.writeInt(u64, seq_bytes[4..12], seq, .big);
     xor12(&nonce, &seq_bytes);
     return nonce;
@@ -366,7 +366,7 @@ pub const RecordCipherState = struct {
                 .tls12 => nonce12(self.iv, sequence),
                 .tls10, .tls11 => return error.InvalidVersion,
             },
-            .aad = [_]u8{0} ** 13,
+            .aad = @as([13]u8, @splat(0)),
             .aad_len = 0,
         };
         params.aad_len = try self.makeAad(sequence, content_type, wire_version, length, &params.aad);
@@ -612,8 +612,8 @@ pub fn Tls13KeySchedule(comptime alg: hash.Alg) type {
         }
 
         pub fn earlySecret(psk: []const u8) SecretBytes {
-            const zero_salt = [_]u8{0} ** Hash.digest_len;
-            const zero_ikm = [_]u8{0} ** Hash.digest_len;
+            const zero_salt = @as([Hash.digest_len]u8, @splat(0));
+            const zero_ikm = @as([Hash.digest_len]u8, @splat(0));
             const ikm = if (psk.len == 0) zero_ikm[0..] else psk;
             return Hkdf.extractRaw(&zero_salt, ikm);
         }
@@ -641,7 +641,7 @@ pub fn Tls13KeySchedule(comptime alg: hash.Alg) type {
         pub fn masterSecret(handshake: *const SecretBytes) Tls13KeyScheduleError!SecretBytes {
             var derived = try deriveSecret(handshake, "derived", &emptyTranscriptHash());
             defer derived.wipe();
-            const zero_ikm = [_]u8{0} ** Hash.digest_len;
+            const zero_ikm = @as([Hash.digest_len]u8, @splat(0));
             return Hkdf.extractRaw(&derived.declassify(), &zero_ikm);
         }
 
@@ -673,8 +673,8 @@ pub fn Tls13KeySchedule(comptime alg: hash.Alg) type {
             var keys = TrafficKeys{
                 .suite = suite,
                 .key_len = info.key_len,
-                .key = [_]u8{0} ** 32,
-                .iv = [_]u8{0} ** 12,
+                .key = @as([32]u8, @splat(0)),
+                .iv = @as([12]u8, @splat(0)),
             };
             try Hkdf.expandLabel(traffic_secret, "key", "", keys.key[0..info.key_len]);
             try Hkdf.expandLabel(traffic_secret, "iv", "", &keys.iv);
@@ -793,7 +793,7 @@ test "record cipher state derives TLS 1.2 and 1.3 nonces without network IO" {
 
 test "TLS 1.2 record params keep AAD and nonce sequence aligned across round trips" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-    const key: [Aes128Gcm.key_length]u8 = [_]u8{0x42} ** Aes128Gcm.key_length;
+    const key: [Aes128Gcm.key_length]u8 = @splat(0x42);
     const iv = hex("202122232425262728292a2b");
     var sender = try RecordCipherState.init(.tls12, .tls_ecdhe_rsa_with_aes_128_gcm_sha256, iv);
     var receiver = try RecordCipherState.init(.tls12, .tls_ecdhe_rsa_with_aes_128_gcm_sha256, iv);
@@ -844,7 +844,7 @@ test "typed and runtime handshake transitions reject illegal order" {
 }
 
 test "TLS 1.3 key schedule SHA-256 known vector" {
-    const psk = [_]u8{0} ** 32;
+    const psk = @as([32]u8, @splat(0));
     const shared = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
     const th = Tls13Sha256.transcriptHash("clienthello|serverhello");
 
@@ -907,7 +907,7 @@ test "CertificateVerifier enforces chain signatures before the policy hook" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const StdEd25519 = std.crypto.sign.Ed25519;
 
-    const kp = try StdEd25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    const kp = try StdEd25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
     var root_buf: [512]u8 = undefined;
     const root = try x509_selfsign.buildSelfSigned(&root_buf, .{
         .common_name = "verifier.test.root",

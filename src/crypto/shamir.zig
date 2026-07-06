@@ -102,7 +102,7 @@ fn validateShares(shares: []const Share) !void {
     }
 
     const share_len = shares[0].y.len;
-    var seen = [_]bool{false} ** 256;
+    var seen = @as([256]bool, @splat(false));
 
     for (shares) |share| {
         if (share.x == 0) {

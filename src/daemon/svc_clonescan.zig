@@ -450,7 +450,7 @@ test "input validation rejects malformed connections and bad params" {
     };
     try testing.expectError(error.TooManyConnections, scan(testing.allocator, &two, .{ .max_connections = 1 }));
 
-    const long = "x" ** 300;
+    const long = &@as([300]u8, @splat('x'));
     const too_long = [_]Connection{mk(null, "1.2.3.4", "1.2.3.0/24", long)};
     try testing.expectError(error.FieldTooLong, scan(testing.allocator, &too_long, .{ .max_field_len = 256 }));
 }

@@ -57,8 +57,8 @@ const sender_bank = [_][]const u8{
 };
 
 const ModelEntry = struct {
-    hash: chathistory.ContentHash = [_]u8{0} ** 32,
-    msgid_buf: [max_msgid_bytes]u8 = [_]u8{0} ** max_msgid_bytes,
+    hash: chathistory.ContentHash = @splat(0),
+    msgid_buf: [max_msgid_bytes]u8 = @splat(0),
     msgid_len: usize = 0,
     timestamp: chathistory.Hlc = .{},
     content: []const u8 = "",
@@ -71,7 +71,7 @@ const ModelEntry = struct {
 
 const TargetModel = struct {
     entries: [max_entries_per_target]ModelEntry =
-        [_]ModelEntry{.{}} ** max_entries_per_target,
+        @as([max_entries_per_target]ModelEntry, @splat(.{})),
     start: usize = 0,
     len: usize = 0,
 
@@ -142,7 +142,7 @@ const TargetModel = struct {
 };
 
 const Model = struct {
-    targets: [max_targets]TargetModel = [_]TargetModel{.{}} ** max_targets,
+    targets: [max_targets]TargetModel = @splat(.{}),
 
     fn target(self: *Model, index: usize) *TargetModel {
         return &self.targets[index];
@@ -155,9 +155,9 @@ const Model = struct {
 
 const ExpectedRefs = struct {
     hashes: [max_targets * max_entries_per_target]chathistory.ContentHash =
-        [_]chathistory.ContentHash{[_]u8{0} ** 32} ** (max_targets * max_entries_per_target),
+        @as([(max_targets * max_entries_per_target)]chathistory.ContentHash, @splat(@as([32]u8, @splat(0)))),
     refs: [max_targets * max_entries_per_target]usize =
-        [_]usize{0} ** (max_targets * max_entries_per_target),
+        @as([(max_targets * max_entries_per_target)]usize, @splat(0)),
     len: usize = 0,
 
     fn add(self: *ExpectedRefs, hash: chathistory.ContentHash) void {

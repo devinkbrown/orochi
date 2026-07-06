@@ -40,7 +40,7 @@ pub fn Art(comptime V: type) type {
                 value: V = undefined,
                 count: u8 = 0,
                 keys: [cap]u8 = undefined,
-                children: [cap]?*Node = [_]?*Node{null} ** cap,
+                children: [cap]?*Node = @splat(null),
             };
         }
 
@@ -53,8 +53,8 @@ pub fn Art(comptime V: type) type {
             key: []u8 = &.{},
             value: V = undefined,
             count: u8 = 0,
-            index: [256]u8 = [_]u8{empty48} ** 256,
-            children: [48]?*Node = [_]?*Node{null} ** 48,
+            index: [256]u8 = @splat(empty48),
+            children: [48]?*Node = @splat(null),
         };
 
         const Node256 = struct {
@@ -63,7 +63,7 @@ pub fn Art(comptime V: type) type {
             key: []u8 = &.{},
             value: V = undefined,
             count: u16 = 0,
-            children: [256]?*Node = [_]?*Node{null} ** 256,
+            children: [256]?*Node = @splat(null),
         };
 
         const Node = union(enum) {

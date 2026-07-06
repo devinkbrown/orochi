@@ -558,7 +558,7 @@ test "Sig_structure bytes correct" {
 
 test "build and verify COSE_Sign1 EdDSA" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
     const cose = try encodeSign1Ed25519(allocator, "hello", "", kp);
     defer allocator.free(cose);
     try std.testing.expect(try verifySign1(allocator, cose, "", .{ .ed25519 = kp.public_key.toBytes() }));
@@ -566,7 +566,7 @@ test "build and verify COSE_Sign1 EdDSA" {
 
 test "COSE_Sign1 ES256 verifies" {
     const allocator = std.testing.allocator;
-    const kp = try Es256.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    const kp = try Es256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
     const sec1 = kp.public_key.toUncompressedSec1();
     const cose = try encodeSign1Es256(allocator, "p256 payload", "ctx", kp);
     defer allocator.free(cose);
@@ -577,7 +577,7 @@ test "COSE_Sign1 ES256 verifies" {
 
 test "tampered payload and protected header are rejected" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x24)));
     const cose = try encodeSign1Ed25519(allocator, "hello", "", kp);
     defer allocator.free(cose);
 
@@ -594,14 +594,14 @@ test "tampered payload and protected header are rejected" {
 
 test "COSE_Key parse for OKP Ed25519 and EC2 P-256" {
     const allocator = std.testing.allocator;
-    const ed = try Ed25519.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
+    const ed = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11)));
     var okp_list: std.ArrayList(u8) = .empty;
     defer okp_list.deinit(allocator);
     try appendCoseKeyOkp(&okp_list, allocator, ed.public_key.toBytes());
     const okp = try parseCoseKey(allocator, okp_list.items);
     try std.testing.expectEqualSlices(u8, &ed.public_key.toBytes(), &okp.ed25519);
 
-    const ec = try Es256.KeyPair.generateDeterministic([_]u8{0x12} ** 32);
+    const ec = try Es256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x12)));
     const sec1 = ec.public_key.toUncompressedSec1();
     var ec2_list: std.ArrayList(u8) = .empty;
     defer ec2_list.deinit(allocator);
@@ -613,7 +613,7 @@ test "COSE_Key parse for OKP Ed25519 and EC2 P-256" {
 
 test "CBOR round-trip for COSE structures" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x55} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x55)));
     const cose = try encodeSign1Ed25519(allocator, "round", "aad", kp);
     defer allocator.free(cose);
     var decoded = try Cbor.decode(allocator, cose);

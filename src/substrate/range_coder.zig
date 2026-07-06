@@ -252,8 +252,8 @@ test "empty stream produces deterministic final bytes" {
 }
 
 test "edge patterns round trip" {
-    const all_zero = [_]bool{false} ** 257;
-    const all_one = [_]bool{true} ** 257;
+    const all_zero = @as([257]bool, @splat(false));
+    const all_one = @as([257]bool, @splat(true));
     var alternating: [513]bool = undefined;
     for (&alternating, 0..) |*slot, i| slot.* = (i & 1) != 0;
 

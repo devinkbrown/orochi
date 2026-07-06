@@ -53,7 +53,7 @@ pub fn signature(
     items: []const u64,
     seed: u64,
 ) [k]u64 {
-    var sig: [k]u64 = [_]u64{std.math.maxInt(u64)} ** k;
+    var sig: [k]u64 = @splat(std.math.maxInt(u64));
 
     for (items) |item| {
         for (0..k) |i| {

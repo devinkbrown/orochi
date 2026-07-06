@@ -176,7 +176,7 @@ pub const OpenedPlaintext = struct {
 /// TLS 1.3 per-record nonce: static write_iv XOR (0x00000000 || seq_be64).
 pub fn deriveNonce(write_iv: Nonce96, seq: u64) Nonce96 {
     var nonce = write_iv;
-    var seq_bytes: Nonce96 = [_]u8{0} ** @sizeOf(Nonce96);
+    var seq_bytes: Nonce96 = @splat(0);
     std.mem.writeInt(u64, seq_bytes[4..12], seq, .big);
     for (&nonce, seq_bytes) |*dst, rhs| {
         dst.* ^= rhs;
@@ -344,7 +344,7 @@ test "seal/open round-trip" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const A = aead.Aead(.chacha20_poly1305);
-    var cipher = A.init([_]u8{0x42} ** A.key_length);
+    var cipher = A.init(@as([A.key_length]u8, @splat(0x42)));
     defer cipher.deinit();
 
     const iv = hex("000102030405060708090a0b");
@@ -386,7 +386,7 @@ test "tamper detection rejects modified ciphertext and tag" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const A = aead.Aead(.chacha20_poly1305);
-    var cipher = A.init([_]u8{0xA5} ** A.key_length);
+    var cipher = A.init(@as([A.key_length]u8, @splat(0xA5)));
     defer cipher.deinit();
 
     const iv = hex("101112131415161718191a1b");

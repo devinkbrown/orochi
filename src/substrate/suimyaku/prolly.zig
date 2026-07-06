@@ -525,7 +525,7 @@ fn destroyNodeMap(allocator: Allocator, map: *std.AutoHashMap(Hash, Node)) void 
 }
 
 fn testKey(n: u8) Key {
-    var out: Key = [_]u8{0} ** 32;
+    var out: Key = @splat(0);
     out[31] = n;
     return out;
 }

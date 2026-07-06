@@ -241,7 +241,7 @@ test "certFileLeafNotAfterUnix reads the leaf expiry from a PEM certificate file
     const allocator = std.testing.allocator;
     const expected_not_after: i64 = 1_735_689_599;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x88} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x88)));
     var der_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&der_buf, .{
         .common_name = "acme.test",

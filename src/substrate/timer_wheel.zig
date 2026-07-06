@@ -353,9 +353,7 @@ pub const TimerWheel = struct {
     }
 
     fn emptyBuckets() [Params.level_count][Params.slots_per_level]Bucket {
-        return [_][Params.slots_per_level]Bucket{
-            [_]Bucket{.{}} ** Params.slots_per_level,
-        } ** Params.level_count;
+        return @splat(@splat(.{}));
     }
 
     fn dueBefore(a: Node, b: Node) bool {
@@ -504,8 +502,8 @@ test "deterministic with a seeded sequence" {
     var right = try init(std.testing.allocator, 3);
     defer right.deinit();
 
-    var left_handles = [_]?TimerHandle{null} ** 32;
-    var right_handles = [_]?TimerHandle{null} ** 32;
+    var left_handles = @as([32]?TimerHandle, @splat(null));
+    var right_handles = @as([32]?TimerHandle, @splat(null));
     var prng = std.Random.Pcg.init(0x4d495a55434849);
 
     var now: u64 = 0;

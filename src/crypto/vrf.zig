@@ -162,7 +162,7 @@ fn updatePoint(st: *Sha512, p: Curve) void {
 }
 
 fn cToScalar(c: [Proof.challenge_length]u8) Scalar {
-    var out = [_]u8{0} ** 32;
+    var out = @as([32]u8, @splat(0));
     out[0..Proof.challenge_length].* = c;
     return out;
 }
@@ -194,7 +194,7 @@ test "prove then verify succeeds and yields beta" {
     const direct_beta = proofToHash(proof) orelse return error.ExpectedValidProof;
 
     try std.testing.expectEqualSlices(u8, direct_beta[0..], beta[0..]);
-    try std.testing.expect(!std.mem.eql(u8, beta[0..], (&([_]u8{0} ** Sha512.digest_length))[0..]));
+    try std.testing.expect(!std.mem.eql(u8, beta[0..], (&(@as([Sha512.digest_length]u8, @splat(0))))[0..]));
 }
 
 test "proof encoding round-trips" {

@@ -94,7 +94,7 @@ pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || err
 };
 
 comptime {
-    if (@typeInfo(ServiceError).error_set == null) @compileError("ServiceError must remain concrete");
+    if (@typeInfo(ServiceError).error_set.error_names == null) @compileError("ServiceError must remain concrete");
 }
 
 /// Optional integration hook for the daemon's SUIMYAKU state.
@@ -117,7 +117,7 @@ pub const StateHook = struct {
 
 pub fn InlineText(comptime max_len: usize) type {
     return struct {
-        bytes: [max_len]u8 = [_]u8{0} ** max_len,
+        bytes: [max_len]u8 = @splat(0),
         len: u16 = 0,
 
         pub fn init(input: []const u8) error{StringTooLong}!@This() {
@@ -3123,7 +3123,7 @@ test "account email verification persists across store reopen" {
 test "certfp binding persists across store reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const fp = "a" ** 64; // 64-hex placeholder fingerprint
+    const fp = &@as([64]u8, @splat('a')); // 64-hex placeholder fingerprint
 
     {
         var store = try openTestStore(tmp, "services-certfp.wal");
@@ -3146,7 +3146,7 @@ test "certfp binding persists across store reopen" {
         services.attachCertfpBinds(&binds);
         try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
         // An unknown fingerprint still returns null.
-        try std.testing.expect(services.accountForCertfp("b" ** 64) == null);
+        try std.testing.expect(services.accountForCertfp(&@as([64]u8, @splat('b'))) == null);
     }
 }
 
@@ -3357,21 +3357,21 @@ test "channel mlock access akick and ward replay from durable services" {
         try std.testing.expectEqual(AccessLevel.op, (try services.channelAccessLevelFor("#orochi", "bob")).?);
 
         const ReplayRecorder = struct {
-            channel: [channel_max]u8 = [_]u8{0} ** channel_max,
+            channel: [channel_max]u8 = @splat(0),
             channel_len: usize = 0,
-            mlock: [mlock_max]u8 = [_]u8{0} ** mlock_max,
+            mlock: [mlock_max]u8 = @splat(0),
             mlock_len: usize = 0,
-            akick_channel: [channel_max]u8 = [_]u8{0} ** channel_max,
+            akick_channel: [channel_max]u8 = @splat(0),
             akick_channel_len: usize = 0,
-            akick_mask: [mask_max]u8 = [_]u8{0} ** mask_max,
+            akick_mask: [mask_max]u8 = @splat(0),
             akick_mask_len: usize = 0,
-            akick_reason: [reason_max]u8 = [_]u8{0} ** reason_max,
+            akick_reason: [reason_max]u8 = @splat(0),
             akick_reason_len: usize = 0,
-            ward_match: [16]u8 = [_]u8{0} ** 16,
+            ward_match: [16]u8 = @splat(0),
             ward_match_len: usize = 0,
-            ward_pattern: [mask_max]u8 = [_]u8{0} ** mask_max,
+            ward_pattern: [mask_max]u8 = @splat(0),
             ward_pattern_len: usize = 0,
-            ward_reason: [reason_max]u8 = [_]u8{0} ** reason_max,
+            ward_reason: [reason_max]u8 = @splat(0),
             ward_reason_len: usize = 0,
 
             fn copyInto(dst: []u8, len: *usize, value: []const u8) ServiceError!void {
@@ -3450,14 +3450,14 @@ test "SACCESS entries persist across a WAL reopen and replay" {
 
         const Recorder = struct {
             count: usize = 0,
-            deny_mask: [256]u8 = [_]u8{0} ** 256,
+            deny_mask: [256]u8 = @splat(0),
             deny_mask_len: usize = 0,
             deny_duration: u64 = 0,
-            deny_reason: [512]u8 = [_]u8{0} ** 512,
+            deny_reason: [512]u8 = @splat(0),
             deny_reason_len: usize = 0,
             saw_grant: bool = false,
             saw_gag: bool = false,
-            gag_reason: [512]u8 = [_]u8{0} ** 512,
+            gag_reason: [512]u8 = @splat(0),
             gag_reason_len: usize = 0,
             saw_temp: bool = false,
 

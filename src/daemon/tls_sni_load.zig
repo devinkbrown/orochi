@@ -166,13 +166,13 @@ fn stubLoader(allocator: std.mem.Allocator, io: std.Io, opts: tls_certs.Options)
     @memset(der, 0xAB);
     const chain = try allocator.alloc([]const u8, 1);
     chain[0] = der;
-    const key_pair = Ed25519.KeyPair.generateDeterministic([_]u8{0x7A} ** Ed25519.KeyPair.seed_length) catch unreachable;
+    const key_pair = Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7A))) catch unreachable;
     return .{ .cert_chain = chain, .key_kind = .ed25519, .signing_key = key_pair };
 }
 
 /// Mint a deterministic Ed25519 self-signed leaf DER for `cn`, seeded by `seed`.
 fn mintLeafDer(out: *[768]u8, cn: []const u8, seed: u8) ![]const u8 {
-    const key_pair = try Ed25519.KeyPair.generateDeterministic([_]u8{seed} ** Ed25519.KeyPair.seed_length);
+    const key_pair = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
     return x509_selfsign.buildSelfSigned(out, .{
         .common_name = cn,
         .not_before = 1_704_067_200,
@@ -185,7 +185,7 @@ fn mintLeafDer(out: *[768]u8, cn: []const u8, seed: u8) ![]const u8 {
 /// Encode a deterministic Ed25519 PKCS#8 private key PEM into `out`.
 fn mintKeyPem(out: *[4096]u8, seed: u8) ![]const u8 {
     var key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
-    const key_der = try ed25519_pkcs8.encode(&key_der_buf, [_]u8{seed} ** Ed25519.KeyPair.seed_length);
+    const key_der = try ed25519_pkcs8.encode(&key_der_buf, @as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
     return pem.encode(out, key_pem_label, key_der);
 }
 

@@ -46,8 +46,8 @@ pub const Match = enum {
     }
 
     pub fn parse(raw: []const u8) ?Match {
-        inline for (@typeInfo(Match).@"enum".fields) |f| {
-            const m: Match = @enumFromInt(f.value);
+        inline for (@typeInfo(Match).@"enum".field_values) |f_value| {
+            const m: Match = @enumFromInt(f_value);
             if (std.ascii.eqlIgnoreCase(raw, m.token())) return m;
         }
         return null;
@@ -90,8 +90,8 @@ pub const Action = enum {
     }
 
     pub fn parse(raw: []const u8) ?Action {
-        inline for (@typeInfo(Action).@"enum".fields) |f| {
-            const a: Action = @enumFromInt(f.value);
+        inline for (@typeInfo(Action).@"enum".field_values) |f_value| {
+            const a: Action = @enumFromInt(f_value);
             if (std.ascii.eqlIgnoreCase(raw, a.token())) return a;
         }
         return null;
@@ -376,8 +376,8 @@ fn takeStr(buf: []const u8, off: *usize) WireError![]const u8 {
 }
 
 fn enumFromByte(comptime E: type, raw: u8) WireError!E {
-    inline for (@typeInfo(E).@"enum".fields) |f| {
-        if (f.value == raw) return @enumFromInt(f.value);
+    inline for (@typeInfo(E).@"enum".field_values) |f_value| {
+        if (f_value == raw) return @enumFromInt(f_value);
     }
     return error.BadField;
 }
@@ -503,8 +503,8 @@ fn mkWard(match: Match, pattern: []const u8, action: Action) Ward {
 }
 
 test "axis tokens parse round-trip" {
-    inline for (@typeInfo(Match).@"enum".fields) |f| {
-        const m: Match = @enumFromInt(f.value);
+    inline for (@typeInfo(Match).@"enum".field_values) |f_value| {
+        const m: Match = @enumFromInt(f_value);
         try std.testing.expectEqual(m, Match.parse(m.token()).?);
     }
     try std.testing.expectEqual(Scope.mesh, Scope.parse("MESH").?);

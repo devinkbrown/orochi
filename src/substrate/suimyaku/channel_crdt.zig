@@ -48,7 +48,7 @@ pub const KeyMode = struct {
     pub const Error = error{KeyTooLong};
 
     present: bool = false,
-    bytes: [max_len]u8 = [_]u8{0} ** max_len,
+    bytes: [max_len]u8 = @splat(0),
     len: u8 = 0,
 
     pub fn init(key: []const u8) Error!KeyMode {

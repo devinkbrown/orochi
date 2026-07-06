@@ -53,7 +53,7 @@ fn aesCmXor(key: [16]u8, iv: [16]u8, buf: []u8) void {
 /// Derive one keystream output for KDF label `label` (RFC 3711 §4.3.1, with
 /// key-derivation rate 0 so the packet index does not enter the key id).
 fn deriveOne(master_key: [16]u8, master_salt: [master_salt_len]u8, label: u8, out: []u8) void {
-    var iv = [_]u8{0} ** 16;
+    var iv = @as([16]u8, @splat(0));
     @memcpy(iv[0..master_salt_len], &master_salt);
     iv[7] ^= label; // key_id = label || index(=0); aligns to salt byte 7
     @memset(out, 0);
@@ -72,7 +72,7 @@ pub fn deriveSessionKeys(master_key: [master_key_len]u8, master_salt: [master_sa
 /// Build the AES-CM IV for an RTP packet (RFC 3711 §4.1.1):
 /// IV = (salt << 16) XOR (SSRC << 64) XOR (index << 16), index = ROC*2^16 + SEQ.
 fn srtpIv(salt: [session_salt_len]u8, ssrc: u32, index: u64) [16]u8 {
-    var iv = [_]u8{0} ** 16;
+    var iv = @as([16]u8, @splat(0));
     @memcpy(iv[0..session_salt_len], &salt);
     var ssrc_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &ssrc_be, ssrc, .big);

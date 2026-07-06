@@ -126,10 +126,10 @@ const testing = std.testing;
 const Harness = struct {
     /// Incremented by the worker on each loop iteration until `run` clears.
     counters: [shard.max_shards]std.atomic.Value(u64) =
-        [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** shard.max_shards,
+        @splat(std.atomic.Value(u64).init(0)),
     /// Set once when shard `i` first runs; a second set is a duplicate index.
     seen: [shard.max_shards]std.atomic.Value(u32) =
-        [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** shard.max_shards,
+        @splat(std.atomic.Value(u32).init(0)),
     /// Counts any duplicate shard index observed across all workers.
     duplicate_index: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 

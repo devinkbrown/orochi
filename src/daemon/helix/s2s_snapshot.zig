@@ -53,7 +53,7 @@ pub const Snapshot = struct {
     role: u8 = 0,
     s2s_initiator: bool = false,
     /// Serialized `hs.Established` (record keys + base nonces + peer identity).
-    established: [est_len]u8 = [_]u8{0} ** est_len,
+    established: [est_len]u8 = @splat(0),
     send_counter: u64 = 0,
     recv_counter: u64 = 0,
     feed_seq: u64 = 0,
@@ -208,7 +208,7 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
         .remote_epoch_ms = 2000,
         .caps = cap_signing | cap_oper_info,
         .remote_name = "ircx.us",
-        .connect_addr = "\x0a" ** 28,
+        .connect_addr = &@as([28]u8, @splat('\x0a')),
         .rec_inbuf = "\x04\x00\x00\x00partial",
         .pending_out = "sealed-record-bytes",
     };
@@ -233,7 +233,7 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEF00D), got.remote_node_id);
     try testing.expectEqual(cap_signing | cap_oper_info, got.caps);
     try testing.expectEqualStrings("ircx.us", got.remote_name);
-    try testing.expectEqualStrings("\x0a" ** 28, got.connect_addr);
+    try testing.expectEqualStrings(&@as([28]u8, @splat('\x0a')), got.connect_addr);
     try testing.expectEqualStrings("\x04\x00\x00\x00partial", got.rec_inbuf);
     try testing.expectEqualStrings("sealed-record-bytes", got.pending_out);
 }

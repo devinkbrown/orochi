@@ -45,9 +45,9 @@ pub const LineView = struct {
     tags_raw: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
     command: []const u8,
-    params: [MAXPARA][]const u8 = [_][]const u8{""} ** MAXPARA,
+    params: [MAXPARA][]const u8 = @splat(""),
     param_count: usize = 0,
-    tags: [MAXTAGS]TagView = [_]TagView{.{ .key = "", .value_raw = null }} ** MAXTAGS,
+    tags: [MAXTAGS]TagView = @splat(.{ .key = "", .value_raw = null }),
     tag_count: usize = 0,
     trailing: ?[]const u8 = null,
 
@@ -312,6 +312,6 @@ test "rejects too many tags" {
 }
 
 test "rejects oversize line bodies" {
-    const big = "A" ** (MAX_LINE_BODY + 1);
+    const big = &@as([(MAX_LINE_BODY + 1)]u8, @splat('A'));
     try std.testing.expectError(error.OversizeLine, parseLine(big));
 }

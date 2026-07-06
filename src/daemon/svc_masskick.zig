@@ -652,7 +652,7 @@ test "parser enforces allowlist and reason bounds" {
     try testing.expectError(error.InvalidAccount, parseClearUsers("CLEAR #x USERS ALLOW bad:acct", allow[0..]));
     try testing.expectError(error.InvalidReason, parseClearUsers("CLEAR #x USERS :\r\n", allow[0..]));
 
-    const long_reason = "x" ** 181;
+    const long_reason = &@as([181]u8, @splat('x'));
     const line = "CLEAR #x USERS :" ++ long_reason;
     try testing.expectError(error.ReasonTooLong, parseClearUsers(line, allow[0..]));
 }

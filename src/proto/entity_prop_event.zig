@@ -447,7 +447,7 @@ test "entity prop codec rejects a bad entity kind byte" {
 }
 
 test "entity prop codec rejects oversized fields" {
-    const big = "x" ** (max_value_len + 1);
+    const big = &@as([(max_value_len + 1)]u8, @splat('x'));
     const ev = EntityPropEvent{ .present = true, .kind = .user, .origin_node = 7, .hlc = 1, .entity = "u", .key = "K", .value = big, .owner = "o" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }
@@ -457,7 +457,7 @@ test "entity prop codec rejects oversized fields" {
 // ---------------------------------------------------------------------------
 
 fn propTestKeyPair(seed_byte: u8) !sign.KeyPair {
-    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+    return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
 }
 
 /// Build a prop fact whose `origin_node` is the self-certified short id of `kp`,
@@ -638,7 +638,7 @@ test "entity prop signature does NOT validate under the channel-prop domain" {
 }
 
 test "entity prop encode rejects a half-present signature pair" {
-    var pk = [_]u8{0xAB} ** pubkey_len;
+    var pk = @as([pubkey_len]u8, @splat(0xAB));
     const ev = EntityPropEvent{
         .present = true,
         .kind = .user,

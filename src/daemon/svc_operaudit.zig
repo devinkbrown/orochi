@@ -92,7 +92,7 @@ pub const OperAudit = struct {
     pub fn init(allocator: std.mem.Allocator) OperAudit {
         return .{
             .allocator = allocator,
-            .slots = [_]?Entry{null} ** cap,
+            .slots = @as([cap]?Entry, @splat(null)),
             .start = 0,
             .count = 0,
             .next_seq = 1,

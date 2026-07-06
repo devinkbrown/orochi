@@ -73,7 +73,7 @@ const NewsEntry = struct {
     key_len: usize = 0,
     // Headlines packed back-to-back; `lens` gives each length.
     text: [max_headline * max_headlines]u8 = undefined,
-    lens: [max_headlines]u16 = [_]u16{0} ** max_headlines,
+    lens: [max_headlines]u16 = @splat(0),
     count: usize = 0,
     fetched_ms: i64 = 0,
 
@@ -108,8 +108,8 @@ pub const Service = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    weather: [weather_slots]WeatherEntry = .{WeatherEntry{}} ** weather_slots,
-    news: [news_slots]NewsEntry = .{NewsEntry{}} ** news_slots,
+    weather: [weather_slots]WeatherEntry = @splat(WeatherEntry{}),
+    news: [news_slots]NewsEntry = @splat(NewsEntry{}),
     jobs: [job_capacity]Job = undefined,
     job_head: usize = 0,
     job_tail: usize = 0,
@@ -346,7 +346,7 @@ pub const Service = struct {
         var name_buf: [max_key]u8 = undefined;
         const fname = fileKey(k, &name_buf);
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.txt", .{ self.opts.news_cache_dir, fname }) catch return;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.txt", .{ self.opts.news_cache_dir, fname }, 0) catch return;
 
         var file_buf: [16 * 1024]u8 = undefined;
         const contents = readFileZ(path, &file_buf) orelse return;

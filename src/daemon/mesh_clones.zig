@@ -237,14 +237,14 @@ test "counts codec rejects malformed input" {
 }
 
 test "hashIp is stable and IP-distinct under a shared key" {
-    const key = [_]u8{0x5a} ** 16;
+    const key = @as([16]u8, @splat(0x5a));
     const a = hashIp(key, &[_]u8{ 192, 0, 2, 1 });
     const b = hashIp(key, &[_]u8{ 192, 0, 2, 1 });
     const c = hashIp(key, &[_]u8{ 192, 0, 2, 2 });
     try std.testing.expectEqual(a, b); // same IP, same key -> same hash
     try std.testing.expect(a != c); // different IP -> (almost surely) different hash
     // A different key yields a different hash for the same IP (salting works).
-    const key2 = [_]u8{0x17} ** 16;
+    const key2 = @as([16]u8, @splat(0x17));
     try std.testing.expect(hashIp(key2, &[_]u8{ 192, 0, 2, 1 }) != a);
 }
 

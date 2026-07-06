@@ -138,7 +138,7 @@ pub fn HistoryStore(
     };
 
     const MessageEntry = struct {
-        hash: ContentHash = [_]u8{0} ** Blake3.digest_length,
+        hash: ContentHash = @splat(0),
         msgid: Msgid = Msgid.empty(),
         sender: SenderName = SenderName.empty(),
         timestamp: Hlc = .{},
@@ -149,7 +149,7 @@ pub fn HistoryStore(
         const Self = @This();
 
         entries: [max_entries_per_target]MessageEntry =
-            [_]MessageEntry{.{}} ** max_entries_per_target,
+            @as([max_entries_per_target]MessageEntry, @splat(.{})),
         start: usize = 0,
         len: usize = 0,
 
@@ -521,7 +521,7 @@ fn FixedBytes(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        bytes: [capacity]u8 = @splat(0),
         len: usize = 0,
 
         fn empty() Self {

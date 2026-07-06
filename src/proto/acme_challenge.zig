@@ -272,7 +272,7 @@ test "validateToken rejects illegal characters" {
 
 test "validateToken rejects an over-long token" {
     // Arrange
-    const token = "a" ** (default_max_token_len + 1);
+    const token = &@as([(default_max_token_len + 1)]u8, @splat('a'));
 
     // Act / Assert
     try testing.expect(!validateToken(token));

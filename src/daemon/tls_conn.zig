@@ -597,7 +597,7 @@ fn makeLeaf(out: []u8, kp: Ed25519.KeyPair) ![]const u8 {
 test "onInbound drives a full handshake against tls_client and streams app data both ways" {
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -646,7 +646,7 @@ test "buildKtlsTxCryptoInfo produces a kernel-shaped TLS 1.3 crypto_info post-ha
     const alloc = std.testing.allocator;
     const native = @import("builtin").cpu.arch.endian();
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -691,7 +691,7 @@ test "kTLS TX offload: the kernel encrypts server writes and tls_client decrypts
 
     // In-memory TLS 1.3 handshake → a connected TlsConn whose keys the client
     // shares (so the client can decrypt whatever the kernel produces from them).
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
     var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
@@ -758,7 +758,7 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     // In-memory TLS 1.3 handshake → a connected TlsConn whose keys the client
     // shares (so records the client encrypts, the kernel — using our RX
     // crypto_info from the same keys — can decrypt).
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
     var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
@@ -905,10 +905,10 @@ test "classifyKtlsRecord maps TLS content types to recv-loop actions" {
 test "shared ticket key and replay guard resume across TlsConn instances" {
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x68} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x68)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
-    const ticket_key = [_]u8{0x24} ** @sizeOf(tls_resumption.TicketKey);
+    const ticket_key = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0x24));
     var guard = tls_resumption.ReplayGuard{};
 
     var conn1 = try TlsConn.init(alloc, .{
@@ -999,7 +999,7 @@ test "shared ticket key and replay guard resume across TlsConn instances" {
 test "exportResume/resumeFrom carries a live TLS 1.3 conn, including a buffered partial record" {
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x71)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
     const cfg13 = tls_server.Config{ .cert_chain = &.{der}, .signing_key = kp };
@@ -1065,7 +1065,7 @@ test "exportResume/resumeFrom carries a live TLS 1.3 conn, including a buffered 
 
 test "resumeFrom rejects a TLS 1.2 engine state when no 1.2 config is supplied" {
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x72} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x72)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
     const st = TlsConn.ResumeState{ .engine = .{ .tls12 = .{
@@ -1083,7 +1083,7 @@ test "resumeFrom rejects a TLS 1.2 engine state when no 1.2 config is supplied" 
 test "onInbound reassembles a handshake record split across two calls" {
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -1127,7 +1127,7 @@ test "onInbound reassembles a handshake record split across two calls" {
 test "write splits plaintext larger than the record limit into multiple records" {
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -1173,7 +1173,7 @@ test "write splits plaintext larger than the record limit into multiple records"
 
 test "write before handshakeDone is rejected" {
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -1187,7 +1187,7 @@ const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 
 test "version-dispatch: a TLS 1.3 client completes through a dual TlsConn" {
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp);
 
@@ -1238,7 +1238,7 @@ test "version-dispatch: a TLS 1.3 client completes through a dual TlsConn" {
 
 test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x55} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x55)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp); // 1.3 leg (unused here)
 
@@ -1294,7 +1294,7 @@ test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
 
 test "TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)" {
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x57} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x57)));
     var cert_buf: [1024]u8 = undefined;
     const der = try makeLeaf(&cert_buf, kp); // 1.3 leg (unused here)
 
@@ -1310,7 +1310,7 @@ test "TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)" {
         .is_ca = true,
     });
 
-    const ticket_key = [_]u8{0x42} ** @sizeOf(tls_resumption.TicketKey);
+    const ticket_key = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0x42));
     var guard = tls_resumption.ReplayGuard{};
     const cfg13 = tls_server.Config{ .cert_chain = &.{der}, .signing_key = kp };
     const cfg12 = tls12_server.Config{

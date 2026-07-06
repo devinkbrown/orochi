@@ -31,11 +31,11 @@ const Pair = struct {
 };
 
 fn fixedRoot(byte: u8) [key_len]u8 {
-    return [_]u8{byte} ** key_len;
+    return @as([key_len]u8, @splat(byte));
 }
 
 fn fixedNonceBase(byte: u8) [nonce_base_len]u8 {
-    return [_]u8{byte} ** nonce_base_len;
+    return @as([nonce_base_len]u8, @splat(byte));
 }
 
 fn testOuterHeader() [outer_header_len]u8 {

@@ -162,7 +162,7 @@ pub const transport_error_internal: u64 = 0x01;
 /// never imports the socket layer. Path migration is keyed entirely on this
 /// value: two datagrams from the same `PathAddress` are on the same path.
 pub const PathAddress = struct {
-    ip: [16]u8 = [_]u8{0} ** 16,
+    ip: [16]u8 = @splat(0),
     ip_len: u8 = 0,
     port: u16 = 0,
 
@@ -202,7 +202,7 @@ const PathValidation = struct {
     candidate: PathAddress = .{},
     /// The 8 unpredictable challenge bytes we sent to `candidate`. A
     /// PATH_RESPONSE from `candidate` echoing these exact bytes validates it.
-    challenge: [8]u8 = [_]u8{0} ** 8,
+    challenge: [8]u8 = @splat(0),
     /// Whether `challenge` still needs to go on the wire to the candidate path.
     challenge_pending: bool = false,
     /// Anti-amplification budget for the candidate path (RFC 9000 §9.3.1): a
@@ -462,12 +462,12 @@ const KeyUpdate = struct {
     suite: quic_protect.CipherSuite = .aes128gcm,
 
     /// Current generation traffic secrets (write = ours, read = peer's).
-    write_secret: [32]u8 = [_]u8{0} ** 32,
-    read_secret: [32]u8 = [_]u8{0} ** 32,
+    write_secret: [32]u8 = @splat(0),
+    read_secret: [32]u8 = @splat(0),
 
     /// Pre-computed next-generation read keys + their secret (peer-update trial).
     next_read: PacketKeys = undefined,
-    next_read_secret: [32]u8 = [_]u8{0} ** 32,
+    next_read_secret: [32]u8 = @splat(0),
 
     /// Retained previous-generation read keys for reordered packets (§6.4), valid
     /// until `prev_read_until_ns`.
@@ -2800,7 +2800,7 @@ const Loopback = struct {
     fn init(alloc: Allocator) !*Loopback {
         const lb = try alloc.create(Loopback);
         errdefer alloc.destroy(lb);
-        lb.kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+        lb.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
         lb.cert = try mintCert(&lb.cert_buf, lb.kp);
         lb.cert_chain = .{lb.cert};
 
@@ -2810,8 +2810,8 @@ const Loopback = struct {
             .alpn_protocols = &test_alpn,
             .transport_params = test_server_params,
             .local_cid = &test_server_cid,
-            .x25519_seed = [_]u8{0x21} ** 32,
-            .server_random = [_]u8{0x55} ** 32,
+            .x25519_seed = @as([32]u8, @splat(0x21)),
+            .server_random = @as([32]u8, @splat(0x55)),
         });
         errdefer lb.server.deinit();
 
@@ -2820,8 +2820,8 @@ const Loopback = struct {
             .transport_params = test_client_params,
             .local_cid = &test_client_cid,
             .initial_dcid = &test_initial_dcid,
-            .x25519_seed = [_]u8{0x42} ** 32,
-            .client_random = [_]u8{0x11} ** 32,
+            .x25519_seed = @as([32]u8, @splat(0x42)),
+            .client_random = @as([32]u8, @splat(0x11)),
         });
         return lb;
     }
@@ -3814,7 +3814,7 @@ test "quic migration — a PATH_RESPONSE with the wrong bytes or from the wrong 
 
     // A PATH_RESPONSE echoing the WRONG bytes must not validate.
     lb.server.recv_src = addr_b;
-    lb.server.onPathResponse([_]u8{0xff} ** 8, now);
+    lb.server.onPathResponse(@as([8]u8, @splat(0xff)), now);
     lb.server.recv_src = null;
     try testing.expect(lb.server.isValidatingPath());
     try testing.expect(lb.server.currentPath().eql(addr_a));

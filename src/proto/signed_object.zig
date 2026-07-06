@@ -69,7 +69,7 @@ pub fn decodeValue(allocator: std.mem.Allocator, obj: SignedObject) !Value {
 const testing = std.testing;
 
 fn key(seed: u8) !KeyPair {
-    return KeyPair.generateDeterministic([_]u8{seed} ** Ed25519.KeyPair.seed_length);
+    return KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
 }
 
 test "sign/verify round-trip and signer pinning" {

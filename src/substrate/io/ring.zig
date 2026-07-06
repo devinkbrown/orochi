@@ -182,8 +182,8 @@ pub fn encodeUserData(kind: OpKind, token: FdToken) error{TokenOutOfRange}!u64 {
 /// defined enum values. `std.meta.intToEnum` does not exist in Zig 0.16, so we
 /// roll a comptime-checked converter. Pure.
 fn opKindFromInt(raw: u8) error{UnknownOpKind}!OpKind {
-    inline for (@typeInfo(OpKind).@"enum".fields) |f| {
-        if (raw == f.value) return @enumFromInt(f.value);
+    inline for (@typeInfo(OpKind).@"enum".field_values) |f_value| {
+        if (raw == f_value) return @enumFromInt(f_value);
     }
     return error.UnknownOpKind;
 }

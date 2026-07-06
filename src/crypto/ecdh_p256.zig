@@ -125,7 +125,7 @@ pub fn generate() EcdhError!KeyPair {
 pub fn generateDeterministic(seed: [scalar_length]u8) EcdhError!KeyPair {
     // Reduce the seed modulo the curve order to obtain a canonical scalar.
     // reduce48 expects 48 bytes; left-pad the 32-byte seed with zeros.
-    var wide: [48]u8 = [_]u8{0} ** 48;
+    var wide: [48]u8 = @splat(0);
     wide[16..48].* = seed;
     const secret = scalar.reduce48(wide, .big);
 
@@ -182,7 +182,7 @@ test "two key pairs derive the same shared secret" {
 
 test "deterministic key generation is reproducible" {
     // Arrange: a fixed seed.
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(0x42));
 
     // Act: derive the key pair twice.
     const kp1 = try generateDeterministic(seed);
@@ -195,8 +195,8 @@ test "deterministic key generation is reproducible" {
 
 test "deterministic key pairs still perform valid ECDH" {
     // Arrange: two distinct deterministic key pairs.
-    const a = try generateDeterministic([_]u8{0x01} ** 32);
-    const b = try generateDeterministic([_]u8{0x02} ** 32);
+    const a = try generateDeterministic(@as([32]u8, @splat(0x01)));
+    const b = try generateDeterministic(@as([32]u8, @splat(0x02)));
 
     // Act
     const ab = try sharedSecret(a.secret, b.public_sec1);
@@ -220,7 +220,7 @@ test "generated public key is uncompressed SEC1 form" {
 
 test "parsePoint rejects an invalid prefix byte" {
     // Arrange: a valid point with the prefix corrupted to a compressed tag.
-    const kp = try generateDeterministic([_]u8{0x07} ** 32);
+    const kp = try generateDeterministic(@as([32]u8, @splat(0x07)));
     var bad = kp.public_sec1;
     bad[0] = 0x02;
 
@@ -231,7 +231,7 @@ test "parsePoint rejects an invalid prefix byte" {
 test "parsePoint rejects an off-curve point" {
     // Arrange: keep a valid prefix and X but flip a byte in Y so the point is
     // no longer on the curve.
-    const kp = try generateDeterministic([_]u8{0x09} ** 32);
+    const kp = try generateDeterministic(@as([32]u8, @splat(0x09)));
     var bad = kp.public_sec1;
     bad[64] ^= 0x01;
 
@@ -242,7 +242,7 @@ test "parsePoint rejects an off-curve point" {
 test "parsePoint rejects the identity element" {
     // Arrange: all-zero body with valid uncompressed prefix is not a valid
     // affine point and must be rejected.
-    var sec1 = [_]u8{0} ** public_length;
+    var sec1 = @as([public_length]u8, @splat(0));
     sec1[0] = sec1_uncompressed_prefix;
 
     // Act + Assert
@@ -252,7 +252,7 @@ test "parsePoint rejects the identity element" {
 
 test "parsePoint accepts a well-formed point" {
     // Arrange
-    const kp = try generateDeterministic([_]u8{0x11} ** 32);
+    const kp = try generateDeterministic(@as([32]u8, @splat(0x11)));
 
     // Act
     const point = try parsePoint(kp.public_sec1);
@@ -264,8 +264,8 @@ test "parsePoint accepts a well-formed point" {
 
 test "shared secret is the 32-byte X coordinate of the product point" {
     // Arrange: two deterministic key pairs.
-    const a = try generateDeterministic([_]u8{0x21} ** 32);
-    const b = try generateDeterministic([_]u8{0x22} ** 32);
+    const a = try generateDeterministic(@as([32]u8, @splat(0x21)));
+    const b = try generateDeterministic(@as([32]u8, @splat(0x22)));
 
     // Act: compute via the API, and independently via the raw point math.
     const secret = try sharedSecret(a.secret, b.public_sec1);
@@ -281,8 +281,8 @@ test "shared secret is the 32-byte X coordinate of the product point" {
 
 test "sharedSecret rejects a zero scalar" {
     // Arrange
-    const kp = try generateDeterministic([_]u8{0x31} ** 32);
-    const zero_secret = [_]u8{0} ** scalar_length;
+    const kp = try generateDeterministic(@as([32]u8, @splat(0x31)));
+    const zero_secret = @as([scalar_length]u8, @splat(0));
 
     // Act + Assert
     try testing.expectError(error.InvalidPrivateKey, sharedSecret(zero_secret, kp.public_sec1));

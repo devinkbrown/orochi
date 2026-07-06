@@ -27,8 +27,8 @@ pub const TraceId = [16]u8;
 pub const SpanId = [8]u8;
 
 /// Convenience zero values used for "no parent".
-pub const null_span_id: SpanId = [_]u8{0} ** 8;
-pub const null_trace_id: TraceId = [_]u8{0} ** 16;
+pub const null_span_id: SpanId = @splat(0);
+pub const null_trace_id: TraceId = @splat(0);
 
 // ---------------------------------------------------------------------------
 // Attribute value
@@ -517,10 +517,10 @@ test "NDJSON export golden compare — single span" {
     defer tracer.deinit();
 
     // Deterministic IDs
-    var tid: TraceId = [_]u8{0} ** 16;
+    var tid: TraceId = @splat(0);
     tid[0] = 0xDE;
     tid[1] = 0xAD;
-    var sid: SpanId = [_]u8{0} ** 8;
+    var sid: SpanId = @splat(0);
     sid[0] = 0xBE;
     sid[1] = 0xEF;
 

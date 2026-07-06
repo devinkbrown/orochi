@@ -72,7 +72,7 @@ pub const NativeMediaTransport = struct {
     /// clients that do not append the MAC tag are still accepted.
     require_mac: bool = false,
     /// Existing stream-id PRF root, copied from LinuxServer.native_stream_key.
-    mac_stream_key: [16]u8 = [_]u8{0} ** 16,
+    mac_stream_key: [16]u8 = @splat(0),
     mac_key_configured: bool = false,
     /// Optional cross-leg sink: after forwarding a native frame to native peers,
     /// the pump hands it here to also reach the channel's WebRTC members
@@ -427,7 +427,7 @@ test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the
 test "NativeMediaTransport: required MAC drops untagged and accepts valid tagged datagrams" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
-    const mac_key = [_]u8{0x5A} ** 16;
+    const mac_key = @as([16]u8, @splat(0x5A));
     nmt.configureMac(&mac_key, true);
 
     try nmt.register("#secure", "alice", .voice, 100, .{});
@@ -451,7 +451,7 @@ test "NativeMediaTransport: required MAC drops untagged and accepts valid tagged
 test "NativeMediaTransport: MAC flag off preserves untagged datagram behavior" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
-    const mac_key = [_]u8{0x33} ** 16;
+    const mac_key = @as([16]u8, @splat(0x33));
     nmt.configureMac(&mac_key, false);
 
     try nmt.register("#compat", "alice", .voice, 100, .{});

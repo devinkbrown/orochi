@@ -177,7 +177,7 @@ const ContextStorage = struct {
     country: [max_context_field_len]u8 = undefined,
     country_len: usize = 0,
     channel_bufs: [max_channels][max_context_field_len]u8 = undefined,
-    channel_lens: [max_channels]usize = [_]usize{0} ** max_channels,
+    channel_lens: [max_channels]usize = @splat(0),
     channels: [max_channels][]const u8 = undefined,
     channel_count: usize = 0,
 };

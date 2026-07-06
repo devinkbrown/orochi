@@ -706,7 +706,7 @@ fn stateHash(ns: *const NetworkState) anti_entropy.Hash {
 }
 
 const StateHashFold = struct {
-    acc: anti_entropy.Hash = [_]u8{0} ** 32,
+    acc: anti_entropy.Hash = @splat(0),
 
     fn init() StateHashFold {
         return .{};

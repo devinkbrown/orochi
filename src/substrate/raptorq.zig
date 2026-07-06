@@ -367,8 +367,8 @@ pub const gf = struct {
 
     fn buildTables() Tables {
         var t = Tables{
-            .exp = [_]u8{0} ** 512,
-            .log = [_]u8{0} ** 256,
+            .exp = @as([512]u8, @splat(0)),
+            .log = @as([256]u8, @splat(0)),
         };
         var x: u16 = 1;
         var i: usize = 0;

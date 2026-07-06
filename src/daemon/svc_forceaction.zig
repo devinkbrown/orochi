@@ -53,8 +53,8 @@ pub const Privilege = enum {
     }
 
     pub fn parse(raw: []const u8) ?Privilege {
-        inline for (@typeInfo(Privilege).@"enum".fields) |field| {
-            const privilege: Privilege = @enumFromInt(field.value);
+        inline for (@typeInfo(Privilege).@"enum".field_values) |field_value| {
+            const privilege: Privilege = @enumFromInt(field_value);
             if (std.ascii.eqlIgnoreCase(raw, privilege.token())) return privilege;
         }
         return null;
@@ -106,8 +106,8 @@ pub const ForceActionKind = enum {
     }
 
     pub fn parse(raw: []const u8) ?ForceActionKind {
-        inline for (@typeInfo(ForceActionKind).@"enum".fields) |field| {
-            const action: ForceActionKind = @enumFromInt(field.value);
+        inline for (@typeInfo(ForceActionKind).@"enum".field_values) |field_value| {
+            const action: ForceActionKind = @enumFromInt(field_value);
             if (std.ascii.eqlIgnoreCase(raw, action.command())) return action;
         }
         return null;
@@ -526,8 +526,8 @@ test "forcetopic authorizes to real TOPIC plan" {
 }
 
 test "required privilege is stable for every force action" {
-    inline for (@typeInfo(ForceActionKind).@"enum".fields) |field| {
-        const action: ForceActionKind = @enumFromInt(field.value);
+    inline for (@typeInfo(ForceActionKind).@"enum".field_values) |field_value| {
+        const action: ForceActionKind = @enumFromInt(field_value);
         try std.testing.expectEqual(Privilege.channel_moderate, requiredPrivilege(action));
     }
 }

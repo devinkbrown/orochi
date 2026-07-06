@@ -266,11 +266,11 @@ comptime {
     }
 }
 
-fn buildNumericTable() [@typeInfo(Numeric).@"enum".fields.len]Numeric {
-    const fields = @typeInfo(Numeric).@"enum".fields;
-    var table: [fields.len]Numeric = undefined;
-    for (fields, 0..) |field, index| {
-        table[index] = @as(Numeric, @enumFromInt(field.value));
+fn buildNumericTable() [@typeInfo(Numeric).@"enum".field_names.len]Numeric {
+    const field_values = @typeInfo(Numeric).@"enum".field_values;
+    var table: [field_values.len]Numeric = undefined;
+    for (field_values, 0..) |field_value, index| {
+        table[index] = @as(Numeric, @enumFromInt(field_value));
     }
     return table;
 }

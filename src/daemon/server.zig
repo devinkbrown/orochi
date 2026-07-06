@@ -491,7 +491,7 @@ const irc_line = struct {
         /// none). Relayed verbatim by TAGMSG to message-tags recipients.
         tags_raw: ?[]const u8 = null,
         command: []const u8,
-        params: [MAXPARA][]const u8 = [_][]const u8{""} ** MAXPARA,
+        params: [MAXPARA][]const u8 = @splat(""),
         param_count: usize = 0,
 
         pub fn paramSlice(self: *const LineView) []const []const u8 {
@@ -2396,7 +2396,7 @@ const OperPrefixDedup = struct {
         ts_ms: i64 = 0,
         used: bool = false,
     };
-    entries: [cap]Entry = [_]Entry{.{}} ** cap,
+    entries: [cap]Entry = @splat(.{}),
     head: usize = 0,
 
     fn eqCi(buf: []const u8, s: []const u8) bool {
@@ -2436,7 +2436,7 @@ pub const LinuxServer = struct {
     /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
     /// resumption is enabled, then copied into every per-connection TLS config so
     /// a ticket issued on one reactor can resume on another.
-    tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey),
+    tls_ticket_key: tls_resumption.TicketKey = @splat(0),
     /// The PREVIOUS ticket key, retained across one rotation so tickets sealed
     /// before the last REHASH still resume for one more window. Null until the
     /// first rotation. See `rotateTicketKey` + tls_resumption.openTicketWithRotation.
@@ -2447,7 +2447,7 @@ pub const LinuxServer = struct {
     /// so an attacker who knows the public (channel, nick) can no longer precompute
     /// a victim's stream id and hijack/inject on the native-media UDP port.
     /// Generated once at init (getrandom via secure_fns).
-    native_stream_key: [16]u8 = [_]u8{0} ** 16,
+    native_stream_key: [16]u8 = @splat(0),
     /// Shared anti-replay ring for accepted 0-RTT binders. The guard is
     /// internally synchronized because all reactor threads share it.
     tls_replay_guard: tls_resumption.ReplayGuard = .{},
@@ -2542,7 +2542,7 @@ pub const LinuxServer = struct {
     /// disabled). 0 = never refreshed yet.
     metrics_last_refresh_ms: i64 = 0,
     /// Ring of recent client-count samples for the stats sparkline.
-    stats_history: [60]u32 = [_]u32{0} ** 60,
+    stats_history: [60]u32 = @splat(0),
     stats_hist_count: usize = 0,
     stats_hist_head: usize = 0,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
@@ -2582,7 +2582,7 @@ pub const LinuxServer = struct {
     geo: *geo_services.Service,
     /// Per-channel fantasy-bot cooldown (anti-flood): the last reply time in each
     /// of a small set of recently-active channels. Bounded; oldest slot evicted.
-    fantasy_cooldown: [fantasy_cooldown_slots]FantasyCooldown = [_]FantasyCooldown{.{}} ** fantasy_cooldown_slots,
+    fantasy_cooldown: [fantasy_cooldown_slots]FantasyCooldown = @splat(.{}),
     props: ircx_prop_store.DefaultStore,
     /// Mesh LWW clocks for IRCX channel PROP facts. Current values live in
     /// `props`; this table retains delete tombstones for relink convergence.
@@ -2747,8 +2747,8 @@ pub const LinuxServer = struct {
     /// net_peer_count, so a reader that acquire-loads the count sees the matching
     /// names. The peer set rarely changes and the write is idempotent, so a
     /// concurrent overwrite is at worst a momentary cosmetic mix in MAP.
-    mesh_peer_names: [32][64]u8 = [_][64]u8{[_]u8{0} ** 64} ** 32,
-    mesh_peer_name_lens: [32]u8 = [_]u8{0} ** 32,
+    mesh_peer_names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
+    mesh_peer_name_lens: [32]u8 = @splat(0),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Orochi media SFU control plane): who is in each call.
@@ -3025,7 +3025,7 @@ pub const LinuxServer = struct {
             reactors[built] = try initReactor(allocator, config, @intCast(built), reuse_port);
         }
 
-        var tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey);
+        var tls_ticket_key: tls_resumption.TicketKey = @splat(0);
         if (config.tls_enable_resumption) secure_fns.randomBytes(&tls_ticket_key);
 
         var whowas_store = try WhowasStore.init(allocator);
@@ -3657,7 +3657,7 @@ pub const LinuxServer = struct {
                 // only touch our own shard's client table, on our own thread).
                 if (msg.broadcast_category) |cat_raw| {
                     const category: event_spine.EventCategory = @enumFromInt(cat_raw);
-                    const severity: event_spine.EventSeverity = @enumFromInt(@min(msg.broadcast_severity, @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".fields.len - 1)));
+                    const severity: event_spine.EventSeverity = @enumFromInt(@min(msg.broadcast_severity, @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1)));
                     // The publishing reactor carried the event subject inline so this
                     // reactor applies each local subscriber's per-category subject
                     // glob exactly as the origin did. An empty carried subject means
@@ -3938,7 +3938,7 @@ pub const LinuxServer = struct {
             var summaries: [16]event_collapse_mod.Summary = undefined;
             const n = self.event_collapse.flush(platform.realtimeMillis(), &summaries);
             for (summaries[0..n]) |*s| {
-                const cat: event_spine.EventCategory = if (s.category < @typeInfo(event_spine.EventCategory).@"enum".fields.len)
+                const cat: event_spine.EventCategory = if (s.category < @typeInfo(event_spine.EventCategory).@"enum".field_names.len)
                     @enumFromInt(s.category)
                 else
                     .flood;
@@ -4802,7 +4802,7 @@ pub const LinuxServer = struct {
     fn addrIsLoopback(addr: dns.Address) bool {
         return switch (addr) {
             .ipv4 => |b| b[0] == 127,
-            .ipv6 => |b| std.mem.eql(u8, &b, &([_]u8{0} ** 15 ++ [_]u8{1})),
+            .ipv6 => |b| std.mem.eql(u8, &b, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
         };
     }
 
@@ -15544,8 +15544,8 @@ pub const LinuxServer = struct {
 
     /// Map an EVENT category token (code or tag) to a daemon EventCategory.
     fn eventCategoryFromToken(token: []const u8) ?event_spine.EventCategory {
-        inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
-            const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+        inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
+            const c: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
             if (std.ascii.eqlIgnoreCase(token, c.code()) or std.ascii.eqlIgnoreCase(token, c.token())) return c;
         }
         // IRCX draft EVENT type aliases (CHANNEL/MEMBER/SERVER/CONNECTION/SOCKET/
@@ -16236,8 +16236,8 @@ pub const LinuxServer = struct {
             var w = std.Io.Writer.fixed(&buf);
             w.writeAll("  by category:") catch {};
             var any = false;
-            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
-                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
+                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
                 const n = self.event_stats.categoryCount(@intFromEnum(cat));
                 if (n != 0) {
                     var nb: [40]u8 = undefined;
@@ -16253,8 +16253,8 @@ pub const LinuxServer = struct {
             var buf: [320]u8 = undefined;
             var w = std.Io.Writer.fixed(&buf);
             w.writeAll("  by severity:") catch {};
-            inline for (@typeInfo(event_spine.EventSeverity).@"enum".fields) |field| {
-                const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field.name);
+            inline for (@typeInfo(event_spine.EventSeverity).@"enum".field_names) |field_name| {
+                const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field_name);
                 const n = self.event_stats.severityCount(@intFromEnum(sev));
                 if (n != 0) {
                     var nb: [40]u8 = undefined;
@@ -16273,8 +16273,8 @@ pub const LinuxServer = struct {
         if (mask.isEmpty()) {
             w.writeAll(" (none)") catch {};
         } else {
-            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
-                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
+                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
                 if (mask.contains(cat)) {
                     w.writeAll(" ") catch {};
                     w.writeAll(cat.code()) catch {};
@@ -16471,8 +16471,8 @@ pub const LinuxServer = struct {
     fn decodeObserveEvent(bytes: []const u8) ?ObserveDecoded {
         const ev = observe_event.decode(bytes) catch return null;
         var action_opt: ?observe_mod.Action = null;
-        inline for (@typeInfo(observe_mod.Action).@"enum".fields) |f| {
-            if (f.value == ev.action) action_opt = @enumFromInt(ev.action);
+        inline for (@typeInfo(observe_mod.Action).@"enum".field_values) |f_value| {
+            if (f_value == ev.action) action_opt = @enumFromInt(ev.action);
         }
         const action = action_opt orelse return null;
         return .{ .origin = ev.origin_server, .action = action, .subject = .{
@@ -22113,7 +22113,7 @@ pub const LinuxServer = struct {
     /// Generate a 16-byte session reclaim token from the daemon CSPRNG (zeroed
     /// when no crypto_io is configured — reclaim then effectively disabled).
     fn genSessionToken(self: *LinuxServer) sessions_mod.Token {
-        var t: sessions_mod.Token = [_]u8{0} ** 16;
+        var t: sessions_mod.Token = @splat(0);
         if (self.config.crypto_io) |io| io.random(&t);
         return t;
     }
@@ -23627,8 +23627,8 @@ pub const LinuxServer = struct {
     }
 
     test "native stream id is keyed, stable per key, and unguessable across keys" {
-        const key_a = [_]u8{0xA1} ** 16;
-        const key_b = [_]u8{0xB2} ** 16;
+        const key_a = @as([16]u8, @splat(0xA1));
+        const key_b = @as([16]u8, @splat(0xB2));
         // Stable per (key, channel, nick): re-JOIN must reproduce the same id.
         const a1 = nativeStreamIdKeyed(&key_a, "#chan", "alice");
         try std.testing.expectEqual(a1, nativeStreamIdKeyed(&key_a, "#chan", "alice"));
@@ -24436,13 +24436,13 @@ pub const LinuxServer = struct {
             // Reject a category value that is not a defined EventCategory variant
             // (a hostile peer could send any in-range u6) — never @enumFromInt blind.
             var category_opt: ?event_spine.EventCategory = null;
-            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |f| {
-                if (f.value == ev.category) category_opt = @enumFromInt(ev.category);
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".field_values) |f_value| {
+                if (f_value == ev.category) category_opt = @enumFromInt(ev.category);
             }
             const category = category_opt orelse continue;
             // Severity rides the wire (u8); clamp an out-of-range value from a
             // hostile/newer peer to the top defined level rather than @enumFromInt blind.
-            const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".fields.len - 1);
+            const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
             const severity: event_spine.EventSeverity = @enumFromInt(@min(ev.severity, sev_max));
             // Subject == message (callers that publish locally use the same).
             // Origin is the authenticated peer, not the spoofable wire field.
@@ -27153,7 +27153,7 @@ test "SendQ: inline fast path, heap overflow, refill, and per-class cap" {
     conn.sendq_cap = 20 * 1024; // 20 KiB
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
 
-    const chunk = [_]u8{'a'} ** 4096;
+    const chunk = @as([4096]u8, @splat('a'));
     // Two chunks fill the inline 8 KiB buffer exactly (no heap).
     try rawAppendToConn(&conn, &chunk);
     try rawAppendToConn(&conn, &chunk);
@@ -27488,7 +27488,7 @@ fn hasSep(s: []const u8) bool {
 /// syscalls. Best-effort: a failure is silently ignored (persistence is a
 /// convenience, never a correctness dependency).
 fn writeFileAbs(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) void {
-    const zpath = allocator.dupeZ(u8, path) catch return;
+    const zpath = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(zpath);
     const rc = linux.open(zpath, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
     if (posix.errno(rc) != .SUCCESS) return;
@@ -27718,7 +27718,7 @@ fn buildOperBindingsFromConfig(allocator: std.mem.Allocator, parsed: config_form
 /// True for an IPv4-mapped IPv6 address (::ffff:a.b.c.d) — the form a dual-stack
 /// AF_INET6 listener reports for an IPv4 peer.
 fn isV4Mapped(address: [16]u8) bool {
-    return std.mem.eql(u8, address[0..10], &([_]u8{0} ** 10)) and address[10] == 0xff and address[11] == 0xff;
+    return std.mem.eql(u8, address[0..10], &(@as([10]u8, @splat(0)))) and address[10] == 0xff and address[11] == 0xff;
 }
 
 fn formatIp6(out: []u8, address: [16]u8) ![]const u8 {
@@ -27866,7 +27866,7 @@ fn sockaddrIn6FromV6(addr: [16]u8, port: u16) posix.sockaddr.in6 {
 }
 
 fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
-    var a: [16]u8 = [_]u8{0} ** 16;
+    var a: [16]u8 = @splat(0);
     a[10] = 0xff;
     a[11] = 0xff;
     @memcpy(a[12..16], &addr4);
@@ -27908,7 +27908,7 @@ fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ServerError!void {
 /// empty) binds in6addr_any; an IPv6 literal binds directly; an IPv4 literal
 /// binds as its IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
 fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
-    var addr: [16]u8 = [_]u8{0} ** 16; // in6addr_any (dual-stack wildcard)
+    var addr: [16]u8 = @splat(0); // in6addr_any (dual-stack wildcard)
     if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
         if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
             addr = a6.bytes;
@@ -28861,7 +28861,7 @@ test "session-sync unit: two sessions same account both session-sync get the DM"
     sibling.session.addCap(.orochi_session_sync);
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
-        .token = [_]u8{0} ** 16,
+        .token = @as([16]u8, @splat(0)),
         .signon_ms = 0,
     };
 
@@ -28880,7 +28880,7 @@ test "session-sync unit: a session without the cap does not get the DM" {
     var sibling = ConnState.init(-1);
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
-        .token = [_]u8{0} ** 16,
+        .token = @as([16]u8, @splat(0)),
         .signon_ms = 0,
     };
 
@@ -28901,7 +28901,7 @@ test "session-sync unit: a same-nick sibling gets the DM even without the cap" {
     var sibling = ConnState.init(-1); // NO orochi_session_sync cap
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
-        .token = [_]u8{0} ** 16,
+        .token = @as([16]u8, @splat(0)),
         .signon_ms = 0,
     };
     // same_nick = true bypasses the cap requirement.
@@ -28930,7 +28930,7 @@ test "session-sync unit: sender other session gets outgoing DM echo" {
     sibling.session.addCap(.orochi_session_sync);
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
-        .token = [_]u8{0} ** 16,
+        .token = @as([16]u8, @splat(0)),
         .signon_ms = 0,
     };
 
@@ -28947,7 +28947,7 @@ test "session-sync unit: single-session account has no sibling copies" {
     const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
     var store = sessions_mod.SessionStore.init(std.testing.allocator);
     defer store.deinit();
-    _ = try store.attach("alice", monitorIdFromClient(target_id), [_]u8{1} ** 16, 0);
+    _ = try store.attach("alice", monitorIdFromClient(target_id), @as([16]u8, @splat(1)), 0);
 
     var target_conn = ConnState.init(-1);
     target_conn.session.addCap(.orochi_session_sync);
@@ -29217,7 +29217,7 @@ test "pinned messages: PINS prop value validation" {
     // Whitespace, commas-in-token, empty token, or overlong token are invalid.
     try std.testing.expect(!LinuxServer.validPinsValue("has space"));
     try std.testing.expect(!LinuxServer.validPinsValue("a,,b")); // empty token
-    try std.testing.expect(!LinuxServer.validPinsValue("a," ++ "x" ** 65));
+    try std.testing.expect(!LinuxServer.validPinsValue("a," ++ &@as([65]u8, @splat('x'))));
     // Over the count cap.
     var buf: [8 * 60]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -29493,7 +29493,7 @@ test "deliverRelay accepts a correctly signed origin message" {
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x21} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x21)));
     defer kp.deinit();
     var pk_buf: [message_relay.pubkey_len]u8 = undefined;
     var sig_buf: [message_relay.sig_len]u8 = undefined;
@@ -29514,7 +29514,7 @@ test "deliverRelay rejects a forged signature: not delivered, counted" {
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x31} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x31)));
     defer kp.deinit();
     var pk_buf: [message_relay.pubkey_len]u8 = undefined;
     var sig_buf: [message_relay.sig_len]u8 = undefined;
@@ -29537,7 +29537,7 @@ test "deliverRelay rejects a pubkey whose originShortId != origin_node" {
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x41} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x41)));
     defer kp.deinit();
     var pk_buf: [message_relay.pubkey_len]u8 = undefined;
     var sig_buf: [message_relay.sig_len]u8 = undefined;
@@ -29586,7 +29586,7 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
     // No local recipient for #relay here: deliverRelay's job is the re-forward
     // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
     // original signature, by re-verifying the encoded copy at std-allocator level.
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x51} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
     defer kp.deinit();
     var pk_buf: [message_relay.pubkey_len]u8 = undefined;
     var sig_buf: [message_relay.sig_len]u8 = undefined;
@@ -29665,7 +29665,7 @@ fn buildSignedProp(
 }
 
 test "channel prop: a locally-authored fact is signed and verifies against its origin" {
-    var ident = try node_identity.fromSeed([_]u8{0x71} ** 32, "local");
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -29705,7 +29705,7 @@ test "channel prop: an inbound signed fact verifies, applies, and is stored for 
     const founder_id = try addTestLocalClient(&server, "Founder", null);
     _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x82} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x82)));
     defer kp.deinit();
     var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
@@ -29738,7 +29738,7 @@ test "channel prop: a forged inbound fact is rejected, counted, and not applied"
     const founder_id = try addTestLocalClient(&server, "Founder", null);
     _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x83} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x83)));
     defer kp.deinit();
     var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
@@ -29777,12 +29777,12 @@ test "channel prop: a re-broadcast preserves the ORIGINAL author's signature (mu
     _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
 
     // A THIRD node authored the fact; THIS node is a relay with its own identity.
-    var ident = try node_identity.fromSeed([_]u8{0x84} ** 32, "relay");
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x84)), "relay");
     defer ident.deinit();
     server.config.node_id = ident.shortId();
     server.config.node_identity = &ident;
 
-    var author = try sign_mod.KeyPair.fromSeed([_]u8{0x90} ** sign_mod.seed_len);
+    var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x90)));
     defer author.deinit();
     var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
@@ -29903,7 +29903,7 @@ fn buildSignedEntityProp(
 }
 
 test "entity prop: a local user prop and member prop are signed and verify against their origin" {
-    var ident = try node_identity.fromSeed([_]u8{0x61} ** 32, "local");
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -29948,7 +29948,7 @@ test "entity prop: an inbound signed user fact verifies, applies, and is stored 
     };
     defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x62} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x62)));
     defer kp.deinit();
     var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
@@ -29980,7 +29980,7 @@ test "entity prop: an inbound signed member fact verifies and applies" {
     };
     defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x63} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x63)));
     defer kp.deinit();
     var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
@@ -29999,7 +29999,7 @@ test "entity prop: a forged inbound fact is rejected, counted, and not applied" 
     };
     defer server.deinit();
 
-    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x64} ** sign_mod.seed_len);
+    var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x64)));
     defer kp.deinit();
     var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
@@ -30042,12 +30042,12 @@ test "entity prop: a re-broadcast preserves the ORIGINAL author's signature (mul
     defer server.deinit();
 
     // A THIRD node authored the fact; THIS node is a relay with its own identity.
-    var ident = try node_identity.fromSeed([_]u8{0x65} ** 32, "relay");
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x65)), "relay");
     defer ident.deinit();
     server.config.node_id = ident.shortId();
     server.config.node_identity = &ident;
 
-    var author = try sign_mod.KeyPair.fromSeed([_]u8{0x91} ** sign_mod.seed_len);
+    var author = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x91)));
     defer author.deinit();
     var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
     var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
@@ -31368,12 +31368,12 @@ test "threaded server: VERIFY accepts account argument and legacy code form" {
     defer server.deinit();
 
     const now_u: u64 = @intCast(@max(0, server.nowMs()));
-    var alice_bytes = [_]u8{0x11} ** 16;
+    var alice_bytes = @as([16]u8, @splat(0x11));
     const alice_token = try server.account_verifies.issue("alice", "alice@example.test", &alice_bytes, now_u);
     var alice_verify_buf: [128]u8 = undefined;
     const alice_verify = try std.fmt.bufPrint(&alice_verify_buf, "VERIFY alice {s}\r\n", .{alice_token});
 
-    var bob_bytes = [_]u8{0x22} ** 16;
+    var bob_bytes = @as([16]u8, @splat(0x22));
     const bob_token = try server.account_verifies.issue("bob", "bob@example.test", &bob_bytes, now_u);
     var bob_verify_buf: [128]u8 = undefined;
     const bob_verify = try std.fmt.bufPrint(&bob_verify_buf, "VERIFY {s}\r\n", .{bob_token});
@@ -33326,7 +33326,7 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
     const alloc = std.testing.allocator;
 
     // Bootstrap a self-signed Ed25519 leaf with a SAN the client will accept.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -33431,8 +33431,8 @@ test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 27
     const proto_certfp = @import("../proto/certfp.zig");
     const alloc = std.testing.allocator;
 
-    const server_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
-    const client_seed = [_]u8{0x62} ** Ed25519.KeyPair.seed_length;
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
+    const client_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x62));
     const client_kp = try Ed25519.KeyPair.generateDeterministic(client_seed);
     const client_sign = try sign.KeyPair.fromSeed(client_seed);
 
@@ -33665,7 +33665,7 @@ test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" 
 
     // Self-signed Ed25519 leaf, exactly like the implicit-TLS listener test:
     // the wss listener must serve the SAME certificate material.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x52} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x52)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -34764,7 +34764,7 @@ test "IRCX 800 package list offers SCRAM-SHA-512 when provisioned" {
     conn.session.sasl_session_token = .{ .ptr = &anchor, .verifyFn = TokenDb.verify };
     conn.session.sasl_oauthbearer = .{ .ptr = &anchor, .verifyFn = OAuthDb.verify };
     conn.session.sasl_allow_anonymous = true;
-    conn.session.tls_exporter = [_]u8{0x42} ** sasl_scram512_mod.tls_exporter_len;
+    conn.session.tls_exporter = @as([sasl_scram512_mod.tls_exporter_len]u8, @splat(0x42));
     var buf: [128]u8 = undefined;
     const pkg_list = LinuxServer.ircxAuthPackageList(&conn, &buf);
     const idx256 = std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-256") orelse return error.TestUnexpectedResult;
@@ -36038,7 +36038,7 @@ test "threaded server: PROP user profile extended keys round-trip and enforce ac
         try std.testing.expect(std.mem.indexOf(u8, a.written(), case.profile_fragment) != null);
     }
 
-    var too_long = [_]u8{'x'} ** (ircx_prop_store.user_profile_max_value + 1);
+    var too_long = @as([(ircx_prop_store.user_profile_max_value + 1)]u8, @splat('x'));
     a.reset();
     try writeAllFd(fd_a, "PROP A SET URL :");
     try writeAllFd(fd_a, too_long[0..]);
@@ -36201,7 +36201,7 @@ fn propGeoAppendUint(out: *PropGeoTestBytes, value_type: u8, value: u64) !void {
         9 => 8,
         else => return error.UnsupportedDatabase,
     };
-    var tmp = [_]u8{0} ** 8;
+    var tmp = @as([8]u8, @splat(0));
     var value_copy = value;
     var len: usize = 0;
     while (value_copy != 0) : (value_copy >>= 8) len += 1;
@@ -40338,7 +40338,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     // later direct-runOnce tests never see a stale pointer.
     defer current_reactor = null;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -40588,7 +40588,7 @@ fn mintRehashTlsLeaf(buf: []u8, seed_byte: u8, cn: []const u8) !struct {
 } {
     const Ed25519 = std.crypto.sign.Ed25519;
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{seed_byte} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed_byte)));
     const der = try x509_selfsign.buildSelfSigned(buf, .{
         .common_name = cn,
         .not_before = 1_704_067_200,
@@ -40638,7 +40638,7 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
     // Write a rotated cert B + its Ed25519 key (both PEM) to a temp dir.
     var b_buf: [1024]u8 = undefined;
     const b = try mintRehashTlsLeaf(&b_buf, 0x72, "b.test");
-    const b_seed = [_]u8{0x72} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    const b_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x72));
     var b_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
     const b_key_der = try ed25519_pkcs8.encode(&b_key_der_buf, b_seed);
 
@@ -40690,7 +40690,7 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
     // boot cert A must STILL never be freed (only the server-owned gen rotates).
     var c_buf: [1024]u8 = undefined;
     const c = try mintRehashTlsLeaf(&c_buf, 0x73, "c.test");
-    const c_seed = [_]u8{0x73} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    const c_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x73));
     var c_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
     const c_key_der = try ed25519_pkcs8.encode(&c_key_der_buf, c_seed);
     var c_cert_pem_buf: [4096]u8 = undefined;
@@ -40724,7 +40724,7 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
     // double-free of B fails; the boot cert A is still never freed.
     var d_buf: [1024]u8 = undefined;
     const d = try mintRehashTlsLeaf(&d_buf, 0x77, "d.test");
-    const d_seed = [_]u8{0x77} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    const d_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x77));
     var d_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
     const d_key_der = try ed25519_pkcs8.encode(&d_key_der_buf, d_seed);
     var d_cert_pem_buf: [4096]u8 = undefined;
@@ -40812,7 +40812,7 @@ test "rotateTicketKey moves current to previous and generates a fresh key" {
     };
     defer server.deinit();
 
-    const key_a = [_]u8{0xAA} ** @sizeOf(tls_resumption.TicketKey);
+    const key_a = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0xAA));
     server.tls_ticket_key = key_a;
     server.tls_previous_ticket_key = null;
 

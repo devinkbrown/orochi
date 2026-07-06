@@ -545,7 +545,7 @@ fn ecP256Spki(x: [32]u8, y: [32]u8) [91]u8 {
         0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
         0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
         0x42, 0x00, 0x04,
-    } ++ [_]u8{0} ** 64;
+    } ++ @as([64]u8, @splat(0));
     @memcpy(out[27..59], &x);
     @memcpy(out[59..91], &y);
     return out;
@@ -618,8 +618,8 @@ fn testSign(ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]co
 fn makeSigner(calls: *usize) Signer {
     return .{
         .ctx = calls,
-        .public_key_x = [_]u8{7} ** 32,
-        .public_key_y = [_]u8{9} ** 32,
+        .public_key_x = @as([32]u8, @splat(7)),
+        .public_key_y = @as([32]u8, @splat(9)),
         .signFn = testSign,
     };
 }

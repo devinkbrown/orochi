@@ -274,7 +274,7 @@ fn ctEql(a: []const u8, b: []const u8) bool {
 }
 
 fn testKey(seed_byte: u8) !KeyPair {
-    return KeyPair.generateDeterministic([_]u8{seed_byte} ** seed_len);
+    return KeyPair.generateDeterministic(@as([seed_len]u8, @splat(seed_byte)));
 }
 
 fn testEnvelope(kp: *const KeyPair, hlc: u64, scope: []const u8, op: []const u8) Envelope {

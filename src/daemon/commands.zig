@@ -41,7 +41,7 @@ pub fn formatCode(n: Numeric, buf: []u8) []const u8 {
 
 fn InlineString(comptime max_len: usize) type {
     return struct {
-        bytes: [max_len]u8 = [_]u8{0} ** max_len,
+        bytes: [max_len]u8 = @splat(0),
         len: u16 = 0,
 
         fn init(input: []const u8) !@This() {
@@ -283,7 +283,7 @@ pub const DeltaKind = enum {
 };
 
 pub const DeltaSet = struct {
-    items: [16]DeltaKind = [_]DeltaKind{.channel_birth} ** 16,
+    items: [16]DeltaKind = @splat(.channel_birth),
     len: usize = 0,
 
     fn add(self: *DeltaSet, kind: DeltaKind) void {

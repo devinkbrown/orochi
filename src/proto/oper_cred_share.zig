@@ -336,7 +336,7 @@ pub fn Sized(comptime cap: usize) type {
         const Self = @This();
 
         slots: [cap]OwnedFields = undefined,
-        used: [cap]bool = [_]bool{false} ** cap,
+        used: [cap]bool = @splat(false),
         len: usize = 0,
 
         /// Explicit zero-valued constructor (the default struct value also works).
@@ -475,7 +475,7 @@ fn expectFieldsEqual(a: GrantFields, b: GrantFields) !void {
 
 test "sign and verify round-trip recovers all fields" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
     const fields = sampleFields();
     var buf: [max_grant_len]u8 = undefined;
 
@@ -489,7 +489,7 @@ test "sign and verify round-trip recovers all fields" {
 
 test "sign is deterministic for identical fields" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x32} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x32)));
     const fields = sampleFields();
     var a: [max_grant_len]u8 = undefined;
     var b: [max_grant_len]u8 = undefined;
@@ -505,7 +505,7 @@ test "sign is deterministic for identical fields" {
 
 test "sign rejects a grant that is born expired" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
     var fields = sampleFields();
     fields.issued_ms = 10_001;
     fields.expiry_ms = 10_000;
@@ -517,7 +517,7 @@ test "sign rejects a grant that is born expired" {
 
 test "tampered field is detected as BadSignature" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x34} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x34)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf);
 
@@ -532,8 +532,8 @@ test "tampered field is detected as BadSignature" {
 
 test "verification with the wrong public key fails as BadSignature" {
     // Arrange
-    const signer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x35} ** 32);
-    const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x99} ** 32);
+    const signer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x35)));
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x99)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(signer, sampleFields(), &buf);
 
@@ -543,7 +543,7 @@ test "verification with the wrong public key fails as BadSignature" {
 
 test "tampered signature byte fails as BadSignature" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x36} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x36)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf);
 
@@ -556,7 +556,7 @@ test "tampered signature byte fails as BadSignature" {
 
 test "expired grant fails as Expired" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x37)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf); // expiry_ms = 10_000
 
@@ -567,7 +567,7 @@ test "expired grant fails as Expired" {
 
 test "truncated buffer fails as BadFormat" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x38} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x38)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf);
 
@@ -581,7 +581,7 @@ test "truncated buffer fails as BadFormat" {
 
 test "wrong magic fails as BadFormat" {
     // Arrange
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x39} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x39)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf);
 
@@ -792,7 +792,7 @@ test "registry drops new accounts when capacity is exhausted" {
 
 test "verified grant feeds straight into the registry" {
     // Arrange: full end-to-end — sign on node A, verify on node B, store.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x40} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x40)));
     var buf: [max_grant_len]u8 = undefined;
     const n = try sign(kp, sampleFields(), &buf);
     var reg = Registry.init();

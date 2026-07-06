@@ -108,7 +108,7 @@ pub fn unprotect(keys: Keys, sframe: []const u8, out: []u8) Error![]const u8 {
 }
 
 fn nonceFor(salt: [nonce_len]u8, ctr: u64) [nonce_len]u8 {
-    var ctr_bytes = [_]u8{0} ** nonce_len;
+    var ctr_bytes = @as([nonce_len]u8, @splat(0));
     std.mem.writeInt(u64, ctr_bytes[nonce_len - 8 ..][0..8], ctr, .big);
 
     var nonce = salt;

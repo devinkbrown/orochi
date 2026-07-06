@@ -112,7 +112,7 @@ fn isExpired(now_ms: i64, last_ms: i64, ttl_ms: i64) bool {
 }
 
 fn tokenWithLast(byte: u8) Token {
-    var token: Token = .{0} ** 16;
+    var token: Token = @splat(0);
     token[15] = byte;
     return token;
 }

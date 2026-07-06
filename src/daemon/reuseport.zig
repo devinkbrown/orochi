@@ -85,7 +85,7 @@ fn socketTcp() ReusePortError!linux.fd_t {
 /// families. An IPv6 literal binds directly; an IPv4 literal binds as its
 /// IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
 fn sockaddrIn6(host: []const u8, port: u16) ReusePortError!posix.sockaddr.in6 {
-    var addr: [16]u8 = [_]u8{0} ** 16; // in6addr_any (dual-stack wildcard)
+    var addr: [16]u8 = @splat(0); // in6addr_any (dual-stack wildcard)
     if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
         if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
             addr = a6.bytes;

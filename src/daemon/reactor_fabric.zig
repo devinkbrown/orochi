@@ -243,7 +243,7 @@ const TestReactor = struct {
     expected: usize,
     received: usize = 0,
     /// seen[seq] guards against duplicate delivery of a sequence number.
-    seen: [per_shard]bool = [_]bool{false} ** per_shard,
+    seen: [per_shard]bool = @splat(false),
     /// Set on misrouting, a malformed payload, an out-of-range seq, or a dup.
     corrupt: bool = false,
 

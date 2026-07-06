@@ -141,7 +141,7 @@ test "parse accepts msgid with hyphen and dot punctuation" {
 }
 
 test "parse accepts maximum-length msgid" {
-    const value = "a" ** MAX_MSGID_LEN;
+    const value = &@as([MAX_MSGID_LEN]u8, @splat('a'));
     try std.testing.expectEqualStrings(value, try parse(value));
 }
 
@@ -150,7 +150,7 @@ test "parse rejects empty value" {
 }
 
 test "parse rejects over-length value" {
-    const value = "a" ** (MAX_MSGID_LEN + 1);
+    const value = &@as([(MAX_MSGID_LEN + 1)]u8, @splat('a'));
     try std.testing.expectError(error.MsgidTooLong, parse(value));
 }
 
@@ -168,7 +168,7 @@ test "parse rejects structural and control characters" {
 test "isValidMsgid mirrors parse success and failure" {
     try std.testing.expect(isValidMsgid("abc123"));
     try std.testing.expect(!isValidMsgid(""));
-    try std.testing.expect(!isValidMsgid("a" ** (MAX_MSGID_LEN + 1)));
+    try std.testing.expect(!isValidMsgid(&@as([(MAX_MSGID_LEN + 1)]u8, @splat('a'))));
     try std.testing.expect(!isValidMsgid("a b"));
     try std.testing.expect(!isValidMsgid("a;b"));
 }

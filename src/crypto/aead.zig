@@ -223,8 +223,8 @@ const ChaCha = Aead(.chacha20_poly1305);
 const AesGcm = Aead(.aes256_gcm);
 
 fn roundTrip(comptime A: type) !void {
-    const key: A.Key = [_]u8{0xA5} ** A.key_length;
-    const nonce: A.Nonce = [_]u8{0x07} ** A.nonce_length;
+    const key: A.Key = @splat(0xA5);
+    const nonce: A.Nonce = @splat(0x07);
     const aad = "suimyaku-outer-header|gen=1|kind=data";
     const plaintext = "the quick brown fox jumps over the lazy dog";
 
@@ -248,8 +248,8 @@ test "round-trip seal/open: AES-256-GCM" {
 }
 
 fn aadMismatch(comptime A: type) !void {
-    const key: A.Key = [_]u8{0x11} ** A.key_length;
-    const nonce: A.Nonce = [_]u8{0x22} ** A.nonce_length;
+    const key: A.Key = @splat(0x11);
+    const nonce: A.Nonce = @splat(0x22);
     const plaintext = "secret payload";
 
     var aead = A.init(key);
@@ -271,8 +271,8 @@ test "AAD mismatch yields AuthFailed: AES-256-GCM" {
 }
 
 fn tamperedCiphertext(comptime A: type) !void {
-    const key: A.Key = [_]u8{0x33} ** A.key_length;
-    const nonce: A.Nonce = [_]u8{0x44} ** A.nonce_length;
+    const key: A.Key = @splat(0x33);
+    const nonce: A.Nonce = @splat(0x44);
     const aad = "header";
     const plaintext = "do not tamper with me";
 
@@ -304,9 +304,9 @@ test "tampered ciphertext yields AuthFailed: AES-256-GCM" {
 }
 
 test "buffer length mismatch is rejected" {
-    var aead = ChaCha.init([_]u8{0} ** ChaCha.key_length);
+    var aead = ChaCha.init(@as([ChaCha.key_length]u8, @splat(0)));
     defer aead.deinit();
-    const nonce: ChaCha.Nonce = [_]u8{0} ** ChaCha.nonce_length;
+    const nonce: ChaCha.Nonce = @splat(0);
     var short: [3]u8 = undefined;
     try testing.expectError(Error.BufferLengthMismatch, aead.seal(nonce, "", "four", &short));
     const tag: ChaCha.Tag = undefined;
@@ -314,11 +314,11 @@ test "buffer length mismatch is rejected" {
 }
 
 test "Aead interops with Secret-wrapped key" {
-    const raw: ChaCha.Key = [_]u8{0x5C} ** ChaCha.key_length;
+    const raw: ChaCha.Key = @splat(0x5C);
     var aead = ChaCha.fromSecret(ChaCha.SecretKey.init(raw));
     defer aead.deinit();
 
-    const nonce: ChaCha.Nonce = [_]u8{0x01} ** ChaCha.nonce_length;
+    const nonce: ChaCha.Nonce = @splat(0x01);
     const msg = "via keyring";
     var ct: [msg.len]u8 = undefined;
     const tag = try aead.seal(nonce, "", msg, &ct);
@@ -344,7 +344,7 @@ test "counter nonce composes base + big-endian u32 and advances" {
 }
 
 test "counter nonce refuses to wrap" {
-    var cn = CounterNonce.resumeFrom([_]u8{0xFF} ** nonce_base_len, std.math.maxInt(u32) - 1);
+    var cn = CounterNonce.resumeFrom(@as([nonce_base_len]u8, @splat(0xFF)), std.math.maxInt(u32) - 1);
 
     // counter = max-1 : usable
     const a = try cn.next();
@@ -368,7 +368,7 @@ test "random base nonce starts at counter zero and advances" {
 }
 
 test "resumeFrom restores a known counter position" {
-    var cn = CounterNonce.resumeFrom([_]u8{0xAB} ** nonce_base_len, 42);
+    var cn = CounterNonce.resumeFrom(@as([nonce_base_len]u8, @splat(0xAB)), 42);
     const n = try cn.next();
     try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, n[nonce_base_len..][0..4], .big));
     try testing.expectEqual(@as(u32, 43), cn.counter);

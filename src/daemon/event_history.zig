@@ -37,14 +37,14 @@ pub const StoredEvent = struct {
     /// The category as an enum, or null if the stored ordinal is out of range
     /// (a forward-compat / corrupt-snapshot guard — callers skip such rows).
     pub fn categoryEnum(self: *const StoredEvent) ?event_spine.EventCategory {
-        const n = @typeInfo(event_spine.EventCategory).@"enum".fields.len;
+        const n = @typeInfo(event_spine.EventCategory).@"enum".field_names.len;
         if (self.category >= n) return null;
         return @enumFromInt(self.category);
     }
 
     /// The severity as an enum, clamped to the top defined level.
     pub fn severityEnum(self: *const StoredEvent) event_spine.EventSeverity {
-        const max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".fields.len - 1);
+        const max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
         return @enumFromInt(@min(self.severity, max));
     }
 
@@ -60,16 +60,16 @@ pub const StoredEvent = struct {
     }
 };
 
-pub const category_count = @typeInfo(event_spine.EventCategory).@"enum".fields.len;
-pub const severity_count = @typeInfo(event_spine.EventSeverity).@"enum".fields.len;
+pub const category_count = @typeInfo(event_spine.EventCategory).@"enum".field_names.len;
+pub const severity_count = @typeInfo(event_spine.EventSeverity).@"enum".field_names.len;
 
 /// Lock-free per-category / per-severity Event Spine counters backing
 /// `EVENT STATS`. Incremented from any reactor + the mesh drain (atomic adds),
 /// read for the stats reply. Process-lifetime (not persisted — a running total
 /// resets on restart, which is the useful semantics for "since this boot").
 pub const EventStats = struct {
-    by_category: [category_count]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** category_count,
-    by_severity: [severity_count]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** severity_count,
+    by_category: [category_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    by_severity: [severity_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
     total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn record(self: *EventStats, cat: u8, sev: u8) void {

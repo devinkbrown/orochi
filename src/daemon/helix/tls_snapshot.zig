@@ -218,7 +218,7 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
         .fd = 42,
         .state = .{ .engine = .{ .tls13 = s13 }, .pending_recv = "\x17\x03\x03" },
         .pending_out = "queued-record",
-        .certfp = "ab" ** 32,
+        .certfp = &repeatBytes("ab", 32),
         .tx_offloaded = true,
         .rx_offloaded = true,
     });
@@ -234,7 +234,7 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
     try testing.expectEqual(@as(u64, 9), g13.app_write_seq);
     try testing.expectEqualStrings("\x17\x03\x03", got.state.pending_recv);
     try testing.expectEqualStrings("queued-record", got.pending_out);
-    try testing.expectEqualStrings("ab" ** 32, got.certfp);
+    try testing.expectEqualStrings(&repeatBytes("ab", 32), got.certfp);
     try testing.expect(got.tx_offloaded);
     try testing.expect(got.rx_offloaded);
 
@@ -282,4 +282,10 @@ test "decode rejects truncation and unknown engines" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }));
     // fd(4) + engine byte 9 = unknown.
     try testing.expectError(error.BadEngine, decode(&[_]u8{ 1, 0, 0, 0, 9, 0x01, 0x13 }));
+}
+
+fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    var b: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+    return b;
 }

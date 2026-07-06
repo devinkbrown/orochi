@@ -552,14 +552,14 @@ test "long keys exceeding the inline buffer take the heap path" {
     // Arrange
     var thr = Throttle.init(testing.allocator, .{ .lock_threshold = 2, .cooldown_ms = 1000 });
     defer thr.deinit();
-    const long_key = "X" ** 300;
+    const long_key = &@as([300]u8, @splat('X'));
 
     // Act
     _ = thr.recordFailure(.account, long_key, 0);
     _ = thr.recordFailure(.account, long_key, 0);
 
     // Assert: stored lowercased, locked, then cleanly cleared.
-    try testing.expectApproxEqAbs(@as(f64, 2), thr.score(.account, "x" ** 300, 0), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 2), thr.score(.account, &@as([300]u8, @splat('x')), 0), 1e-9);
     try testing.expect(thr.isLocked(.account, long_key, 0) != null);
     thr.recordSuccess(.account, long_key);
     try testing.expectEqual(@as(usize, 0), thr.count(.account));

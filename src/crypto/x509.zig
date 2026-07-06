@@ -838,7 +838,7 @@ fn parseSubjectAltName(comptime CertType: type, cert: *CertType, parent: DerRead
             Tag.san_ip_address => {
                 if (name.value.len != 4 and name.value.len != 16) return error.InvalidIpAddress;
                 if (cert.san_ip_count >= cert.san_ips.len) return error.TooManySan;
-                var ip = IpAddress{ .bytes = [_]u8{0} ** 16, .len = @intCast(name.value.len) };
+                var ip = IpAddress{ .bytes = @as([16]u8, @splat(0)), .len = @intCast(name.value.len) };
                 @memcpy(ip.bytes[0..name.value.len], name.value);
                 cert.san_ips[cert.san_ip_count] = ip;
                 cert.san_ip_count += 1;

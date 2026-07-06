@@ -282,7 +282,7 @@ fn expectFoldedLinesWellFormed(
     tokens: []const isupport.Token,
     rendered_storage: anytype,
 ) !void {
-    var seen: [64]bool = [_]bool{false} ** 64;
+    var seen: [64]bool = @splat(false);
     try std.testing.expect(tokens.len <= seen.len);
 
     for (lines) |line| {

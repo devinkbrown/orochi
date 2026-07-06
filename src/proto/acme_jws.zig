@@ -244,7 +244,7 @@ test "flattened: JSON shape with three b64url fields in order" {
     var buf: [512]u8 = undefined;
     const protected = "{\"alg\":\"ES256\"}";
     const payload = "{\"p\":1}";
-    const signature = [_]u8{0xAA} ** 64; // raw r||s placeholder
+    const signature = @as([64]u8, @splat(0xAA)); // raw r||s placeholder
     var pbuf: [64]u8 = undefined;
     var paybuf: [64]u8 = undefined;
     var sbuf: [128]u8 = undefined;
@@ -274,7 +274,7 @@ test "flattened: empty payload (POST-as-GET) has empty payload field" {
     // Arrange
     var buf: [512]u8 = undefined;
     const protected = "{\"kid\":\"u\"}";
-    const signature = [_]u8{0x01} ** 64;
+    const signature = @as([64]u8, @splat(0x01));
 
     // Act
     const jws = try flattened(protected, "", &signature, &buf);
@@ -291,6 +291,6 @@ test "NoSpaceLeft surfaces when output buffer too small" {
     // Act / Assert
     try std.testing.expectError(error.NoSpaceLeft, protectedHeaderKid("ES256", "n", "u", "k", &tiny));
     try std.testing.expectError(error.NoSpaceLeft, signingInput("{\"a\":1}", "{\"b\":2}", &tiny));
-    const sig = [_]u8{0} ** 64;
+    const sig = @as([64]u8, @splat(0));
     try std.testing.expectError(error.NoSpaceLeft, flattened("{}", "{}", &sig, &tiny));
 }

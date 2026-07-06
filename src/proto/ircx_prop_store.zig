@@ -167,8 +167,8 @@ pub const ChannelPropInfo = struct {
 };
 
 pub fn channelPropKey(raw: []const u8) ?ChannelPropKey {
-    inline for (@typeInfo(ChannelPropKey).@"enum".fields) |field| {
-        const key: ChannelPropKey = @field(ChannelPropKey, field.name);
+    inline for (@typeInfo(ChannelPropKey).@"enum".field_names) |field_name| {
+        const key: ChannelPropKey = @field(ChannelPropKey, field_name);
         if (std.ascii.eqlIgnoreCase(raw, key.token())) return key;
     }
     return null;
@@ -227,8 +227,8 @@ pub const UserProfilePropInfo = struct {
 };
 
 pub fn userProfilePropKey(raw: []const u8) ?UserProfilePropKey {
-    inline for (@typeInfo(UserProfilePropKey).@"enum".fields) |field| {
-        const key: UserProfilePropKey = @field(UserProfilePropKey, field.name);
+    inline for (@typeInfo(UserProfilePropKey).@"enum".field_names) |field_name| {
+        const key: UserProfilePropKey = @field(UserProfilePropKey, field_name);
         if (std.ascii.eqlIgnoreCase(raw, key.token())) return key;
     }
     return null;
@@ -956,7 +956,7 @@ test "user profile properties use the profile value limit" {
         try std.testing.expect(userProfilePropKey(case.key) != null);
     }
 
-    var too_long = [_]u8{'x'} ** (user_profile_max_value + 1);
+    var too_long = @as([(user_profile_max_value + 1)]u8, @splat('x'));
     try std.testing.expectError(error.InvalidValue, store.setProp(entity, "URL", too_long[0..], setter));
 
     // The tighter cap applies only to the newly added Ophion-profile fields.

@@ -385,9 +385,9 @@ fn Sim(comptime n: usize) type {
     return struct {
         const Self = @This();
         nodes: [n]Mesh = undefined,
-        alive: [n]bool = [_]bool{true} ** n,
+        alive: [n]bool = @splat(true),
         queue: std.ArrayList(SimMsg) = .empty,
-        delivered: [n]usize = [_]usize{0} ** n,
+        delivered: [n]usize = @splat(0),
         now_ms: i64 = 0,
         allocator: std.mem.Allocator,
 

@@ -151,6 +151,6 @@ test "decode rejects truncated, trailing, empty, and control-byte payloads" {
 
 test "encode enforces field bounds" {
     var buf: [max_encoded_len]u8 = undefined;
-    const long_name = "x" ** (max_name_len + 1);
+    const long_name = &@as([(max_name_len + 1)]u8, @splat('x'));
     try testing.expectError(error.FieldTooLong, encode(.{ .origin_server = long_name, .killer = "k", .target = "t", .reason = "r" }, &buf));
 }

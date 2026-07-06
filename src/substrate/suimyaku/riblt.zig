@@ -226,7 +226,7 @@ fn xorKey(target: *Key, source: Key) void {
 }
 
 fn zeroKey() Key {
-    return [_]u8{0} ** 32;
+    return @as([32]u8, @splat(0));
 }
 
 fn containsKey(keys: []const Key, needle: Key) bool {

@@ -448,19 +448,19 @@ test "STUN header encode/decode round-trip" {
 }
 
 test "STUN header decode: bad magic cookie" {
-    var buf: [20]u8 = .{0} ** 20;
+    var buf: [20]u8 = @splat(0);
     mem.writeInt(u32, buf[4..8], 0xDEAD_BEEF, .big); // wrong cookie
     const result = decodeStunHeader(&buf);
     try testing.expectError(error.BadMagicCookie, result);
 }
 
 test "STUN header decode: buffer too short" {
-    const buf: [10]u8 = .{0} ** 10;
+    const buf: [10]u8 = @splat(0);
     try testing.expectError(error.BufferTooShort, decodeStunHeader(&buf));
 }
 
 test "STUN header decode: truncated attributes" {
-    var buf: [24]u8 = .{0} ** 24;
+    var buf: [24]u8 = @splat(0);
     const msg_type = encodeMessageType(.allocate, .request);
     mem.writeInt(u16, buf[0..2], msg_type, .big);
     mem.writeInt(u16, buf[2..4], 100, .big); // claims 100 bytes of attrs
@@ -500,7 +500,7 @@ test "attribute TLV: multiple attrs iteration" {
 }
 
 test "XOR-address IPv4 encode/decode round-trip" {
-    const txn: TxnId = .{0} ** 12;
+    const txn: TxnId = @splat(0);
     const ip4: [4]u8 = .{ 192, 168, 1, 10 };
     var vbuf: [8]u8 = undefined;
     encodeXorAddr(&vbuf, .{ .v4 = ip4 }, 3478, &txn);
@@ -520,14 +520,14 @@ test "XOR-address IPv6 encode/decode round-trip" {
 }
 
 test "XOR-address decode: buffer too short" {
-    const txn: TxnId = .{0} ** 12;
+    const txn: TxnId = @splat(0);
     const short: [3]u8 = .{ 0, 1, 0 };
     try testing.expectError(error.BufferTooShort, decodeXorAddr(&short, &txn));
 }
 
 test "XOR-address decode: unknown family" {
-    const txn: TxnId = .{0} ** 12;
-    var buf: [8]u8 = .{0} ** 8;
+    const txn: TxnId = @splat(0);
+    var buf: [8]u8 = @splat(0);
     buf[1] = 0x03; // invalid family
     try testing.expectError(error.UnknownFamily, decodeXorAddr(&buf, &txn));
 }
@@ -586,13 +586,13 @@ test "ChannelData decode: truncated payload" {
 }
 
 test "ChannelData decode: invalid channel number (below range)" {
-    var buf: [8]u8 = .{0} ** 8;
+    var buf: [8]u8 = @splat(0);
     mem.writeInt(u16, buf[0..2], 0x3FFF, .big); // one below valid range
     try testing.expectError(error.InvalidChannel, decodeChannelData(&buf));
 }
 
 test "ChannelData decode: invalid channel number (above range)" {
-    var buf: [8]u8 = .{0} ** 8;
+    var buf: [8]u8 = @splat(0);
     mem.writeInt(u16, buf[0..2], 0x8000, .big); // one above valid range
     try testing.expectError(error.InvalidChannel, decodeChannelData(&buf));
 }
@@ -675,7 +675,7 @@ test "Allocate success response with XOR-RELAYED-ADDRESS (IPv6)" {
 }
 
 test "ChannelBind request round-trip" {
-    const txn: TxnId = .{0x99} ** 12;
+    const txn: TxnId = @splat(0x99);
     const peer_ip4: [4]u8 = .{ 10, 0, 0, 1 };
     var buf: [256]u8 = undefined;
     var builder = MessageBuilder.init(&buf, .channel_bind, .request, txn);
@@ -705,7 +705,7 @@ test "ChannelBind request round-trip" {
 }
 
 test "Send indication with DATA attribute round-trip" {
-    const txn: TxnId = .{0x55} ** 12;
+    const txn: TxnId = @splat(0x55);
     var buf: [256]u8 = undefined;
     var builder = MessageBuilder.init(&buf, .send, .indication, txn);
     builder.appendData("hello peer");
@@ -721,7 +721,7 @@ test "Send indication with DATA attribute round-trip" {
 }
 
 test "Data indication round-trip" {
-    const txn: TxnId = .{0x77} ** 12;
+    const txn: TxnId = @splat(0x77);
     const payload: []const u8 = &.{ 0x01, 0x02, 0x03 };
     var buf: [256]u8 = undefined;
     var builder = MessageBuilder.init(&buf, .data, .indication, txn);
@@ -750,7 +750,7 @@ test "ChannelData round-trip with max payload boundary" {
 }
 
 test "Refresh request round-trip" {
-    const txn: TxnId = .{0x11} ** 12;
+    const txn: TxnId = @splat(0x11);
     var buf: [64]u8 = undefined;
     var builder = MessageBuilder.init(&buf, .refresh, .request, txn);
     builder.appendLifetime(0); // lifetime=0 means deallocate
@@ -764,7 +764,7 @@ test "Refresh request round-trip" {
 }
 
 test "CreatePermission request round-trip" {
-    const txn: TxnId = .{0x22} ** 12;
+    const txn: TxnId = @splat(0x22);
     const peer_ip4: [4]u8 = .{ 198, 51, 100, 7 };
     var buf: [128]u8 = undefined;
     var builder = MessageBuilder.init(&buf, .create_permission, .request, txn);

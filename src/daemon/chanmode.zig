@@ -334,7 +334,7 @@ pub const oper_mode_letter: u8 = 'Y';
 /// Inline prefix list returned by MemberModes.allPrefixes(). Sized for the four
 /// grantable tiers (!.@+) plus a possible leading oper `*`.
 pub const PrefixList = struct {
-    bytes: [5]u8 = [_]u8{0} ** 5,
+    bytes: [5]u8 = @splat(0),
     len: u8 = 0,
 
     pub fn asSlice(self: *const PrefixList) []const u8 {

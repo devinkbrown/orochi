@@ -113,9 +113,9 @@ pub const EntityScope = enum {
     }
 
     pub fn parse(raw: []const u8) ?EntityScope {
-        inline for (@typeInfo(EntityScope).@"enum".fields) |field| {
-            if (std.ascii.eqlIgnoreCase(raw, field.name)) {
-                return @field(EntityScope, field.name);
+        inline for (@typeInfo(EntityScope).@"enum".field_names) |field_name| {
+            if (std.ascii.eqlIgnoreCase(raw, field_name)) {
+                return @field(EntityScope, field_name);
             }
         }
         return null;

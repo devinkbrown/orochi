@@ -47,13 +47,13 @@ pub fn shortId(node_id: NodeId) u64 {
 const testing = std.testing;
 
 test "shortId is deterministic for the same node id" {
-    const id: NodeId = [_]u8{0xAB} ** 20;
+    const id: NodeId = @splat(0xAB);
     try testing.expectEqual(shortId(id), shortId(id));
 }
 
 test "distinct node ids yield distinct handles (no trivial collision)" {
-    const a: NodeId = [_]u8{0x01} ** 20;
-    var b: NodeId = [_]u8{0x01} ** 20;
+    const a: NodeId = @splat(0x01);
+    var b: NodeId = @splat(0x01);
     b[19] = 0x02; // flip one byte
     try testing.expect(shortId(a) != shortId(b));
 }
@@ -63,14 +63,14 @@ test "handle is never the zero sentinel" {
     // if the hash ever produced one).
     var i: u32 = 0;
     while (i < 2048) : (i += 1) {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @splat(0);
         std.mem.writeInt(u32, id[0..4], i, .little);
         try testing.expect(shortId(id) != 0);
     }
 }
 
 test "derivation diffuses: a single-bit input change flips many output bits" {
-    const a: NodeId = [_]u8{0x55} ** 20;
+    const a: NodeId = @splat(0x55);
     var b = a;
     b[0] ^= 0x01;
     const da = shortId(a);

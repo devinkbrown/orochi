@@ -693,7 +693,7 @@ test "channel-binding n,, gs2 header is echoed by client-final c=biws" {
     try std.testing.expectEqualStrings("n,,", first.gs2_header);
     try std.testing.expectEqualStrings("n=user,r=abc123", first.client_first_bare);
 
-    var proof: [digest_len]u8 = .{0} ** digest_len;
+    var proof: [digest_len]u8 = @splat(0);
     var proof_b64_buf: [std.base64.standard.Encoder.calcSize(digest_len)]u8 = undefined;
     const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
     var raw_buf: [MAX_MESSAGE]u8 = undefined;

@@ -429,17 +429,17 @@ test "real_host without certfp leaves certfp empty; absent both stays old-format
 }
 
 test "an over-long real_host / certfp is rejected by encode" {
-    const big_host = "a" ** (max_real_host_len + 1);
+    const big_host = &@as([(max_real_host_len + 1)]u8, @splat('a'));
     const ev_h = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .real_host = big_host };
     var buf: [max_encoded_len]u8 = undefined;
     try testing.expectError(error.NameTooLong, encode(ev_h, &buf));
-    const big_fp = "a" ** (max_certfp_len + 1);
+    const big_fp = &@as([(max_certfp_len + 1)]u8, @splat('a'));
     const ev_f = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .certfp = big_fp };
     try testing.expectError(error.NameTooLong, encode(ev_f, &buf));
 }
 
 test "an over-long account is rejected by encode" {
-    const big = "a" ** (max_account_len + 1);
+    const big = &@as([(max_account_len + 1)]u8, @splat('a'));
     const ev = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .account = big };
     try testing.expectError(error.NameTooLong, encodedLen(ev));
 }
@@ -464,19 +464,19 @@ test "setter round-trips and an empty setter stays old-format compatible" {
 }
 
 test "over-long names are rejected by encode and decode" {
-    const big = "#" ++ ("x" ** max_channel_len);
+    const big = "#" ++ (&@as([max_channel_len]u8, @splat('x')));
     const ev = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = big, .nick = "n" };
     try testing.expectError(error.NameTooLong, encodedLen(ev));
 
-    const big_user = "u" ** (max_username_len + 1);
+    const big_user = &@as([(max_username_len + 1)]u8, @splat('u'));
     const ev2 = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .username = big_user };
     try testing.expectError(error.NameTooLong, encodedLen(ev2));
 
-    const big_real = "r" ** (max_realname_len + 1);
+    const big_real = &@as([(max_realname_len + 1)]u8, @splat('r'));
     const ev3 = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .realname = big_real };
     try testing.expectError(error.NameTooLong, encodedLen(ev3));
 
-    const big_host = "h" ** (max_host_len + 1);
+    const big_host = &@as([(max_host_len + 1)]u8, @splat('h'));
     const ev4 = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .host = big_host };
     try testing.expectError(error.NameTooLong, encodedLen(ev4));
 }

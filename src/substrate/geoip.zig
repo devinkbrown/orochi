@@ -327,7 +327,7 @@ pub const Database = struct {
     }
 
     fn findRecordEx(self: Database, ip: Ip) Error!?RecordHit {
-        var ip_buf = [_]u8{0} ** 16;
+        var ip_buf = @as([16]u8, @splat(0));
         const bit_count: usize = switch (ip) {
             .v4 => |v4| if (self.metadata.ip_version == 4) blk: {
                 ip_buf[0..4].* = v4;
@@ -816,7 +816,7 @@ fn appendUint(out: *ByteList, value_type: ValueType, value: u64) !void {
         .uint64 => 8,
         else => return Error.UnsupportedDatabase,
     };
-    var tmp = [_]u8{0} ** 8;
+    var tmp = @as([8]u8, @splat(0));
     var value_copy = value;
     var len: usize = 0;
     while (value_copy != 0) : (value_copy >>= 8) len += 1;

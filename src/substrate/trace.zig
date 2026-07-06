@@ -131,7 +131,7 @@ pub const CategoryFilter = struct {
     levels: [category_slots]Level,
 
     pub fn init(default_level: Level) CategoryFilter {
-        return .{ .levels = [_]Level{default_level} ** category_slots };
+        return .{ .levels = @as([category_slots]Level, @splat(default_level)) };
     }
 
     pub fn set(self: *CategoryFilter, category: Category, minimum: Level) void {
@@ -205,7 +205,7 @@ pub const RecordedEvent = struct {
     ts_mono_ns: u64 = 0,
     hlc: Hlc = 0,
     msg: StoredMsg = .{},
-    fields: [max_fields]RecordedField = [_]RecordedField{.{}} ** max_fields,
+    fields: [max_fields]RecordedField = @splat(.{}),
     field_count: usize = 0,
 
     pub fn fromEvent(event: Event) RecordedEvent {
@@ -245,7 +245,7 @@ pub fn FlightRecorder(comptime capacity: usize) type {
 
         head: Counter align(cache_line_bytes) = .init(0),
         tail: Counter align(cache_line_bytes) = .init(0),
-        events: [capacity]RecordedEvent = [_]RecordedEvent{.{}} ** capacity,
+        events: [capacity]RecordedEvent = @splat(.{}),
 
         pub fn init() Self {
             return .{};
@@ -327,7 +327,7 @@ fn Stored(comptime max_len: usize) type {
     return struct {
         const Self = @This();
 
-        buf: [max_len]u8 = [_]u8{0} ** max_len,
+        buf: [max_len]u8 = @splat(0),
         len: usize = 0,
 
         pub fn fromSlice(src: []const u8) Self {

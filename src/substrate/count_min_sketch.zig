@@ -362,7 +362,7 @@ test "estimates never undercount true frequencies" {
     var sketch = try CountMinSketch.initSeeded(std.testing.allocator, 64, 5, 0xabc);
     defer sketch.deinit();
 
-    var true_counts = [_]Count{0} ** 80;
+    var true_counts = @as([80]Count, @splat(0));
     for (&true_counts, 0..) |*count, i| {
         var key: [8]u8 = undefined;
         writeU64Big(&key, @intCast(i));
@@ -382,7 +382,7 @@ test "overestimate stays within epsilon total on deterministic sample" {
     var sketch = try CountMinSketch.initSeeded(std.testing.allocator, 256, 6, 0x5555);
     defer sketch.deinit();
 
-    var true_counts = [_]Count{0} ** 120;
+    var true_counts = @as([120]Count, @splat(0));
     for (&true_counts, 0..) |*actual, i| {
         var key: [8]u8 = undefined;
         writeU64Big(&key, @intCast(i));
@@ -408,7 +408,7 @@ test "conservative update reduces aggregate overestimate" {
     var conservative = try CountMinSketch.initSeeded(std.testing.allocator, 12, 4, 0x7777);
     defer conservative.deinit();
 
-    var true_counts = [_]Count{0} ** 64;
+    var true_counts = @as([64]Count, @splat(0));
     for (0..400) |n| {
         const item_index = (n * 17 + n / 3) % true_counts.len;
         const amount: Count = if (item_index < 4) 5 else 1;

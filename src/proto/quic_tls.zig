@@ -290,9 +290,9 @@ pub const PacketKeys = struct {
 pub fn derivePacketKeys(traffic_secret: [32]u8, suite: CipherSuite) PacketKeys {
     var pk: PacketKeys = .{
         .suite = suite,
-        .key = [_]u8{0} ** max_key_len,
+        .key = @as([max_key_len]u8, @splat(0)),
         .iv = undefined,
-        .hp = [_]u8{0} ** max_key_len,
+        .hp = @as([max_key_len]u8, @splat(0)),
     };
     const klen = suite.keyLen();
     const hlen = suite.hpKeyLen();
@@ -442,7 +442,7 @@ test "hkdfExpandLabel — output length changes the derived key" {
     // The HkdfLabel info encodes the requested output length, so asking for
     // 16 vs 32 bytes from the same PRK + label produces different T(1) blocks.
     // This test verifies that behaviour and that each expansion is non-zero.
-    const prk = [_]u8{0x42} ** 32;
+    const prk = @as([32]u8, @splat(0x42));
     var out16: [16]u8 = undefined;
     var out32: [32]u8 = undefined;
     var out12: [12]u8 = undefined;
@@ -450,8 +450,8 @@ test "hkdfExpandLabel — output length changes the derived key" {
     hkdfExpandLabel(&out32, prk, "quic key", "");
     hkdfExpandLabel(&out12, prk, "quic iv", "");
     // Outputs must be non-zero (expansion actually ran).
-    try testing.expect(!mem.eql(u8, &out16, &([_]u8{0} ** 16)));
-    try testing.expect(!mem.eql(u8, &out12, &([_]u8{0} ** 12)));
+    try testing.expect(!mem.eql(u8, &out16, &(@as([16]u8, @splat(0)))));
+    try testing.expect(!mem.eql(u8, &out12, &(@as([12]u8, @splat(0)))));
     // Because length is encoded in HkdfLabel, out16 and out32[0..16] DIFFER.
     try testing.expect(!mem.eql(u8, &out16, out32[0..16]));
     // Different labels produce different output (belt-and-suspenders).
@@ -459,7 +459,7 @@ test "hkdfExpandLabel — output length changes the derived key" {
 }
 
 test "hkdfExpandLabel — deterministic" {
-    const prk = [_]u8{0x11} ** 32;
+    const prk = @as([32]u8, @splat(0x11));
     var a: [16]u8 = undefined;
     var b: [16]u8 = undefined;
     hkdfExpandLabel(&a, prk, "quic key", "");
@@ -468,7 +468,7 @@ test "hkdfExpandLabel — deterministic" {
 }
 
 test "hkdfExpandLabel — label sensitivity" {
-    const prk = [_]u8{0x55} ** 32;
+    const prk = @as([32]u8, @splat(0x55));
     var key_out: [16]u8 = undefined;
     var hp_out: [16]u8 = undefined;
     hkdfExpandLabel(&key_out, prk, "quic key", "");
@@ -489,7 +489,7 @@ test "hkdfExpandLabel — label sensitivity" {
 //           90b6c73bb50f9c3122ec844ad7c2b3e5  (32 octets)
 
 test "hkdfExtract — RFC 5869 A.1 vector" {
-    const ikm = [_]u8{0x0b} ** 22;
+    const ikm = @as([22]u8, @splat(0x0b));
     const salt = fromHex(13, "000102030405060708090a0b0c");
     const prk = hkdfExtract(&salt, &ikm);
     const exp = fromHex(32, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
@@ -501,26 +501,26 @@ test "hkdfExtract — RFC 5869 A.1 vector" {
 // ---------------------------------------------------------------------------
 
 test "headerProtectionMask — deterministic" {
-    const key = [_]u8{0xaa} ** 16;
-    const sample = [_]u8{0xbb} ** 16;
+    const key = @as([16]u8, @splat(0xaa));
+    const sample = @as([16]u8, @splat(0xbb));
     const m1 = headerProtectionMask(key, sample);
     const m2 = headerProtectionMask(key, sample);
     try testing.expectEqualSlices(u8, &m1, &m2);
 }
 
 test "headerProtectionMask — key sensitivity" {
-    const key1 = [_]u8{0x01} ** 16;
-    const key2 = [_]u8{0x02} ** 16;
-    const sample = [_]u8{0xcc} ** 16;
+    const key1 = @as([16]u8, @splat(0x01));
+    const key2 = @as([16]u8, @splat(0x02));
+    const sample = @as([16]u8, @splat(0xcc));
     const m1 = headerProtectionMask(key1, sample);
     const m2 = headerProtectionMask(key2, sample);
     try testing.expect(!mem.eql(u8, &m1, &m2));
 }
 
 test "headerProtectionMask — sample sensitivity" {
-    const key = [_]u8{0xff} ** 16;
-    const s1 = [_]u8{0x00} ** 16;
-    const s2 = [_]u8{0x01} ** 16;
+    const key = @as([16]u8, @splat(0xff));
+    const s1 = @as([16]u8, @splat(0x00));
+    const s2 = @as([16]u8, @splat(0x01));
     const m1 = headerProtectionMask(key, s1);
     const m2 = headerProtectionMask(key, s2);
     try testing.expect(!mem.eql(u8, &m1, &m2));
@@ -594,9 +594,9 @@ test "quic CipherSuite — key/hp lengths per suite" {
 }
 
 test "quic AES-256 header-protection mask is deterministic and key-sensitive" {
-    const sample = [_]u8{0x9c} ** 16;
-    const k1 = [_]u8{0x01} ** 32;
-    const k2 = [_]u8{0x02} ** 32;
+    const sample = @as([16]u8, @splat(0x9c));
+    const k1 = @as([32]u8, @splat(0x01));
+    const k2 = @as([32]u8, @splat(0x02));
     const m1 = headerProtectionMaskAes256(k1, sample);
     try testing.expectEqualSlices(u8, &m1, &headerProtectionMaskAes256(k1, sample));
     try testing.expect(!mem.eql(u8, &m1, &headerProtectionMaskAes256(k2, sample)));

@@ -248,11 +248,11 @@ pub const Server = struct {
     // Secrets stored at SHA-384 width; only the live (hash-length) prefix is
     // used. The Handshake secret is retained so the Master secret (and thus the
     // application traffic secrets) can be derived after the server flight.
-    handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_ap_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_ap_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    handshake_secret: [max_hash_len]u8 = @splat(0),
+    client_hs_secret: [max_hash_len]u8 = @splat(0),
+    server_hs_secret: [max_hash_len]u8 = @splat(0),
+    client_ap_secret: [max_hash_len]u8 = @splat(0),
+    server_ap_secret: [max_hash_len]u8 = @splat(0),
 
     handshake_keys: ?KeySet = null,
     application_keys: ?KeySet = null,
@@ -798,9 +798,9 @@ fn derivePacketKeys(comptime KS: type, suite: CipherSuite, secret: []const u8) P
 
     var pk: PacketKeys = .{
         .suite = qsuite,
-        .key = [_]u8{0} ** quic_tls.max_key_len,
+        .key = @as([quic_tls.max_key_len]u8, @splat(0)),
         .iv = undefined,
-        .hp = [_]u8{0} ** quic_tls.max_key_len,
+        .hp = @as([quic_tls.max_key_len]u8, @splat(0)),
     };
     const klen = qsuite.keyLen();
     const hlen = qsuite.hpKeyLen();
@@ -1029,11 +1029,11 @@ pub const Client = struct {
     out_initial: std.ArrayList(u8) = .empty,
     out_handshake: std.ArrayList(u8) = .empty,
 
-    client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_ap_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_ap_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    client_hs_secret: [max_hash_len]u8 = @splat(0),
+    server_hs_secret: [max_hash_len]u8 = @splat(0),
+    client_ap_secret: [max_hash_len]u8 = @splat(0),
+    server_ap_secret: [max_hash_len]u8 = @splat(0),
+    handshake_secret: [max_hash_len]u8 = @splat(0),
 
     handshake_keys: ?KeySet = null,
     application_keys: ?KeySet = null,
@@ -1071,7 +1071,7 @@ pub const Client = struct {
         return .{
             .allocator = allocator,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
-            .client_random = [_]u8{0x11} ** 32,
+            .client_random = @as([32]u8, @splat(0x11)),
             .alpn_protocols = alpn_protocols,
             .transport_params = transport_params,
         };
@@ -1512,7 +1512,7 @@ fn runLoopback(
     alpn_server: []const []const u8,
     alpn_client: []const []const u8,
 ) !struct { server_suite: CipherSuite, server_alpn: ?[]const u8 } {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
 
@@ -1521,12 +1521,12 @@ fn runLoopback(
         .signing_key = .{ .ed25519 = kp },
         .alpn_protocols = alpn_server,
         .transport_params = test_server_params,
-        .x25519_seed = [_]u8{0x21} ** kx.X25519Kx.seed_len,
-        .server_random = [_]u8{0x55} ** 32,
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x21)),
+        .server_random = @as([32]u8, @splat(0x55)),
     });
     defer server.deinit();
 
-    var client = try TestClient.init(alloc, [_]u8{0x42} ** kx.X25519Kx.seed_len, alpn_client, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x42)), alpn_client, test_client_params);
     defer client.deinit();
 
     var ch = try client.start();
@@ -1608,7 +1608,7 @@ test "quic handshake loopback completes for TLS_AES_128_GCM_SHA256 with matching
 
 test "quic handshake loopback agrees on keys for ChaCha20-Poly1305-SHA256" {
     // Offer only ChaCha20 so the server selects the SHA-256 ChaCha suite.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x38} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x38)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1620,7 +1620,7 @@ test "quic handshake loopback agrees on keys for ChaCha20-Poly1305-SHA256" {
         .transport_params = test_server_params,
     });
     defer server.deinit();
-    var client = try TestClient.init(alloc, [_]u8{0x43} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x43)), &.{"h3"}, test_client_params);
     defer client.deinit();
 
     // ClientHello offering ONLY ChaCha20.
@@ -1647,7 +1647,7 @@ test "quic handshake loopback agrees on keys for ChaCha20-Poly1305-SHA256" {
 }
 
 test "quic handshake loopback agrees on keys for AES-256-GCM-SHA384" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x39} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x39)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1659,7 +1659,7 @@ test "quic handshake loopback agrees on keys for AES-256-GCM-SHA384" {
         .transport_params = test_server_params,
     });
     defer server.deinit();
-    var client = try TestClient.init(alloc, [_]u8{0x44} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x44)), &.{"h3"}, test_client_params);
     defer client.deinit();
 
     var ch = try buildSingleSuiteHello(alloc, &client, .tls_aes_256_gcm_sha384);
@@ -1734,7 +1734,7 @@ test "quic handshake negotiates ALPN and exchanges transport parameters" {
 }
 
 test "quic handshake surfaces peer transport params on both sides" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3a} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3a)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1746,7 +1746,7 @@ test "quic handshake surfaces peer transport params on both sides" {
         .transport_params = test_server_params,
     });
     defer server.deinit();
-    var client = try TestClient.init(alloc, [_]u8{0x45} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x45)), &.{"h3"}, test_client_params);
     defer client.deinit();
 
     var ch = try client.start();
@@ -1772,7 +1772,7 @@ test "quic handshake surfaces peer transport params on both sides" {
 }
 
 test "quic handshake rejects a ClientHello with no transport parameters" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3b} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3b)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1788,13 +1788,13 @@ test "quic handshake rejects a ClientHello with no transport parameters" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     try appendU16(alloc, &body, legacy_version);
-    try body.appendSlice(alloc, &([_]u8{0x11} ** 32));
+    try body.appendSlice(alloc, &(@as([32]u8, @splat(0x11))));
     try body.append(alloc, 0);
     try appendU16(alloc, &body, 2);
     try appendU16(alloc, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
     try body.append(alloc, 1);
     try body.append(alloc, 0);
-    var seed = [_]u8{0x42} ** kx.X25519Kx.seed_len;
+    var seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42));
     var pair = try kx.X25519Kx.generateDeterministic(seed);
     defer pair.wipe();
     seed = undefined;
@@ -1814,7 +1814,7 @@ test "quic handshake rejects a ClientHello with no transport parameters" {
 }
 
 test "quic handshake client rejects a tampered server Finished" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3c} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3c)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1825,7 +1825,7 @@ test "quic handshake client rejects a tampered server Finished" {
         .transport_params = test_server_params,
     });
     defer server.deinit();
-    var client = try TestClient.init(alloc, [_]u8{0x46} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x46)), &.{"h3"}, test_client_params);
     defer client.deinit();
 
     var ch = try client.start();
@@ -1845,7 +1845,7 @@ test "quic handshake client rejects a tampered server Finished" {
 }
 
 test "quic handshake server rejects a tampered client Finished" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3d} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3d)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1856,7 +1856,7 @@ test "quic handshake server rejects a tampered client Finished" {
         .transport_params = test_server_params,
     });
     defer server.deinit();
-    var client = try TestClient.init(alloc, [_]u8{0x47} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+    var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x47)), &.{"h3"}, test_client_params);
     defer client.deinit();
 
     var ch = try client.start();
@@ -1878,7 +1878,7 @@ test "quic handshake server rejects a tampered client Finished" {
 
 test "quic handshake feeds a ClientHello split across two CRYPTO chunks" {
     const r = blk: {
-        const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x3e} ** Ed25519.KeyPair.seed_length);
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3e)));
         var cert_buf: [1024]u8 = undefined;
         const der = try mintEd25519Cert(&cert_buf, kp);
         const alloc = testing.allocator;
@@ -1889,7 +1889,7 @@ test "quic handshake feeds a ClientHello split across two CRYPTO chunks" {
             .transport_params = test_server_params,
         });
         defer server.deinit();
-        var client = try TestClient.init(alloc, [_]u8{0x48} ** kx.X25519Kx.seed_len, &.{"h3"}, test_client_params);
+        var client = try TestClient.init(alloc, @as([kx.X25519Kx.seed_len]u8, @splat(0x48)), &.{"h3"}, test_client_params);
         defer client.deinit();
 
         var ch = try client.start();
@@ -1916,7 +1916,7 @@ test "quic handshake feeds a ClientHello split across two CRYPTO chunks" {
 }
 
 test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybrid server share" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5a} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5a)));
     var cert_buf: [1024]u8 = undefined;
     const der = try mintEd25519Cert(&cert_buf, kp);
     const alloc = testing.allocator;
@@ -1930,11 +1930,11 @@ test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybr
 
     // Build a ClientHello that offers ONLY an X25519MLKEM768 key_share, exactly
     // as modern Chrome/Edge do for WebTransport. Client share = ek(1184) ‖ pk(32).
-    var x_seed = [_]u8{0x63} ** kx.X25519Kx.seed_len;
+    var x_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x63));
     var x_pair = try kx.X25519Kx.generateDeterministic(x_seed);
     defer x_pair.wipe();
     x_seed = undefined;
-    const mlkem_kp = try MlKem768.KeyPair.generateDeterministic([_]u8{0x29} ** MlKem768.seed_length);
+    const mlkem_kp = try MlKem768.KeyPair.generateDeterministic(@as([MlKem768.seed_length]u8, @splat(0x29)));
     var client_share: [hybrid_client_share_len]u8 = undefined;
     client_share[0..mlkem_ek_len].* = mlkem_kp.public_key.toBytes();
     client_share[mlkem_ek_len..].* = x_pair.public_key;
@@ -1942,7 +1942,7 @@ test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybr
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     try appendU16(alloc, &body, legacy_version);
-    try body.appendSlice(alloc, &([_]u8{0x11} ** 32));
+    try body.appendSlice(alloc, &(@as([32]u8, @splat(0x11))));
     try body.append(alloc, 0); // empty legacy_session_id
     try appendU16(alloc, &body, 2);
     try appendU16(alloc, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));

@@ -61,8 +61,8 @@ pub fn HashedTimerWheel(comptime config: WheelConfig) type {
             active: bool = false,
         };
 
-        heads: [config.slots]usize = [_]usize{none} ** config.slots,
-        tails: [config.slots]usize = [_]usize{none} ** config.slots,
+        heads: [config.slots]usize = @splat(none),
+        tails: [config.slots]usize = @splat(none),
         nodes: [config.capacity]Node = initNodes(),
         free_head: usize = if (config.capacity == 0) none else 0,
         cursor_tick: usize = 0,

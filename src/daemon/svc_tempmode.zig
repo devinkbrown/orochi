@@ -427,7 +427,7 @@ fn addDuration(now_ms: TimestampMs, duration_ms: TimestampMs) TempModeError!Time
 
 const IrcLine = struct {
     command: []const u8,
-    params: [MAX_IRC_PARAMS][]const u8 = [_][]const u8{""} ** MAX_IRC_PARAMS,
+    params: [MAX_IRC_PARAMS][]const u8 = @splat(""),
     param_count: usize = 0,
 
     fn paramSlice(self: *const IrcLine) []const []const u8 {

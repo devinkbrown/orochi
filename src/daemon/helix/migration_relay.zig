@@ -978,7 +978,7 @@ const testing = std.testing;
 /// Deterministic Ed25519 keypair from a single seed byte. No CSPRNG.
 fn testKey(seed: u8) !KeyPair {
     const Ed25519 = std.crypto.sign.Ed25519;
-    return KeyPair.generateDeterministic([_]u8{seed} ** Ed25519.KeyPair.seed_length);
+    return KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
 }
 
 fn sampleSnapshot() Snapshot {

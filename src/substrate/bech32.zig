@@ -265,7 +265,7 @@ pub fn base58CheckDecode(allocator: std.mem.Allocator, text: []const u8) (Base58
 }
 
 fn createChecksum(hrp: []const u8, data5: []const u8, encoding: Encoding) [BECH32_CHECKSUM_LEN]u8 {
-    var values: [BECH32_CHECKSUM_LEN]u8 = .{0} ** BECH32_CHECKSUM_LEN;
+    var values: [BECH32_CHECKSUM_LEN]u8 = @splat(0);
     const constant = encodingConstant(encoding);
     var chk = polymodHrpData(hrp, data5);
     for (0..BECH32_CHECKSUM_LEN) |_| chk = polymodStep(chk, 0);

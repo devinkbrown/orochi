@@ -165,7 +165,7 @@ fn lowerName(buf: []u8, name: []const u8) ?[]const u8 {
 
 /// Build the hashable key for an address via an exhaustive switch.
 fn addressKey(address: Address) HostsTable.AddressKey {
-    var key = HostsTable.AddressKey{ .is_v6 = false, .bytes = [_]u8{0} ** 16 };
+    var key = HostsTable.AddressKey{ .is_v6 = false, .bytes = @as([16]u8, @splat(0)) };
     switch (address) {
         .ipv4 => |octets| {
             key.is_v6 = false;
@@ -224,7 +224,7 @@ fn parseIpv6(text: []const u8) ?[16]u8 {
         const tail_len = parseGroups(tail, &tail_groups) orelse return null;
         if (head_len + tail_len > ipv6_groups) return null;
 
-        var groups = [_]u16{0} ** ipv6_groups;
+        var groups = @as([ipv6_groups]u16, @splat(0));
         for (0..head_len) |i| groups[i] = head_groups[i];
         const tail_start = ipv6_groups - tail_len;
         for (0..tail_len) |i| groups[tail_start + i] = tail_groups[i];
@@ -337,7 +337,7 @@ test "IPv6 entry parses with zero-run compression in both directions" {
     var table = HostsTable.init(std.testing.allocator);
     defer table.deinit();
     try table.parse("::1 ip6-localhost ip6-loopback\n");
-    var expected_bytes = [_]u8{0} ** 16;
+    var expected_bytes = @as([16]u8, @splat(0));
     expected_bytes[15] = 1;
     const expected = Address{ .ipv6 = expected_bytes };
 

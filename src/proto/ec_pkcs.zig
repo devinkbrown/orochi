@@ -91,7 +91,7 @@ pub fn parseScalar(der: []const u8) ParseError![scalar_len]u8 {
 
 fn scalarFromOctets(value: []const u8) ParseError![scalar_len]u8 {
     if (value.len == 0 or value.len > scalar_len) return error.InvalidKey;
-    var out: [scalar_len]u8 = [_]u8{0} ** scalar_len;
+    var out: [scalar_len]u8 = @splat(0);
     @memcpy(out[scalar_len - value.len ..], value);
     return out;
 }

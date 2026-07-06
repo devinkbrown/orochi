@@ -160,9 +160,9 @@ pub const Server = struct {
     transcript: std.ArrayList(u8) = .empty,
 
     key_pair: ecdh_p256.KeyPair,
-    client_random: [32]u8 = [_]u8{0} ** 32,
+    client_random: [32]u8 = @splat(0),
     server_random: [32]u8,
-    session_id: [32]u8 = [_]u8{0} ** 32,
+    session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
     /// The client offered status_request (wants an OCSP staple).
     client_requested_ocsp: bool = false,
@@ -204,7 +204,7 @@ pub const Server = struct {
     /// the resume path to confirm the ticket's suite was actually offered.
     offered_suites: []const u8 = &.{},
 
-    master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
+    master_secret: [tls12.master_secret_len]u8 = @splat(0),
     keys: tls12.KeyMaterial = .{},
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
@@ -1903,7 +1903,7 @@ test "TLS 1.2 tampered encrypted Finished is rejected" {
 
 // ---- RFC 5077 session-ticket resumption tests ----
 
-const test_ticket_key = [_]u8{0x5c} ** @sizeOf(tls_resumption.TicketKey);
+const test_ticket_key = @as([@sizeOf(tls_resumption.TicketKey)]u8, @splat(0x5c));
 
 /// Drive one full TLS 1.2 handshake with tickets enabled, asserting the server
 /// issued a NewSessionTicket, and return the serialized resumable session the

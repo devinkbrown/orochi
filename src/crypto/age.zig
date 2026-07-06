@@ -187,14 +187,14 @@ fn appendHeaderWithoutMac(
 }
 
 fn wrapFileKey(wrap_key: [Aead.key_length]u8, file_key: FileKey) [wrapped_file_key_len]u8 {
-    const zero_nonce = [_]u8{0} ** Aead.nonce_length;
+    const zero_nonce = @as([Aead.nonce_length]u8, @splat(0));
     var wrapped: [wrapped_file_key_len]u8 = undefined;
     Aead.encrypt(wrapped[0..file_key_len], wrapped[file_key_len..][0..tag_len], &file_key, "", zero_nonce, wrap_key);
     return wrapped;
 }
 
 fn unwrapFileKey(wrap_key: [Aead.key_length]u8, wrapped: [wrapped_file_key_len]u8) !FileKey {
-    const zero_nonce = [_]u8{0} ** Aead.nonce_length;
+    const zero_nonce = @as([Aead.nonce_length]u8, @splat(0));
     var file_key: FileKey = undefined;
     errdefer secureZero(&file_key);
     Aead.decrypt(&file_key, wrapped[0..file_key_len], wrapped[file_key_len..][0..tag_len].*, "", zero_nonce, wrap_key) catch
@@ -310,7 +310,7 @@ fn deriveKey(salt: []const u8, ikm: []const u8, info: []const u8) [Aead.key_leng
 
 fn streamNonce(counter: u128, final: bool) Error![Aead.nonce_length]u8 {
     if (counter >= (@as(u128, 1) << 88)) return error.ChunkCounterExhausted;
-    var nonce = [_]u8{0} ** Aead.nonce_length;
+    var nonce = @as([Aead.nonce_length]u8, @splat(0));
     var x = counter;
     var i: usize = 11;
     while (i > 0) {
@@ -426,7 +426,7 @@ const DeterministicIo = struct {
 };
 
 fn fixtureKeyPair(seed_byte: u8) !KeyPair {
-    return try KeyPair.generateDeterministic([_]u8{seed_byte} ** X25519.seed_length);
+    return try KeyPair.generateDeterministic(@as([X25519.seed_length]u8, @splat(seed_byte)));
 }
 
 fn roundTripSize(size: usize) !void {
@@ -517,9 +517,9 @@ test "fixed ephemeral scalar file key and nonce make encryption deterministic" {
     var rng_b = DeterministicIo{ .state = 0x2222 };
 
     const opts = EncryptOptions{
-        .ephemeral_scalar = [_]u8{0x61} ** secret_key_len,
-        .file_key = [_]u8{0x62} ** file_key_len,
-        .payload_nonce = [_]u8{0x63} ** payload_nonce_len,
+        .ephemeral_scalar = @as([secret_key_len]u8, @splat(0x61)),
+        .file_key = @as([file_key_len]u8, @splat(0x62)),
+        .payload_nonce = @as([payload_nonce_len]u8, @splat(0x63)),
     };
 
     const first = try encryptWithOptions(allocator, rng_a.io(), recipient.public_key, "deterministic", opts);
@@ -545,7 +545,7 @@ test "fixed ephemeral scalar alone still decrypts correctly" {
         rng.io(),
         recipient.public_key,
         "ephemeral injection",
-        [_]u8{0x71} ** secret_key_len,
+        @as([secret_key_len]u8, @splat(0x71)),
     );
     defer allocator.free(sealed);
 
@@ -555,5 +555,5 @@ test "fixed ephemeral scalar alone still decrypts correctly" {
 }
 
 test "header parser rejects non-age input" {
-    try testing.expectError(error.InvalidFormat, decrypt(testing.allocator, [_]u8{1} ** secret_key_len, "not age"));
+    try testing.expectError(error.InvalidFormat, decrypt(testing.allocator, @as([secret_key_len]u8, @splat(1)), "not age"));
 }

@@ -41,7 +41,7 @@ pub const ResolvConf = struct {
     nameservers: [max_nameservers]Address = undefined,
     nameserver_count: usize = 0,
 
-    search: [max_search]SearchEntry = [_]SearchEntry{.{}} ** max_search,
+    search: [max_search]SearchEntry = @splat(.{}),
     search_count: usize = 0,
 
     ndots: u8 = default_ndots,
@@ -186,9 +186,9 @@ fn parseIpv6(text: []const u8) ?[16]u8 {
 
     // Split on "::" into head and tail halves at most once.
     const dbl = std.mem.indexOf(u8, text, "::");
-    var head: [16]u8 = [_]u8{0} ** 16;
+    var head: [16]u8 = @splat(0);
     var head_groups: usize = 0;
-    var tail: [16]u8 = [_]u8{0} ** 16;
+    var tail: [16]u8 = @splat(0);
     var tail_groups: usize = 0;
 
     if (dbl) |pos| {
@@ -204,7 +204,7 @@ fn parseIpv6(text: []const u8) ?[16]u8 {
         if (head_groups != 8) return null;
     }
 
-    var out: [16]u8 = [_]u8{0} ** 16;
+    var out: [16]u8 = @splat(0);
     @memcpy(out[0 .. head_groups * 2], head[0 .. head_groups * 2]);
     const tail_off = 16 - tail_groups * 2;
     @memcpy(out[tail_off..16], tail[0 .. tail_groups * 2]);
@@ -295,7 +295,7 @@ test "parse reads full IPv6 loopback ::1" {
     const cfg = parse(text);
 
     // Assert
-    var expected = [_]u8{0} ** 16;
+    var expected = @as([16]u8, @splat(0));
     expected[15] = 1;
     try testing.expectEqual(Address{ .ipv6 = expected }, cfg.nameservers[0]);
 }

@@ -217,7 +217,7 @@ fn deriveKeySaltWith(comptime Aead: type, suite: CipherSuite, kid: u64, base_key
     const secret = HkdfSha256.extract("", base_key);
 
     var out: KeySalt = .{
-        .key = [_]u8{0} ** 32,
+        .key = @as([32]u8, @splat(0)),
         .key_len = Aead.key_length,
         .salt = undefined,
     };
@@ -246,7 +246,7 @@ fn buildLabel(out: []u8, comptime prefix: []const u8, kid: u64, suite_id: u16) v
 }
 
 fn nonceFromSalt(salt: [nonce_length]u8, ctr: u64) [nonce_length]u8 {
-    var ctr_bytes = [_]u8{0} ** nonce_length;
+    var ctr_bytes = @as([nonce_length]u8, @splat(0));
     std.mem.writeInt(u64, ctr_bytes[nonce_length - 8 ..][0..8], ctr, .big);
 
     var nonce = salt;

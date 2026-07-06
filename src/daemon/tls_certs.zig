@@ -443,7 +443,7 @@ test "loadOrBootstrap: a lone cert_path is rejected" {
 test "loadOrBootstrap: PEM round-trip from disk decodes cert + key" {
     // Arrange: mint a DER cert + key, wrap both as PEM, write to a temp dir.
     const allocator = testing.allocator;
-    const seed = [_]u8{0x21} ** Ed25519.KeyPair.seed_length;
+    const seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x21));
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
 
     var cert_der_buf: [768]u8 = undefined;
@@ -494,7 +494,7 @@ test "loadOrBootstrap: PEM round-trip from disk decodes cert + key" {
 test "loadOrBootstrap: raw DER files (no PEM armor) load directly" {
     // Arrange
     const allocator = testing.allocator;
-    const seed = [_]u8{0x37} ** Ed25519.KeyPair.seed_length;
+    const seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x37));
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
 
     var cert_der_buf: [768]u8 = undefined;
@@ -545,8 +545,8 @@ test "loadCertChain: allocation failure at any point is leak-clean (dupe/append 
     // every run either fully succeeds or returns OutOfMemory with NO leak.
     const allocator = testing.allocator;
 
-    const kp0 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x41} ** Ed25519.KeyPair.seed_length);
-    const kp1 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** Ed25519.KeyPair.seed_length);
+    const kp0 = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x41)));
+    const kp1 = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x42)));
     var der0_buf: [768]u8 = undefined;
     var der1_buf: [768]u8 = undefined;
     const der0 = try x509_selfsign.buildSelfSigned(&der0_buf, .{

@@ -198,14 +198,14 @@ test "CAP LIST serialization mirrors the negotiated set" {
 }
 
 test "CapSet bit operations are consistent for all capability ids" {
-    const fields = @typeInfo(cap.CapId).@"enum".fields;
-    try std.testing.expectEqual(fields.len, cap.CAP_COUNT);
+    const field_names = @typeInfo(cap.CapId).@"enum".field_names;
+    try std.testing.expectEqual(field_names.len, cap.CAP_COUNT);
 
     var set = cap.CapSet.empty();
     try std.testing.expect(set.isEmpty());
 
-    inline for (fields) |field| {
-        const id: cap.CapId = @field(cap.CapId, field.name);
+    inline for (field_names) |field_name| {
+        const id: cap.CapId = @field(cap.CapId, field_name);
         try std.testing.expect(!set.contains(id));
         set.add(id);
         try std.testing.expect(set.contains(id));

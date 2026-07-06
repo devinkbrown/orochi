@@ -387,8 +387,8 @@ test "matching passwords derive matching keys and confirmations verify" {
     const password = "correct horse battery staple";
     const id_a = "alice";
     const id_b = "bob";
-    const seed_a = [_]u8{0x01} ** 32;
-    const seed_b = [_]u8{0x02} ** 32;
+    const seed_a = @as([32]u8, @splat(0x01));
+    const seed_b = @as([32]u8, @splat(0x02));
 
     // Act – party A starts
     var state_a: State = undefined;
@@ -424,8 +424,8 @@ test "wrong password yields different keys and confirmation fails" {
     // Arrange
     const id_a = "alice";
     const id_b = "bob";
-    const seed_a = [_]u8{0x11} ** 32;
-    const seed_b = [_]u8{0x22} ** 32;
+    const seed_a = @as([32]u8, @splat(0x11));
+    const seed_b = @as([32]u8, @splat(0x22));
 
     var state_a: State = undefined;
     var msg_a: [point_len]u8 = undefined;
@@ -462,8 +462,8 @@ test "wrong password yields different keys and confirmation fails" {
 test "transcript binds identities: swapped ids fail confirmation" {
     // Arrange – both parties use the same password, but B uses swapped ids.
     const password = "shared secret";
-    const seed_a = [_]u8{0x33} ** 32;
-    const seed_b = [_]u8{0x44} ** 32;
+    const seed_a = @as([32]u8, @splat(0x33));
+    const seed_b = @as([32]u8, @splat(0x44));
 
     // A identifies correctly: self="alice", peer="bob".
     var state_a: State = undefined;
@@ -500,8 +500,8 @@ test "transcript binds identities: swapped ids fail confirmation" {
 test "deterministic: same seeds produce identical messages and keys" {
     // Arrange
     const password = "deterministic test password";
-    const seed_a = [_]u8{0x55} ** 32;
-    const seed_b = [_]u8{0x66} ** 32;
+    const seed_a = @as([32]u8, @splat(0x55));
+    const seed_b = @as([32]u8, @splat(0x66));
 
     // First exchange
     var sa1: State = undefined;
@@ -561,8 +561,8 @@ test "blinding points match derivation and are distinct" {
 
 test "empty identities are accepted" {
     const password = "no id test";
-    const seed_a = [_]u8{0x77} ** 32;
-    const seed_b = [_]u8{0x88} ** 32;
+    const seed_a = @as([32]u8, @splat(0x77));
+    const seed_b = @as([32]u8, @splat(0x88));
 
     var state_a: State = undefined;
     var msg_a: [point_len]u8 = undefined;

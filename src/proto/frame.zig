@@ -556,7 +556,7 @@ test "hop zero is dropped" {
 }
 
 test "oversize payloads and buffers are rejected" {
-    const payload = [_]u8{0} ** (max_payload_len + 1);
+    const payload = @as([(max_payload_len + 1)]u8, @splat(0));
     var tiny: [header_len]u8 = undefined;
     try std.testing.expectError(error.PayloadTooLarge, (Frame{
         .type = .privmsg,
@@ -607,7 +607,7 @@ test "unknown extension frame types are accepted but unknown required types are 
 
 test "credit debit and grant threshold behavior" {
     var window = CreditWindow.init();
-    const data = [_]u8{0xaa} ** 8192;
+    const data = @as([8192]u8, @splat(0xaa));
     const frame = Frame{ .type = .irc_line, .ctrl = Ctrl.init(0, .normal, false), .payload = &data };
     // Credit is charged over the full inner frame (header + payload), per spec.
     const cost = creditCost(frame);

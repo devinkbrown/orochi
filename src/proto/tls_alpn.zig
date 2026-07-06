@@ -193,7 +193,7 @@ test "empty and oversized names are rejected by the Builder" {
     // Arrange
     var buf: [512]u8 = undefined;
     var b = try Builder.begin(&buf);
-    const oversized = [_]u8{'x'} ** (max_name_len + 1);
+    const oversized = @as([(max_name_len + 1)]u8, @splat('x'));
 
     // Act
     const empty_err = b.add("");

@@ -98,7 +98,7 @@ pub fn TokenMap(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        entries: [capacity]Token = [_]Token{.{ .name = "" }} ** capacity,
+        entries: [capacity]Token = @splat(.{ .name = "" }),
         count: usize = 0,
 
         pub fn init() Self {

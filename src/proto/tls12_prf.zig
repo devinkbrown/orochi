@@ -249,9 +249,9 @@ test "prfSha384 single-block output equals one raw HMAC-SHA384 block" {
 
 test "masterSecret produces 48 bytes and is deterministic" {
     // Arrange
-    const pms = [_]u8{0xAB} ** 48;
-    const cr = [_]u8{0x01} ** 32;
-    const sr = [_]u8{0x02} ** 32;
+    const pms = @as([48]u8, @splat(0xAB));
+    const cr = @as([32]u8, @splat(0x01));
+    const sr = @as([32]u8, @splat(0x02));
 
     // Act
     const ms1 = masterSecret(&pms, cr, sr, false);
@@ -268,9 +268,9 @@ test "masterSecret produces 48 bytes and is deterministic" {
 
 test "masterSecret equals direct PRF(\"master secret\", cr||sr)" {
     // Arrange
-    const pms = [_]u8{0x5A} ** 48;
-    const cr = [_]u8{0x11} ** 32;
-    const sr = [_]u8{0x22} ** 32;
+    const pms = @as([48]u8, @splat(0x5A));
+    const cr = @as([32]u8, @splat(0x11));
+    const sr = @as([32]u8, @splat(0x22));
 
     var seed: [64]u8 = undefined;
     @memcpy(seed[0..32], &cr);
@@ -287,9 +287,9 @@ test "masterSecret equals direct PRF(\"master secret\", cr||sr)" {
 
 test "keyBlock fills an arbitrary length and uses server||client seed order" {
     // Arrange
-    const master = [_]u8{0xCD} ** 48;
-    const cr = [_]u8{0x33} ** 32;
-    const sr = [_]u8{0x44} ** 32;
+    const master = @as([48]u8, @splat(0xCD));
+    const cr = @as([32]u8, @splat(0x33));
+    const sr = @as([32]u8, @splat(0x44));
     var block: [104]u8 = undefined; // 2*MAC + IVs sized, arbitrary length
 
     // Act
@@ -312,8 +312,8 @@ test "keyBlock fills an arbitrary length and uses server||client seed order" {
 
 test "verifyData is deterministic and differs for client vs server label" {
     // Arrange
-    const master = [_]u8{0xEF} ** 48;
-    const handshake_hash = [_]u8{0x77} ** 32;
+    const master = @as([48]u8, @splat(0xEF));
+    const handshake_hash = @as([32]u8, @splat(0x77));
 
     // Act
     var client_vd: [verify_data_len]u8 = undefined;

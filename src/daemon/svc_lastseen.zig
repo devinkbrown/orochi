@@ -57,7 +57,7 @@ pub const Record = struct {
     /// Wall-clock time of the event, Unix-epoch milliseconds.
     timestamp: i64,
     /// Inline hostmask storage; only `mask_len` bytes are valid.
-    mask_buf: [max_hostmask_len]u8 = [_]u8{0} ** max_hostmask_len,
+    mask_buf: [max_hostmask_len]u8 = @splat(0),
     /// Number of valid bytes in `mask_buf`.
     mask_len: usize = 0,
     /// What happened.
@@ -288,7 +288,7 @@ test "hostmask is copied and truncated to capacity" {
     try testing.expectEqualStrings(short, h.latest().?.hostmask());
 
     // Over-long mask is truncated, not overflowing.
-    const long = "x" ** (max_hostmask_len + 50);
+    const long = &@as([(max_hostmask_len + 50)]u8, @splat('x'));
     h.record(2, long, .login);
     try testing.expectEqual(max_hostmask_len, h.latest().?.hostmask().len);
 }

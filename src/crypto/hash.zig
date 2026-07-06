@@ -390,7 +390,7 @@ test "SHA-384 / SHA-512 KATs for \"abc\"" {
 test "HMAC-SHA256 KATs (RFC 4231 test cases 1, 2, 4)" {
     // Case 1: key = 0x0b*20, data = "Hi There"
     {
-        const key = [_]u8{0x0b} ** 20;
+        const key = @as([20]u8, @splat(0x0b));
         const tag = HmacSha256.create(&key, "Hi There");
         try std.testing.expectEqualSlices(
             u8,
@@ -410,7 +410,7 @@ test "HMAC-SHA256 KATs (RFC 4231 test cases 1, 2, 4)" {
     // Case 4: key = 0x01..0x19, data = 0xcd*50
     {
         const key = hex("0102030405060708090a0b0c0d0e0f10111213141516171819");
-        const data = [_]u8{0xcd} ** 50;
+        const data = @as([50]u8, @splat(0xcd));
         const tag = HmacSha256.create(&key, &data);
         try std.testing.expectEqualSlices(
             u8,
@@ -421,7 +421,7 @@ test "HMAC-SHA256 KATs (RFC 4231 test cases 1, 2, 4)" {
 }
 
 test "HMAC-SHA256 incremental matches one-shot" {
-    const key = [_]u8{0x0b} ** 20;
+    const key = @as([20]u8, @splat(0x0b));
     var m = HmacSha256.init(&key);
     m.update("Hi ");
     m.update("There");
@@ -429,7 +429,7 @@ test "HMAC-SHA256 incremental matches one-shot" {
 }
 
 test "HKDF-SHA256 KAT (RFC 5869 Appendix A.1)" {
-    const ikm_bytes = [_]u8{0x0b} ** 22;
+    const ikm_bytes = @as([22]u8, @splat(0x0b));
     const salt = hex("000102030405060708090a0b0c");
     const info = hex("f0f1f2f3f4f5f6f7f8f9");
 
@@ -453,7 +453,7 @@ test "HKDF-SHA256 KAT (RFC 5869 Appendix A.1)" {
 }
 
 test "HKDF-SHA256 with empty salt/info (RFC 5869 Appendix A.3)" {
-    const ikm_bytes = [_]u8{0x0b} ** 22;
+    const ikm_bytes = @as([22]u8, @splat(0x0b));
     const ikm = Secret([]const u8).init(&ikm_bytes);
     const prk = HkdfSha256.extract("", &ikm);
 
@@ -474,7 +474,7 @@ test "HKDF-SHA256 with empty salt/info (RFC 5869 Appendix A.3)" {
 }
 
 test "HKDF expand rejects oversized output" {
-    const prk = HkdfSha256.Prk.init([_]u8{0} ** 32);
+    const prk = HkdfSha256.Prk.init(@as([32]u8, @splat(0)));
     var big: [256 * 32 + 1]u8 = undefined;
     try std.testing.expectError(HkdfError.OutputTooLong, HkdfSha256.expand(&prk, "", &big));
 }
@@ -483,7 +483,7 @@ test "HKDF-Expand-Label produces stable TLS 1.3 derived secret shape" {
     // Vector cross-checked against an independent HKDF-Expand-Label using the
     // empty-transcript "derived" secret from TLS 1.3 key schedule.
     // early_secret = HKDF-Extract(salt=0, IKM=0^HashLen)
-    const zeros = [_]u8{0} ** 32;
+    const zeros = @as([32]u8, @splat(0));
     const ikm = Secret([]const u8).init(&zeros);
     const early = HkdfSha256.extract("", &ikm);
 

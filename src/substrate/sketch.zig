@@ -24,7 +24,7 @@ pub fn BloomFilter(comptime cfg: anytype) type {
     }
 
     return struct {
-        bits: [word_count]u64 = [_]u64{0} ** word_count,
+        bits: [word_count]u64 = @splat(0),
         inserts: u64 = 0,
         salt: u64,
 
@@ -104,7 +104,7 @@ pub fn HyperLogLog(comptime precision: usize) type {
     const register_count: usize = @as(usize, 1) << precision;
 
     return struct {
-        registers: [register_count]u8 = [_]u8{0} ** register_count,
+        registers: [register_count]u8 = @splat(0),
         salt: u64,
 
         const Self = @This();

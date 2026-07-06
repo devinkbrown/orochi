@@ -88,9 +88,9 @@ pub const OperPrivileges = struct {
     /// grants. Stable as long as the Privilege enum only appends new members.
     pub fn toBits(self: OperPrivileges) u64 {
         var bits: u64 = 0;
-        inline for (@typeInfo(Privilege).@"enum".fields) |f| {
-            if (self.set.contains(@field(Privilege, f.name))) {
-                bits |= @as(u64, 1) << @intCast(f.value);
+        inline for (@typeInfo(Privilege).@"enum".field_names, @typeInfo(Privilege).@"enum".field_values) |f_name, f_value| {
+            if (self.set.contains(@field(Privilege, f_name))) {
+                bits |= @as(u64, 1) << @intCast(f_value);
             }
         }
         return bits;
@@ -100,9 +100,9 @@ pub const OperPrivileges = struct {
     /// bits (from a newer peer) are ignored.
     pub fn fromBits(bits: u64) OperPrivileges {
         var out = OperPrivileges.empty;
-        inline for (@typeInfo(Privilege).@"enum".fields) |f| {
-            if (bits & (@as(u64, 1) << @intCast(f.value)) != 0) {
-                out.set.insert(@field(Privilege, f.name));
+        inline for (@typeInfo(Privilege).@"enum".field_names, @typeInfo(Privilege).@"enum".field_values) |f_name, f_value| {
+            if (bits & (@as(u64, 1) << @intCast(f_value)) != 0) {
+                out.set.insert(@field(Privilege, f_name));
             }
         }
         return out;
@@ -326,8 +326,8 @@ pub fn replyForMissingPrivilege(grant: OperGrant, privilege: Privilege) Reply {
 }
 
 fn privilegeFromName(name: []const u8) RegistryError!Privilege {
-    inline for (@typeInfo(Privilege).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @field(Privilege, field.name);
+    inline for (@typeInfo(Privilege).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, name, field_name)) return @field(Privilege, field_name);
     }
     return error.UnknownPrivilege;
 }

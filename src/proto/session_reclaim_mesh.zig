@@ -244,9 +244,9 @@ pub fn ReplayRing(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        slots: [capacity]u64 = [_]u64{0} ** capacity,
+        slots: [capacity]u64 = @splat(0),
         /// used[i] true means slot i holds a live (recorded) nonce.
-        used: [capacity]bool = [_]bool{false} ** capacity,
+        used: [capacity]bool = @splat(false),
         head: usize = 0,
 
         /// True if `nonce` is already recorded (a replay). Otherwise records it

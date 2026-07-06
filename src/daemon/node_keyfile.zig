@@ -125,18 +125,18 @@ fn writeSeed(io: std.Io, dir: std.Io.Dir, path: []const u8, seed: [seed_len]u8) 
 const testing = std.testing;
 
 test "parseSeedHex accepts a hex seed with surrounding whitespace" {
-    const seed = try parseSeedHex("42" ** seed_len ++ "\n");
-    try testing.expectEqual([_]u8{0x42} ** seed_len, seed);
+    const seed = try parseSeedHex(&repeatBytes("42", seed_len) ++ "\n");
+    try testing.expectEqual(@as([seed_len]u8, @splat(0x42)), seed);
 
-    const padded = try parseSeedHex("  \t" ++ "ab" ** seed_len ++ "\r\n");
-    try testing.expectEqual([_]u8{0xab} ** seed_len, padded);
+    const padded = try parseSeedHex("  \t" ++ &repeatBytes("ab", seed_len) ++ "\r\n");
+    try testing.expectEqual(@as([seed_len]u8, @splat(0xab)), padded);
 }
 
 test "parseSeedHex rejects wrong lengths and non-hex input" {
     try testing.expectError(error.BadSeed, parseSeedHex(""));
     try testing.expectError(error.BadSeed, parseSeedHex("abcd")); // too short
-    try testing.expectError(error.BadSeed, parseSeedHex("42" ** seed_len ++ "ff")); // too long
-    try testing.expectError(error.BadSeed, parseSeedHex("zz" ** seed_len)); // non-hex
+    try testing.expectError(error.BadSeed, parseSeedHex(&repeatBytes("42", seed_len) ++ "ff")); // too long
+    try testing.expectError(error.BadSeed, parseSeedHex(&repeatBytes("zz", seed_len))); // non-hex
 }
 
 test "derivePath places the keyfile next to the config, or in the CWD" {
@@ -191,4 +191,10 @@ test "loadOrCreate refuses to clobber a corrupt keyfile" {
     const text = try tmp.dir.readFileAlloc(testing.io, "orochi-node.key", testing.allocator, .limited(max_keyfile_bytes));
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("not a seed\n", text);
+}
+
+fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    var b: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+    return b;
 }

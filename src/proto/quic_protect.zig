@@ -355,9 +355,9 @@ pub const EncryptionLevel = enum {
 fn keysToPacketKeys(keys: Keys) PacketKeys {
     var pk: PacketKeys = .{
         .suite = .aes128gcm,
-        .key = [_]u8{0} ** quic_tls.max_key_len,
+        .key = @as([quic_tls.max_key_len]u8, @splat(0)),
         .iv = keys.iv,
-        .hp = [_]u8{0} ** quic_tls.max_key_len,
+        .hp = @as([quic_tls.max_key_len]u8, @splat(0)),
     };
     @memcpy(pk.key[0..16], &keys.key);
     @memcpy(pk.hp[0..16], &keys.hp);
@@ -651,7 +651,7 @@ const a2_client_payload =
     "0d0010000e0403050306030203080408050806002d00020101001c0002400100" ++
     "3900320408ffffffffffffffff05048000ffff07048000ffff08011001048000" ++
     "75300901100f088394c8f03e51570806048000ffff" ++
-    ("00" ** 917);
+    (&repeatBytes("00", 917));
 
 // RFC 9001 §A.2 landmarks that I can encode with full confidence and that are
 // NOT self-referential (they come straight from the RFC text and the existing
@@ -910,7 +910,7 @@ test "open fails when the auth tag is flipped" {
     defer allocator.free(header);
     const pn_offset = header.len - 4;
 
-    var payload: [32]u8 = .{0x11} ** 32;
+    var payload: [32]u8 = @splat(0x11);
     const out = try allocator.alloc(u8, header.len + payload.len + aead_tag_len);
     defer allocator.free(out);
     const sealed = try sealPacket(out, header, pn_offset, 4, 2, &payload, keys);
@@ -938,7 +938,7 @@ test "open fails or mis-decodes pn when a header-protected byte is corrupted" {
     defer allocator.free(header);
     const pn_offset = header.len - 4;
 
-    var payload: [32]u8 = .{0x22} ** 32;
+    var payload: [32]u8 = @splat(0x22);
     const out = try allocator.alloc(u8, header.len + payload.len + aead_tag_len);
     defer allocator.free(out);
     const sealed = try sealPacket(out, header, pn_offset, 4, 2, &payload, keys);
@@ -966,16 +966,16 @@ test "nonce XORs the packet number into the low IV bytes" {
 }
 
 test "sampleForHeaderProtection rejects a too-short packet" {
-    var pkt = [_]u8{0} ** 16;
+    var pkt = @as([16]u8, @splat(0));
     // pn_offset = 4 → sample needs bytes [8, 24); only 16 present → Truncated.
     try testing.expectError(error.Truncated, sampleForHeaderProtection(&pkt, 4));
 }
 
 test "sealPacket rejects an inconsistent packet-number length" {
     const keys = Keys{
-        .key = .{0} ** 16,
-        .iv = .{0} ** 12,
-        .hp = .{0} ** 16,
+        .key = @splat(0),
+        .iv = @splat(0),
+        .hp = @splat(0),
     };
     // header[0]=0xc3 declares a 4-byte pn, but we claim pn_len=2.
     const header = [_]u8{ 0xc3, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
@@ -988,12 +988,12 @@ test "sealPacket rejects an inconsistent packet-number length" {
 
 test "openPacket rejects a packet too short for the AEAD tag" {
     const keys = Keys{
-        .key = .{0} ** 16,
-        .iv = .{0} ** 12,
-        .hp = .{0} ** 16,
+        .key = @splat(0),
+        .iv = @splat(0),
+        .hp = @splat(0),
     };
     // A 24-byte packet with pn_offset 18 + 1-byte pn leaves 5 bytes < tag(16).
-    var pkt = [_]u8{0} ** 24;
+    var pkt = @as([24]u8, @splat(0));
     pkt[0] = 0xc0; // long header, pn_len bits 00 → 1 byte
     // Header protection removal needs a 16-byte sample at pn_offset+4 = 22;
     // 22+16 = 38 > 24 → Truncated before AEAD even runs.
@@ -1184,7 +1184,7 @@ test "RFC 9001 quic key update — quic ku rolls the 1-RTT secret" {
 // "quic key/iv/hp" expansion used for the real suites.
 
 fn a256Keys() PacketKeys {
-    const secret = [_]u8{0x5a} ** 32;
+    const secret = @as([32]u8, @splat(0x5a));
     return quic_tls.derivePacketKeys(secret, .aes256gcm);
 }
 
@@ -1224,7 +1224,7 @@ test "quic protect — AES-256-GCM open rejects a flipped ciphertext byte" {
 
     const header = [_]u8{ 0x43, 0x00, 0x00, 0x00, 0x05 };
     const pn_offset = header.len - 4;
-    var payload: [48]u8 = .{0x33} ** 48;
+    var payload: [48]u8 = @splat(0x33);
 
     const out = try allocator.alloc(u8, header.len + payload.len + aead_tag_len);
     defer allocator.free(out);
@@ -1249,7 +1249,7 @@ test "quic protect — AES-256-GCM open rejects a flipped tag byte" {
 
     const header = [_]u8{ 0x43, 0x00, 0x00, 0x00, 0x05 };
     const pn_offset = header.len - 4;
-    var payload: [16]u8 = .{0x77} ** 16;
+    var payload: [16]u8 = @splat(0x77);
 
     const out = try allocator.alloc(u8, header.len + payload.len + aead_tag_len);
     defer allocator.free(out);
@@ -1267,7 +1267,7 @@ test "quic protect — AES-256-GCM open rejects a flipped tag byte" {
 
 test "quic protect — ChaCha20-Poly1305 arbitrary round-trip + tamper reject" {
     const allocator = testing.allocator;
-    const secret = [_]u8{0xc4} ** 32;
+    const secret = @as([32]u8, @splat(0xc4));
     const keys = quic_tls.derivePacketKeys(secret, .chacha20poly1305);
 
     const header = [_]u8{ 0x42, 0x12, 0x34, 0x56 }; // short header, 3-byte pn
@@ -1343,8 +1343,8 @@ test "quic KeySet — Initial level derives client/server keys (RFC 9001 A.1)" {
 }
 
 test "quic KeySet — handshake/1-RTT derives from traffic secrets per suite" {
-    const own = [_]u8{0x11} ** 32;
-    const peer = [_]u8{0x22} ** 32;
+    const own = @as([32]u8, @splat(0x11));
+    const peer = @as([32]u8, @splat(0x22));
 
     const set = KeySet.fromTrafficSecrets(.handshake, own, peer, .aes256gcm);
     try testing.expectEqual(EncryptionLevel.handshake, set.level);
@@ -1368,7 +1368,7 @@ test "quic KeySet — handshake/1-RTT derives from traffic secrets per suite" {
     try testing.expectEqualSlices(u8, a_set.write.keyBytes(), b_set.read.keyBytes());
 
     const header = [_]u8{ 0x42, 0xab, 0xcd, 0xef };
-    var payload: [24]u8 = .{0x5e} ** 24;
+    var payload: [24]u8 = @splat(0x5e);
     const out = try allocator.alloc(u8, header.len + payload.len + aead_tag_len);
     defer allocator.free(out);
     const sealed = try sealPacketSuite(out, &header, 1, 3, 0xabcdef, &payload, a_set.write);
@@ -1376,4 +1376,10 @@ test "quic KeySet — handshake/1-RTT derives from traffic secrets per suite" {
     defer allocator.free(recovered);
     const opened = try openPacketSuite(recovered, out[0..sealed.len], 1, b_set.read, identityPacketNumber);
     try testing.expectEqualSlices(u8, &payload, recovered[0..opened.plaintext_len]);
+}
+
+fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    var b: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+    return b;
 }

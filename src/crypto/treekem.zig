@@ -193,7 +193,7 @@ pub const Group = struct {
     members: std.ArrayList(Member) = .empty,
     next_id: MemberId = 1,
     epoch: u64 = 0,
-    root_secret: Secret = [_]u8{0} ** secret_len,
+    root_secret: Secret = @splat(0),
 
     pub fn init(allocator: std.mem.Allocator, seeds: []const MemberSeed) (std.mem.Allocator.Error || Error)!Group {
         if (seeds.len == 0) return error.EmptyGroup;
@@ -524,7 +524,7 @@ fn secureZero(ptr: anytype) void {
 }
 
 fn fixedSeed(byte: u8) MemberSeed {
-    return [_]u8{byte} ** member_seed_len;
+    return @as([member_seed_len]u8, @splat(byte));
 }
 
 fn expectSameRoot(group: *const Group, views: []const MemberView) !void {

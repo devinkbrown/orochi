@@ -18,7 +18,7 @@ pub const max_bytes: usize = 4096;
 const invalid_index: u32 = std.math.maxInt(u32);
 
 pub const DeliverBuf = struct {
-    data: [max_bytes]u8 = [_]u8{0} ** max_bytes,
+    data: [max_bytes]u8 = @splat(0),
     len: usize = 0,
     refs: std.atomic.Value(usize) = .init(0),
     next_free: std.atomic.Value(u32) = .init(invalid_index),
@@ -52,14 +52,14 @@ pub const DeliverMsg = struct {
     /// reactor does. `broadcast_subject_len == 0` means the empty/wildcard subject
     /// (match-all). Capped at `broadcast_subject_max`; longer subjects are
     /// truncated for filtering (the displayed bytes in `buf` are untruncated).
-    broadcast_subject: [broadcast_subject_max]u8 = [_]u8{0} ** broadcast_subject_max,
+    broadcast_subject: [broadcast_subject_max]u8 = @splat(0),
     broadcast_subject_len: u16 = 0,
     /// Cross-shard oper-event ORIGIN server name (inline POD copy): the server the
     /// event was raised on, so a network-wide event fanned to other shards renders
     /// `:<origin> EVENT …` with the originating node — not the local one. Empty
     /// (`broadcast_origin_len == 0`) means "use the local server name" (the case
     /// for a locally-raised event). Capped at `broadcast_origin_max`.
-    broadcast_origin: [broadcast_origin_max]u8 = [_]u8{0} ** broadcast_origin_max,
+    broadcast_origin: [broadcast_origin_max]u8 = @splat(0),
     broadcast_origin_len: u16 = 0,
     /// Cross-shard OBSERVE fan-out: when true, `buf` holds an encoded
     /// `observe_event` payload (action + origin + structured subject), and the
@@ -190,7 +190,7 @@ pub fn DeliverPool(comptime slots: usize) type {
             var bufs: [slots]DeliverBuf = undefined;
             for (&bufs, 0..) |*buf, i| {
                 buf.* = .{
-                    .data = [_]u8{0} ** max_bytes,
+                    .data = @as([max_bytes]u8, @splat(0)),
                     .len = 0,
                     .refs = .init(0),
                     .next_free = .init(if (i + 1 == slots) invalid_index else @as(u32, @intCast(i + 1))),
@@ -229,7 +229,7 @@ test "DeliverPool acquire copies bytes and release reuses a free slot" {
 
 test "DeliverPool returns null when exhausted or bytes are too long" {
     var pool = DeliverPool(1).init();
-    const too_long = [_]u8{'x'} ** (max_bytes + 1);
+    const too_long = @as([(max_bytes + 1)]u8, @splat('x'));
     try std.testing.expectEqual(@as(?*DeliverBuf, null), pool.acquire(&too_long));
 
     const buf = pool.acquire("one") orelse return error.TestExpectedEqual;

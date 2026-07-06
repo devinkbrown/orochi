@@ -179,7 +179,7 @@ test "topic event rejects malformed input" {
 }
 
 test "topic event enforces bounds" {
-    const big = "x" ** (max_topic_len + 1);
+    const big = &@as([(max_topic_len + 1)]u8, @splat('x'));
     const ev = TopicEvent{ .present = true, .origin_node = 1, .hlc = 1, .set_at = 1, .channel = "#c", .topic = big, .setter = "s" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }

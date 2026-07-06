@@ -243,7 +243,7 @@ test "nextApplicationSecret matches the HKDF-Expand-Label definition" {
 
 test "nextApplicationSecret changes the secret and ratchets forward" {
     // Arrange
-    var prev: [secret_len]u8 = [_]u8{0x11} ** secret_len;
+    var prev: [secret_len]u8 = @splat(0x11);
 
     // Act
     const gen1 = nextApplicationSecret(prev);

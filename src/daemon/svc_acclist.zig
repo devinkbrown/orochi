@@ -373,7 +373,7 @@ test "over-long account names are rejected and never match" {
     var store = AccountAccess.init(default_max_masks);
     defer store.deinit(allocator);
 
-    const long = "a" ** (max_account_len + 1);
+    const long = &@as([(max_account_len + 1)]u8, @splat('a'));
     try std.testing.expectError(Error.AccountNameTooLong, store.add(allocator, long, "x!*@host"));
     try std.testing.expectEqual(@as(usize, 0), store.accountCount());
     try std.testing.expect(!store.matches(long, "x!u@host"));

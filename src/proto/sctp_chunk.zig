@@ -247,7 +247,7 @@ test "common header and DATA chunk round trip" {
     const data_len = DataHeader.len + user_data.len;
     const chunk_len = 4 + data_len;
     const packet_len = CommonHeader.len + chunk_len + 1;
-    var packet: [packet_len]u8 = [_]u8{0} ** packet_len;
+    var packet: [packet_len]u8 = @splat(0);
 
     try (CommonHeader{
         .src_port = 5000,
@@ -289,7 +289,7 @@ test "crc32c known vector" {
 }
 
 test "setChecksum writes the packet crc with checksum field zeroed" {
-    var packet: [CommonHeader.len + 4 + DataHeader.len]u8 = [_]u8{0} ** (CommonHeader.len + 4 + DataHeader.len);
+    var packet: [CommonHeader.len + 4 + DataHeader.len]u8 = @splat(0);
     try (CommonHeader{
         .src_port = 1,
         .dst_port = 2,
@@ -313,13 +313,13 @@ test "setChecksum writes the packet crc with checksum field zeroed" {
 }
 
 test "truncated buffers are rejected" {
-    try std.testing.expectError(error.Truncated, CommonHeader.decode(&[_]u8{0} ** 11));
+    try std.testing.expectError(error.Truncated, CommonHeader.decode(&@as([11]u8, @splat(0))));
 
     var body = [_]u8{ 0, 0, 0, 8, 1, 2, 3 };
     var it = ChunkIterator.init(&body);
     try std.testing.expectError(error.Truncated, it.next());
 
-    try std.testing.expectError(error.Truncated, parseData(&[_]u8{0} ** 11));
-    try std.testing.expectError(error.Truncated, parseSack(&[_]u8{0} ** 11));
-    try std.testing.expectError(error.Truncated, parseInit(&[_]u8{0} ** 15));
+    try std.testing.expectError(error.Truncated, parseData(&@as([11]u8, @splat(0))));
+    try std.testing.expectError(error.Truncated, parseSack(&@as([11]u8, @splat(0))));
+    try std.testing.expectError(error.Truncated, parseInit(&@as([15]u8, @splat(0))));
 }

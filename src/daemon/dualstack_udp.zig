@@ -88,14 +88,14 @@ pub const DualStackUdpSocket = struct {
 
         fn toBytes(self: BindAddr) [16]u8 {
             return switch (self) {
-                .any => [_]u8{0} ** 16, // ::
+                .any => @as([16]u8, @splat(0)), // ::
                 .loopback_v6 => blk: {
-                    var a = [_]u8{0} ** 16;
+                    var a = @as([16]u8, @splat(0));
                     a[15] = 1; // ::1
                     break :blk a;
                 },
                 .v4_mapped => |v4| blk: {
-                    var a = [_]u8{0} ** 16;
+                    var a = @as([16]u8, @splat(0));
                     @memcpy(a[0..12], &v4mapped_prefix);
                     @memcpy(a[12..16], &v4);
                     break :blk a;
@@ -179,7 +179,7 @@ pub fn toSockaddrIn6(addr: TransportAddress) ?linux.sockaddr.in6 {
     var out = linux.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, addr.port),
         .flowinfo = 0,
-        .addr = [_]u8{0} ** 16,
+        .addr = @as([16]u8, @splat(0)),
         .scope_id = 0,
     };
     switch (addr.ip_len) {
@@ -200,18 +200,18 @@ pub fn toSockaddrIn6(addr: TransportAddress) ?linux.sockaddr.in6 {
 const testing = std.testing;
 
 test "isV4Mapped recognises ::ffff:0:0/96 and rejects native v6" {
-    var mapped = [_]u8{0} ** 16;
+    var mapped = @as([16]u8, @splat(0));
     @memcpy(mapped[0..12], &v4mapped_prefix);
     mapped[12..16].* = [_]u8{ 192, 0, 2, 7 };
     try testing.expect(isV4Mapped(mapped));
 
     // ::1 (loopback) is NOT v4-mapped.
-    var v6 = [_]u8{0} ** 16;
+    var v6 = @as([16]u8, @splat(0));
     v6[15] = 1;
     try testing.expect(!isV4Mapped(v6));
 
     // A global-unicast v6 address is not v4-mapped.
-    const g = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+    const g = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1};
     try testing.expect(!isV4Mapped(g));
 }
 
@@ -220,7 +220,7 @@ test "round-trip: a v4-mapped sockaddr_in6 surfaces as an ipv4 TransportAddress 
     var sa = linux.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 4433),
         .flowinfo = 0,
-        .addr = [_]u8{0} ** 16,
+        .addr = @as([16]u8, @splat(0)),
         .scope_id = 0,
     };
     @memcpy(sa.addr[0..12], &v4mapped_prefix);
@@ -262,7 +262,7 @@ test "round-trip: a native v6 sockaddr_in6 surfaces as an ipv6 TransportAddress 
 }
 
 test "round-trip: ::1 loopback surfaces as a 16-byte ipv6 TransportAddress" {
-    var v6 = [_]u8{0} ** 16;
+    var v6 = @as([16]u8, @splat(0));
     v6[15] = 1;
     var sa = linux.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 9000),
@@ -344,7 +344,7 @@ test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
     if (posix.errno(c6_rc) != .SUCCESS) return error.SkipZigTest;
     const c6: linux.fd_t = @intCast(c6_rc);
     defer _ = linux.close(c6);
-    var lo6 = [_]u8{0} ** 16;
+    var lo6 = @as([16]u8, @splat(0));
     lo6[15] = 1; // ::1
     var c6_bind = linux.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 };
     if (posix.errno(linux.bind(c6, @ptrCast(&c6_bind), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)

@@ -14,6 +14,20 @@
 
 const std = @import("std");
 
+/// Case-insensitive substring search, mirroring the pre-0.17 `std.ascii.indexOfIgnoreCase`
+/// (removed from std). Returns the index of the first case-insensitive match, or null;
+/// an empty needle matches at 0.
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    const end = haystack.len - needle.len;
+    var i: usize = 0;
+    while (i <= end) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 /// Caps — generous for real channels, hard ceilings against abuse.
 const max_users_per_channel: usize = 4096;
 const max_words_per_channel: usize = 8192;
@@ -61,8 +75,8 @@ const ChannelAgg = struct {
     quits: u64 = 0,
     kicks: u64 = 0,
     topic_changes: u64 = 0,
-    hours: [24]u64 = [_]u64{0} ** 24,
-    heatmap: [7][24]u64 = [_][24]u64{[_]u64{0} ** 24} ** 7,
+    hours: [24]u64 = @splat(0),
+    heatmap: [7][24]u64 = @splat(@as([24]u64, @splat(0))),
     days: std.ArrayListUnmanaged(DayBucket) = .empty,
     users: std.StringHashMapUnmanaged(*UserAgg) = .empty,
     word_freq: std.StringHashMapUnmanaged(u64) = .empty,
@@ -179,8 +193,8 @@ pub const ChanStats = struct {
         var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
         while (it.next()) |tok| {
             words += 1;
-            if (std.ascii.indexOfIgnoreCase(tok, "http://") != null or
-                std.ascii.indexOfIgnoreCase(tok, "https://") != null)
+            if (indexOfIgnoreCase(tok, "http://") != null or
+                indexOfIgnoreCase(tok, "https://") != null)
             {
                 // counted per-user below
             }
@@ -197,8 +211,8 @@ pub const ChanStats = struct {
             for (text) |c| {
                 if (c == '!') usr.exclamations += 1;
             }
-            if (std.ascii.indexOfIgnoreCase(text, "http://") != null or
-                std.ascii.indexOfIgnoreCase(text, "https://") != null) usr.urls += 1;
+            if (indexOfIgnoreCase(text, "http://") != null or
+                indexOfIgnoreCase(text, "https://") != null) usr.urls += 1;
         }
 
         // Monologue: consecutive lines by the same nick.
@@ -631,7 +645,7 @@ fn normalizeWord(raw: []const u8, buf: []u8) ?[]const u8 {
     while (end > start and !std.ascii.isAlphanumeric(raw[end - 1])) end -= 1;
     const w = raw[start..end];
     if (w.len < min_word_len or w.len > max_word_len) return null;
-    if (std.ascii.indexOfIgnoreCase(w, "http") == 0) return null;
+    if (indexOfIgnoreCase(w, "http") == 0) return null;
     var all_digit = true;
     for (w) |c| {
         if (!std.ascii.isDigit(c)) {
@@ -683,7 +697,7 @@ fn busiestDay(agg: *ChannelAgg) struct { date: [10]u8, messages: u64 } {
             best_day = d.day;
         }
     }
-    var out: [10]u8 = [_]u8{0} ** 10;
+    var out: [10]u8 = @splat(0);
     var tmp: [16]u8 = undefined;
     const s = fmtDay(best_day, &tmp);
     @memcpy(out[0..@min(s.len, 10)], s[0..@min(s.len, 10)]);

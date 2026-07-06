@@ -212,7 +212,7 @@ fn parseV6(text: []const u8) ParseError!u128 {
         const tail_len = try parseV6Groups(tail, &tail_groups);
 
         if (head_len + tail_len > 7) return ParseError.BadGroupCount; // '::' must cover >=1 group
-        var groups: [8]u16 = [_]u16{0} ** 8;
+        var groups: [8]u16 = @splat(0);
         for (0..head_len) |i| groups[i] = head_groups[i];
         for (0..tail_len) |i| groups[8 - tail_len + i] = tail_groups[i];
         return groupsToU128(&groups);

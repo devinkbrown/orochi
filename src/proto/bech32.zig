@@ -22,7 +22,7 @@ pub const charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 /// Reverse lookup table: ascii byte -> 5-bit value, or 0xFF if not in charset.
 const charset_rev = blk: {
-    var table = [_]u8{0xFF} ** 256;
+    var table = @as([256]u8, @splat(0xFF));
     for (charset, 0..) |c, i| {
         table[c] = @intCast(i);
     }

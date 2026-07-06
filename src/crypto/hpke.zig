@@ -340,7 +340,7 @@ pub fn openBase(
 fn nonceFromSeq(base_nonce: Nonce, seq: u128) Nonce {
     std.debug.assert(seq <= max_sequence);
     var nonce = base_nonce;
-    var seq_bytes: [nonce_len]u8 = [_]u8{0} ** nonce_len;
+    var seq_bytes: [nonce_len]u8 = @splat(0);
     var remaining = seq;
     var i: usize = nonce_len;
     while (i > 0) {
@@ -361,7 +361,7 @@ fn secureZero(ptr: anytype) void {
 }
 
 fn testSeed(byte: u8) [X25519.seed_length]u8 {
-    return [_]u8{byte} ** X25519.seed_length;
+    return @as([X25519.seed_length]u8, @splat(byte));
 }
 
 fn expectOpenFails(err: anyerror!Plaintext) !void {

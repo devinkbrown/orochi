@@ -65,7 +65,7 @@ pub fn plan(
     if (capsules.len > out.len) return error.TooMany;
     if (fds.len > max_fds) return error.TooMany;
 
-    var seen = [_]u64{0} ** bitset_words;
+    var seen = @as([bitset_words]u64, @splat(0));
 
     for (capsules, 0..) |capsule, i| {
         const idx = capsule.fd_index;
@@ -92,7 +92,7 @@ pub fn validate(
 ) Error!void {
     if (fd_count > max_fds) return error.TooMany;
 
-    var seen = [_]u64{0} ** bitset_words;
+    var seen = @as([bitset_words]u64, @splat(0));
 
     for (capsules) |capsule| {
         const idx = capsule.fd_index;

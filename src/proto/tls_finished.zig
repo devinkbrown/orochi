@@ -110,7 +110,7 @@ test "finishedKey is deterministic for a fixed input" {
 
 test "finishedKey differs from the base key it is derived from" {
     // Arrange
-    const base_key = [_]u8{0xAB} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0xAB));
 
     // Act
     const fk = finishedKey(base_key);
@@ -121,7 +121,7 @@ test "finishedKey differs from the base key it is derived from" {
 
 test "finishedKey reuses the shared key schedule primitive" {
     // Arrange
-    const base_key = [_]u8{0x5C} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x5C));
     const secret = hkdf.Sha256.SecretBytes.init(base_key);
 
     // Act
@@ -133,8 +133,8 @@ test "finishedKey reuses the shared key schedule primitive" {
 }
 
 test "SHA-384 Finished surface produces 48-byte verify_data" {
-    const base_key = [_]u8{0x24} ** Sha384F.len;
-    const transcript = [_]u8{0x42} ** Sha384F.len;
+    const base_key = @as([Sha384F.len]u8, @splat(0x24));
+    const transcript = @as([Sha384F.len]u8, @splat(0x42));
     try std.testing.expectEqual(@as(usize, 48), Sha384F.len);
     const mac = Sha384F.verifyData(base_key, transcript);
     try std.testing.expect(Sha384F.verify(base_key, transcript, &mac));
@@ -145,8 +145,8 @@ test "SHA-384 Finished surface produces 48-byte verify_data" {
 
 test "verifyData round-trips with verify returning true" {
     // Arrange
-    const base_key = [_]u8{0x11} ** mac_len;
-    const transcript = [_]u8{0x22} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x11));
+    const transcript = @as([mac_len]u8, @splat(0x22));
 
     // Act
     const mac = verifyData(base_key, transcript);
@@ -158,8 +158,8 @@ test "verifyData round-trips with verify returning true" {
 
 test "tampered MAC fails verification" {
     // Arrange
-    const base_key = [_]u8{0x33} ** mac_len;
-    const transcript = [_]u8{0x44} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x33));
+    const transcript = @as([mac_len]u8, @splat(0x44));
     var mac = verifyData(base_key, transcript);
 
     // Act: flip a single bit of the received tag.
@@ -172,13 +172,13 @@ test "tampered MAC fails verification" {
 
 test "verify rejects a wrong-length received MAC" {
     // Arrange
-    const base_key = [_]u8{0x55} ** mac_len;
-    const transcript = [_]u8{0x66} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x55));
+    const transcript = @as([mac_len]u8, @splat(0x66));
     const full = verifyData(base_key, transcript);
 
     // Act
     const too_short = verify(base_key, transcript, full[0 .. mac_len - 1]);
-    const too_long = verify(base_key, transcript, &([_]u8{0} ** (mac_len + 1)));
+    const too_long = verify(base_key, transcript, &(@as([(mac_len + 1)]u8, @splat(0))));
 
     // Assert
     try std.testing.expect(!too_short);
@@ -187,8 +187,8 @@ test "verify rejects a wrong-length received MAC" {
 
 test "verifyData changes when the transcript hash changes" {
     // Arrange
-    const base_key = [_]u8{0x77} ** mac_len;
-    const transcript_a = [_]u8{0x00} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x77));
+    const transcript_a = @as([mac_len]u8, @splat(0x00));
     var transcript_b = transcript_a;
     transcript_b[mac_len - 1] = 0x01;
 
@@ -205,8 +205,8 @@ test "verifyData changes when the transcript hash changes" {
 test "verify uses a constant-time comparison" {
     // Arrange: a MAC matching every byte except the last still fails, and the
     // comparison must not short-circuit on the first byte.
-    const base_key = [_]u8{0x99} ** mac_len;
-    const transcript = [_]u8{0xAA} ** mac_len;
+    const base_key = @as([mac_len]u8, @splat(0x99));
+    const transcript = @as([mac_len]u8, @splat(0xAA));
     var almost = verifyData(base_key, transcript);
     almost[mac_len - 1] ^= 0xFF;
 

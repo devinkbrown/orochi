@@ -112,8 +112,8 @@ pub const Registry = struct {
 };
 
 fn mergePrivileges(dst: *oper.OperPrivileges, src: oper.OperPrivileges) void {
-    inline for (@typeInfo(oper.Privilege).@"enum".fields) |field| {
-        const privilege: oper.Privilege = @enumFromInt(field.value);
+    inline for (@typeInfo(oper.Privilege).@"enum".field_values) |field_value| {
+        const privilege: oper.Privilege = @enumFromInt(field_value);
         if (src.has(privilege)) dst.insert(privilege);
     }
 }

@@ -49,7 +49,7 @@ pub const Config = struct {
 };
 
 pub const WitnessSnapshot = struct {
-    ids: [max_witnesses]NodeId = [_]NodeId{0} ** max_witnesses,
+    ids: [max_witnesses]NodeId = @splat(0),
     len: u8 = 0,
 
     pub fn slice(self: *const WitnessSnapshot) []const NodeId {
@@ -58,7 +58,7 @@ pub const WitnessSnapshot = struct {
 };
 
 const WitnessSet = struct {
-    ids: [max_witnesses]NodeId = [_]NodeId{0} ** max_witnesses,
+    ids: [max_witnesses]NodeId = @splat(0),
     len: u8 = 0,
 
     fn clear(self: *WitnessSet) void {

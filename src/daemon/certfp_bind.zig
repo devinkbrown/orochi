@@ -136,7 +136,7 @@ test "rejects malformed fingerprints and oversize accounts" {
 
     try std.testing.expectError(error.InvalidFingerprint, store.bind("alice", "short"));
     const fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const long = "a" ** (max_account_len + 1);
+    const long = &@as([(max_account_len + 1)]u8, @splat('a'));
     try std.testing.expectError(error.AccountTooLong, store.bind(long, fp));
 }
 

@@ -58,7 +58,7 @@ pub fn decode(bytes: []const u8) Error!Peer {
         },
         legacy_v4_version => {
             if (bytes.len < legacy_v4_len) return error.Truncated;
-            var peer = Peer{ .addr = [_]u8{0} ** 16, .port = std.mem.readInt(u16, bytes[5..7], .little) };
+            var peer = Peer{ .addr = @as([16]u8, @splat(0)), .port = std.mem.readInt(u16, bytes[5..7], .little) };
             peer.addr[10] = 0xff;
             peer.addr[11] = 0xff;
             @memcpy(peer.addr[12..16], bytes[1..5]);

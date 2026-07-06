@@ -310,9 +310,7 @@ pub const TimingWheel = struct {
 };
 
 fn emptyBuckets() [TimingWheel.level_count][TimingWheel.slots_per_level]TimingWheel.Bucket {
-    return [_][TimingWheel.slots_per_level]TimingWheel.Bucket{
-        [_]TimingWheel.Bucket{.{}} ** TimingWheel.slots_per_level,
-    } ** TimingWheel.level_count;
+    return @splat(@splat(.{}));
 }
 
 fn levelForDiff(diff: u64) usize {

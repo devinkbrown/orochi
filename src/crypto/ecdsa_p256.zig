@@ -164,7 +164,7 @@ fn readDerInteger(der: []const u8, pos: usize) DerError!struct { scalar: [scalar
     }
     if (content.len > scalar_len) return error.ScalarTooLong;
 
-    var scalar = [_]u8{0} ** scalar_len;
+    var scalar = @as([scalar_len]u8, @splat(0));
     @memcpy(scalar[scalar_len - content.len ..], content);
     return .{ .scalar = scalar, .next = content_end };
 }
@@ -232,8 +232,8 @@ test "DER encode then decode round-trips a signature" {
 test "DER codec handles a high-bit scalar with sign-bit padding" {
     // Arrange: r has its top bit set, forcing a 0x00 pad; s starts with a zero
     // byte that must be stripped on the minimal encoding.
-    var r = [_]u8{0} ** scalar_len;
-    var s = [_]u8{0} ** scalar_len;
+    var r = @as([scalar_len]u8, @splat(0));
+    var s = @as([scalar_len]u8, @splat(0));
     r[0] = 0xFF;
     r[scalar_len - 1] = 0x01;
     s[1] = 0x80;

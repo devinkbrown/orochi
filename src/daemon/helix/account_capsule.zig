@@ -258,8 +258,8 @@ test "round-trip with non-null vhost and realistic hash/salt" {
 }
 
 test "round-trip with null vhost" {
-    const hash = [_]u8{0xAB} ** 32;
-    const salt = [_]u8{0xCD} ** 16;
+    const hash = @as([32]u8, @splat(0xAB));
+    const salt = @as([16]u8, @splat(0xCD));
 
     const original = AccountCapsule{
         .account = "guest-acct",

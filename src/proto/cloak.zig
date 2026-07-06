@@ -500,7 +500,7 @@ const test_key = SecretKey.init([_]u8{
     0x74, 0x20, 0x6f, 0x6e, 0x6c, 0x79, 0x21, 0x00,
 });
 
-const other_key = SecretKey.init([_]u8{0xa5} ** key_len);
+const other_key = SecretKey.init(@as([key_len]u8, @splat(0xa5)));
 
 const geo_us = Geo{ .country = "US", .asn = 13335 };
 

@@ -118,7 +118,7 @@ pub const VersionVector = struct {
         counter: u64,
     };
 
-    entries: [max_entries]Entry = [_]Entry{.{ .replica = 0, .counter = 0 }} ** max_entries,
+    entries: [max_entries]Entry = @splat(.{ .replica = 0, .counter = 0 }),
     len: usize = 0,
 
     /// Empty vector.
@@ -308,7 +308,7 @@ test "version vector reports capacity and counter overflow explicitly" {
     try std.testing.expectError(error.CapacityExceeded, full.increment(VersionVector.max_entries));
 
     var overflow = VersionVector{
-        .entries = [_]VersionVector.Entry{.{ .replica = 0, .counter = 0 }} ** VersionVector.max_entries,
+        .entries = @as([VersionVector.max_entries]VersionVector.Entry, @splat(.{ .replica = 0, .counter = 0 })),
         .len = 1,
     };
     overflow.entries[0] = .{ .replica = 1, .counter = std.math.maxInt(u64) };

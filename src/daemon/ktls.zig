@@ -452,8 +452,8 @@ test "seqToBytes encodes big-endian" {
 }
 
 test "encode lays out AES-GCM-128 exactly as the kernel struct" {
-    const key = [_]u8{0xAA} ** 16;
-    const iv = [_]u8{0xBB} ** 8;
+    const key = @as([16]u8, @splat(0xAA));
+    const iv = @as([8]u8, @splat(0xBB));
     const salt = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const info = CryptoInfo{
         .version = TLS_1_3_VERSION,
@@ -482,8 +482,8 @@ test "encode rejects mismatched component lengths and a short buffer" {
         .version = TLS_1_3_VERSION,
         .cipher = .aes_gcm_128,
         .salt = &[_]u8{ 1, 2, 3 }, // wrong: needs 4
-        .iv = &[_]u8{0} ** 8,
-        .key = &[_]u8{0} ** 16,
+        .iv = &@as([8]u8, @splat(0)),
+        .key = &@as([16]u8, @splat(0)),
         .rec_seq = seqToBytes(0),
     };
     var buf: [max_crypto_info_len]u8 = undefined;
@@ -493,8 +493,8 @@ test "encode rejects mismatched component lengths and a short buffer" {
         .version = TLS_1_3_VERSION,
         .cipher = .aes_gcm_128,
         .salt = &[_]u8{ 1, 2, 3, 4 },
-        .iv = &[_]u8{0} ** 8,
-        .key = &[_]u8{0} ** 16,
+        .iv = &@as([8]u8, @splat(0)),
+        .key = &@as([16]u8, @splat(0)),
         .rec_seq = seqToBytes(0),
     };
     var tiny: [8]u8 = undefined;
@@ -504,7 +504,7 @@ test "encode rejects mismatched component lengths and a short buffer" {
 test "tls13CryptoInfo splits the AES-GCM static IV into salt(4)+iv(8)" {
     var static_iv: [12]u8 = undefined;
     for (&static_iv, 0..) |*b, i| b.* = @intCast(i + 1); // 01 02 … 0c
-    const key = [_]u8{0xCC} ** 16;
+    const key = @as([16]u8, @splat(0xCC));
 
     const info = try tls13CryptoInfo(.aes_gcm_128, &static_iv, &key, 42);
     try testing.expectEqual(TLS_1_3_VERSION, info.version);
@@ -522,7 +522,7 @@ test "tls13CryptoInfo splits the AES-GCM static IV into salt(4)+iv(8)" {
 test "tls13CryptoInfo gives ChaCha20-Poly1305 no salt and the full 12-byte IV" {
     var static_iv: [12]u8 = undefined;
     for (&static_iv, 0..) |*b, i| b.* = @intCast(0xF0 + i);
-    const key = [_]u8{0xDD} ** 32;
+    const key = @as([32]u8, @splat(0xDD));
 
     const info = try tls13CryptoInfo(.chacha20_poly1305, &static_iv, &key, 3);
     try testing.expectEqual(@as(usize, 0), info.salt.len);
@@ -531,9 +531,9 @@ test "tls13CryptoInfo gives ChaCha20-Poly1305 no salt and the full 12-byte IV" {
 }
 
 test "tls13CryptoInfo rejects a wrong IV or key length" {
-    const key = [_]u8{0} ** 16;
-    try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &[_]u8{0} ** 11, &key, 0));
-    try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &[_]u8{0} ** 12, &[_]u8{0} ** 15, 0));
+    const key = @as([16]u8, @splat(0));
+    try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &@as([11]u8, @splat(0)), &key, 0));
+    try testing.expectError(error.BadLength, tls13CryptoInfo(.aes_gcm_128, &@as([12]u8, @splat(0)), &@as([15]u8, @splat(0)), 0));
 }
 
 test "ulpAvailable matches the tls ULP token exactly" {
@@ -639,8 +639,8 @@ fn expectKernelAcceptsTx(cipher: Cipher, key_len: usize) !void {
 
     attachUlp(server_fd) catch return error.SkipZigTest; // no CONFIG_TLS ⇒ skip
 
-    var static_iv = [_]u8{0xAB} ** 12;
-    var key = [_]u8{0xCD} ** 32;
+    var static_iv = @as([12]u8, @splat(0xAB));
+    var key = @as([32]u8, @splat(0xCD));
     const info = try tls13CryptoInfo(cipher, &static_iv, key[0..key_len], 0);
     var enc: [max_crypto_info_len]u8 = undefined;
     const encoded = try info.encode(&enc);

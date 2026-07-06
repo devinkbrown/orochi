@@ -2470,7 +2470,7 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
 // ---------------------------------------------------------------------------
 
 fn signingKeyFor(seed_byte: u8) !sign.KeyPair {
-    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+    return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
 }
 
 /// Stand up a signing-capable peer. The self-certifying invariant REQUIRES

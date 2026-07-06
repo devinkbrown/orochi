@@ -170,9 +170,9 @@ pub fn buildExecPlan(
 ) anyerror!ExecPlan {
     var argv = try allocator.alloc([:0]const u8, 2);
     errdefer allocator.free(argv);
-    argv[0] = try allocator.dupeZ(u8, binary_path);
+    argv[0] = try allocator.dupeSentinel(u8, binary_path, 0);
     errdefer allocator.free(argv[0]);
-    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    argv[1] = try allocator.dupeSentinel(u8, "--supervisor", 0);
     errdefer allocator.free(argv[1]);
 
     var envp = try allocator.alloc([:0]const u8, 2);
@@ -202,9 +202,9 @@ pub fn buildExecPlanWithListener(
 ) anyerror!ExecPlan {
     var argv = try allocator.alloc([:0]const u8, 2);
     errdefer allocator.free(argv);
-    argv[0] = try allocator.dupeZ(u8, binary_path);
+    argv[0] = try allocator.dupeSentinel(u8, binary_path, 0);
     errdefer allocator.free(argv[0]);
-    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    argv[1] = try allocator.dupeSentinel(u8, "--supervisor", 0);
     errdefer allocator.free(argv[1]);
 
     var envp = try allocator.alloc([:0]const u8, 3);
@@ -231,12 +231,12 @@ pub fn buildListenerExecPlan(
     const argc: usize = if (config_path != null) 3 else 2;
     var argv = try allocator.alloc([:0]const u8, argc);
     errdefer allocator.free(argv);
-    argv[0] = try allocator.dupeZ(u8, binary_path);
+    argv[0] = try allocator.dupeSentinel(u8, binary_path, 0);
     errdefer allocator.free(argv[0]);
-    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    argv[1] = try allocator.dupeSentinel(u8, "--supervisor", 0);
     errdefer allocator.free(argv[1]);
     if (config_path) |cp| {
-        argv[2] = try allocator.dupeZ(u8, cp);
+        argv[2] = try allocator.dupeSentinel(u8, cp, 0);
         errdefer allocator.free(argv[2]);
     }
 
@@ -264,12 +264,12 @@ pub fn buildArenaListenerExecPlan(
     const argc: usize = if (config_path != null) 3 else 2;
     var argv = try allocator.alloc([:0]const u8, argc);
     errdefer allocator.free(argv);
-    argv[0] = try allocator.dupeZ(u8, binary_path);
+    argv[0] = try allocator.dupeSentinel(u8, binary_path, 0);
     errdefer allocator.free(argv[0]);
-    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    argv[1] = try allocator.dupeSentinel(u8, "--supervisor", 0);
     errdefer allocator.free(argv[1]);
     if (config_path) |cp| {
-        argv[2] = try allocator.dupeZ(u8, cp);
+        argv[2] = try allocator.dupeSentinel(u8, cp, 0);
         errdefer allocator.free(argv[2]);
     }
 
@@ -349,7 +349,7 @@ pub fn readArena(allocator: std.mem.Allocator, arena_fd: handoff.Fd) anyerror![]
 fn fdEnvEntry(allocator: std.mem.Allocator, name: []const u8, fd: handoff.Fd) ![:0]u8 {
     var buf: [128]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{s}={d}", .{ name, fd });
-    return try allocator.dupeZ(u8, text);
+    return try allocator.dupeSentinel(u8, text, 0);
 }
 
 fn readFdFromEnvBlock(env: []const u8, name: []const u8) ?handoff.Fd {

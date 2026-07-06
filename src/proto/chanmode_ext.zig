@@ -95,7 +95,7 @@ const render_specs = [_]ModeSpec{
 };
 
 comptime {
-    const flag_count = @typeInfo(ExtChannelFlag).@"enum".fields.len;
+    const flag_count = @typeInfo(ExtChannelFlag).@"enum".field_names.len;
     if (mode_specs.len != flag_count) @compileError("missing IRCX channel flag mode");
     if (render_specs.len != flag_count) @compileError("missing render spec");
 

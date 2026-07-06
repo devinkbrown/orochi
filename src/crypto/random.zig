@@ -51,8 +51,8 @@ pub const Drbg = struct {
     /// Seed a new DRBG from the OS CSPRNG.
     pub fn init() Error!Drbg {
         var self = Drbg{
-            .key = Secret([key_len]u8).init([_]u8{0} ** key_len),
-            .nonce = [_]u8{0} ** nonce_len,
+            .key = Secret([key_len]u8).init(@as([key_len]u8, @splat(0))),
+            .nonce = @as([nonce_len]u8, @splat(0)),
             .counter = 0,
             .owner_pid = platform.currentPid(),
         };
@@ -240,7 +240,7 @@ fn testDrbg(seed: [seed_len]u8) Drbg {
 const testing = std.testing;
 
 test "getrandom fills a buffer" {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @splat(0);
     try fillOsEntropy(&buf);
 
     var any_nonzero = false;
@@ -249,7 +249,7 @@ test "getrandom fills a buffer" {
 }
 
 test "DRBG emits distinct consecutive outputs" {
-    var rng = testDrbg([_]u8{0xA5} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0xA5)));
     defer rng.deinit();
 
     var a: [64]u8 = undefined;
@@ -261,7 +261,7 @@ test "DRBG emits distinct consecutive outputs" {
 }
 
 test "reseed changes the stream" {
-    var rng = testDrbg([_]u8{0x11} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x11)));
     defer rng.deinit();
 
     var before: [64]u8 = undefined;
@@ -274,7 +274,7 @@ test "reseed changes the stream" {
 }
 
 test "snapshot pid mismatch forces reseed before output" {
-    var rng = testDrbg([_]u8{0x22} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x22)));
     defer rng.deinit();
 
     rng.owner_pid = 0;
@@ -284,19 +284,19 @@ test "snapshot pid mismatch forces reseed before output" {
 }
 
 test "fillSecret writes through Secret backing storage" {
-    var rng = testDrbg([_]u8{0x33} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x33)));
     defer rng.deinit();
 
-    var secret = Secret([32]u8).init([_]u8{0} ** 32);
+    var secret = Secret([32]u8).init(@as([32]u8, @splat(0)));
     defer secret.wipe();
     try rng.fillSecret(&secret);
 
     const value = secret.declassify();
-    try testing.expect(!std.mem.eql(u8, &value, &([_]u8{0} ** 32)));
+    try testing.expect(!std.mem.eql(u8, &value, &(@as([32]u8, @splat(0)))));
 }
 
 test "randomU64 produces changing values" {
-    var rng = testDrbg([_]u8{0x44} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x44)));
     defer rng.deinit();
 
     const a = try rng.randomU64();
@@ -305,7 +305,7 @@ test "randomU64 produces changing values" {
 }
 
 test "boundedInt validates range and stays within bound" {
-    var rng = testDrbg([_]u8{0x55} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x55)));
     defer rng.deinit();
 
     try testing.expectError(Error.InvalidBound, rng.boundedInt(u32, 0));
@@ -319,7 +319,7 @@ test "boundedInt validates range and stays within bound" {
 }
 
 test "boundedInt has no visible modulo bias on small ranges" {
-    var rng = testDrbg([_]u8{0x66} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x66)));
     defer rng.deinit();
 
     var counts = [_]usize{ 0, 0, 0 };
@@ -336,7 +336,7 @@ test "boundedInt has no visible modulo bias on small ranges" {
 }
 
 test "rangeLessThan handles signed ranges" {
-    var rng = testDrbg([_]u8{0x77} ** seed_len);
+    var rng = testDrbg(@as([seed_len]u8, @splat(0x77)));
     defer rng.deinit();
 
     var i: usize = 0;

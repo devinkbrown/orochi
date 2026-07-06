@@ -76,7 +76,7 @@ const testing = std.testing;
 
 test "ticket-key capsule round-trips a current-only key" {
     const a = testing.allocator;
-    const cur = [_]u8{0xAB} ** key_len;
+    const cur = @as([key_len]u8, @splat(0xAB));
     const bytes = try encode(a, .{ .current = cur });
     defer a.free(bytes);
     const got = try decode(bytes);
@@ -86,8 +86,8 @@ test "ticket-key capsule round-trips a current-only key" {
 
 test "ticket-key capsule round-trips current + previous (post-rotation)" {
     const a = testing.allocator;
-    const cur = [_]u8{0x11} ** key_len;
-    const prev = [_]u8{0x22} ** key_len;
+    const cur = @as([key_len]u8, @splat(0x11));
+    const prev = @as([key_len]u8, @splat(0x22));
     const bytes = try encode(a, .{ .current = cur, .previous = prev });
     defer a.free(bytes);
     const got = try decode(bytes);
@@ -98,8 +98,8 @@ test "ticket-key capsule round-trips current + previous (post-rotation)" {
 
 test "ticket-key capsule decode rejects truncation and a bad version" {
     try testing.expectError(error.Truncated, decode(&[_]u8{1}));
-    const short = [_]u8{1} ++ [_]u8{0} ** 10;
+    const short = [_]u8{1} ++ @as([10]u8, @splat(0));
     try testing.expectError(error.Truncated, decode(&short));
-    const bad = [_]u8{9} ++ [_]u8{0} ** (1 + key_len);
+    const bad = [_]u8{9} ++ @as([(1 + key_len)]u8, @splat(0));
     try testing.expectError(error.BadVersion, decode(&bad));
 }

@@ -378,9 +378,9 @@ const RawTag = struct {
 const RawLine = struct {
     raw: []const u8,
     command: []const u8,
-    params: [irc_line.MAXPARA][]const u8 = [_][]const u8{""} ** irc_line.MAXPARA,
+    params: [irc_line.MAXPARA][]const u8 = @splat(""),
     param_count: usize = 0,
-    tags: [irc_line.MAXTAGS]RawTag = [_]RawTag{.{ .key = "", .value_raw = null }} ** irc_line.MAXTAGS,
+    tags: [irc_line.MAXTAGS]RawTag = @splat(.{ .key = "", .value_raw = null }),
     tag_count: usize = 0,
     trailing: ?[]const u8 = null,
 

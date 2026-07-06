@@ -25,7 +25,7 @@ fn expectSecret(expected: []const u8, actual: *const Schedule.SecretBytes) !void
 }
 
 test "RFC 8448 Simple 1-RTT TLS 1.3 SHA-256 key schedule" {
-    const zero_psk = [_]u8{0} ** Schedule.hash_len;
+    const zero_psk = @as([Schedule.hash_len]u8, @splat(0));
     const empty_hash = Schedule.emptyTranscriptHash();
     const shared_secret = hex(
         "8bd4054fb55b9d63fdfbacf9f04b9f0d" ++

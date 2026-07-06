@@ -426,7 +426,7 @@ test "buildOneByteExtension rejects invalid ids and oversized data" {
     const zero_id = [_]Element{.{ .id = 0, .data = &[_]u8{0x01} }};
     try testing.expectError(error.BadProfile, buildOneByteExtension(&zero_id, &out));
 
-    const too_long = [_]Element{.{ .id = 1, .data = &[_]u8{0} ** 17 }};
+    const too_long = [_]Element{.{ .id = 1, .data = &@as([17]u8, @splat(0)) }};
     try testing.expectError(error.TooLong, buildOneByteExtension(&too_long, &out));
 
     const empty = [_]Element{.{ .id = 1, .data = &.{} }};

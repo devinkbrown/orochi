@@ -367,7 +367,7 @@ test "encodeCertificateVerify reports small output and oversized signature" {
     // Arrange.
     var short_out: [6]u8 = undefined;
     const signature = [_]u8{ 0xaa, 0xbb, 0xcc };
-    const oversized_signature = [_]u8{0xaa} ** (max_u16 + 1);
+    const oversized_signature = @as([(max_u16 + 1)]u8, @splat(0xaa));
     var enough: [handshake_header_len + certificate_verify_body_prefix_len]u8 = undefined;
 
     // Act and assert.
@@ -387,7 +387,7 @@ test "signedContent builds known server and client inputs" {
 
     // Assert.
     try testing.expectEqual(@as(usize, 64 + server_context.len + 1 + transcript_hash.len), server.len);
-    try testing.expectEqualSlices(u8, &([_]u8{0x20} ** 64), server[0..64]);
+    try testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0x20))), server[0..64]);
     try testing.expectEqualSlices(u8, server_context, server[64..][0..server_context.len]);
     try testing.expectEqual(@as(u8, 0), server[64 + server_context.len]);
     try testing.expectEqualSlices(u8, &transcript_hash, server[64 + server_context.len + 1 ..]);

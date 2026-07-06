@@ -248,10 +248,10 @@ test "X-Wing encapsulate/decapsulate round-trip" {
 test "X-Wing tampered ML-KEM ciphertext implicitly rejects to a different secret" {
     const allocator = std.testing.allocator;
 
-    var kp = try KeyPair.generateDeterministic([_]u8{0x11} ** secret_key_len);
+    var kp = try KeyPair.generateDeterministic(@as([secret_key_len]u8, @splat(0x11)));
     defer kp.wipe();
 
-    var enc = try encapsulateDeterministic(kp.public_key, [_]u8{0x22} ** encaps_seed_len);
+    var enc = try encapsulateDeterministic(kp.public_key, @as([encaps_seed_len]u8, @splat(0x22)));
     defer enc.wipe();
 
     const tampered_buf = try allocator.dupe(u8, &enc.ciphertext);
@@ -267,17 +267,17 @@ test "X-Wing tampered ML-KEM ciphertext implicitly rejects to a different secret
 
 test "X-Wing combiner is deterministic for fixed inputs" {
     var a = combine(
-        [_]u8{0x01} ** mlkem_shared_len,
-        [_]u8{0x02} ** x25519_shared_len,
-        [_]u8{0x03} ** x25519_public_len,
-        [_]u8{0x04} ** x25519_public_len,
+        @as([mlkem_shared_len]u8, @splat(0x01)),
+        @as([x25519_shared_len]u8, @splat(0x02)),
+        @as([x25519_public_len]u8, @splat(0x03)),
+        @as([x25519_public_len]u8, @splat(0x04)),
     );
     defer a.wipe();
     var b = combine(
-        [_]u8{0x01} ** mlkem_shared_len,
-        [_]u8{0x02} ** x25519_shared_len,
-        [_]u8{0x03} ** x25519_public_len,
-        [_]u8{0x04} ** x25519_public_len,
+        @as([mlkem_shared_len]u8, @splat(0x01)),
+        @as([x25519_shared_len]u8, @splat(0x02)),
+        @as([x25519_public_len]u8, @splat(0x03)),
+        @as([x25519_public_len]u8, @splat(0x04)),
     );
     defer b.wipe();
 
@@ -286,26 +286,26 @@ test "X-Wing combiner is deterministic for fixed inputs" {
 
 test "X-Wing combiner binds X25519 public key and ciphertext" {
     var baseline = combine(
-        [_]u8{0x01} ** mlkem_shared_len,
-        [_]u8{0x02} ** x25519_shared_len,
-        [_]u8{0x03} ** x25519_public_len,
-        [_]u8{0x04} ** x25519_public_len,
+        @as([mlkem_shared_len]u8, @splat(0x01)),
+        @as([x25519_shared_len]u8, @splat(0x02)),
+        @as([x25519_public_len]u8, @splat(0x03)),
+        @as([x25519_public_len]u8, @splat(0x04)),
     );
     defer baseline.wipe();
 
     var changed_ct = combine(
-        [_]u8{0x01} ** mlkem_shared_len,
-        [_]u8{0x02} ** x25519_shared_len,
-        [_]u8{0x7f} ** x25519_public_len,
-        [_]u8{0x04} ** x25519_public_len,
+        @as([mlkem_shared_len]u8, @splat(0x01)),
+        @as([x25519_shared_len]u8, @splat(0x02)),
+        @as([x25519_public_len]u8, @splat(0x7f)),
+        @as([x25519_public_len]u8, @splat(0x04)),
     );
     defer changed_ct.wipe();
 
     var changed_pk = combine(
-        [_]u8{0x01} ** mlkem_shared_len,
-        [_]u8{0x02} ** x25519_shared_len,
-        [_]u8{0x03} ** x25519_public_len,
-        [_]u8{0x80} ** x25519_public_len,
+        @as([mlkem_shared_len]u8, @splat(0x01)),
+        @as([x25519_shared_len]u8, @splat(0x02)),
+        @as([x25519_public_len]u8, @splat(0x03)),
+        @as([x25519_public_len]u8, @splat(0x80)),
     );
     defer changed_pk.wipe();
 
@@ -314,14 +314,14 @@ test "X-Wing combiner binds X25519 public key and ciphertext" {
 }
 
 test "X-Wing public key binding changes encapsulated secret" {
-    var a = try KeyPair.generateDeterministic([_]u8{0x33} ** secret_key_len);
+    var a = try KeyPair.generateDeterministic(@as([secret_key_len]u8, @splat(0x33)));
     defer a.wipe();
-    var b = try KeyPair.generateDeterministic([_]u8{0x34} ** secret_key_len);
+    var b = try KeyPair.generateDeterministic(@as([secret_key_len]u8, @splat(0x34)));
     defer b.wipe();
 
-    var enc_a = try encapsulateDeterministic(a.public_key, [_]u8{0x35} ** encaps_seed_len);
+    var enc_a = try encapsulateDeterministic(a.public_key, @as([encaps_seed_len]u8, @splat(0x35)));
     defer enc_a.wipe();
-    var enc_b = try encapsulateDeterministic(b.public_key, [_]u8{0x35} ** encaps_seed_len);
+    var enc_b = try encapsulateDeterministic(b.public_key, @as([encaps_seed_len]u8, @splat(0x35)));
     defer enc_b.wipe();
 
     try expectDifferentSecret(&enc_a.shared, &enc_b.shared);

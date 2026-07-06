@@ -224,7 +224,7 @@ test "runtime slice returns all failure indices" {
         try signedElement(kp, "slice bad key"),
     };
     entries[1].signature[4] ^= 0x01;
-    entries[2].public_key = [_]u8{0xff} ** public_key_len;
+    entries[2].public_key = @as([public_key_len]u8, @splat(0xff));
 
     const result = try verifyBatchSlice(allocator, entries[0..]);
     defer result.deinit(allocator);

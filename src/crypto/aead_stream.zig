@@ -164,7 +164,7 @@ pub const Encryptor = struct {
 /// reject streams that never delivered an authenticated final chunk.
 pub const Decryptor = struct {
     key: Key,
-    base_nonce: BaseNonce = [_]u8{0} ** base_nonce_len,
+    base_nonce: BaseNonce = @splat(0),
     have_base_nonce: bool = false,
     expected_counter: u32 = 0,
     ended: bool = false,

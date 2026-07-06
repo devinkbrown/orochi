@@ -78,8 +78,8 @@ const Entry = struct {
     stored_key: [digest_len]u8,
     server_key: [digest_len]u8,
     has_512: bool = false,
-    stored_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
-    server_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
+    stored_key_512: [digest512_len]u8 = @splat(0),
+    server_key_512: [digest512_len]u8 = @splat(0),
 };
 
 /// In-memory registry of per-account SCRAM-SHA-256 credentials.
@@ -290,8 +290,8 @@ pub const ScramStore = struct {
         stored_key: [digest_len]u8,
         server_key: [digest_len]u8,
         has_512: bool = false,
-        stored_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
-        server_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
+        stored_key_512: [digest512_len]u8 = @splat(0),
+        server_key_512: [digest512_len]u8 = @splat(0),
 
         /// View the SHA-256 portion as the legacy `sasl.ScramRecord`.
         pub fn sha256(self: FullRecord) sasl.ScramRecord {
@@ -605,7 +605,7 @@ test "empty or oversize account names are rejected" {
     // Arrange
     var store = ScramStore.init(std.testing.allocator);
     defer store.deinit();
-    const too_long = "x" ** (MAX_ACCOUNT_LEN + 1);
+    const too_long = &@as([(MAX_ACCOUNT_LEN + 1)]u8, @splat('x'));
 
     // Act / Assert
     try std.testing.expectError(error.InvalidAccount, store.deriveAndStore("", "password value here"));
@@ -623,7 +623,7 @@ const ScramMtCtx = struct {
         var i: usize = 0;
         while (i < ctx.iters) : (i += 1) {
             const name = std.fmt.bufPrint(&name_buf, "scram{d}_{d}", .{ ctx.writer_id, i }) catch unreachable;
-            var salt = [_]u8{@intCast(ctx.writer_id * ctx.iters + i + 1)} ** salt_len;
+            var salt = @as([salt_len]u8, @splat(@intCast(ctx.writer_id * ctx.iters + i + 1)));
             ctx.store.storeWithSalt(name, "thread password value", &salt, 4096) catch {
                 _ = ctx.failures.fetchAdd(1, .monotonic);
                 return;
@@ -651,7 +651,7 @@ test "ScramStore concurrent writers and readers preserve entries" {
     var store = ScramStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const seed_salt = [_]u8{0xA5} ** salt_len;
+    const seed_salt = @as([salt_len]u8, @splat(0xA5));
     try store.storeWithSalt("seed", "thread password value", &seed_salt, 4096);
 
     const writers = 4;

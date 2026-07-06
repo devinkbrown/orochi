@@ -90,7 +90,7 @@ pub const MonitorReplySink = struct {
 };
 
 const NickKey = struct {
-    bytes: [MAX_NICK_BYTES]u8 = [_]u8{0} ** MAX_NICK_BYTES,
+    bytes: [MAX_NICK_BYTES]u8 = @splat(0),
     len: u8 = 0,
 
     fn init(value: []const u8, normalize: bool) MonitorError!NickKey {
@@ -602,7 +602,7 @@ test "watchersOf can return more than the old fixed fanout buffer" {
     const n = store.watchersOf("alice", &out);
     try std.testing.expectEqual(@as(usize, watcher_count), n);
 
-    var saw = [_]bool{false} ** watcher_count;
+    var saw = @as([watcher_count]bool, @splat(false));
     for (out[0..n]) |watcher| {
         try std.testing.expect(watcher >= 1 and watcher <= watcher_count);
         saw[@intCast(watcher - 1)] = true;

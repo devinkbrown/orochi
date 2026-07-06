@@ -72,7 +72,7 @@ pub const Demux = struct {
     const Entry = struct {
         used: bool = false,
         len: usize = 0,
-        key: [max_key_len]u8 = [_]u8{0} ** max_key_len,
+        key: [max_key_len]u8 = @splat(0),
         token: u32 = 0,
 
         fn matches(self: Entry, key: []const u8) bool {
@@ -80,7 +80,7 @@ pub const Demux = struct {
         }
     };
 
-    entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+    entries: [capacity]Entry = @splat(.{}),
 
     pub fn put(self: *Demux, key: []const u8, token: u32) !void {
         try validateMid(key);

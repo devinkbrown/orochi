@@ -623,7 +623,7 @@ test "string literal: empty string" {
 
 test "string literal: long string" {
     var buf: [512]u8 = undefined;
-    const s = "x" ** 200;
+    const s = &@as([200]u8, @splat('x'));
     const n = try encodeString(&buf, s);
     const r = try decodeString(buf[0..n]);
     try testing.expectEqualStrings(s, r.str);

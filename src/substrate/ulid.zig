@@ -50,7 +50,7 @@ pub const MonotonicGenerator = struct {
     const Self = @This();
 
     last_ms: ?u64 = null,
-    last_random: [random_len]u8 = [_]u8{0} ** random_len,
+    last_random: [random_len]u8 = @splat(0),
 
     pub fn init() Self {
         return .{};
@@ -93,7 +93,7 @@ pub fn decode(text: []const u8) Error!Ulid {
     }
     if (values[0] > 7) return error.InvalidCharacter;
 
-    var bytes: [byte_len]u8 = [_]u8{0} ** byte_len;
+    var bytes: [byte_len]u8 = @splat(0);
     for (0..(byte_len * 8)) |data_bit| {
         const stream_bit = data_bit + 2;
         const value_index = stream_bit / 5;
@@ -212,8 +212,8 @@ test "encode and decode round-trip to 26 Crockford base32 characters" {
 }
 
 test "known minimum and maximum encodings are canonical" {
-    const zero = Ulid{ .bytes = [_]u8{0} ** byte_len };
-    const max = Ulid{ .bytes = [_]u8{0xff} ** byte_len };
+    const zero = Ulid{ .bytes = @as([byte_len]u8, @splat(0)) };
+    const max = Ulid{ .bytes = @as([byte_len]u8, @splat(0xff)) };
 
     const zero_text = zero.encode();
     const max_text = max.encode();
@@ -225,9 +225,9 @@ test "known minimum and maximum encodings are canonical" {
 }
 
 test "ULIDs sort lexicographically by timestamp" {
-    const earlier = fromParts(42, [_]u8{0xff} ** random_len);
-    const later = fromParts(43, [_]u8{0} ** random_len);
-    const much_later = fromParts(4_294_967_296, [_]u8{0} ** random_len);
+    const earlier = fromParts(42, @as([random_len]u8, @splat(0xff)));
+    const later = fromParts(43, @as([random_len]u8, @splat(0)));
+    const much_later = fromParts(4_294_967_296, @as([random_len]u8, @splat(0)));
 
     const earlier_text = earlier.encode();
     const later_text = later.encode();
@@ -299,11 +299,11 @@ test "monotonic generator reports 80-bit random overflow" {
     var prng = std.Random.DefaultPrng.init(0);
     var generator = MonotonicGenerator{
         .last_ms = 7,
-        .last_random = [_]u8{0xff} ** random_len,
+        .last_random = @as([random_len]u8, @splat(0xff)),
     };
 
     try testing.expectError(error.RandomOverflow, generator.next(7, prng.random()));
-    try testing.expectEqualSlices(u8, (&[_]u8{0xff} ** random_len)[0..], generator.last_random[0..]);
+    try testing.expectEqualSlices(u8, (&@as([random_len]u8, @splat(0xff)))[0..], generator.last_random[0..]);
 }
 
 test "decode rejects malformed input and invalid characters" {

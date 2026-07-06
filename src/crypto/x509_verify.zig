@@ -835,7 +835,7 @@ fn mintEd25519Leaf(
 }
 
 fn ed25519KpFromSeed(seed_byte: u8) !StdEd25519.KeyPair {
-    return StdEd25519.KeyPair.generateDeterministic([_]u8{seed_byte} ** 32);
+    return StdEd25519.KeyPair.generateDeterministic(@as([32]u8, @splat(seed_byte)));
 }
 
 test "valid Ed25519 two-cert chain (leaf signed by self-signed root) verifies" {
@@ -1045,13 +1045,13 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
 // ===========================================================================
 
 const m1279_n = blk: {
-    var n: [160]u8 = [_]u8{0xFF} ** 160;
+    var n: [160]u8 = @splat(0xFF);
     n[0] = 0x7F; // 2^1279 - 1 has 1279 set bits ⇒ top byte 0x7F, then 159×0xFF
     break :blk n;
 };
 // n - 2: identical to n except the least-significant byte 0xFF → 0xFD.
 const m1279_ed = blk: {
-    var d: [160]u8 = [_]u8{0xFF} ** 160;
+    var d: [160]u8 = @splat(0xFF);
     d[0] = 0x7F;
     d[159] = 0xFD;
     break :blk d;
@@ -1261,7 +1261,7 @@ test "verifyCertSignature accepts RSASSA-PSS over SHA-256/384/512 and rejects a 
 
         var mhash: [64]u8 = undefined;
         testHash(alg, tbs, mhash[0..alg.digestLen()]);
-        const salt = [_]u8{0x5A} ** 64;
+        const salt = @as([64]u8, @splat(0x5A));
         var sig: [160]u8 = undefined;
         try testSignPss(&sig, &m1279_n, &m1279_ed, alg, mhash[0..alg.digestLen()], salt[0..salt_len]);
 
@@ -1288,7 +1288,7 @@ test "verifyCertSignature accepts RSASSA-PSS whose hash AlgorithmIdentifiers omi
     const tbs = "pss without explicit null hash params";
     var mhash: [32]u8 = undefined;
     testHash(.sha256, tbs, &mhash);
-    const salt = [_]u8{0x33} ** 32;
+    const salt = @as([32]u8, @splat(0x33));
     var sig: [160]u8 = undefined;
     try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
 
@@ -1309,7 +1309,7 @@ test "verifyCertSignature rejects RSASSA-PSS when the declared hash differs from
     const tbs = "declared-hash mismatch";
     var mhash: [32]u8 = undefined;
     testHash(.sha256, tbs, &mhash);
-    const salt = [_]u8{0x11} ** 32;
+    const salt = @as([32]u8, @splat(0x11));
     var sig: [160]u8 = undefined;
     try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
 
@@ -1331,7 +1331,7 @@ test "verifyCertSignature rejects RSASSA-PSS when the declared hash differs from
 test "verifyCertSignature rejects RSASSA-PSS with a missing/oversized salt (fail-closed cap)" {
     var spki_buf: [700]u8 = undefined;
     const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
-    const sig = [_]u8{0} ** 160;
+    const sig = @as([160]u8, @splat(0));
 
     // saltLength = 4096, far above the max_pss_salt_len (512) cap → reject.
     var over_buf: [256]u8 = undefined;

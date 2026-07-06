@@ -106,7 +106,7 @@ pub fn FixedString(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        bytes: [capacity]u8 = @splat(0),
         len: usize = 0,
 
         pub fn empty() Self {
@@ -197,7 +197,7 @@ pub const AddressFamily = enum {
 
 pub const SocketAddress = struct {
     family: AddressFamily = .none,
-    bytes: [16]u8 = [_]u8{0} ** 16,
+    bytes: [16]u8 = @splat(0),
     port: u16 = 0,
 };
 
@@ -622,7 +622,7 @@ test "fixed strings reject oversize values" {
     try nick.set("valid");
     try std.testing.expect(nick.eql("valid"));
 
-    const too_long = "x" ** (MAX_NICK_BYTES + 1);
+    const too_long = &@as([(MAX_NICK_BYTES + 1)]u8, @splat('x'));
     try std.testing.expectError(error.TextTooLong, nick.set(too_long));
     try std.testing.expect(nick.eql("valid"));
 }

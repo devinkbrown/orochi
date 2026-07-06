@@ -171,7 +171,7 @@ pub const LanczosResampler = struct {
             .in_rate = in_rate,
             .out_rate = out_rate,
             .phase_num = 0,
-            .history = [_]f32{0.0} ** N_TAPS,
+            .history = @as([N_TAPS]f32, @splat(0.0)),
             .hist_len = 0,
         };
     }
@@ -179,7 +179,7 @@ pub const LanczosResampler = struct {
     pub fn reset(self: *LanczosResampler) void {
         self.phase_num = 0;
         self.hist_len = 0;
-        self.history = [_]f32{0.0} ** N_TAPS;
+        self.history = @as([N_TAPS]f32, @splat(0.0));
     }
 
     /// Retrieve input sample at logical index `idx` relative to chunk start.

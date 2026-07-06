@@ -338,8 +338,8 @@ const State = enum {
 };
 
 const TrafficKeys = struct {
-    key: [ChaCha20Poly1305.key_length]u8 = [_]u8{0} ** ChaCha20Poly1305.key_length,
-    iv: tls_record.Nonce96 = [_]u8{0} ** 12,
+    key: [ChaCha20Poly1305.key_length]u8 = @splat(0),
+    iv: tls_record.Nonce96 = @splat(0),
 
     fn wipe(self: *TrafficKeys) void {
         secureZero(&self.key);
@@ -380,7 +380,7 @@ pub const Server = struct {
     /// PSK binder of the accepted resumption (for the 0-RTT anti-replay check).
     accepted_binder: [tls_resumption.max_binder_len]u8 = undefined,
     accepted_binder_len: usize = 0,
-    legacy_session_id: [32]u8 = [_]u8{0} ** 32,
+    legacy_session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
 
     transcript: std.ArrayList(u8) = .empty,
@@ -406,18 +406,18 @@ pub const Server = struct {
 
     // Stored at the maximum hash length (SHA-384); only the first
     // `selected_suite.hashAlg()` digest bytes are live for a given connection.
-    early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    accepted_psk: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    early_secret: [max_hash_len]u8 = @splat(0),
+    accepted_psk: [max_hash_len]u8 = @splat(0),
     accepted_psk_len: usize = 0,
-    handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    handshake_secret: [max_hash_len]u8 = @splat(0),
+    master_secret: [max_hash_len]u8 = @splat(0),
+    exporter_master_secret: [max_hash_len]u8 = @splat(0),
     exporter_master_secret_ready: bool = false,
-    resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    resumption_master_secret: [max_hash_len]u8 = @splat(0),
+    client_hs_secret: [max_hash_len]u8 = @splat(0),
+    server_hs_secret: [max_hash_len]u8 = @splat(0),
+    client_app_secret: [max_hash_len]u8 = @splat(0),
+    server_app_secret: [max_hash_len]u8 = @splat(0),
     client_hs_keys: TrafficKeys = .{},
     server_hs_keys: TrafficKeys = .{},
     client_early_keys: TrafficKeys = .{},
@@ -927,7 +927,7 @@ pub const Server = struct {
         suite: u16,
         client_app_secret: [max_hash_len]u8,
         server_app_secret: [max_hash_len]u8,
-        exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+        exporter_master_secret: [max_hash_len]u8 = @splat(0),
         exporter_master_secret_ready: bool = false,
         app_read_seq: u64,
         app_write_seq: u64,
@@ -2444,7 +2444,7 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2539,7 +2539,7 @@ test "loopback: record_size_limit negotiated + fragments outbound records (RFC 8
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5d} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5d)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2610,7 +2610,7 @@ test "loopback: X25519MLKEM768 post-quantum hybrid handshake (client offer + ser
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6a} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6a)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2666,7 +2666,7 @@ test "loopback: X25519MLKEM768 post-quantum hybrid handshake (client offer + ser
 test "OCSP staple: leaf CertificateEntry carries status_request when client asked + staple set" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7b} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7b)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2746,7 +2746,7 @@ test "loopback: exportResume/resumeConnected carries a live session across Serve
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x44} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x44)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2840,7 +2840,7 @@ test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x91} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x91)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -2960,7 +2960,7 @@ test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xA0} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xA0)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3055,7 +3055,7 @@ test "loopback: an expired resumption ticket is rejected (lifetime enforced)" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xB1} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xB1)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3128,7 +3128,7 @@ test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refus
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xC2} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xC2)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3220,7 +3220,7 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xA1} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xA1)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3421,7 +3421,7 @@ test "loopback: handshake completes over TLS_AES_256_GCM_SHA384 (SHA-384 schedul
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x84} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x84)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3490,7 +3490,7 @@ test "loopback: handshake completes over secp256r1 key exchange" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x63} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x63)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3549,7 +3549,7 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x71)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3624,7 +3624,7 @@ test "server rejects a ClientHello2 whose SNI differs from ClientHello1 (RFC 844
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x73} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x73)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3688,7 +3688,7 @@ test "init rejects a signing key whose type mismatches the leaf public key" {
     // An Ed25519 leaf paired (wrongly) with an ECDSA-P256 signing key: every
     // CertificateVerify would be produced by a key that doesn't match the
     // presented leaf, so the server must refuse the config at init.
-    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
     var buf: [1024]u8 = undefined;
     const ed_leaf = try x509_selfsign.buildSelfSigned(&buf, .{
         .common_name = "leaf.test",
@@ -3724,7 +3724,7 @@ test "alertDescriptionForError maps handshake errors to RFC 8446 §6 codes" {
 test "takeAlert emits a fatal plaintext alert only before the ServerHello" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&buf, .{
         .common_name = "alert.test",
@@ -3763,7 +3763,7 @@ test "takeAlert seals an ENCRYPTED fatal alert for post-ServerHello handshake er
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x53} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x53)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3851,7 +3851,7 @@ test "loopback: RFC 8879 cert compression — server sends CompressedCertificate
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x88} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x88)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -3962,9 +3962,9 @@ test "loopback: SNI selects the matching certificate among multiple" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp0 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x90} ** Ed25519.KeyPair.seed_length);
-    const kpA = try Ed25519.KeyPair.generateDeterministic([_]u8{0x91} ** Ed25519.KeyPair.seed_length);
-    const kpB = try Ed25519.KeyPair.generateDeterministic([_]u8{0x92} ** Ed25519.KeyPair.seed_length);
+    const kp0 = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x90)));
+    const kpA = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x91)));
+    const kpB = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x92)));
 
     var buf0: [1024]u8 = undefined;
     var bufA: [1024]u8 = undefined;
@@ -3993,7 +3993,7 @@ test "loopback: client rejects an expired server certificate when a clock is sup
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x44} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x44)));
     var cert_buf: [1024]u8 = undefined;
     // Validity window entirely in 2024.
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
@@ -4031,7 +4031,7 @@ test "loopback: post-handshake KeyUpdate rotates keys both directions" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -4101,8 +4101,8 @@ test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
     // One seed yields both the std-Ed25519 cert key and the sign.KeyPair the
     // client signs CertificateVerify with — same public key, so the server's
     // SPKI-extracted key verifies the possession proof.
-    const s_seed = [_]u8{0x33} ** Ed25519.KeyPair.seed_length;
-    const c_seed = [_]u8{0x44} ** Ed25519.KeyPair.seed_length;
+    const s_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x33));
+    const c_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x44));
     const server_kp = try Ed25519.KeyPair.generateDeterministic(s_seed);
     const client_kp = try Ed25519.KeyPair.generateDeterministic(c_seed);
     const client_sign = try sign.KeyPair.fromSeed(c_seed);
@@ -4159,7 +4159,7 @@ test "mTLS: a declining client still completes with no client cert" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x55} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x55)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -4198,7 +4198,7 @@ test "mTLS: CertificateRequest wire encoding is exact (RFC 8446 §4.3.2)" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x66} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x66)));
     var cert_buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
         .common_name = "irc.test",
@@ -4266,7 +4266,7 @@ test "mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP" {
     const certfp = @import("../proto/certfp.zig");
     const alloc = std.testing.allocator;
 
-    const server_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x77} ** Ed25519.KeyPair.seed_length);
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x77)));
     const client_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
 
     var server_cert_buf: [1024]u8 = undefined;
@@ -4335,7 +4335,7 @@ test "mTLS: RSA client cert completes and exposes leaf + CertFP" {
     const certfp = @import("../proto/certfp.zig");
     const alloc = std.testing.allocator;
 
-    const server_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x78} ** Ed25519.KeyPair.seed_length);
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x78)));
     const client_rsa = rsaTestPrivateKey();
 
     var server_cert_buf: [1024]u8 = undefined;

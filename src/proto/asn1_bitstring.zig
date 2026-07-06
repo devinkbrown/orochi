@@ -167,7 +167,7 @@ test "encode and parse round-trip non-byte-aligned content" {
 
 test "encode writes short-form length at the DER boundary" {
     // Arrange
-    const input = [_]u8{0xaa} ** 126;
+    const input = @as([126]u8, @splat(0xaa));
     var out: [129]u8 = undefined;
 
     // Act
@@ -183,7 +183,7 @@ test "encode writes short-form length at the DER boundary" {
 
 test "encode writes long-form length after the DER short-form boundary" {
     // Arrange
-    const input = [_]u8{0xbb} ** 127;
+    const input = @as([127]u8, @splat(0xbb));
     var out: [131]u8 = undefined;
 
     // Act

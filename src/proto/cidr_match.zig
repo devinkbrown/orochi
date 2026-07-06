@@ -181,7 +181,7 @@ fn parseIpv6(text: []const u8) ParseError!u128 {
         const total = left_count + right_count;
         if (total >= 8) return error.InvalidCompression;
 
-        var groups: [8]u16 = [_]u16{0} ** 8;
+        var groups: [8]u16 = @splat(0);
         @memcpy(groups[0..left_count], left[0..left_count]);
         const right_start = 8 - right_count;
         @memcpy(groups[right_start..8], right[0..right_count]);

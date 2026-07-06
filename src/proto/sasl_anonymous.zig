@@ -152,7 +152,7 @@ test "parse rejects invalid utf8" {
 test "parse rejects oversize trace" {
     const allocator = std.testing.allocator;
 
-    const msg = "a" ** (default_max_trace_bytes + 1);
+    const msg = &@as([(default_max_trace_bytes + 1)]u8, @splat('a'));
 
     _ = allocator;
     try std.testing.expectError(error.TraceTooLong, parse(msg));

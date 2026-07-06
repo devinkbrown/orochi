@@ -108,9 +108,9 @@ pub fn Assembler(comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        ref_bytes: [config.max_ref_len]u8 = [_]u8{0} ** config.max_ref_len,
+        ref_bytes: [config.max_ref_len]u8 = @splat(0),
         ref_len: usize = 0,
-        target_bytes: [config.max_target_len]u8 = [_]u8{0} ** config.max_target_len,
+        target_bytes: [config.max_target_len]u8 = @splat(0),
         target_len: usize = 0,
         command: ?PayloadCommand = null,
         line_count: usize = 0,

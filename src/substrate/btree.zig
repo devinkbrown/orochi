@@ -32,7 +32,7 @@ pub fn BTreeMap(comptime K: type, comptime V: type, comptime branching_factor: u
                     .key_count = 0,
                     .keys = undefined,
                     .values = undefined,
-                    .children = [_]?*Node{null} ** branching_factor,
+                    .children = @splat(null),
                 };
             }
         };

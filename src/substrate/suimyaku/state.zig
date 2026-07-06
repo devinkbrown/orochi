@@ -34,7 +34,7 @@ pub fn InlineString(comptime max_len: usize) type {
     return struct {
         const Self = @This();
 
-        bytes: [max_len]u8 = [_]u8{0} ** max_len,
+        bytes: [max_len]u8 = @splat(0),
         len: u16 = 0,
 
         pub const Error = error{StringTooLong};

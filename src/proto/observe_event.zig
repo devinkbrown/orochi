@@ -229,7 +229,7 @@ test "trailing bytes rejected" {
 }
 
 test "over-long fields rejected by encode" {
-    const big_host = "x" ** (max_host_len + 1);
+    const big_host = &@as([(max_host_len + 1)]u8, @splat('x'));
     try testing.expectError(error.NameTooLong, encodedLen(.{ .action = 0, .origin_server = "n", .nick = "a", .user = "u", .host = big_host, .account = null, .detail = "" }));
 }
 

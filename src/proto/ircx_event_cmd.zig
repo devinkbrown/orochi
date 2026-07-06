@@ -84,8 +84,8 @@ pub fn parseOperation(token: []const u8) ParseError!Operation {
 /// Resolve category tokens using `EventCategory.code()`, `.token()`, and the
 /// IRCX draft compatibility aliases.
 pub fn lookupCategory(token: []const u8) ParseError!EventCategory {
-    inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
-        const category: EventCategory = @field(EventCategory, field.name);
+    inline for (@typeInfo(EventCategory).@"enum".field_names) |field_name| {
+        const category: EventCategory = @field(EventCategory, field_name);
         if (std.ascii.eqlIgnoreCase(token, category.code()) or
             std.ascii.eqlIgnoreCase(token, category.token()))
         {
@@ -133,8 +133,8 @@ pub const ListReplyBuilder = struct {
 
     /// Write one `EVENT LIST <CATEGORY>` line for each mask bit, then an end line.
     pub fn write(self: *ListReplyBuilder, mask: CategoryMask) BuildError![]const u8 {
-        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
-            const category: EventCategory = @field(EventCategory, field.name);
+        inline for (@typeInfo(EventCategory).@"enum".field_names) |field_name| {
+            const category: EventCategory = @field(EventCategory, field_name);
             if (mask.contains(category)) {
                 try self.writer.append("EVENT LIST ");
                 try self.writer.append(category.code());

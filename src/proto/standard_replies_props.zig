@@ -192,10 +192,10 @@ test "valid structured replies parse back to the original command code contexts 
 }
 
 test "catalog code tokens round trip through parseCatalogCode and remain well formed" {
-    inline for (@typeInfo(standard_replies.Code).@"enum".fields) |field| {
-        const parsed = standard_replies.parseCatalogCode(field.name).?;
-        try std.testing.expectEqual(@field(standard_replies.Code, field.name), parsed);
-        try std.testing.expect(standard_replies.validCodeToken(field.name));
+    inline for (@typeInfo(standard_replies.Code).@"enum".field_names) |field_name| {
+        const parsed = standard_replies.parseCatalogCode(field_name).?;
+        try std.testing.expectEqual(@field(standard_replies.Code, field_name), parsed);
+        try std.testing.expect(standard_replies.validCodeToken(field_name));
     }
 
     try std.testing.expectEqual(@as(?standard_replies.Code, null), standard_replies.parseCatalogCode("bad-code"));
@@ -299,11 +299,11 @@ fn replyTypeForIteration(iteration: usize) standard_replies.ReplyType {
     };
 }
 
-const catalog_code_count = @typeInfo(standard_replies.Code).@"enum".fields.len;
+const catalog_code_count = @typeInfo(standard_replies.Code).@"enum".field_names.len;
 
 fn catalogCodeByIndex(index: usize) standard_replies.Code {
-    inline for (@typeInfo(standard_replies.Code).@"enum".fields, 0..) |field, field_index| {
-        if (index == field_index) return @field(standard_replies.Code, field.name);
+    inline for (@typeInfo(standard_replies.Code).@"enum".field_names, 0..) |field_name, field_index| {
+        if (index == field_index) return @field(standard_replies.Code, field_name);
     }
     return .UNKNOWN_ERROR;
 }

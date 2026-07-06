@@ -318,8 +318,8 @@ fn sampleFields(node_pubkey: PublicKeyBytes) Fields {
 }
 
 test "issue and verify happy path" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x22} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22)));
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
 
     try verify(token, issuer.public_key.toBytes(), 2_000);
@@ -333,8 +333,8 @@ test "issue and verify happy path" {
 }
 
 test "tampered field or signature fails as BadSig" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x12} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x23} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x12)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x23)));
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
 
     var tampered_field = token;
@@ -347,16 +347,16 @@ test "tampered field or signature fails as BadSig" {
 }
 
 test "expired token fails as Expired" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x13} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x13)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x24)));
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
 
     try std.testing.expectError(error.Expired, verify(token, issuer.public_key.toBytes(), 10_001));
 }
 
 test "wrong realm fails as WrongRealm" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x14} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x25} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x14)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x25)));
     var fields = sampleFields(node.public_key.toBytes());
     fields.realm = "other";
     const token = try issue(issuer, fields);
@@ -365,8 +365,8 @@ test "wrong realm fails as WrongRealm" {
 }
 
 test "revoked epoch fails as Revoked" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x15} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x26} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x15)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x26)));
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
     const root = TrustRoot{
         .public_key = issuer.public_key.toBytes(),
@@ -377,8 +377,8 @@ test "revoked epoch fails as Revoked" {
 }
 
 test "canonical encoding is stable across decode and re-encode" {
-    const issuer = try Ed25519.KeyPair.generateDeterministic([_]u8{0x16} ** 32);
-    const node = try Ed25519.KeyPair.generateDeterministic([_]u8{0x27} ** 32);
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x16)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x27)));
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
 
     var a_buf: [max_token_len]u8 = undefined;

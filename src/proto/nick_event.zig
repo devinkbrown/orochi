@@ -210,7 +210,7 @@ test "nick event round-trips an account, and omits it when empty (old-peer compa
 }
 
 test "nick event enforces bounds" {
-    const big = "x" ** (max_nick_len + 1);
+    const big = &@as([(max_nick_len + 1)]u8, @splat('x'));
     const ev = NickEvent{ .origin_node = 1, .hlc = 1, .old_nick = big, .new_nick = "b", .username = "", .realname = "", .host = "" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }

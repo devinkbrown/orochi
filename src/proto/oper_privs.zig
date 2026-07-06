@@ -222,11 +222,11 @@ pub fn validateClassName(class_name: []const u8) Error!void {
 
 fn appendPrivilegeList(b: *LineBuilder, privileges: OperPrivileges) Error!void {
     var wrote = false;
-    inline for (@typeInfo(Privilege).@"enum".fields) |field| {
-        const privilege: Privilege = @field(Privilege, field.name);
+    inline for (@typeInfo(Privilege).@"enum".field_names) |field_name| {
+        const privilege: Privilege = @field(Privilege, field_name);
         if (privileges.has(privilege)) {
             if (wrote) try b.appendByte(' ');
-            try b.appendBytes(field.name);
+            try b.appendBytes(field_name);
             wrote = true;
         }
     }

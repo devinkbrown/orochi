@@ -31,14 +31,14 @@ test "FIPS 180-4 SHA-2 digests for abc" {
 }
 
 test "RFC 4231 HMAC-SHA256 test case 1" {
-    const key = [_]u8{0x0b} ** 20;
+    const key = @as([20]u8, @splat(0x0b));
     const actual = hash.HmacSha256.create(&key, "Hi There");
     const expected = hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
     try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "RFC 5869 HKDF-SHA256 test case 1" {
-    const ikm = [_]u8{0x0b} ** 22;
+    const ikm = @as([22]u8, @splat(0x0b));
     const salt = hex("000102030405060708090a0b0c");
     const info = hex("f0f1f2f3f4f5f6f7f8f9");
 

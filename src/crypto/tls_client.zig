@@ -206,8 +206,8 @@ const CipherSuite = enum(u16) {
 };
 
 const TrafficKeys = struct {
-    key: [ChaCha20Poly1305.key_length]u8 = [_]u8{0} ** ChaCha20Poly1305.key_length,
-    iv: tls_record.Nonce96 = [_]u8{0} ** 12,
+    key: [ChaCha20Poly1305.key_length]u8 = @splat(0),
+    iv: tls_record.Nonce96 = @splat(0),
 
     fn wipe(self: *TrafficKeys) void {
         secureZero(&self.key);
@@ -383,16 +383,16 @@ pub const Client = struct {
 
     // Traffic secrets are stored at the maximum hash length (SHA-384); only the
     // first `selected_suite.hashLen()` bytes are live for a given connection.
-    early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    early_secret: [max_hash_len]u8 = @splat(0),
+    handshake_secret: [max_hash_len]u8 = @splat(0),
+    master_secret: [max_hash_len]u8 = @splat(0),
+    exporter_master_secret: [max_hash_len]u8 = @splat(0),
     exporter_master_secret_ready: bool = false,
-    resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    client_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
-    server_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    resumption_master_secret: [max_hash_len]u8 = @splat(0),
+    client_hs_secret: [max_hash_len]u8 = @splat(0),
+    server_hs_secret: [max_hash_len]u8 = @splat(0),
+    client_app_secret: [max_hash_len]u8 = @splat(0),
+    server_app_secret: [max_hash_len]u8 = @splat(0),
     client_hs_keys: TrafficKeys = .{},
     server_hs_keys: TrafficKeys = .{},
     client_early_keys: TrafficKeys = .{},
@@ -580,7 +580,7 @@ pub const Client = struct {
         }
         const ticket = try self.allocator.dupe(u8, decoded.ticket);
         errdefer self.allocator.free(ticket);
-        var psk: [max_hash_len]u8 = [_]u8{0} ** max_hash_len;
+        var psk: [max_hash_len]u8 = @splat(0);
         @memcpy(psk[0..decoded.psk.len], decoded.psk);
         self.resume_offer = .{
             .ticket = ticket,
@@ -1052,7 +1052,7 @@ pub const Client = struct {
                 .identity = offer.ticket,
                 .obfuscated_ticket_age = tls_session_ticket.obfuscatedAge(offer.ticket_age_ms, offer.ticket_age_add),
             };
-            var zero_binder: [max_hash_len]u8 = [_]u8{0} ** max_hash_len;
+            var zero_binder: [max_hash_len]u8 = @splat(0);
             const binders = [_][]const u8{zero_binder[0..offer.psk_len]};
             const psk_ext_data_offset = ext_builder.len + tls_extension.header_len;
             const psk_tmp_len = 2 + (try identity.wireLen()) + 2 + 1 + offer.psk_len;
@@ -2780,8 +2780,8 @@ test "DNS wildcard matching is single-label only" {
 
 test "Finished verify detects tampering" {
     // Arrange
-    const base = [_]u8{0x11} ** tls_finished.mac_len;
-    const transcript = [_]u8{0x22} ** tls_finished.mac_len;
+    const base = @as([tls_finished.mac_len]u8, @splat(0x11));
+    const transcript = @as([tls_finished.mac_len]u8, @splat(0x22));
     var mac = tls_finished.verifyData(base, transcript);
 
     // Act
@@ -2798,8 +2798,8 @@ test "application record seals and opens with AES-128-GCM" {
     // Arrange
     const allocator = std.testing.allocator;
     var keys = TrafficKeys{};
-    keys.key[0..Aes128Gcm.key_length].* = [_]u8{0x42} ** Aes128Gcm.key_length;
-    keys.iv = [_]u8{0x24} ** 12;
+    keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x42));
+    keys.iv = @as([12]u8, @splat(0x24));
     const msg = "GET / HTTP/1.1\r\n\r\n";
 
     // Act
@@ -2820,8 +2820,8 @@ test "decryptApp skips post-handshake handshake records (NewSessionTicket)" {
     defer client.deinit();
     client.state = .connected;
     client.selected_suite = .tls_aes_128_gcm_sha256;
-    client.server_app_keys.key[0..Aes128Gcm.key_length].* = [_]u8{0x5A} ** Aes128Gcm.key_length;
-    client.server_app_keys.iv = [_]u8{0xA5} ** 12;
+    client.server_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+    client.server_app_keys.iv = @as([12]u8, @splat(0xA5));
 
     // A syntactically valid, zero-lifetime NewSessionTicket arrives first
     // (seq 0), then real application data (seq 1). Zero lifetime means it is
@@ -3187,7 +3187,7 @@ test "checkCrlRevocation fail-open: no clock and unparseable CRL never error" {
 test "checkCrlRevocation revokes only a listed serial under an authentic, current CRL" {
     const a = std.testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
     const spki = try crlTestEd25519Spki(a, kp.public_key.toBytes());
     defer a.free(spki);
     const der = try crlTestSignedCrlWithRevoked(a, kp, &[_]u8{0x2A});
@@ -3205,7 +3205,7 @@ test "checkCrlRevocation revokes only a listed serial under an authentic, curren
 test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
     const a = std.testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
     const der = try crlTestSignedCrlWithRevoked(a, kp, &[_]u8{0x2A});
     defer a.free(der);
     const parsed = try crl.parse(der);
@@ -3213,7 +3213,7 @@ test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
 
     // Authenticated under the WRONG issuer key → the CRL is discarded (fail-open)
     // even though the serial is listed: an unauthenticated CRL must never revoke.
-    const attacker = try Ed25519.KeyPair.generateDeterministic([_]u8{0x77} ** Ed25519.KeyPair.seed_length);
+    const attacker = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x77)));
     const attacker_spki = try crlTestEd25519Spki(a, attacker.public_key.toBytes());
     defer a.free(attacker_spki);
     try checkCrlRevocation(der, attacker_spki, &[_]u8{0x2A}, now);

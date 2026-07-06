@@ -379,8 +379,8 @@ test "subscription list encode/decode round-trip" {
     const ep1 = try testing.allocator.dupe(u8, "https://push.example.net/send/abc123");
     const ep2 = try testing.allocator.dupe(u8, "https://fcm.googleapis.com/fcm/send/xyz");
     var subs = [_]Subscription{
-        .{ .endpoint = ep1, .ua_public = [_]u8{4} ++ [_]u8{1} ** 64, .auth = [_]u8{9} ** 16 },
-        .{ .endpoint = ep2, .ua_public = [_]u8{4} ++ [_]u8{2} ** 64, .auth = [_]u8{8} ** 16 },
+        .{ .endpoint = ep1, .ua_public = [_]u8{4} ++ @as([64]u8, @splat(1)), .auth = @as([16]u8, @splat(9)) },
+        .{ .endpoint = ep2, .ua_public = [_]u8{4} ++ @as([64]u8, @splat(2)), .auth = @as([16]u8, @splat(8)) },
     };
     defer for (&subs) |*s| s.deinit(testing.allocator);
 
@@ -411,7 +411,7 @@ test "validEndpoint enforces https, length and character rules" {
     try testing.expect(!validEndpoint("https://"));
     try testing.expect(!validEndpoint("https://x.example/a b"));
     try testing.expect(!validEndpoint("https://x.example/a\tb"));
-    const long = "https://x.example/" ++ "a" ** (max_endpoint_len);
+    const long = "https://x.example/" ++ &@as([(max_endpoint_len)]u8, @splat('a'));
     try testing.expect(!validEndpoint(long));
 }
 
@@ -446,7 +446,7 @@ test "worker enqueue/shutdown never blocks and bounds the queue" {
     };
     try w.spawn();
     const ua = try @import("../crypto/ecdh_p256.zig").generate();
-    w.enqueue("https://push.example.net/send/1", ua.public_sec1, [_]u8{1} ** 16, "{\"type\":\"dm\"}");
+    w.enqueue("https://push.example.net/send/1", ua.public_sec1, @as([16]u8, @splat(1)), "{\"type\":\"dm\"}");
     sleepMs(50);
     w.shutdown();
     // The lone job either failed (dead resolver) or was still queued at

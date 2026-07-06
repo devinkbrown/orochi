@@ -1300,7 +1300,7 @@ const TestServerKeys = struct {
     cert_chain: [1][]const u8,
 
     fn init(self: *TestServerKeys) !void {
-        self.kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x37} ** Ed25519.KeyPair.seed_length);
+        self.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
         self.cert = try x509_selfsign.buildSelfSigned(&self.cert_buf, .{
             .common_name = "wt.test",
             .not_before = 1_704_067_200,
@@ -1431,8 +1431,8 @@ test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both w
         },
         .local_cid = &client_cid,
         .initial_dcid = &initial_dcid,
-        .x25519_seed = [_]u8{0x42} ** 32,
-        .client_random = [_]u8{0x11} ** 32,
+        .x25519_seed = @as([32]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
     });
     defer client.deinit();
 
@@ -1674,7 +1674,7 @@ test "version negotiation — an Initial with version 0xff000099 yields a VN lis
     // reply (a few dozen bytes) never amplifies. We mimic that here: the parsed
     // header is the same, but the on-wire datagram is padded so the VN passes the
     // never-amplify guard.
-    var buf: [1300]u8 = [_]u8{0} ** 1300;
+    var buf: [1300]u8 = @splat(0);
     const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
     const scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
     const hdr = buildInitialHeader(&buf, 0xff00_0099, &dcid, &scid, &.{});

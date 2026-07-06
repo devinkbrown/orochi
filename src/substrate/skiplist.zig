@@ -451,7 +451,7 @@ test "stress insert remove keeps invariants" {
     defer list.deinit();
 
     var rng = SplitMix64{ .state = 0xdecaf_bad };
-    var present = [_]bool{false} ** 512;
+    var present = @as([512]bool, @splat(false));
 
     for (0..2000) |step| {
         const key: u64 = @intCast(rng.next() % present.len);

@@ -152,7 +152,7 @@ pub fn AwayStore(
     }
 
     return struct {
-        entries: [max_clients]Entry = [_]Entry{Entry{}} ** max_clients,
+        entries: [max_clients]Entry = @splat(Entry{}),
         count: usize = 0,
 
         const Self = @This();
@@ -160,7 +160,7 @@ pub fn AwayStore(
         const Entry = struct {
             client: ClientId = 0,
             away: bool = false,
-            message: [max_message_bytes]u8 = [_]u8{0} ** max_message_bytes,
+            message: [max_message_bytes]u8 = @splat(0),
             message_len: u16 = 0,
 
             fn messageSlice(self: *const Entry) []const u8 {

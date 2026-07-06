@@ -360,7 +360,7 @@ fn hasCrlf(s: []const u8) bool {
 fn isLoopback(addr: net.IpAddress) bool {
     return switch (addr) {
         .ip4 => |x| x.bytes[0] == 127,
-        .ip6 => |x| std.mem.eql(u8, &x.bytes, &([_]u8{0} ** 15 ++ [_]u8{1})),
+        .ip6 => |x| std.mem.eql(u8, &x.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
     };
 }
 
@@ -578,8 +578,8 @@ test "isLoopback detects 127.0.0.0/8 and ::1, rejects public addresses" {
     try testing.expect(isLoopback(.{ .ip4 = .{ .bytes = .{ 127, 5, 9, 200 }, .port = 587 } }));
     try testing.expect(!isLoopback(.{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 587 } }));
 
-    const v6_loop = [_]u8{0} ** 15 ++ [_]u8{1};
+    const v6_loop = @as([15]u8, @splat(0)) ++ [_]u8{1};
     try testing.expect(isLoopback(.{ .ip6 = .{ .bytes = v6_loop, .port = 587 } }));
-    const v6_pub = [_]u8{ 0x20, 0x01 } ++ [_]u8{0} ** 13 ++ [_]u8{1};
+    const v6_pub = [_]u8{ 0x20, 0x01 } ++ @as([13]u8, @splat(0)) ++ [_]u8{1};
     try testing.expect(!isLoopback(.{ .ip6 = .{ .bytes = v6_pub, .port = 587 } }));
 }

@@ -364,7 +364,7 @@ test "channel prop codec rejects truncated and trailing input" {
 }
 
 test "channel prop codec rejects oversized fields" {
-    const big = "x" ** (max_value_len + 1);
+    const big = &@as([(max_value_len + 1)]u8, @splat('x'));
     const ev = ChannelPropEvent{ .present = true, .origin_node = 7, .hlc = 1, .channel = "#c", .key = "K", .value = big, .owner = "o" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }
@@ -374,7 +374,7 @@ test "channel prop codec rejects oversized fields" {
 // ---------------------------------------------------------------------------
 
 fn propTestKeyPair(seed_byte: u8) !sign.KeyPair {
-    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+    return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
 }
 
 /// Build a prop fact whose `origin_node` is the self-certified short id of `kp`,
@@ -528,7 +528,7 @@ test "channel prop signature survives a re-encode/decode round-trip verbatim (mu
 }
 
 test "channel prop encode rejects a half-present signature pair" {
-    var pk = [_]u8{0xAB} ** pubkey_len;
+    var pk = @as([pubkey_len]u8, @splat(0xAB));
     const ev = ChannelPropEvent{
         .present = true,
         .origin_node = 7,

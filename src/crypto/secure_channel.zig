@@ -155,7 +155,7 @@ pub const SecureGroup = struct {
 const testing = std.testing;
 
 fn pairFromSeed(b: u8) !X25519.KeyPair {
-    return X25519.KeyPair.generateDeterministic([_]u8{b} ** X25519.seed_length);
+    return X25519.KeyPair.generateDeterministic(@as([X25519.seed_length]u8, @splat(b)));
 }
 
 test "1:1 channel: HPKE bootstrap + ratchet round-trip both directions" {
@@ -227,9 +227,9 @@ test "1:1 channel: out-of-order delivery within the skip window" {
 test "group: all members share a key; rekey on remove evicts the removed member" {
     const allocator = testing.allocator;
     const seeds = [_]treekem.MemberSeed{
-        [_]u8{0xa1} ** treekem.member_seed_len,
-        [_]u8{0xa2} ** treekem.member_seed_len,
-        [_]u8{0xa3} ** treekem.member_seed_len,
+        @as([treekem.member_seed_len]u8, @splat(0xa1)),
+        @as([treekem.member_seed_len]u8, @splat(0xa2)),
+        @as([treekem.member_seed_len]u8, @splat(0xa3)),
     };
     var g = try SecureGroup.init(allocator, &seeds);
     defer g.deinit();

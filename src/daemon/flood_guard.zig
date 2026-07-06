@@ -234,7 +234,7 @@ pub const FloodGuard = struct {
     command_rate: RuntimeBucket,
     target_change_rate: RuntimeBucket,
     excess: RuntimeExcess,
-    targets: [target_slots]TargetKey = [_]TargetKey{TargetKey.empty} ** target_slots,
+    targets: [target_slots]TargetKey = @splat(TargetKey.empty),
     target_count: usize = 0,
     next_target_slot: usize = 0,
 

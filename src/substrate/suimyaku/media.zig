@@ -85,7 +85,7 @@ pub const KindSet = struct {
 };
 
 pub const ParticipantId = struct {
-    bytes: [max_participant_id_bytes]u8 = [_]u8{0} ** max_participant_id_bytes,
+    bytes: [max_participant_id_bytes]u8 = @splat(0),
     len: u8 = 0,
 
     pub const Error = error{ EmptyParticipantId, ParticipantIdTooLong, InvalidParticipantId };
@@ -283,7 +283,7 @@ pub fn ForwardSet(comptime capacity: usize) type {
 }
 
 pub const Rid = struct {
-    bytes: [max_rid_bytes]u8 = [_]u8{0} ** max_rid_bytes,
+    bytes: [max_rid_bytes]u8 = @splat(0),
     len: u8 = 0,
 
     pub const Error = error{ EmptyRid, RidTooLong, InvalidRid };

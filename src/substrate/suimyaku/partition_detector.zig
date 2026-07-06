@@ -74,7 +74,7 @@ pub const Detector = struct {
     /// Adjacency over node *indices* (into `nodes`), restricted to live nodes.
     /// `adj[i]` lists indices reachable in one hop from node index `i`.
     adj: [max_nodes][max_nodes]u16 = undefined,
-    adj_len: [max_nodes]usize = [_]usize{0} ** max_nodes,
+    adj_len: [max_nodes]usize = @splat(0),
 
     /// Previous reachable-from-local set (sorted node ids) and whether the
     /// previous snapshot considered local partitioned. Used by `step`.
@@ -152,7 +152,7 @@ pub const Detector = struct {
     pub fn reachableFrom(self: *const Detector, local: NodeId, out: []NodeId) usize {
         const start = self.indexOfLive(local) orelse return 0;
 
-        var seen = [_]bool{false} ** max_nodes;
+        var seen = @as([max_nodes]bool, @splat(false));
         var queue: [max_nodes]u16 = undefined;
         var head: usize = 0;
         var tail: usize = 0;
@@ -202,7 +202,7 @@ pub const Detector = struct {
 
     /// Number of connected components among live nodes (dead nodes ignored).
     pub fn componentCount(self: *const Detector) usize {
-        var seen = [_]bool{false} ** max_nodes;
+        var seen = @as([max_nodes]bool, @splat(false));
         var components: usize = 0;
         for (0..self.node_count) |i| {
             if (self.live[i] == .dead) continue;

@@ -222,9 +222,9 @@ pub fn custom(kind: ReplyType, command: []const u8, code: []const u8, descriptio
 
 /// Parse a catalog code from its wire token.
 pub fn parseCatalogCode(token: []const u8) ?Code {
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
-        if (std.mem.eql(u8, token, field.name)) {
-            return @field(Code, field.name);
+    inline for (@typeInfo(Code).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, token, field_name)) {
+            return @field(Code, field_name);
         }
     }
     return null;
@@ -417,11 +417,11 @@ test "validates command code and context tokens" {
 }
 
 test "code catalog round-trip" {
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
-        const code = @field(Code, field.name);
-        try std.testing.expectEqual(code, parseCatalogCode(field.name).?);
-        try std.testing.expectEqualStrings(field.name, (CodeToken{ .catalog = code }).token());
-        try std.testing.expect(validCodeToken(field.name));
+    inline for (@typeInfo(Code).@"enum".field_names) |field_name| {
+        const code = @field(Code, field_name);
+        try std.testing.expectEqual(code, parseCatalogCode(field_name).?);
+        try std.testing.expectEqualStrings(field_name, (CodeToken{ .catalog = code }).token());
+        try std.testing.expect(validCodeToken(field_name));
     }
 
     try std.testing.expectEqual(@as(?Code, null), parseCatalogCode("DOES_NOT_EXIST"));

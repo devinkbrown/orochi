@@ -124,8 +124,8 @@ fn countingBytes(comptime len: usize, start: u8) [len]u8 {
 }
 
 test "deterministic P-256 ECDH key agreement matches on both sides" {
-    const alice = generateKeyPair([_]u8{0x11} ** 32);
-    const bob = generateKeyPair([_]u8{0x22} ** 32);
+    const alice = generateKeyPair(@as([32]u8, @splat(0x11)));
+    const bob = generateKeyPair(@as([32]u8, @splat(0x22)));
 
     try testing.expect(!std.mem.eql(u8, &alice.secret, &bob.secret));
     try testing.expect(!std.mem.eql(u8, &alice.public, &bob.public));

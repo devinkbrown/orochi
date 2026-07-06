@@ -57,7 +57,7 @@ const Reactor = struct {
     expected: usize,
     received: usize = 0,
     /// seen[seq] — guards against duplicate delivery of the same sequence.
-    seen: [per_shard]bool = [_]bool{false} ** per_shard,
+    seen: [per_shard]bool = @splat(false),
     /// Set if a message addressed to the wrong shard, a bad seq, or a duplicate
     /// is ever observed; checked by the test after the join.
     corrupt: bool = false,

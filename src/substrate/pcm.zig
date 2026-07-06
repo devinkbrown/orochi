@@ -385,9 +385,9 @@ test "mono to stereo upmix duplicate" {
 
 test "stereo upmix then downmix round-trip" {
     const src = [_]f32{ 0.5, -0.3, 0.0, 1.0 };
-    var stereo = [_]f32{0.0} ** 8;
+    var stereo = @as([8]f32, @splat(0.0));
     monoToStereo(&src, &stereo);
-    var back = [_]f32{0.0} ** 4;
+    var back = @as([4]f32, @splat(0.0));
     stereoToMono(&stereo, &back);
     const eps = 1e-6;
     for (src, 0..) |s, i| {

@@ -661,10 +661,10 @@ fn ecPrivateKeyPem(kp: ecdsa_p256.KeyPair, out: []u8) ![]const u8 {
     //   [0] namedCurve(prime256v1), [1] BIT STRING uncompressed-point }
     var der: [121]u8 = .{
         0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
-    } ++ [_]u8{0} ** 32 // private scalar
+    } ++ @as([32]u8, @splat(0)) // private scalar
     ++ [_]u8{ 0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 } // [0] prime256v1
     ++ [_]u8{ 0xa1, 0x44, 0x03, 0x42, 0x00 } // [1] BIT STRING header (0 unused bits)
-    ++ [_]u8{0} ** 65; // uncompressed point
+    ++ @as([65]u8, @splat(0)); // uncompressed point
     @memcpy(der[7..39], &priv);
     @memcpy(der[56..121], &sec1);
     return pem.encode(out, "EC PRIVATE KEY", &der) catch return error.NoSpaceLeft;

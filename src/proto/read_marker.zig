@@ -31,7 +31,7 @@ pub const ReadMarkerError = error{
 /// Stored as the fixed `YYYY-MM-DDThh:mm:ss.sssZ` wire form. Since the format
 /// is fixed-width UTC, lexicographic order is chronological after validation.
 pub const ReadTimestamp = struct {
-    bytes: [timestamp_wire_len]u8 = [_]u8{0} ** timestamp_wire_len,
+    bytes: [timestamp_wire_len]u8 = @splat(0),
 
     pub fn parseParam(value: []const u8) ReadMarkerError!ReadTimestamp {
         if (!std.mem.startsWith(u8, value, timestamp_param_prefix)) return error.InvalidTimestamp;
@@ -182,7 +182,7 @@ pub fn ReadMarkerStore(comptime config: Config) type {
         const Key = @This();
 
         client: ClientId = 0,
-        target: [config.max_target_bytes]u8 = [_]u8{0} ** config.max_target_bytes,
+        target: [config.max_target_bytes]u8 = @splat(0),
         target_len: u8 = 0,
 
         fn init(client: ClientId, target: []const u8) ReadMarkerError!Key {
@@ -224,7 +224,7 @@ pub fn ReadMarkerStore(comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        entries: [config.max_markers]Entry = [_]Entry{.{}} ** config.max_markers,
+        entries: [config.max_markers]Entry = @splat(.{}),
         len: usize = 0,
 
         pub fn init() Self {

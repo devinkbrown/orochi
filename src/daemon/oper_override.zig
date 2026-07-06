@@ -64,8 +64,8 @@ pub const Restriction = enum {
 
     /// Parse a restriction token case-insensitively, or `null` if unknown.
     pub fn parse(raw: []const u8) ?Restriction {
-        inline for (@typeInfo(Restriction).@"enum".fields) |field| {
-            const restriction: Restriction = @enumFromInt(field.value);
+        inline for (@typeInfo(Restriction).@"enum".field_values) |field_value| {
+            const restriction: Restriction = @enumFromInt(field_value);
             if (std.ascii.eqlIgnoreCase(raw, restriction.token())) return restriction;
         }
         return null;
@@ -314,8 +314,8 @@ const testing = std.testing;
 
 test "restriction tokens and mode letters round trip case-insensitively" {
     // Arrange / Act / Assert.
-    inline for (@typeInfo(Restriction).@"enum".fields) |field| {
-        const restriction: Restriction = @enumFromInt(field.value);
+    inline for (@typeInfo(Restriction).@"enum".field_values) |field_value| {
+        const restriction: Restriction = @enumFromInt(field_value);
         try testing.expectEqual(restriction, Restriction.parse(restriction.token()).?);
     }
     try testing.expectEqual(Restriction.ban, Restriction.parse("BAN").?);
@@ -381,8 +381,8 @@ test "mayBypass gates per restriction and by time" {
 
 test "default allowed set covers every restriction" {
     const state = try engage(true, "alice", 0, 1_000, null, .{});
-    inline for (@typeInfo(Restriction).@"enum".fields) |field| {
-        const restriction: Restriction = @enumFromInt(field.value);
+    inline for (@typeInfo(Restriction).@"enum".field_values) |field_value| {
+        const restriction: Restriction = @enumFromInt(field_value);
         try testing.expect(mayBypass(state, restriction, 500));
     }
 }

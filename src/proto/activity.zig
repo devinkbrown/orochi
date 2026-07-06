@@ -173,7 +173,7 @@ test "reaction from tags requires a reply target and a non-empty reaction" {
 }
 
 test "an over-long reaction is rejected" {
-    const big = "x" ** (max_reaction_len + 1);
+    const big = &@as([(max_reaction_len + 1)]u8, @splat('x'));
     try testing.expectError(error.ReactionTooLong, Reaction.fromTags(big, "m1"));
 }
 

@@ -152,7 +152,7 @@ pub fn decompressMessageBounded(
 
 test "compress then decompress round-trips the original payload" {
     const allocator = testing.allocator;
-    const original = "Hello, permessage-deflate! " ** 16;
+    const original = &repeatBytes("Hello, permessage-deflate! ", 16);
 
     const compressed = try compressMessage(allocator, original);
     defer allocator.free(compressed);
@@ -165,7 +165,7 @@ test "compress then decompress round-trips the original payload" {
 
 test "compression actually shrinks repetitive data" {
     const allocator = testing.allocator;
-    const original = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ** 8;
+    const original = &repeatBytes("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 8);
 
     const compressed = try compressMessage(allocator, original);
     defer allocator.free(compressed);
@@ -256,4 +256,10 @@ test "negotiateResponse is case-insensitive on the extension token" {
 test "negotiateResponse returns null when the extension is absent" {
     try testing.expectEqual(@as(?[]const u8, null), negotiateResponse("permessage-bzip2"));
     try testing.expectEqual(@as(?[]const u8, null), negotiateResponse(""));
+}
+
+fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    var b: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+    return b;
 }

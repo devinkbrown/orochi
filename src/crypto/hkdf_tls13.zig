@@ -113,8 +113,8 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
         /// An empty PSK means "no PSK" and is substituted with HashLen zero
         /// bytes, matching RFC 8446's unavailable-secret rule.
         pub fn earlySecret(psk: []const u8) SecretBytes {
-            const zero_salt = [_]u8{0} ** hash_len;
-            const zero_ikm = [_]u8{0} ** hash_len;
+            const zero_salt = @as([hash_len]u8, @splat(0));
+            const zero_ikm = @as([hash_len]u8, @splat(0));
             const ikm = if (psk.len == 0) zero_ikm[0..] else psk;
             return Hkdf.extractRaw(&zero_salt, ikm);
         }
@@ -128,7 +128,7 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             var derived = try deriveSecret(early, "derived", &emptyTranscriptHash());
             defer derived.wipe();
 
-            const zero_ikm = [_]u8{0} ** hash_len;
+            const zero_ikm = @as([hash_len]u8, @splat(0));
             const ikm = if (shared_secret.len == 0) zero_ikm[0..] else shared_secret;
             return Hkdf.extractRaw(&derived.declassify(), ikm);
         }
@@ -138,7 +138,7 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
         pub fn masterSecret(handshake: *const SecretBytes) Error!SecretBytes {
             var derived = try deriveSecret(handshake, "derived", &emptyTranscriptHash());
             defer derived.wipe();
-            const zero_ikm = [_]u8{0} ** hash_len;
+            const zero_ikm = @as([hash_len]u8, @splat(0));
             return Hkdf.extractRaw(&derived.declassify(), &zero_ikm);
         }
 
@@ -434,7 +434,7 @@ test "RFC 8448 schedule exports RFC 9266 tls-exporter channel binding" {
     );
     try std.testing.expect(!std.mem.eql(u8, &channel_binding, &different_label));
 
-    var bounded = [_]u8{0xa5} ** 40;
+    var bounded = @as([40]u8, @splat(0xa5));
     try Sha256.exportKeyingMaterial(&chain.exporter_master, "EXPORTER-Channel-Binding", "", bounded[4..36]);
     try std.testing.expectEqual(@as(u8, 0xa5), bounded[0]);
     try std.testing.expectEqual(@as(u8, 0xa5), bounded[3]);

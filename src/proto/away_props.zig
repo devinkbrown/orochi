@@ -18,9 +18,9 @@ test "setting and clearing away state matches a bounded reference model" {
     const max_message = 64;
 
     var store = away.AwayStore(max_clients, max_message).init();
-    var model_away = [_]bool{false} ** max_clients;
+    var model_away = @as([max_clients]bool, @splat(false));
     var model_messages: [max_clients][max_message]u8 = undefined;
-    var model_lens = [_]usize{0} ** max_clients;
+    var model_lens = @as([max_clients]usize, @splat(0));
 
     var prng = std.Random.DefaultPrng.init(seed ^ 0x1001);
     const random = prng.random();

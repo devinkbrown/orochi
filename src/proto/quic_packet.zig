@@ -53,7 +53,7 @@ pub const PacketNumberLength = enum(u2) {
 
 pub const ConnectionId = struct {
     len: u8 = 0,
-    bytes: [max_connection_id_len]u8 = [_]u8{0} ** max_connection_id_len,
+    bytes: [max_connection_id_len]u8 = @splat(0),
 
     pub fn init(bytes: []const u8) QuicPacketError!ConnectionId {
         if (bytes.len > max_connection_id_len) return error.InvalidConnectionIdLength;
@@ -429,7 +429,7 @@ test "header protection is reversible for long and short headers" {
         .scid = try ConnectionId.init(&.{ 0x01, 0x02 }),
         .packet_number_len = .three,
     };
-    var long_packet: [64]u8 = [_]u8{0} ** 64;
+    var long_packet: [64]u8 = @splat(0);
     var long_len = try encodeLongHeader(&long_packet, long_header);
     const long_pn_offset = long_len;
     long_len += try encodePacketNumber(long_packet[long_len..], 0x10203, .three);
@@ -451,7 +451,7 @@ test "header protection is reversible for long and short headers" {
         .packet_number = 0x7f,
         .packet_number_len = .one,
     };
-    var short_packet: [32]u8 = [_]u8{0} ** 32;
+    var short_packet: [32]u8 = @splat(0);
     var short_len = try encodeShortHeader(&short_packet, short_header);
     const short_pn_offset = short_len - short_header.packet_number_len.byteLen();
     short_packet[short_len] = 0x99;

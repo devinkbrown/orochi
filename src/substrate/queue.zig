@@ -258,7 +258,7 @@ test "mpmc multi-threaded stress has no loss or duplication" {
         seen: [total]AtomicU8 = initSeen(),
 
         fn initSeen() [total]AtomicU8 {
-            return [_]AtomicU8{AtomicU8.init(0)} ** total;
+            return @as([total]AtomicU8, @splat(AtomicU8.init(0)));
         }
 
         fn producer(ctx: *@This(), producer_id: usize) void {

@@ -114,7 +114,7 @@ fn makeSigned(kp: *const signed_delta.KeyPair, hlc: u64, op: []const u8) !Signed
 
 test "append then replay decodes and re-verifies every delta" {
     const allocator = testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x31} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x31)));
     const pub_key = kp.public_key.toBytes();
 
     var j = DeltaJournal.init(allocator);
@@ -135,7 +135,7 @@ test "append then replay decodes and re-verifies every delta" {
 
 test "a torn tail record is detected by CRC and dropped, not applied" {
     const allocator = testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x32} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x32)));
 
     var j = DeltaJournal.init(allocator);
     defer j.deinit();
@@ -154,7 +154,7 @@ test "a torn tail record is detected by CRC and dropped, not applied" {
 
 test "snapshot + truncate + recover reconstructs state plus tail" {
     const allocator = testing.allocator;
-    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x33} ** signed_delta.seed_len);
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x33)));
 
     var j = DeltaJournal.init(allocator);
     defer j.deinit();

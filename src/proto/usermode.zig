@@ -31,7 +31,7 @@ pub const UserMode = enum(u4) {
     override, // j: operator channel override plus SYSTEM kill attribution.
 };
 
-const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
+const mode_count: usize = @typeInfo(UserMode).@"enum".field_names.len;
 
 comptime {
     if (mode_count > 64) @compileError("UmodeSet stores bits in u64");
@@ -320,7 +320,7 @@ fn validateSpecs(comptime specs: []const ModeSpec) void {
     if (specs.len > mode_count) @compileError("user-mode catalog has too many entries");
 
     var seen_modes: u64 = 0;
-    var seen_letters: [256]bool = [_]bool{false} ** 256;
+    var seen_letters: [256]bool = @splat(false);
     for (specs) |spec| {
         if (!validModeLetter(spec.letter)) @compileError("invalid user-mode letter");
 

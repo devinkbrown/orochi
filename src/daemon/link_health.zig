@@ -61,7 +61,7 @@ pub const LinkHealth = struct {
     bytes_out: u64 = 0,
 
     /// Bounded ring of recent raw RTT samples (ms) for jitter estimation.
-    rtt_ring: [rtt_ring_len]u32 = [_]u32{0} ** rtt_ring_len,
+    rtt_ring: [rtt_ring_len]u32 = @splat(0),
     /// Number of valid entries currently in the ring (saturates at len).
     rtt_count: u8 = 0,
     /// Next write index into the ring.
@@ -168,7 +168,7 @@ pub const LinkHealth = struct {
 
 /// One named slot in the registry.
 pub const Entry = struct {
-    name_buf: [max_name_len]u8 = [_]u8{0} ** max_name_len,
+    name_buf: [max_name_len]u8 = @splat(0),
     name_len: usize = 0,
     health: LinkHealth = .{},
     used: bool = false,
@@ -189,7 +189,7 @@ pub fn Table(comptime capacity: usize) type {
         /// Slot capacity of this table.
         pub const cap: usize = capacity;
 
-        slots: [capacity]Entry = [_]Entry{.{}} ** capacity,
+        slots: [capacity]Entry = @splat(.{}),
 
         pub fn init() Self {
             return .{};
@@ -495,7 +495,7 @@ test "registry iterator visits every occupied entry once" {
 test "long peer names are truncated to max_name_len on copy" {
     // Arrange
     var reg = Registry.init();
-    const long = "n" ** (max_name_len + 10);
+    const long = &@as([(max_name_len + 10)]u8, @splat('n'));
 
     // Act
     _ = try reg.upsert(long, 0);

@@ -695,7 +695,7 @@ fn testParams() !Params {
         .not_before = 1_704_067_200,
         .not_after = 1_735_689_599,
         .serial = &.{ 0x7f, 0x01 },
-        .key_pair = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** Ed25519.KeyPair.seed_length),
+        .key_pair = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x42))),
     };
 }
 
@@ -778,7 +778,7 @@ test "buildSelfSigned reports truncation and oversized inputs with typed errors"
     var cursor: usize = 0;
     try testing.expectError(error.Truncated, readTlv(full[0 .. full.len - 1], &cursor));
 
-    params.serial = &([_]u8{0x01} ** 21);
+    params.serial = &(@as([21]u8, @splat(0x01)));
     try testing.expectError(error.SerialTooLarge, buildSelfSigned(&out, params));
 
     params.serial = &.{0};

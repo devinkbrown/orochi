@@ -206,7 +206,7 @@ test "online offline notification selection matches watched nick set" {
         var sink_data: TestSink = undefined;
         sink_data.init();
 
-        var watched: [8]bool = [_]bool{false} ** 8;
+        var watched: [8]bool = @splat(false);
         for (0..watched.len) |client_offset| {
             if (((iteration + client_offset) % 3) == 0 or random.boolean()) {
                 watched[client_offset] = true;
@@ -279,7 +279,7 @@ fn expectNotificationClients(
     watched: [8]bool,
     replies: []const monitor.MonitorReply,
 ) !void {
-    var seen: [watched.len]bool = [_]bool{false} ** watched.len;
+    var seen: [watched.len]bool = @splat(false);
     var expected_count: usize = 0;
     for (watched) |is_watching| {
         if (is_watching) expected_count += 1;

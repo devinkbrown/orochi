@@ -65,7 +65,7 @@ pub fn CollapseTable(comptime capacity: usize) type {
             msg_len: u16 = 0,
         };
 
-        entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+        entries: [capacity]Entry = @splat(.{}),
         window_ms: i64 = default_window_ms,
         threshold: u32 = default_threshold,
         mu: rwlock.RwLock = .{},

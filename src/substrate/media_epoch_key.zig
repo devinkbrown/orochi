@@ -80,7 +80,7 @@ test "key and salt lengths are correct" {
 }
 
 test "Ladder.bump changes derived keys" {
-    var secret = [_]u8{0} ** 32;
+    var secret = @as([32]u8, @splat(0));
     secret[0] = 1;
     var ladder = Ladder.init(secret);
 
@@ -92,8 +92,8 @@ test "Ladder.bump changes derived keys" {
 }
 
 test "distinct group secrets produce distinct keys" {
-    var first = [_]u8{0} ** 32;
-    var second = [_]u8{0} ** 32;
+    var first = @as([32]u8, @splat(0));
+    var second = @as([32]u8, @splat(0));
     first[0] = 1;
     second[0] = 2;
 

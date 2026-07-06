@@ -145,7 +145,7 @@ pub const Client = struct {
 
     key_pair: ecdh_p256.KeyPair,
     client_random: [32]u8,
-    server_random: [32]u8 = [_]u8{0} ** 32,
+    server_random: [32]u8 = @splat(0),
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
     leaf_key: ?LeafPublicKey = null,
@@ -157,7 +157,7 @@ pub const Client = struct {
     leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
     leaf_rsa_e: [16]u8 = undefined,
 
-    master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
+    master_secret: [tls12.master_secret_len]u8 = @splat(0),
     keys: tls12.KeyMaterial = .{},
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
@@ -178,7 +178,7 @@ pub const Client = struct {
     resume_ticket: ?[]u8 = null,
     /// master_secret + suite recovered from the loaded session, used to derive
     /// key material on the abbreviated handshake instead of a fresh ECDHE run.
-    resume_master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
+    resume_master_secret: [tls12.master_secret_len]u8 = @splat(0),
     resume_suite: ?tls12.CipherSuite = null,
     /// True once the ServerHello echoed an empty SessionTicket extension. This
     /// is sent on both resumed and fresh-issue full handshakes, so it only means
@@ -1267,11 +1267,11 @@ const testing = std.testing;
 test "tls12 client downgrade sentinel (RFC 8446 4.1.3): inert for a 1.2-only client, aborts when a higher version was offered" {
     // Arrange: a server_random carrying the 1.3->1.2 sentinel, one carrying the
     // 1.3->1.1-or-below sentinel, and an ordinary random.
-    var with_tls12_sentinel = [_]u8{0xAB} ** 32;
+    var with_tls12_sentinel = @as([32]u8, @splat(0xAB));
     @memcpy(with_tls12_sentinel[24..32], &downgrade_sentinel_tls12);
-    var with_tls11_sentinel = [_]u8{0xCD} ** 32;
+    var with_tls11_sentinel = @as([32]u8, @splat(0xCD));
     @memcpy(with_tls11_sentinel[24..32], &downgrade_sentinel_tls11);
-    const normal_random = [_]u8{0x5A} ** 32;
+    const normal_random = @as([32]u8, @splat(0x5A));
 
     // This engine's real configuration is 1.2-only, so the sentinel is NOT a
     // downgrade signal for it: the check must accept EVERY random, including one a

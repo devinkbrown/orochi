@@ -139,7 +139,7 @@ pub fn originShortId(pubkey: sign.PublicKey) u64 {
 const testing = std.testing;
 
 fn testKeyPair(seed_byte: u8) !sign.KeyPair {
-    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+    return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
 }
 
 test "wrap/unwrap round-trips and verifies" {
@@ -225,7 +225,7 @@ test "wrap rejects an undersized buffer" {
 }
 
 test "originShortId is stable and matches node_identity derivation" {
-    const seed = [_]u8{0x42} ** sign.seed_len;
+    const seed = @as([sign.seed_len]u8, @splat(0x42));
     var kp = try sign.KeyPair.fromSeed(seed);
     defer kp.deinit();
 

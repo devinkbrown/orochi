@@ -328,7 +328,7 @@ test "soft limiter keeps |sample| < 1.0 under many loud streams" {
     var i: u32 = 0;
     while (i < N) : (i += 1) {
         try mx.addParticipant(i);
-        const loud = [_]f32{1.0} ** FS;
+        const loud = @as([FS]f32, @splat(1.0));
         try mx.submitFrame(i, &loud);
     }
 

@@ -68,7 +68,7 @@ const Key = struct {
     bytes: [16]u8,
 
     fn fromAddress(addr: Address) Key {
-        var out = Key{ .tag = 0, .bytes = [_]u8{0} ** 16 };
+        var out = Key{ .tag = 0, .bytes = @as([16]u8, @splat(0)) };
         switch (addr) {
             .ipv4 => |b| {
                 out.tag = 4;
@@ -314,7 +314,7 @@ test "ipv4 and ipv6 keys do not alias" {
     var rep = try IpReputation.init(testing.allocator, .{ .half_life_ms = 1000 });
     defer rep.deinit();
     const four = v4(0, 0, 0, 0);
-    const six = Address{ .ipv6 = [_]u8{0} ** 16 };
+    const six = Address{ .ipv6 = @as([16]u8, @splat(0)) };
 
     // Act
     _ = try rep.penalize(four, 10, 0);

@@ -152,7 +152,7 @@ test "migration capsule encode/decode round-trips" {
 test "decode rejects truncated input" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 2, 3 }));
     // valid token + account-len claiming more than present
-    var buf: [20]u8 = .{0} ** 20;
+    var buf: [20]u8 = @splat(0);
     buf[16] = 50; // account_len = 50, but no bytes follow
     try testing.expectError(error.Truncated, decode(&buf));
 }
@@ -162,8 +162,8 @@ test "PendingMigrations stores, finds, and consumes by token" {
     var pm = PendingMigrations.init(allocator);
     defer pm.deinit();
 
-    const t1: Token = .{0} ** 15 ++ .{1};
-    const t2: Token = .{0} ** 15 ++ .{2};
+    const t1: Token = @as([15]u8, @splat(0)) ++ .{1};
+    const t2: Token = @as([15]u8, @splat(0)) ++ .{2};
     try pm.put(.{ .token = t1, .account = "alice", .snapshot = "A" });
     try pm.put(.{ .token = t2, .account = "bob", .snapshot = "BB" });
     try testing.expectEqual(@as(usize, 2), pm.count());
@@ -182,7 +182,7 @@ test "put replaces an existing token without leaking" {
     const allocator = testing.allocator;
     var pm = PendingMigrations.init(allocator);
     defer pm.deinit();
-    const t: Token = .{9} ** 16;
+    const t: Token = @splat(9);
     try pm.put(.{ .token = t, .account = "old", .snapshot = "x" });
     try pm.put(.{ .token = t, .account = "new", .snapshot = "yy" });
     try testing.expectEqual(@as(usize, 1), pm.count());
@@ -199,7 +199,7 @@ test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> Pen
     // restored snapshot (nick/umodes/channels/away/account/host/is_oper).
     const allocator = testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7E} ** Ed25519.KeyPair.seed_length);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7E)));
 
     // ORIGIN: build the full session snapshot and mint the relay frame.
     const channels = [_][]const u8{ "#orochi", "#helix", "#ops" };
@@ -271,8 +271,8 @@ test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> Pen
 test "end-to-end: target rejects a capsule signed by the wrong key (no staging)" {
     const allocator = testing.allocator;
     const Ed25519 = std.crypto.sign.Ed25519;
-    const real = try Ed25519.KeyPair.generateDeterministic([_]u8{0x01} ** Ed25519.KeyPair.seed_length);
-    const attacker = try Ed25519.KeyPair.generateDeterministic([_]u8{0x02} ** Ed25519.KeyPair.seed_length);
+    const real = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x01)));
+    const attacker = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x02)));
 
     const channels = [_][]const u8{"#orochi"};
     const snapshot = migration_relay.Snapshot{ .nick = "kain", .umodes = "+i", .channels = channels[0..] };
@@ -281,7 +281,7 @@ test "end-to-end: target rejects a capsule signed by the wrong key (no staging)"
     var prepared = try origin.prepare("kain", snapshot, 0x1, 1);
     defer prepared.deinit(allocator);
 
-    const session_token: Token = .{1} ** 16;
+    const session_token: Token = @splat(1);
     const wire = try encode(allocator, .{ .token = session_token, .account = "kain", .snapshot = prepared.frame_bytes });
     defer allocator.free(wire);
     const outer = try decode(wire);

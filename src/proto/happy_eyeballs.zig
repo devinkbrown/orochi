@@ -16,7 +16,7 @@ pub const Address = struct {
     port: u16,
 
     pub fn ipv4(octets: [4]u8, port: u16) Address {
-        var bytes = [_]u8{0} ** 16;
+        var bytes = @as([16]u8, @splat(0));
         bytes[10] = 0xff;
         bytes[11] = 0xff;
         @memcpy(bytes[12..16], octets[0..]);
@@ -187,7 +187,7 @@ pub fn init(addresses: []const Address, cfg: Config) !HappyEyeballs {
 }
 
 fn v6(last: u8) Address {
-    var bytes = [_]u8{0} ** 16;
+    var bytes = @as([16]u8, @splat(0));
     bytes[15] = last;
     return Address.ipv6(bytes, 443);
 }

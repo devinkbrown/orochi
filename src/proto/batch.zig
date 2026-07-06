@@ -43,7 +43,7 @@ pub const BatchError = error{
 
 /// A validated IRCv3 batch reference tag.
 pub const BatchRef = struct {
-    bytes: [max_reference_len]u8 = [_]u8{0} ** max_reference_len,
+    bytes: [max_reference_len]u8 = @splat(0),
     len: usize = 0,
 
     pub fn slice(self: *const BatchRef) []const u8 {
@@ -77,7 +77,7 @@ pub fn BatchSession(comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        stack: [config.max_depth]BatchRef = [_]BatchRef{.{}} ** config.max_depth,
+        stack: [config.max_depth]BatchRef = @splat(.{}),
         depth: usize = 0,
         next_ref: u64 = 0,
 
