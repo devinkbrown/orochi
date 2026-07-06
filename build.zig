@@ -344,6 +344,55 @@ pub fn build(b: *std.Build) void {
     const interop_wt_step = b.step("quic-interop-wt-server", "Build the standalone WebTransport (browser) interop test server");
     interop_wt_step.dependOn(&b.addInstallArtifact(interop_wt_exe, .{}).step);
 
+    // `zig build bogo-shim` — the roadmap-0.3 BoGo shim: a standalone tool that
+    // speaks BoringSSL's `ssl/test/runner` shim contract (dial the runner's TCP
+    // port, drive orochi's TlsConn/tls_client engine, XOR-echo, exit 0/89/nonzero)
+    // so the external Go harness can protocol-test the Yoroi TLS stack. Kept out
+    // of `zig build test` (it's a separate harness, not a unit-test module) and
+    // linked to nothing in the daemon — it reuses the engines via the shared
+    // `orochi` module exactly as `tools/quic_interop_server.zig` does.
+    const bogo_shim_exe = b.addExecutable(.{
+        .name = "bogo_shim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bogo_shim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "orochi", .module = mod }},
+        }),
+    });
+    const bogo_shim_install = b.addInstallArtifact(bogo_shim_exe, .{});
+    const bogo_shim_step = b.step("bogo-shim", "Build the standalone BoGo (BoringSSL runner) TLS shim");
+    bogo_shim_step.dependOn(&bogo_shim_install.step);
+
+    // `zig build bogo-shim-test` — the self-driven proof: builds+installs the
+    // shim, then runs the shim file's own `test` blocks (parse + framing units,
+    // plus subprocess exit-code smokes that spawn the installed binary and drive
+    // it with orochi's own loopback engines). BOGO_SHIM_BIN points the subprocess
+    // tests at the freshly-built binary; without it they skip.
+    const bogo_shim_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bogo_shim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "orochi", .module = mod }},
+        }),
+    });
+    const run_bogo_shim_tests = b.addRunArtifact(bogo_shim_tests);
+    // The subprocess smokes spawn the freshly-installed binary via BOGO_SHIM_BIN.
+    // This assumes the DEFAULT install prefix (`<build_root>/zig-out`); a `-p`
+    // override is not resolved here, so run this step without `-p`. (When the
+    // shim test binary is run OUTSIDE this step — e.g. by hand — BOGO_SHIM_BIN is
+    // unset and the subprocess smokes skip; the pure parse/framing tests run.)
+    run_bogo_shim_tests.setEnvironmentVariable(
+        "BOGO_SHIM_BIN",
+        b.pathJoin(&.{ b.root.root_dir.path orelse ".", "zig-out", "bin", "bogo_shim" }),
+    );
+    run_bogo_shim_tests.step.dependOn(&bogo_shim_install.step);
+    const bogo_shim_test_step = b.step("bogo-shim-test", "Build + self-drive the BoGo shim (loopback exit-code smokes; no external harness)");
+    bogo_shim_test_step.dependOn(&run_bogo_shim_tests.step);
+
     // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
     // installed to zig-out/bin, independent of the default step's optimize mode.
     //
