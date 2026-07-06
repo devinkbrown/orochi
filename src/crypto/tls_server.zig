@@ -202,6 +202,52 @@ pub const FeedResult = union(enum) {
     bytes_to_send: []u8,
 };
 
+/// TLS Alert level (RFC 8446 §6). TLS 1.3 treats every alert this daemon sends as
+/// fatal (a `warning` alert other than close_notify is not used).
+pub const AlertLevel = enum(u8) { warning = 1, fatal = 2 };
+
+/// The subset of RFC 8446 §6 AlertDescription codes this server maps handshake
+/// errors to. Non-exhaustive: only the codes we actually emit are named.
+pub const AlertDescription = enum(u8) {
+    handshake_failure = 40,
+    decode_error = 50,
+    decrypt_error = 51,
+    protocol_version = 70,
+    internal_error = 80,
+    missing_extension = 109,
+    _,
+};
+
+/// Map a handshake-processing error to the fatal alert a peer should receive
+/// (RFC 8446 §6), or null when no alert should be sent (`OutOfMemory` — we can't
+/// allocate a record anyway). Accepts `anyerror` so the daemon can pass the
+/// merged `TlsConn` error set without coupling to it.
+pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
+    return switch (err) {
+        error.OutOfMemory => null,
+        error.ProtocolVersion => .protocol_version,
+        error.MissingExtension => .missing_extension,
+        error.UnsupportedGroup, error.UnsupportedCipherSuite => .handshake_failure,
+        error.FinishedMismatch => .decrypt_error, // (post-ServerHello ⇒ gated to null here)
+        error.NoCertificate, error.NoSigningKey, error.LeafKeyMismatch => .internal_error,
+        // Malformed handshake bytes or a wrong first-record content type: the peer
+        // sent something we couldn't decode.
+        error.BadHandshake, error.BadRecord => .decode_error,
+        // Any other parse/negotiation failure: a generic fatal handshake_failure.
+        else => .handshake_failure,
+    };
+}
+
+/// Encode a fatal-alert PLAINTEXT record (content_type 21) for `err`, or null
+/// when no alert should be sent. Plaintext is correct only before the ServerHello
+/// (no handshake keys yet); post-ServerHello alerts must be encrypted (see
+/// `Server.takeAlert`). Caller owns the returned buffer.
+pub fn alertRecordForError(allocator: Allocator, err: anyerror) ?[]u8 {
+    const desc = alertDescriptionForError(err) orelse return null;
+    const body = [_]u8{ @intFromEnum(AlertLevel.fatal), @intFromEnum(desc) };
+    return writePlainRecord(allocator, .alert, &body) catch null;
+}
+
 const CipherSuite = enum(u16) {
     tls_aes_128_gcm_sha256 = 0x1301,
     tls_aes_256_gcm_sha384 = 0x1302,
@@ -452,6 +498,22 @@ pub const Server = struct {
 
     pub fn handshakeDone(self: *const Server) bool {
         return self.state == .connected;
+    }
+
+    /// A fatal TLS alert (RFC 8446 §6) to send for the handshake error `err`
+    /// BEFORE closing, so the peer learns why instead of seeing a bare reset.
+    ///
+    /// Only emitted while still awaiting a (first or retried) ClientHello — before
+    /// any ServerHello, so no handshake keys exist and a PLAINTEXT alert is
+    /// correct. After the ServerHello the alert would have to be encrypted under
+    /// the handshake/application keys (a documented follow-up); there we return
+    /// null and the caller closes bare. Caller owns the returned buffer.
+    pub fn takeAlert(self: *const Server, err: anyerror) ?[]u8 {
+        switch (self.state) {
+            .wait_client_hello, .wait_second_client_hello => {},
+            else => return null,
+        }
+        return alertRecordForError(self.allocator, err);
     }
 
     /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
@@ -3610,6 +3672,53 @@ test "init rejects a signing key whose type mismatches the leaf public key" {
     // The matching pairing (Ed25519 leaf + Ed25519 key) initializes fine.
     var ok = try Server.init(alloc, .{ .cert_chain = &.{ed_leaf}, .signing_key = ed_kp });
     ok.deinit();
+}
+
+test "alertDescriptionForError maps handshake errors to RFC 8446 §6 codes" {
+    try std.testing.expectEqual(AlertDescription.protocol_version, alertDescriptionForError(error.ProtocolVersion).?);
+    try std.testing.expectEqual(AlertDescription.missing_extension, alertDescriptionForError(error.MissingExtension).?);
+    try std.testing.expectEqual(AlertDescription.handshake_failure, alertDescriptionForError(error.UnsupportedCipherSuite).?);
+    try std.testing.expectEqual(AlertDescription.decode_error, alertDescriptionForError(error.BadHandshake).?);
+    try std.testing.expectEqual(AlertDescription.internal_error, alertDescriptionForError(error.NoCertificate).?);
+    // OutOfMemory ⇒ no alert (can't allocate a record anyway).
+    try std.testing.expect(alertDescriptionForError(error.OutOfMemory) == null);
+    // Any unmapped error ⇒ a generic fatal handshake_failure.
+    try std.testing.expectEqual(AlertDescription.handshake_failure, alertDescriptionForError(error.SomethingUnmapped).?);
+}
+
+test "takeAlert emits a fatal plaintext alert only before the ServerHello" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&buf, .{
+        .common_name = "alert.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = kp,
+        .dns_names = &.{"alert.test"},
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+
+    // Fresh server (state = wait_client_hello): a well-formed plaintext alert.
+    const rec = server.takeAlert(error.ProtocolVersion) orelse return error.TestUnexpectedResult;
+    defer alloc.free(rec);
+    // [content_type=21][0x03 0x03][len=0x0002][level=fatal(2)][desc=protocol_version(70)]
+    try std.testing.expectEqual(@as(usize, 7), rec.len);
+    try std.testing.expectEqual(@as(u8, 21), rec[0]); // ContentType.alert
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rec[3..5], .big)); // fragment length
+    try std.testing.expectEqual(@as(u8, @intFromEnum(AlertLevel.fatal)), rec[5]);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(AlertDescription.protocol_version)), rec[6]);
+
+    // OutOfMemory ⇒ no alert even before ServerHello.
+    try std.testing.expect(server.takeAlert(error.OutOfMemory) == null);
+
+    // Past the ClientHello wait, a plaintext alert would be wrong (keys exist) ⇒
+    // null (bare close; encrypted alerts are a follow-up).
+    server.state = .connected;
+    try std.testing.expect(server.takeAlert(error.BadHandshake) == null);
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {

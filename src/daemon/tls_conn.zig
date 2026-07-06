@@ -282,6 +282,20 @@ pub const TlsConn = struct {
         return .{ .handshake_bytes = self.send_buf.items, .plaintext = self.plain_buf.items };
     }
 
+    /// A fatal TLS alert record to send for the handshake error `err` before
+    /// closing (RFC 8446 §6). Only produced before a ServerHello (plaintext, no
+    /// keys): the TLS 1.3 engine gates on its own state; an `undecided` engine
+    /// (version-detect / init failure) has sent nothing either, so a plaintext
+    /// alert is likewise correct. The 1.2 leg has no encoder yet ⇒ null (bare
+    /// close, the prior behavior). Caller owns the returned buffer.
+    pub fn takeAlert(self: *const TlsConn, err: anyerror) ?[]u8 {
+        return switch (self.engine) {
+            .tls13 => |*s| s.takeAlert(err),
+            .undecided => tls_server.alertRecordForError(self.allocator, err),
+            .tls12 => null,
+        };
+    }
+
     /// Adapter-level resume state for a Helix live upgrade: the chosen engine's
     /// connected-state snapshot plus any buffered partial inbound record. The
     /// `pending_recv` slice borrows this TlsConn's internal buffer — serialize it
