@@ -251,6 +251,41 @@ pub fn build(b: *std.Build) void {
     check_exe.generated_bin = null; // analyze only; do not codegen/link an artifact
     check_step.dependOn(&check_exe.step);
 
+    // `zig build ct-check` — the opt-in, dudect-style constant-time verification
+    // harness (roadmap 0.4). It measures execution-time independence from secret
+    // inputs for ECDSA-P256 sign, X25519 scalar-mult, and the blinded RSA-2048
+    // private op, reporting a Welch t-statistic per primitive.
+    //
+    // Deliberately a SEPARATE step, NOT part of `zig build test`: a timing
+    // measurement is inherently noisy and folding it into the ~6100-test suite
+    // would make the suite flaky. Sample counts are tunable via the CT_ITERS /
+    // CT_RSA_ITERS environment variables (see the harness's module doc comment).
+    //
+    // The imported orochi crypto is built ReleaseFast in its OWN module (not the
+    // shared `mod`, which inherits -Doptimize and is Debug when unset): the CT
+    // claim is about the codegen that ships, and ReleaseFast has surfaced bugs
+    // Debug never did (e.g. the rsa_verify inline-asm earlyclobber regression).
+    const ct_orochi_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = needs_libc,
+    });
+    ct_orochi_mod.addImport("build_info", build_info_mod);
+    const ct_check_exe = b.addExecutable(.{
+        .name = "orochi-ct-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/constant_time_check.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "orochi", .module = ct_orochi_mod }},
+        }),
+    });
+    const ct_check_run = b.addRunArtifact(ct_check_exe);
+    const ct_check_step = b.step("ct-check", "Run the opt-in dudect-style constant-time verification harness (roadmap 0.4)");
+    ct_check_step.dependOn(&ct_check_run.step);
+
     // `zig build quic-interop-server` — a standalone test harness binary that
     // stands up the real `WebTransportListener` (QUIC/HTTP3) on an ephemeral UDP
     // port with a self-signed cert and blocks, so `tools/quic_interop.sh` can run
