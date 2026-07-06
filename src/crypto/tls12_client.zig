@@ -31,6 +31,28 @@ const sig_rsa_pkcs1_sha384: u16 = 0x0501;
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
 
+/// RFC 8446 §4.1.3 downgrade-protection sentinels ("DOWNGRD" + a version tag). A
+/// TLS-1.3-capable server that is forced to negotiate a lower version stamps the
+/// last 8 bytes of ServerHello.random with one of these, letting a client that
+/// *offered* TLS 1.3 detect an active version-downgrade attack:
+///   * `downgrade_sentinel_tls12` — server fell back from 1.3 to 1.2.
+///   * `downgrade_sentinel_tls11` — server fell back from 1.3 to 1.1 or below.
+/// This project's own 1.2 server stamps `downgrade_sentinel_tls12` on every
+/// ServerHello (see tls12_server.tls13_downgrade_sentinel).
+const downgrade_sentinel_tls12 = [8]u8{ 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01 };
+const downgrade_sentinel_tls11 = [8]u8{ 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00 };
+
+/// Whether this engine ever offers a TLS version higher than the 1.2 it
+/// negotiates. It does NOT: `writeClientHelloBody` sets legacy_version to 1.2 and
+/// `writeSupportedVersionsExtension` offers ONLY 1.2. Per RFC 8446 §4.1.3 the
+/// downgrade sentinel is therefore not a downgrade signal *for us*, so
+/// `checkDowngradeSentinel` is inert by construction — it MUST be, or the client
+/// could never complete a handshake with a 1.3-capable server that stamps the
+/// sentinel unconditionally (as this project's own 1.2 server does). Kept as a
+/// named flag so that teaching this client to also offer 1.3 (making 1.2 a
+/// genuine fallback) activates a conformant check by flipping one value.
+const client_offered_tls13 = false;
+
 pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     ecdsa_p256.Sec1Error || rsa_verify.Error || x509.Error || x509_verify.Error ||
     tls_resumption.Error || Allocator.Error || error{
@@ -39,6 +61,7 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     BadSignature,
     BadState,
     CertificateNameMismatch,
+    DowngradeDetected,
     EmptyCertificateChain,
     FinishedMismatch,
     NeedMore,
@@ -589,6 +612,10 @@ pub const Client = struct {
         var c = Cursor.init(body);
         if (try c.readU16() != tls12.tls_version) return error.ProtocolVersion;
         @memcpy(&self.server_random, try c.take(32));
+        // RFC 8446 §4.1.3 downgrade protection, wired at the natural parse point.
+        // Inert for this 1.2-only engine (see checkDowngradeSentinel), so it goes
+        // live the moment the client is taught to offer TLS 1.3.
+        try checkDowngradeSentinel(client_offered_tls13, &self.server_random);
         const sid_len = try c.readU8();
         _ = try c.take(sid_len);
         const suite = try tls12.CipherSuite.fromWire(try c.readU16());
@@ -872,6 +899,26 @@ fn parseHandshakeMaybe(bytes: []const u8, off: *usize) ?HandshakeMsg {
     if (bytes.len - start < 4 + len) return null;
     off.* = start + 4 + len;
     return .{ .typ = typ, .body = bytes[start + 4 .. start + 4 + len], .raw = bytes[start .. start + 4 + len] };
+}
+
+/// RFC 8446 §4.1.3 downgrade detection. A client that OFFERED a version higher
+/// than the one it negotiated MUST abort if the last 8 bytes of
+/// ServerHello.random equal a downgrade sentinel — a 1.3-capable server signals a
+/// forced downgrade that way. `offered_higher` gates the check: this engine
+/// offers only 1.2 (`client_offered_tls13 == false`), so the caller passes a
+/// false guard and the check is a no-op. That inertness is required, not
+/// incidental — a 1.2-only client must accept the sentinel, otherwise it could
+/// never handshake with a 1.3-capable server that stamps it unconditionally (as
+/// this project's own 1.2 server does). Passing `true` (once the client offers
+/// 1.3) activates the conformant abort with no other edits.
+fn checkDowngradeSentinel(offered_higher: bool, server_random: *const [32]u8) Error!void {
+    if (!offered_higher) return;
+    const tail = server_random[24..32];
+    if (std.mem.eql(u8, tail, &downgrade_sentinel_tls12) or
+        std.mem.eql(u8, tail, &downgrade_sentinel_tls11))
+    {
+        return error.DowngradeDetected;
+    }
 }
 
 fn parseCertificateChain(allocator: Allocator, body: []const u8) Error![][]u8 {
@@ -1172,4 +1219,30 @@ fn osEntropy(buf: []u8) Error!void {
         },
         else => return error.EntropyUnavailable,
     }
+}
+
+const testing = std.testing;
+
+test "tls12 client downgrade sentinel (RFC 8446 4.1.3): inert for a 1.2-only client, aborts when a higher version was offered" {
+    // Arrange: a server_random carrying the 1.3->1.2 sentinel, one carrying the
+    // 1.3->1.1-or-below sentinel, and an ordinary random.
+    var with_tls12_sentinel = [_]u8{0xAB} ** 32;
+    @memcpy(with_tls12_sentinel[24..32], &downgrade_sentinel_tls12);
+    var with_tls11_sentinel = [_]u8{0xCD} ** 32;
+    @memcpy(with_tls11_sentinel[24..32], &downgrade_sentinel_tls11);
+    const normal_random = [_]u8{0x5A} ** 32;
+
+    // This engine's real configuration is 1.2-only, so the sentinel is NOT a
+    // downgrade signal for it: the check must accept EVERY random, including one a
+    // 1.3-capable server (such as this project's own 1.2 server) stamped.
+    try testing.expect(!client_offered_tls13);
+    try checkDowngradeSentinel(client_offered_tls13, &with_tls12_sentinel);
+    try checkDowngradeSentinel(client_offered_tls13, &with_tls11_sentinel);
+    try checkDowngradeSentinel(client_offered_tls13, &normal_random);
+
+    // Had the client offered a higher version, RFC 8446 §4.1.3 requires aborting
+    // on either sentinel while still accepting an ordinary random.
+    try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls12_sentinel));
+    try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls11_sentinel));
+    try checkDowngradeSentinel(true, &normal_random);
 }
