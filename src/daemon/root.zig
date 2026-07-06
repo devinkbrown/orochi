@@ -119,6 +119,7 @@ pub const webpush = @import("webpush.zig");
 pub const tiered_keys = @import("tiered_keys.zig");
 pub const tls_certs = @import("tls_certs.zig");
 pub const tls_conn = @import("tls_conn.zig");
+pub const tls_sni_load = @import("tls_sni_load.zig");
 pub const totp_auth = @import("totp_auth.zig");
 pub const transcript = @import("transcript.zig");
 pub const warden = @import("warden.zig");
@@ -250,6 +251,7 @@ test {
     _ = tiered_keys;
     _ = tls_certs;
     _ = tls_conn;
+    _ = tls_sni_load;
     _ = totp_auth;
     _ = transcript;
     _ = warden;

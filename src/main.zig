@@ -502,43 +502,25 @@ pub fn main(init: std.process.Init) !void {
                 // wired, so TLS stays fully disabled rather than half-configured,
                 // consistent with the default cert's validation-failure path.
                 if (h.tls.sni.len != 0) {
-                    const built = allocator.alloc(orochi.crypto.tls_server.SniCert, h.tls.sni.len) catch {
-                        std.debug.print("orochi: out of memory building SNI cert list; TLS disabled\n", .{});
+                    // The load loop lives in `daemon/tls_sni_load` so its four
+                    // key-material error paths are unit-tested under
+                    // `std.testing.allocator`. Ownership is unchanged: each entry
+                    // is retained in `tls_sni_loaded` (freed at process exit by the
+                    // defer above), the returned list is freed here, and on ANY
+                    // error the helper frees its partial list + deinits the
+                    // just-loaded entry, so we simply fail-fast into `break`.
+                    const built = orochi.daemon.tls_sni_load.buildSniCerts(
+                        allocator,
+                        init.io,
+                        h.tls.sni,
+                        h.tls.dns_name,
+                        &tls_sni_loaded,
+                        validateTlsChain,
+                        orochi.daemon.tls_sni_load.default_loader,
+                    ) catch |err| {
+                        std.debug.print("orochi: [[tls.sni]] certificate setup failed ({s}); TLS disabled\n", .{@errorName(err)});
                         break :tls_material;
                     };
-                    for (h.tls.sni, 0..) |entry, i| {
-                        const sni_material = orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
-                            .enabled = true,
-                            .cert_path = entry.cert_path,
-                            .key_path = entry.key_path,
-                            .dns_name = h.tls.dns_name,
-                        }) catch |err| {
-                            allocator.free(built);
-                            std.debug.print("orochi: [[tls.sni]] cert load failed ({s}); TLS disabled\n", .{@errorName(err)});
-                            break :tls_material;
-                        };
-                        validateTlsChain(sni_material.cert_chain) catch |err| {
-                            var rejected = sni_material;
-                            rejected.deinit(allocator);
-                            allocator.free(built);
-                            std.debug.print("orochi: [[tls.sni]] certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
-                            break :tls_material;
-                        };
-                        tls_sni_loaded.append(allocator, sni_material) catch {
-                            var rejected = sni_material;
-                            rejected.deinit(allocator);
-                            allocator.free(built);
-                            std.debug.print("orochi: out of memory retaining SNI cert; TLS disabled\n", .{});
-                            break :tls_material;
-                        };
-                        built[i] = .{
-                            .server_names = entry.server_names,
-                            .cert_chain = sni_material.cert_chain,
-                            .signing_key = sni_material.signing_key,
-                            .ecdsa_p256_signing_key = sni_material.ecdsa_p256_signing_key,
-                            .rsa_signing_key = sni_material.rsa_signing_key,
-                        };
-                    }
                     tls_sni_certs = built;
                     srv_cfg.tls_sni_certs = tls_sni_certs;
                     std.debug.print("orochi: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
