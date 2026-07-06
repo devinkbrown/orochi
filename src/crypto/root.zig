@@ -24,6 +24,7 @@ pub const jwt = @import("jwt.zig");
 pub const kx_kat = @import("kx_kat.zig");
 pub const kx = @import("kx.zig");
 pub const ml_dsa_kat = @import("ml_dsa_kat.zig");
+pub const ml_dsa_variants_kat = @import("ml_dsa_variants_kat.zig");
 pub const ml_dsa = @import("ml_dsa.zig");
 pub const mls_keyschedule = @import("mls_keyschedule.zig");
 pub const node_short_id = @import("node_short_id.zig");
@@ -90,6 +91,7 @@ test {
     _ = kx_kat;
     _ = kx;
     _ = ml_dsa_kat;
+    _ = ml_dsa_variants_kat;
     _ = ml_dsa;
     _ = mls_keyschedule;
     _ = node_short_id;
