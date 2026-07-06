@@ -32,6 +32,9 @@ pub const Error = error{
     NoSpaceLeft,
     /// An extension's data exceeds the u16 wire field (65535 bytes).
     DataTooLong,
+    /// A `certificate_type` vector was empty, over-long, or its declared length
+    /// did not match the body (RFC 7250 §3).
+    MalformedCertificateType,
 };
 
 /// Well-known TLS extension types (RFC 8446 §4.2 and the IANA registry).
@@ -44,6 +47,8 @@ pub const ExtensionType = enum(u16) {
     supported_groups = 10,
     signature_algorithms = 13,
     alpn = 16,
+    client_certificate_type = 19,
+    server_certificate_type = 20,
     compress_certificate = 27,
     record_size_limit = 28,
     pre_shared_key = 41,
@@ -73,6 +78,8 @@ pub const ExtensionType = enum(u16) {
             .supported_groups,
             .signature_algorithms,
             .alpn,
+            .client_certificate_type,
+            .server_certificate_type,
             .compress_certificate,
             .record_size_limit,
             .pre_shared_key,
@@ -102,6 +109,64 @@ pub const Extension = struct {
         return ExtensionType.fromInt(self.ext_type);
     }
 };
+
+/// RFC 7250 certificate types, as negotiated by the `server_certificate_type`
+/// and `client_certificate_type` extensions.  `x509` is the classic X.509
+/// chain; when `raw_public_key` is selected the peer's Certificate message
+/// carries a single bare `SubjectPublicKeyInfo` instead (no chain, no CA path).
+/// Non-exhaustive: unknown wire values round-trip via `@intFromEnum`.  OpenPGP
+/// (1, RFC 6091) is deprecated and intentionally omitted.
+pub const CertificateType = enum(u8) {
+    x509 = 0,
+    raw_public_key = 2,
+    _,
+
+    /// Map a raw wire byte onto the enum; unknown values land in `_`.
+    pub fn fromInt(value: u8) CertificateType {
+        return @enumFromInt(value);
+    }
+
+    /// The raw wire byte for this certificate type.
+    pub fn toInt(self: CertificateType) u8 {
+        return @intFromEnum(self);
+    }
+};
+
+/// RFC 7250 §3: encode a `CertificateType types<1..2^8-1>` vector — a 1-byte
+/// length prefix followed by one byte per type — into `out`.  This is the
+/// *client offer* body for the `server_certificate_type` /
+/// `client_certificate_type` extensions.  The list must name at least one type
+/// (the vector floor is 1) and at most 255.
+pub fn buildCertTypeList(out: []u8, types: []const CertificateType) Error![]const u8 {
+    if (types.len == 0 or types.len > std.math.maxInt(u8)) return error.MalformedCertificateType;
+    const need = 1 + types.len;
+    if (out.len < need) return error.NoSpaceLeft;
+    out[0] = @intCast(types.len);
+    for (types, 0..) |t, i| out[1 + i] = t.toInt();
+    return out[0..need];
+}
+
+/// RFC 7250 §3: decode a `CertificateType types<1..2^8-1>` vector into `out`,
+/// returning the filled prefix.  The 1-byte length prefix must exactly cover
+/// the remaining body and name at least one type.  Used by the server side
+/// (and round-trip tests) to read what a client offered.
+pub fn parseCertTypeList(body: []const u8, out: []CertificateType) Error![]CertificateType {
+    if (body.len == 0) return error.MalformedCertificateType;
+    const count = body[0];
+    if (count == 0 or body.len - 1 != count) return error.MalformedCertificateType;
+    if (out.len < count) return error.NoSpaceLeft;
+    for (0..count) |i| out[i] = CertificateType.fromInt(body[1 + i]);
+    return out[0..count];
+}
+
+/// RFC 7250 §3: decode the peer's *single selected* `CertificateType` from a
+/// `server_certificate_type` / `client_certificate_type` response body — exactly
+/// one byte, with no length prefix.  The returned value is non-exhaustive; the
+/// caller MUST confirm the peer selected a type it actually offered.
+pub fn parseSelectedCertType(body: []const u8) Error!CertificateType {
+    if (body.len != 1) return error.MalformedCertificateType;
+    return CertificateType.fromInt(body[0]);
+}
 
 /// Forward iterator over the *body* of an extension list — i.e. the bytes that
 /// follow the 2-byte total-length prefix.  Use `fromBlock` to validate and
@@ -337,4 +402,67 @@ test "fromInt and isKnown agree for named and unnamed types" {
     try testing.expect(ExtensionType.isKnown(13)); // signature_algorithms
     try testing.expect(!ExtensionType.isKnown(9999));
     try testing.expectEqual(@as(u16, 51), ExtensionType.key_share.toInt());
+}
+
+test "certificate_type extension types are named and known (RFC 7250)" {
+    // Arrange / Act / Assert
+    try testing.expectEqual(ExtensionType.client_certificate_type, ExtensionType.fromInt(19));
+    try testing.expectEqual(ExtensionType.server_certificate_type, ExtensionType.fromInt(20));
+    try testing.expect(ExtensionType.isKnown(19));
+    try testing.expect(ExtensionType.isKnown(20));
+    try testing.expectEqual(@as(u16, 20), ExtensionType.server_certificate_type.toInt());
+}
+
+test "certificate_type offer list round-trips through the list parser" {
+    // Arrange: the standard client offer preferring raw public keys.
+    var buf: [8]u8 = undefined;
+    const offer = [_]CertificateType{ .raw_public_key, .x509 };
+
+    // Act
+    const body = try buildCertTypeList(&buf, &offer);
+    var out: [4]CertificateType = undefined;
+    const parsed = try parseCertTypeList(body, &out);
+
+    // Assert: 1-byte length prefix + two type bytes, order preserved.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x02, 0x00 }, body);
+    try testing.expectEqual(@as(usize, 2), parsed.len);
+    try testing.expectEqual(CertificateType.raw_public_key, parsed[0]);
+    try testing.expectEqual(CertificateType.x509, parsed[1]);
+}
+
+test "parseSelectedCertType reads one server selection and rejects bad framing" {
+    // Arrange / Act / Assert: a single byte decodes to the selected type.
+    try testing.expectEqual(CertificateType.raw_public_key, try parseSelectedCertType(&[_]u8{0x02}));
+    try testing.expectEqual(CertificateType.x509, try parseSelectedCertType(&[_]u8{0x00}));
+    // An unknown value round-trips (policy is the caller's job, not the codec's).
+    try testing.expectEqual(@as(u8, 0x63), (try parseSelectedCertType(&[_]u8{0x63})).toInt());
+    // Zero or multiple bytes are malformed: the response is a single type.
+    try testing.expectError(error.MalformedCertificateType, parseSelectedCertType(&[_]u8{}));
+    try testing.expectError(error.MalformedCertificateType, parseSelectedCertType(&[_]u8{ 0x00, 0x02 }));
+}
+
+test "buildCertTypeList and parseCertTypeList are fail-closed on empty and mismatched lengths" {
+    // Arrange
+    var buf: [8]u8 = undefined;
+
+    // Act / Assert: the vector floor is 1 — an empty offer is rejected.
+    try testing.expectError(error.MalformedCertificateType, buildCertTypeList(&buf, &[_]CertificateType{}));
+    // A one-type offer still fits and round-trips.
+    const one = try buildCertTypeList(&buf, &[_]CertificateType{.x509});
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x00 }, one);
+    // Declared count exceeding the body is rejected (declares 3, supplies 1).
+    var out: [4]CertificateType = undefined;
+    try testing.expectError(error.MalformedCertificateType, parseCertTypeList(&[_]u8{ 0x03, 0x00 }, &out));
+    // A zero declared count is rejected.
+    try testing.expectError(error.MalformedCertificateType, parseCertTypeList(&[_]u8{0x00}, &out));
+    // An empty body is rejected (no length prefix at all).
+    try testing.expectError(error.MalformedCertificateType, parseCertTypeList(&[_]u8{}, &out));
+}
+
+test "buildCertTypeList reports NoSpaceLeft when the buffer cannot hold the vector" {
+    // Arrange: room for the length prefix but not the two type bytes.
+    var buf: [2]u8 = undefined;
+
+    // Act / Assert
+    try testing.expectError(error.NoSpaceLeft, buildCertTypeList(&buf, &[_]CertificateType{ .raw_public_key, .x509 }));
 }

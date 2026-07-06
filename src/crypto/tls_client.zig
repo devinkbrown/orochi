@@ -116,6 +116,15 @@ pub const Options = struct {
     /// missing or broken CRL never breaks an otherwise-valid handshake. Borrowed
     /// for the call; the client copies it.
     crl: ?[]const u8 = null,
+    /// RFC 7250 raw public keys. When true, the ClientHello offers
+    /// `server_certificate_type = [RawPublicKey, X509]`, permitting the server
+    /// to reply with a bare `SubjectPublicKeyInfo` in place of an X.509 chain.
+    /// Default false ⇒ the extension is never emitted (the ClientHello is
+    /// byte-identical to the pre-feature wire) and only the X.509 path is ever
+    /// taken. A raw public key has NO CA chain, so this mode does not bypass the
+    /// normal X.509 trust checks — it *replaces* them with caller trust
+    /// (TOFU/pinning), and only when explicitly opted in here.
+    offer_raw_public_key: bool = false,
 };
 
 pub const FeedResult = union(enum) {
@@ -407,6 +416,15 @@ pub const Client = struct {
     /// it accepts). Default 2^14+1 = unrestricted; outbound records are fragmented
     /// to honor a smaller value.
     peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
+    /// RFC 7250: whether this client offered raw public keys (copied from
+    /// `Options` at init). Gates both the ClientHello offer and whether a
+    /// `server_certificate_type` response is even permitted in EncryptedExtensions.
+    offer_raw_public_key: bool = false,
+    /// The certificate type the server selected via `server_certificate_type`.
+    /// Defaults to `.x509` (RFC 8446/7250: absence means X.509), so the normal,
+    /// fully trust-verified chain path runs unless the server explicitly picks
+    /// `.raw_public_key` after we offered it.
+    server_cert_type: tls_extension.CertificateType = .x509,
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
         if (options.server_name.len == 0) return error.BadHandshake;
@@ -436,6 +454,7 @@ pub const Client = struct {
             .alpn_protocols = alpn,
             .crl = crl_owned,
             .verify_time = options.now_unix_seconds,
+            .offer_raw_public_key = options.offer_raw_public_key,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
             .hybrid_pair = try kx.HybridKx.generateDeterministic(hy_seed),
@@ -1027,6 +1046,20 @@ pub const Client = struct {
             try ext_builder.addTyped(.compress_certificate, &[_]u8{ 2, 0x00, 0x01 });
         }
 
+        // RFC 7250 raw public keys: offer server_certificate_type = [RawPublicKey,
+        // X509], preferring a bare SPKI but accepting the classic chain. Opt-in
+        // only — when off, no bytes are emitted here, so the ClientHello wire is
+        // byte-identical to the pre-feature encoding. (Placed before any
+        // pre_shared_key extension, which RFC 8446 §4.2.11 requires to be last.)
+        if (self.offer_raw_public_key) {
+            var ct_buf: [8]u8 = undefined;
+            const ct_body = try tls_extension.buildCertTypeList(&ct_buf, &[_]tls_extension.CertificateType{
+                .raw_public_key,
+                .x509,
+            });
+            try ext_builder.addTyped(.server_certificate_type, ct_body);
+        }
+
         // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
         // extension body is opaque cookie<1..2^16-1>: a u16 length then the bytes.
         if (self.cookie) |cookie| {
@@ -1438,6 +1471,21 @@ pub const Client = struct {
                     if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
                     self.peer_record_size_limit = limit;
                 },
+                // RFC 7250 / RFC 8446 §4.2: the server's chosen certificate type
+                // is echoed here. It is legal only if we offered raw public keys
+                // (a server MUST NOT send an unsolicited extension response) and
+                // may only name a type we offered ([RawPublicKey, X509]).
+                .server_certificate_type => {
+                    if (!self.offer_raw_public_key) return error.BadHandshake;
+                    self.server_cert_type = switch (try tls_extension.parseSelectedCertType(ext.data)) {
+                        .raw_public_key => .raw_public_key,
+                        .x509 => .x509,
+                        else => return error.BadHandshake,
+                    };
+                },
+                // We never offer client_certificate_type (we present no client
+                // cert by default), so any response for it is unsolicited.
+                .client_certificate_type => return error.BadHandshake,
                 // key_share / supported_versions / signature_algorithms belong to
                 // ServerHello/CertificateRequest and are illegal here. server_name
                 // (empty SNI ack) and supported_groups ARE permitted in EE
@@ -1468,6 +1516,15 @@ pub const Client = struct {
     }
 
     fn parseAndVerifyCertificate(self: *Client, body: []const u8) Error!void {
+        // RFC 7250: if the server negotiated RawPublicKey, the Certificate
+        // message carries a bare SubjectPublicKeyInfo, not an X.509 chain. This
+        // branch is only reachable when the caller opted in AND the server
+        // selected it; the default (.x509) falls straight through to the normal,
+        // fully trust-verified chain path below.
+        if (self.server_cert_type == .raw_public_key) {
+            return self.parseRawPublicKey(body);
+        }
+
         var c = Cursor.init(body);
         const request_context = try c.take(try c.readU8());
         if (request_context.len != 0) return error.BadHandshake;
@@ -1511,18 +1568,53 @@ pub const Client = struct {
             try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
-        // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
-        // owned storage so the key survives the post-message consume of hs_plain.
-        if (self.leaf_key) |lk| {
-            if (lk == .rsa) {
-                const n = lk.rsa.n;
-                const e = lk.rsa.e;
-                if (n.len > self.leaf_rsa_n.len or e.len > self.leaf_rsa_e.len) return error.BadCertificate;
-                @memcpy(self.leaf_rsa_n[0..n.len], n);
-                @memcpy(self.leaf_rsa_e[0..e.len], e);
-                self.leaf_key = .{ .rsa = .{ .n = self.leaf_rsa_n[0..n.len], .e = self.leaf_rsa_e[0..e.len] } };
-            }
+        try self.ownLeafRsaKey();
+    }
+
+    /// After `leaf_key` is parsed from SPKI bytes that alias `hs_plain`, copy any
+    /// RSA modulus/exponent into owned storage so the key survives the
+    /// post-message consume of `hs_plain`. ECDSA/Ed25519 leaves are value types
+    /// with no borrowed slices, so they need no copy. Shared by the X.509 chain
+    /// path and the RFC 7250 raw-public-key path.
+    fn ownLeafRsaKey(self: *Client) Error!void {
+        const lk = self.leaf_key orelse return;
+        if (lk != .rsa) return;
+        const n = lk.rsa.n;
+        const e = lk.rsa.e;
+        if (n.len > self.leaf_rsa_n.len or e.len > self.leaf_rsa_e.len) return error.BadCertificate;
+        @memcpy(self.leaf_rsa_n[0..n.len], n);
+        @memcpy(self.leaf_rsa_e[0..e.len], e);
+        self.leaf_key = .{ .rsa = .{ .n = self.leaf_rsa_n[0..n.len], .e = self.leaf_rsa_e[0..e.len] } };
+    }
+
+    /// RFC 7250 §3 + RFC 8446 §4.4.2: parse a Certificate message whose single
+    /// CertificateEntry's `cert_data` is a bare `SubjectPublicKeyInfo`. There is
+    /// no chain and no trust-anchor path — a raw public key is TOFU/pinning
+    /// territory, so this only establishes the peer key used to verify the
+    /// server CertificateVerify signature. It runs solely when the caller opted
+    /// in and the server negotiated RawPublicKey (gated in
+    /// `parseAndVerifyCertificate`); it NEVER runs on the default X.509 path.
+    fn parseRawPublicKey(self: *Client, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        const request_context = try c.take(try c.readU8());
+        if (request_context.len != 0) return error.BadHandshake;
+        const list = try c.take(try c.readU24());
+        try c.expectEmpty();
+
+        // Exactly one CertificateEntry, carrying the SPKI as its cert_data
+        // (a raw-public-key Certificate has no chain — RFC 7250 §4.4).
+        var entries = Cursor.init(list);
+        const spki = try entries.take(try entries.readU24());
+        const entry_ext = try entries.take(try entries.readU16());
+        if (entry_ext.len != 0) {
+            var eit = tls_extension.Iterator.init(entry_ext);
+            while (try eit.next()) |_| {}
         }
+        try entries.expectEmpty();
+        if (spki.len == 0) return error.EmptyCertificateChain;
+
+        self.leaf_key = try parsePublicKeyFromSpki(spki);
+        try self.ownLeafRsaKey();
     }
 
     fn verifyCertificateVerify(self: *Client, body: []const u8) Error!void {
@@ -2739,6 +2831,215 @@ test "ClientHello advertises OCSP status_request" {
         }
     }
     try std.testing.expect(saw);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7250 raw public keys (roadmap 5.3) — client-side negotiation + consume.
+// ---------------------------------------------------------------------------
+
+/// Wrap a 32-byte Ed25519 public key in a DER SubjectPublicKeyInfo:
+/// SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING { 0x00 || key } }.
+fn ed25519Spki(pubkey: [sign.public_key_len]u8) [44]u8 {
+    var spki: [44]u8 = undefined;
+    const header = [_]u8{ 0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00 };
+    @memcpy(spki[0..header.len], &header);
+    @memcpy(spki[header.len..][0..pubkey.len], &pubkey);
+    return spki;
+}
+
+/// Build a TLS 1.3 Certificate message body carrying a single RawPublicKey
+/// CertificateEntry whose cert_data is `spki` (RFC 7250 §3, RFC 8446 §4.4.2):
+/// request_context(0) then one entry {u24 cert_data_len, spki, u16 ext_len=0}.
+fn rawPubKeyCertificateBody(a: std.mem.Allocator, spki: []const u8) !std.ArrayList(u8) {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(a);
+    try body.append(a, 0); // certificate_request_context length = 0
+    const entry_len: usize = 3 + spki.len + 2; // certLen(u24) + spki + extLen(u16)
+    try body.append(a, @intCast((entry_len >> 16) & 0xff));
+    try body.append(a, @intCast((entry_len >> 8) & 0xff));
+    try body.append(a, @intCast(entry_len & 0xff));
+    try body.append(a, @intCast((spki.len >> 16) & 0xff));
+    try body.append(a, @intCast((spki.len >> 8) & 0xff));
+    try body.append(a, @intCast(spki.len & 0xff));
+    try body.appendSlice(a, spki);
+    try body.append(a, 0);
+    try body.append(a, 0); // extensions length = 0
+    return body;
+}
+
+test "ClientHello omits certificate_type extensions when raw public keys are off (byte-identical gate)" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const ext_block = clientHelloExtensions(ch.body).?;
+
+    // The default client offers NEITHER certificate_type extension, so no bytes
+    // are added and the ClientHello wire is byte-identical to the pre-feature
+    // encoding (the sole feature-added code is skipped when the gate is off).
+    var it = tls_extension.Iterator.init(ext_block);
+    while (try it.next()) |ext| {
+        try std.testing.expect(ext.typed() != .server_certificate_type);
+        try std.testing.expect(ext.typed() != .client_certificate_type);
+    }
+}
+
+test "ClientHello offers server_certificate_type=[RawPublicKey, X509] when enabled" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{
+        .server_name = "example.com",
+        .trust_anchors = &.{},
+        .offer_raw_public_key = true,
+    });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const ext_block = clientHelloExtensions(ch.body).?;
+
+    var saw_server: ?[]const u8 = null;
+    var it = tls_extension.Iterator.init(ext_block);
+    while (try it.next()) |ext| {
+        // We present no client cert, so client_certificate_type is never offered.
+        try std.testing.expect(ext.typed() != .client_certificate_type);
+        if (ext.typed() == .server_certificate_type) saw_server = ext.data;
+    }
+    try std.testing.expect(saw_server != null);
+    const data = saw_server.?;
+    // Body: 1-byte list length (2) then RawPublicKey(2), X509(0), in preference order.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x02, 0x00 }, data);
+    var out: [4]tls_extension.CertificateType = undefined;
+    const parsed = try tls_extension.parseCertTypeList(data, &out);
+    try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, parsed[0]);
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, parsed[1]);
+}
+
+test "raw public key: bare SPKI Certificate sets the leaf key and validates the CertificateVerify signature" {
+    const a = std.testing.allocator;
+
+    // A deterministic Ed25519 server key; its bare SPKI IS the "certificate".
+    const seed: [sign.seed_len]u8 = @splat(0x42);
+    var kp = try sign.KeyPair.fromSeed(seed);
+    defer kp.deinit();
+    const spki = ed25519Spki(kp.public_key);
+
+    var body = try rawPubKeyCertificateBody(a, &spki);
+    defer body.deinit(a);
+
+    var client = try Client.init(a, .{
+        .server_name = "rpk.test",
+        .trust_anchors = &.{},
+        .offer_raw_public_key = true,
+    });
+    defer client.deinit();
+    // Simulate the EncryptedExtensions negotiation result.
+    client.server_cert_type = .raw_public_key;
+
+    // The bare SPKI is accepted with NO chain and NO trust anchors, yielding the
+    // Ed25519 leaf key.
+    try client.parseAndVerifyCertificate(body.items);
+    const lk = client.leaf_key.?;
+    try std.testing.expect(lk == .ed25519);
+    try std.testing.expectEqualSlices(u8, &kp.public_key, &lk.ed25519);
+
+    // Fold the Certificate into the transcript (as the driver would), then build
+    // and verify a server CertificateVerify signed by the raw public key — proving
+    // the RPK-derived key actually authenticates the handshake signature.
+    try client.appendTranscript(body.items);
+    var th: [max_hash_len]u8 = undefined;
+    const th_len = client.transcriptHash(&th);
+    var in_buf: [cert_verify_input_max]u8 = undefined;
+    const input = buildCertVerifyInput(&in_buf, certificate_verify_context, th[0..th_len]);
+    const sig = try kp.sign(input);
+
+    var cv: std.ArrayList(u8) = .empty;
+    defer cv.deinit(a);
+    try cv.append(a, 0x08); // ed25519 signature scheme = 0x0807
+    try cv.append(a, 0x07);
+    try cv.append(a, @intCast((sig.len >> 8) & 0xff));
+    try cv.append(a, @intCast(sig.len & 0xff));
+    try cv.appendSlice(a, &sig);
+    try client.verifyCertificateVerify(cv.items);
+
+    // A tampered signature must fail against the same raw public key.
+    cv.items[cv.items.len - 1] ^= 0x01;
+    try std.testing.expectError(error.BadSignature, client.verifyCertificateVerify(cv.items));
+}
+
+test "raw public key OFF: a bare SPKI Certificate is rejected by the X.509 path (no trust bypass)" {
+    const a = std.testing.allocator;
+    const seed: [sign.seed_len]u8 = @splat(0x24);
+    var kp = try sign.KeyPair.fromSeed(seed);
+    defer kp.deinit();
+    const spki = ed25519Spki(kp.public_key);
+
+    var body = try rawPubKeyCertificateBody(a, &spki);
+    defer body.deinit(a);
+
+    // Default client: raw public keys OFF, so server_cert_type stays .x509.
+    var client = try Client.init(a, .{ .server_name = "rpk.test", .trust_anchors = &.{} });
+    defer client.deinit();
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, client.server_cert_type);
+
+    // The same bare SPKI is NOT a valid X.509 chain — the normal path MUST reject
+    // it. A raw key is never silently accepted when RPK was not negotiated.
+    if (client.parseAndVerifyCertificate(body.items)) |_| {
+        return error.RawKeyMustNotBeAcceptedOnX509Path;
+    } else |_| {}
+    try std.testing.expect(client.leaf_key == null);
+}
+
+test "EncryptedExtensions rejects a server_certificate_type we did not offer" {
+    const a = std.testing.allocator;
+    var client = try Client.init(a, .{ .server_name = "rpk.test", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    var ext_buf: [64]u8 = undefined;
+    var b = try tls_extension.Builder.begin(&ext_buf);
+    try b.addTyped(.server_certificate_type, &[_]u8{tls_extension.CertificateType.raw_public_key.toInt()});
+    const block = try b.finish();
+
+    // Unsolicited: we never advertised raw public keys, so this is illegal.
+    try std.testing.expectError(error.BadHandshake, client.parseEncryptedExtensions(block));
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, client.server_cert_type);
+}
+
+test "EncryptedExtensions server_certificate_type selection flips only the negotiated path" {
+    const a = std.testing.allocator;
+    var client = try Client.init(a, .{
+        .server_name = "rpk.test",
+        .trust_anchors = &.{},
+        .offer_raw_public_key = true,
+    });
+    defer client.deinit();
+
+    // Selecting X509 keeps the normal, fully-verified chain path.
+    var buf_x509: [64]u8 = undefined;
+    var bx = try tls_extension.Builder.begin(&buf_x509);
+    try bx.addTyped(.server_certificate_type, &[_]u8{tls_extension.CertificateType.x509.toInt()});
+    try client.parseEncryptedExtensions(try bx.finish());
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, client.server_cert_type);
+
+    // Selecting RawPublicKey flips us onto the RPK path.
+    var buf_rpk: [64]u8 = undefined;
+    var br = try tls_extension.Builder.begin(&buf_rpk);
+    try br.addTyped(.server_certificate_type, &[_]u8{tls_extension.CertificateType.raw_public_key.toInt()});
+    try client.parseEncryptedExtensions(try br.finish());
+    try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, client.server_cert_type);
+
+    // A type we never offered (e.g. an unknown 0x63) is rejected.
+    var buf_bad: [64]u8 = undefined;
+    var bb = try tls_extension.Builder.begin(&buf_bad);
+    try bb.addTyped(.server_certificate_type, &[_]u8{0x63});
+    try std.testing.expectError(error.BadHandshake, client.parseEncryptedExtensions(try bb.finish()));
 }
 
 test "OCSP staple status decision rejects revoked and soft-passes good or absent" {
