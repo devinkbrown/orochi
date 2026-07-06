@@ -574,6 +574,15 @@ pub const max_internal_signed_entry: usize = 16 * 1024;
 /// extension that would overflow this yields `error.NoSpaceLeft` → `.invalid`.
 const internal_signed_data_buf_len: usize = 14 + u24_prefix_len + max_internal_signed_entry;
 
+/// Upper bound on a reconstructed precertificate TBSCertificate that still fits,
+/// once framed as a `PreCert` (`issuer_key_hash[32] || TBS<1..2^24-1>`), within
+/// `max_internal_signed_entry` — and hence within the internal signed-data
+/// buffer of `verifyOneSct`/`verifyList`. A caller reconstructing a precert TBS
+/// (see `x509.buildPrecertTbs`) sizes its output buffer to this so a legitimate
+/// certificate never spuriously overflows the framing; a TBS larger than this is
+/// rejected at reconstruction time (fail-open) rather than mis-tallied `.invalid`.
+pub const max_precert_tbs_len: usize = max_internal_signed_entry - log_id_len - u24_prefix_len;
+
 fn findLog(target: [log_id_len]u8, logs: []const CtLog) ?CtLog {
     for (logs) |log| {
         if (std.mem.eql(u8, &log.log_id, &target)) return log;

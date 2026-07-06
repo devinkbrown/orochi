@@ -17,6 +17,8 @@ const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
 const ocsp = @import("ocsp.zig");
 const crl = @import("crl.zig");
+const sct = @import("sct.zig");
+const hash = @import("hash.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
 const rsa_sign = @import("rsa_sign.zig");
@@ -79,6 +81,7 @@ pub const Error = error{
     BadCertificate,
     BadHandshake,
     BadRecord,
+    BadSct,
     BadSignature,
     BadState,
     CertificateNameMismatch,
@@ -168,6 +171,28 @@ pub const Options = struct {
     /// resumption offer or 0-RTT is configured (ECH-over-PSK is a follow-up).
     /// Borrowed for the call; the client copies it.
     ech_config_list: ?[]const u8 = null,
+    /// Optional caller-supplied set of pinned Certificate Transparency logs (RFC
+    /// 6962) for verifying SCTs embedded in the leaf certificate. Orochi ships NO
+    /// log list; a deployment that wants CT enforcement supplies the logs it
+    /// trusts (each `CtLog` pairs a log's DER SubjectPublicKeyInfo with its
+    /// `log_id` — derive the id with `sct.logIdFromSpki`).
+    ///
+    /// OPT-IN and FAIL-OPEN. When this is empty (the default) the whole SCT path
+    /// is skipped and the handshake is byte-identical to before. When non-empty,
+    /// each embedded SCT is verified against the pinned logs, but a leaf with no
+    /// SCTs, or SCTs only from unpinned logs, still passes — SCT enforcement is
+    /// marginal for an outbound ACME/HTTPS client and must never regress
+    /// connectivity. Only when `enforce_sct` is ALSO set does an SCT that is
+    /// present, matches a pinned log, and whose signature is INVALID fail the
+    /// handshake (`error.BadSct`). Borrowed for the call; the client deep-copies
+    /// it (both the slice and each `key_spki_der`).
+    ct_logs: []const sct.CtLog = &.{},
+    /// When true AND `ct_logs` is non-empty, a signature-invalid SCT from a
+    /// pinned log fails the handshake closed. Default false: verification still
+    /// runs but never rejects, so even a pinned + invalid SCT is tolerated —
+    /// keeping the outbound TLS surface byte-identical until an operator
+    /// explicitly opts into enforcement.
+    enforce_sct: bool = false,
 };
 
 pub const FeedResult = union(enum) {
@@ -323,6 +348,13 @@ pub const Client = struct {
     alpn_protocols: []const []const u8,
     /// Owned copy of the caller-supplied CRL DER (see `Options.crl`), or null.
     crl: ?[]u8 = null,
+    /// Owned deep copy of the caller-supplied pinned CT logs (see
+    /// `Options.ct_logs`). Empty when CT verification is not configured; each
+    /// entry's `key_spki_der` is separately owned and freed on `deinit`.
+    ct_logs: []sct.CtLog = &.{},
+    /// When true and `ct_logs` is non-empty, a signature-invalid pinned SCT fails
+    /// the handshake closed (see `Options.enforce_sct`).
+    enforce_sct: bool = false,
 
     state: State = .idle,
     /// Wall-clock time (Unix seconds) for certificate validity checks, or null to
@@ -542,6 +574,8 @@ pub const Client = struct {
         errdefer if (crl_owned) |c| allocator.free(c);
         const ech_list_owned = if (options.ech_config_list) |e| try allocator.dupe(u8, e) else null;
         errdefer if (ech_list_owned) |e| allocator.free(e);
+        const ct_logs_owned = try dupeCtLogs(allocator, options.ct_logs);
+        errdefer freeCtLogs(allocator, ct_logs_owned);
 
         return .{
             .allocator = allocator,
@@ -551,6 +585,8 @@ pub const Client = struct {
             .crl = crl_owned,
             .ech_config_list = ech_list_owned,
             .ech_inner_random = ech_inner_random,
+            .ct_logs = ct_logs_owned,
+            .enforce_sct = options.enforce_sct,
             .verify_time = options.now_unix_seconds,
             .offer_raw_public_key = options.offer_raw_public_key,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
@@ -596,6 +632,7 @@ pub const Client = struct {
         if (self.ech_config_list) |e| self.allocator.free(e);
         if (self.ech_public_name) |p| self.allocator.free(p);
         if (self.ech_inner_hello) |h| self.allocator.free(h);
+        freeCtLogs(self.allocator, self.ct_logs);
         self.* = undefined;
     }
 
@@ -2027,6 +2064,9 @@ pub const Client = struct {
             const issuer_parts = try extractCertParts(issuer_der);
             try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
+        // Roadmap 4.1: opt-in, fail-open embedded-SCT (Certificate Transparency)
+        // verification. Byte-identical when `ct_logs` is empty (the default).
+        try verifyEmbeddedScts(chain, self.ct_logs, self.enforce_sct);
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         try self.ownLeafRsaKey();
 
@@ -2719,6 +2759,88 @@ fn enforceOcspStatusForSerial(parsed: anytype, leaf_serial: []const u8) Error!vo
         .revoked => return error.CertificateRevoked,
         .good, .unknown => return,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Embedded-SCT (Certificate Transparency, RFC 6962) verification — roadmap 4.1.
+//
+// OPT-IN and FAIL-OPEN, mirroring the CRL wiring above. Runs only when a
+// non-empty pinned CT log set was configured; a leaf with no SCT extension, or
+// SCTs only from unpinned logs, always passes. Only when `enforce_sct` is set
+// does a pinned-log-matched, signature-INVALID SCT reject the handshake.
+// ---------------------------------------------------------------------------
+
+/// Deep-copy a caller-supplied pinned CT log set into allocator-owned storage:
+/// the `[]sct.CtLog` slice and each entry's `key_spki_der`. Leak-tight on OOM —
+/// on failure every byte allocated so far is freed. An empty input yields the
+/// empty slice with no allocation.
+fn dupeCtLogs(allocator: Allocator, logs: []const sct.CtLog) Allocator.Error![]sct.CtLog {
+    if (logs.len == 0) return &.{};
+    const owned = try allocator.alloc(sct.CtLog, logs.len);
+    var made: usize = 0;
+    errdefer {
+        for (owned[0..made]) |l| allocator.free(l.key_spki_der);
+        allocator.free(owned);
+    }
+    while (made < logs.len) : (made += 1) {
+        const key = try allocator.dupe(u8, logs[made].key_spki_der);
+        owned[made] = .{ .log_id = logs[made].log_id, .key_spki_der = key };
+    }
+    return owned;
+}
+
+/// Free a deep-copied CT log set (each `key_spki_der` then the slice). A no-op on
+/// the empty set so it is safe to call unconditionally.
+fn freeCtLogs(allocator: Allocator, logs: []sct.CtLog) void {
+    if (logs.len == 0) return;
+    for (logs) |l| allocator.free(l.key_spki_der);
+    allocator.free(logs);
+}
+
+/// OPT-IN, FAIL-OPEN embedded-SCT verification for the leaf certificate.
+///
+/// Reconstructs the precertificate TBS the embedded SCTs sign over, frames the
+/// `PreCert` entry (issuer_key_hash + TBS), and verifies each SCT in the leaf's
+/// SCT-list extension against `ct_logs`. Absent SCTs, an unpinned log, or any
+/// parse/reconstruction failure fail OPEN (return without error). Only when
+/// `enforce_sct` is set AND at least one SCT is pinned-log-matched with an
+/// INVALID signature does this reject with `error.BadSct`.
+///
+/// The temporal (future-dated) check is deliberately NOT enforced here: passing
+/// a null clock scopes `.invalid` to genuine authentication failures (bad
+/// signature, malformed SCT, algorithm mismatch), matching the conservative
+/// outbound-client posture where only a forged SCT — never clock skew — rejects.
+fn verifyEmbeddedScts(chain: []const []const u8, ct_logs: []const sct.CtLog, enforce: bool) Error!void {
+    if (ct_logs.len == 0) return; // feature off ⇒ nothing runs, wire byte-identical
+    if (chain.len == 0) return; // defensive: this fail-open helper never indexes an empty chain
+    const leaf_der = chain[0];
+    const list_bytes = (x509.findSctListExtension(leaf_der) catch return) orelse return; // no embedded SCTs
+
+    // Reconstruct the precert TBS (fail-open on any reconstruction failure).
+    var tbs_buf: [sct.max_precert_tbs_len]u8 = undefined;
+    const tbs = x509.buildPrecertTbs(&tbs_buf, leaf_der) catch return;
+
+    // issuer_key_hash = SHA-256 of the issuer's SubjectPublicKeyInfo. The issuer
+    // is chain[1] when present, else the leaf itself — matching the OCSP/CRL
+    // issuer fallback above. A leaf-ONLY chain whose issuer is a directly-trusted
+    // root (absent from `chain`) would hash the leaf's own SPKI, so a genuine
+    // embedded SCT tallies `.invalid`; under `enforce_sct` that is a false reject
+    // (fail-CLOSED, never a security bypass) for a cert shape that is essentially
+    // nonexistent — SCT-embedding issuers are intermediates that ship in the
+    // chain. With enforcement off (the default) it is tolerated.
+    const issuer_der = if (chain.len > 1) chain[1] else chain[0];
+    const issuer_parts = extractCertParts(issuer_der) catch return;
+    const issuer_key_hash = hash.Sha256.hash(issuer_parts.spki_der);
+
+    var entry_buf: [sct.max_internal_signed_entry]u8 = undefined;
+    const entry = sct.buildPrecertEntry(&entry_buf, issuer_key_hash, tbs) catch return;
+    const ctx = sct.CertContext{ .entry_type = .precert_entry, .signed_entry = entry };
+
+    // A structurally broken SCT list fails OPEN (never break an outbound
+    // handshake over a malformed CT blob); only an authenticated-but-invalid SCT
+    // can reject, and only under enforcement.
+    const summary = sct.verifyList(list_bytes, ctx, ct_logs, null) catch return;
+    if (enforce and summary.invalid > 0) return error.BadSct;
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
@@ -4946,4 +5068,268 @@ test "ECH acceptance signal: client switches to the inner transcript on match, r
     try std.testing.expectEqual(@as(?bool, true), client.ech_accepted);
     try std.testing.expectEqualSlices(u8, inner, client.transcript.items);
     try std.testing.expectEqualSlices(u8, "secret.example", client.effectiveVerifyName()); // accepted ⇒ real name
+}
+
+// Embedded-SCT (Certificate Transparency, roadmap 4.1) wiring — end-to-end over
+// `verifyEmbeddedScts`. A real Ed25519 self-signed issuer (so `extractCertParts`
+// succeeds) is paired with a SYNTHETIC leaf that carries a genuine embedded SCT
+// signed, by a test ECDSA log key, over the reconstructed precertificate. What
+// is proven HERE is the wiring's opt-in / fail-open composition: a pinned +
+// signature-INVALID SCT rejects ONLY under enforcement; absent, unpinned, or
+// tolerated-invalid SCTs never break an otherwise-valid handshake.
+// ---------------------------------------------------------------------------
+
+/// One canonical DER TLV (arena-owned), reusing the CRL test length encoder.
+fn sctTlv(a: Allocator, tag: u8, value: []const u8) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    crlTestTlv(&out, a, tag, value) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// An ECDSA-P256 log SPKI: SEQUENCE { SEQUENCE { OID ecPublicKey, OID
+/// prime256v1 }, BIT STRING { 0x00 || sec1 } }.
+fn sctTestEcdsaSpki(a: Allocator, sec1: [65]u8) []u8 {
+    const oid_ec = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+    const oid_p256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+    var alg: std.ArrayList(u8) = .empty;
+    alg.appendSlice(a, sctTlv(a, x509.Tag.oid, &oid_ec)) catch unreachable;
+    alg.appendSlice(a, sctTlv(a, x509.Tag.oid, &oid_p256)) catch unreachable;
+    var bits: std.ArrayList(u8) = .empty;
+    bits.append(a, 0) catch unreachable; // 0 unused bits
+    bits.appendSlice(a, &sec1) catch unreachable;
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, sctTlv(a, x509.Tag.sequence, alg.items)) catch unreachable;
+    body.appendSlice(a, sctTlv(a, x509.Tag.bit_string, bits.items)) catch unreachable;
+    return sctTlv(a, x509.Tag.sequence, body.items);
+}
+
+/// A structurally-walkable leaf TBS prefix (version[0]…spki) — copied verbatim.
+fn sctTestPrefix(a: Allocator) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(a, sctTlv(a, x509.Tag.context_0_constructed, sctTlv(a, x509.Tag.integer, &[_]u8{0x02}))) catch unreachable;
+    out.appendSlice(a, sctTlv(a, x509.Tag.integer, &[_]u8{ 0xAB, 0xCD })) catch unreachable;
+    for (0..5) |_| out.appendSlice(a, sctTlv(a, x509.Tag.sequence, "")) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// A generic `Extension ::= SEQUENCE { OID, OCTET STRING }`.
+fn sctTestExt(a: Allocator, oid: []const u8, extn_value_content: []const u8) []u8 {
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, sctTlv(a, x509.Tag.oid, oid)) catch unreachable;
+    body.appendSlice(a, sctTlv(a, x509.Tag.octet_string, extn_value_content)) catch unreachable;
+    return sctTlv(a, x509.Tag.sequence, body.items);
+}
+
+/// The SCT-list extension carrying `list` (OCTET STRING wrapping OCTET STRING).
+fn sctTestSctExt(a: Allocator, list: []const u8) []u8 {
+    return sctTestExt(a, &x509.sct_list_extension_oid, sctTlv(a, x509.Tag.octet_string, list));
+}
+
+/// Assemble a TBSCertificate from `prefix` and ordered extension TLVs.
+fn sctTestTbs(a: Allocator, prefix: []const u8, exts: []const []const u8) []u8 {
+    var ext_content: std.ArrayList(u8) = .empty;
+    for (exts) |e| ext_content.appendSlice(a, e) catch unreachable;
+    const ext3 = sctTlv(a, x509.Tag.context_3_constructed, sctTlv(a, x509.Tag.sequence, ext_content.items));
+    var tbs_body: std.ArrayList(u8) = .empty;
+    tbs_body.appendSlice(a, prefix) catch unreachable;
+    tbs_body.appendSlice(a, ext3) catch unreachable;
+    return sctTlv(a, x509.Tag.sequence, tbs_body.items);
+}
+
+/// Wrap a TBS into a `Certificate ::= SEQUENCE { tbs, sigAlg, sigValue }`.
+fn sctTestCert(a: Allocator, tbs: []const u8) []u8 {
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, tbs) catch unreachable;
+    body.appendSlice(a, sctTlv(a, x509.Tag.sequence, "")) catch unreachable;
+    body.appendSlice(a, sctTlv(a, x509.Tag.bit_string, &[_]u8{0x00})) catch unreachable;
+    return sctTlv(a, x509.Tag.sequence, body.items);
+}
+
+/// A single `serialized_sct` body (RFC 6962 §3.2 wire format) for a v1 SCT with
+/// an ECDSA-P256/SHA-256 signature and empty CtExtensions.
+fn sctTestSctBody(a: Allocator, log_id: [32]u8, ts: u64, der_sig: []const u8) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.append(a, 0) catch unreachable; // version v1
+    out.appendSlice(a, &log_id) catch unreachable;
+    var ts_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ts_be, ts, .big);
+    out.appendSlice(a, &ts_be) catch unreachable;
+    out.appendSlice(a, &[_]u8{ 0x00, 0x00 }) catch unreachable; // CtExtensions length 0
+    out.appendSlice(a, &[_]u8{ 0x04, 0x03 }) catch unreachable; // sha256, ecdsa
+    var sig_len: [2]u8 = undefined;
+    std.mem.writeInt(u16, &sig_len, @intCast(der_sig.len), .big);
+    out.appendSlice(a, &sig_len) catch unreachable;
+    out.appendSlice(a, der_sig) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// Wrap one `serialized_sct` body into a `SignedCertificateTimestampList`.
+fn sctTestList(a: Allocator, body: []const u8) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var total: [2]u8 = undefined;
+    std.mem.writeInt(u16, &total, @intCast(body.len + 2), .big);
+    var item_len: [2]u8 = undefined;
+    std.mem.writeInt(u16, &item_len, @intCast(body.len), .big);
+    out.appendSlice(a, &total) catch unreachable;
+    out.appendSlice(a, &item_len) catch unreachable;
+    out.appendSlice(a, body) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// Everything a wiring test needs: a real issuer, a valid SCT-bearing leaf, and
+/// the pinned log that issued it.
+const SctFixture = struct {
+    issuer_der: []const u8,
+    prefix: []const u8,
+    other_ext: []const u8,
+    precert_tbs: []const u8,
+    log: sct.CtLog,
+    ts: u64,
+    der_sig: []u8, // mutable so a test can tamper it
+};
+
+fn buildSctFixture(a: Allocator) !SctFixture {
+    // A real Ed25519 self-signed issuer so `extractCertParts` succeeds.
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const issuer_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x33)));
+    var issuer_buf: [1024]u8 = undefined;
+    const issuer_der = try a.dupe(u8, try x509_selfsign.buildSelfSigned(&issuer_buf, .{
+        .common_name = "issuer.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = issuer_kp,
+        .dns_names = &.{"issuer.test"},
+        .is_ca = true,
+    }));
+    const issuer_parts = try extractCertParts(issuer_der);
+    const issuer_key_hash = hash.Sha256.hash(issuer_parts.spki_der);
+
+    // A test ECDSA-P256 CT log key.
+    const log_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const log_spki = sctTestEcdsaSpki(a, log_kp.public_key.toUncompressedSec1());
+    const log = sct.CtLog{ .log_id = sct.logIdFromSpki(log_spki), .key_spki_der = log_spki };
+
+    // The precertificate TBS the SCT signs over (leaf minus the SCT extension).
+    const prefix = sctTestPrefix(a);
+    const other_ext = sctTestExt(a, &[_]u8{ 0x55, 0x1D, 0x13 }, sctTlv(a, x509.Tag.sequence, "")); // basicConstraints
+    const precert_tbs = sctTestTbs(a, prefix, &.{other_ext});
+
+    // Sign the SCT over the precert entry exactly as `verifyList` reframes it.
+    const ts: u64 = 1_700_000_000_000;
+    var entry_buf: [1024]u8 = undefined;
+    const entry = try sct.buildPrecertEntry(&entry_buf, issuer_key_hash, precert_tbs);
+    var signed_buf: [2048]u8 = undefined;
+    const signed = try sct.buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .precert_entry,
+        .signed_entry = entry,
+        .extensions = &.{},
+    });
+    const sig = try ecdsa_p256.sign(signed, log_kp);
+    var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_sig = try a.dupe(u8, try ecdsa_p256.signatureToDer(sig, &der_buf));
+
+    return .{
+        .issuer_der = issuer_der,
+        .prefix = prefix,
+        .other_ext = other_ext,
+        .precert_tbs = precert_tbs,
+        .log = log,
+        .ts = ts,
+        .der_sig = der_sig,
+    };
+}
+
+/// Assemble the SCT-bearing leaf certificate for a fixture given a signature.
+fn sctFixtureLeaf(a: Allocator, f: SctFixture, der_sig: []const u8) []u8 {
+    const body = sctTestSctBody(a, f.log.log_id, f.ts, der_sig);
+    const list = sctTestList(a, body);
+    const sct_ext = sctTestSctExt(a, list);
+    return sctTestCert(a, sctTestTbs(a, f.prefix, &.{ f.other_ext, sct_ext }));
+}
+
+test "verifyEmbeddedScts: reconstruction round-trips and a valid pinned SCT verifies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+    const leaf = sctFixtureLeaf(a, f, f.der_sig);
+
+    // The production reconstruction reproduces the exact bytes we signed over.
+    var tbs_buf: [4096]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, f.precert_tbs, try x509.buildPrecertTbs(&tbs_buf, leaf));
+
+    // A valid pinned SCT passes under enforcement (and, trivially, without it).
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    try verifyEmbeddedScts(&chain, &.{f.log}, true);
+    try verifyEmbeddedScts(&chain, &.{f.log}, false);
+}
+
+test "verifyEmbeddedScts: a tampered pinned SCT rejects ONLY under enforcement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+
+    // Flip a signature byte so the pinned log matches but verification fails.
+    const bad_sig = try a.dupe(u8, f.der_sig);
+    bad_sig[bad_sig.len - 1] ^= 0x01;
+    const bad_leaf = sctFixtureLeaf(a, f, bad_sig);
+    const chain = [_][]const u8{ bad_leaf, f.issuer_der };
+
+    // Enforcement on → the invalid pinned SCT is a hard reject.
+    try std.testing.expectError(error.BadSct, verifyEmbeddedScts(&chain, &.{f.log}, true));
+    // Enforcement off → the same invalid SCT is tolerated (fail-open).
+    try verifyEmbeddedScts(&chain, &.{f.log}, false);
+}
+
+test "verifyEmbeddedScts: absent, unpinned, and feature-off cases all pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+    const leaf = sctFixtureLeaf(a, f, f.der_sig);
+
+    // Feature off (empty log set) is a pure no-op even under enforcement, even
+    // for a structurally broken leaf — the byte-identical-when-off gate.
+    try verifyEmbeddedScts(&.{&[_]u8{ 0xDE, 0xAD }}, &.{}, true);
+
+    // An SCT from a log this deployment does not pin → no_applicable_log → pass.
+    const other_log = sct.CtLog{ .log_id = @as([32]u8, @splat(0x00)), .key_spki_der = f.log.key_spki_der };
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    try verifyEmbeddedScts(&chain, &.{other_log}, true);
+
+    // A leaf with NO embedded SCT extension → nothing to check → pass.
+    const no_sct_leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
+    const no_sct_chain = [_][]const u8{ no_sct_leaf, f.issuer_der };
+    try verifyEmbeddedScts(&no_sct_chain, &.{f.log}, true);
+
+    // A tampered (invalid) SCT with the feature off is still tolerated.
+    const bad_sig = try a.dupe(u8, f.der_sig);
+    bad_sig[0] ^= 0xFF;
+    const bad_chain = [_][]const u8{ sctFixtureLeaf(a, f, bad_sig), f.issuer_der };
+    try verifyEmbeddedScts(&bad_chain, &.{}, true);
+}
+
+test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
+    const a = std.testing.allocator;
+    // A heap-allocated SPKI that we free right after init: the client must own
+    // its own copy, so a later use must not read freed memory.
+    const src_spki = try a.dupe(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x07 });
+    const logs = [_]sct.CtLog{.{ .log_id = @as([32]u8, @splat(0xA5)), .key_spki_der = src_spki }};
+
+    var client = try Client.init(a, .{
+        .server_name = "ct.test",
+        .trust_anchors = &.{},
+        .ct_logs = &logs,
+        .enforce_sct = true,
+    });
+    // Free the caller's SPKI; the client's deep copy must be unaffected.
+    a.free(src_spki);
+    try std.testing.expectEqual(@as(usize, 1), client.ct_logs.len);
+    try std.testing.expect(client.enforce_sct);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x07 }, client.ct_logs[0].key_spki_der);
+    try std.testing.expect(client.ct_logs[0].key_spki_der.ptr != src_spki.ptr);
+    client.deinit(); // the testing allocator flags any leak or double-free here
 }
