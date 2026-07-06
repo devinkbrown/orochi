@@ -658,6 +658,13 @@ pub const ListSummary = struct {
     valid: usize = 0,
     no_applicable_log: usize = 0,
     invalid: usize = 0,
+    /// Number of DISTINCT pinned logs (counted by `log_id`) that contributed at
+    /// least one `.valid` SCT. This is the RFC 6962 §5.1-style presence-quorum
+    /// count: two valid SCTs from the SAME log count once, so a "≥ N distinct
+    /// logs" policy cannot be satisfied by N copies from a single log. An
+    /// `.invalid` or `.no_applicable_log` SCT never contributes. Always
+    /// `<= valid` (and `<= max_scts`).
+    distinct_valid_logs: usize = 0,
 };
 
 /// Parse a `SignedCertificateTimestampList` and verify every SCT it carries
@@ -674,13 +681,36 @@ pub fn verifyList(
     const list = try parseList(list_bytes);
     var buf: [internal_signed_data_buf_len]u8 = undefined;
     var summary: ListSummary = .{};
+    // Log ids of the DISTINCT pinned logs already credited with a `.valid` SCT,
+    // so a second valid SCT from the same log does not double-count toward the
+    // presence quorum. Bounded by `max_scts` (`parseList` never yields more).
+    var seen_valid_logs: [max_scts][log_id_len]u8 = undefined;
+    var seen_len: usize = 0;
     for (list.slice()) |sct| {
         const signed = frameSignedData(&buf, sct, ctx) catch {
             summary.invalid += 1;
             continue;
         };
         switch (verifySignedDataAgainstLogs(sct, signed, logs, now_ms)) {
-            .valid => summary.valid += 1,
+            .valid => {
+                summary.valid += 1;
+                // Credit this log toward the distinct-log quorum only the first
+                // time a valid SCT from it is seen. `sct.log_id` matched a pinned
+                // log (else `.valid` would be impossible), so it identifies a
+                // pinned log unambiguously.
+                var already_seen = false;
+                for (seen_valid_logs[0..seen_len]) |id| {
+                    if (std.mem.eql(u8, &id, &sct.log_id)) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (!already_seen) {
+                    seen_valid_logs[seen_len] = sct.log_id;
+                    seen_len += 1;
+                    summary.distinct_valid_logs += 1;
+                }
+            },
             .no_applicable_log => summary.no_applicable_log += 1,
             .invalid => summary.invalid += 1,
         }
@@ -1472,6 +1502,95 @@ test "verifyList tallies valid and no_applicable_log outcomes" {
 
     // A structurally broken list is a hard failure, not a summary.
     try testing.expectError(error.LengthMismatch, verifyList(&[_]u8{ 0x00, 0x08, 0x00, 0x01, 0x00, 0x02 }, ctx, &.{log}, null));
+}
+
+test "verifyList counts distinct valid logs for a presence quorum" {
+    const allocator = testing.allocator;
+    // Two DISTINCT pinned logs (fresh, independent keys), both signing the same
+    // x509 entry so their SCTs are individually valid.
+    const kp_a = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki_a = try testEcdsaSpki(allocator, kp_a.public_key.toUncompressedSec1());
+    defer allocator.free(spki_a);
+    const log_a = CtLog{ .log_id = logIdFromSpki(spki_a), .key_spki_der = spki_a };
+
+    const kp_b = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki_b = try testEcdsaSpki(allocator, kp_b.public_key.toUncompressedSec1());
+    defer allocator.free(spki_b);
+    const log_b = CtLog{ .log_id = logIdFromSpki(spki_b), .key_spki_der = spki_b };
+    // The two logs are genuinely distinct — otherwise the quorum test is vacuous.
+    try testing.expect(!std.mem.eql(u8, &log_a.log_id, &log_b.log_id));
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x0d };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 1234;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+
+    // A valid SCT from log A.
+    const sig_a = try ecdsa_p256.sign(signed, kp_a);
+    var da: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const dsig_a = try ecdsa_p256.signatureToDer(sig_a, &da);
+    var ba: [256]u8 = undefined;
+    const body_a = buildOneSctBody(&ba, log_a.log_id, ts, &.{}, dsig_a);
+    // A SECOND valid SCT that is ALSO from log A (same log id, same signature).
+    var ba2: [256]u8 = undefined;
+    const body_a2 = buildOneSctBody(&ba2, log_a.log_id, ts, &.{}, dsig_a);
+    // A valid SCT from the distinct log B.
+    const sig_b = try ecdsa_p256.sign(signed, kp_b);
+    var db: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const dsig_b = try ecdsa_p256.signatureToDer(sig_b, &db);
+    var bb: [256]u8 = undefined;
+    const body_b = buildOneSctBody(&bb, log_b.log_id, ts, &.{}, dsig_b);
+
+    // Two valid SCTs from the SAME log ⇒ valid=2 but distinct_valid_logs=1: a
+    // "≥2 distinct logs" policy is NOT satisfiable by duplicating one log.
+    {
+        var lb: [768]u8 = undefined;
+        const list_bytes = buildList(&lb, &.{ body_a, body_a2 });
+        const summary = try verifyList(list_bytes, ctx, &.{ log_a, log_b }, null);
+        try testing.expectEqual(@as(usize, 2), summary.valid);
+        try testing.expectEqual(@as(usize, 1), summary.distinct_valid_logs);
+    }
+
+    // One valid SCT from each of two distinct pinned logs ⇒ distinct_valid_logs=2.
+    {
+        var lb: [768]u8 = undefined;
+        const list_bytes = buildList(&lb, &.{ body_a, body_b });
+        const summary = try verifyList(list_bytes, ctx, &.{ log_a, log_b }, null);
+        try testing.expectEqual(@as(usize, 2), summary.valid);
+        try testing.expectEqual(@as(usize, 2), summary.distinct_valid_logs);
+    }
+
+    // An INVALID SCT (tampered signature) from a pinned log never contributes to
+    // the distinct-log count, even though its log_id matches a pinned log.
+    {
+        var tampered: [256]u8 = undefined;
+        @memcpy(tampered[0..body_b.len], body_b);
+        tampered[body_b.len - 1] ^= 0x01;
+        var lb: [768]u8 = undefined;
+        const list_bytes = buildList(&lb, &.{ body_a, tampered[0..body_b.len] });
+        const summary = try verifyList(list_bytes, ctx, &.{ log_a, log_b }, null);
+        try testing.expectEqual(@as(usize, 1), summary.valid);
+        try testing.expectEqual(@as(usize, 1), summary.invalid);
+        try testing.expectEqual(@as(usize, 1), summary.distinct_valid_logs);
+    }
+
+    // An SCT from an UNPINNED log is no_applicable_log ⇒ contributes nothing.
+    {
+        var junk_body: [256]u8 = undefined;
+        const body_unpinned = buildOneSctBody(&junk_body, @as([log_id_len]u8, @splat(0xEE)), ts, &.{}, dsig_a);
+        var lb: [768]u8 = undefined;
+        const list_bytes = buildList(&lb, &.{body_unpinned});
+        const summary = try verifyList(list_bytes, ctx, &.{ log_a, log_b }, null);
+        try testing.expectEqual(@as(usize, 0), summary.valid);
+        try testing.expectEqual(@as(usize, 1), summary.no_applicable_log);
+        try testing.expectEqual(@as(usize, 0), summary.distinct_valid_logs);
+    }
 }
 
 test "verifyOneSct fails closed when the certified entry exceeds the internal buffer" {

@@ -111,6 +111,11 @@ pub const Error = error{
     EmptyCertificateChain,
     FinishedMismatch,
     HelloRetryRequestUnsupported,
+    /// Certificate Transparency presence policy (`Options.require_sct`) was not
+    /// met: the leaf did not present at least `require_sct` embedded SCTs that
+    /// each verify against a DISTINCT pinned CT log. Distinct from `BadSct`,
+    /// which flags a tampered SCT; this flags MISSING logged-ness.
+    InsufficientScts,
     MissingExtension,
     NeedMore,
     OutputTooSmall,
@@ -179,20 +184,40 @@ pub const Options = struct {
     ///
     /// OPT-IN and FAIL-OPEN. When this is empty (the default) the whole SCT path
     /// is skipped and the handshake is byte-identical to before. When non-empty,
-    /// each embedded SCT is verified against the pinned logs, but a leaf with no
-    /// SCTs, or SCTs only from unpinned logs, still passes — SCT enforcement is
-    /// marginal for an outbound ACME/HTTPS client and must never regress
-    /// connectivity. Only when `enforce_sct` is ALSO set does an SCT that is
-    /// present, matches a pinned log, and whose signature is INVALID fail the
-    /// handshake (`error.BadSct`). Borrowed for the call; the client deep-copies
-    /// it (both the slice and each `key_spki_der`).
+    /// each embedded SCT is verified against the pinned logs, but by default a
+    /// leaf with no SCTs, or SCTs only from unpinned logs, still passes —
+    /// verification alone is marginal for an outbound ACME/HTTPS client and must
+    /// never regress connectivity unless an operator explicitly opts into a
+    /// stricter policy via `enforce_sct` (tamper detection) and/or `require_sct`
+    /// (presence + distinct-log quorum). Borrowed for the call; the client
+    /// deep-copies it (both the slice and each `key_spki_der`).
     ct_logs: []const sct.CtLog = &.{},
-    /// When true AND `ct_logs` is non-empty, a signature-invalid SCT from a
-    /// pinned log fails the handshake closed. Default false: verification still
-    /// runs but never rejects, so even a pinned + invalid SCT is tolerated —
-    /// keeping the outbound TLS surface byte-identical until an operator
-    /// explicitly opts into enforcement.
+    /// TAMPER DETECTION. When true AND `ct_logs` is non-empty, an SCT that is
+    /// present, matches a pinned log, and whose signature is INVALID fails the
+    /// handshake closed (`error.BadSct`). Default false: verification still runs
+    /// but never rejects, so even a pinned + invalid SCT is tolerated — keeping
+    /// the outbound TLS surface byte-identical until an operator opts in.
+    ///
+    /// Note this alone does NOT close the mis-issuance gap: an attacker holding a
+    /// mis-issued cert simply embeds no SCT (or only unpinned-log SCTs), which
+    /// `enforce_sct` never rejects. `require_sct` closes that gap.
     enforce_sct: bool = false,
+    /// PRESENCE + DISTINCT-LOG QUORUM (the real mis-issuance protection). The CT
+    /// policy threshold N. When `>= 1` AND `ct_logs` is non-empty, the handshake
+    /// REQUIRES the leaf to present at least N embedded SCTs that EACH verify
+    /// (valid signature) against a DISTINCT pinned log (RFC 6962 §5.1-style
+    /// quorum — duplicate SCTs from one log count once). A leaf below the
+    /// threshold — no SCTs, too few, only unpinned-log SCTs, or a malformed /
+    /// unreconstructable SCT set — is REJECTED with `error.InsufficientScts`,
+    /// closing the embed-nothing bypass that `enforce_sct` cannot. Composes with
+    /// `enforce_sct` (a signature-invalid pinned SCT still fails under it, and an
+    /// invalid SCT never counts toward the quorum here).
+    ///
+    /// Default 0 ⇒ presence is NOT enforced: behavior is identical to before
+    /// (fail-open), so an empty `ct_logs` OR `require_sct == 0` leaves the wire
+    /// byte-identical. This is a fail-CLOSED policy — enable it only where the
+    /// peer is expected to serve publicly-logged certificates.
+    require_sct: u8 = 0,
 };
 
 pub const FeedResult = union(enum) {
@@ -355,6 +380,10 @@ pub const Client = struct {
     /// When true and `ct_logs` is non-empty, a signature-invalid pinned SCT fails
     /// the handshake closed (see `Options.enforce_sct`).
     enforce_sct: bool = false,
+    /// CT presence-quorum threshold: when `>= 1` and `ct_logs` is non-empty, the
+    /// leaf must present at least this many valid SCTs from distinct pinned logs
+    /// or the handshake fails closed (see `Options.require_sct`).
+    require_sct: u8 = 0,
 
     state: State = .idle,
     /// Wall-clock time (Unix seconds) for certificate validity checks, or null to
@@ -587,6 +616,7 @@ pub const Client = struct {
             .ech_inner_random = ech_inner_random,
             .ct_logs = ct_logs_owned,
             .enforce_sct = options.enforce_sct,
+            .require_sct = options.require_sct,
             .verify_time = options.now_unix_seconds,
             .offer_raw_public_key = options.offer_raw_public_key,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
@@ -2064,9 +2094,10 @@ pub const Client = struct {
             const issuer_parts = try extractCertParts(issuer_der);
             try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
-        // Roadmap 4.1: opt-in, fail-open embedded-SCT (Certificate Transparency)
-        // verification. Byte-identical when `ct_logs` is empty (the default).
-        try verifyEmbeddedScts(chain, self.ct_logs, self.enforce_sct);
+        // Roadmap 4.1: opt-in embedded-SCT (Certificate Transparency) verification.
+        // Byte-identical when `ct_logs` is empty (the default). `enforce_sct` adds
+        // tamper detection; `require_sct` adds a presence + distinct-log quorum.
+        try verifyEmbeddedScts(chain, self.ct_logs, self.enforce_sct, self.require_sct);
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         try self.ownLeafRsaKey();
 
@@ -2764,10 +2795,16 @@ fn enforceOcspStatusForSerial(parsed: anytype, leaf_serial: []const u8) Error!vo
 // ---------------------------------------------------------------------------
 // Embedded-SCT (Certificate Transparency, RFC 6962) verification — roadmap 4.1.
 //
-// OPT-IN and FAIL-OPEN, mirroring the CRL wiring above. Runs only when a
-// non-empty pinned CT log set was configured; a leaf with no SCT extension, or
-// SCTs only from unpinned logs, always passes. Only when `enforce_sct` is set
-// does a pinned-log-matched, signature-INVALID SCT reject the handshake.
+// OPT-IN, mirroring the CRL wiring above: runs only when a non-empty pinned CT
+// log set was configured, and byte-identical to the pre-feature client when it
+// is empty. Two composable policies gate the result:
+//   * `enforce_sct` (tamper detection): a pinned-log-matched, signature-INVALID
+//     SCT rejects the handshake (`error.BadSct`).
+//   * `require_sct` (presence + distinct-log quorum): the leaf must present at
+//     least N SCTs that each verify against a DISTINCT pinned log, else
+//     `error.InsufficientScts` — closing the "embed no SCT" mis-issuance bypass.
+// With both off (`enforce_sct=false`, `require_sct=0`) the path is FAIL-OPEN: a
+// leaf with no SCT extension, or SCTs only from unpinned logs, always passes.
 // ---------------------------------------------------------------------------
 
 /// Deep-copy a caller-supplied pinned CT log set into allocator-owned storage:
@@ -2797,50 +2834,84 @@ fn freeCtLogs(allocator: Allocator, logs: []sct.CtLog) void {
     allocator.free(logs);
 }
 
-/// OPT-IN, FAIL-OPEN embedded-SCT verification for the leaf certificate.
+/// OPT-IN embedded-SCT verification for the leaf certificate.
 ///
 /// Reconstructs the precertificate TBS the embedded SCTs sign over, frames the
 /// `PreCert` entry (issuer_key_hash + TBS), and verifies each SCT in the leaf's
-/// SCT-list extension against `ct_logs`. Absent SCTs, an unpinned log, or any
-/// parse/reconstruction failure fail OPEN (return without error). Only when
-/// `enforce_sct` is set AND at least one SCT is pinned-log-matched with an
-/// INVALID signature does this reject with `error.BadSct`.
+/// SCT-list extension against `ct_logs`, yielding an `sct.ListSummary`. Two
+/// independent, composable policies act on that summary:
+///
+///   * `enforce` (tamper detection): when set, ANY pinned-log-matched SCT whose
+///     signature is INVALID rejects with `error.BadSct`.
+///   * `require` (presence + distinct-log quorum): when `>= 1`, the leaf MUST
+///     present at least `require` SCTs that each verify against a DISTINCT pinned
+///     log, else `error.InsufficientScts`.
+///
+/// Fail-open vs fail-closed hinges on `require`. When `require == 0` this stays
+/// FAIL-OPEN exactly as before: absent SCTs, an unpinned log, or any
+/// parse/reconstruction failure return without error (a zero summary that no
+/// enabled policy rejects). When `require >= 1` those same "no valid SCTs
+/// proven" outcomes are a hard reject — an attacker embedding NO SCT (so
+/// `findSctListExtension` yields nothing) or a malformed one produces a zero
+/// summary that falls below the threshold and is rejected, which is the whole
+/// point of presence enforcement.
+///
+/// `ct_logs` empty ⇒ the entire path is skipped ⇒ the wire is byte-identical to
+/// the pre-feature client regardless of `enforce`/`require`.
 ///
 /// The temporal (future-dated) check is deliberately NOT enforced here: passing
 /// a null clock scopes `.invalid` to genuine authentication failures (bad
 /// signature, malformed SCT, algorithm mismatch), matching the conservative
 /// outbound-client posture where only a forged SCT — never clock skew — rejects.
-fn verifyEmbeddedScts(chain: []const []const u8, ct_logs: []const sct.CtLog, enforce: bool) Error!void {
+fn verifyEmbeddedScts(
+    chain: []const []const u8,
+    ct_logs: []const sct.CtLog,
+    enforce: bool,
+    require: u8,
+) Error!void {
     if (ct_logs.len == 0) return; // feature off ⇒ nothing runs, wire byte-identical
-    if (chain.len == 0) return; // defensive: this fail-open helper never indexes an empty chain
-    const leaf_der = chain[0];
-    const list_bytes = (x509.findSctListExtension(leaf_der) catch return) orelse return; // no embedded SCTs
 
-    // Reconstruct the precert TBS (fail-open on any reconstruction failure).
-    var tbs_buf: [sct.max_precert_tbs_len]u8 = undefined;
-    const tbs = x509.buildPrecertTbs(&tbs_buf, leaf_der) catch return;
+    // Compute the verification summary. Every fail-open path (missing chain, no
+    // SCT extension, precert reconstruction failure, malformed SCT list) breaks
+    // out with a ZERO summary rather than returning — the presence gate below
+    // then decides open vs closed based on `require`, so a mis-issued cert that
+    // simply omits SCTs cannot bypass a `require >= 1` policy.
+    const summary: sct.ListSummary = summarize: {
+        if (chain.len == 0) break :summarize .{}; // defensive: no leaf to check
+        const leaf_der = chain[0];
+        const list_bytes = (x509.findSctListExtension(leaf_der) catch break :summarize .{}) orelse
+            break :summarize .{}; // no embedded SCTs
 
-    // issuer_key_hash = SHA-256 of the issuer's SubjectPublicKeyInfo. The issuer
-    // is chain[1] when present, else the leaf itself — matching the OCSP/CRL
-    // issuer fallback above. A leaf-ONLY chain whose issuer is a directly-trusted
-    // root (absent from `chain`) would hash the leaf's own SPKI, so a genuine
-    // embedded SCT tallies `.invalid`; under `enforce_sct` that is a false reject
-    // (fail-CLOSED, never a security bypass) for a cert shape that is essentially
-    // nonexistent — SCT-embedding issuers are intermediates that ship in the
-    // chain. With enforcement off (the default) it is tolerated.
-    const issuer_der = if (chain.len > 1) chain[1] else chain[0];
-    const issuer_parts = extractCertParts(issuer_der) catch return;
-    const issuer_key_hash = hash.Sha256.hash(issuer_parts.spki_der);
+        // Reconstruct the precert TBS (zero summary on any reconstruction failure).
+        var tbs_buf: [sct.max_precert_tbs_len]u8 = undefined;
+        const tbs = x509.buildPrecertTbs(&tbs_buf, leaf_der) catch break :summarize .{};
 
-    var entry_buf: [sct.max_internal_signed_entry]u8 = undefined;
-    const entry = sct.buildPrecertEntry(&entry_buf, issuer_key_hash, tbs) catch return;
-    const ctx = sct.CertContext{ .entry_type = .precert_entry, .signed_entry = entry };
+        // issuer_key_hash = SHA-256 of the issuer's SubjectPublicKeyInfo. The
+        // issuer is chain[1] when present, else the leaf itself — matching the
+        // OCSP/CRL issuer fallback above. A leaf-ONLY chain whose issuer is a
+        // directly-trusted root (absent from `chain`) would hash the leaf's own
+        // SPKI, so a genuine embedded SCT tallies `.invalid` — under `enforce` a
+        // false reject and under `require` a below-quorum reject (both fail-CLOSED,
+        // never a security bypass) for a cert shape that is essentially nonexistent
+        // (SCT-embedding issuers are intermediates that ship in the chain). With
+        // both policies off (the default) it is tolerated.
+        const issuer_der = if (chain.len > 1) chain[1] else chain[0];
+        const issuer_parts = extractCertParts(issuer_der) catch break :summarize .{};
+        const issuer_key_hash = hash.Sha256.hash(issuer_parts.spki_der);
 
-    // A structurally broken SCT list fails OPEN (never break an outbound
-    // handshake over a malformed CT blob); only an authenticated-but-invalid SCT
-    // can reject, and only under enforcement.
-    const summary = sct.verifyList(list_bytes, ctx, ct_logs, null) catch return;
+        var entry_buf: [sct.max_internal_signed_entry]u8 = undefined;
+        const entry = sct.buildPrecertEntry(&entry_buf, issuer_key_hash, tbs) catch break :summarize .{};
+        const ctx = sct.CertContext{ .entry_type = .precert_entry, .signed_entry = entry };
+
+        break :summarize sct.verifyList(list_bytes, ctx, ct_logs, null) catch break :summarize .{};
+    };
+
+    // Tamper detection: an authenticated-but-invalid SCT rejects under `enforce`.
     if (enforce and summary.invalid > 0) return error.BadSct;
+    // Presence + distinct-log quorum: fewer than `require` valid distinct-log
+    // SCTs rejects. Skipped entirely when `require == 0`, so the default path is
+    // byte-for-byte the prior fail-open behavior.
+    if (require >= 1 and summary.distinct_valid_logs < require) return error.InsufficientScts;
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
@@ -5114,6 +5185,10 @@ const SctFixture = struct {
     log: sct.CtLog,
     ts: u64,
     der_sig: []u8, // mutable so a test can tamper it
+    /// The exact `CertificateTimestamp` bytes every embedded SCT signs over (the
+    /// precert entry framed by `verifyList`). Additional CT logs sign these same
+    /// bytes to build a distinct-log quorum (see `sctFixtureSignWithLog`).
+    signed: []const u8,
 };
 
 fn buildSctFixture(a: Allocator) !SctFixture {
@@ -5166,7 +5241,64 @@ fn buildSctFixture(a: Allocator) !SctFixture {
         .log = log,
         .ts = ts,
         .der_sig = der_sig,
+        .signed = try a.dupe(u8, signed), // signed aliases the stack buffer; own it
     };
+}
+
+/// A pinned CT log plus a valid SCT signature over a fixture's `signed` bytes.
+const SctLogSig = struct {
+    log: sct.CtLog,
+    der_sig: []u8,
+};
+
+/// Mint a FRESH, distinct ECDSA-P256 CT log and produce a valid SCT signature
+/// over `f.signed` with it — the building block for a distinct-log quorum. Each
+/// call generates an independent key (via `testing.io`), so successive logs have
+/// distinct `log_id`s.
+fn sctFixtureSignWithLog(a: Allocator, f: SctFixture) SctLogSig {
+    const log_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const log_spki = sctTestEcdsaSpki(a, log_kp.public_key.toUncompressedSec1());
+    const log = sct.CtLog{ .log_id = sct.logIdFromSpki(log_spki), .key_spki_der = log_spki };
+    const sig = ecdsa_p256.sign(f.signed, log_kp) catch unreachable;
+    var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_sig = a.dupe(u8, ecdsa_p256.signatureToDer(sig, &der_buf) catch unreachable) catch unreachable;
+    return .{ .log = log, .der_sig = der_sig };
+}
+
+/// One embedded SCT to place in a multi-SCT leaf: which log id claims it, and the
+/// signature bytes to carry (valid or deliberately broken).
+const SctLeafEntry = struct {
+    log_id: [32]u8,
+    der_sig: []const u8,
+};
+
+/// Wrap several `serialized_sct` bodies into one `SignedCertificateTimestampList`
+/// (outer u16 length + per-item u16-length-prefixed bodies).
+fn sctTestListMulti(a: Allocator, bodies: []const []const u8) []u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    for (bodies) |b| {
+        var item_len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &item_len, @intCast(b.len), .big);
+        inner.appendSlice(a, &item_len) catch unreachable;
+        inner.appendSlice(a, b) catch unreachable;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var total: [2]u8 = undefined;
+    std.mem.writeInt(u16, &total, @intCast(inner.items.len), .big);
+    out.appendSlice(a, &total) catch unreachable;
+    out.appendSlice(a, inner.items) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// Assemble a leaf carrying MANY embedded SCTs (in order), for quorum tests. The
+/// precert TBS (and thus `f.signed`) is independent of the SCT list, so every
+/// entry signs the same bytes; the leaf reconstructs to `f.precert_tbs`.
+fn sctFixtureLeafMulti(a: Allocator, f: SctFixture, entries: []const SctLeafEntry) []u8 {
+    var bodies: std.ArrayList([]const u8) = .empty;
+    for (entries) |e| bodies.append(a, sctTestSctBody(a, e.log_id, f.ts, e.der_sig)) catch unreachable;
+    const list = sctTestListMulti(a, bodies.items);
+    const sct_ext = sctTestSctExt(a, list);
+    return sctTestCert(a, sctTestTbs(a, f.prefix, &.{ f.other_ext, sct_ext }));
 }
 
 /// Assemble the SCT-bearing leaf certificate for a fixture given a signature.
@@ -5190,8 +5322,8 @@ test "verifyEmbeddedScts: reconstruction round-trips and a valid pinned SCT veri
 
     // A valid pinned SCT passes under enforcement (and, trivially, without it).
     const chain = [_][]const u8{ leaf, f.issuer_der };
-    try verifyEmbeddedScts(&chain, &.{f.log}, true);
-    try verifyEmbeddedScts(&chain, &.{f.log}, false);
+    try verifyEmbeddedScts(&chain, &.{f.log}, true, 0);
+    try verifyEmbeddedScts(&chain, &.{f.log}, false, 0);
 }
 
 test "verifyEmbeddedScts: a tampered pinned SCT rejects ONLY under enforcement" {
@@ -5207,9 +5339,9 @@ test "verifyEmbeddedScts: a tampered pinned SCT rejects ONLY under enforcement" 
     const chain = [_][]const u8{ bad_leaf, f.issuer_der };
 
     // Enforcement on → the invalid pinned SCT is a hard reject.
-    try std.testing.expectError(error.BadSct, verifyEmbeddedScts(&chain, &.{f.log}, true));
+    try std.testing.expectError(error.BadSct, verifyEmbeddedScts(&chain, &.{f.log}, true, 0));
     // Enforcement off → the same invalid SCT is tolerated (fail-open).
-    try verifyEmbeddedScts(&chain, &.{f.log}, false);
+    try verifyEmbeddedScts(&chain, &.{f.log}, false, 0);
 }
 
 test "verifyEmbeddedScts: absent, unpinned, and feature-off cases all pass" {
@@ -5219,25 +5351,135 @@ test "verifyEmbeddedScts: absent, unpinned, and feature-off cases all pass" {
     const f = try buildSctFixture(a);
     const leaf = sctFixtureLeaf(a, f, f.der_sig);
 
-    // Feature off (empty log set) is a pure no-op even under enforcement, even
-    // for a structurally broken leaf — the byte-identical-when-off gate.
-    try verifyEmbeddedScts(&.{&[_]u8{ 0xDE, 0xAD }}, &.{}, true);
+    // Feature off (empty log set) is a pure no-op even under enforcement AND a
+    // presence requirement, even for a structurally broken leaf — the
+    // byte-identical-when-off gate (an empty `ct_logs` short-circuits before any
+    // policy, so `require_sct` cannot manufacture a rejection out of thin air).
+    try verifyEmbeddedScts(&.{&[_]u8{ 0xDE, 0xAD }}, &.{}, true, 2);
 
-    // An SCT from a log this deployment does not pin → no_applicable_log → pass.
+    // An SCT from a log this deployment does not pin → no_applicable_log → pass
+    // when presence is not required.
     const other_log = sct.CtLog{ .log_id = @as([32]u8, @splat(0x00)), .key_spki_der = f.log.key_spki_der };
     const chain = [_][]const u8{ leaf, f.issuer_der };
-    try verifyEmbeddedScts(&chain, &.{other_log}, true);
+    try verifyEmbeddedScts(&chain, &.{other_log}, true, 0);
 
-    // A leaf with NO embedded SCT extension → nothing to check → pass.
+    // A leaf with NO embedded SCT extension → nothing to check → pass when
+    // presence is not required.
     const no_sct_leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
     const no_sct_chain = [_][]const u8{ no_sct_leaf, f.issuer_der };
-    try verifyEmbeddedScts(&no_sct_chain, &.{f.log}, true);
+    try verifyEmbeddedScts(&no_sct_chain, &.{f.log}, true, 0);
 
     // A tampered (invalid) SCT with the feature off is still tolerated.
     const bad_sig = try a.dupe(u8, f.der_sig);
     bad_sig[0] ^= 0xFF;
     const bad_chain = [_][]const u8{ sctFixtureLeaf(a, f, bad_sig), f.issuer_der };
-    try verifyEmbeddedScts(&bad_chain, &.{}, true);
+    try verifyEmbeddedScts(&bad_chain, &.{}, true, 0);
+}
+
+test "verifyEmbeddedScts: require_sct enforces a distinct-log presence quorum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+
+    // Two ADDITIONAL, independent pinned logs, each signing the same precert.
+    const l1 = sctFixtureSignWithLog(a, f);
+    const l2 = sctFixtureSignWithLog(a, f);
+    try std.testing.expect(!std.mem.eql(u8, &l1.log.log_id, &l2.log.log_id));
+
+    // A leaf carrying one valid SCT from each of the two DISTINCT logs.
+    const two_distinct = sctFixtureLeafMulti(a, f, &.{
+        .{ .log_id = l1.log.log_id, .der_sig = l1.der_sig },
+        .{ .log_id = l2.log.log_id, .der_sig = l2.der_sig },
+    });
+    const chain = [_][]const u8{ two_distinct, f.issuer_der };
+    const pins = [_]sct.CtLog{ l1.log, l2.log };
+
+    // At or below the number of distinct valid logs present ⇒ pass.
+    try verifyEmbeddedScts(&chain, &pins, false, 1);
+    try verifyEmbeddedScts(&chain, &pins, false, 2);
+    // Requiring MORE distinct logs than are present ⇒ hard reject.
+    try std.testing.expectError(error.InsufficientScts, verifyEmbeddedScts(&chain, &pins, false, 3));
+}
+
+test "verifyEmbeddedScts: duplicate-log SCTs cannot satisfy a 2-log quorum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+    const l1 = sctFixtureSignWithLog(a, f);
+
+    // TWO valid SCTs, both from the SAME pinned log l1.
+    const dup = sctFixtureLeafMulti(a, f, &.{
+        .{ .log_id = l1.log.log_id, .der_sig = l1.der_sig },
+        .{ .log_id = l1.log.log_id, .der_sig = l1.der_sig },
+    });
+    const chain = [_][]const u8{ dup, f.issuer_der };
+    const pins = [_]sct.CtLog{l1.log};
+
+    // distinct_valid_logs = 1: satisfies a 1-log quorum but NOT a 2-log quorum —
+    // N copies from one log can never meet an N-distinct-log policy.
+    try verifyEmbeddedScts(&chain, &pins, false, 1);
+    try std.testing.expectError(error.InsufficientScts, verifyEmbeddedScts(&chain, &pins, false, 2));
+}
+
+test "verifyEmbeddedScts: require_sct rejects absent and unpinned-only SCTs (mis-issuance gate)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+    const leaf = sctFixtureLeaf(a, f, f.der_sig); // one valid SCT from f.log
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+
+    // 1) A leaf with NO SCT extension is exactly the bypass `enforce_sct` cannot
+    //    catch (nothing present to be "invalid"); `require_sct` MUST reject it.
+    const no_sct_leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
+    const no_sct_chain = [_][]const u8{ no_sct_leaf, f.issuer_der };
+    try std.testing.expectError(error.InsufficientScts, verifyEmbeddedScts(&no_sct_chain, &.{f.log}, false, 1));
+    // enforce_sct alone never rejects the absent-SCT leaf — the very gap we close.
+    try verifyEmbeddedScts(&no_sct_chain, &.{f.log}, true, 0);
+
+    // 2) A valid SCT but from an UNPINNED log ⇒ distinct_valid_logs = 0 ⇒ reject.
+    const other_log = sct.CtLog{ .log_id = @as([32]u8, @splat(0x00)), .key_spki_der = f.log.key_spki_der };
+    try std.testing.expectError(error.InsufficientScts, verifyEmbeddedScts(&chain, &.{other_log}, false, 1));
+
+    // 3) Non-vacuous: the SAME leaf PASSES once its issuing log is pinned, so the
+    //    rejections above are about presence/pinning, not a broken fixture.
+    try verifyEmbeddedScts(&chain, &.{f.log}, false, 1);
+
+    // 4) require_sct = 0 (default) keeps the absent-SCT leaf passing — the opt-in,
+    //    byte-identical-when-off contract, independent of enforce_sct.
+    try verifyEmbeddedScts(&no_sct_chain, &.{f.log}, false, 0);
+}
+
+test "verifyEmbeddedScts: require_sct composes with enforce_sct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try buildSctFixture(a);
+    const good = sctFixtureSignWithLog(a, f);
+    const other = sctFixtureSignWithLog(a, f);
+
+    // A tampered signature for `other`'s pinned log: matches a pin but invalid.
+    const bad_sig = try a.dupe(u8, other.der_sig);
+    bad_sig[bad_sig.len - 1] ^= 0x01;
+
+    // Leaf: one VALID SCT (good's log) + one INVALID SCT (other's log).
+    const leaf = sctFixtureLeafMulti(a, f, &.{
+        .{ .log_id = good.log.log_id, .der_sig = good.der_sig },
+        .{ .log_id = other.log.log_id, .der_sig = bad_sig },
+    });
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    const pins = [_]sct.CtLog{ good.log, other.log };
+
+    // enforce on: the invalid pinned SCT hard-rejects (BadSct) regardless of quorum.
+    try std.testing.expectError(error.BadSct, verifyEmbeddedScts(&chain, &pins, true, 1));
+    // enforce off, require 1: one distinct VALID log present ⇒ pass; the invalid
+    // SCT is tolerated and never counts toward the quorum.
+    try verifyEmbeddedScts(&chain, &pins, false, 1);
+    // enforce off, require 2: only ONE distinct valid log ⇒ below quorum ⇒ reject.
+    // The invalid SCT does NOT make up the shortfall.
+    try std.testing.expectError(error.InsufficientScts, verifyEmbeddedScts(&chain, &pins, false, 2));
 }
 
 test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
@@ -5252,11 +5494,13 @@ test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
         .trust_anchors = &.{},
         .ct_logs = &logs,
         .enforce_sct = true,
+        .require_sct = 2,
     });
     // Free the caller's SPKI; the client's deep copy must be unaffected.
     a.free(src_spki);
     try std.testing.expectEqual(@as(usize, 1), client.ct_logs.len);
     try std.testing.expect(client.enforce_sct);
+    try std.testing.expectEqual(@as(u8, 2), client.require_sct); // policy threshold round-trips
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x07 }, client.ct_logs[0].key_spki_der);
     try std.testing.expect(client.ct_logs[0].key_spki_der.ptr != src_spki.ptr);
     client.deinit(); // the testing allocator flags any leak or double-free here
