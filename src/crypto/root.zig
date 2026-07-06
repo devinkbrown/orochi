@@ -14,6 +14,7 @@ pub const crl = @import("crl.zig");
 pub const ecdh_p256 = @import("ecdh_p256.zig");
 pub const ecdsa_kat = @import("ecdsa_kat.zig");
 pub const ecdsa_p256 = @import("ecdsa_p256.zig");
+pub const ech_seal = @import("ech_seal.zig");
 pub const ed25519_batch = @import("ed25519_batch.zig");
 pub const hash = @import("hash.zig");
 pub const hash_kat = @import("hash_kat.zig");
@@ -77,6 +78,7 @@ test {
     _ = ecdh_p256;
     _ = ecdsa_kat;
     _ = ecdsa_p256;
+    _ = ech_seal;
     _ = ed25519_batch;
     _ = hash;
     _ = hash_kat;

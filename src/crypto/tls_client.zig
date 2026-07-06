@@ -31,6 +31,13 @@ const tls_extension = @import("../proto/tls_extension.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
 const cert_compression = @import("../proto/cert_compression.zig");
 const sni = @import("../proto/sni.zig");
+// ECH: `ech_seal` (this package) does the HPKE seal + acceptance confirmation;
+// `ech_config` (proto) parses/selects the caller-supplied ECHConfigList. See
+// their module docs for why they live apart from the pre-existing, unwired
+// `proto/ech.zig` (which decodes to owned structs and drops the raw config bytes
+// HPKE's `info` needs).
+const ech = @import("ech_seal.zig");
+const ech_config = @import("../proto/ech_config.zig");
 const tls_alert = @import("../proto/tls_alert.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
 const tls_psk = @import("../proto/tls_psk.zig");
@@ -96,7 +103,8 @@ pub const Error = error{
     tls_signature_scheme.Error || supported_groups.Error || tls_alpn.Error ||
     tls_alert.ParseError || rsa_verify.Error || sign.VerifyError ||
     tls_psk.Error || tls_session_ticket.ParseError || tls_session_ticket.EncodeError ||
-    tls_resumption.Error || ocsp.Error || cert_compression.Error;
+    tls_resumption.Error || ocsp.Error || cert_compression.Error ||
+    ech.Error || ech_config.Error;
 
 pub const Options = struct {
     server_name: []const u8,
@@ -116,6 +124,17 @@ pub const Options = struct {
     /// missing or broken CRL never breaks an otherwise-valid handshake. Borrowed
     /// for the call; the client copies it.
     crl: ?[]const u8 = null,
+    /// Optional caller-supplied ECHConfigList (draft-ietf-tls-esni, version
+    /// `0xfe0d`) — e.g. base64-decoded from a config file or a DNS HTTPS RR. This
+    /// module never fetches it; the bytes are supplied out of band, mirroring how
+    /// `crl` takes caller-supplied data. When set AND a usable config is present,
+    /// the ClientHello is split into an HPKE-encrypted ClientHelloInner (carrying
+    /// the real SNI) wrapped in a ClientHelloOuter (SNI = the config's
+    /// `public_name`). Null, empty, or no supported config ⇒ the ClientHello is
+    /// byte-identical to today (ECH omitted entirely). ECH is also skipped when a
+    /// resumption offer or 0-RTT is configured (ECH-over-PSK is a follow-up).
+    /// Borrowed for the call; the client copies it.
+    ech_config_list: ?[]const u8 = null,
 };
 
 pub const FeedResult = union(enum) {
@@ -285,8 +304,35 @@ pub const Client = struct {
     hybrid_pair: kx.HybridKx.KeyPair,
     legacy_session_id: [32]u8,
     /// ClientHello random, generated once. RFC 8446 §4.1.2 requires the second
-    /// ClientHello (after a HelloRetryRequest) to carry the same random.
+    /// ClientHello (after a HelloRetryRequest) to carry the same random. This is
+    /// the *outer* random when ECH is offered.
     client_random: [32]u8,
+
+    // --- Encrypted Client Hello (ECH) client state (roadmap 5.1) ---
+    // All ECH state is inert unless a usable config is found in `start()`; when it
+    // is not, `ech_active` stays false and the ClientHello is byte-identical.
+    /// Owned copy of the caller-supplied ECHConfigList (see `Options.ech_config_list`).
+    ech_config_list: ?[]u8 = null,
+    /// The config `start()` committed to offering ECH under. Borrows
+    /// `ech_config_list` (owned, stable for the client's life). Null unless ECH
+    /// is active.
+    ech_selected: ?ech_config.Config = null,
+    /// True once `start()` has committed to offering ECH.
+    ech_active: bool = false,
+    /// Owned copy of the selected config's `public_name` — the ClientHelloOuter
+    /// SNI and the identity authenticated if the server rejects ECH.
+    ech_public_name: ?[]u8 = null,
+    /// ClientHelloInner random (distinct from `client_random`, the outer random).
+    /// Feeds the acceptance-confirmation HKDF-Extract as its IKM.
+    ech_inner_random: [32]u8,
+    /// Owned ClientHelloInner handshake-message bytes (real SNI, real session_id,
+    /// inner ECH marker). Retained so the transcript can switch to the inner on
+    /// acceptance and so the confirmation can be recomputed. Null unless active.
+    ech_inner_hello: ?[]u8 = null,
+    /// Set when ServerHello is processed: whether the server accepted ECH. Null
+    /// until then, or when ECH was never offered.
+    ech_accepted: ?bool = null,
+
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     /// Owned storage for `selected_alpn`: the negotiated protocol is read from the
@@ -419,6 +465,8 @@ pub const Client = struct {
         try osEntropy(&session_id);
         var random: [32]u8 = undefined;
         try osEntropy(&random);
+        var ech_inner_random: [32]u8 = undefined;
+        try osEntropy(&ech_inner_random);
 
         const name = try allocator.dupe(u8, options.server_name);
         errdefer allocator.free(name);
@@ -428,6 +476,8 @@ pub const Client = struct {
         errdefer allocator.free(alpn);
         const crl_owned = if (options.crl) |c| try allocator.dupe(u8, c) else null;
         errdefer if (crl_owned) |c| allocator.free(c);
+        const ech_list_owned = if (options.ech_config_list) |e| try allocator.dupe(u8, e) else null;
+        errdefer if (ech_list_owned) |e| allocator.free(e);
 
         return .{
             .allocator = allocator,
@@ -435,6 +485,8 @@ pub const Client = struct {
             .trust_anchors = anchors,
             .alpn_protocols = alpn,
             .crl = crl_owned,
+            .ech_config_list = ech_list_owned,
+            .ech_inner_random = ech_inner_random,
             .verify_time = options.now_unix_seconds,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
@@ -475,6 +527,10 @@ pub const Client = struct {
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
         if (self.crl) |c| self.allocator.free(c);
+        secureZero(&self.ech_inner_random);
+        if (self.ech_config_list) |e| self.allocator.free(e);
+        if (self.ech_public_name) |p| self.allocator.free(p);
+        if (self.ech_inner_hello) |h| self.allocator.free(h);
         self.* = undefined;
     }
 
@@ -482,7 +538,15 @@ pub const Client = struct {
         if (self.state != .idle) return error.BadState;
         var handshake: std.ArrayList(u8) = .empty;
         defer handshake.deinit(self.allocator);
-        try self.writeClientHello(&handshake);
+        if (try self.prepareEch()) {
+            // ECH active: `handshake` becomes the ClientHelloOuter (SNI =
+            // public_name) with the sealed ClientHelloInner inside; the outer is
+            // what enters the transcript until/unless the server confirms
+            // acceptance (then the transcript switches to the inner).
+            try self.writeClientHelloOuterEch(&handshake);
+        } else {
+            try self.writeClientHello(&handshake);
+        }
         try self.appendTranscript(handshake.items);
         self.state = .wait_server_hello;
         const ch_record = try writePlainRecord(self.allocator, .handshake, handshake.items);
@@ -549,6 +613,22 @@ pub const Client = struct {
 
     pub fn handshakeDone(self: *const Client) bool {
         return self.state == .connected;
+    }
+
+    /// True when this handshake offered Encrypted Client Hello (a usable
+    /// ECHConfig was found in `start()`).
+    pub fn echOffered(self: *const Client) bool {
+        return self.ech_active;
+    }
+
+    /// The server's ECH decision, available once ServerHello is processed:
+    /// `true` = accepted (the real inner SNI is authenticated), `false` =
+    /// rejected (only the cover `public_name` is authenticated — the caller must
+    /// treat the inner ClientHello as not delivered and should not send inner
+    /// application data over this connection). Null before ServerHello, or when
+    /// ECH was never offered.
+    pub fn echAccepted(self: *const Client) ?bool {
+        return self.ech_accepted;
     }
 
     /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
@@ -904,6 +984,305 @@ pub const Client = struct {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Encrypted Client Hello (ECH) — client, roadmap 5.1.
+    //
+    // Wire-model: draft-ietf-tls-esni §5. ClientHelloInner carries the real SNI;
+    // it is HPKE-sealed and placed in the outer `encrypted_client_hello`
+    // extension of a ClientHelloOuter whose SNI is the config's `public_name`.
+    // The seal is bound to the ClientHelloOuterAAD (the outer with the ECH
+    // payload zeroed). Outer-extension compression (`ech_outer_extensions`) is
+    // deliberately omitted — the inner carries the full extension set — so the
+    // ClientHelloOuter is larger than a compressing client would send. That is a
+    // size/privacy trade-off, not a correctness one, and is a noted follow-up.
+    // -----------------------------------------------------------------------
+
+    /// Constant-time byte compare (equal length assumed by callers). Used for the
+    /// ECH acceptance signal, which is derived from public transcript material —
+    /// CT is hygiene, not a hard secrecy requirement.
+    fn ctBytesEqual(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        var diff: u8 = 0;
+        for (a, b) |x, y| diff |= x ^ y;
+        return diff == 0;
+    }
+
+    /// The name whose certificate must validate: the real inner name when ECH was
+    /// accepted (or not offered), else the cover `public_name` (ECH rejected —
+    /// the client authenticates the client-facing server).
+    fn effectiveVerifyName(self: *const Client) []const u8 {
+        if (self.ech_active) {
+            if (self.ech_accepted orelse false) return self.server_name;
+            // Rejected ⇒ authenticate the cover name. `orelse` is defensive: the
+            // ech_active ⇒ ech_public_name-set invariant already guarantees it.
+            return self.ech_public_name orelse self.server_name;
+        }
+        return self.server_name;
+    }
+
+    /// Decide whether to offer ECH this handshake; latch the selected config and
+    /// an owned copy of its `public_name` on success. Returns true iff ECH is
+    /// active. FAIL-SAFE (RFC-appropriate for a DNS/config-sourced list): ANY
+    /// reason not to offer ECH — no list, a *malformed* list, no supported/
+    /// sealable config, or a resumption / 0-RTT offer whose ECH interaction is
+    /// deferred — yields false and a byte-identical ClientHello. An unusable
+    /// ECHConfigList must never abort the connection; the client just proceeds
+    /// without ECH.
+    fn prepareEch(self: *Client) Error!bool {
+        if (self.ech_active) return true; // idempotent: never re-select / re-dupe
+        const list = self.ech_config_list orelse return false;
+        if (self.resume_offer != null or self.early_data != null) return false;
+        // A malformed list ⇒ stand down (do not propagate the parse error out of
+        // start()); a broken ECHConfigList should degrade to plain, not fail.
+        const cfg = (ech_config.selectSupported(list, ech.kem_id, ech.kdf_id, ech.aead_id) catch return false) orelse return false;
+        // Only offer ECH under a config we can actually seal: our KEM (X25519)
+        // needs a 32-byte public key. This guarantees `beginSeal` cannot fail on
+        // the selected config, so no ECH error can escape start().
+        if (cfg.public_key.len != ech.hpke_public_key_len) return false;
+        const public_name = try self.allocator.dupe(u8, cfg.public_name);
+        errdefer self.allocator.free(public_name);
+        self.ech_selected = cfg;
+        self.ech_public_name = public_name;
+        self.ech_active = true;
+        return true;
+    }
+
+    /// Append a ClientHello *body* (legacy_version … extensions, no handshake
+    /// header) for the ECH path. `sni`, `session_id`, and `random` differ between
+    /// the inner and outer hellos; `ech_ext_data` is the `encrypted_client_hello`
+    /// extension body (the 1-byte inner marker, or the serialized outer body).
+    /// Mirrors the non-PSK, non-test extension set of `writeClientHello`, so an
+    /// accepted ClientHelloInner is a well-formed ordinary ClientHello.
+    fn appendEchHelloBody(
+        self: *Client,
+        body: *std.ArrayList(u8),
+        server_name: []const u8,
+        session_id: []const u8,
+        random: []const u8,
+        ech_ext_data: []const u8,
+    ) Error!void {
+        const a = self.allocator;
+        try appendU16(a, body, tls_record.legacy_record_version);
+        try body.appendSlice(a, random); // 32 bytes
+        try body.append(a, @intCast(session_id.len));
+        try body.appendSlice(a, session_id);
+        // cipher_suites: aes256, chacha20, aes128 — same order as writeClientHello.
+        try appendU16(a, body, 6);
+        try appendU16(a, body, @intFromEnum(CipherSuite.tls_aes_256_gcm_sha384));
+        try appendU16(a, body, @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256));
+        try appendU16(a, body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+        try body.append(a, 1);
+        try body.append(a, 0);
+
+        // Extensions built into a heap buffer sized for the (large, hybrid) key
+        // share plus the ECH extension. The ECH path is handshake setup, not the
+        // hot path, so allocation here is fine.
+        const ext_cap = ech_ext_data.len + 8192;
+        const ext_buf = try a.alloc(u8, ext_cap);
+        defer a.free(ext_buf);
+        var eb = try tls_extension.Builder.begin(ext_buf);
+
+        var sni_buf: [512]u8 = undefined;
+        const sni_body = try buildSniBody(&sni_buf, server_name);
+        try eb.addTyped(.server_name, sni_body);
+
+        var versions_buf: [8]u8 = undefined;
+        const versions = try tls_supported_versions.buildClient(&versions_buf, &[_]u16{tls_supported_versions.tls13});
+        try eb.addTyped(.supported_versions, versions);
+
+        var groups_buf: [16]u8 = undefined;
+        const groups = try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519mlkem768, .x25519, .secp256r1 });
+        try eb.addTyped(.supported_groups, groups);
+
+        var sigs_buf: [16]u8 = undefined;
+        const sigs = try tls_signature_scheme.build(&sigs_buf, &[_]tls_signature_scheme.SignatureScheme{
+            .rsa_pss_rsae_sha256,
+            .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            .ed25519,
+            .rsa_pkcs1_sha256,
+        });
+        try eb.addTyped(.signature_algorithms, sigs);
+
+        var rsl_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
+        try eb.addTyped(.record_size_limit, &rsl_buf);
+
+        var hybrid_share: [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 = undefined;
+        const hy_pub = self.hybrid_pair.publicShare();
+        @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
+        @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
+        var keyshare_buf: [1400]u8 = undefined;
+        const keyshares = try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+            .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
+            .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
+            .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+        });
+        try eb.addTyped(.key_share, keyshares);
+
+        if (self.alpn_protocols.len != 0) {
+            var alpn_buf: [512]u8 = undefined;
+            var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
+            for (self.alpn_protocols) |proto| try alpn_builder.add(proto);
+            const alpn_body = try alpn_builder.finish();
+            try eb.addTyped(.alpn, alpn_body);
+        }
+
+        try eb.add(ext_status_request, &[_]u8{ 1, 0, 0, 0, 0 });
+        if (self.offer_cert_compression) {
+            try eb.addTyped(.compress_certificate, &[_]u8{ 2, 0x00, 0x01 });
+        }
+
+        // The encrypted_client_hello extension: inner marker or outer body.
+        try eb.add(ech.extension_type, ech_ext_data);
+
+        const extensions = try eb.finish();
+        try body.appendSlice(a, extensions);
+    }
+
+    /// Build a full ClientHello handshake *message* (with header) for the ECH
+    /// path; caller owns the result.
+    fn buildEchHelloMessage(
+        self: *Client,
+        server_name: []const u8,
+        session_id: []const u8,
+        random: []const u8,
+        ech_ext_data: []const u8,
+    ) Error![]u8 {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try self.appendEchHelloBody(&body, server_name, session_id, random, ech_ext_data);
+        var msg: std.ArrayList(u8) = .empty;
+        errdefer msg.deinit(self.allocator);
+        try writeHandshake(self.allocator, &msg, .client_hello, body.items);
+        return msg.toOwnedSlice(self.allocator);
+    }
+
+    /// Build a ClientHelloOuter *body* (SNI = public_name, outer random; the
+    /// `ClientHello` structure legacy_version…extensions, WITHOUT the 4-byte
+    /// Handshake header) whose `encrypted_client_hello` extension carries `enc`
+    /// and `payload`. Used both for the ClientHelloOuterAAD (payload = zeros) and,
+    /// wrapped by `writeHandshake`, for the final wire message.
+    ///
+    /// AAD convention: the ClientHelloOuterAAD is this header-LESS ClientHello
+    /// body with the ECH payload zeroed — matching the header-less
+    /// EncodedClientHelloInner plaintext (ECH operates at the ClientHello-body
+    /// level, draft-ietf-tls-esni §5.2). This is the single point to flip if a
+    /// reference ECH server proves the AAD must include the Handshake header.
+    fn buildOuterEchBody(
+        self: *Client,
+        cfg: ech_config.Config,
+        enc: []const u8,
+        payload: []const u8,
+    ) Error![]u8 {
+        const a = self.allocator;
+        const ech_body = try a.alloc(u8, ech.outerExtBodyLen(enc.len, payload.len));
+        defer a.free(ech_body);
+        _ = try ech.writeOuterExtBody(ech_body, cfg.config_id, enc, payload);
+        var body: std.ArrayList(u8) = .empty;
+        errdefer body.deinit(a);
+        try self.appendEchHelloBody(&body, self.ech_public_name.?, &self.legacy_session_id, &self.client_random, ech_body);
+        return body.toOwnedSlice(a);
+    }
+
+    /// Assemble the ClientHelloOuter (with the sealed ClientHelloInner inside) and
+    /// append it to `out`. Precondition: `prepareEch()` returned true.
+    fn writeClientHelloOuterEch(self: *Client, out: *std.ArrayList(u8)) Error!void {
+        const a = self.allocator;
+        const cfg = self.ech_selected orelse return error.BadState;
+
+        // 1. ClientHelloInner message (real SNI, real session_id, inner marker) —
+        //    retained for the transcript switch on acceptance and the confirmation.
+        const inner_hello = try self.buildEchHelloMessage(self.server_name, &self.legacy_session_id, &self.ech_inner_random, &ech.inner_ext_body);
+        // Freed on any error below; stored (and thus not freed here) on success.
+        errdefer a.free(inner_hello);
+
+        // 2. EncodedClientHelloInner = the inner CH *body* with an EMPTY session_id
+        //    (reconstructed from the outer by the server) plus §6.1.3 padding.
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(a);
+        try self.appendEchHelloBody(&encoded, self.server_name, &.{}, &self.ech_inner_random, &ech.inner_ext_body);
+        const pad = ech.paddingLen(encoded.items.len, self.server_name.len, cfg.maximum_name_length);
+        try encoded.appendNTimes(a, 0, pad);
+
+        // 3. HPKE sender context; `enc` is known before the AAD is built.
+        var eph_seed: [32]u8 = undefined;
+        try osEntropy(&eph_seed);
+        defer secureZero(&eph_seed);
+        var sealer = try ech.beginSeal(a, cfg, eph_seed);
+        errdefer sealer.wipe(); // `seal` wipes it on the success path
+
+        // 4. ClientHelloOuterAAD: the header-less outer ClientHello body with a
+        //    zeroed payload placeholder of the exact sealed length.
+        const payload_len = encoded.items.len + ech.tag_len;
+        const zero_payload = try a.alloc(u8, payload_len);
+        defer a.free(zero_payload);
+        @memset(zero_payload, 0);
+        const aad_body = try self.buildOuterEchBody(cfg, &sealer.enc, zero_payload);
+        defer a.free(aad_body);
+
+        // 5. Seal the padded encoded inner, authenticating the AAD.
+        const payload = try sealer.seal(a, aad_body, encoded.items);
+        defer a.free(payload);
+        if (payload.len != payload_len) return error.BadHandshake;
+
+        // 6. Final ClientHelloOuter body — identical to the AAD body except the
+        //    real payload replaces the zeros — wrapped into the handshake message
+        //    and appended to `out`.
+        const outer_body = try self.buildOuterEchBody(cfg, &sealer.enc, payload);
+        defer a.free(outer_body);
+        try writeHandshake(a, out, .client_hello, outer_body);
+
+        // Commit (last statement — no fallible op follows). Free any prior inner
+        // hello so a re-entrant start() (e.g. retried after a mid-start OOM) stays
+        // free-once; the idempotent `prepareEch` makes this unreachable in normal use.
+        if (self.ech_inner_hello) |old| a.free(old);
+        self.ech_inner_hello = inner_hello;
+    }
+
+    /// Verify the ECH acceptance confirmation in ServerHello.random[24..32]
+    /// (draft-ietf-tls-esni §7.2). On acceptance, switch the running transcript
+    /// from ClientHelloOuter to ClientHelloInner. Must run after `parseServerHello`
+    /// (so the suite is known) and before ServerHello is folded into the
+    /// transcript / the handshake keys are derived.
+    fn checkEchAcceptance(self: *Client, sh_raw: []const u8) Error!void {
+        const inner = self.ech_inner_hello orelse return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        // ServerHello = header(4) + legacy_version(2) + random(32) + …; the
+        // confirmation is random[24..32] = sh_raw[30..38].
+        if (sh_raw.len < 38) return error.BadHandshake;
+
+        // Confirmation transcript = ClientHelloInner || ServerHelloECHConf, where
+        // ServerHelloECHConf is this ServerHello with random[24..32] set to zero.
+        var conf: std.ArrayList(u8) = .empty;
+        defer conf.deinit(self.allocator);
+        try conf.appendSlice(self.allocator, inner);
+        try conf.appendSlice(self.allocator, sh_raw);
+        @memset(conf.items[inner.len + 30 .. inner.len + 38], 0);
+
+        var expected: [ech.confirmation_len]u8 = undefined;
+        switch (suite.hashAlg()) {
+            .sha256 => {
+                const th = Sha256.transcriptHash(conf.items);
+                try ech.acceptConfirmation(Sha256, &self.ech_inner_random, &th, .server_hello, &expected);
+            },
+            .sha384 => {
+                const th = Sha384.transcriptHash(conf.items);
+                try ech.acceptConfirmation(Sha384, &self.ech_inner_random, &th, .server_hello, &expected);
+            },
+        }
+
+        const accepted = ctBytesEqual(&expected, sh_raw[30..38]);
+        secureZero(&expected);
+        self.ech_accepted = accepted;
+        if (accepted) {
+            // The server accepted ECH: the handshake proceeds over the inner
+            // transcript. Replace the outer ClientHello bytes with the inner.
+            self.transcript.clearRetainingCapacity();
+            try self.appendTranscript(inner);
+        }
+    }
+
     fn writeClientHello(self: *Client, out: *std.ArrayList(u8)) Error!void {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
@@ -1134,6 +1513,10 @@ pub const Client = struct {
             if (isHelloRetryRequest(msg.body)) {
                 // A second HelloRetryRequest in one connection is fatal.
                 if (self.hrr_seen) return error.BadHandshake;
+                // ECH + HRR (re-seal with an empty `enc`, the "hrr ech accept
+                // confirmation" transcript) is not yet implemented. Rather than
+                // emit a subtly non-compliant CH2, refuse. Deferred follow-up.
+                if (self.ech_active) return error.HelloRetryRequestUnsupported;
                 const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 self.retry_hello = ch2;
@@ -1141,6 +1524,10 @@ pub const Client = struct {
             }
 
             var selected = try self.parseServerHello(msg.body);
+            // ECH acceptance: inspect the confirmation in ServerHello.random and,
+            // if the server accepted, switch the transcript to the ClientHelloInner
+            // BEFORE ServerHello is folded in and the handshake keys are derived.
+            if (self.ech_active) try self.checkEchAcceptance(msg.raw);
             try self.appendTranscript(msg.raw);
             try self.deriveHandshakeKeys(selected.buf[0..selected.len]);
             secureZero(&selected.buf);
@@ -1496,7 +1883,7 @@ pub const Client = struct {
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
         if (!self.skip_cert_verify_for_test) {
-            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.verify_time);
+            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
         }
         if (leaf_ocsp_staple) |staple| {
             const leaf = try x509.parse(chain[0]);
@@ -3223,4 +3610,320 @@ test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
     defer a.free(spki);
     const stale = parsed.next_update.?.epoch_seconds;
     try checkCrlRevocation(der, spki, &[_]u8{0x2A}, stale);
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted Client Hello (ECH) — client integration tests (roadmap 5.1)
+// ---------------------------------------------------------------------------
+
+const ech_hpke = @import("hpke.zig");
+
+/// Build a single-entry ECHConfigList into `buf` around HPKE public key `pk`,
+/// with the given `kem_id`, one cipher suite `{HKDF-SHA256, ChaCha20-Poly1305}`,
+/// and `public_name`. Returns the slice.
+fn buildEchTestList(buf: []u8, config_id: u8, kem_id: u16, pk: []const u8, public_name: []const u8) []const u8 {
+    var contents: [512]u8 = undefined;
+    var n: usize = 0;
+    contents[n] = config_id;
+    n += 1;
+    std.mem.writeInt(u16, contents[n..][0..2], kem_id, .big);
+    n += 2;
+    std.mem.writeInt(u16, contents[n..][0..2], @intCast(pk.len), .big);
+    n += 2;
+    @memcpy(contents[n..][0..pk.len], pk);
+    n += pk.len;
+    std.mem.writeInt(u16, contents[n..][0..2], 4, .big);
+    n += 2;
+    std.mem.writeInt(u16, contents[n..][0..2], ech.kdf_id, .big);
+    n += 2;
+    std.mem.writeInt(u16, contents[n..][0..2], ech.aead_id, .big);
+    n += 2;
+    contents[n] = 64; // maximum_name_length
+    n += 1;
+    contents[n] = @intCast(public_name.len);
+    n += 1;
+    @memcpy(contents[n..][0..public_name.len], public_name);
+    n += public_name.len;
+    std.mem.writeInt(u16, contents[n..][0..2], 0, .big); // extensions
+    n += 2;
+
+    var entry: [560]u8 = undefined;
+    var m: usize = 0;
+    std.mem.writeInt(u16, entry[m..][0..2], ech_config.version_draft13, .big);
+    m += 2;
+    std.mem.writeInt(u16, entry[m..][0..2], @intCast(n), .big);
+    m += 2;
+    @memcpy(entry[m..][0..n], contents[0..n]);
+    m += n;
+
+    std.mem.writeInt(u16, buf[0..2], @intCast(m), .big);
+    @memcpy(buf[2..][0..m], entry[0..m]);
+    return buf[0 .. 2 + m];
+}
+
+fn findClientExt(exts: []const u8, ext_type: u16) ?[]const u8 {
+    var it = tls_extension.Iterator.init(exts);
+    while (it.next() catch return null) |e| {
+        if (e.ext_type == ext_type) return e.data;
+    }
+    return null;
+}
+
+test "ECH off (no config) ⇒ ClientHello is the ordinary form: real SNI, no ECH extension" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "secret.example", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+
+    try std.testing.expect(!client.echOffered());
+    try std.testing.expectEqual(@as(?bool, null), client.echAccepted());
+    switch (sni.extract(record)) {
+        .found => |name| try std.testing.expectEqualSlices(u8, "secret.example", name),
+        else => return error.TestExpectedSni,
+    }
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const exts = clientHelloExtensions(ch.body).?;
+    try std.testing.expect(findClientExt(exts, ech.extension_type) == null);
+}
+
+test "ECH with an unsupported-KEM config ⇒ byte-identical off-path (no ECH offered)" {
+    const allocator = std.testing.allocator;
+    var pk: [32]u8 = @splat(0x77);
+    var list_buf: [600]u8 = undefined;
+    // KEM 0x0010 (P-256) is not one hpke.zig can seal under ⇒ no usable config.
+    const list = buildEchTestList(&list_buf, 4, 0x0010, &pk, "cover.example");
+
+    var client = try Client.init(allocator, .{
+        .server_name = "secret.example",
+        .trust_anchors = &.{},
+        .ech_config_list = list,
+    });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+
+    try std.testing.expect(!client.echOffered());
+    // The real SNI is on the wire (not a cover name) and no ECH extension leaks.
+    switch (sni.extract(record)) {
+        .found => |name| try std.testing.expectEqualSlices(u8, "secret.example", name),
+        else => return error.TestExpectedSni,
+    }
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const exts = clientHelloExtensions(ch.body).?;
+    try std.testing.expect(findClientExt(exts, ech.extension_type) == null);
+}
+
+test "ECH fail-safe: a malformed ECHConfigList stands down to a plain ClientHello (never aborts start)" {
+    const allocator = std.testing.allocator;
+    // Truncated list: 2-byte prefix declares 10 bytes, only 2 follow ⇒ Malformed.
+    const bad_list = [_]u8{ 0x00, 0x0A, 0x01, 0x02 };
+    var client = try Client.init(allocator, .{
+        .server_name = "secret.example",
+        .trust_anchors = &.{},
+        .ech_config_list = &bad_list,
+    });
+    defer client.deinit();
+
+    // start() must NOT propagate error.Malformed; it degrades to plain.
+    const record = try client.start();
+    defer allocator.free(record);
+    try std.testing.expect(!client.echOffered());
+    switch (sni.extract(record)) {
+        .found => |name| try std.testing.expectEqualSlices(u8, "secret.example", name),
+        else => return error.TestExpectedSni,
+    }
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const exts = clientHelloExtensions(ch.body).?;
+    try std.testing.expect(findClientExt(exts, ech.extension_type) == null);
+}
+
+test "ECH fail-safe: a KEM-matching config with a wrong-length public key is not offered" {
+    const allocator = std.testing.allocator;
+    // Hand-build a 0xfe0d / KEM-0x0020 config whose public_key is 5 bytes (not
+    // the 32 X25519 needs). It matches the KEM+suite but is not sealable.
+    var contents: [64]u8 = undefined;
+    var n: usize = 0;
+    contents[n] = 9;
+    n += 1; // config_id
+    std.mem.writeInt(u16, contents[n..][0..2], ech.kem_id, .big);
+    n += 2;
+    std.mem.writeInt(u16, contents[n..][0..2], 5, .big);
+    n += 2; // public_key length = 5 (invalid for X25519)
+    @memcpy(contents[n..][0..5], &[_]u8{ 1, 2, 3, 4, 5 });
+    n += 5;
+    std.mem.writeInt(u16, contents[n..][0..2], 4, .big);
+    n += 2; // cipher_suites length
+    std.mem.writeInt(u16, contents[n..][0..2], ech.kdf_id, .big);
+    n += 2;
+    std.mem.writeInt(u16, contents[n..][0..2], ech.aead_id, .big);
+    n += 2;
+    contents[n] = 32;
+    n += 1; // maximum_name_length
+    contents[n] = 9;
+    n += 1;
+    @memcpy(contents[n..][0..9], "a.example");
+    n += 9;
+    std.mem.writeInt(u16, contents[n..][0..2], 0, .big);
+    n += 2; // extensions
+
+    var entry: [96]u8 = undefined;
+    var m: usize = 0;
+    std.mem.writeInt(u16, entry[m..][0..2], ech_config.version_draft13, .big);
+    m += 2;
+    std.mem.writeInt(u16, entry[m..][0..2], @intCast(n), .big);
+    m += 2;
+    @memcpy(entry[m..][0..n], contents[0..n]);
+    m += n;
+    var list_buf: [128]u8 = undefined;
+    std.mem.writeInt(u16, list_buf[0..2], @intCast(m), .big);
+    @memcpy(list_buf[2..][0..m], entry[0..m]);
+    const list = list_buf[0 .. 2 + m];
+
+    var client = try Client.init(allocator, .{
+        .server_name = "secret.example",
+        .trust_anchors = &.{},
+        .ech_config_list = list,
+    });
+    defer client.deinit();
+    const record = try client.start();
+    defer allocator.free(record);
+    try std.testing.expect(!client.echOffered()); // not sealable ⇒ stand down
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const exts = clientHelloExtensions(ch.body).?;
+    try std.testing.expect(findClientExt(exts, ech.extension_type) == null);
+}
+
+test "ECH active ⇒ ClientHelloOuter uses public_name and a config holder opens the real inner" {
+    const allocator = std.testing.allocator;
+    // The config holder's HPKE recipient keypair.
+    const kp = try ech_hpke.KeyPair.generateDeterministic(@splat(0x5A));
+    var list_buf: [600]u8 = undefined;
+    const list = buildEchTestList(&list_buf, 7, ech.kem_id, &kp.public_key, "cover.example");
+
+    var client = try Client.init(allocator, .{
+        .server_name = "secret.example",
+        .trust_anchors = &.{},
+        .ech_config_list = list,
+    });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+
+    try std.testing.expect(client.echOffered());
+    // The outer SNI is the cover name, never the real one.
+    switch (sni.extract(record)) {
+        .found => |name| try std.testing.expectEqualSlices(u8, "cover.example", name),
+        else => return error.TestExpectedSni,
+    }
+
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const exts = clientHelloExtensions(ch.body).?;
+    const ech_ext = findClientExt(exts, ech.extension_type) orelse return error.TestExpectedEch;
+
+    // Parse the outer ECH extension: type(0) kdf(2) aead(2) config_id(1) enc<2> payload<2>.
+    try std.testing.expectEqual(@as(u8, 0), ech_ext[0]); // ClientHelloType.outer
+    try std.testing.expectEqual(ech.kdf_id, std.mem.readInt(u16, ech_ext[1..3], .big));
+    try std.testing.expectEqual(ech.aead_id, std.mem.readInt(u16, ech_ext[3..5], .big));
+    try std.testing.expectEqual(@as(u8, 7), ech_ext[5]); // config_id
+    const enc_len = std.mem.readInt(u16, ech_ext[6..8], .big);
+    try std.testing.expectEqual(@as(u16, ech_hpke.enc_len), enc_len);
+    const enc = ech_ext[8 .. 8 + enc_len];
+    const payload = ech_ext[8 + enc_len + 2 ..];
+
+    // Reconstruct the ClientHelloOuterAAD: the header-LESS outer ClientHello body
+    // (ch.body, i.e. without the 4-byte Handshake header) with the ECH payload
+    // zeroed. `payload` aliases `record`, so its offset within ch.body is a
+    // pointer delta.
+    const aad = try allocator.dupe(u8, ch.body);
+    defer allocator.free(aad);
+    const poff = @intFromPtr(payload.ptr) - @intFromPtr(ch.body.ptr);
+    @memset(aad[poff .. poff + payload.len], 0);
+
+    // The config holder opens the payload with its secret key + the same info.
+    const cfg = (try ech_config.selectSupported(list, ech.kem_id, ech.kdf_id, ech.aead_id)).?;
+    const info = try ech.buildInfo(allocator, cfg);
+    defer allocator.free(info);
+    var enc_arr: [ech_hpke.enc_len]u8 = undefined;
+    @memcpy(&enc_arr, enc);
+    const opened = try ech_hpke.openBase(allocator, enc_arr, kp.secret_key, info, aad, payload);
+    defer opened.deinit(allocator);
+
+    // opened.bytes = EncodedClientHelloInner (inner CH body + padding). Its
+    // legacy_session_id is empty and it carries the REAL SNI + the inner marker.
+    const inner_body = opened.bytes;
+    try std.testing.expectEqual(@as(u8, 0), inner_body[34]); // empty session_id
+    const inner_exts = clientHelloExtensions(inner_body).?;
+    const inner_sni = findClientExt(inner_exts, 0) orelse return error.TestExpectedInnerSni;
+    try std.testing.expect(std.mem.indexOf(u8, inner_sni, "secret.example") != null);
+    const inner_marker = findClientExt(inner_exts, ech.extension_type) orelse return error.TestExpectedInnerEch;
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x01}, inner_marker);
+}
+
+test "ECH acceptance signal: client switches to the inner transcript on match, rejects on mismatch" {
+    const allocator = std.testing.allocator;
+    const kp = try ech_hpke.KeyPair.generateDeterministic(@splat(0x21));
+    var list_buf: [600]u8 = undefined;
+    const list = buildEchTestList(&list_buf, 1, ech.kem_id, &kp.public_key, "cover.example");
+
+    var client = try Client.init(allocator, .{
+        .server_name = "secret.example",
+        .trust_anchors = &.{},
+        .ech_config_list = list,
+    });
+    defer client.deinit();
+    const record = try client.start();
+    defer allocator.free(record);
+    try std.testing.expect(client.echOffered());
+
+    // After start() the transcript holds the ClientHelloOuter; snapshot it.
+    const outer_copy = try allocator.dupe(u8, client.transcript.items);
+    defer allocator.free(outer_copy);
+    const inner = client.ech_inner_hello.?;
+
+    // parseServerHello would set this; craft the state directly for the unit.
+    client.selected_suite = .tls_aes_128_gcm_sha256;
+
+    // A ServerHello raw (only random[24..32] is read by the acceptance check).
+    var sh: [64]u8 = @splat(0xAB);
+
+    // Compute the signal a real accepting server would stamp: over
+    // ClientHelloInner || ServerHelloECHConf (this SH with random[24..32] zeroed).
+    var conf: std.ArrayList(u8) = .empty;
+    defer conf.deinit(allocator);
+    try conf.appendSlice(allocator, inner);
+    try conf.appendSlice(allocator, &sh);
+    @memset(conf.items[inner.len + 30 .. inner.len + 38], 0);
+    const th = Sha256.transcriptHash(conf.items);
+    var signal: [ech.confirmation_len]u8 = undefined;
+    try ech.acceptConfirmation(Sha256, &client.ech_inner_random, &th, .server_hello, &signal);
+
+    // --- Reject path first (wrong signal): transcript must stay the outer. ---
+    var sh_bad = sh;
+    @memcpy(sh_bad[30..38], &signal);
+    sh_bad[30] ^= 0x01;
+    try client.checkEchAcceptance(&sh_bad);
+    try std.testing.expectEqual(@as(?bool, false), client.ech_accepted);
+    try std.testing.expectEqualSlices(u8, outer_copy, client.transcript.items);
+    try std.testing.expectEqualSlices(u8, "cover.example", client.effectiveVerifyName()); // rejected ⇒ public name
+
+    // --- Accept path (correct signal): transcript switches to the inner. ---
+    @memcpy(sh[30..38], &signal);
+    try client.checkEchAcceptance(&sh);
+    try std.testing.expectEqual(@as(?bool, true), client.ech_accepted);
+    try std.testing.expectEqualSlices(u8, inner, client.transcript.items);
+    try std.testing.expectEqualSlices(u8, "secret.example", client.effectiveVerifyName()); // accepted ⇒ real name
 }
