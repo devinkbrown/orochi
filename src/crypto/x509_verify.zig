@@ -84,11 +84,15 @@ const SigOid = struct {
     const ecdsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
     /// id-Ed25519 (1.3.101.112).
     const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+    /// id-ML-DSA-44 (2.16.840.1.101.3.4.3.17). See id-ML-DSA-65 below.
+    const ml_dsa_44 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11 };
     /// id-ML-DSA-65 (2.16.840.1.101.3.4.3.18). Like Ed25519, this OID names no
     /// hash/params — ML-DSA signs the message directly and the certificate's
     /// signatureAlgorithm carries an absent parameters field
     /// (draft-ietf-lamps-dilithium-certificates).
     const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+    /// id-ML-DSA-87 (2.16.840.1.101.3.4.3.19). See id-ML-DSA-65 above.
+    const ml_dsa_87 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13 };
     /// id-slh-dsa-sha2-128s (2.16.840.1.101.3.4.3.20). Like ML-DSA, this OID
     /// names no hash/params — SLH-DSA signs the message directly and the
     /// certificate's signatureAlgorithm carries an absent parameters field
@@ -336,14 +340,26 @@ pub fn verifyCertSignature(
     sig_alg_params: ?[]const u8,
     issuer_spki: []const u8,
 ) Error!void {
-    // ML-DSA-65 is a post-quantum scheme with a raw (non-union) public key, so it
-    // is dispatched before the classical `extractPublicKey` — the PQ path never
-    // touches the `SubjectPublicKey` union that unrelated verifiers switch over.
-    // The context string is empty for X.509 certificate signatures
-    // (draft-ietf-lamps-dilithium-certificates).
+    // ML-DSA is a post-quantum scheme with a raw (non-union) public key, so each
+    // parameter set is dispatched before the classical `extractPublicKey` — the
+    // PQ path never touches the `SubjectPublicKey` union that unrelated verifiers
+    // switch over. The context string is empty for X.509 certificate signatures
+    // (draft-ietf-lamps-dilithium-certificates). Each arm extracts a key whose
+    // length is pinned to its parameter set, so a signatureAlgorithm/SPKI-OID
+    // mismatch fails closed as UnsupportedKey rather than mis-verifying.
+    if (std.mem.eql(u8, sig_alg_oid, &SigOid.ml_dsa_44)) {
+        const pk = try x509.extractMlDsa44PublicKey(issuer_spki);
+        if (!ml_dsa.verify44(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
+        return;
+    }
     if (std.mem.eql(u8, sig_alg_oid, &SigOid.ml_dsa_65)) {
         const pk = try x509.extractMlDsa65PublicKey(issuer_spki);
         if (!ml_dsa.verify65(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
+        return;
+    }
+    if (std.mem.eql(u8, sig_alg_oid, &SigOid.ml_dsa_87)) {
+        const pk = try x509.extractMlDsa87PublicKey(issuer_spki);
+        if (!ml_dsa.verify87(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
         return;
     }
     // SLH-DSA-SHA2-128s: same PQ raw-key shape as ML-DSA, KAT-verified against

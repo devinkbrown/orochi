@@ -346,10 +346,17 @@ const SpkiOid = struct {
     const prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
     /// id-Ed25519 (1.3.101.112).
     const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+    /// id-ML-DSA-44 (2.16.840.1.101.3.4.3.17) — SPKI AlgorithmIdentifier OID for
+    /// a raw ML-DSA-44 public key (NIST CSOR sigAlgs .17). One OID names both the
+    /// key and the signature algorithm.
+    const ml_dsa_44 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11 };
     /// id-ML-DSA-65 (2.16.840.1.101.3.4.3.18) — the SPKI AlgorithmIdentifier OID
     /// for a raw ML-DSA-65 public key (draft-ietf-lamps-dilithium-certificates).
     /// Same OID identifies both the key and the signature algorithm.
     const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+    /// id-ML-DSA-87 (2.16.840.1.101.3.4.3.19) — SPKI AlgorithmIdentifier OID for
+    /// a raw ML-DSA-87 public key (NIST CSOR sigAlgs .19).
+    const ml_dsa_87 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13 };
     /// id-slh-dsa-sha2-128s (2.16.840.1.101.3.4.3.20) — the SPKI
     /// AlgorithmIdentifier OID for a raw SLH-DSA-SHA2-128s public key
     /// (draft-ietf-lamps-x509-slhdsa). Same OID identifies both the key and the
@@ -359,8 +366,12 @@ const SpkiOid = struct {
 
 /// Length of an Ed25519 raw public key.
 pub const ed25519_public_key_len = 32;
+/// Length of a raw ML-DSA-44 public key (ρ ‖ t1), per FIPS 204.
+pub const ml_dsa_44_public_key_len = 1312;
 /// Length of a raw ML-DSA-65 public key (ρ ‖ t1), per FIPS 204.
 pub const ml_dsa_65_public_key_len = 1952;
+/// Length of a raw ML-DSA-87 public key (ρ ‖ t1), per FIPS 204.
+pub const ml_dsa_87_public_key_len = 2592;
 /// Length of a raw SLH-DSA-SHA2-128s public key (PK.seed ‖ PK.root), per FIPS 205.
 pub const slh_dsa_sha2_128s_public_key_len = 32;
 /// Length of an uncompressed SEC1 P-256 point (0x04 || X32 || Y32).
@@ -421,15 +432,15 @@ pub fn extractPublicKey(spki_der: []const u8) Error!SubjectPublicKey {
     return error.UnsupportedKey;
 }
 
-/// Extract the raw ML-DSA-65 public key (1952 bytes, ρ ‖ t1) from a
-/// SubjectPublicKeyInfo. The AlgorithmIdentifier OID must be exactly id-ML-DSA-65
-/// (2.16.840.1.101.3.4.3.18) with an ABSENT parameters field
-/// (draft-ietf-lamps-dilithium-certificates), and the key BIT STRING must hold
-/// exactly the raw key bytes with zero unused bits. Fails closed on any
-/// deviation. This is a separate entry point from `extractPublicKey` so the
-/// post-quantum path never widens the classical `SubjectPublicKey` union that
-/// many unrelated verifiers switch over.
-pub fn extractMlDsa65PublicKey(spki_der: []const u8) Error![]const u8 {
+/// Extract a raw ML-DSA public key from a SubjectPublicKeyInfo, requiring the
+/// AlgorithmIdentifier OID to match `expected_oid` exactly (one of id-ML-DSA-44/
+/// 65/87) with an ABSENT parameters field (draft-ietf-lamps-dilithium-
+/// certificates), the key BIT STRING to hold exactly the raw key bytes with zero
+/// unused bits, and the decoded key to be exactly `expected_len` bytes. Fails
+/// closed on any deviation. This is a separate entry point from
+/// `extractPublicKey` so the post-quantum path never widens the classical
+/// `SubjectPublicKey` union that many unrelated verifiers switch over.
+fn extractMlDsaPublicKey(spki_der: []const u8, expected_oid: []const u8, expected_len: usize) Error![]const u8 {
     var top = DerReader.init(spki_der);
     const seq = try top.readExpected(Tag.sequence);
     try top.expectEmpty();
@@ -443,15 +454,33 @@ pub fn extractMlDsa65PublicKey(spki_der: []const u8) Error![]const u8 {
     var alg = try spki.child(alg_seq);
     const oid = try alg.readExpected(Tag.oid);
     try validateOid(oid.value);
-    if (!std.mem.eql(u8, oid.value, &SpkiOid.ml_dsa_65)) return error.UnsupportedKey;
+    if (!std.mem.eql(u8, oid.value, expected_oid)) return error.UnsupportedKey;
     try alg.expectEmpty();
 
     // A raw key BIT STRING is byte-aligned: zero unused bits (parseBitString only
     // rejects >7, so enforce the exact-0 requirement here for the PQ path).
     if (key_bits.value.len == 0 or key_bits.value[0] != 0) return error.InvalidKey;
     const key_bytes = try parseBitString(key_bits);
-    if (key_bytes.len != ml_dsa_65_public_key_len) return error.InvalidKey;
+    if (key_bytes.len != expected_len) return error.InvalidKey;
     return key_bytes;
+}
+
+/// Extract the raw ML-DSA-44 public key (1312 bytes, ρ ‖ t1) from an SPKI whose
+/// AlgorithmIdentifier OID is exactly id-ML-DSA-44 (2.16.840.1.101.3.4.3.17).
+pub fn extractMlDsa44PublicKey(spki_der: []const u8) Error![]const u8 {
+    return extractMlDsaPublicKey(spki_der, &SpkiOid.ml_dsa_44, ml_dsa_44_public_key_len);
+}
+
+/// Extract the raw ML-DSA-65 public key (1952 bytes, ρ ‖ t1) from an SPKI whose
+/// AlgorithmIdentifier OID is exactly id-ML-DSA-65 (2.16.840.1.101.3.4.3.18).
+pub fn extractMlDsa65PublicKey(spki_der: []const u8) Error![]const u8 {
+    return extractMlDsaPublicKey(spki_der, &SpkiOid.ml_dsa_65, ml_dsa_65_public_key_len);
+}
+
+/// Extract the raw ML-DSA-87 public key (2592 bytes, ρ ‖ t1) from an SPKI whose
+/// AlgorithmIdentifier OID is exactly id-ML-DSA-87 (2.16.840.1.101.3.4.3.19).
+pub fn extractMlDsa87PublicKey(spki_der: []const u8) Error![]const u8 {
+    return extractMlDsaPublicKey(spki_der, &SpkiOid.ml_dsa_87, ml_dsa_87_public_key_len);
 }
 
 /// Extract the raw SLH-DSA-SHA2-128s public key (32 bytes, PK.seed ‖ PK.root)
