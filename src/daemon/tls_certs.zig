@@ -190,7 +190,13 @@ pub fn loadCertChain(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
         const der_buf = try allocator.alloc(u8, block.len);
         defer allocator.free(der_buf);
         const der = try pem.decode(block, cert_pem_label, der_buf);
-        try list.append(allocator, try allocator.dupe(u8, der));
+        // Reserve first so the owned dupe can never be orphaned by an
+        // ArrayList-growth OOM landing *between* the dupe and the append
+        // (six-invariants: each owned allocation freed exactly once). With
+        // capacity guaranteed, appendAssumeCapacity is infallible, so if the
+        // dupe itself OOMs nothing was allocated to leak.
+        try list.ensureUnusedCapacity(allocator, 1);
+        list.appendAssumeCapacity(try allocator.dupe(u8, der));
         off = e;
     }
 
@@ -527,6 +533,65 @@ test "loadOrBootstrap: raw DER files (no PEM armor) load directly" {
         &key_pair.public_key.toBytes(),
         &loaded.signing_key.?.public_key.toBytes(),
     );
+}
+
+test "loadCertChain: allocation failure at any point is leak-clean (dupe/append boundary)" {
+    // Regression for the dupe-then-append OOM leak: an OutOfMemory landing between
+    // the per-cert `allocator.dupe` and its insertion into `list` must free the
+    // dupe, never orphan it. The 2-block PEM makes a *later* iteration OOM while
+    // `list` already holds an earlier dupe, so the sweep proves the function-level
+    // errdefer frees the accumulated items (not just the current one) with no leak.
+    // `checkAllAllocationFailures` fails allocation 0,1,2,... in turn and asserts
+    // every run either fully succeeds or returns OutOfMemory with NO leak.
+    const allocator = testing.allocator;
+
+    const kp0 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x41} ** Ed25519.KeyPair.seed_length);
+    const kp1 = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** Ed25519.KeyPair.seed_length);
+    var der0_buf: [768]u8 = undefined;
+    var der1_buf: [768]u8 = undefined;
+    const der0 = try x509_selfsign.buildSelfSigned(&der0_buf, .{
+        .common_name = "chain0.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x0A, 0x01 },
+        .key_pair = kp0,
+    });
+    const der1 = try x509_selfsign.buildSelfSigned(&der1_buf, .{
+        .common_name = "chain1.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x0A, 0x02 },
+        .key_pair = kp1,
+    });
+
+    var pem0_buf: [4096]u8 = undefined;
+    var pem1_buf: [4096]u8 = undefined;
+    const pem0 = try pem.encode(&pem0_buf, cert_pem_label, der0);
+    const pem1 = try pem.encode(&pem1_buf, cert_pem_label, der1);
+
+    // Concatenate the two PEM blocks into one chain file.
+    var file_buf: [8192]u8 = undefined;
+    @memcpy(file_buf[0..pem0.len], pem0);
+    @memcpy(file_buf[pem0.len..][0..pem1.len], pem1);
+    const file_data = file_buf[0 .. pem0.len + pem1.len];
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "chain.pem", .data = file_data });
+    const chain_path = try tmpPath(allocator, tmp, "chain.pem");
+    defer allocator.free(chain_path);
+
+    const Sweep = struct {
+        fn run(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+            const chain = try loadCertChain(alloc, io, path);
+            defer {
+                for (chain) |der| alloc.free(der);
+                alloc.free(chain);
+            }
+            try testing.expectEqual(@as(usize, 2), chain.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{ testing.io, @as([]const u8, chain_path) });
 }
 
 /// Build a cwd-relative path into a testing tmp dir, matching `testing.tmpDir`'s
