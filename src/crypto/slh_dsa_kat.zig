@@ -1,41 +1,39 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Independent known-answer tests for SLH-DSA-SHA2-128s (FIPS 205) signature
-//! verification.
+//! Independent known-answer tests for SLH-DSA (FIPS 205) signature verification,
+//! covering ALL 12 standardized parameter sets (SHA2 and SHAKE, {128,192,256}×
+//! {s,f}).
 //!
 //! The vectors embedded here are NIST ACVP FIPS 205 `SLH-DSA-sigVer` test cases
-//! (parameter set SLH-DSA-SHA2-128s) taken verbatim from
-//! `usnistgov/ACVP-Server:gen-val/json-files/SLH-DSA-sigVer-FIPS205/
-//! internalProjection.json`, plus one empty-context accept case sourced from the
-//! matching `SLH-DSA-sigGen-FIPS205` corpus (the X.509 certificate path uses an
-//! empty context, and the sigVer accept cases all carry non-empty contexts). All
-//! are INDEPENDENT published vectors — triples of (public key, message, signature)
-//! with a NIST-supplied accept/reject verdict — NOT values this code produced.
-//! That independence is the whole point: a plausible-but-wrong hash-based
-//! verifier passes the module's own self-consistency checks but fails these ACVP
-//! accept vectors.
+//! taken verbatim from `usnistgov/ACVP-Server:gen-val/json-files/
+//! SLH-DSA-sigVer-FIPS205/internalProjection.json`, plus one empty-context accept
+//! per hash-family representative sourced from the matching `SLH-DSA-sigGen`
+//! corpus (the X.509 certificate path uses an empty context, which most sigVer
+//! accept cases in this lean corpus do not). All are INDEPENDENT published
+//! vectors — triples of (public key, message, signature) with a NIST-supplied
+//! accept/reject verdict — NOT values this code produced (orochi has no SLH-DSA
+//! signer or key generator). That independence is the whole point: a
+//! plausible-but-wrong hash-based verifier passes the module's own
+//! self-consistency checks but fails these ACVP accept vectors.
 //!
-//! Two interfaces are covered:
-//!   * external / pure  (ACVP sigVer tgId 19) → `verify(pk, msg, ctx, sig)`,
-//!     exercising the 0x00‖len(ctx)‖ctx domain prefix, plus the empty-context
-//!     sigGen accept (the X.509 path).
-//!   * internal         (ACVP sigVer tgId 31) → `verifyInternal(pk, M′, sig)`.
-//!
-//! Reject cases span every ACVP failure class: modified message, modified R,
-//! modified FORS signature, modified hypertree signature, and structural
-//! wrong-length (too small / too large).
+//! Interfaces exercised per set:
+//!   * external / pure  → `verify(pk, msg, ctx, sig)` (0x00‖len(ctx)‖ctx prefix).
+//!   * internal         → `verifyInternal(pk, M′, sig)`.
+//! Stored rejects are real ACVP "modified message" / "modified signature"
+//! verdicts; broad bit-flip tamper coverage is generated dynamically below.
 
 const std = @import("std");
 const slh_dsa = @import("slh_dsa.zig");
 const x509_verify = @import("x509_verify.zig");
 const testing = std.testing;
 
-const vectors_txt = @embedFile("slh_dsa_sha2_128s_sigver_acvp.txt");
+const vectors_txt = @embedFile("slh_dsa_sigver_acvp.txt");
 
 const Mode = enum { external, internal };
 
 const Vector = struct {
+    set: []const u8,
     mode: Mode,
     expect: bool,
     tc: []const u8,
@@ -44,6 +42,30 @@ const Vector = struct {
     ctx: []u8,
     msg: []u8,
     sig: []u8,
+};
+
+/// Every standardized parameter set, paired with its ACVP name, X.509 OID suffix
+/// byte (id-slh-dsa-* = 2.16.840.1.101.3.4.3.{20..31}), and raw public-key length.
+const Spec = struct {
+    name: []const u8,
+    Verifier: type,
+    oid_suffix: u8,
+    pk_len: usize,
+};
+
+const specs = [_]Spec{
+    .{ .name = "SLH-DSA-SHA2-128s", .Verifier = slh_dsa.Sha2_128s, .oid_suffix = 0x14, .pk_len = 32 },
+    .{ .name = "SLH-DSA-SHA2-128f", .Verifier = slh_dsa.Sha2_128f, .oid_suffix = 0x15, .pk_len = 32 },
+    .{ .name = "SLH-DSA-SHA2-192s", .Verifier = slh_dsa.Sha2_192s, .oid_suffix = 0x16, .pk_len = 48 },
+    .{ .name = "SLH-DSA-SHA2-192f", .Verifier = slh_dsa.Sha2_192f, .oid_suffix = 0x17, .pk_len = 48 },
+    .{ .name = "SLH-DSA-SHA2-256s", .Verifier = slh_dsa.Sha2_256s, .oid_suffix = 0x18, .pk_len = 64 },
+    .{ .name = "SLH-DSA-SHA2-256f", .Verifier = slh_dsa.Sha2_256f, .oid_suffix = 0x19, .pk_len = 64 },
+    .{ .name = "SLH-DSA-SHAKE-128s", .Verifier = slh_dsa.Shake_128s, .oid_suffix = 0x1A, .pk_len = 32 },
+    .{ .name = "SLH-DSA-SHAKE-128f", .Verifier = slh_dsa.Shake_128f, .oid_suffix = 0x1B, .pk_len = 32 },
+    .{ .name = "SLH-DSA-SHAKE-192s", .Verifier = slh_dsa.Shake_192s, .oid_suffix = 0x1C, .pk_len = 48 },
+    .{ .name = "SLH-DSA-SHAKE-192f", .Verifier = slh_dsa.Shake_192f, .oid_suffix = 0x1D, .pk_len = 48 },
+    .{ .name = "SLH-DSA-SHAKE-256s", .Verifier = slh_dsa.Shake_256s, .oid_suffix = 0x1E, .pk_len = 64 },
+    .{ .name = "SLH-DSA-SHAKE-256f", .Verifier = slh_dsa.Shake_256f, .oid_suffix = 0x1F, .pk_len = 64 },
 };
 
 /// Decode a lowercase-hex field into freshly allocated bytes.
@@ -72,6 +94,7 @@ fn parseVectors(a: std.mem.Allocator) !std.ArrayList(Vector) {
             // Append the empty record up front so a mid-record allocation failure
             // still leaves it owned by `list` for the errdefer to free.
             try list.append(a, .{
+                .set = "",
                 .mode = .internal,
                 .expect = false,
                 .tc = "",
@@ -88,7 +111,9 @@ fn parseVectors(a: std.mem.Allocator) !std.ArrayList(Vector) {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadRecord;
         const key = line[0..colon];
         const val = line[colon + 1 ..];
-        if (std.mem.eql(u8, key, "mode")) {
+        if (std.mem.eql(u8, key, "set")) {
+            cur.set = val;
+        } else if (std.mem.eql(u8, key, "mode")) {
             cur.mode = if (std.mem.eql(u8, val, "external")) .external else .internal;
         } else if (std.mem.eql(u8, key, "expect")) {
             cur.expect = std.mem.eql(u8, val, "1");
@@ -116,14 +141,21 @@ fn freeVector(a: std.mem.Allocator, v: Vector) void {
     a.free(v.sig);
 }
 
-fn runVector(v: Vector) bool {
-    return switch (v.mode) {
-        .external => slh_dsa.verify(v.pk, v.msg, v.ctx, v.sig),
-        .internal => slh_dsa.verifyInternal(v.pk, v.msg, v.sig),
-    };
+/// Dispatch a vector to its parameter set's verifier. Returns null for an
+/// unrecognized set name (which the caller treats as a test failure).
+fn runVector(v: Vector) ?bool {
+    inline for (specs) |s| {
+        if (std.mem.eql(u8, v.set, s.name)) {
+            return switch (v.mode) {
+                .external => s.Verifier.verify(v.pk, v.msg, v.ctx, v.sig),
+                .internal => s.Verifier.verifyInternal(v.pk, v.msg, v.sig),
+            };
+        }
+    }
+    return null;
 }
 
-test "SLH-DSA-SHA2-128s ACVP sigVer known-answer vectors (accept + reject)" {
+test "SLH-DSA ACVP sigVer known-answer vectors, all 12 parameter sets (accept + reject)" {
     const a = testing.allocator;
     var vecs = try parseVectors(a);
     defer {
@@ -131,29 +163,49 @@ test "SLH-DSA-SHA2-128s ACVP sigVer known-answer vectors (accept + reject)" {
         vecs.deinit(a);
     }
 
-    // Sanity: we actually loaded the expected corpus, not an empty file.
-    try testing.expect(vecs.items.len >= 28);
+    // Sanity: we loaded the expected corpus (>= 4 records per set), not a stub.
+    try testing.expect(vecs.items.len >= 48);
 
+    // Track which sets produced an accept, so "all pass" cannot be vacuous for
+    // any single set (e.g. an unrecognized name silently skipped).
+    var accept_by_set: [specs.len]bool = @splat(false);
     var accept_seen: usize = 0;
     var reject_seen: usize = 0;
     for (vecs.items) |v| {
-        const got = runVector(v);
+        const got = runVector(v) orelse {
+            std.debug.print("SLH-DSA KAT: unrecognized set '{s}'\n", .{v.set});
+            return error.UnknownSet;
+        };
         if (got != v.expect) {
             std.debug.print(
-                "SLH-DSA-SHA2-128s KAT MISMATCH: mode={s} tc={s} expected={} got={} reason={s}\n",
-                .{ @tagName(v.mode), v.tc, v.expect, got, v.reason },
+                "SLH-DSA KAT MISMATCH: set={s} mode={s} tc={s} expected={} got={} reason={s}\n",
+                .{ v.set, @tagName(v.mode), v.tc, v.expect, got, v.reason },
             );
             return error.KatMismatch;
         }
-        if (v.expect) accept_seen += 1 else reject_seen += 1;
+        if (v.expect) {
+            accept_seen += 1;
+            inline for (specs, 0..) |s, i| {
+                if (std.mem.eql(u8, v.set, s.name)) accept_by_set[i] = true;
+            }
+        } else {
+            reject_seen += 1;
+        }
     }
 
-    // The corpus must contain both verdicts, or "all pass" would be vacuous.
-    try testing.expect(accept_seen >= 3);
-    try testing.expect(reject_seen >= 3);
+    // Every set must have at least one *passing* accept vector — the real proof
+    // that its full tree walk / ADRS / hash family is correct.
+    inline for (specs, 0..) |s, i| {
+        if (!accept_by_set[i]) {
+            std.debug.print("SLH-DSA KAT: no accept vector verified for {s}\n", .{s.name});
+            return error.MissingAcceptForSet;
+        }
+    }
+    try testing.expect(accept_seen >= specs.len);
+    try testing.expect(reject_seen >= specs.len);
 }
 
-test "SLH-DSA-SHA2-128s tamper: flipping any accept vector's signature/pk/msg rejects" {
+test "SLH-DSA tamper: flipping any accept vector's signature/pk/msg rejects" {
     const a = testing.allocator;
     var vecs = try parseVectors(a);
     defer {
@@ -164,19 +216,16 @@ test "SLH-DSA-SHA2-128s tamper: flipping any accept vector's signature/pk/msg re
     var checked: usize = 0;
     for (vecs.items) |v| {
         if (!v.expect) continue; // start from a known-good triple
+        try testing.expect(runVector(v).?);
 
-        // Baseline must still verify.
-        try testing.expect(runVector(v));
-
-        // Flip one bit deep in the signature body (in the SIG_HT region, past R
-        // and the FORS signature).
+        // Flip one bit deep in the signature body (in the SIG_HT region).
         {
             const dup = try a.dupe(u8, v.sig);
             defer a.free(dup);
             dup[dup.len - 100] ^= 0x01;
             var w = v;
             w.sig = dup;
-            try testing.expect(!runVector(w));
+            try testing.expect(!runVector(w).?);
         }
         // Flip one bit of the public key (PK.root half).
         {
@@ -185,7 +234,7 @@ test "SLH-DSA-SHA2-128s tamper: flipping any accept vector's signature/pk/msg re
             dup[dup.len - 1] ^= 0x80;
             var w = v;
             w.pk = dup;
-            try testing.expect(!runVector(w));
+            try testing.expect(!runVector(w).?);
         }
         // Flip one bit of the message (if non-empty).
         if (v.msg.len > 0) {
@@ -194,14 +243,14 @@ test "SLH-DSA-SHA2-128s tamper: flipping any accept vector's signature/pk/msg re
             dup[0] ^= 0x01;
             var w = v;
             w.msg = dup;
-            try testing.expect(!runVector(w));
+            try testing.expect(!runVector(w).?);
         }
         checked += 1;
     }
-    try testing.expect(checked >= 3);
+    try testing.expect(checked >= specs.len);
 }
 
-test "SLH-DSA-SHA2-128s structural rejects: wrong-length pk/sig and oversized context" {
+test "SLH-DSA structural rejects: wrong-length pk/sig and oversized context" {
     const a = testing.allocator;
     var vecs = try parseVectors(a);
     defer {
@@ -209,27 +258,29 @@ test "SLH-DSA-SHA2-128s structural rejects: wrong-length pk/sig and oversized co
         vecs.deinit(a);
     }
 
-    // Use the first external accept vector as a valid base.
-    var base: ?Vector = null;
+    var checked: usize = 0;
     for (vecs.items) |v| {
-        if (v.expect and v.mode == .external) {
-            base = v;
-            break;
-        }
+        if (!(v.expect and v.mode == .external)) continue;
+        // Truncated pk / sig must fail closed (no panic, no OOB) for this set.
+        var t = v;
+        t.pk = v.pk[0 .. v.pk.len - 1];
+        try testing.expect(!(runVector(t) orelse return error.UnknownSet));
+        t = v;
+        t.sig = v.sig[0 .. v.sig.len - 1];
+        try testing.expect(!(runVector(t) orelse return error.UnknownSet));
+        // Over-length context (>255) is rejected without touching the hash trees.
+        const big_ctx = try a.alloc(u8, 256);
+        defer a.free(big_ctx);
+        @memset(big_ctx, 0);
+        t = v;
+        t.ctx = big_ctx;
+        try testing.expect(!(runVector(t) orelse return error.UnknownSet));
+        checked += 1;
     }
-    const v = base orelse return error.NoAcceptVector;
-
-    // Truncated public key / signature must fail closed (no panic, no OOB).
-    try testing.expect(!slh_dsa.verify(v.pk[0 .. v.pk.len - 1], v.msg, v.ctx, v.sig));
-    try testing.expect(!slh_dsa.verify(v.pk, v.msg, v.ctx, v.sig[0 .. v.sig.len - 1]));
-    try testing.expect(!slh_dsa.verifyInternal(v.pk, v.msg, v.sig[0 .. v.sig.len - 1]));
-
-    // Over-length context (>255) is rejected without touching the hash trees.
-    const big_ctx = try a.alloc(u8, 256);
-    defer a.free(big_ctx);
-    @memset(big_ctx, 0);
-    try testing.expect(!slh_dsa.verify(v.pk, v.msg, big_ctx, v.sig));
+    try testing.expect(checked >= specs.len);
 }
+
+// ── X.509 dispatch wiring ───────────────────────────────────────────────────
 
 /// Encode one DER TLV (`tag ‖ len ‖ val`) into arena-owned bytes.
 fn derTlv(a: std.mem.Allocator, tag: u8, val: []const u8) ![]u8 {
@@ -252,10 +303,10 @@ fn derTlv(a: std.mem.Allocator, tag: u8, val: []const u8) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-/// Wrap a raw SLH-DSA-SHA2-128s public key in a SubjectPublicKeyInfo:
-///   SEQUENCE { SEQUENCE { OID id-slh-dsa-sha2-128s }, BIT STRING (0x00 ‖ pk) }.
-fn buildSlhDsaSpki(a: std.mem.Allocator, pk: []const u8) ![]u8 {
-    const oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x14 };
+/// Wrap a raw SLH-DSA public key in a SubjectPublicKeyInfo:
+///   SEQUENCE { SEQUENCE { OID id-slh-dsa-* }, BIT STRING (0x00 ‖ pk) }.
+fn buildSlhDsaSpki(a: std.mem.Allocator, oid_suffix: u8, pk: []const u8) ![]u8 {
+    const oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, oid_suffix };
     const oid_tlv = try derTlv(a, 0x06, &oid);
     const alg = try derTlv(a, 0x30, oid_tlv);
     const bit_val = try a.alloc(u8, pk.len + 1);
@@ -266,10 +317,7 @@ fn buildSlhDsaSpki(a: std.mem.Allocator, pk: []const u8) ![]u8 {
     return derTlv(a, 0x30, inner);
 }
 
-test "x509 dispatch: verifyCertSignature routes id-slh-dsa-sha2-128s to the KAT-verified verifier" {
-    // id-slh-dsa-sha2-128s in the outer signatureAlgorithm (2.16.840.1.101.3.4.3.20).
-    const sig_alg_oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x14 };
-
+test "x509 dispatch: verifyCertSignature routes id-slh-dsa-* (empty-context cert path)" {
     const backing = testing.allocator;
     var vecs = try parseVectors(backing);
     defer {
@@ -277,38 +325,48 @@ test "x509 dispatch: verifyCertSignature routes id-slh-dsa-sha2-128s to the KAT-
         vecs.deinit(backing);
     }
 
-    // The empty-context external accept vector is exactly the X.509 path:
-    // verifyCertSignature verifies with an empty SLH-DSA context.
-    var chosen: ?Vector = null;
+    // The empty-context external accept vectors (sigGen-sourced, one per hash
+    // family) are exactly the X.509 path: verifyCertSignature verifies with an
+    // empty SLH-DSA context. Prove full accept + tamper-reject + wrong-key
+    // through the real dispatcher for each hash family represented.
+    var checked: usize = 0;
     for (vecs.items) |v| {
-        if (v.expect and v.mode == .external and v.ctx.len == 0) {
-            chosen = v;
-            break;
+        if (!(v.expect and v.mode == .external and v.ctx.len == 0)) continue;
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var handled = false;
+        inline for (specs) |s| {
+            if (std.mem.eql(u8, v.set, s.name)) {
+                handled = true;
+                const sig_alg_oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, s.oid_suffix };
+                const spki = try buildSlhDsaSpki(a, s.oid_suffix, v.pk);
+
+                // Treat the vector's message as the TBSCertificate bytes; the
+                // dispatcher verifies the correct SLH-DSA set with empty context.
+                try x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, spki);
+
+                // A single flipped signature byte must be rejected as BadSignature.
+                const bad_sig = try a.dupe(u8, v.sig);
+                bad_sig[bad_sig.len - 50] ^= 0x01;
+                try testing.expectError(
+                    error.BadSignature,
+                    x509_verify.verifyCertSignature(v.msg, bad_sig, &sig_alg_oid, null, spki),
+                );
+
+                // An SPKI whose declared key length is wrong must fail closed.
+                const short_spki = try buildSlhDsaSpki(a, s.oid_suffix, v.pk[0 .. v.pk.len - 1]);
+                try testing.expectError(
+                    error.InvalidKey,
+                    x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, short_spki),
+                );
+                checked += 1;
+            }
         }
+        if (!handled) return error.UnknownSet;
     }
-    const v = chosen orelse return error.NoEmptyContextAcceptVector;
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const spki = try buildSlhDsaSpki(a, v.pk);
-
-    // Treat the vector's message as the TBSCertificate bytes; the dispatcher
-    // verifies SLH-DSA-SHA2-128s over them with an empty context.
-    try x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, spki);
-
-    // A single flipped signature byte must be rejected as BadSignature.
-    const bad_sig = try a.dupe(u8, v.sig);
-    bad_sig[bad_sig.len - 50] ^= 0x01;
-    try testing.expectError(
-        error.BadSignature,
-        x509_verify.verifyCertSignature(v.msg, bad_sig, &sig_alg_oid, null, spki),
-    );
-
-    // An SPKI whose declared key length is wrong must fail closed.
-    const short_spki = try buildSlhDsaSpki(a, v.pk[0 .. v.pk.len - 1]);
-    try testing.expectError(
-        error.InvalidKey,
-        x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, short_spki),
-    );
+    // One per hash family: SHA2 cat1, SHA2 cat3/5, SHAKE.
+    try testing.expect(checked >= 3);
 }
