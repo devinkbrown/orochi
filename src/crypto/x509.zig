@@ -559,6 +559,165 @@ fn scanExtensionsForSct(parent: DerReader, ext_tlv: Tlv) Error!?[]const u8 {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Precertificate TBSCertificate reconstruction (RFC 6962 §3.2).
+//
+// An SCT EMBEDDED in a certificate signs over the *precertificate*: the leaf's
+// TBSCertificate with the embedded SCT-list extension (OID
+// 1.3.6.1.4.1.11129.2.4.2) removed. To verify a deployed leaf's embedded SCTs,
+// the exact precert TBS bytes must be reconstructed — the leaf TBS with only
+// that one extension stripped and every affected enclosing length (the
+// Extensions SEQUENCE, the [3] EXPLICIT wrapper, and the outer TBSCertificate
+// SEQUENCE) re-encoded to canonical minimal DER. Every other byte — all the
+// other extensions, in wire order — is preserved verbatim.
+//
+// Scope: the common case where the CA signs the precertificate directly, so the
+// issuer_key_hash is SHA-256 of the issuing CA's SubjectPublicKeyInfo and the
+// TBS issuer field is unchanged. A Precertificate Signing Certificate (RFC 6962
+// §3.1), which additionally rewrites the issuer, is out of scope — an SCT that
+// needs that rewrite simply fails to verify, which the caller's fail-open policy
+// tolerates. Standalone from `parseInto`; fails closed on malformed DER.
+// ---------------------------------------------------------------------------
+
+/// Bytes the DER length octets for `content_len` occupy (excluding the tag).
+/// Canonical minimal encoding: short form (<128) is a single octet; long form is
+/// `0x80|n` followed by `n` big-endian minimal magnitude octets.
+fn derLenOctets(content_len: usize) usize {
+    if (content_len < 0x80) return 1;
+    var n = content_len;
+    var octets: usize = 0;
+    while (n != 0) : (n >>= 8) octets += 1;
+    return 1 + octets;
+}
+
+/// Size of a full DER TLV header (tag + length octets) for `content_len`.
+fn derHeaderLen(content_len: usize) usize {
+    return 1 + derLenOctets(content_len);
+}
+
+/// Write a canonical minimal DER TLV header (`tag` + length octets for
+/// `content_len`) at the start of `out`, returning the number of bytes written.
+/// Caller guarantees `out.len >= derHeaderLen(content_len)`.
+fn writeDerHeader(out: []u8, tag: u8, content_len: usize) usize {
+    out[0] = tag;
+    if (content_len < 0x80) {
+        out[1] = @intCast(content_len);
+        return 2;
+    }
+    var n = content_len;
+    var octets: usize = 0;
+    while (n != 0) : (n >>= 8) octets += 1;
+    out[1] = 0x80 | @as(u8, @intCast(octets));
+    var i: usize = 0;
+    while (i < octets) : (i += 1) {
+        const shift: u6 = @intCast(8 * (octets - 1 - i));
+        out[2 + i] = @intCast((content_len >> shift) & 0xff);
+    }
+    return 2 + octets;
+}
+
+/// Reconstruct the precertificate TBSCertificate that a leaf's EMBEDDED SCTs
+/// sign over: its TBSCertificate with the SCT-list extension (OID
+/// 1.3.6.1.4.1.11129.2.4.2) removed and the enclosing lengths re-encoded to
+/// canonical minimal DER (RFC 6962 §3.2). Writes into `out` and returns the
+/// written prefix — the exact bytes to frame as the `PreCert` TBSCertificate for
+/// `sct.buildPrecertEntry` / `verifySctAgainstLogs`.
+///
+/// Requires the leaf to actually carry the SCT-list extension (call after
+/// `findSctListExtension` returns non-null); a leaf without it yields
+/// `error.MissingField`. Fails with `error.OutputTooSmall` when `out` cannot
+/// hold the (always strictly smaller than the input) result, and fails closed on
+/// any malformed DER.
+pub fn buildPrecertTbs(out: []u8, leaf_der: []const u8) Error![]const u8 {
+    if (leaf_der.len == 0) return error.EmptyInput;
+    if (leaf_der.len > MaxDerLen) return error.Oversize;
+
+    var top = DerReader.init(leaf_der);
+    const cert_seq = try top.readExpected(Tag.sequence);
+    try top.expectEmpty();
+    var body = try top.child(cert_seq);
+    const tbs = try body.readExpected(Tag.sequence);
+    // signatureAlgorithm / signatureValue are irrelevant to the TBS.
+
+    var tbs_reader = try body.child(tbs);
+    if (tbs_reader.hasRemaining() and try tbs_reader.peekTag() == Tag.context_0_constructed) {
+        _ = try tbs_reader.readTlv(); // [0] EXPLICIT version
+    }
+    _ = try tbs_reader.readExpected(Tag.integer); // serialNumber
+    _ = try tbs_reader.readExpected(Tag.sequence); // signature
+    _ = try tbs_reader.readExpected(Tag.sequence); // issuer
+    _ = try tbs_reader.readExpected(Tag.sequence); // validity
+    _ = try tbs_reader.readExpected(Tag.sequence); // subject
+    _ = try tbs_reader.readExpected(Tag.sequence); // subjectPublicKeyInfo
+
+    // issuerUniqueID [1] / subjectUniqueID [2] (primitive, IMPLICIT) belong to
+    // the preserved prefix; skip them and stop at the extensions [3].
+    while (tbs_reader.hasRemaining()) {
+        const tag = try tbs_reader.peekTag();
+        if (tag == Tag.context_3_constructed) break;
+        if (tag == 0x81 or tag == 0x82) {
+            _ = try tbs_reader.readTlv();
+            continue;
+        }
+        return error.MissingField; // an unexpected field, or no extensions at all
+    }
+    if (!tbs_reader.hasRemaining()) return error.MissingField; // no extensions
+
+    // Every TBS byte before [3] is copied verbatim.
+    const prefix_len = tbs_reader.offset;
+    const ext3 = try tbs_reader.readExpected(Tag.context_3_constructed);
+    try tbs_reader.expectEmpty();
+
+    var explicit = try tbs_reader.child(ext3);
+    const exts_seq = try explicit.readExpected(Tag.sequence);
+    try explicit.expectEmpty();
+
+    // Pass 1: size the SCT-stripped Extensions SEQUENCE content, and confirm the
+    // SCT-list extension is present (removing something absent is a caller error).
+    var new_exts_content_len: usize = 0;
+    var found_sct = false;
+    var pass1 = try explicit.child(exts_seq);
+    while (pass1.hasRemaining()) {
+        const one_tlv = try pass1.readExpected(Tag.sequence);
+        var one = try pass1.child(one_tlv);
+        const oid_tlv = try one.readExpected(Tag.oid);
+        try validateOid(oid_tlv.value);
+        if (std.mem.eql(u8, oid_tlv.value, &sct_list_extension_oid)) {
+            found_sct = true;
+            continue;
+        }
+        new_exts_content_len += one_tlv.raw.len;
+    }
+    if (!found_sct) return error.MissingField;
+
+    // Enclosing sizes, computed bottom-up in canonical minimal DER.
+    const exts_seq_total = derHeaderLen(new_exts_content_len) + new_exts_content_len;
+    const ext3_total = derHeaderLen(exts_seq_total) + exts_seq_total;
+    const tbs_content_len = prefix_len + ext3_total;
+    const tbs_total = derHeaderLen(tbs_content_len) + tbs_content_len;
+    if (out.len < tbs_total) return error.OutputTooSmall;
+
+    // Pass 2: emit the TBS header, the verbatim prefix, the [3] header, the
+    // Extensions SEQUENCE header, then every non-SCT extension's raw bytes in order.
+    var w: usize = 0;
+    w += writeDerHeader(out[w..], Tag.sequence, tbs_content_len);
+    @memcpy(out[w..][0..prefix_len], tbs.value[0..prefix_len]);
+    w += prefix_len;
+    w += writeDerHeader(out[w..], Tag.context_3_constructed, exts_seq_total);
+    w += writeDerHeader(out[w..], Tag.sequence, new_exts_content_len);
+
+    var pass2 = try explicit.child(exts_seq);
+    while (pass2.hasRemaining()) {
+        const one_tlv = try pass2.readExpected(Tag.sequence);
+        var one = try pass2.child(one_tlv);
+        const oid_tlv = try one.readExpected(Tag.oid);
+        if (std.mem.eql(u8, oid_tlv.value, &sct_list_extension_oid)) continue;
+        @memcpy(out[w..][0..one_tlv.raw.len], one_tlv.raw);
+        w += one_tlv.raw.len;
+    }
+    return out[0..w];
+}
+
 fn parseInto(comptime CertType: type, cert: *CertType, der: []const u8) Error!void {
     if (der.len == 0) return error.EmptyInput;
     if (der.len > MaxDerLen) return error.Oversize;
@@ -1293,6 +1452,197 @@ test "findSctListExtension fails closed on malformed certificate DER" {
     // Well-formed outer SEQUENCE but the TBS is cut off before extensions.
     try std.testing.expectError(error.Truncated, findSctListExtension(&[_]u8{ 0x30, 0x02, 0x30, 0x00 }));
 }
+
+// -- Precert TBS reconstruction tests ---------------------------------------
+
+/// Append canonical minimal DER length octets for `len` (short form <128; else
+/// `0x80|n` + n big-endian magnitude octets) — the same encoding `writeDerHeader`
+/// emits, so an independently-built "expected" TBS is byte-comparable to the
+/// reconstruction across the 127/128 long-form boundary.
+fn appendDerLenTest(a: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) void {
+    if (len < 0x80) {
+        out.append(a, @intCast(len)) catch unreachable;
+        return;
+    }
+    var octets: usize = 0;
+    var n = len;
+    while (n != 0) : (n >>= 8) octets += 1;
+    out.append(a, 0x80 | @as(u8, @intCast(octets))) catch unreachable;
+    var i: usize = 0;
+    while (i < octets) : (i += 1) {
+        const shift: u6 = @intCast(8 * (octets - 1 - i));
+        out.append(a, @intCast((len >> shift) & 0xff)) catch unreachable;
+    }
+}
+
+/// Build one DER TLV (`tag` + canonical length + `value`) of any length.
+fn derTlvAny(a: std.mem.Allocator, tag: u8, value: []const u8) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.append(a, tag) catch unreachable;
+    appendDerLenTest(a, &out, value.len);
+    out.appendSlice(a, value) catch unreachable;
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// An `Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }`.
+fn buildExt(a: std.mem.Allocator, oid: []const u8, extn_value_content: []const u8) []u8 {
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, derTlvAny(a, Tag.oid, oid)) catch unreachable;
+    body.appendSlice(a, derTlvAny(a, Tag.octet_string, extn_value_content)) catch unreachable;
+    return derTlvAny(a, Tag.sequence, body.items);
+}
+
+/// The SCT-list extension carrying `tls_list` (extnValue = OCTET STRING wrapping
+/// an inner OCTET STRING wrapping the TLS list bytes).
+fn buildSctExt(a: std.mem.Allocator, tls_list: []const u8) []u8 {
+    const inner = derTlvAny(a, Tag.octet_string, tls_list);
+    return buildExt(a, &sct_list_extension_oid, inner);
+}
+
+/// A structurally valid TBSCertificate prefix (version[0], serial, signature,
+/// issuer, validity, subject, spki) — the fields `buildPrecertTbs` walks past
+/// and copies verbatim. Reused for both the leaf and the "expected" precert TBS.
+fn buildTbsPrefix(a: std.mem.Allocator) []u8 {
+    var out: std.ArrayList(u8) = .empty;
+    // version [0] EXPLICIT { INTEGER v3(2) }
+    out.appendSlice(a, derTlvAny(a, Tag.context_0_constructed, derTlvAny(a, Tag.integer, &[_]u8{0x02}))) catch unreachable;
+    out.appendSlice(a, derTlvAny(a, Tag.integer, &[_]u8{ 0x12, 0x34 })) catch unreachable; // serialNumber
+    out.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // signature
+    out.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // issuer
+    out.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // validity
+    out.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // subject
+    out.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // subjectPublicKeyInfo
+    return out.toOwnedSlice(a) catch unreachable;
+}
+
+/// Assemble a TBSCertificate from `prefix` and an ordered list of extension TLVs
+/// ([3] EXPLICIT { SEQUENCE OF Extension }).
+fn buildTbs(a: std.mem.Allocator, prefix: []const u8, exts: []const []const u8) []u8 {
+    var ext_content: std.ArrayList(u8) = .empty;
+    for (exts) |e| ext_content.appendSlice(a, e) catch unreachable;
+    const ext_seq = derTlvAny(a, Tag.sequence, ext_content.items);
+    const ext3 = derTlvAny(a, Tag.context_3_constructed, ext_seq);
+    var tbs_body: std.ArrayList(u8) = .empty;
+    tbs_body.appendSlice(a, prefix) catch unreachable;
+    tbs_body.appendSlice(a, ext3) catch unreachable;
+    return derTlvAny(a, Tag.sequence, tbs_body.items);
+}
+
+/// Wrap a TBSCertificate into a full `Certificate ::= SEQUENCE { tbs, sigAlg,
+/// sigValue }`. sigAlg/sigValue are placeholders; `buildPrecertTbs` ignores them.
+fn wrapCert(a: std.mem.Allocator, tbs: []const u8) []u8 {
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, tbs) catch unreachable;
+    body.appendSlice(a, derTlvAny(a, Tag.sequence, "")) catch unreachable; // signatureAlgorithm
+    body.appendSlice(a, derTlvAny(a, Tag.bit_string, &[_]u8{0x00})) catch unreachable; // signatureValue
+    return derTlvAny(a, Tag.sequence, body.items);
+}
+
+// basicConstraints (2.5.29.13 — a real extension OID validateOid accepts) and
+// keyUsage (2.5.29.15), used as the "other" extensions preserved verbatim.
+const oid_basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };
+const oid_key_usage = [_]u8{ 0x55, 0x1D, 0x0F };
+
+test "buildPrecertTbs reproduces the exact TBS with only the SCT extension removed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prefix = buildTbsPrefix(a);
+    const ext_bc = buildExt(a, &oid_basic_constraints, derTlvAny(a, Tag.sequence, ""));
+    const ext_ku = buildExt(a, &oid_key_usage, derTlvAny(a, Tag.bit_string, &[_]u8{ 0x01, 0x86 }));
+    const tls_list = [_]u8{ 0x00, 0x04, 0x00, 0x02, 0xAB, 0xCD };
+    const ext_sct = buildSctExt(a, &tls_list);
+
+    // SCT in the MIDDLE — proves surrounding extensions keep their order/bytes.
+    const leaf_tbs = buildTbs(a, prefix, &.{ ext_bc, ext_sct, ext_ku });
+    const expected_tbs = buildTbs(a, prefix, &.{ ext_bc, ext_ku });
+    const leaf_cert = wrapCert(a, leaf_tbs);
+
+    var out: [4096]u8 = undefined;
+    const got = try buildPrecertTbs(&out, leaf_cert);
+    try std.testing.expectEqualSlices(u8, expected_tbs, got);
+    // The reconstruction is always strictly smaller than the source TBS.
+    try std.testing.expect(got.len < leaf_tbs.len);
+}
+
+test "buildPrecertTbs strips the SCT whether first or last, preserving order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prefix = buildTbsPrefix(a);
+    const ext_bc = buildExt(a, &oid_basic_constraints, derTlvAny(a, Tag.sequence, ""));
+    const ext_ku = buildExt(a, &oid_key_usage, derTlvAny(a, Tag.bit_string, &[_]u8{0x03}));
+    const ext_sct = buildSctExt(a, &[_]u8{ 0x00, 0x02, 0x00, 0x00 });
+    const expected_tbs = buildTbs(a, prefix, &.{ ext_bc, ext_ku });
+
+    var out: [4096]u8 = undefined;
+    // SCT first.
+    const first = wrapCert(a, buildTbs(a, prefix, &.{ ext_sct, ext_bc, ext_ku }));
+    try std.testing.expectEqualSlices(u8, expected_tbs, try buildPrecertTbs(&out, first));
+    // SCT last.
+    var out2: [4096]u8 = undefined;
+    const last = wrapCert(a, buildTbs(a, prefix, &.{ ext_bc, ext_ku, ext_sct }));
+    try std.testing.expectEqualSlices(u8, expected_tbs, try buildPrecertTbs(&out2, last));
+}
+
+test "buildPrecertTbs re-encodes lengths across the long-form DER boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prefix = buildTbsPrefix(a);
+    // A large "other" extension so the Extensions SEQUENCE (and TBS) length use
+    // long-form (>127) both before and after removal — the length re-encoding is
+    // exercised, and the exact-byte match validates it.
+    const big_payload = try a.alloc(u8, 300);
+    @memset(big_payload, 0x5A);
+    const ext_big = buildExt(a, &oid_basic_constraints, big_payload);
+    const ext_sct = buildSctExt(a, &[_]u8{ 0x00, 0x08, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 });
+
+    const leaf_tbs = buildTbs(a, prefix, &.{ ext_big, ext_sct });
+    const expected_tbs = buildTbs(a, prefix, &.{ext_big});
+    const leaf_cert = wrapCert(a, leaf_tbs);
+
+    var out: [1024]u8 = undefined;
+    const got = try buildPrecertTbs(&out, leaf_cert);
+    try std.testing.expectEqualSlices(u8, expected_tbs, got);
+}
+
+test "buildPrecertTbs errors when the certificate carries no SCT extension" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prefix = buildTbsPrefix(a);
+    const ext_bc = buildExt(a, &oid_basic_constraints, derTlvAny(a, Tag.sequence, ""));
+    const cert = wrapCert(a, buildTbs(a, prefix, &.{ext_bc}));
+
+    var out: [1024]u8 = undefined;
+    try std.testing.expectError(error.MissingField, buildPrecertTbs(&out, cert));
+}
+
+test "buildPrecertTbs reports OutputTooSmall and fails closed on malformed DER" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prefix = buildTbsPrefix(a);
+    const ext_sct = buildSctExt(a, &[_]u8{ 0x00, 0x02, 0x00, 0x00 });
+    const cert = wrapCert(a, buildTbs(a, prefix, &.{ext_sct}));
+
+    // A 4-byte output cannot hold even the TBS header.
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, buildPrecertTbs(&tiny, cert));
+
+    // Malformed inputs fail closed rather than reading past the slice.
+    var out: [256]u8 = undefined;
+    try std.testing.expectError(error.EmptyInput, buildPrecertTbs(&out, ""));
+    try std.testing.expectError(error.Truncated, buildPrecertTbs(&out, &[_]u8{0x30}));
+    try std.testing.expectError(error.Truncated, buildPrecertTbs(&out, &[_]u8{ 0x30, 0x02, 0x30, 0x00 }));
+}
+
 pub const MaxCrlDistributionPointUrls = 8;
 
 /// URLs extracted from a certificate's cRLDistributionPoints extension. The
