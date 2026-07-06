@@ -41,6 +41,8 @@ pub const sframe = @import("sframe.zig");
 pub const shamir = @import("shamir.zig");
 pub const sign_kat = @import("sign_kat.zig");
 pub const sign = @import("sign.zig");
+pub const slh_dsa_kat = @import("slh_dsa_kat.zig");
+pub const slh_dsa = @import("slh_dsa.zig");
 pub const tls12_client = @import("tls12_client.zig");
 pub const tls12_server = @import("tls12_server.zig");
 pub const tls12 = @import("tls12.zig");
@@ -107,6 +109,8 @@ test {
     _ = shamir;
     _ = sign_kat;
     _ = sign;
+    _ = slh_dsa_kat;
+    _ = slh_dsa;
     _ = tls12_client;
     _ = tls12_server;
     _ = tls12;

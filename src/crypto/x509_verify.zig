@@ -36,6 +36,7 @@ const rsa_verify = @import("rsa_verify.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const ed25519 = @import("sign.zig");
 const ml_dsa = @import("ml_dsa.zig");
+const slh_dsa = @import("slh_dsa.zig");
 
 /// std ECDSA over P-384 with SHA-384. Used only for the ecdsa-with-SHA384 chain
 /// branch, whose P-384 issuer key is parsed straight from the SPKI (see
@@ -88,6 +89,11 @@ const SigOid = struct {
     /// signatureAlgorithm carries an absent parameters field
     /// (draft-ietf-lamps-dilithium-certificates).
     const ml_dsa_65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+    /// id-slh-dsa-sha2-128s (2.16.840.1.101.3.4.3.20). Like ML-DSA, this OID
+    /// names no hash/params — SLH-DSA signs the message directly and the
+    /// certificate's signatureAlgorithm carries an absent parameters field
+    /// (draft-ietf-lamps-x509-slhdsa).
+    const slh_dsa_sha2_128s = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x14 };
 };
 
 pub const LinkInfo = struct {
@@ -338,6 +344,14 @@ pub fn verifyCertSignature(
     if (std.mem.eql(u8, sig_alg_oid, &SigOid.ml_dsa_65)) {
         const pk = try x509.extractMlDsa65PublicKey(issuer_spki);
         if (!ml_dsa.verify65(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
+        return;
+    }
+    // SLH-DSA-SHA2-128s: same PQ raw-key shape as ML-DSA, KAT-verified against
+    // independent NIST ACVP FIPS 205 sigVer vectors. Empty context for X.509
+    // certificate signatures (draft-ietf-lamps-x509-slhdsa).
+    if (std.mem.eql(u8, sig_alg_oid, &SigOid.slh_dsa_sha2_128s)) {
+        const pk = try x509.extractSlhDsaSha2_128sPublicKey(issuer_spki);
+        if (!slh_dsa.verify(pk, cert_tbs, &.{}, sig_value)) return error.BadSignature;
         return;
     }
     // ecdsa-with-SHA384 verifies under a P-384 issuer key, which the shared
