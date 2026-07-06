@@ -173,6 +173,17 @@ pub const Config = struct {
     /// unmatched SNI falls back to the default cert. Empty ⇒ SNI is not consulted
     /// and the handshake is byte-identical to before.
     sni_certs: []const SniCert = &.{},
+    /// RFC 7250: when true, and a client offers `server_certificate_type`
+    /// including RawPublicKey, the server negotiates RawPublicKey — it echoes the
+    /// selection in EncryptedExtensions and sends a Certificate message whose one
+    /// CertificateEntry `cert_data` is the active leaf's bare SubjectPublicKeyInfo
+    /// (no chain, no CA path). CertificateVerify is still signed with the same
+    /// leaf key, so a client that has pinned/TOFU'd the key verifies possession.
+    /// A client that does not offer the extension (or this flag off) gets the
+    /// classic X.509 chain, byte-identical to before. Only ever affects the server
+    /// certificate; `client_certificate_type` (raw-key client certs) is not
+    /// negotiated. Default false ⇒ the extension is never negotiated.
+    enable_raw_public_key: bool = false,
 };
 
 /// One SNI-selectable certificate (see `Config.sni_certs`). The signing-key
@@ -442,6 +453,13 @@ pub const Server = struct {
     /// `config.enable_cert_compression`). Null ⇒ send a plain Certificate.
     /// Re-derived per ClientHello (so a HelloRetryRequest re-reads it).
     cert_compression: ?cert_compression.Algorithm = null,
+    /// RFC 7250: RawPublicKey was negotiated for the server certificate — the
+    /// client offered `server_certificate_type` including RawPublicKey and
+    /// `config.enable_raw_public_key` is set. When true (and not a resumption),
+    /// EncryptedExtensions echoes the selection and `writeCertificate` sends a
+    /// bare SubjectPublicKeyInfo instead of the X.509 chain. Re-derived per
+    /// ClientHello (a HelloRetryRequest re-reads the offer). False ⇒ X.509.
+    server_cert_type_rpk: bool = false,
     /// Index into `config.sni_certs` selected by the ClientHello's server_name,
     /// or null for the default top-level cert. Pinned on ClientHello1 and NOT
     /// re-derived on ClientHello2 (a HelloRetryRequest must not change the cert).
@@ -1158,6 +1176,7 @@ pub const Server = struct {
         var hybrid_share: ?[]const u8 = null; // X25519MLKEM768 (post-quantum)
         var offered_groups: ?[]const u8 = null; // supported_groups body (for HRR)
         var offered_cert_compression: ?cert_compression.Algorithm = null; // RFC 8879
+        var offered_rpk = false; // RFC 7250: client will accept a RawPublicKey server cert
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
@@ -1186,6 +1205,20 @@ pub const Server = struct {
                     // RFC 8879: remember the first algorithm we can produce (zlib).
                     offered_cert_compression = cert_compression.pickSupported(ext.data);
                 },
+                .server_certificate_type => if (self.config.enable_raw_public_key) {
+                    // RFC 7250: the client offers a `CertificateType types<1..2^8-1>`
+                    // list it will accept for the SERVER certificate. Negotiate
+                    // RawPublicKey iff the client listed it. A malformed list is a
+                    // protocol violation (like record_size_limit) and is fatal — but
+                    // only ever parsed when the server is configured for RPK, so a
+                    // default (RPK-off) server never rejects on this.
+                    var types_buf: [std.math.maxInt(u8)]tls_extension.CertificateType = undefined;
+                    const types = tls_extension.parseCertTypeList(ext.data, &types_buf) catch
+                        return error.BadHandshake;
+                    for (types) |t| if (t == .raw_public_key) {
+                        offered_rpk = true;
+                    };
+                },
                 .record_size_limit => {
                     // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
                     if (ext.data.len != 2) return error.BadHandshake;
@@ -1209,6 +1242,7 @@ pub const Server = struct {
         if (!offered_tls13) return error.ProtocolVersion;
         self.selected_suite = full_suite;
         self.cert_compression = offered_cert_compression;
+        self.server_cert_type_rpk = offered_rpk;
         // SNI (RFC 6066): pin the cert on ClientHello1. On ClientHello2 the SNI
         // MUST be unchanged (RFC 8446 §4.1.2 — it is not among the fields a client
         // may alter across a HelloRetryRequest), so verify CH2's host_name digest
@@ -1472,6 +1506,15 @@ pub const Server = struct {
             try alpn_builder.add(proto);
             try ext_builder.addTyped(.alpn, try alpn_builder.finish());
         }
+        // RFC 7250: echo the negotiated server_certificate_type (single selected
+        // value) only when we will actually present a RawPublicKey Certificate —
+        // never on a resumption (no Certificate is sent then).
+        if (self.server_cert_type_rpk and !self.resumed) {
+            try ext_builder.addTyped(
+                .server_certificate_type,
+                &[_]u8{tls_extension.CertificateType.raw_public_key.toInt()},
+            );
+        }
         if (self.early_data_accepted) try ext_builder.addTyped(.early_data, "");
         // RFC 8449: advertise the max TLSInnerPlaintext we accept (full-size
         // records — our recv path handles them). Enforcement of the PEER's limit
@@ -1561,6 +1604,11 @@ pub const Server = struct {
     }
 
     fn writeCertificate(self: *Server, out: *std.ArrayList(u8)) Error!void {
+        // RFC 7250: when RawPublicKey was negotiated, present a bare SPKI instead
+        // of the X.509 chain. Split out so the classic path below stays exactly as
+        // it was (byte-identical when RPK is off / not negotiated).
+        if (self.server_cert_type_rpk) return self.writeRawPublicKeyCertificate(out);
+
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
         try body.append(self.allocator, 0); // certificate_request_context = empty
@@ -1611,6 +1659,35 @@ pub const Server = struct {
                 return;
             }
         }
+        try self.emit(out, .certificate, body.items);
+    }
+
+    /// RFC 7250 §3 + RFC 8446 §4.4.2: a Certificate message carrying a bare
+    /// SubjectPublicKeyInfo in place of an X.509 chain — one CertificateEntry
+    /// whose `cert_data` is the active leaf's SPKI, with no chain, no per-cert
+    /// extensions, and no OCSP staple (there is no chain to staple). Reached only
+    /// when RawPublicKey was negotiated (`server_cert_type_rpk`); the client
+    /// verifies CertificateVerify against this SPKI's key. The SPKI is the full
+    /// `SubjectPublicKeyInfo` SEQUENCE from the leaf certificate — the same bytes
+    /// hashed for CertFP — so the signing key (unchanged) matches it.
+    fn writeRawPublicKeyCertificate(self: *Server, out: *std.ArrayList(u8)) Error!void {
+        const leaf = self.activeCertChain()[0];
+        const spki = (x509.parse(leaf) catch return error.NoCertificate).spki_der;
+        if (spki.len == 0) return error.NoCertificate;
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try body.append(self.allocator, 0); // certificate_request_context = empty
+
+        // certificate_list<0..2^24-1>: exactly one entry, whose cert_data is the
+        // SPKI and whose per-cert extensions are empty.
+        // entry = cert_data_len(u24) ‖ SPKI ‖ ext_len(u16)=0.
+        const entry_len: usize = 3 + spki.len + 2;
+        try appendU24(self.allocator, &body, entry_len);
+        try appendU24(self.allocator, &body, spki.len);
+        try body.appendSlice(self.allocator, spki);
+        try appendU16(self.allocator, &body, 0); // per-cert extensions = empty
+
         try self.emit(out, .certificate, body.items);
     }
 
@@ -3903,6 +3980,262 @@ test "loopback: RFC 8879 cert compression — server sends CompressedCertificate
     const got = try client.decrypt(s2c);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("compressed cert ok", got);
+}
+
+/// Drive a full RFC 7250 loopback (both sides orochi): the client offers
+/// RawPublicKey, the server (with `enable_raw_public_key`) presents a bare SPKI,
+/// and application data round-trips both ways. `cfg` supplies the server's leaf
+/// chain + signing key. Returns nothing — a green run IS the proof that the
+/// client parsed a bare SubjectPublicKeyInfo (no chain, no trust anchors) and
+/// verified the server CertificateVerify against that key.
+fn runRawPublicKeyLoopback(alloc: std.mem.Allocator, cfg: Config) !void {
+    const tls_client = @import("tls_client.zig");
+    try std.testing.expect(cfg.enable_raw_public_key);
+    var server = try Server.init(alloc, cfg);
+    defer server.deinit();
+    // A raw key has no chain, so no trust anchors are consulted (RFC 7250 is
+    // TOFU/pinning) — pass an empty set. The completed handshake + a
+    // CertificateVerify over the presented SPKI's key IS the possession proof.
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{},
+        .offer_raw_public_key = true,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    // Server negotiated RawPublicKey (client offered it + server configured).
+    if (!server.server_cert_type_rpk) return error.TestUnexpectedResult;
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    if (!client.handshakeDone()) return error.TestUnexpectedResult;
+    // The client accepted a bare SPKI and recorded the negotiated selection.
+    if (client.server_cert_type != .raw_public_key) return error.TestUnexpectedResult;
+    _ = try server.feed(cfin);
+    if (!server.handshakeDone()) return error.TestUnexpectedResult;
+
+    const s2c = try server.encrypt("raw key ok");
+    defer alloc.free(s2c);
+    const got = try client.decrypt(s2c);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("raw key ok", got);
+
+    const c2s = try client.encrypt("client hi");
+    defer alloc.free(c2s);
+    const got2 = try server.decrypt(c2s);
+    defer alloc.free(got2);
+    try std.testing.expectEqualStrings("client hi", got2);
+}
+
+test "loopback: RFC 7250 raw public key — server presents a bare SPKI, client accepts (Ed25519)" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3a)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3a, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    try runRawPublicKeyLoopback(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_raw_public_key = true,
+    });
+}
+
+test "loopback: RFC 7250 raw public key — ECDSA-P256 leaf SPKI matches the ECDSA signing key" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3b, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    try runRawPublicKeyLoopback(alloc, .{
+        .cert_chain = &.{der},
+        .ecdsa_p256_signing_key = kp,
+        .enable_raw_public_key = true,
+    });
+}
+
+test "loopback: RFC 7250 raw public key — RSA-2048 leaf SPKI, CertificateVerify is RSA-PSS" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const rsa_key = rsaTestPrivateKey();
+    var cert_buf: [2048]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedRsa(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3e, 0x01 },
+        .public_modulus = rsa_key.n,
+        .public_exponent = rsa_key.e,
+        .private_key = rsa_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    try runRawPublicKeyLoopback(alloc, .{
+        .cert_chain = &.{der},
+        .rsa_signing_key = rsa_key,
+        .enable_raw_public_key = true,
+    });
+}
+
+test "RFC 7250 default-off: EncryptedExtensions + X.509 Certificate stay byte-identical" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3c)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3c, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    const emit = struct {
+        fn ee(server: *Server, a: std.mem.Allocator) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            try server.writeEncryptedExtensions(&out);
+            return out.toOwnedSlice(a);
+        }
+        fn cert(server: *Server, a: std.mem.Allocator) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            try server.writeCertificate(&out);
+            return out.toOwnedSlice(a);
+        }
+    };
+
+    // Reference: the feature does not exist for this server.
+    var ref = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer ref.deinit();
+    // Feature compiled ON but NOT negotiated (client offered nothing, or offered
+    // no RawPublicKey ⇒ server_cert_type_rpk stays false). Must be byte-identical.
+    var feat = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_raw_public_key = true });
+    defer feat.deinit();
+    try std.testing.expect(!feat.server_cert_type_rpk);
+
+    const ref_ee = try emit.ee(&ref, alloc);
+    defer alloc.free(ref_ee);
+    const feat_ee = try emit.ee(&feat, alloc);
+    defer alloc.free(feat_ee);
+    try std.testing.expectEqualSlices(u8, ref_ee, feat_ee);
+
+    const ref_cert = try emit.cert(&ref, alloc);
+    defer alloc.free(ref_cert);
+    const feat_cert = try emit.cert(&feat, alloc);
+    defer alloc.free(feat_cert);
+    try std.testing.expectEqualSlices(u8, ref_cert, feat_cert);
+
+    // And the X.509 Certificate still carries the full leaf DER (not a bare SPKI):
+    // handshake type(1)+len(3), ctx_len(1)=0, cert_list_len(3), cert_len(3)+DER.
+    var p: usize = 4 + 1 + 3;
+    const cert_len = (@as(usize, feat_cert[p]) << 16) | (@as(usize, feat_cert[p + 1]) << 8) | feat_cert[p + 2];
+    p += 3;
+    try std.testing.expectEqualSlices(u8, der, feat_cert[p .. p + cert_len]);
+
+    // No server_certificate_type (type 20) extension appears in EncryptedExtensions.
+    try std.testing.expect(!eeHasExtension(feat_ee, tls_extension.ExtensionType.server_certificate_type.toInt()));
+}
+
+test "RFC 7250 negotiated: EncryptedExtensions echoes server_certificate_type and the Certificate is a bare SPKI" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3d)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3d, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const expected_spki = (try x509.parse(der)).spki_der;
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_raw_public_key = true });
+    defer server.deinit();
+    server.server_cert_type_rpk = true; // as processClientHello would set on a RawPublicKey offer
+
+    // EncryptedExtensions carries exactly one server_certificate_type extension
+    // whose single-byte body is RawPublicKey(2).
+    var ee: std.ArrayList(u8) = .empty;
+    try server.writeEncryptedExtensions(&ee);
+    const ee_bytes = try ee.toOwnedSlice(alloc);
+    defer alloc.free(ee_bytes);
+    // handshake type(1)+len(3), then extensions vector (u16 len prefix + body).
+    const ext_body = ee_bytes[4 + 2 ..];
+    var it = tls_extension.Iterator.init(ext_body);
+    var saw: ?[]const u8 = null;
+    while (try it.next()) |ext| {
+        if (ext.typed() == .server_certificate_type) saw = ext.data;
+    }
+    try std.testing.expect(saw != null);
+    try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, try tls_extension.parseSelectedCertType(saw.?));
+
+    // The Certificate message is a single CertificateEntry whose cert_data is the
+    // leaf's bare SPKI, with empty per-cert extensions and nothing after it.
+    var cert: std.ArrayList(u8) = .empty;
+    try server.writeCertificate(&cert);
+    const m = try cert.toOwnedSlice(alloc);
+    defer alloc.free(m);
+    var p: usize = 4; // skip handshake type(1)+len(3)
+    try std.testing.expectEqual(@as(u8, 0), m[p]); // certificate_request_context = empty
+    p += 1;
+    const list_len = (@as(usize, m[p]) << 16) | (@as(usize, m[p + 1]) << 8) | m[p + 2];
+    p += 3;
+    try std.testing.expectEqual(m.len - p, list_len); // list spans the rest exactly
+    const spki_len = (@as(usize, m[p]) << 16) | (@as(usize, m[p + 1]) << 8) | m[p + 2];
+    p += 3;
+    try std.testing.expectEqualSlices(u8, expected_spki, m[p .. p + spki_len]);
+    p += spki_len;
+    const ext_len = (@as(usize, m[p]) << 8) | m[p + 1];
+    try std.testing.expectEqual(@as(usize, 0), ext_len); // no per-cert extensions
+    try std.testing.expectEqual(m.len, p + 2); // exactly one entry, nothing after
+}
+
+/// Scan an EncryptedExtensions handshake message (`ee_bytes`, type(1)+len(3) then
+/// the u16-prefixed extensions vector) for an extension of `ext_type`.
+fn eeHasExtension(ee_bytes: []const u8, ext_type: u16) bool {
+    if (ee_bytes.len < 6) return false;
+    var it = tls_extension.Iterator.init(ee_bytes[4 + 2 ..]);
+    while (it.next() catch return false) |ext| {
+        if (ext.ext_type == ext_type) return true;
+    }
+    return false;
 }
 
 test "serverNameMatches: exact, case-insensitive, and single-label wildcard" {
