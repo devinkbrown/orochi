@@ -295,6 +295,136 @@ pub fn attachRx(fd: linux.fd_t, crypto_info: []const u8) AttachError!void {
     if (posix.errno(rc) != .SUCCESS) return error.KtlsRxUnsupported;
 }
 
+// ── Control-record demux (recvmsg + TLS_GET_RECORD_TYPE cmsg) ────────────────
+//
+// On a kTLS-RX-offloaded socket the kernel decrypts inbound records and a plain
+// `recv()` returns *application_data* plaintext. A kernel-decrypted TLS *control*
+// record (KeyUpdate / close_notify) cannot be conveyed by a plain `recv()` — the
+// content type has nowhere to go — so the kernel rejects it with `EIO`. The record
+// stays queued; a `recvmsg()` that supplies a `SOL_TLS` control buffer then both
+// delivers the record's (decrypted) payload AND reports its TLS content type out
+// of band via a `TLS_GET_RECORD_TYPE` control message. This is the recv path an
+// offloaded conn must use to demux control records instead of dropping.
+
+/// `SOL_TLS` cmsg types (Linux UAPI `include/uapi/linux/tls.h`). `TLS_GET_RECORD_TYPE`
+/// is the ancillary message the kernel attaches to a `recvmsg` carrying a record's
+/// 1-byte TLS content type; `TLS_SET_RECORD_TYPE` is its TX twin (unused — the
+/// daemon never emits control records over kTLS).
+pub const TLS_SET_RECORD_TYPE: u32 = 1;
+pub const TLS_GET_RECORD_TYPE: u32 = 2;
+
+/// TLS record content types (RFC 8446 §5.1) — the byte the kernel places in the
+/// `TLS_GET_RECORD_TYPE` cmsg. `application_data` is the fast-path type a plain
+/// `recv` returns; the rest are control records surfaced only via `recvmsg`.
+pub const RecordType = enum(u8) {
+    change_cipher_spec = 20,
+    alert = 21,
+    handshake = 22,
+    application_data = 23,
+    _,
+};
+
+/// TLS alert description for an orderly shutdown (RFC 8446 §6.1) — the payload of
+/// a benign `alert` control record.
+pub const alert_close_notify: u8 = 0;
+
+/// The daemon runs LP64 only (x86_64 / aarch64), so `CMSG_ALIGN` rounds to 8.
+const cmsg_align_to: usize = @sizeOf(usize);
+inline fn cmsgAlign(n: usize) usize {
+    return (n + cmsg_align_to - 1) & ~(cmsg_align_to - 1);
+}
+/// `sizeof(struct cmsghdr)` — the fixed `{len,level,type}` ancillary header.
+pub const cmsg_hdr_len: usize = @sizeOf(linux.cmsghdr);
+/// `CMSG_SPACE(1)`: the control buffer size for one single-byte
+/// `TLS_GET_RECORD_TYPE` cmsg (aligned header + one aligned data byte).
+pub const cmsg_space_record_type: usize = cmsgAlign(cmsg_hdr_len) + cmsgAlign(1);
+
+pub const RecvError = error{
+    /// No record is immediately available (`EAGAIN`/`EWOULDBLOCK`) — only when the
+    /// caller passed `MSG.DONTWAIT`.
+    WouldBlock,
+    /// The peer closed the TCP connection (`recvmsg` returned 0).
+    Eof,
+    /// The kernel cannot decrypt the next record with the installed RX key: a
+    /// KeyUpdate rotated the peer's send key and the RX `crypto_info` was not
+    /// re-installed (`EKEYEXPIRED`). Distinct from a hard error so the caller can
+    /// tell "needs rekey" from a genuine fault.
+    NeedsRekey,
+    /// `recvmsg` failed for any other reason (a real socket error).
+    RecvFailed,
+};
+
+/// One record read off a kTLS-RX socket: the kernel-decrypted `plaintext` (a
+/// prefix of the caller's buffer) plus the TLS content `record_type` the kernel
+/// reported out of band.
+pub const RecordRead = struct {
+    record_type: u8,
+    plaintext: []u8,
+};
+
+/// Extract the first `SOL_TLS` / `TLS_GET_RECORD_TYPE` cmsg's 1-byte content type
+/// from a completed `recvmsg`'s control buffer. Returns null when no such cmsg is
+/// present (⇒ the caller treats the read as application_data, matching a plain
+/// recv) or the control data was truncated (`MSG_CTRUNC`, fail-safe). Walks the
+/// ancillary buffer with the standard `CMSG_*` geometry rather than trusting a
+/// fixed offset, so an unexpected extra cmsg cannot desync the parse.
+fn parseRecordTypeCmsg(msg: *const linux.msghdr) ?u8 {
+    if (msg.flags & linux.MSG.CTRUNC != 0) return null;
+    const control = msg.control orelse return null;
+    const control_len = msg.controllen;
+    const base: [*]const u8 = @ptrCast(control);
+    var off: usize = 0;
+    while (off + cmsg_hdr_len <= control_len) {
+        const hdr: *align(cmsg_align_to) const linux.cmsghdr = @ptrCast(@alignCast(base + off));
+        const clen = hdr.len;
+        if (clen < cmsg_hdr_len or off + clen > control_len) break;
+        if (hdr.level == @as(i32, @intCast(SOL_TLS)) and hdr.type == @as(i32, @intCast(TLS_GET_RECORD_TYPE))) {
+            const data_off = off + cmsgAlign(cmsg_hdr_len);
+            if (data_off < control_len) return base[data_off];
+        }
+        const step = cmsgAlign(clen);
+        if (step == 0) break;
+        off += step;
+    }
+    return null;
+}
+
+/// Do one `recvmsg(fd)` that also reads the out-of-band TLS record content type
+/// from a `TLS_GET_RECORD_TYPE` control message. Application-data records land in
+/// `buf` exactly as a plain `recv` would return them (`record_type` =
+/// application_data(23), whether or not the kernel attached a cmsg); a *control*
+/// record that a plain `recv` rejects with `EIO` is delivered here with its true
+/// `record_type` (handshake(22) for a KeyUpdate, alert(21) for close_notify).
+/// `flags` should include `MSG.DONTWAIT` on the non-blocking reactor path.
+pub fn recvmsgRecordType(fd: linux.fd_t, buf: []u8, flags: u32) RecvError!RecordRead {
+    var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
+    var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    while (true) {
+        var msg = linux.msghdr{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &cbuf,
+            .controllen = cbuf.len,
+            .flags = 0,
+        };
+        const rc = linux.recvmsg(fd, &msg, flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return error.Eof;
+                const rt = parseRecordTypeCmsg(&msg) orelse @intFromEnum(RecordType.application_data);
+                return .{ .record_type = rt, .plaintext = buf[0..n] };
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .KEYEXPIRED => return error.NeedsRekey,
+            else => return error.RecvFailed,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -416,6 +546,60 @@ test "ulpAvailable matches the tls ULP token exactly" {
     try testing.expect(!ulpAvailable(""));
     // Whole-token match only — no substring false positives.
     try testing.expect(!ulpAvailable("tlsx notls\n"));
+}
+
+test "parseRecordTypeCmsg reads the TLS_GET_RECORD_TYPE content byte" {
+    // Hand-build the exact control-buffer shape the kernel writes for one
+    // TLS_GET_RECORD_TYPE cmsg: a cmsghdr {CMSG_LEN(1), SOL_TLS, TLS_GET_RECORD_TYPE}
+    // followed (after CMSG_ALIGN(sizeof cmsghdr)) by a single content-type byte.
+    var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const hdr: *linux.cmsghdr = @ptrCast(@alignCast(&cbuf));
+    const cmsg_len = cmsgAlign(cmsg_hdr_len) + 1; // CMSG_LEN(1)
+    hdr.len = cmsg_len;
+    hdr.level = @intCast(SOL_TLS);
+    hdr.type = @intCast(TLS_GET_RECORD_TYPE);
+    cbuf[cmsgAlign(cmsg_hdr_len)] = @intFromEnum(RecordType.handshake);
+
+    var iov = [_]posix.iovec{.{ .base = undefined, .len = 0 }};
+    var msg = linux.msghdr{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = &cbuf,
+        .controllen = cmsg_len,
+        .flags = 0,
+    };
+    // The handshake(22) content type is parsed out of the ancillary data.
+    try testing.expectEqual(@as(?u8, @intFromEnum(RecordType.handshake)), parseRecordTypeCmsg(&msg));
+
+    // No control data ⇒ null (the caller then treats the read as application_data,
+    // matching a plain recv of app plaintext).
+    msg.controllen = 0;
+    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+
+    // A truncated cmsg (MSG_CTRUNC) ⇒ null, fail-safe (never trust a partial type).
+    msg.controllen = cmsg_len;
+    msg.flags = linux.MSG.CTRUNC;
+    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+
+    // A cmsg for a different (level,type) is ignored ⇒ null.
+    msg.flags = 0;
+    hdr.type = @intCast(TLS_SET_RECORD_TYPE);
+    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+}
+
+test "cmsg geometry matches the LP64 CMSG_* macros" {
+    // sizeof(struct cmsghdr) == 16, CMSG_ALIGN rounds to 8, CMSG_SPACE(1) == 24.
+    try testing.expectEqual(@as(usize, 16), cmsg_hdr_len);
+    try testing.expectEqual(@as(usize, 16), cmsgAlign(cmsg_hdr_len));
+    try testing.expectEqual(@as(usize, 24), cmsg_space_record_type);
+    try testing.expectEqual(@as(usize, 8), cmsgAlign(1));
+    try testing.expectEqual(@as(u32, 2), TLS_GET_RECORD_TYPE);
+    // The content-type registry values the kernel reports in the cmsg.
+    try testing.expectEqual(@as(u8, 21), @intFromEnum(RecordType.alert));
+    try testing.expectEqual(@as(u8, 22), @intFromEnum(RecordType.handshake));
+    try testing.expectEqual(@as(u8, 23), @intFromEnum(RecordType.application_data));
 }
 
 /// Establish an ESTABLISHED loopback TCP pair, attach the TLS ULP to the server

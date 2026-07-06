@@ -503,6 +503,73 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
     list.shrinkRetainingCapacity(remain);
 }
 
+// ── kTLS RX control-record demux ─────────────────────────────────────────────
+//
+// Once a conn is kTLS-RX-offloaded the kernel returns application_data plaintext
+// from a plain `recv`, but a kernel-decrypted *control* record (KeyUpdate /
+// close_notify) can only be conveyed via `recvmsg` + a `TLS_GET_RECORD_TYPE`
+// cmsg — a plain `recv` rejects it with `EIO`. The daemon's recv loop, on that
+// error, calls `drainKtlsRxControl` to read the record's content type out of band
+// and act on it WITHOUT dropping the connection for a benign KeyUpdate.
+
+/// The typed outcome of demuxing one record off a kTLS-RX-offloaded socket. The
+/// daemon maps each variant to a recv-loop action (feed / consume+continue /
+/// close) so a control record never reaches the IRC parser and a KeyUpdate never
+/// triggers a spurious drop.
+pub const KtlsRxRecord = union(enum) {
+    /// Kernel-decrypted application bytes (a prefix of the passed buffer) — feed to
+    /// the IRC/WS layer exactly as the plain-recv fast path does.
+    app_data: []u8,
+    /// A TLS 1.3 post-handshake handshake record — a client KeyUpdate. The kernel
+    /// consumed it; the conn continues, no drop. Caveat (see `enableKtlsRx`): a
+    /// KeyUpdate rotates the peer's send key, so the kernel needs the RX
+    /// `crypto_info` re-installed (a second `setsockopt(TLS_RX)` from the advanced
+    /// read keys) to keep decrypting *subsequent* app data. Until that
+    /// continuation lands, a post-KeyUpdate app record surfaces as `.needs_rekey`.
+    key_update,
+    /// A close_notify (or any) alert record — close the conn gracefully.
+    close_notify,
+    /// TCP EOF — the peer closed the socket.
+    eof,
+    /// Nothing more is queued right now (EAGAIN) — re-arm recv and wait.
+    would_block,
+    /// The kernel needs a fresh RX key before it can decrypt the next record
+    /// (post-KeyUpdate app data; EKEYEXPIRED). A distinct, non-fault close reason.
+    needs_rekey,
+    /// An unexpected record type or a genuine recv fault — close fail-safe.
+    fault,
+};
+
+/// Pure classifier: map a demuxed TLS content type to the recv-loop action. Split
+/// out from `drainKtlsRxControl` so the policy (handshake ⇒ consume, alert ⇒
+/// close, unexpected ⇒ fail-safe close) is unit-testable without a live socket.
+fn classifyKtlsRecord(record_type: u8, plaintext: []u8) KtlsRxRecord {
+    return switch (record_type) {
+        @intFromEnum(ktls.RecordType.application_data) => .{ .app_data = plaintext },
+        @intFromEnum(ktls.RecordType.handshake) => .key_update,
+        @intFromEnum(ktls.RecordType.alert) => .close_notify,
+        // change_cipher_spec (a legal no-op mid-handshake) has no business after
+        // the handshake on a kTLS conn, and any other type is unknown — fail-safe.
+        else => .fault,
+    };
+}
+
+/// Demux ONE record from a kTLS-RX-offloaded socket `fd` via `recvmsg` + the
+/// `TLS_GET_RECORD_TYPE` cmsg, returning the typed action for the daemon's recv
+/// loop. `buf` receives kernel-decrypted plaintext for an application-data
+/// record. `flags` is forwarded to `recvmsg` (the reactor passes `MSG.DONTWAIT`
+/// so a spurious wakeup never blocks the loop). This is the offloaded-conn recv
+/// path that replaces "a control record ⇒ drop the conn".
+pub fn drainKtlsRxControl(fd: linux.fd_t, buf: []u8, flags: u32) KtlsRxRecord {
+    const rr = ktls.recvmsgRecordType(fd, buf, flags) catch |err| return switch (err) {
+        error.WouldBlock => .would_block,
+        error.Eof => .eof,
+        error.NeedsRekey => .needs_rekey,
+        error.RecvFailed => .fault,
+    };
+    return classifyKtlsRecord(rr.record_type, rr.plaintext);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -748,27 +815,89 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     // recv() returns the KERNEL-DECRYPTED plaintext (not a TLS record).
     try std.testing.expectEqualStrings(msg, buf[0..n]);
 
-    // Control-record behavior (the recv-path decision-maker for RX offload): the
-    // client emits a KeyUpdate — a TLS 1.3 *control* record. The kernel decrypts
-    // it but MUST NOT hand it to a plain recv() as application data. Confirm recv()
-    // signals it distinctly (an error, typically EIO) so the daemon's recv-error
-    // path closes/handles the conn rather than feeding a control record to the IRC
-    // parser. This is why the RX recv-path can treat control records as a drop.
+    // ── Control-record demux via recvmsg + TLS_GET_RECORD_TYPE cmsg ─────────
+    // The client emits a KeyUpdate — a TLS 1.3 *control* record (inner
+    // content_type = handshake(22)). A plain recv() cannot convey a record type,
+    // so it rejects the control record with an error (EIO) — the pre-demux
+    // behavior that forced a drop — while leaving the decrypted record queued for
+    // a recvmsg that supplies a SOL_TLS control buffer.
     try client.sendKeyUpdateForTest();
     const ku = (try client.takePendingSend()) orelse return error.TestUnexpectedResult;
     defer alloc.free(ku);
-    var ko: usize = 0;
-    while (ko < ku.len) {
-        const w = linux.write(client_fd, ku[ko..].ptr, ku.len - ko);
-        if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
-        ko += @intCast(w);
+    {
+        var ko: usize = 0;
+        while (ko < ku.len) {
+            const w = linux.write(client_fd, ku[ko..].ptr, ku.len - ko);
+            if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+            ko += @intCast(w);
+        }
     }
-    var cbuf: [256]u8 = undefined;
-    const cr = linux.read(server_fd, &cbuf, cbuf.len);
-    // The safe invariant: a control record is never delivered as app-data
-    // plaintext. recv() returns an error (kTLS surfaces non-data records only via
-    // recvmsg + cmsg), so the byte stream is not corrupted.
-    try std.testing.expect(posix.errno(cr) != .SUCCESS);
+
+    // Pre-demux: a plain recv() still fails on the control record (kTLS surfaces
+    // non-data records only via recvmsg + cmsg), leaving it queued.
+    var throwaway: [256]u8 = undefined;
+    try std.testing.expect(posix.errno(linux.read(server_fd, &throwaway, throwaway.len)) != .SUCCESS);
+
+    // THE CRUX: recvmsg + the TLS_GET_RECORD_TYPE cmsg recover the record's content
+    // type out of band — handshake(22), NOT application_data(23). So the daemon can
+    // identify the KeyUpdate instead of feeding a control record to the IRC parser.
+    var demux_buf: [256]u8 = undefined;
+    const rr2 = try ktls.recvmsgRecordType(server_fd, &demux_buf, 0);
+    // Observed on this kernel (7.0.3): record_type=22 (handshake), n=5 (the
+    // KeyUpdate handshake message: 4-byte header + 1-byte update_request).
+    try std.testing.expectEqual(@intFromEnum(ktls.RecordType.handshake), rr2.record_type);
+    try std.testing.expect(rr2.record_type != @intFromEnum(ktls.RecordType.application_data));
+    // The daemon-level classifier maps that to `.key_update` (consume + continue),
+    // never `.app_data` and never a hard fault ⇒ no spurious drop.
+    try std.testing.expect(classifyKtlsRecord(rr2.record_type, rr2.plaintext) == .key_update);
+
+    // Continuation boundary (see enableKtlsRx / KtlsRxRecord.key_update): the
+    // client rotated its send key with the KeyUpdate, so its next app record is
+    // under the NEW key while the kernel's RX crypto_info is still the OLD key
+    // (this phase does not re-install it). The kernel therefore does NOT decrypt
+    // that record and never delivers the new-key plaintext as application_data —
+    // it signals the stream needs a rekey (EKEYEXPIRED ⇒ NeedsRekey) rather than
+    // corrupting the byte stream. This pins the exact scope: demux + no-drop
+    // consume is proven; RX-key rotation (a second setsockopt(TLS_RX)) is a
+    // documented follow-up.
+    const after = try client.encrypt("post-rekey app data");
+    defer alloc.free(after);
+    {
+        var ao: usize = 0;
+        while (ao < after.len) {
+            const w = linux.write(client_fd, after[ao..].ptr, after.len - ao);
+            if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+            ao += @intCast(w);
+        }
+    }
+    var after_buf: [256]u8 = undefined;
+    // Observed on this kernel (7.0.3): this returns error.NeedsRekey (EKEYEXPIRED).
+    if (ktls.recvmsgRecordType(server_fd, &after_buf, linux.MSG.DONTWAIT)) |ok| {
+        // Whatever came back, it must NOT be the new-key plaintext delivered as a
+        // clean application_data record.
+        try std.testing.expect(!(ok.record_type == @intFromEnum(ktls.RecordType.application_data) and
+            std.mem.eql(u8, ok.plaintext, "post-rekey app data")));
+    } else |err| {
+        // The stale RX key cannot open the rotated record: a rekey signal or a
+        // recv fault, never a successful app-data delivery.
+        try std.testing.expect(err == error.NeedsRekey or err == error.RecvFailed or err == error.WouldBlock);
+    }
+}
+
+test "classifyKtlsRecord maps TLS content types to recv-loop actions" {
+    var pt = [_]u8{ 1, 2, 3 };
+    // application_data ⇒ feed the plaintext buffer.
+    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.application_data), &pt)) {
+        .app_data => |d| try std.testing.expectEqualSlices(u8, &pt, d),
+        else => return error.TestUnexpectedResult,
+    }
+    // handshake (a client KeyUpdate) ⇒ consume + continue.
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &pt) == .key_update);
+    // alert (close_notify) ⇒ graceful close.
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.alert), &pt) == .close_notify);
+    // change_cipher_spec / any unknown type post-handshake ⇒ fail-safe close.
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.change_cipher_spec), &pt) == .fault);
+    try std.testing.expect(classifyKtlsRecord(99, &pt) == .fault);
 }
 
 test "shared ticket key and replay guard resume across TlsConn instances" {

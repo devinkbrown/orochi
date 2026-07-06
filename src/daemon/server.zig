@@ -954,6 +954,10 @@ const default_reply_bytes: usize = 8192;
 /// trips before the class is known.
 const default_sendq_cap: usize = 1 << 20; // 1 MiB
 const default_recv_bytes: usize = 4096;
+/// Upper bound on records demuxed in one kTLS-RX control-record drain pass, so a
+/// peer that streams control records can never spin the reactor on one conn. A
+/// clean stream hits `.would_block` long before this; the cap is only a safety net.
+const ktls_control_drain_max: usize = 16;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
 /// Default inbound RecvQ ceiling: the physical inline line buffer. A connection
 /// class may raise it (lines spill to a heap overflow) or lower it; `0` in the
@@ -1940,7 +1944,10 @@ pub const ConnState = struct {
     /// kTLS RX offload (roadmap 3.1, `[tls] ktls=txrx`): the kernel now decrypts
     /// this conn's inbound records, so `recv()` returns plaintext that bypasses
     /// the userspace TLS engine (routed straight to the IRC/WS layer). A control
-    /// record (KeyUpdate/close_notify) surfaces as a recv error → the conn closes.
+    /// record (KeyUpdate/close_notify) surfaces as a recv *error* (a plain recv
+    /// cannot convey the record type); `handleRecv` then demuxes it via `recvmsg`
+    /// + the `TLS_GET_RECORD_TYPE` cmsg (see `handleKtlsRxControl`) — a KeyUpdate is
+    /// consumed and the conn continues; a close_notify closes gracefully.
     /// Attached one-shot at the connected transition when the inbound is at a
     /// clean record boundary; false unless offload is enabled for a TLS 1.3 conn.
     tls_rx_offloaded: bool = false,
@@ -5517,9 +5524,117 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Outcome of demuxing a kTLS-RX control record off `conn` (see
+    /// `handleKtlsRxControl`).
+    const KtlsRxDrain = enum {
+        /// The conn survived (a KeyUpdate and/or app data was consumed) — re-arm recv.
+        survived,
+        /// The conn should be closed (close_notify / rekey-needed / fault). The
+        /// caller sets `closing` and closes once the send queue drains.
+        close,
+        /// `driveClientBytes` already closed and freed the conn (e.g. LineTooLong) —
+        /// the caller must return immediately and touch nothing further.
+        freed,
+    };
+
+    /// kTLS-RX control-record demux. On an offloaded conn a kernel-decrypted TLS
+    /// *control* record (KeyUpdate / close_notify) surfaces as a recv error because
+    /// a plain recv cannot convey the record type; rather than drop the conn, read
+    /// the queued record(s) via `recvmsg` + the `TLS_GET_RECORD_TYPE` cmsg and act
+    /// on the content type. A KeyUpdate is consumed (no drop); any coalesced app
+    /// data is fed to the IRC/WS layer; a close_notify closes gracefully; a
+    /// rekey-needed or unexpected record closes fail-safe (distinct reasons for
+    /// logs). Bounded by `ktls_control_drain_max`; `MSG.DONTWAIT` keeps it off the
+    /// blocking path.
+    fn handleKtlsRxControl(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !KtlsRxDrain {
+        var survived = false;
+        var iters: usize = 0;
+        while (iters < ktls_control_drain_max) : (iters += 1) {
+            switch (tls_conn.drainKtlsRxControl(conn.fd, &conn.recv_buf, linux.MSG.DONTWAIT)) {
+                // Nothing (more) to read right now. In this single-threaded reactor
+                // nothing else drains the fd between the recv completion and here,
+                // so a genuine control record always surfaces as a record above —
+                // an EAGAIN on the FIRST pass means the recv error was NOT a
+                // demuxable control record (a real socket error), so close. After
+                // we've consumed ≥1 record, EAGAIN just means the queue is drained:
+                // keep the conn and re-arm recv.
+                .would_block => {
+                    if (survived) return .survived;
+                    conn.close_reason = "TLS RX error";
+                    return .close;
+                },
+                .key_update => {
+                    // The kernel consumed the KeyUpdate; the conn continues.
+                    conn.last_activity_ms = self.nowMs();
+                    survived = true;
+                },
+                .app_data => |pt| {
+                    // Inbound app data proves liveness — mirror the normal recv path
+                    // (clear a pending ping-timeout) so a coalesced record here can't
+                    // false-trip an idle disconnect.
+                    conn.last_activity_ms = self.nowMs();
+                    conn.awaiting_pong = false;
+                    self.stats.onBytesIn(pt.len);
+                    if (!try self.driveClientBytes(id, conn, pt)) return .freed;
+                    survived = true;
+                    if (conn.closing) return .survived;
+                },
+                .close_notify => {
+                    conn.close_reason = "TLS close_notify";
+                    return .close;
+                },
+                .eof => {
+                    conn.close_reason = "connection closed";
+                    return .close;
+                },
+                .needs_rekey => {
+                    // A post-KeyUpdate app record arrived but the kernel RX key was
+                    // not rotated (RX rekey continuation is a follow-up). Close
+                    // cleanly with a distinct reason rather than spin or corrupt.
+                    conn.close_reason = "TLS RX rekey unsupported";
+                    return .close;
+                },
+                .fault => {
+                    conn.close_reason = "TLS RX control record";
+                    return .close;
+                },
+            }
+        }
+        // Hit the drain cap while still making progress: keep the conn and let the
+        // next recv completion continue draining.
+        return if (survived) .survived else .close;
+    }
+
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
+
+        // kTLS RX offload: a kernel-decrypted TLS control record surfaces here as a
+        // recv error (res < 0, typically -EIO) because a plain recv cannot carry the
+        // record type. Demux it via recvmsg + cmsg instead of dropping the conn — a
+        // KeyUpdate is consumed and the conn continues; a close_notify closes.
+        if (conn.tls_rx_offloaded and event.res < 0) {
+            switch (try self.handleKtlsRxControl(id, conn)) {
+                .freed => return,
+                .survived => {
+                    try self.armSendIfNeeded(conn);
+                    if (!conn.closing) {
+                        try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+                    } else if (!conn.send_armed and conn.send_len == conn.send_offset) {
+                        try self.closeConn(event.token, conn.close_reason);
+                    }
+                    return;
+                },
+                .close => {
+                    conn.closing = true;
+                    if (!conn.send_armed and conn.send_len == conn.send_offset) {
+                        try self.closeConn(event.token, conn.close_reason);
+                    }
+                    return;
+                },
+            }
+        }
+
         conn.closing = event.res <= 0;
         if (event.res > 0) {
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
