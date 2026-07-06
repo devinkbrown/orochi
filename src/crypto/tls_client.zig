@@ -229,6 +229,9 @@ const LeafPublicKey = union(enum) {
 const CertParts = struct {
     tbs_der: []const u8,
     signature_algorithm_oid: []const u8,
+    /// Raw `parameters` TLV of the outer signatureAlgorithm, or `null` if absent.
+    /// Needed for RSASSA-PSS, whose hash/MGF/salt live here, not in the OID.
+    signature_algorithm_params: ?[]const u8,
     signature: []const u8,
     issuer_der: []const u8,
     subject_der: []const u8,
@@ -2388,13 +2391,38 @@ fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {
             .rsa => |pk| pk,
             else => return error.UnsupportedPublicKey,
         };
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(cert.tbs_der, &digest, .{});
-        if (!rsa_verify.verifyPss(pk, .sha256, &digest, cert.signature, 32)) return error.BadSignature;
+        // id-RSASSA-PSS: the hash/MGF/salt are NOT in the OID — decode and
+        // validate them (fail-closed) from the signatureAlgorithm parameters
+        // instead of assuming SHA-256/salt-32.
+        try verifyCertPss(pk, cert.signature_algorithm_params, cert.tbs_der, cert.signature);
     } else if (oidEq(cert.signature_algorithm_oid, &oid_ed25519)) {
         try verifySignatureScheme(key, .ed25519, cert.tbs_der, cert.signature);
     } else {
         return error.UnsupportedSignatureScheme;
+    }
+}
+
+/// Verify an RSASSA-PSS certificate signature whose hash/MGF/salt are declared in
+/// the `RSASSA-PSS-params` (raw parameters TLV). Delegates parameter validation
+/// to `x509_verify.parsePssParams`, which fails closed on SHA-1 defaults, an
+/// MGF/hash mismatch, an oversized salt, or malformed DER.
+fn verifyCertPss(
+    pk: rsa_verify.PublicKey,
+    params_der: ?[]const u8,
+    tbs: []const u8,
+    sig: []const u8,
+) Error!void {
+    const params = x509_verify.parsePssParams(params_der orelse return error.BadSignature) catch
+        return error.BadSignature;
+    var digest: [64]u8 = undefined;
+    const digest_slice = digest[0..params.hash.digestLen()];
+    switch (params.hash) {
+        .sha256 => std.crypto.hash.sha2.Sha256.hash(tbs, digest[0..32], .{}),
+        .sha384 => std.crypto.hash.sha2.Sha384.hash(tbs, digest[0..48], .{}),
+        .sha512 => std.crypto.hash.sha2.Sha512.hash(tbs, digest[0..64], .{}),
+    }
+    if (!rsa_verify.verifyPss(pk, params.hash, digest_slice, sig, params.salt_len)) {
+        return error.BadSignature;
     }
 }
 
@@ -2493,9 +2521,11 @@ fn extractCertParts(der: []const u8) Error!CertParts {
     const subject = try tbs_reader.readExpected(x509.Tag.sequence);
     const spki = try tbs_reader.readExpected(x509.Tag.sequence);
 
+    const sig_alg_parts = try algorithmOidParams(body, sig_alg);
     return .{
         .tbs_der = tbs.raw,
-        .signature_algorithm_oid = try algorithmOid(body, sig_alg),
+        .signature_algorithm_oid = sig_alg_parts.oid,
+        .signature_algorithm_params = sig_alg_parts.params,
         .signature = try bitStringBytes(signature),
         .issuer_der = issuer.raw,
         .subject_der = subject.raw,
@@ -2564,6 +2594,20 @@ fn algorithmOid(parent: x509.DerReader, seq_tlv: x509.Tlv) Error![]const u8 {
     const oid = try r.readExpected(x509.Tag.oid);
     while (r.hasRemaining()) _ = try r.readTlv();
     return oid.value;
+}
+
+/// Like `algorithmOid` but also returns the raw `parameters` TLV (if present) —
+/// RSASSA-PSS carries its hash/MGF/salt there rather than in the OID.
+fn algorithmOidParams(parent: x509.DerReader, seq_tlv: x509.Tlv) Error!struct {
+    oid: []const u8,
+    params: ?[]const u8,
+} {
+    var r = try parent.child(seq_tlv);
+    const oid = try r.readExpected(x509.Tag.oid);
+    var params: ?[]const u8 = null;
+    if (r.hasRemaining()) params = (try r.readTlv()).raw;
+    while (r.hasRemaining()) _ = try r.readTlv();
+    return .{ .oid = oid.value, .params = params };
 }
 
 fn bitStringBytes(tlv: x509.Tlv) Error![]const u8 {

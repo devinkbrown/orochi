@@ -356,6 +356,14 @@ pub fn verifyPss(pub_key: PublicKey, alg: HashAlg, mhash: []const u8, signature:
     if (signature.len != k) return false;
     const h_len = alg.digestLen();
     if (mhash.len != h_len) return false;
+    // Defensive overflow guard: `salt_len` is attacker-influenced — it originates
+    // from a certificate's RSASSA-PSS-params. The `em_len < h_len + salt_len + 2`
+    // bound below adds it to usizes; a colossal value would wrap in a ReleaseFast
+    // build, letting the bound pass and a later `salt`/`mprime` slice run out of
+    // bounds. A conformant PSS salt is the hash length; reject anything a modulus
+    // this size could never encode. (The X.509 parse layer also caps this far
+    // lower — see x509_verify.max_pss_salt_len — this is belt-and-suspenders.)
+    if (salt_len > max_bytes) return false;
 
     // modBits = bit length of the modulus; emBits = modBits - 1.
     const n_big = Big.fromBytesBE(pub_key.n) catch return false;

@@ -306,7 +306,7 @@ fn delegateAuthorizesResponse(parsed: anytype, cert_der: []const u8, issuer_spki
     // (d) Issued (signed) by the trusted CA — `linkInfo` exposes the outer
     //     signature that the parsed Certificate view does not.
     const link = x509_verify.linkInfo(cert_der) catch return false;
-    x509_verify.verifyCertSignature(link.tbs_der, link.signature_der, link.sig_alg_oid, issuer_spki_der) catch return false;
+    x509_verify.verifyCertSignature(link.tbs_der, link.signature_der, link.sig_alg_oid, link.sig_alg_params, issuer_spki_der) catch return false;
     // (e) The response must verify under this authorized responder's key.
     return verifyDerSignature(
         parsed.signature_algorithm_oid,

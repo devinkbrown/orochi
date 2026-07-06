@@ -61,6 +61,10 @@ const SigOid = struct {
     const rsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C };
     /// sha512WithRSAEncryption (1.2.840.113549.1.1.13).
     const rsa_sha512 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
+    /// id-RSASSA-PSS (1.2.840.113549.1.1.10). Unlike the sha*WithRSAEncryption
+    /// OIDs, this one does NOT name the hash/salt — those live in the
+    /// AlgorithmIdentifier `parameters` (RSASSA-PSS-params) and must be parsed.
+    const rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
     /// ecdsa-with-SHA256 (1.2.840.10045.4.3.2).
     const ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
     /// id-Ed25519 (1.3.101.112).
@@ -75,6 +79,10 @@ pub const LinkInfo = struct {
     tbs_der: []const u8,
     /// The outer signatureAlgorithm OID identifying the signature scheme.
     sig_alg_oid: []const u8,
+    /// The raw AlgorithmIdentifier `parameters` TLV that follows the OID in the
+    /// outer signatureAlgorithm, or `null` when absent. Required for RSASSA-PSS,
+    /// whose hash/MGF/salt are carried here rather than in the OID.
+    sig_alg_params: ?[]const u8,
     /// This certificate's own SubjectPublicKeyInfo (the full SEQUENCE).
     spki_der: []const u8,
 
@@ -177,7 +185,7 @@ pub fn verifySimpleChain(chain_der: []const []const u8) Error!void {
 
 /// Verify that `child`'s TBS bytes were signed by the holder of `issuer`'s key.
 fn verifySignedBy(child: LinkInfo, issuer: LinkInfo) Error!void {
-    try verifyCertSignature(child.tbs_der, child.signature_der, child.sig_alg_oid, issuer.spki_der);
+    try verifyCertSignature(child.tbs_der, child.signature_der, child.sig_alg_oid, child.sig_alg_params, issuer.spki_der);
 }
 
 pub fn verifySimpleChainAt(chain_der: []const []const u8, now_epoch_seconds: i64) Error!void {
@@ -216,11 +224,11 @@ fn extractLinkInfo(der: []const u8) x509.Error!LinkInfo {
 
     var body = try top.child(cert_seq);
     const tbs = try body.readExpected(x509.Tag.sequence);
-    const sig_alg = try body.readExpected(x509.Tag.sequence);
+    const sig_alg_seq = try body.readExpected(x509.Tag.sequence);
     const signature = try body.readExpected(x509.Tag.bit_string);
     try body.expectEmpty();
 
-    const sig_alg_oid = try algorithmOid(body, sig_alg);
+    const sig_alg = try algorithmOidAndParams(body, sig_alg_seq);
     const signature_der = try signatureBytes(signature);
     var tbs_reader = try body.child(tbs);
 
@@ -240,17 +248,26 @@ fn extractLinkInfo(der: []const u8) x509.Error!LinkInfo {
         .issuer_der = issuer.raw,
         .signature_der = signature_der,
         .tbs_der = tbs.raw,
-        .sig_alg_oid = sig_alg_oid,
+        .sig_alg_oid = sig_alg.oid,
+        .sig_alg_params = sig_alg.params,
         .spki_der = spki.raw,
     };
 }
 
-/// Read the OID from an AlgorithmIdentifier SEQUENCE (ignoring any parameters).
-fn algorithmOid(parent: x509.DerReader, seq_tlv: x509.Tlv) x509.Error![]const u8 {
+/// Read the OID and the raw `parameters` TLV (if any) from an
+/// AlgorithmIdentifier SEQUENCE. `params` is the full parameters TLV
+/// (`tag||len||value`), or `null` when the SEQUENCE holds only the OID.
+fn algorithmOidAndParams(parent: x509.DerReader, seq_tlv: x509.Tlv) x509.Error!struct {
+    oid: []const u8,
+    params: ?[]const u8,
+} {
     var r = try parent.child(seq_tlv);
     const oid = try r.readExpected(x509.Tag.oid);
+    var params: ?[]const u8 = null;
+    if (r.hasRemaining()) params = (try r.readTlv()).raw;
+    // AlgorithmIdentifier carries at most one `parameters`; tolerate none beyond.
     while (r.hasRemaining()) _ = try r.readTlv();
-    return oid.value;
+    return .{ .oid = oid.value, .params = params };
 }
 
 fn signatureBytes(tlv: x509.Tlv) x509.Error![]const u8 {
@@ -267,8 +284,15 @@ fn signatureBytes(tlv: x509.Tlv) x509.Error![]const u8 {
 ///
 /// Dispatches on the signature-algorithm OID:
 ///   * sha256/384/512WithRSAEncryption → RSASSA-PKCS1-v1_5 over the matching SHA
+///   * id-RSASSA-PSS                    → RSASSA-PSS; hash/MGF/salt come from the
+///                                        `sig_alg_params` (RSASSA-PSS-params)
 ///   * ecdsa-with-SHA256 (P-256)       → ECDSA/P-256/SHA-256
 ///   * id-Ed25519                       → Ed25519 (signs the TBS directly)
+///
+/// `sig_alg_params` is the raw AlgorithmIdentifier `parameters` TLV from the
+/// outer signatureAlgorithm (see `LinkInfo.sig_alg_params`); it is only consumed
+/// by the PSS branch, which fails closed (`BadSignature`) when it is absent or
+/// does not parse to a supported {hash, MGF1-same-hash, capped salt}.
 ///
 /// The issuer's key family must be compatible with the signature scheme (an
 /// RSA OID requires an RSA issuer key, etc.); a mismatch is `BadSignature`. Any
@@ -277,6 +301,7 @@ pub fn verifyCertSignature(
     cert_tbs: []const u8,
     sig_value: []const u8,
     sig_alg_oid: []const u8,
+    sig_alg_params: ?[]const u8,
     issuer_spki: []const u8,
 ) Error!void {
     const key = try x509.extractPublicKey(issuer_spki);
@@ -287,6 +312,8 @@ pub fn verifyCertSignature(
         return verifyRsaPkcs1(key, .sha384, cert_tbs, sig_value);
     } else if (std.mem.eql(u8, sig_alg_oid, &SigOid.rsa_sha512)) {
         return verifyRsaPkcs1(key, .sha512, cert_tbs, sig_value);
+    } else if (std.mem.eql(u8, sig_alg_oid, &SigOid.rsassa_pss)) {
+        return verifyRsaPss(key, sig_alg_params, cert_tbs, sig_value);
     } else if (std.mem.eql(u8, sig_alg_oid, &SigOid.ecdsa_sha256)) {
         return verifyEcdsaP256(key, cert_tbs, sig_value);
     } else if (std.mem.eql(u8, sig_alg_oid, &SigOid.ed25519)) {
@@ -314,6 +341,203 @@ fn verifyRsaPkcs1(
     }
     const pub_key = rsa_verify.PublicKey{ .n = rsa.modulus, .e = rsa.exponent };
     if (!rsa_verify.verifyPkcs1v15(pub_key, alg, digest_slice, sig)) return error.BadSignature;
+}
+
+// ---------------------------------------------------------------------------
+// RSASSA-PSS.
+//
+// The id-RSASSA-PSS OID names neither the hash nor the salt length; both live
+// in the AlgorithmIdentifier `parameters` (RSASSA-PSS-params, RFC 4055 §3.1).
+// `parsePssParams` decodes and *validates* those parameters fail-closed before
+// any signature math runs, so a certificate can never steer the verifier into an
+// implicit-SHA1 configuration or an unbounded salt.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on an accepted PSS `saltLength` (bytes). A conformant PSS salt is the
+/// hash length (≤ 64). This bound is a SECURITY boundary, not a compat knob: the
+/// value is attacker-controlled (it comes from the certificate) and feeds an
+/// addition in `rsa_verify.verifyPss` that would overflow a `usize` in a
+/// ReleaseFast build on a huge value. Capping here fails closed at the edge.
+pub const max_pss_salt_len: usize = 512;
+
+/// Validated RSASSA-PSS parameters.
+pub const PssParams = struct {
+    hash: rsa_verify.HashAlg,
+    salt_len: usize,
+};
+
+/// [2] context-specific constructed (saltLength) — not in `x509.Tag`.
+const context_2_constructed: u8 = 0xA2;
+
+/// Hash OIDs that may appear inside RSASSA-PSS-params (SHA-1 is deliberately
+/// absent — see `pssHashFromOid`).
+const PssHashOid = struct {
+    /// id-sha256 (2.16.840.1.101.3.4.2.1).
+    const sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+    /// id-sha384 (2.16.840.1.101.3.4.2.2).
+    const sha384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+    /// id-sha512 (2.16.840.1.101.3.4.2.3).
+    const sha512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
+};
+/// id-mgf1 (1.2.840.113549.1.1.8).
+const oid_mgf1 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x08 };
+
+fn verifyRsaPss(
+    key: x509.SubjectPublicKey,
+    params_der: ?[]const u8,
+    tbs: []const u8,
+    sig: []const u8,
+) Error!void {
+    const rsa = switch (key) {
+        .rsa => |k| k,
+        else => return error.BadSignature,
+    };
+    // A PSS OID with no parameters is malformed — fail closed, never default.
+    const params = try parsePssParams(params_der orelse return error.BadSignature);
+    var digest: [64]u8 = undefined;
+    const digest_slice = digest[0..params.hash.digestLen()];
+    switch (params.hash) {
+        .sha256 => std.crypto.hash.sha2.Sha256.hash(tbs, digest[0..32], .{}),
+        .sha384 => std.crypto.hash.sha2.Sha384.hash(tbs, digest[0..48], .{}),
+        .sha512 => std.crypto.hash.sha2.Sha512.hash(tbs, digest[0..64], .{}),
+    }
+    const pub_key = rsa_verify.PublicKey{ .n = rsa.modulus, .e = rsa.exponent };
+    if (!rsa_verify.verifyPss(pub_key, params.hash, digest_slice, sig, params.salt_len)) {
+        return error.BadSignature;
+    }
+}
+
+/// Parse and validate RSASSA-PSS-params (RFC 4055 §3.1). Fail-closed:
+///   * `hashAlgorithm` [0] MUST be present and one of SHA-256/384/512 — the
+///     `sha1` DEFAULT is rejected (an omitted field means SHA-1, which we never
+///     accept),
+///   * `maskGenAlgorithm` [1] MUST be present, MGF1, over the SAME hash,
+///   * `saltLength` [2] MUST be present, non-negative, and ≤ `max_pss_salt_len`,
+///   * `trailerField` [3], if present, MUST be 1 (the sole defined value).
+///
+/// `params_der` is the raw parameters TLV (the `RSASSA-PSS-params` SEQUENCE).
+pub fn parsePssParams(params_der: []const u8) Error!PssParams {
+    var top = x509.DerReader.init(params_der);
+    const seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    var r = try top.child(seq);
+
+    // hashAlgorithm [0] EXPLICIT AlgorithmIdentifier — REQUIRED.
+    if (!r.hasRemaining() or try r.peekTag() != x509.Tag.context_0_constructed) {
+        return error.UnsupportedSigAlg;
+    }
+    const hash_alg_id = try readExplicitAlgId(r, try r.readTlv());
+    const hash_alg = try pssHashFromOid(hash_alg_id.oid, hash_alg_id.params);
+
+    // maskGenAlgorithm [1] EXPLICIT AlgorithmIdentifier — REQUIRED = MGF1(hash).
+    if (!r.hasRemaining() or try r.peekTag() != x509.Tag.context_1_constructed) {
+        return error.UnsupportedSigAlg;
+    }
+    const mgf_alg_id = try readExplicitAlgId(r, try r.readTlv());
+    if (!std.mem.eql(u8, mgf_alg_id.oid, &oid_mgf1)) return error.UnsupportedSigAlg;
+    // MGF1's own parameters are the AlgorithmIdentifier of its inner hash.
+    const mgf_hash_tlv = mgf_alg_id.params orelse return error.BadSignature;
+    const mgf_inner = try parseAlgId(mgf_hash_tlv);
+    const mgf_hash = try pssHashFromOid(mgf_inner.oid, mgf_inner.params);
+    if (mgf_hash != hash_alg) return error.BadSignature;
+
+    // saltLength [2] EXPLICIT INTEGER — REQUIRED (never accept the 20 DEFAULT).
+    if (!r.hasRemaining() or try r.peekTag() != context_2_constructed) {
+        return error.UnsupportedSigAlg;
+    }
+    const salt_len = try readExplicitSaltLen(r, try r.readTlv());
+
+    // trailerField [3] EXPLICIT INTEGER DEFAULT 1 — if present it MUST be 1.
+    if (r.hasRemaining()) {
+        if (try r.peekTag() != x509.Tag.context_3_constructed) return error.BadSignature;
+        try requireTrailerFieldOne(r, try r.readTlv());
+    }
+    try r.expectEmpty();
+
+    return .{ .hash = hash_alg, .salt_len = salt_len };
+}
+
+const AlgIdView = struct {
+    oid: []const u8,
+    /// Raw parameters TLV, or `null` when absent.
+    params: ?[]const u8,
+};
+
+/// Decode an `[n] EXPLICIT AlgorithmIdentifier` wrapper (the explicit tag holds a
+/// single AlgorithmIdentifier SEQUENCE) into its OID and raw parameters TLV.
+fn readExplicitAlgId(parent: x509.DerReader, explicit: x509.Tlv) Error!AlgIdView {
+    var e = try parent.child(explicit);
+    const alg_seq = try e.readExpected(x509.Tag.sequence);
+    try e.expectEmpty();
+    return parseAlgIdReader(e, alg_seq);
+}
+
+/// Decode a bare AlgorithmIdentifier SEQUENCE (`alg_der` is the raw SEQUENCE).
+fn parseAlgId(alg_der: []const u8) Error!AlgIdView {
+    var top = x509.DerReader.init(alg_der);
+    const alg_seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    return parseAlgIdReader(top, alg_seq);
+}
+
+fn parseAlgIdReader(parent: x509.DerReader, alg_seq: x509.Tlv) Error!AlgIdView {
+    var a = try parent.child(alg_seq);
+    const oid = try a.readExpected(x509.Tag.oid);
+    var params: ?[]const u8 = null;
+    if (a.hasRemaining()) params = (try a.readTlv()).raw;
+    try a.expectEmpty();
+    return .{ .oid = oid.value, .params = params };
+}
+
+/// Map a hash OID (with its optional AlgorithmIdentifier parameters) to a
+/// supported `HashAlg`. SHA-1 and everything else are `UnsupportedSigAlg`. When
+/// parameters are present they MUST be an explicit NULL (RFC 4055).
+fn pssHashFromOid(oid: []const u8, params: ?[]const u8) Error!rsa_verify.HashAlg {
+    if (params) |p| {
+        // The only conformant parameters for a SHA-2 AlgorithmIdentifier are an
+        // explicit NULL (0x05 0x00); anything else is malformed.
+        if (p.len != 2 or p[0] != x509.Tag.null_value or p[1] != 0x00) return error.BadSignature;
+    }
+    if (std.mem.eql(u8, oid, &PssHashOid.sha256)) return .sha256;
+    if (std.mem.eql(u8, oid, &PssHashOid.sha384)) return .sha384;
+    if (std.mem.eql(u8, oid, &PssHashOid.sha512)) return .sha512;
+    return error.UnsupportedSigAlg;
+}
+
+/// Decode `[2] EXPLICIT INTEGER` saltLength, capping it at `max_pss_salt_len`.
+fn readExplicitSaltLen(parent: x509.DerReader, explicit: x509.Tlv) Error!usize {
+    var e = try parent.child(explicit);
+    const int = try e.readExpected(x509.Tag.integer);
+    try e.expectEmpty();
+    return saltLenFromInteger(int.value);
+}
+
+/// A DER INTEGER's content as a saltLength, rejecting negatives, non-canonical
+/// encodings, and anything above the security cap. Bounded arithmetic: a value
+/// wider than two content bytes already exceeds the cap, so overflow is
+/// impossible before the range check fires.
+fn saltLenFromInteger(bytes: []const u8) Error!usize {
+    if (bytes.len == 0) return error.BadSignature;
+    if (bytes[0] & 0x80 != 0) return error.BadSignature; // negative
+    var v = bytes;
+    if (v.len > 1 and v[0] == 0x00) {
+        if (v[1] & 0x80 == 0) return error.BadSignature; // non-canonical padding
+        v = v[1..];
+    }
+    if (v.len > 2) return error.BadSignature; // > 0xFFFF, far past the cap
+    var val: usize = 0;
+    for (v) |byte| val = (val << 8) | byte;
+    if (val > max_pss_salt_len) return error.BadSignature;
+    return val;
+}
+
+/// Decode `[3] EXPLICIT INTEGER` trailerField, requiring the sole defined value 1
+/// (the `0xBC` trailer byte itself is checked by `rsa_verify.verifyPss`).
+fn requireTrailerFieldOne(parent: x509.DerReader, explicit: x509.Tlv) Error!void {
+    var e = try parent.child(explicit);
+    const int = try e.readExpected(x509.Tag.integer);
+    try e.expectEmpty();
+    if (int.value.len != 1 or int.value[0] != 0x01) return error.BadSignature;
 }
 
 fn verifyEcdsaP256(key: x509.SubjectPublicKey, tbs: []const u8, sig: []const u8) Error!void {
@@ -760,7 +984,7 @@ test "unsupported signature algorithm is rejected with UnsupportedSigAlg" {
     const md5_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04 };
     try std.testing.expectError(
         error.UnsupportedSigAlg,
-        verifyCertSignature(info.tbs_der, info.signature_der, &md5_rsa, info.spki_der),
+        verifyCertSignature(info.tbs_der, info.signature_der, &md5_rsa, info.sig_alg_params, info.spki_der),
     );
 }
 
@@ -802,4 +1026,415 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
     return out;
+}
+
+// ===========================================================================
+// RSASSA-PSS certificate-signature tests.
+//
+// Test signatures use a self-verifying Mersenne modulus n = M1279 = 2^1279 - 1
+// (a known Mersenne PRIME) with e = d = n - 2. Because n is prime,
+// x^(n-1) ≡ 1 (mod n) (Fermat), and e·d ≡ (-1)(-1) ≡ 1 (mod n-1), so
+// s = EM^d and EM = s^e round-trip through a single public modexp — NO key
+// generation, NO modular inverse, NO external tooling. M1279 is 160 bytes, large
+// enough to carry SHA-512 with a 64-byte salt (emBits = 1278 ⇒ emLen = 160,
+// which also exercises the top-bit masking the smaller M521 vector does not).
+//
+// The EMSA-PSS-ENCODE below is written straight from RFC 8017 §9.1.1 and is
+// deliberately independent of the verify path under test (its hashing and MGF1
+// use std.crypto directly, not rsa_verify's helpers).
+// ===========================================================================
+
+const m1279_n = blk: {
+    var n: [160]u8 = [_]u8{0xFF} ** 160;
+    n[0] = 0x7F; // 2^1279 - 1 has 1279 set bits ⇒ top byte 0x7F, then 159×0xFF
+    break :blk n;
+};
+// n - 2: identical to n except the least-significant byte 0xFF → 0xFD.
+const m1279_ed = blk: {
+    var d: [160]u8 = [_]u8{0xFF} ** 160;
+    d[0] = 0x7F;
+    d[159] = 0xFD;
+    break :blk d;
+};
+
+/// id-sha1 (1.3.14.3.2.26) — used only to prove PSS-with-SHA-1 is rejected.
+const oid_sha1 = [_]u8{ 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+
+fn testHash(alg: rsa_verify.HashAlg, msg: []const u8, out: []u8) void {
+    switch (alg) {
+        .sha256 => std.crypto.hash.sha2.Sha256.hash(msg, out[0..32], .{}),
+        .sha384 => std.crypto.hash.sha2.Sha384.hash(msg, out[0..48], .{}),
+        .sha512 => std.crypto.hash.sha2.Sha512.hash(msg, out[0..64], .{}),
+    }
+}
+
+/// MGF1 (RFC 8017 §B.2.1), written directly (mask is produced, not XORed) so the
+/// encoder does not lean on the module under test.
+fn testMgf1(alg: rsa_verify.HashAlg, seed: []const u8, mask_out: []u8) void {
+    const h_len = alg.digestLen();
+    var counter: u32 = 0;
+    var off: usize = 0;
+    var buf: [64 + 4]u8 = undefined;
+    var block: [64]u8 = undefined;
+    while (off < mask_out.len) : (counter += 1) {
+        @memcpy(buf[0..seed.len], seed);
+        std.mem.writeInt(u32, buf[seed.len..][0..4], counter, .big);
+        testHash(alg, buf[0 .. seed.len + 4], block[0..h_len]);
+        const take = @min(h_len, mask_out.len - off);
+        @memcpy(mask_out[off..][0..take], block[0..take]);
+        off += take;
+    }
+}
+
+fn testBitLenBE(bytes: []const u8) usize {
+    var i: usize = 0;
+    while (i < bytes.len and bytes[i] == 0) i += 1;
+    if (i == bytes.len) return 0;
+    return (bytes.len - i - 1) * 8 + (8 - @clz(bytes[i]));
+}
+
+/// EMSA-PSS-ENCODE(mhash, emBits=bitLen(n)-1, salt) then s = EM^d mod n.
+fn testSignPss(
+    out_sig: []u8,
+    n: []const u8,
+    d: []const u8,
+    alg: rsa_verify.HashAlg,
+    mhash: []const u8,
+    salt: []const u8,
+) !void {
+    const k = n.len;
+    const h_len = alg.digestLen();
+    const em_bits = testBitLenBE(n) - 1;
+    const em_len = (em_bits + 7) / 8;
+
+    var mprime: [8 + 64 + 64]u8 = undefined;
+    @memset(mprime[0..8], 0);
+    @memcpy(mprime[8..][0..h_len], mhash);
+    @memcpy(mprime[8 + h_len ..][0..salt.len], salt);
+    var hbuf: [64]u8 = undefined;
+    testHash(alg, mprime[0 .. 8 + h_len + salt.len], hbuf[0..h_len]);
+
+    const db_len = em_len - h_len - 1;
+    const ps_len = db_len - salt.len - 1;
+    var db: [256]u8 = undefined;
+    @memset(db[0..ps_len], 0);
+    db[ps_len] = 0x01;
+    @memcpy(db[ps_len + 1 ..][0..salt.len], salt);
+    var mask: [256]u8 = undefined;
+    testMgf1(alg, hbuf[0..h_len], mask[0..db_len]);
+    for (0..db_len) |i| db[i] ^= mask[i];
+    const top_bits: u3 = @intCast(8 * em_len - em_bits);
+    if (top_bits != 0) db[0] &= @as(u8, 0xFF) >> top_bits;
+
+    var em: [256]u8 = undefined;
+    @memcpy(em[0..db_len], db[0..db_len]);
+    @memcpy(em[db_len..][0..h_len], hbuf[0..h_len]);
+    em[em_len - 1] = 0xbc;
+
+    try rsa_verify.modExp(em[0..em_len], d, n, out_sig[0..k]);
+}
+
+/// Build an RSA SubjectPublicKeyInfo DER from a big-endian modulus/exponent
+/// (both already valid positive DER-INTEGER magnitudes: MSB clear).
+fn testBuildRsaSpki(out: []u8, n: []const u8, e: []const u8) []const u8 {
+    var rsapk_body: [512]u8 = undefined;
+    var rp = W.init(&rsapk_body);
+    rp.tlv(0x02, n);
+    rp.tlv(0x02, e);
+    var rsapk_seq: [520]u8 = undefined;
+    var rs = W.init(&rsapk_seq);
+    rs.tlv(0x30, rp.bytes());
+
+    var bit_buf: [540]u8 = undefined;
+    bit_buf[0] = 0x00; // BIT STRING unused-bits octet
+    @memcpy(bit_buf[1..][0..rs.bytes().len], rs.bytes());
+    const bit_val = bit_buf[0 .. 1 + rs.bytes().len];
+
+    var alg_body: [32]u8 = undefined;
+    var ab = W.init(&alg_body);
+    ab.tlv(0x06, &[_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 }); // rsaEncryption
+    ab.tlv(0x05, &[_]u8{}); // NULL
+    var alg_seq: [40]u8 = undefined;
+    var as_ = W.init(&alg_seq);
+    as_.tlv(0x30, ab.bytes());
+
+    var spki_body: [640]u8 = undefined;
+    var sb = W.init(&spki_body);
+    sb.raw(as_.bytes());
+    sb.tlv(0x03, bit_val);
+    var spki = W.init(out);
+    spki.tlv(0x30, sb.bytes());
+    return spki.bytes();
+}
+
+fn testBuildHashAlgId(out: []u8, oid: []const u8, include_null: bool) []const u8 {
+    var body: [32]u8 = undefined;
+    var b = W.init(&body);
+    b.tlv(0x06, oid);
+    if (include_null) b.tlv(0x05, &[_]u8{});
+    var seq = W.init(out);
+    seq.tlv(0x30, b.bytes());
+    return seq.bytes();
+}
+
+const PssBuildOpts = struct {
+    hash_oid: []const u8,
+    mgf_hash_oid: []const u8,
+    /// saltLength INTEGER content, or null to omit the [2] field entirely.
+    salt_content: ?[]const u8,
+    /// trailerField INTEGER value, or null to omit the [3] field.
+    trailer: ?u8 = null,
+    /// Whether the hash AlgorithmIdentifiers carry an explicit NULL parameters.
+    hash_null_params: bool = true,
+};
+
+/// Build an RSASSA-PSS-params SEQUENCE DER (the raw signatureAlgorithm
+/// `parameters`), fully parameterized for both positive and fail-closed tests.
+fn testBuildPssParams(out: []u8, opts: PssBuildOpts) []const u8 {
+    var body: [400]u8 = undefined;
+    var bw = W.init(&body);
+
+    // hashAlgorithm [0]
+    var halg: [40]u8 = undefined;
+    const halg_bytes = testBuildHashAlgId(&halg, opts.hash_oid, opts.hash_null_params);
+    var e0: [48]u8 = undefined;
+    var e0w = W.init(&e0);
+    e0w.tlv(0xA0, halg_bytes);
+    bw.raw(e0w.bytes());
+
+    // maskGenAlgorithm [1] = SEQUENCE { OID mgf1, <inner hash AlgId> }
+    var inner: [40]u8 = undefined;
+    const inner_bytes = testBuildHashAlgId(&inner, opts.mgf_hash_oid, opts.hash_null_params);
+    var mgf_body: [64]u8 = undefined;
+    var mgfw = W.init(&mgf_body);
+    mgfw.tlv(0x06, &oid_mgf1);
+    mgfw.raw(inner_bytes);
+    var mgf_seq: [72]u8 = undefined;
+    var mgfsw = W.init(&mgf_seq);
+    mgfsw.tlv(0x30, mgfw.bytes());
+    var e1: [80]u8 = undefined;
+    var e1w = W.init(&e1);
+    e1w.tlv(0xA1, mgfsw.bytes());
+    bw.raw(e1w.bytes());
+
+    // saltLength [2] (optional)
+    if (opts.salt_content) |sc| {
+        var salt_int: [16]u8 = undefined;
+        var siw = W.init(&salt_int);
+        siw.tlv(0x02, sc);
+        var e2: [24]u8 = undefined;
+        var e2w = W.init(&e2);
+        e2w.tlv(0xA2, siw.bytes());
+        bw.raw(e2w.bytes());
+    }
+
+    // trailerField [3] (optional)
+    if (opts.trailer) |t| {
+        var tr_int: [8]u8 = undefined;
+        var tiw = W.init(&tr_int);
+        tiw.tlv(0x02, &[_]u8{t});
+        var e3: [16]u8 = undefined;
+        var e3w = W.init(&e3);
+        e3w.tlv(0xA3, tiw.bytes());
+        bw.raw(e3w.bytes());
+    }
+
+    var seq = W.init(out);
+    seq.tlv(0x30, bw.bytes());
+    return seq.bytes();
+}
+
+test "verifyCertSignature accepts RSASSA-PSS over SHA-256/384/512 and rejects a flipped byte" {
+    const tbs = "orochi RSASSA-PSS cert-signature end-to-end test bytes";
+    var spki_buf: [700]u8 = undefined;
+    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+
+    const cases = .{
+        .{ rsa_verify.HashAlg.sha256, @as([]const u8, &PssHashOid.sha256), @as(u8, 32) },
+        .{ rsa_verify.HashAlg.sha384, @as([]const u8, &PssHashOid.sha384), @as(u8, 48) },
+        .{ rsa_verify.HashAlg.sha512, @as([]const u8, &PssHashOid.sha512), @as(u8, 64) },
+    };
+    inline for (cases) |case| {
+        const alg = case[0];
+        const hash_oid = case[1];
+        const salt_len = case[2];
+
+        var mhash: [64]u8 = undefined;
+        testHash(alg, tbs, mhash[0..alg.digestLen()]);
+        const salt = [_]u8{0x5A} ** 64;
+        var sig: [160]u8 = undefined;
+        try testSignPss(&sig, &m1279_n, &m1279_ed, alg, mhash[0..alg.digestLen()], salt[0..salt_len]);
+
+        var params_buf: [256]u8 = undefined;
+        const params = testBuildPssParams(&params_buf, .{
+            .hash_oid = hash_oid,
+            .mgf_hash_oid = hash_oid,
+            .salt_content = &[_]u8{salt_len},
+        });
+
+        try verifyCertSignature(tbs, &sig, &SigOid.rsassa_pss, params, spki);
+
+        // A single flipped signature byte must be rejected.
+        var bad = sig;
+        bad[13] ^= 0x01;
+        try std.testing.expectError(
+            error.BadSignature,
+            verifyCertSignature(tbs, &bad, &SigOid.rsassa_pss, params, spki),
+        );
+    }
+}
+
+test "verifyCertSignature accepts RSASSA-PSS whose hash AlgorithmIdentifiers omit the NULL params" {
+    const tbs = "pss without explicit null hash params";
+    var mhash: [32]u8 = undefined;
+    testHash(.sha256, tbs, &mhash);
+    const salt = [_]u8{0x33} ** 32;
+    var sig: [160]u8 = undefined;
+    try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
+
+    var spki_buf: [700]u8 = undefined;
+    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    var params_buf: [256]u8 = undefined;
+    const params = testBuildPssParams(&params_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{32},
+        .trailer = 1, // explicit trailerField 1 is also accepted
+        .hash_null_params = false,
+    });
+    try verifyCertSignature(tbs, &sig, &SigOid.rsassa_pss, params, spki);
+}
+
+test "verifyCertSignature rejects RSASSA-PSS when the declared hash differs from the signed hash" {
+    const tbs = "declared-hash mismatch";
+    var mhash: [32]u8 = undefined;
+    testHash(.sha256, tbs, &mhash);
+    const salt = [_]u8{0x11} ** 32;
+    var sig: [160]u8 = undefined;
+    try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
+
+    var spki_buf: [700]u8 = undefined;
+    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    // The signature is a SHA-256 PSS, but the params declare SHA-512.
+    var params_buf: [256]u8 = undefined;
+    const params = testBuildPssParams(&params_buf, .{
+        .hash_oid = &PssHashOid.sha512,
+        .mgf_hash_oid = &PssHashOid.sha512,
+        .salt_content = &[_]u8{32},
+    });
+    try std.testing.expectError(
+        error.BadSignature,
+        verifyCertSignature(tbs, &sig, &SigOid.rsassa_pss, params, spki),
+    );
+}
+
+test "verifyCertSignature rejects RSASSA-PSS with a missing/oversized salt (fail-closed cap)" {
+    var spki_buf: [700]u8 = undefined;
+    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    const sig = [_]u8{0} ** 160;
+
+    // saltLength = 4096, far above the max_pss_salt_len (512) cap → reject.
+    var over_buf: [256]u8 = undefined;
+    const over = testBuildPssParams(&over_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{ 0x10, 0x00 },
+    });
+    try std.testing.expectError(
+        error.BadSignature,
+        verifyCertSignature("x", &sig, &SigOid.rsassa_pss, over, spki),
+    );
+
+    // A PSS OID with absent parameters is malformed → reject (never default).
+    try std.testing.expectError(
+        error.BadSignature,
+        verifyCertSignature("x", &sig, &SigOid.rsassa_pss, null, spki),
+    );
+}
+
+test "parsePssParams accepts the three supported hashes with matching MGF1" {
+    inline for (.{
+        .{ rsa_verify.HashAlg.sha256, @as([]const u8, &PssHashOid.sha256), @as(u8, 32) },
+        .{ rsa_verify.HashAlg.sha384, @as([]const u8, &PssHashOid.sha384), @as(u8, 48) },
+        .{ rsa_verify.HashAlg.sha512, @as([]const u8, &PssHashOid.sha512), @as(u8, 64) },
+    }) |case| {
+        var buf: [256]u8 = undefined;
+        const params = testBuildPssParams(&buf, .{
+            .hash_oid = case[1],
+            .mgf_hash_oid = case[1],
+            .salt_content = &[_]u8{case[2]},
+        });
+        const parsed = try parsePssParams(params);
+        try std.testing.expectEqual(case[0], parsed.hash);
+        try std.testing.expectEqual(@as(usize, case[2]), parsed.salt_len);
+    }
+    // saltLength exactly at the cap (512 = 0x0200) is accepted.
+    var cap_buf: [256]u8 = undefined;
+    const cap = testBuildPssParams(&cap_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{ 0x02, 0x00 },
+    });
+    try std.testing.expectEqual(@as(usize, 512), (try parsePssParams(cap)).salt_len);
+}
+
+test "parsePssParams is fail-closed on SHA-1, MGF/hash mismatch, oversized salt, trailer, and malformed input" {
+    // A) SHA-1 hashAlgorithm (and MGF1-SHA1) → never accepted.
+    var a_buf: [256]u8 = undefined;
+    const a = testBuildPssParams(&a_buf, .{
+        .hash_oid = &oid_sha1,
+        .mgf_hash_oid = &oid_sha1,
+        .salt_content = &[_]u8{20},
+    });
+    try std.testing.expectError(error.UnsupportedSigAlg, parsePssParams(a));
+
+    // B) hashAlgorithm SHA-256 but MGF1 inner hash SHA-512 → mismatch.
+    var b_buf: [256]u8 = undefined;
+    const b = testBuildPssParams(&b_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha512,
+        .salt_content = &[_]u8{32},
+    });
+    try std.testing.expectError(error.BadSignature, parsePssParams(b));
+
+    // C) oversized saltLength (513 = 0x0201, one past the cap) → reject.
+    var c_buf: [256]u8 = undefined;
+    const c = testBuildPssParams(&c_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{ 0x02, 0x01 },
+    });
+    try std.testing.expectError(error.BadSignature, parsePssParams(c));
+
+    // D) missing saltLength [2] → reject (never fall back to the DEFAULT 20).
+    var d_buf: [256]u8 = undefined;
+    const d = testBuildPssParams(&d_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = null,
+    });
+    try std.testing.expectError(error.UnsupportedSigAlg, parsePssParams(d));
+
+    // E) trailerField = 2 (only 1 is defined) → reject.
+    var e_buf: [256]u8 = undefined;
+    const e = testBuildPssParams(&e_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{32},
+        .trailer = 2,
+    });
+    try std.testing.expectError(error.BadSignature, parsePssParams(e));
+
+    // F) a non-SEQUENCE / truncated blob → structural parse error.
+    try std.testing.expectError(error.InvalidTag, parsePssParams(&[_]u8{ 0x05, 0x00 }));
+    try std.testing.expectError(error.Truncated, parsePssParams(&[_]u8{0x30}));
+
+    // G) negative saltLength (INTEGER 0x80) → reject.
+    var g_buf: [256]u8 = undefined;
+    const g = testBuildPssParams(&g_buf, .{
+        .hash_oid = &PssHashOid.sha256,
+        .mgf_hash_oid = &PssHashOid.sha256,
+        .salt_content = &[_]u8{0x80},
+    });
+    try std.testing.expectError(error.BadSignature, parsePssParams(g));
 }
