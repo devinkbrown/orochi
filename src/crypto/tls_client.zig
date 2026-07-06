@@ -16,6 +16,7 @@ const tls_record = @import("tls_record.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
 const ocsp = @import("ocsp.zig");
+const crl = @import("crl.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
 const rsa_sign = @import("rsa_sign.zig");
@@ -107,6 +108,14 @@ pub const Options = struct {
     /// and ACME paths) should always set it; loopback tests with fixed fixtures
     /// leave it null.
     now_unix_seconds: ?i64 = null,
+    /// Optional caller-supplied CRL (DER) for leaf revocation checking, e.g. one
+    /// a CDP fetch retrieved out of band. When set AND `now_unix_seconds` is set,
+    /// a CRL that verifies under the leaf's issuer key and is current can REJECT a
+    /// revoked leaf (`error.CertificateRevoked`). Fail-open in every other case
+    /// (absent, unparseable, wrong-issuer signature, stale, or no clock) so a
+    /// missing or broken CRL never breaks an otherwise-valid handshake. Borrowed
+    /// for the call; the client copies it.
+    crl: ?[]const u8 = null,
 };
 
 pub const FeedResult = union(enum) {
@@ -260,6 +269,8 @@ pub const Client = struct {
     server_name: []u8,
     trust_anchors: []const []const u8,
     alpn_protocols: []const []const u8,
+    /// Owned copy of the caller-supplied CRL DER (see `Options.crl`), or null.
+    crl: ?[]u8 = null,
 
     state: State = .idle,
     /// Wall-clock time (Unix seconds) for certificate validity checks, or null to
@@ -415,12 +426,15 @@ pub const Client = struct {
         errdefer allocator.free(anchors);
         const alpn = try allocator.dupe([]const u8, options.alpn_protocols);
         errdefer allocator.free(alpn);
+        const crl_owned = if (options.crl) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (crl_owned) |c| allocator.free(c);
 
         return .{
             .allocator = allocator,
             .server_name = name,
             .trust_anchors = anchors,
             .alpn_protocols = alpn,
+            .crl = crl_owned,
             .verify_time = options.now_unix_seconds,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
@@ -460,6 +474,7 @@ pub const Client = struct {
         self.allocator.free(self.server_name);
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
+        if (self.crl) |c| self.allocator.free(c);
         self.* = undefined;
     }
 
@@ -1489,6 +1504,12 @@ pub const Client = struct {
             const issuer_parts = try extractCertParts(issuer_der);
             try verifyOcspStapleForLeaf(staple, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
+        if (self.crl) |crl_der| {
+            const leaf = try x509.parse(chain[0]);
+            const issuer_der = if (chain.len > 1) chain[1] else chain[0];
+            const issuer_parts = try extractCertParts(issuer_der);
+            try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
+        }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
         // owned storage so the key survives the post-message consume of hs_plain.
@@ -2012,6 +2033,23 @@ fn parseTicketEarlyDataLimit(extensions: []const u8) Error!u32 {
 /// The extension_data is a CertificateStatus:
 /// status_type(1) || ocsp_response_length(uint24) || OCSPResponse DER. Only
 /// status_type=ocsp(1) is accepted here.
+/// Config-gated CRL revocation check for the leaf, FAIL-OPEN. Only a CRL that
+/// (a) parses, (b) verifies under the leaf issuer's key, and (c) is current at
+/// `now_unix` may revoke: it returns `error.CertificateRevoked` iff the leaf
+/// serial is listed. Every other case — no clock, unparseable, wrong-issuer
+/// signature, or a stale/not-yet-valid window — is IGNORED, so a missing or
+/// broken CRL never breaks an otherwise-valid handshake. Conservative posture for
+/// an outbound HTTPS/ACME client: soft-fail revocation, hard-fail forgery (the
+/// chain verifier already enforced the latter; a CRL can only ever authenticate a
+/// *revocation*, never clear a bad chain).
+fn checkCrlRevocation(crl_der: []const u8, issuer_spki_der: []const u8, leaf_serial_der: []const u8, now_unix: ?i64) Error!void {
+    const now = now_unix orelse return; // no trustworthy clock → can't judge currency
+    const parsed = crl.parse(crl_der) catch return; // fail-open: unparseable CRL
+    crl.verifyParsedCrlSignature(parsed, issuer_spki_der) catch return; // fail-open: not authentic for this issuer
+    if (!crl.crlIsCurrent(parsed, now)) return; // fail-open: stale or not-yet-valid
+    if (crl.isSerialRevoked(parsed, leaf_serial_der)) return error.CertificateRevoked;
+}
+
 fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
     if (data.len < 4) return error.BadCertificate;
     if (data[0] != 1) return error.BadCertificate;
@@ -3037,4 +3075,152 @@ test "leaf RSA key survives the hs_plain consume (regression: copied, not borrow
     try std.testing.expectEqualSlices(u8, n_snapshot[0..n_len], client.leaf_key.?.rsa.n);
     try std.testing.expect(client.leaf_key.?.rsa.n[0] != 0xAA);
     try std.testing.expect(client.leaf_key.?.rsa.e.len >= 1 and client.leaf_key.?.rsa.e[client.leaf_key.?.rsa.e.len - 1] == 0x01);
+}
+
+// ---------------------------------------------------------------------------
+// CRL revocation wiring (roadmap 4.2) — end-to-end over `checkCrlRevocation`.
+// A self-contained Ed25519 signed-CRL builder keeps these hermetic; the CRL
+// parse/verify primitives themselves are exercised in crl.zig. What is proven
+// HERE is the wiring's fail-open composition: only an authentic + current CRL
+// that lists the leaf serial may revoke; every other outcome is ignored.
+// ---------------------------------------------------------------------------
+
+fn crlTestDerLen(out: *std.ArrayList(u8), a: std.mem.Allocator, len: usize) !void {
+    if (len < 128) {
+        try out.append(a, @intCast(len));
+        return;
+    }
+    var tmp: [@sizeOf(usize)]u8 = undefined;
+    var n = len;
+    var count: usize = 0;
+    while (n != 0) : (n >>= 8) {
+        tmp[tmp.len - 1 - count] = @intCast(n & 0xff);
+        count += 1;
+    }
+    try out.append(a, 0x80 | @as(u8, @intCast(count)));
+    try out.appendSlice(a, tmp[tmp.len - count ..]);
+}
+
+fn crlTestTlv(out: *std.ArrayList(u8), a: std.mem.Allocator, tag: u8, value: []const u8) !void {
+    try out.append(a, tag);
+    try crlTestDerLen(out, a, value.len);
+    try out.appendSlice(a, value);
+}
+
+const crl_test_ed25519_oid = [_]u8{ 0x2B, 0x65, 0x70 };
+
+fn crlTestAlgIdEd25519(out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try crlTestTlv(&body, a, x509.Tag.oid, &crl_test_ed25519_oid);
+    try crlTestTlv(out, a, x509.Tag.sequence, body.items);
+}
+
+fn crlTestBitString(out: *std.ArrayList(u8), a: std.mem.Allocator, value: []const u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.append(a, 0); // 0 unused bits
+    try body.appendSlice(a, value);
+    try crlTestTlv(out, a, x509.Tag.bit_string, body.items);
+}
+
+fn crlTestEd25519Spki(a: std.mem.Allocator, public_key: [32]u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try crlTestAlgIdEd25519(&body, a);
+    try crlTestBitString(&body, a, &public_key);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try crlTestTlv(&out, a, x509.Tag.sequence, body.items);
+    return out.toOwnedSlice(a);
+}
+
+/// Signed Ed25519 CRL that revokes `revoked_serial`, valid 2026-01-01..2026-02-01.
+fn crlTestSignedCrlWithRevoked(
+    a: std.mem.Allocator,
+    kp: std.crypto.sign.Ed25519.KeyPair,
+    revoked_serial: []const u8,
+) ![]u8 {
+    // revokedCertificates ::= SEQUENCE OF SEQUENCE { serial INTEGER, date UTCTime }
+    var entry: std.ArrayList(u8) = .empty;
+    defer entry.deinit(a);
+    try crlTestTlv(&entry, a, x509.Tag.integer, revoked_serial);
+    try crlTestTlv(&entry, a, x509.Tag.utc_time, "260115000000Z");
+    var revoked: std.ArrayList(u8) = .empty;
+    defer revoked.deinit(a);
+    try crlTestTlv(&revoked, a, x509.Tag.sequence, entry.items);
+
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(a);
+    try crlTestTlv(&tbs_body, a, x509.Tag.integer, &[_]u8{1}); // version v2(1)
+    try crlTestAlgIdEd25519(&tbs_body, a); // signature AlgId
+    try crlTestTlv(&tbs_body, a, x509.Tag.sequence, ""); // issuer (empty Name)
+    try crlTestTlv(&tbs_body, a, x509.Tag.utc_time, "260101000000Z"); // thisUpdate
+    try crlTestTlv(&tbs_body, a, x509.Tag.utc_time, "260201000000Z"); // nextUpdate
+    try crlTestTlv(&tbs_body, a, x509.Tag.sequence, revoked.items); // revokedCertificates
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(a);
+    try crlTestTlv(&tbs, a, x509.Tag.sequence, tbs_body.items);
+    const sig = try kp.sign(tbs.items, null);
+    const sig_bytes = sig.toBytes();
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, tbs.items);
+    try crlTestAlgIdEd25519(&body, a);
+    try crlTestBitString(&body, a, &sig_bytes);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try crlTestTlv(&out, a, x509.Tag.sequence, body.items);
+    return out.toOwnedSlice(a);
+}
+
+test "checkCrlRevocation fail-open: no clock and unparseable CRL never error" {
+    // No trustworthy clock → cannot judge currency → fail-open (returns before
+    // touching the CRL) even against a syntactically valid-looking input.
+    try checkCrlRevocation(&[_]u8{ 0x30, 0x00 }, &[_]u8{}, &[_]u8{0x2A}, null);
+    // Clock present but the bytes are not a CRL → parse fails → fail-open.
+    try checkCrlRevocation(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, &[_]u8{}, &[_]u8{0x2A}, 1_767_225_601);
+}
+
+test "checkCrlRevocation revokes only a listed serial under an authentic, current CRL" {
+    const a = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const spki = try crlTestEd25519Spki(a, kp.public_key.toBytes());
+    defer a.free(spki);
+    const der = try crlTestSignedCrlWithRevoked(a, kp, &[_]u8{0x2A});
+    defer a.free(der);
+
+    const parsed = try crl.parse(der);
+    const now = parsed.this_update.epoch_seconds + 1; // inside [thisUpdate, nextUpdate)
+
+    // Positive: an authentic, current CRL that lists the leaf serial MUST revoke.
+    try std.testing.expectError(error.CertificateRevoked, checkCrlRevocation(der, spki, &[_]u8{0x2A}, now));
+    // A serial absent from the CRL passes cleanly.
+    try checkCrlRevocation(der, spki, &[_]u8{0x2B}, now);
+}
+
+test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
+    const a = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    const der = try crlTestSignedCrlWithRevoked(a, kp, &[_]u8{0x2A});
+    defer a.free(der);
+    const parsed = try crl.parse(der);
+    const now = parsed.this_update.epoch_seconds + 1;
+
+    // Authenticated under the WRONG issuer key → the CRL is discarded (fail-open)
+    // even though the serial is listed: an unauthenticated CRL must never revoke.
+    const attacker = try Ed25519.KeyPair.generateDeterministic([_]u8{0x77} ** Ed25519.KeyPair.seed_length);
+    const attacker_spki = try crlTestEd25519Spki(a, attacker.public_key.toBytes());
+    defer a.free(attacker_spki);
+    try checkCrlRevocation(der, attacker_spki, &[_]u8{0x2A}, now);
+
+    // Correct issuer key but the CRL is stale (now == nextUpdate) → fail-open.
+    const spki = try crlTestEd25519Spki(a, kp.public_key.toBytes());
+    defer a.free(spki);
+    const stale = parsed.next_update.?.epoch_seconds;
+    try checkCrlRevocation(der, spki, &[_]u8{0x2A}, stale);
 }
