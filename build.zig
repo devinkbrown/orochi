@@ -163,9 +163,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -248,7 +246,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "orochi", .module = mod }},
         }),
     });
-    check_exe.generated_bin = null; // analyze only; do not codegen/link an artifact
+    check_exe.generated_bin = .none; // analyze only; do not codegen/link an artifact
     check_step.dependOn(&check_exe.step);
 
     // `zig build ct-check` — the opt-in, dudect-style constant-time verification
@@ -423,7 +421,7 @@ fn manifestVersion() []const u8 {
 /// source tarball still succeed. The `-C <build_root>` keeps it correct
 /// regardless of the build's working directory.
 fn gitCommit(b: *std.Build) []const u8 {
-    const root = b.build_root.path orelse ".";
+    const root = b.root.root_dir.path orelse ".";
     const hash = b.runAllowFail(
         &.{ "git", "-C", root, "rev-parse", "--short", "HEAD" },
         &code,
