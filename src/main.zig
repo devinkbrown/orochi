@@ -466,6 +466,19 @@ pub fn main(init: std.process.Init) !void {
     defer if (tls_loaded) |*t| t.deinit(allocator);
     var tls12_loaded: ?orochi.daemon.tls_certs.Tls12 = null;
     defer if (tls12_loaded) |*t| t.deinit(allocator);
+    // [[tls.sni]] additional certs: each entry's on-disk cert+key is loaded with
+    // the SAME loader as the default cert. The loaded material must outlive the
+    // server (each `tls_server.SniCert` borrows its chain bytes and aliases any
+    // RSA key storage), so the loads live on main's frame and free at process
+    // exit — mirroring `tls_loaded`. `tls_sni_certs` is the selection list handed
+    // to the listener; the array itself is freed here, its contents borrow above.
+    var tls_sni_loaded: std.ArrayList(orochi.daemon.tls_certs.Loaded) = .empty;
+    defer {
+        for (tls_sni_loaded.items) |*s| s.deinit(allocator);
+        tls_sni_loaded.deinit(allocator);
+    }
+    var tls_sni_certs: []orochi.crypto.tls_server.SniCert = &.{};
+    defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
     if (held) |h| {
         if (h.tls.enabled) {
             if (orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
@@ -481,6 +494,55 @@ pub fn main(init: std.process.Init) !void {
                     break :tls_material;
                 };
                 tls_loaded = loaded;
+                // [[tls.sni]] additional SNI-selectable certificates: load each
+                // entry's cert+key with the SAME loader as the default cert, retain
+                // the material for the server's lifetime, and hand the listener the
+                // selection list. A malformed/expired entry fails TLS bring-up
+                // wholesale (fail-fast) — reached BEFORE any `srv_cfg.tls_*` field is
+                // wired, so TLS stays fully disabled rather than half-configured,
+                // consistent with the default cert's validation-failure path.
+                if (h.tls.sni.len != 0) {
+                    const built = allocator.alloc(orochi.crypto.tls_server.SniCert, h.tls.sni.len) catch {
+                        std.debug.print("orochi: out of memory building SNI cert list; TLS disabled\n", .{});
+                        break :tls_material;
+                    };
+                    for (h.tls.sni, 0..) |entry, i| {
+                        const sni_material = orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
+                            .enabled = true,
+                            .cert_path = entry.cert_path,
+                            .key_path = entry.key_path,
+                            .dns_name = h.tls.dns_name,
+                        }) catch |err| {
+                            allocator.free(built);
+                            std.debug.print("orochi: [[tls.sni]] cert load failed ({s}); TLS disabled\n", .{@errorName(err)});
+                            break :tls_material;
+                        };
+                        validateTlsChain(sni_material.cert_chain) catch |err| {
+                            var rejected = sni_material;
+                            rejected.deinit(allocator);
+                            allocator.free(built);
+                            std.debug.print("orochi: [[tls.sni]] certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                            break :tls_material;
+                        };
+                        tls_sni_loaded.append(allocator, sni_material) catch {
+                            var rejected = sni_material;
+                            rejected.deinit(allocator);
+                            allocator.free(built);
+                            std.debug.print("orochi: out of memory retaining SNI cert; TLS disabled\n", .{});
+                            break :tls_material;
+                        };
+                        built[i] = .{
+                            .server_names = entry.server_names,
+                            .cert_chain = sni_material.cert_chain,
+                            .signing_key = sni_material.signing_key,
+                            .ecdsa_p256_signing_key = sni_material.ecdsa_p256_signing_key,
+                            .rsa_signing_key = sni_material.rsa_signing_key,
+                        };
+                    }
+                    tls_sni_certs = built;
+                    srv_cfg.tls_sni_certs = tls_sni_certs;
+                    std.debug.print("orochi: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
+                }
                 srv_cfg.tls_port = h.tls.port;
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
                 srv_cfg.tls_signing_key = tls_loaded.?.signing_key;

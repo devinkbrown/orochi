@@ -1565,6 +1565,11 @@ pub const Config = struct {
     /// CertificateVerify with ecdsa_secp256r1_sha256 (and the 1.2 leg natively).
     /// This is the common Let's Encrypt / ACME leaf type.
     tls_ecdsa_signing_key: ?ecdsa_p256.KeyPair = null,
+    /// Additional SNI-selectable certificates (`[[tls.sni]]`, loaded by main.zig).
+    /// When a ClientHello's server_name matches an entry, the TLS listener presents
+    /// that entry's chain+key instead of the default leaf. Borrowed for the server's
+    /// lifetime. Empty ⇒ SNI is not consulted (byte-identical single-cert handshake).
+    tls_sni_certs: []const tls_server.SniCert = &.{},
     /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
     /// TLS listener. Default false keeps the listener's historical full-handshake
     /// behavior byte-identical.
@@ -3324,6 +3329,7 @@ pub const LinuxServer = struct {
             .ecdsa_p256_signing_key = self.config.tls_ecdsa_signing_key,
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = request_client_cert,
+            .sni_certs = self.config.tls_sni_certs,
         };
         if (self.config.tls_ocsp_staple) |staple| cfg.ocsp_staple = staple;
         if (self.config.tls_enable_resumption) {

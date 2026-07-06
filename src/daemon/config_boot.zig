@@ -203,6 +203,10 @@ pub const TlsBootConfig = struct {
     enable_resumption: bool = false,
     early_data_max_size: u32 = 0,
     ktls: config_format.Config.KtlsMode = .off,
+    /// Additional SNI-selectable certificates (`[[tls.sni]]`). Strings borrow
+    /// `parsed`; `main.zig` loads each entry's cert+key and hands the material to
+    /// the TLS listener. Empty ⇒ no SNI certs (single-cert behavior).
+    sni: []const config_format.Config.SniCertDef = &.{},
 };
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
@@ -219,6 +223,7 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .enable_resumption = cfg.tls.enable_resumption,
         .early_data_max_size = cfg.tls.early_data_max_size,
         .ktls = cfg.tls.ktls,
+        .sni = cfg.tls.sni,
     };
 }
 
@@ -680,6 +685,39 @@ test "tls section projects onto the boot tls config" {
     try testing.expectEqualStrings("leaf.pem", loaded.tls.cert_path.?);
     try testing.expectEqualStrings("leaf.key", loaded.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", loaded.tls.dns_name);
+}
+
+test "tls sni entries surface on the boot tls projection" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\cert_path = "default.pem"
+        \\key_path = "default.key"
+        \\[[tls.sni]]
+        \\server_names = ["irc.example.test"]
+        \\cert_path = "example.pem"
+        \\key_path = "example.key"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.tls.enabled);
+    try testing.expectEqual(@as(usize, 1), loaded.tls.sni.len);
+    try testing.expectEqualStrings("irc.example.test", loaded.tls.sni[0].server_names[0]);
+    try testing.expectEqualStrings("example.pem", loaded.tls.sni[0].cert_path);
+    try testing.expectEqualStrings("example.key", loaded.tls.sni[0].key_path);
+}
+
+test "tls omitted keeps sni empty on the boot projection" {
+    const allocator = testing.allocator;
+    var loaded = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.tls.sni.len);
 }
 
 test "tls omitted keeps boot defaults" {

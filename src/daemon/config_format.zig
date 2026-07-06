@@ -493,6 +493,25 @@ pub const Config = struct {
         early_data_max_size: u32 = 0,
         /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
         ktls: KtlsMode = .off,
+        /// Additional SNI-selectable certificates (`[[tls.sni]]`, owned). When a
+        /// ClientHello's server_name matches an entry's `server_names`, the TLS
+        /// layer presents that entry's cert instead of the default leaf above.
+        /// Empty ⇒ SNI is not consulted (byte-identical to single-cert behavior).
+        sni: []SniCertDef = &.{},
+    };
+
+    /// One `[[tls.sni]]` entry. `main.zig` loads `cert_path` + `key_path` with the
+    /// SAME loader as the default cert (`tls_certs.loadOrBootstrap`) and hands the
+    /// material to the TLS layer as a `crypto/tls_server.SniCert`. All three fields
+    /// are required — a partial entry is a fail-fast parse error.
+    pub const SniCertDef = struct {
+        /// Host names (or `*.`-wildcard patterns) this cert answers to, matched
+        /// case-insensitively by the TLS layer. Must be non-empty.
+        server_names: []const []const u8 = &.{},
+        /// PEM/DER leaf (or fullchain) certificate path.
+        cert_path: []const u8 = "",
+        /// PEM/DER private key path.
+        key_path: []const u8 = "",
     };
 
     /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
@@ -660,6 +679,12 @@ pub const Config = struct {
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
         if (self.tls.key_path) |value| allocator.free(value);
+        for (self.tls.sni) |s| {
+            freeStringList(allocator, s.server_names);
+            allocator.free(s.cert_path);
+            allocator.free(s.key_path);
+        }
+        allocator.free(self.tls.sni);
         allocator.free(self.acme.directory_url);
         allocator.free(self.webpush.subject);
         allocator.free(self.webpush.vapid_key_path);
@@ -875,6 +900,36 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("tls.enable_resumption")) |b| cfg.tls.enable_resumption = b;
     cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
     if (doc.getString("tls.ktls")) |s| cfg.tls.ktls = parseKtlsMode(s) orelse return error.ParseError;
+
+    // [[tls.sni]] — additional SNI-selectable certificates. Each entry pairs one
+    // or more host names with an on-disk cert+key; main.zig loads the material
+    // (same loader as the default cert). All three keys are required — a partial
+    // entry is a fail-fast config error, matching the `[[opers]]` idiom.
+    if (doc.getArray("tls.sni")) |arr| {
+        var list: std.ArrayList(Config.SniCertDef) = .empty;
+        errdefer {
+            for (list.items) |s| {
+                freeStringList(allocator, s.server_names);
+                allocator.free(s.cert_path);
+                allocator.free(s.key_path);
+            }
+            list.deinit(allocator);
+        }
+        for (arr) |*item| {
+            const names = if (item.getArray("server_names")) |narr|
+                try ownStringArray(allocator, resolver, narr)
+            else
+                return error.ParseError;
+            errdefer freeStringList(allocator, names);
+            if (names.len == 0) return error.ParseError;
+            const cert_path = try resolveStr(allocator, resolver, item.getString("cert_path") orelse return error.ParseError);
+            errdefer allocator.free(cert_path);
+            const key_path = try resolveStr(allocator, resolver, item.getString("key_path") orelse return error.ParseError);
+            errdefer allocator.free(key_path);
+            try list.append(allocator, .{ .server_names = names, .cert_path = cert_path, .key_path = key_path });
+        }
+        cfg.tls.sni = try list.toOwnedSlice(allocator);
+    }
 
     // [acme]
     if (doc.getBool("acme.enabled")) |b| cfg.acme.enabled = b;
@@ -1570,6 +1625,82 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expect(cfg.tls.enable_resumption);
     try testing.expectEqual(@as(u32, 16384), cfg.tls.early_data_max_size);
     try testing.expectEqual(Config.KtlsMode.tx, cfg.tls.ktls);
+}
+
+test "parseToml: [[tls.sni]] projects additional SNI certs onto Config" {
+    // Arrange
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\cert_path = "/etc/orochi/default.pem"
+        \\key_path = "/etc/orochi/default.key"
+        \\[[tls.sni]]
+        \\server_names = ["irc.example.test", "*.example.test"]
+        \\cert_path = "/etc/orochi/example.pem"
+        \\key_path = "/etc/orochi/example.key"
+        \\[[tls.sni]]
+        \\server_names = ["alt.test"]
+        \\cert_path = "/etc/orochi/alt.pem"
+        \\key_path = "/etc/orochi/alt.key"
+        \\
+    ;
+
+    // Act
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+
+    // Assert: the default cert is unaffected and both SNI entries parse in order.
+    try testing.expectEqualStrings("/etc/orochi/default.pem", cfg.tls.cert_path.?);
+    try testing.expectEqual(@as(usize, 2), cfg.tls.sni.len);
+    try testing.expectEqual(@as(usize, 2), cfg.tls.sni[0].server_names.len);
+    try testing.expectEqualStrings("irc.example.test", cfg.tls.sni[0].server_names[0]);
+    try testing.expectEqualStrings("*.example.test", cfg.tls.sni[0].server_names[1]);
+    try testing.expectEqualStrings("/etc/orochi/example.pem", cfg.tls.sni[0].cert_path);
+    try testing.expectEqualStrings("/etc/orochi/example.key", cfg.tls.sni[0].key_path);
+    try testing.expectEqual(@as(usize, 1), cfg.tls.sni[1].server_names.len);
+    try testing.expectEqualStrings("alt.test", cfg.tls.sni[1].server_names[0]);
+    try testing.expectEqualStrings("/etc/orochi/alt.pem", cfg.tls.sni[1].cert_path);
+}
+
+test "parseToml: [[tls.sni]] absent keeps sni empty (byte-identical default path)" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[tls]\nenabled=true\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), cfg.tls.sni.len);
+}
+
+test "parseToml: a [[tls.sni]] entry missing required keys is rejected" {
+    const allocator = testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n[tls]\nenabled=true\n";
+    // Missing key_path.
+    try testing.expectError(error.ParseError, parseToml(
+        allocator,
+        base ++ "[[tls.sni]]\nserver_names=[\"a.test\"]\ncert_path=\"a.pem\"\n",
+        .{},
+    ));
+    // Missing cert_path.
+    try testing.expectError(error.ParseError, parseToml(
+        allocator,
+        base ++ "[[tls.sni]]\nserver_names=[\"a.test\"]\nkey_path=\"a.key\"\n",
+        .{},
+    ));
+    // Missing server_names entirely.
+    try testing.expectError(error.ParseError, parseToml(
+        allocator,
+        base ++ "[[tls.sni]]\ncert_path=\"a.pem\"\nkey_path=\"a.key\"\n",
+        .{},
+    ));
+    // Empty server_names list.
+    try testing.expectError(error.ParseError, parseToml(
+        allocator,
+        base ++ "[[tls.sni]]\nserver_names=[]\ncert_path=\"a.pem\"\nkey_path=\"a.key\"\n",
+        .{},
+    ));
 }
 
 test "parseToml: ktls mode parses txrx and rejects an unknown value" {
