@@ -370,6 +370,10 @@ pub const Config = struct {
         /// When false (default) untagged datagrams still relay, but a present tag
         /// must verify.
         ws_media_require_mac: bool = false,
+        /// Terminate DTLS-SRTP (RFC 5764) on the WebRTC UDP media plane so
+        /// standard browser/mobile endpoints can key the SRTP leg via a DTLS
+        /// handshake. Off by default; when off the media pump is byte-identical.
+        dtls_srtp: bool = false,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -847,6 +851,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.native_media_require_mac")) |b| cfg.media.native_media_require_mac = b;
     if (doc.getBool("media.ws_media_relay")) |b| cfg.media.ws_media_relay = b;
     if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
+    if (doc.getBool("media.dtls_srtp")) |b| cfg.media.dtls_srtp = b;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
@@ -1545,6 +1550,18 @@ test "parseToml: minimal config keeps defaults" {
     try testing.expectEqual(@as(u16, 0), cfg.listen.s2s);
     try testing.expectEqualStrings("127.0.0.1", cfg.listen.host);
     try testing.expect(!cfg.media.native_media_require_mac);
+    try testing.expect(!cfg.media.dtls_srtp);
+}
+
+test "parseToml: media.dtls_srtp defaults off and lifts when set" {
+    const allocator = testing.allocator;
+    var dflt = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer dflt.deinit(allocator);
+    try testing.expect(!dflt.media.dtls_srtp);
+
+    var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[media]\ndtls_srtp = true\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.media.dtls_srtp);
 }
 
 test "parseToml: media sizing keys default, lift, and validate ranges" {

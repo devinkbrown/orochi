@@ -18,6 +18,8 @@ const media_socket = @import("../substrate/media_socket.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const rtp_nack = @import("../substrate/rtp_nack.zig");
 const media_bridge = @import("media_bridge.zig");
+const dtls_server = @import("../proto/dtls12_server.zig");
+const platform = @import("../substrate/platform.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -92,6 +94,20 @@ pub const MediaPlane = struct {
     /// pump hands it here to also reach the channel's native members (rewrapped to
     /// kagura). Null = no native members / no bridging.
     cross: ?media_bridge.RtpCrossSink = null,
+    /// Opt-in DTLS-SRTP termination (RFC 5764). Set before `start`; when false
+    /// the pump has no DTLS demux branch and is byte-identical to today.
+    dtls_enabled: bool = false,
+    /// Per-peer DTLS server terminator, allocated in `start` when `dtls_enabled`
+    /// and freed in `shutdown`. Pump-thread-owned (not internally synchronised).
+    dtls: ?*dtls_server.Terminator = null,
+    /// Backing session table for `dtls` (owned; freed alongside it).
+    dtls_sessions: []dtls_server.Session = &.{},
+    /// Inline snapshot of the DTLS `a=fingerprint` line, taken once at `start`
+    /// from the immutable cert. Read by the signaling layer from any thread
+    /// WITHOUT dereferencing the mutable terminator pointer (never a UAF, and
+    /// the buffer is inline so it is never freed). `len` 0 = DTLS off/down.
+    dtls_fingerprint_buf: [128]u8 = undefined,
+    dtls_fingerprint_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -132,12 +148,56 @@ pub const MediaPlane = struct {
         }
         self.socket.?.setRecvTimeoutMs(250); // pump: wake to observe the stop flag
 
+        // Stand up the DTLS-SRTP terminator before the pump owns it (the pump is
+        // the sole thread that drives handshakes). A failure disables DTLS but
+        // keeps the media plane serving.
+        if (self.dtls_enabled) self.startDtls() catch |e| {
+            self.dtls_enabled = false;
+            std.log.warn("orochi: DTLS-SRTP terminator disabled ({s})", .{@errorName(e)});
+        };
+
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch |e| {
+            self.stopDtls();
             self.socket.?.deinit();
             self.socket = null;
             return e;
         };
+    }
+
+    /// Allocate + initialise the DTLS terminator and its session table.
+    fn startDtls(self: *MediaPlane) !void {
+        var seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed); // don't leave the seed on the stack
+        try platform.fillOsEntropy(&seed);
+        const sessions = try self.allocator.alloc(dtls_server.Session, dtls_server.default_max_sessions);
+        errdefer self.allocator.free(sessions);
+        const now_s = @divTrunc(platform.realtimeMillis(), 1000);
+        const term = try self.allocator.create(dtls_server.Terminator);
+        errdefer self.allocator.destroy(term);
+        term.* = try dtls_server.Terminator.init(seed, sessions, now_s - 86_400, now_s + 10 * 365 * 86_400);
+        // Snapshot the immutable fingerprint for lock-free cross-thread reads.
+        if (term.fingerprintLine(&self.dtls_fingerprint_buf)) |fp| {
+            self.dtls_fingerprint_len = fp.len;
+        } else |_| {
+            self.dtls_fingerprint_len = 0;
+        }
+        self.dtls_sessions = sessions;
+        self.dtls = term;
+    }
+
+    /// Tear down the DTLS terminator (secure-zeroing key material) and free it.
+    fn stopDtls(self: *MediaPlane) void {
+        self.dtls_fingerprint_len = 0;
+        if (self.dtls) |term| {
+            term.deinit();
+            self.allocator.destroy(term);
+            self.dtls = null;
+        }
+        if (self.dtls_sessions.len != 0) {
+            self.allocator.free(self.dtls_sessions);
+            self.dtls_sessions = &.{};
+        }
     }
 
     /// Signal the pump thread to stop, join it, and close the socket.
@@ -147,6 +207,8 @@ pub const MediaPlane = struct {
             t.join();
             self.thread = null;
         }
+        // Only safe to free after the pump (sole DTLS driver) has joined.
+        self.stopDtls();
         if (self.socket) |*s| {
             s.deinit();
             self.socket = null;
@@ -160,6 +222,13 @@ pub const MediaPlane = struct {
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
             if (got.data.len == 0) continue;
             if (got.data.len > self.max_frame_bytes) continue;
+            // RFC 7983 demultiplexing: DTLS records carry a content-type byte in
+            // 20..=63. Only taken when DTLS-SRTP is enabled, so the STUN/RTP
+            // paths below are byte-identical when off.
+            if (self.dtls_enabled and got.data[0] >= 20 and got.data[0] <= 63) {
+                self.handleDtls(sock, got.from, got.data);
+                continue;
+            }
             if (MediaSocket.isStun(got.data[0])) {
                 lockSpin(&self.mutex);
                 const resp = self.transport.handleStunBinding(self.allocator, got.data, got.from) catch null;
@@ -193,6 +262,30 @@ pub const MediaPlane = struct {
                 }
             }
         }
+    }
+
+    /// Drive one DTLS record datagram through the per-peer terminator and send
+    /// any response flight back to `from`. Terminator state is touched only by
+    /// this (pump) thread. The response is a small handshake flight (< 2 KiB).
+    fn handleDtls(self: *MediaPlane, sock: *MediaSocket, from: TransportAddress, data: []const u8) void {
+        const term = self.dtls orelse return;
+        var out: [2048]u8 = undefined;
+        const now = platform.monotonicMillis();
+        if (term.handleDatagram(from, data, now, &out)) |resp| {
+            sock.sendTo(from, resp);
+        }
+    }
+
+    /// The daemon's DTLS `a=fingerprint` line (SHA-256), copied into `out`, for
+    /// the signaling layer to advertise (Increment 3). Null when DTLS-SRTP is
+    /// disabled/down. Reads the inline snapshot taken at `start` — never
+    /// dereferences the mutable terminator pointer, so it is UAF-safe from any
+    /// thread even racing teardown (worst case: a stale-but-valid line or null).
+    pub fn dtlsFingerprint(self: *const MediaPlane, out: []u8) ?[]const u8 {
+        const n = self.dtls_fingerprint_len;
+        if (n == 0 or out.len < n) return null;
+        @memcpy(out[0..n], self.dtls_fingerprint_buf[0..n]);
+        return out[0..n];
     }
 
     /// Selectively forward `packet` (from `source`) to the other call
@@ -308,6 +401,10 @@ pub const MediaPlane = struct {
 
 const testing = std.testing;
 const stun = @import("../proto/stun.zig");
+const dtls_messages = @import("../proto/dtls12_messages.zig");
+const dtls_record = @import("../proto/dtls12_record.zig");
+const dtls_handshake = @import("../proto/dtls_handshake.zig");
+const dtls_srtp = @import("../proto/dtls_srtp.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);
@@ -351,4 +448,50 @@ test "MediaPlane: start/shutdown is clean and re-startable port is reported" {
     // After shutdown the socket is closed; re-start binds a fresh ephemeral port.
     try plane.start(loopback_be, 0);
     try testing.expect(plane.port != 0);
+}
+
+test "MediaPlane: DTLS off leaves the pump with no terminator and no fingerprint" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    try plane.start(loopback_be, 0);
+    try testing.expect(plane.dtls == null);
+    var fp_buf: [128]u8 = undefined;
+    try testing.expect(plane.dtlsFingerprint(&fp_buf) == null);
+}
+
+test "MediaPlane: DTLS-enabled pump demultiplexes a ClientHello into a HelloVerifyRequest" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true;
+    try plane.start(loopback_be, 0);
+    // Terminator stood up and exposes a well-formed SHA-256 fingerprint.
+    try testing.expect(plane.dtls != null);
+    var fp_buf: [128]u8 = undefined;
+    const fp = plane.dtlsFingerprint(&fp_buf) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, fp, "sha-256 "));
+
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    client.setRecvTimeoutMs(2000);
+
+    // Send a bare ClientHello (RFC 7983 DTLS range → content-type byte 22).
+    var rnd: [32]u8 = undefined;
+    for (&rnd, 0..) |*b, i| b.* = @intCast(i +% 1);
+    var ch_body: [512]u8 = undefined;
+    const chb = try dtls_messages.buildClientHello(&ch_body, .{
+        .random = rnd,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+    });
+    var dgram: [700]u8 = undefined;
+    const dlen = try dtls_server.framePlaintextHandshake(&dgram, .client_hello, 0, 0, 0, chb);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+    client.sendTo(server_addr, dgram[0..dlen]);
+
+    // The pump demuxes to DTLS and replies with a HelloVerifyRequest.
+    var cbuf: [media_socket.max_datagram]u8 = undefined;
+    const got = client.recvFrom(&cbuf) orelse return error.TestUnexpectedResult;
+    const rdec = try dtls_record.RecordHeader.decode(got.data);
+    try testing.expectEqual(dtls_record.ContentType.handshake, rdec.hdr.content_type);
+    const hh = try dtls_handshake.Header.decode(rdec.fragment);
+    try testing.expectEqual(dtls_handshake.HandshakeType.hello_verify_request, hh.hdr.msg_type);
 }

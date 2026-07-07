@@ -82,15 +82,21 @@ pub fn exportSrtpKeys(
     client_random: [32]u8,
     server_random: [32]u8,
 ) ExportedKeys {
-    const klen = srtp.master_key_len;
-    const slen = srtp.master_salt_len;
     var seed: [64]u8 = undefined;
     @memcpy(seed[0..32], &client_random);
     @memcpy(seed[32..64], &server_random);
 
-    var km: [2 * (klen + slen)]u8 = undefined;
+    var km: [2 * (srtp.master_key_len + srtp.master_salt_len)]u8 = undefined;
     prfSha256(master_secret, exporter_label, &seed, &km);
+    return splitSrtpKeyMaterial(&km);
+}
 
+/// Split raw SRTP keying material
+/// (`client_key(16) || server_key(16) || client_salt(14) || server_salt(14)`)
+/// into per-direction `ExportedKeys` (RFC 5764 §4.2 ordering).
+fn splitSrtpKeyMaterial(km: *const [2 * (srtp.master_key_len + srtp.master_salt_len)]u8) ExportedKeys {
+    const klen = srtp.master_key_len;
+    const slen = srtp.master_salt_len;
     var out: ExportedKeys = undefined;
     @memcpy(out.client[0..klen], km[0..klen]);
     @memcpy(out.server[0..klen], km[klen .. 2 * klen]);
