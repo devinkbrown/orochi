@@ -293,11 +293,19 @@ pub fn build(b: *std.Build) void {
     //   * `zig build fuzz`         — replay each target's seed corpus once
     //                                (bounded, fast: a compile-and-no-crash gate).
     //   * `zig build fuzz --fuzz`  — drive the SAME targets coverage-guided via
-    //                                Zig 0.16's builtin fuzzer (runs until stopped).
+    //                                Zig's builtin fuzzer (runs until stopped).
+    //
+    // Toolchain status (Zig 0.17.0-dev, re-verified 2026-07-07): the bounded
+    // `zig build fuzz` mode compiles and passes. Coverage-guided `--fuzz` now
+    // BUILDS, LINKS, and starts fuzzing (the Zig 0.16 test_runner StackTrace build
+    // error is gone), but the compiler's own fuzzer runtime then crashes
+    // deterministically (`panic: start index 1 is larger than end index 0`, a
+    // slice-bounds bug in lib/zig/fuzzer.zig — reproducible with a trivial
+    // zero-orochi target). See the TOOLCHAIN NOTE in src/crypto/tls_fuzz.zig.
     //
     // Kept SEPARATE from `zig build test` (which still runs these targets, but
     // only in bounded corpus-replay mode) so the fuzz filter never perturbs the
-    // full ~6100-test suite, mirroring the ct-check step above. The test filter
+    // full ~6280-test suite, mirroring the ct-check step above. The test filter
     // scopes the artifact to just the `cov-fuzz:` targets so `--fuzz` fuzzes the
     // TLS parsers in isolation rather than every fuzz test in the tree.
     const fuzz_tests = b.addTest(.{
