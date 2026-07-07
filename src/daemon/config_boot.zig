@@ -145,6 +145,12 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.sasl_allow_anonymous = cfg.sasl.allow_anonymous;
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
+    // [webauthn] — passkey RP id + allowed origins (strings borrow cfg, which
+    // lives for the process). Both must be present for WEBAUTHN to activate.
+    if (cfg.webauthn.rp_id) |v| {
+        if (v.len != 0) out.webauthn_rp_id = v;
+    }
+    if (cfg.webauthn.origins.len != 0) out.webauthn_origins = cfg.webauthn.origins;
     return out;
 }
 

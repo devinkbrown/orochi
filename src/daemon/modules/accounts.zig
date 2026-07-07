@@ -89,6 +89,10 @@ fn certAdd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCertAdd(x.conn);
 }
+fn webauthn(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleWebauthn(x.conn, x.parsed);
+}
 fn certList(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCertList(x.conn);
@@ -127,6 +131,7 @@ pub const CS_spec = registry.CommandSpec{ .name = "CS", .feature = accounts_feat
 pub const SESSION_spec = registry.CommandSpec{ .name = "SESSION", .feature = accounts_feature, .handler = session };
 pub const SESSIONTOKEN_spec = registry.CommandSpec{ .name = "SESSIONTOKEN", .feature = accounts_feature, .handler = sessionToken };
 pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = accounts_feature, .handler = certAdd };
+pub const WEBAUTHN_spec = registry.CommandSpec{ .name = "WEBAUTHN", .min_params = 1, .feature = accounts_feature, .handler = webauthn, .summary = "manage passkeys / passwordless login (REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS)" };
 pub const CERTLIST_spec = registry.CommandSpec{ .name = "CERTLIST", .feature = accounts_feature, .handler = certList };
 pub const CERTDEL_spec = registry.CommandSpec{ .name = "CERTDEL", .feature = accounts_feature, .handler = certDel };
 pub const RECOGNIZE_spec = registry.CommandSpec{ .name = "RECOGNIZE", .feature = accounts_feature, .handler = recognize, .summary = "manage your account host-recognition list (ADD|DEL|LIST)" };
@@ -158,6 +163,7 @@ pub const module = registry.Module{
         CERTADD_spec,
         CERTLIST_spec,
         CERTDEL_spec,
+        WEBAUTHN_spec,
         RECOGNIZE_spec,
         LISTCHANS_spec,
     },
@@ -169,5 +175,6 @@ test "accounts commands are feature gated except SASLINFO" {
     try @import("std").testing.expect(!registry.commandAvailable(REGISTER_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(CHANNEL_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(SESSIONTOKEN_spec, caps));
+    try @import("std").testing.expect(!registry.commandAvailable(WEBAUTHN_spec, caps));
     try @import("std").testing.expect(registry.commandAvailable(SASLINFO_spec, caps));
 }

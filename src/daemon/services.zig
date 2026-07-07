@@ -9,6 +9,7 @@ const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
 const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
+const webauthn_creds = @import("webauthn_creds.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
@@ -461,6 +462,261 @@ pub const Services = struct {
         var fp_key_buf: [certfp_key_max]u8 = undefined;
         if (certfpKey(&fp_key_buf, fingerprint)) |fp_key| self.store.family(.props).delete(fp_key) catch {};
         try self.removeCertfpListEntry(key.asSlice(), fingerprint);
+    }
+
+    // -- WebAuthn (passkey) credentials --------------------------------------
+    //
+    // Durable credential storage mirroring the certfp pattern: each credential
+    // is a `.props` record keyed by its (unique) credential id, plus a per-
+    // account newline-separated list of credential ids for LIST/allow-list.
+    // All record encode/decode + validation lives in `webauthn_creds.zig`; these
+    // methods only serialize store access under the Services lock and copy every
+    // borrowed value out before releasing it. The durable store IS authoritative
+    // (no in-memory companion): verification is stateless and the single-use
+    // challenge lives in per-connection state.
+
+    /// A credential looked up by id, with all bytes copied out (valid after the
+    /// lock is released). `cose_key` holds the raw COSE_Key CBOR public key.
+    pub const WebauthnCredential = struct {
+        account_buf: [account_max]u8 = undefined,
+        account_len: usize = 0,
+        sign_count: u32 = 0,
+        created_unix: i64 = 0,
+        cose_key_buf: [webauthn_creds.max_cose_key_bytes]u8 = undefined,
+        cose_key_len: usize = 0,
+        label_buf: [webauthn_creds.max_label_bytes]u8 = undefined,
+        label_len: usize = 0,
+
+        pub fn account(self: *const WebauthnCredential) []const u8 {
+            return self.account_buf[0..self.account_len];
+        }
+        pub fn coseKey(self: *const WebauthnCredential) []const u8 {
+            return self.cose_key_buf[0..self.cose_key_len];
+        }
+        pub fn label(self: *const WebauthnCredential) []const u8 {
+            return self.label_buf[0..self.label_len];
+        }
+    };
+
+    /// A LIST entry, with credential id + label copied out.
+    pub const WebauthnListEntry = struct {
+        cred_id_buf: [webauthn_creds.max_cred_id_b64]u8 = undefined,
+        cred_id_len: usize = 0,
+        label_buf: [webauthn_creds.max_label_bytes]u8 = undefined,
+        label_len: usize = 0,
+        sign_count: u32 = 0,
+        created_unix: i64 = 0,
+
+        pub fn credId(self: *const WebauthnListEntry) []const u8 {
+            return self.cred_id_buf[0..self.cred_id_len];
+        }
+        pub fn label(self: *const WebauthnListEntry) []const u8 {
+            return self.label_buf[0..self.label_len];
+        }
+    };
+
+    /// Bind a passkey credential to `account`. `cose_key` is the raw COSE_Key
+    /// CBOR public key extracted from the registration authData. Fail-closed:
+    /// rejects a malformed/oversized id or key, a duplicate id (already bound to
+    /// any account), and enforces the per-account credential cap. Writes are
+    /// ordered so a failure leaves no half-bound state (record rolled back if the
+    /// list update fails).
+    pub fn webauthnBind(
+        self: *Services,
+        account: []const u8,
+        cred_id_b64: []const u8,
+        cose_key: []const u8,
+        sign_count: u32,
+        label: []const u8,
+        now_unix: i64,
+    ) ServiceError!void {
+        if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.InvalidValue;
+        if (cose_key.len == 0 or cose_key.len > webauthn_creds.max_cose_key_bytes) return error.InvalidValue;
+        if (label.len > webauthn_creds.max_label_bytes) return error.InvalidValue;
+        const key = try accountKey(account); // validates + lowercases
+
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+        const cred_key = webauthn_creds.credKey(&cred_key_buf, cred_id_b64) orelse return error.BufferTooSmall;
+        if (self.store.family(.props).get(cred_key) != null) return error.AlreadyExists;
+
+        // Encode label + cose key to base64url (delimiter-safe record fields).
+        var label_b64_buf: [webauthn_creds.max_cose_key_bytes]u8 = undefined;
+        const label_b64 = std.base64.url_safe_no_pad.Encoder.encode(label_b64_buf[0..std.base64.url_safe_no_pad.Encoder.calcSize(label.len)], label);
+        var cose_b64_buf: [webauthn_creds.max_cose_key_bytes * 2]u8 = undefined;
+        const cose_b64 = std.base64.url_safe_no_pad.Encoder.encode(cose_b64_buf[0..std.base64.url_safe_no_pad.Encoder.calcSize(cose_key.len)], cose_key);
+
+        var rec_buf: [webauthn_creds.record_value_max]u8 = undefined;
+        const record = webauthn_creds.encodeRecord(key.asSlice(), sign_count, now_unix, label_b64, cose_b64, &rec_buf) catch
+            return error.BufferTooSmall;
+
+        // Compute the new account list first so a cap/overflow failure aborts
+        // BEFORE the record is written (no orphaned record).
+        var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const list_key = webauthn_creds.accountListKey(&list_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        const existing = self.store.family(.props).get(list_key) orelse "";
+        var new_list_buf: [webauthn_creds.account_list_value_max]u8 = undefined;
+        const new_list = (webauthn_creds.listAppend(existing, cred_id_b64, &new_list_buf) catch |e| switch (e) {
+            error.ListFull => return error.AlreadyExists,
+            else => return error.BufferTooSmall,
+        }) orelse return error.AlreadyExists; // already present under this account
+
+        // Record first, then list; roll the record back if the list write fails.
+        try self.store.family(.props).put(cred_key, record);
+        self.store.family(.props).put(list_key, new_list) catch |e| {
+            self.store.family(.props).delete(cred_key) catch {};
+            return e;
+        };
+    }
+
+    /// Look up a credential by id, copying its account, COSE key, counter, and
+    /// label out under the lock. Returns `NotFound` when unbound.
+    pub fn webauthnLookup(self: *Services, cred_id_b64: []const u8, out: *WebauthnCredential) ServiceError!void {
+        if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.NotFound;
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+        const cred_key = webauthn_creds.credKey(&cred_key_buf, cred_id_b64) orelse return error.NotFound;
+        const value = self.store.family(.props).get(cred_key) orelse return error.NotFound;
+        const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
+
+        if (rec.account.len > out.account_buf.len) return error.InvalidRecord;
+        @memcpy(out.account_buf[0..rec.account.len], rec.account);
+        out.account_len = rec.account.len;
+        out.sign_count = rec.sign_count;
+        out.created_unix = rec.created_unix;
+        const cose = rec.decodeCoseKey(&out.cose_key_buf) catch return error.InvalidRecord;
+        out.cose_key_len = cose.len;
+        const lbl = rec.decodeLabel(&out.label_buf) catch return error.InvalidRecord;
+        out.label_len = lbl.len;
+    }
+
+    /// Persist a new (monotonically greater) signature counter for a credential.
+    /// Caller has already enforced the monotonic check; this only rewrites the
+    /// record. A missing record is `NotFound`.
+    pub fn webauthnUpdateSignCount(self: *Services, cred_id_b64: []const u8, new_count: u32) ServiceError!void {
+        if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.NotFound;
+
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+        const cred_key = webauthn_creds.credKey(&cred_key_buf, cred_id_b64) orelse return error.NotFound;
+        const value = self.store.family(.props).get(cred_key) orelse return error.NotFound;
+        const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
+        // Re-encode with the new counter, preserving every other field verbatim.
+        var rec_buf: [webauthn_creds.record_value_max]u8 = undefined;
+        const record = webauthn_creds.encodeRecord(rec.account, new_count, rec.created_unix, rec.label_b64, rec.cose_key_b64, &rec_buf) catch
+            return error.BufferTooSmall;
+        try self.store.family(.props).put(cred_key, record);
+    }
+
+    /// List the passkeys bound to `account` into `out`, returning the populated
+    /// prefix. Silently skips any list entry whose record is missing/corrupt.
+    pub fn webauthnList(self: *Services, account: []const u8, out: []WebauthnListEntry) ServiceError![]const WebauthnListEntry {
+        const key = try accountKey(account);
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const list_key = webauthn_creds.accountListKey(&list_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        const list = self.store.family(.props).get(list_key) orelse return out[0..0];
+
+        var ids_buf: [webauthn_creds.max_creds_per_account][]const u8 = undefined;
+        const ids = webauthn_creds.listIds(list, &ids_buf);
+        var n: usize = 0;
+        for (ids) |id| {
+            if (n >= out.len) break;
+            if (id.len > out[n].cred_id_buf.len) continue;
+            var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+            const cred_key = webauthn_creds.credKey(&cred_key_buf, id) orelse continue;
+            const value = self.store.family(.props).get(cred_key) orelse continue;
+            const rec = webauthn_creds.decodeRecord(value) catch continue;
+            @memcpy(out[n].cred_id_buf[0..id.len], id);
+            out[n].cred_id_len = id.len;
+            const lbl = rec.decodeLabel(&out[n].label_buf) catch out[n].label_buf[0..0];
+            out[n].label_len = lbl.len;
+            out[n].sign_count = rec.sign_count;
+            out[n].created_unix = rec.created_unix;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// The credential ids bound to `account`, copied into `out` (each entry's
+    /// `credId()` is valid after the lock releases). Used to build the AUTH
+    /// challenge's allow-list.
+    pub fn webauthnCredIds(self: *Services, account: []const u8, out: []WebauthnListEntry) ServiceError![]const WebauthnListEntry {
+        return self.webauthnList(account, out);
+    }
+
+    /// Delete a credential from `account`, identified by its credential id OR its
+    /// label. Verifies ownership. `NotFound` when no matching credential exists;
+    /// `Forbidden` when the id resolves to a different account.
+    pub fn webauthnDelete(self: *Services, account: []const u8, id_or_label: []const u8) ServiceError!void {
+        const key = try accountKey(account);
+
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        // Resolve the target credential id: try a direct id match, else scan the
+        // account's list for a label match.
+        var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const list_key = webauthn_creds.accountListKey(&list_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        const list = self.store.family(.props).get(list_key) orelse return error.NotFound;
+
+        var target_buf: [webauthn_creds.max_cred_id_b64]u8 = undefined;
+        var target_len: usize = 0;
+        var ids_buf: [webauthn_creds.max_creds_per_account][]const u8 = undefined;
+        const ids = webauthn_creds.listIds(list, &ids_buf);
+        for (ids) |id| {
+            if (std.mem.eql(u8, id, id_or_label)) {
+                @memcpy(target_buf[0..id.len], id);
+                target_len = id.len;
+                break;
+            }
+        }
+        if (target_len == 0) {
+            // Label match: decode each record's label and compare.
+            for (ids) |id| {
+                var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+                const cred_key = webauthn_creds.credKey(&cred_key_buf, id) orelse continue;
+                const value = self.store.family(.props).get(cred_key) orelse continue;
+                const rec = webauthn_creds.decodeRecord(value) catch continue;
+                var lbl_buf: [webauthn_creds.max_label_bytes]u8 = undefined;
+                const lbl = rec.decodeLabel(&lbl_buf) catch continue;
+                if (lbl.len != 0 and std.mem.eql(u8, lbl, id_or_label)) {
+                    @memcpy(target_buf[0..id.len], id);
+                    target_len = id.len;
+                    break;
+                }
+            }
+        }
+        if (target_len == 0) return error.NotFound;
+        const target = target_buf[0..target_len];
+
+        // Ownership: the record must belong to this account.
+        var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+        const cred_key = webauthn_creds.credKey(&cred_key_buf, target) orelse return error.NotFound;
+        const value = self.store.family(.props).get(cred_key) orelse return error.NotFound;
+        const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
+        if (!std.ascii.eqlIgnoreCase(rec.account, key.asSlice())) return error.Forbidden;
+
+        // Remove from the list, then delete the record.
+        var new_list_buf: [webauthn_creds.account_list_value_max]u8 = undefined;
+        const new_list = (webauthn_creds.listRemove(list, target, &new_list_buf) catch return error.BufferTooSmall) orelse
+            return error.NotFound;
+        if (new_list.len == 0) {
+            self.store.family(.props).delete(list_key) catch {};
+        } else {
+            try self.store.family(.props).put(list_key, new_list);
+        }
+        self.store.family(.props).delete(cred_key) catch {};
     }
 
     /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
@@ -3176,6 +3432,116 @@ test "certfp list and delete enforce account ownership" {
     listed = try services.listCertfps("alice", listed_buf[0..]);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
     try std.testing.expect(services.accountForCertfp(fp_alice) == null);
+}
+
+test "webauthn bind/lookup/list/delete round-trip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-webauthn.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01 }; // arbitrary COSE-ish bytes
+    try services.webauthnBind("alice", "credAAA", &cose, 5, "phone", 1_700_000_000);
+
+    // Lookup by id copies out account + COSE key + counter + label.
+    var cred: Services.WebauthnCredential = .{};
+    try services.webauthnLookup("credAAA", &cred);
+    try std.testing.expectEqualStrings("alice", cred.account());
+    try std.testing.expectEqual(@as(u32, 5), cred.sign_count);
+    try std.testing.expectEqualSlices(u8, &cose, cred.coseKey());
+    try std.testing.expectEqualStrings("phone", cred.label());
+
+    // Duplicate id is rejected.
+    try std.testing.expectError(error.AlreadyExists, services.webauthnBind("alice", "credAAA", &cose, 1, "dup", 1));
+
+    // A second credential lists both.
+    try services.webauthnBind("alice", "credBBB", &cose, 0, "laptop", 1_700_000_100);
+    var entries: [8]Services.WebauthnListEntry = undefined;
+    const listed = try services.webauthnList("alice", entries[0..]);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+
+    // Update the counter (monotonic caller-enforced) and read it back.
+    try services.webauthnUpdateSignCount("credAAA", 9);
+    try services.webauthnLookup("credAAA", &cred);
+    try std.testing.expectEqual(@as(u32, 9), cred.sign_count);
+
+    // Delete by label; the other credential survives.
+    try services.webauthnDelete("alice", "laptop");
+    try std.testing.expectError(error.NotFound, services.webauthnLookup("credBBB", &cred));
+    const after = try services.webauthnList("alice", entries[0..]);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings("credAAA", after[0].credId());
+
+    // Delete by id.
+    try services.webauthnDelete("alice", "credAAA");
+    try std.testing.expectError(error.NotFound, services.webauthnLookup("credAAA", &cred));
+    const empty = try services.webauthnList("alice", entries[0..]);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "webauthn credential persists across a store reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cose = [_]u8{ 0xa4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06 };
+
+    {
+        var store = try openTestStore(tmp, "services-webauthn-persist.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try services.webauthnBind("bob", "credPERSIST", &cose, 3, "yubikey", 1_700_000_200);
+    }
+
+    // Reopen from the WAL: the credential must be recoverable.
+    var store = try openTestStore(tmp, "services-webauthn-persist.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var cred: Services.WebauthnCredential = .{};
+    try services.webauthnLookup("credPERSIST", &cred);
+    try std.testing.expectEqualStrings("bob", cred.account());
+    try std.testing.expectEqual(@as(u32, 3), cred.sign_count);
+    try std.testing.expectEqualSlices(u8, &cose, cred.coseKey());
+    try std.testing.expectEqualStrings("yubikey", cred.label());
+
+    var entries: [4]Services.WebauthnListEntry = undefined;
+    const listed = try services.webauthnList("bob", entries[0..]);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("credPERSIST", listed[0].credId());
+}
+
+test "webauthn delete enforces account ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-webauthn-own.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01 };
+
+    try services.webauthnBind("alice", "credA", &cose, 0, "", 1);
+    try services.webauthnBind("bob", "credB", &cose, 0, "", 1);
+
+    // alice cannot delete bob's credential id (not in her list → NotFound).
+    try std.testing.expectError(error.NotFound, services.webauthnDelete("alice", "credB"));
+    // bob's credential is intact.
+    var cred: Services.WebauthnCredential = .{};
+    try services.webauthnLookup("credB", &cred);
+    try std.testing.expectEqualStrings("bob", cred.account());
+}
+
+test "webauthn bind fail-closed on malformed id / oversized key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-webauthn-bad.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    const cose = [_]u8{ 0xa5, 0x01 };
+
+    try std.testing.expectError(error.InvalidValue, services.webauthnBind("alice", "bad/id", &cose, 0, "", 1)); // '/' not url-safe
+    try std.testing.expectError(error.InvalidValue, services.webauthnBind("alice", "", &cose, 0, "", 1)); // empty id
+    var big: [webauthn_creds.max_cose_key_bytes + 1]u8 = @splat(0);
+    try std.testing.expectError(error.InvalidValue, services.webauthnBind("alice", "credX", &big, 0, "", 1)); // oversized key
+    var lbl: [webauthn_creds.max_label_bytes + 1]u8 = @splat('x');
+    try std.testing.expectError(error.InvalidValue, services.webauthnBind("alice", "credY", &cose, 0, &lbl, 1)); // oversized label
 }
 
 test "account lifecycle flags round-trip and persist" {
