@@ -57,27 +57,45 @@ pub fn Bindings(comptime capacity: usize) type {
             addr: TransportAddress = .{},
             digest: [digest_len]u8 = @splat(0),
             active: bool = false,
+            /// Monotonic bind order, for stalest-first eviction on a full table.
+            stamp: u64 = 0,
         };
         slots: [capacity]Slot = @splat(.{}),
+        /// Monotonic tick incremented on every bind; the per-slot `stamp` snapshot
+        /// records recency so a full table evicts its oldest binding.
+        tick: u64 = 0,
 
         /// Bind (or update) the expected fingerprint for `addr`. Idempotent for a
-        /// repeated address. Returns false only when the table is full and `addr`
-        /// is new — the caller then treats that peer as UNVERIFIED (fail closed),
-        /// never evicting a live peer's binding.
+        /// repeated address. ALWAYS records the expectation — a signaled
+        /// fingerprint must never silently vanish (which would let a peer read as
+        /// "verification not required" and export keys UNVERIFIED). On a full
+        /// table with a new address it evicts the STALEST binding; the terminator
+        /// backstops any peer whose binding is evicted after its flight via a
+        /// per-session "mutual auth required" flag, so eviction can never open a
+        /// fail-open hole. Returns true on success (always, barring a zero-capacity
+        /// table), false only when `capacity == 0`.
         pub fn bind(self: *Self, addr: TransportAddress, digest: [digest_len]u8) bool {
+            if (self.slots.len == 0) return false;
+            self.tick += 1;
             var free: ?*Slot = null;
+            var stalest: *Slot = &self.slots[0];
             for (&self.slots) |*s| {
                 if (s.active and s.addr.eql(addr)) {
                     s.digest = digest;
+                    s.stamp = self.tick;
                     return true;
                 }
-                if (!s.active and free == null) free = s;
+                if (!s.active) {
+                    if (free == null) free = s;
+                } else if (s.stamp < stalest.stamp) {
+                    stalest = s;
+                }
             }
-            if (free) |s| {
-                s.* = .{ .addr = addr, .digest = digest, .active = true };
-                return true;
-            }
-            return false;
+            const slot = free orelse stalest;
+            // Evicting another peer's live binding: secure-zero the stale digest.
+            if (slot.active and !slot.addr.eql(addr)) std.crypto.secureZero(u8, &slot.digest);
+            slot.* = .{ .addr = addr, .digest = digest, .active = true, .stamp = self.tick };
+            return true;
         }
 
         /// The expected fingerprint bound for `addr`, or null if none.
@@ -151,18 +169,25 @@ test "Bindings: bind, lookup, idempotent update, and clear" {
     try testing.expectEqualSlices(u8, &d2, &(b.expectedFor(a2).?));
 }
 
-test "Bindings: full table refuses a new address (fail closed) but still updates known ones" {
+test "Bindings: a full table evicts the stalest binding rather than dropping a new one" {
     var b: Bindings(2) = .{};
     const a1 = testAddr(1, 6000);
     const a2 = testAddr(2, 6000);
     const a3 = testAddr(3, 6000);
-    try testing.expect(b.bind(a1, certDigest("1")));
-    try testing.expect(b.bind(a2, certDigest("2")));
-    // Table full: a brand-new address cannot be bound (never evicts a1/a2).
-    try testing.expect(!b.bind(a3, certDigest("3")));
-    try testing.expect(b.expectedFor(a3) == null);
-    // A known address can still be updated even when full.
-    const d1b = certDigest("1-prime");
-    try testing.expect(b.bind(a1, d1b));
-    try testing.expectEqualSlices(u8, &d1b, &(b.expectedFor(a1).?));
+    try testing.expect(b.bind(a1, certDigest("1"))); // stamp 1 (stalest)
+    try testing.expect(b.bind(a2, certDigest("2"))); // stamp 2
+    // Table full + new address: the expectation is ALWAYS recorded (a signaled
+    // fingerprint must never silently vanish). The STALEST binding (a1) is
+    // evicted; the terminator's per-session mutual-auth flag keeps any peer whose
+    // binding is evicted after its flight fail-closed.
+    try testing.expect(b.bind(a3, certDigest("3")));
+    try testing.expectEqualSlices(u8, &certDigest("3"), &(b.expectedFor(a3).?));
+    try testing.expect(b.expectedFor(a1) == null); // evicted (stalest)
+    try testing.expectEqualSlices(u8, &certDigest("2"), &(b.expectedFor(a2).?)); // untouched
+
+    // A known address is still updated in place (no eviction, no new slot).
+    const d2b = certDigest("2-prime");
+    try testing.expect(b.bind(a2, d2b));
+    try testing.expectEqualSlices(u8, &d2b, &(b.expectedFor(a2).?));
+    try testing.expectEqualSlices(u8, &certDigest("3"), &(b.expectedFor(a3).?));
 }

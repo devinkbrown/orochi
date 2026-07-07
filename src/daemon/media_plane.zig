@@ -209,6 +209,11 @@ pub const MediaPlane = struct {
         const term = try self.allocator.create(dtls_server.Terminator);
         errdefer self.allocator.destroy(term);
         term.* = try dtls_server.Terminator.init(seed, sessions, now_s - 86_400, now_s + 10 * 365 * 86_400);
+        // Mutual DTLS auth (#64): with DTLS-SRTP enabled, request + possession-
+        // verify the browser's client certificate for any peer that signaled an
+        // RFC 8122 fingerprint. Peers without a bound fingerprint stay
+        // server-authenticated (byte-identical).
+        term.request_client_cert = true;
         // Snapshot the immutable fingerprint for lock-free cross-thread reads.
         if (term.fingerprintLine(&self.dtls_fingerprint_buf)) |fp| {
             self.dtls_fingerprint_len = fp.len;
@@ -238,6 +243,7 @@ pub const MediaPlane = struct {
         const term = try self.allocator.create(dtls13_server.Terminator);
         errdefer self.allocator.destroy(term);
         term.* = try dtls13_server.Terminator.init(seed, sessions, term12.certDer(), term12.certKeyPair());
+        term.request_client_cert = true; // mutual DTLS auth (#64), mirrors the 1.2 engine
         self.dtls13_sessions = sessions;
         self.dtls13 = term;
     }
