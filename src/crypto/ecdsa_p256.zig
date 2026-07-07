@@ -76,6 +76,20 @@ pub fn verify(sig: Signature, msg: []const u8, public_key: PublicKey) bool {
     return true;
 }
 
+/// SHA-256 digest length (the P-256/SHA-256 pre-hash size).
+pub const prehash_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+/// Verify `sig` against an already-computed SHA-256 `msg_hash` and `public_key`.
+/// Equivalent to `verify(sig, m, pk)` when `msg_hash = SHA-256(m)`, but lets a
+/// caller that maintains a running transcript hash (e.g. the TLS/DTLS 1.2
+/// CertificateVerify, whose signature covers the raw handshake transcript)
+/// verify without re-materialising those bytes. Returns `true` on success; any
+/// verification error maps to `false`.
+pub fn verifyPrehashed(sig: Signature, msg_hash: [prehash_len]u8, public_key: PublicKey) bool {
+    sig.verifyPrehashed(msg_hash, public_key) catch return false;
+    return true;
+}
+
 // -- SEC1 public-key parsing -------------------------------------------------
 
 /// Parse an uncompressed SEC1 point (`0x04 || X32 || Y32`) into a `PublicKey`.
@@ -200,6 +214,21 @@ test "sign then verify round-trips to true" {
 
     // Assert
     try testing.expect(ok);
+}
+
+test "verifyPrehashed agrees with verify over the same message" {
+    // Arrange
+    const kp = KeyPair.generate(testing.io);
+    const msg = "orochi dtls 1.2 certificateverify transcript";
+    const sig = try sign(msg, kp);
+    var digest: [prehash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
+
+    // Act / Assert: prehashed verify of SHA-256(msg) matches full verify of msg.
+    try testing.expect(verifyPrehashed(sig, digest, kp.public_key));
+    // A single-bit flip in the digest fails closed.
+    digest[0] ^= 0x01;
+    try testing.expect(!verifyPrehashed(sig, digest, kp.public_key));
 }
 
 test "verify of a tampered message returns false" {

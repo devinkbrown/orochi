@@ -55,6 +55,9 @@ pub const hello_retry_request_random = [32]u8{
 
 /// TLS 1.3 CertificateVerify signature context (server side, RFC 8446 §4.4.3).
 pub const cert_verify_context = "TLS 1.3, server CertificateVerify";
+/// TLS 1.3 CertificateVerify signature context, CLIENT side (RFC 8446 §4.4.3) —
+/// used to possession-verify a WebRTC peer's client certificate.
+pub const cert_verify_context_client = "TLS 1.3, client CertificateVerify";
 
 pub const Error = error{
     Truncated,
@@ -550,17 +553,66 @@ pub fn parseCertificate13(body: []const u8) Error![]const u8 {
     return cert;
 }
 
-/// Fill `out` with the TLS 1.3 CertificateVerify signed content (RFC 8446
-/// §4.4.3): 64 × 0x20, the context string, a 0x00 separator, then the transcript
-/// hash. Returns the written slice.
-pub fn certificateVerifyContent(out: []u8, transcript_hash: []const u8) Error![]const u8 {
-    const total = 64 + cert_verify_context.len + 1 + transcript_hash.len;
+/// Fill `out` with a TLS 1.3 CertificateVerify signed content (RFC 8446 §4.4.3):
+/// 64 × 0x20, `context`, a 0x00 separator, then the transcript hash. Returns the
+/// written slice. `context` selects server vs. client CertificateVerify.
+pub fn certificateVerifyContentCtx(out: []u8, context: []const u8, transcript_hash: []const u8) Error![]const u8 {
+    const total = 64 + context.len + 1 + transcript_hash.len;
     if (out.len < total) return error.BadLength;
     @memset(out[0..64], 0x20);
-    @memcpy(out[64..][0..cert_verify_context.len], cert_verify_context);
-    out[64 + cert_verify_context.len] = 0x00;
-    @memcpy(out[64 + cert_verify_context.len + 1 ..][0..transcript_hash.len], transcript_hash);
+    @memcpy(out[64..][0..context.len], context);
+    out[64 + context.len] = 0x00;
+    @memcpy(out[64 + context.len + 1 ..][0..transcript_hash.len], transcript_hash);
     return out[0..total];
+}
+
+/// Server-side CertificateVerify signed content (RFC 8446 §4.4.3).
+pub fn certificateVerifyContent(out: []u8, transcript_hash: []const u8) Error![]const u8 {
+    return certificateVerifyContentCtx(out, cert_verify_context, transcript_hash);
+}
+
+// ---------------------------------------------------------------------------
+// CertificateRequest (RFC 8446 §4.3.2) — client-certificate capture
+// ---------------------------------------------------------------------------
+
+/// Build a CertificateRequest body: an EMPTY certificate_request_context and an
+/// extensions block carrying signature_algorithms (ecdsa_secp256r1_sha256). The
+/// context is empty because this request is part of the main handshake (not
+/// post-handshake auth). Byte-reproducible for the transcript.
+pub fn buildCertificateRequest13(out: []u8) Error![]const u8 {
+    var w = Writer{ .buf = out };
+    try w.putU8(0); // certificate_request_context: empty
+    var ext_buf: [16]u8 = undefined;
+    var ext = Writer{ .buf = &ext_buf };
+    try writeSignatureAlgorithms(&ext);
+    try w.putU16(@intCast(ext.pos));
+    try w.put(ext.bytes());
+    return w.bytes();
+}
+
+pub const CertificateRequest13View = struct {
+    /// certificate_request_context (borrows input); empty during the handshake.
+    context: []const u8,
+    /// The request lists ecdsa_secp256r1_sha256 in signature_algorithms.
+    offers_ecdsa_secp256r1_sha256: bool,
+};
+
+/// Parse a CertificateRequest body (fail-closed).
+pub fn parseCertificateRequest13(body: []const u8) Error!CertificateRequest13View {
+    var r = Reader{ .buf = body };
+    const ctx = try r.readVec8();
+    const exts = try r.readVec16();
+    var offers = false;
+    if (try findExtension(exts, ext_signature_algorithms)) |sa| {
+        var sr = Reader{ .buf = sa };
+        const list = try sr.readVec16();
+        if (list.len % 2 != 0) return error.BadLength;
+        var i: usize = 0;
+        while (i + 2 <= list.len) : (i += 2) {
+            if (std.mem.readInt(u16, list[i..][0..2], .big) == sig_scheme_ecdsa_secp256r1_sha256) offers = true;
+        }
+    }
+    return .{ .context = ctx, .offers_ecdsa_secp256r1_sha256 = offers };
 }
 
 pub fn buildCertificateVerify(out: []u8, sig_der: []const u8) Error![]const u8 {
@@ -752,6 +804,26 @@ test "CertificateVerify content + body round-trip" {
     const view = try parseCertificateVerify(cv);
     try testing.expectEqual(sig_scheme_ecdsa_secp256r1_sha256, view.scheme);
     try testing.expectEqualSlices(u8, sig, view.sig_der);
+}
+
+test "CertificateRequest13 round-trips empty context + secp256r1 sig alg" {
+    var buf: [32]u8 = undefined;
+    const body = try buildCertificateRequest13(&buf);
+    const view = try parseCertificateRequest13(body);
+    try testing.expectEqual(@as(usize, 0), view.context.len);
+    try testing.expect(view.offers_ecdsa_secp256r1_sha256);
+}
+
+test "certificateVerifyContentCtx differs between client and server context" {
+    var th: [hash_len]u8 = @splat(0x5a);
+    var sbuf: [200]u8 = undefined;
+    var cbuf: [200]u8 = undefined;
+    const s = try certificateVerifyContentCtx(&sbuf, cert_verify_context, &th);
+    const c = try certificateVerifyContentCtx(&cbuf, cert_verify_context_client, &th);
+    try testing.expect(!std.mem.eql(u8, s, c)); // context string binds the direction
+    // Both share the 64-space prefix and the trailing transcript hash.
+    try testing.expectEqual(@as(u8, 0x20), c[0]);
+    try testing.expectEqualSlices(u8, &th, c[c.len - hash_len ..]);
 }
 
 test "ACK encode / parse round-trip" {

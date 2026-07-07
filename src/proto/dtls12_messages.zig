@@ -476,6 +476,86 @@ pub fn parseClientKeyExchange(body: []const u8) Error![p256_point_len]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// CertificateRequest (RFC 5246 §7.4.4) — client-certificate capture
+// ---------------------------------------------------------------------------
+
+/// ClientCertificateType ecdsa_sign (RFC 8422): the only cert type a WebRTC
+/// DTLS-SRTP peer presents (its self-signed ECDSA cert).
+pub const client_cert_type_ecdsa_sign: u8 = 64;
+
+/// Build a CertificateRequest body asking the peer for an ECDSA-signing
+/// certificate over ecdsa_secp256r1_sha256, with an EMPTY certificate_authorities
+/// list (WebRTC certs are self-signed — there is no CA to name).
+pub fn buildCertificateRequest(out: []u8) Error![]const u8 {
+    var w = Writer{ .buf = out };
+    // certificate_types<1..2^8-1>
+    try w.putU8(1);
+    try w.putU8(client_cert_type_ecdsa_sign);
+    // supported_signature_algorithms<2..2^16-1>
+    try w.putU16(2);
+    try w.putU16(sig_scheme_ecdsa_secp256r1_sha256);
+    // certificate_authorities<0..2^16-1>: empty
+    try w.putU16(0);
+    return w.bytes();
+}
+
+pub const CertificateRequestView = struct {
+    /// The peer requested an ecdsa_sign client certificate.
+    wants_ecdsa_sign: bool,
+    /// The peer offered ecdsa_secp256r1_sha256 among its signature algorithms.
+    offers_ecdsa_secp256r1_sha256: bool,
+};
+
+/// Parse a CertificateRequest body (fail-closed). The certificate_authorities
+/// list is parsed for length correctness but its contents are ignored.
+pub fn parseCertificateRequest(body: []const u8) Error!CertificateRequestView {
+    var r = Reader{ .buf = body };
+    const types = try r.readVec8();
+    var wants_ecdsa = false;
+    for (types) |t| {
+        if (t == client_cert_type_ecdsa_sign) wants_ecdsa = true;
+    }
+    const sigalgs = try r.readVec16();
+    if (sigalgs.len % 2 != 0) return error.BadLength;
+    var offers = false;
+    var i: usize = 0;
+    while (i + 2 <= sigalgs.len) : (i += 2) {
+        if (std.mem.readInt(u16, sigalgs[i..][0..2], .big) == sig_scheme_ecdsa_secp256r1_sha256) offers = true;
+    }
+    _ = try r.readVec16(); // certificate_authorities (ignored)
+    return .{ .wants_ecdsa_sign = wants_ecdsa, .offers_ecdsa_secp256r1_sha256 = offers };
+}
+
+// ---------------------------------------------------------------------------
+// CertificateVerify (RFC 5246 §7.4.8)
+// ---------------------------------------------------------------------------
+
+/// Build a CertificateVerify body: SignatureAndHashAlgorithm +
+/// signature<2..2^16-1> (the DER ECDSA signature over the raw handshake
+/// transcript, produced by the caller).
+pub fn buildCertificateVerify(out: []u8, sig_der: []const u8) Error![]const u8 {
+    var w = Writer{ .buf = out };
+    try w.putU16(sig_scheme_ecdsa_secp256r1_sha256);
+    try w.putU16(@intCast(sig_der.len));
+    try w.put(sig_der);
+    return w.bytes();
+}
+
+pub const CertificateVerifyView = struct {
+    scheme: u16,
+    sig_der: []const u8,
+};
+
+/// Parse a CertificateVerify body (fail-closed; rejects trailing garbage).
+pub fn parseCertificateVerify(body: []const u8) Error!CertificateVerifyView {
+    var r = Reader{ .buf = body };
+    const scheme = try r.readU16();
+    const sig = try r.readVec16();
+    if (r.remaining() != 0) return error.BadLength;
+    return .{ .scheme = scheme, .sig_der = sig };
+}
+
+// ---------------------------------------------------------------------------
 // Key block (RFC 5246 §6.3) — AES-128-GCM has no MAC keys.
 // ---------------------------------------------------------------------------
 
@@ -608,6 +688,31 @@ test "ServerKeyExchange round-trips point and signature" {
     try testing.expectEqualSlices(u8, &point, &view.point);
     try testing.expectEqual(sig_scheme_ecdsa_secp256r1_sha256, view.sig_scheme);
     try testing.expectEqualSlices(u8, sig, view.sig_der);
+}
+
+test "CertificateRequest round-trips ecdsa_sign + secp256r1 sig alg" {
+    var buf: [64]u8 = undefined;
+    const body = try buildCertificateRequest(&buf);
+    const view = try parseCertificateRequest(body);
+    try testing.expect(view.wants_ecdsa_sign);
+    try testing.expect(view.offers_ecdsa_secp256r1_sha256);
+    // Empty certificate_authorities list (self-signed WebRTC certs).
+    try testing.expectEqual(@as(u8, 0x00), body[body.len - 2]);
+    try testing.expectEqual(@as(u8, 0x00), body[body.len - 1]);
+}
+
+test "CertificateVerify round-trips scheme and signature; rejects trailing garbage" {
+    const sig = "\x30\x44 der-ecdsa-cv-sig";
+    var buf: [64]u8 = undefined;
+    const body = try buildCertificateVerify(&buf, sig);
+    const view = try parseCertificateVerify(body);
+    try testing.expectEqual(sig_scheme_ecdsa_secp256r1_sha256, view.scheme);
+    try testing.expectEqualSlices(u8, sig, view.sig_der);
+
+    var padded: [64]u8 = undefined;
+    @memcpy(padded[0..body.len], body);
+    padded[body.len] = 0xAB; // trailing byte
+    try testing.expectError(error.BadLength, parseCertificateVerify(padded[0 .. body.len + 1]));
 }
 
 test "ClientKeyExchange round-trips the point" {

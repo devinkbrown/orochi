@@ -38,6 +38,7 @@ const fingerprint = @import("dtls_fingerprint.zig");
 const peer_verify = @import("dtls_peer_verify.zig");
 const x509_selfsign = @import("x509_selfsign.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+const x509 = @import("../crypto/x509.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -94,12 +95,34 @@ pub const Session = struct {
 
     srtp_keys: dtls_srtp.ExportedKeys = undefined,
 
-    /// RFC 8122 peer verification (Increment 3). `fp_verified` is set true only
-    /// once a presented peer certificate has matched the expected fingerprint
-    /// bound for this address (`recordPeerCertificate`). Whether an expectation
-    /// EXISTS is evaluated live off `Terminator.verify_bindings` at the accessor,
-    /// so a binding registered any time before key export still gates.
+    /// RFC 8122 peer verification. `fp_verified` is set true only once a
+    /// presented peer certificate has matched the expected fingerprint bound for
+    /// this address AND possession of its private key was proven (the client
+    /// CertificateVerify signature validated). Whether an expectation EXISTS is
+    /// evaluated live off `Terminator.verify_bindings` at the accessor, so a
+    /// binding registered any time before key export still gates.
     fp_verified: bool = false,
+
+    /// Mutual-auth (client-certificate capture, #64). Set at flight-4 emission
+    /// when the terminator requests client certs AND a fingerprint is bound for
+    /// this peer. Once set, `peerVerifiedSession` requires `fp_verified` for THIS
+    /// session regardless of the (possibly later-evicted) binding — so an evicted
+    /// binding can never re-open the gate.
+    mutual_auth: bool = false,
+    /// The peer sent a client Certificate message (even an empty/invalid one).
+    /// Also a processed-once latch: a retransmitted Certificate is ignored so the
+    /// transcript is never double-fed.
+    got_client_cert: bool = false,
+    /// Processed-once latch for the client CertificateVerify (retransmit-safe).
+    got_client_cv: bool = false,
+    /// The client CertificateVerify signature validated against the presented
+    /// certificate's public key (possession proven).
+    client_cert_verified: bool = false,
+    /// Parsed public key of the presented client leaf certificate.
+    client_pubkey: ecdsa_p256.PublicKey = undefined,
+    have_client_pubkey: bool = false,
+    /// SHA-256 of the presented client leaf certificate DER (RFC 8122 match).
+    client_cert_digest: [peer_verify.digest_len]u8 = @splat(0),
 
     /// Cached server flights for retransmit (respond to a retransmitted client
     /// flight with the identical bytes rather than re-deriving).
@@ -134,6 +157,12 @@ pub const Terminator = struct {
     /// Bound by the signaling layer (per MEDIA OFFER) before the ClientHello
     /// arrives; consulted at handshake completion. Fixed-capacity, no alloc.
     verify_bindings: peer_verify.Bindings(default_max_sessions) = .{},
+    /// Client-certificate capture (#64). When true, a session with a bound
+    /// expected fingerprint requests + possession-verifies the peer's client
+    /// certificate (mutual DTLS). Default OFF ⇒ server-authenticated only, wire
+    /// byte-identical (no CertificateRequest is ever sent). The media plane sets
+    /// this the moment DTLS-SRTP is enabled.
+    request_client_cert: bool = false,
 
     /// Initialise from a 32-byte entropy seed: mints the self-signed
     /// ECDSA-P256 cert, the cookie secret, and seeds the per-handshake CSPRNG.
@@ -224,11 +253,15 @@ pub const Terminator = struct {
         return s.srtp_profile;
     }
 
-    /// RFC 8122 verdict for a resolved session: true when no expected fingerprint
-    /// is bound for `addr` (verification not requested) or the presented cert
-    /// matched it. Evaluated live so a binding set at any time before key export
-    /// takes effect.
+    /// RFC 8122 verdict for a resolved session: true when the presented cert was
+    /// verified, or when verification was never engaged for this session. Once a
+    /// session commits to mutual auth (`mutual_auth`, set at flight-4 emission
+    /// when a fingerprint was bound), it REQUIRES `fp_verified` — independent of
+    /// the live binding table — so an evicted binding can never re-open the gate.
+    /// Otherwise it is live-evaluated off the binding table (a binding set any
+    /// time before key export still gates).
     fn peerVerifiedSession(self: *const Terminator, addr: TransportAddress, s: *const Session) bool {
+        if (s.mutual_auth) return s.fp_verified;
         return self.verify_bindings.expectedFor(addr) == null or s.fp_verified;
     }
 
@@ -387,7 +420,9 @@ pub const Terminator = struct {
 
         return switch (dh.hdr.msg_type) {
             .client_hello => self.onClientHello(addr, dh.hdr.message_seq, body, now_ms, out),
+            .certificate => self.onClientCertificate(addr, dh.hdr.message_seq, body, now_ms),
             .client_key_exchange => self.onClientKeyExchange(addr, dh.hdr.message_seq, body, now_ms),
+            .certificate_verify => self.onClientCertificateVerify(addr, dh.hdr.message_seq, body, now_ms),
             .finished => self.onFinished(addr, dh.hdr.message_seq, body, now_ms, out),
             else => null,
         };
@@ -441,6 +476,10 @@ pub const Terminator = struct {
         s.client_random = ch.random;
         s.srtp_profile = profile;
         s.epoch0_write_seq = 1;
+        // Mutual auth (#64): request + possession-verify the peer's client cert
+        // when this terminator is configured to AND a fingerprint is bound for
+        // the peer. Committed here so an evicted binding can't relax the gate.
+        s.mutual_auth = self.request_client_cert and self.verify_bindings.expectedFor(addr) != null;
 
         // Server Random — 32 fully random bytes (RFC 8446 §4.1.3 style; the
         // legacy gmt_unix_time field carries no meaning here).
@@ -481,6 +520,98 @@ pub const Terminator = struct {
         return null; // no response until Finished
     }
 
+    /// Handle the client Certificate (mutual auth). Parses + captures the leaf
+    /// cert's public key + fingerprint for the later CertificateVerify possession
+    /// check. Feeds the raw message into the transcript FIRST (so the transcript
+    /// stays consistent even for an unparseable/empty cert, which then simply
+    /// fails closed at CertificateVerify). No response.
+    fn onClientCertificate(
+        self: *Terminator,
+        addr: TransportAddress,
+        message_seq: u16,
+        body: []const u8,
+        now_ms: i64,
+    ) ?usize {
+        const s = self.find(addr) orelse return null;
+        if (s.state != .expect_client_finish or !s.mutual_auth) return null;
+        // Processed-once: a retransmitted Certificate must not double-feed the
+        // transcript (which would break the handshake — fail-closed but a legit
+        // reconnect could fail).
+        if (s.got_client_cert) return null;
+        s.last_activity_ms = now_ms;
+        s.got_client_cert = true;
+        feedTranscript(&s.transcript, .certificate, message_seq, body);
+
+        // Capture the leaf public key + fingerprint (fail-closed on any issue: a
+        // missing pubkey makes the CertificateVerify unverifiable ⇒ no media).
+        const leaf = msg.parseCertificate(body) catch return null;
+        if (leaf.len == 0) return null;
+        s.client_cert_digest = peer_verify.certDigest(leaf);
+        const parsed = x509.parse(leaf) catch return null;
+        const spk = x509.extractPublicKey(parsed.spki_der) catch return null;
+        const point = switch (spk) {
+            .ecdsa_p256 => |pt| pt,
+            else => return null, // wrong key family ⇒ fail closed
+        };
+        s.client_pubkey = ecdsa_p256.parsePublicKeySec1(point) catch return null;
+        s.have_client_pubkey = true;
+        return null;
+    }
+
+    /// Handle the client CertificateVerify (mutual auth). Verifies possession —
+    /// the ECDSA signature over the handshake transcript up to (and including) the
+    /// ClientKeyExchange — under the presented cert's public key, then binds
+    /// RFC 8122 identity (fingerprint match). Fail-closed on any deviation. No
+    /// response. Must run BEFORE the transcript is advanced past CKE.
+    fn onClientCertificateVerify(
+        self: *Terminator,
+        addr: TransportAddress,
+        message_seq: u16,
+        body: []const u8,
+        now_ms: i64,
+    ) ?usize {
+        const s = self.find(addr) orelse return null;
+        if (s.state != .expect_client_finish or !s.mutual_auth) return null;
+        if (s.got_client_cv) return null; // processed-once (retransmit-safe)
+        s.got_client_cv = true;
+        s.last_activity_ms = now_ms;
+
+        // The CertificateVerify signature covers SHA-256(handshake_messages) from
+        // ClientHello through ClientKeyExchange — exactly the current transcript
+        // (CertificateVerify itself is not yet fed).
+        const transcript_through_cke = s.transcript.peek();
+        self.verifyClientPossession(s, addr, body, transcript_through_cke);
+
+        // CertificateVerify is part of the transcript the Finished messages cover.
+        feedTranscript(&s.transcript, .certificate_verify, message_seq, body);
+        return null;
+    }
+
+    /// Possession verify + RFC 8122 fingerprint bind for the presented client
+    /// cert. Sets `client_cert_verified`/`fp_verified` only on full success;
+    /// silent on any failure (the session then stays fail-closed).
+    fn verifyClientPossession(
+        self: *Terminator,
+        s: *Session,
+        addr: TransportAddress,
+        cv_body: []const u8,
+        transcript_hash: [Sha256.digest_length]u8,
+    ) void {
+        if (!s.have_client_pubkey) return;
+        const view = msg.parseCertificateVerify(cv_body) catch return;
+        if (view.scheme != msg.sig_scheme_ecdsa_secp256r1_sha256) return;
+        const sig = ecdsa_p256.signatureFromDer(view.sig_der) catch return;
+        if (!ecdsa_p256.verifyPrehashed(sig, transcript_hash, s.client_pubkey)) return;
+        // Possession proven. Now bind RFC 8122 identity: the presented cert's
+        // fingerprint must match the one the peer signaled (if any expectation).
+        s.client_cert_verified = true;
+        if (self.verify_bindings.expectedFor(addr)) |exp| {
+            s.fp_verified = peer_verify.digestEql(exp, s.client_cert_digest);
+        } else {
+            s.fp_verified = false;
+        }
+    }
+
     fn onFinished(
         self: *Terminator,
         addr: TransportAddress,
@@ -500,6 +631,10 @@ pub const Terminator = struct {
             return null;
         }
         if (!s.have_keys or !s.got_cke or !s.got_ccs) return null;
+        // Mutual auth (#64): the peer's client certificate MUST have been
+        // presented and possession-verified, else fail closed — no server
+        // Finished, no keys, no media (even though the DTLS transcript matches).
+        if (s.mutual_auth and !s.client_cert_verified) return null;
         if (body.len != verify_data_len) return null;
 
         // Verify the client's Finished against the transcript up to CKE.
@@ -562,10 +697,22 @@ pub const Terminator = struct {
             total += framePlaintextHandshake(out[total..], .server_key_exchange, server_hello_seq + 2, 0, s.epoch0_write_seq, ske) catch return null;
             s.epoch0_write_seq += 1;
         }
-        // ServerHelloDone (msg_seq 4, empty)
+        // CertificateRequest (msg_seq 4) — mutual auth only (#64). Off ⇒ this
+        // message is never emitted, so the server-auth-only flight is byte-
+        // identical. When present, ServerHelloDone shifts to msg_seq 5.
+        var done_seq: u16 = server_hello_seq + 3;
+        if (s.mutual_auth) {
+            var cr_buf: [64]u8 = undefined;
+            const cr = msg.buildCertificateRequest(&cr_buf) catch return null;
+            feedTranscript(&s.transcript, .certificate_request, server_hello_seq + 3, cr);
+            total += framePlaintextHandshake(out[total..], .certificate_request, server_hello_seq + 3, 0, s.epoch0_write_seq, cr) catch return null;
+            s.epoch0_write_seq += 1;
+            done_seq = server_hello_seq + 4;
+        }
+        // ServerHelloDone (empty)
         {
-            feedTranscript(&s.transcript, .server_hello_done, server_hello_seq + 3, &.{});
-            total += framePlaintextHandshake(out[total..], .server_hello_done, server_hello_seq + 3, 0, s.epoch0_write_seq, &.{}) catch return null;
+            feedTranscript(&s.transcript, .server_hello_done, done_seq, &.{});
+            total += framePlaintextHandshake(out[total..], .server_hello_done, done_seq, 0, s.epoch0_write_seq, &.{}) catch return null;
             s.epoch0_write_seq += 1;
         }
 
@@ -815,6 +962,13 @@ test "malformed DTLS records are dropped without a trap and never allocate a ses
 // -- Full loopback handshake: a DTLS client driver built from the same lib
 //    completes the handshake and both sides derive identical SRTP keys. -----
 
+/// Client-authentication material for the mutual-auth loopback (a self-signed
+/// ECDSA-P256 cert + its key, mirroring a WebRTC browser peer).
+const ClientAuth = struct {
+    key_pair: ecdsa_p256.KeyPair,
+    cert_der: []const u8,
+};
+
 const ClientDriver = struct {
     client_random: [32]u8,
     server_random: [32]u8 = @splat(0),
@@ -826,11 +980,38 @@ const ClientDriver = struct {
     key_block: msg.KeyBlock = undefined,
     transcript: Sha256 = undefined,
     srtp_profile: u16 = 0,
+    /// Mutual auth: when set, present this client cert + sign a CertificateVerify.
+    auth: ?ClientAuth = null,
+    /// Raw handshake_messages accumulator (only when `auth` is set) — the exact
+    /// bytes the DTLS 1.2 CertificateVerify signature covers.
+    raw: [4096]u8 = undefined,
+    raw_len: usize = 0,
+    saw_certificate_request: bool = false,
 
     fn init() ClientDriver {
         var cr: [32]u8 = undefined;
         for (&cr, 0..) |*b, i| b.* = @intCast((i *% 7) +% 1);
         return .{ .client_random = cr, .ecdhe = kx.generateKeyPair(@splat(0x5c)) };
+    }
+
+    /// Feed one handshake message into the running transcript AND (for mutual
+    /// auth) the raw handshake_messages accumulator.
+    fn feed(self: *ClientDriver, msg_type: dhs.HandshakeType, message_seq: u16, body: []const u8) void {
+        feedTranscript(&self.transcript, msg_type, message_seq, body);
+        if (self.auth == null) return;
+        var hb: [dhs.handshake_header_len]u8 = undefined;
+        const hdr = dhs.Header{
+            .msg_type = msg_type,
+            .length = @intCast(body.len),
+            .message_seq = message_seq,
+            .fragment_offset = 0,
+            .fragment_length = @intCast(body.len),
+        };
+        const enc = hdr.encode(&hb) catch unreachable;
+        @memcpy(self.raw[self.raw_len..][0..enc.len], enc);
+        self.raw_len += enc.len;
+        @memcpy(self.raw[self.raw_len..][0..body.len], body);
+        self.raw_len += body.len;
     }
 
     fn buildClientHello(self: *ClientDriver, message_seq: u16, rec_seq: u48, out: []u8) ![]const u8 {
@@ -849,8 +1030,28 @@ const ClientDriver = struct {
 /// same lib) against `term` for `addr`, returning the client driver once the
 /// session is established. Shared by the handshake and RFC 8122 verification
 /// tests.
+/// Flight-5 behaviour, for exercising the mutual-auth fail-closed paths.
+const Flight5Mode = enum {
+    /// A well-formed flight (server-auth, or mutual auth presenting a valid cert).
+    normal,
+    /// Mutual server, but the client omits Certificate + CertificateVerify.
+    omit_cert,
+    /// Mutual server, but the client's CertificateVerify signature is corrupted.
+    tamper_cv,
+};
+
 fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriver {
+    return driveLoopbackHandshakeAuth(term, addr, null, .normal);
+}
+
+fn driveLoopbackHandshakeAuth(
+    term: *Terminator,
+    addr: TransportAddress,
+    client_auth: ?ClientAuth,
+    mode: Flight5Mode,
+) !ClientDriver {
     var client = ClientDriver.init();
+    client.auth = client_auth;
     var out: [2048]u8 = undefined;
     var scratch: [2048]u8 = undefined;
 
@@ -874,12 +1075,13 @@ fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriv
         .cookie = client.cookie[0..client.cookie_len],
         .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
     });
-    feedTranscript(&client.transcript, .client_hello, 1, ch2_body);
+    client.feed(.client_hello, 1, ch2_body);
     var ch2_dg: [700]u8 = undefined;
     const ch2_len = try framePlaintextHandshake(&ch2_dg, .client_hello, 1, 0, 1, ch2_body);
     const flight4 = term.handleDatagram(addr, ch2_dg[0..ch2_len], 101, &out) orelse return error.TestUnexpectedResult;
 
-    // 3) Parse flight 4: ServerHello, Certificate, ServerKeyExchange, ServerHelloDone.
+    // 3) Parse flight 4: ServerHello, Certificate, ServerKeyExchange,
+    //    [CertificateRequest], ServerHelloDone.
     {
         var off: usize = 0;
         var cert_der: []const u8 = &.{};
@@ -894,11 +1096,11 @@ fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriv
                     client.server_random = sh.random;
                     client.srtp_profile = sh.srtp_profile orelse return error.TestUnexpectedResult;
                     try testing.expectEqual(msg.cipher_ecdhe_ecdsa_aes128_gcm_sha256, sh.cipher_suite);
-                    feedTranscript(&client.transcript, .server_hello, hh.hdr.message_seq, mbody);
+                    client.feed(.server_hello, hh.hdr.message_seq, mbody);
                 },
                 .certificate => {
                     cert_der = try msg.parseCertificate(mbody);
-                    feedTranscript(&client.transcript, .certificate, hh.hdr.message_seq, mbody);
+                    client.feed(.certificate, hh.hdr.message_seq, mbody);
                 },
                 .server_key_exchange => {
                     const ske = try msg.parseServerKeyExchange(mbody);
@@ -909,16 +1111,24 @@ fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriv
                     const signed = try msg.serverKeyExchangeSignedData(&signed_buf, client.client_random, client.server_random, ske.point);
                     const sig = try ecdsa_p256.signatureFromDer(ske.sig_der);
                     try testing.expect(ecdsa_p256.verify(sig, signed, term.certPublicKey()));
-                    feedTranscript(&client.transcript, .server_key_exchange, hh.hdr.message_seq, mbody);
+                    client.feed(.server_key_exchange, hh.hdr.message_seq, mbody);
+                },
+                .certificate_request => {
+                    const cr = try msg.parseCertificateRequest(mbody);
+                    try testing.expect(cr.wants_ecdsa_sign and cr.offers_ecdsa_secp256r1_sha256);
+                    client.saw_certificate_request = true;
+                    client.feed(.certificate_request, hh.hdr.message_seq, mbody);
                 },
                 .server_hello_done => {
-                    feedTranscript(&client.transcript, .server_hello_done, hh.hdr.message_seq, mbody);
+                    client.feed(.server_hello_done, hh.hdr.message_seq, mbody);
                 },
                 else => return error.TestUnexpectedResult,
             }
         }
         try testing.expect(cert_der.len > 0);
         try testing.expectEqualSlices(u8, term.certDer(), cert_der);
+        // The server requests a client cert iff we are doing mutual auth.
+        try testing.expectEqual(client.auth != null, client.saw_certificate_request);
     }
 
     // 4) Client derives the shared secret, master secret, and key block.
@@ -926,21 +1136,60 @@ fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriv
     client.master_secret = kx.masterSecret(&pre_master, client.client_random, client.server_random);
     client.key_block = msg.deriveKeyBlock(&client.master_secret, client.client_random, client.server_random);
 
-    // 5) Build flight 5: ClientKeyExchange + ChangeCipherSpec + Finished.
-    var flight5: [512]u8 = undefined;
+    // 5) Build flight 5. Server-auth only: ClientKeyExchange, CCS, Finished
+    //    (msg_seqs 2, 3). Mutual auth: Certificate, ClientKeyExchange,
+    //    CertificateVerify, CCS, Finished (msg_seqs 2, 3, 4, 5).
+    var flight5: [4096]u8 = undefined;
     var f5_len: usize = 0;
     {
-        // ClientKeyExchange (msg_seq 2, epoch0 seq 2).
+        var epoch0_seq: u48 = 2;
+        var finished_seq: u16 = 3;
+        // `omit_cert` simulates a client that ignores the CertificateRequest and
+        // sends a server-auth-style flight; the server must fail closed.
+        const send_cert = client.auth != null and mode != .omit_cert;
+
+        if (send_cert) {
+            const auth = client.auth.?;
+            // Certificate (msg_seq 2, epoch0 seq 2).
+            var cert_buf: [cert_der_cap + 32]u8 = undefined;
+            const cert = try msg.buildCertificate(&cert_buf, auth.cert_der);
+            client.feed(.certificate, 2, cert);
+            f5_len += try framePlaintextHandshake(flight5[f5_len..], .certificate, 2, 0, epoch0_seq, cert);
+            epoch0_seq += 1;
+        }
+
+        // ClientKeyExchange (msg_seq 2 or 3).
+        const cke_seq: u16 = if (send_cert) 3 else 2;
         var cke_body: [80]u8 = undefined;
         const cke = try msg.buildClientKeyExchange(&cke_body, client.ecdhe.public);
-        feedTranscript(&client.transcript, .client_key_exchange, 2, cke);
-        f5_len += try framePlaintextHandshake(flight5[f5_len..], .client_key_exchange, 2, 0, 2, cke);
+        client.feed(.client_key_exchange, cke_seq, cke);
+        f5_len += try framePlaintextHandshake(flight5[f5_len..], .client_key_exchange, cke_seq, 0, epoch0_seq, cke);
+        epoch0_seq += 1;
 
-        // ChangeCipherSpec (epoch0 seq 3).
-        f5_len += (try record.writePlaintext(.change_cipher_spec, 0, 3, &.{0x01}, flight5[f5_len..])).len;
+        if (send_cert) {
+            const auth = client.auth.?;
+            // CertificateVerify (msg_seq 4, epoch0 seq 4) — sign the raw
+            // handshake_messages accumulated through ClientKeyExchange.
+            const cv_sig = try ecdsa_p256.sign(client.raw[0..client.raw_len], auth.key_pair);
+            var sig_der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+            const sig_der = try ecdsa_p256.signatureToDer(cv_sig, &sig_der_buf);
+            var cv_buf: [128]u8 = undefined;
+            const cv = try msg.buildCertificateVerify(&cv_buf, sig_der);
+            if (mode == .tamper_cv) {
+                // Flip a bit in the signature bytes: possession must NOT verify.
+                cv_buf[cv.len - 1] ^= 0x40;
+            }
+            client.feed(.certificate_verify, 4, cv);
+            f5_len += try framePlaintextHandshake(flight5[f5_len..], .certificate_verify, 4, 0, epoch0_seq, cv);
+            epoch0_seq += 1;
+            finished_seq = 5;
+        }
 
-        // Finished (encrypted, epoch1 seq0, msg_seq 3). verify_data over the
-        // transcript up to (and including) ClientKeyExchange.
+        // ChangeCipherSpec (epoch0 seq).
+        f5_len += (try record.writePlaintext(.change_cipher_spec, 0, epoch0_seq, &.{0x01}, flight5[f5_len..])).len;
+
+        // Finished (encrypted, epoch1 seq0). verify_data over the transcript
+        // through the last handshake message before Finished.
         const client_hash = client.transcript.peek();
         const client_vd = kx.verifyData(&client.master_secret, "client finished", client_hash);
         f5_len += try frameEncryptedHandshake(
@@ -950,15 +1199,21 @@ fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriv
             1,
             0,
             .finished,
-            3,
+            finished_seq,
             &client_vd,
         );
         // The client's transcript for verifying the server's Finished includes
         // its own Finished message.
-        feedTranscript(&client.transcript, .finished, 3, &client_vd);
+        feedTranscript(&client.transcript, .finished, finished_seq, &client_vd);
     }
 
-    const flight6 = term.handleDatagram(addr, flight5[0..f5_len], 102, &out) orelse return error.TestUnexpectedResult;
+    const flight6_opt = term.handleDatagram(addr, flight5[0..f5_len], 102, &out);
+    if (mode != .normal) {
+        // Fail-closed mutual auth: the server must NOT complete (no flight 6).
+        if (flight6_opt != null) return error.TestUnexpectedResult;
+        return client;
+    }
+    const flight6 = flight6_opt orelse return error.TestUnexpectedResult;
 
     // 6) Parse flight 6: ChangeCipherSpec + encrypted server Finished; verify it.
     {
@@ -1087,6 +1342,160 @@ test "RFC 8122: a mismatched peer fingerprint stays fail-closed (no keys, no pro
     try testing.expect(!term.peerVerified(addr)); // ...but identity is unverified
     try testing.expect(term.exportedKeys(addr) == null);
     try testing.expect(term.srtpProfile(addr) == null);
+}
+
+// -- Mutual DTLS auth (#64): client-certificate capture + possession verify ---
+
+/// Build a self-signed ECDSA-P256 client certificate (WebRTC peer) into
+/// `cert_buf`, returning the auth material. The DER borrows `cert_buf`, which
+/// must outlive the handshake.
+fn makeClientAuth(seed_byte: u8, cert_buf: []u8) !ClientAuth {
+    const key_seed: [ecdsa_p256.KeyPair.seed_length]u8 = @splat(seed_byte);
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(key_seed);
+    const serial = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d, 0x01, 0x02, 0x03, 0x04 };
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(cert_buf, .{
+        .common_name = "webrtc-client",
+        .not_before = 1_700_000_000,
+        .not_after = 1_900_000_000,
+        .serial = &serial,
+        .key_pair = kp,
+    });
+    return .{ .key_pair = kp, .cert_der = der };
+}
+
+test "mutual auth: a matching client cert completes the handshake and unlocks SRTP keys" {
+    var setup = try makeTerminator(0xA1);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    term.request_client_cert = true; // DTLS-SRTP mutual auth engaged
+    const addr = testAddr(5, 7700);
+
+    var cert_buf: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x31, &cert_buf);
+    // The signaling layer bound the SHA-256 of the cert the browser will present.
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest(auth.cert_der));
+
+    var client = try driveLoopbackHandshakeAuth(term, addr, auth, .normal);
+
+    // The mutual handshake completed: the server requested + captured +
+    // possession-verified the client cert, and the fingerprint matched.
+    try testing.expect(client.saw_certificate_request);
+    try testing.expect(term.established(addr));
+    try testing.expect(term.peerVerified(addr));
+    const server_keys = term.exportedKeys(addr) orelse return error.TestUnexpectedResult;
+    try testing.expect(term.srtpProfile(addr) != null);
+
+    // Both sides derive identical SRTP keys — media would flow.
+    const client_keys = dtls_srtp.exportSrtpKeys(&client.master_secret, client.client_random, client.server_random);
+    try testing.expectEqualSlices(u8, &client_keys.client, &server_keys.client);
+    try testing.expectEqualSlices(u8, &client_keys.server, &server_keys.server);
+}
+
+test "mutual auth: a client cert whose fingerprint mismatches yields NO keys (fail closed)" {
+    var setup = try makeTerminator(0xA2);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    term.request_client_cert = true;
+    const addr = testAddr(5, 7701);
+
+    var cert_buf: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x32, &cert_buf);
+    // Bind a DIFFERENT fingerprint than the cert the client actually presents.
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest("a cert the peer will NOT present"));
+
+    var client = try driveLoopbackHandshakeAuth(term, addr, auth, .normal);
+    _ = &client;
+
+    // Possession is proven (valid CertificateVerify) so the DTLS layer completes,
+    // but the RFC 8122 identity does NOT match ⇒ no exported keys, no media.
+    try testing.expect(term.established(addr));
+    try testing.expect(!term.peerVerified(addr));
+    try testing.expect(term.exportedKeys(addr) == null);
+    try testing.expect(term.srtpProfile(addr) == null);
+}
+
+test "mutual auth: a client that omits its Certificate is rejected (no completion, no keys)" {
+    var setup = try makeTerminator(0xA3);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    term.request_client_cert = true;
+    const addr = testAddr(5, 7702);
+
+    var cert_buf: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x33, &cert_buf);
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest(auth.cert_der));
+
+    // The client ignores the CertificateRequest and sends a server-auth flight.
+    _ = try driveLoopbackHandshakeAuth(term, addr, auth, .omit_cert);
+    try testing.expect(!term.established(addr));
+    try testing.expect(term.exportedKeys(addr) == null);
+    try testing.expect(term.srtpProfile(addr) == null);
+}
+
+test "mutual auth: a tampered CertificateVerify signature is rejected (no completion, no keys)" {
+    var setup = try makeTerminator(0xA4);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    term.request_client_cert = true;
+    const addr = testAddr(5, 7703);
+
+    var cert_buf: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x34, &cert_buf);
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest(auth.cert_der));
+
+    // The client presents a matching cert but a corrupted CertificateVerify ⇒
+    // possession is NOT proven ⇒ fail closed.
+    _ = try driveLoopbackHandshakeAuth(term, addr, auth, .tamper_cv);
+    try testing.expect(!term.established(addr));
+    try testing.expect(term.exportedKeys(addr) == null);
+    try testing.expect(term.srtpProfile(addr) == null);
+}
+
+test "mutual auth off (server-auth only) is byte-identical to the pre-#64 flight 4" {
+    // Two terminators from the same seed: one with mutual auth engaged but NO
+    // fingerprint bound (⇒ mutual not activated for the peer), one untouched.
+    var a = try makeTerminator(0xB7);
+    defer testing.allocator.free(a.sessions);
+    defer a.term.deinit();
+    var b = try makeTerminator(0xB7);
+    defer testing.allocator.free(b.sessions);
+    defer b.term.deinit();
+    a.term.request_client_cert = true; // engaged, but no fingerprint bound below
+
+    const addr = testAddr(8, 7710);
+    // Drive both through CH2→flight4 and compare the emitted flight 4 bytes.
+    const f4a = try captureFlight4(&a.term, addr);
+    const f4b = try captureFlight4(&b.term, addr);
+    // No CertificateRequest was emitted (no fingerprint bound ⇒ server-auth only).
+    try testing.expectEqualSlices(u8, f4a.bytes[0..f4a.len], f4b.bytes[0..f4b.len]);
+}
+
+const CapturedFlight = struct { bytes: [2048]u8, len: usize };
+
+/// Drive CH1→HVR→CH2 and capture the server's flight 4 bytes (for byte-identity
+/// assertions). Uses a fixed client random so two same-seed terminators emit the
+/// same flight.
+fn captureFlight4(term: *Terminator, addr: TransportAddress) !CapturedFlight {
+    var client = ClientDriver.init();
+    var out: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    const ch1 = try client.buildClientHello(0, 0, &scratch);
+    const hvr = term.handleDatagram(addr, ch1, 100, &out) orelse return error.TestUnexpectedResult;
+    const rdec = try record.RecordHeader.decode(hvr);
+    const hh = try dhs.Header.decode(rdec.fragment);
+    const cookie = try dhs.parseHelloVerifyRequest(rdec.fragment[dhs.handshake_header_len..][0..hh.hdr.length]);
+    @memcpy(client.cookie[0..cookie.len], cookie);
+    client.cookie_len = cookie.len;
+    var ch2_dg: [700]u8 = undefined;
+    const ch2 = try client.buildClientHello(1, 1, &ch2_dg);
+    const f4 = term.handleDatagram(addr, ch2, 101, &out) orelse return error.TestUnexpectedResult;
+    var cap: CapturedFlight = .{ .bytes = undefined, .len = f4.len };
+    @memcpy(cap.bytes[0..f4.len], f4);
+    return cap;
 }
 
 test "retransmitted second ClientHello resends the cached flight 4 verbatim" {
