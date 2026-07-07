@@ -173,6 +173,13 @@ pub const Terminator = struct {
         return self.cert_key.public_key;
     }
 
+    /// The DTLS certificate key pair. Shared with the DTLS 1.3 terminator so both
+    /// version engines sign with — and advertise the fingerprint of — ONE cert.
+    /// Daemon-internal (the signing identity); never leaves the process.
+    pub fn certKeyPair(self: *const Terminator) ecdsa_p256.KeyPair {
+        return self.cert_key;
+    }
+
     /// Format the SHA-256 `a=fingerprint` line (RFC 8122) into `out`.
     pub fn fingerprintLine(self: *const Terminator, out: []u8) fingerprint.Error![]const u8 {
         return fingerprint.format(.sha256, self.certDer(), out);

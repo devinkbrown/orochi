@@ -19,6 +19,7 @@ const rtp_profile = @import("../proto/rtp_profile.zig");
 const rtp_nack = @import("../substrate/rtp_nack.zig");
 const media_bridge = @import("media_bridge.zig");
 const dtls_server = @import("../proto/dtls12_server.zig");
+const dtls13_server = @import("../proto/dtls13_server.zig");
 const platform = @import("../substrate/platform.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
@@ -108,6 +109,19 @@ pub const MediaPlane = struct {
     /// the buffer is inline so it is never freed). `len` 0 = DTLS off/down.
     dtls_fingerprint_buf: [128]u8 = undefined,
     dtls_fingerprint_len: usize = 0,
+    /// Independent opt-in for the DTLS 1.3 engine (default OFF). Set before
+    /// `start`. When false, enabling `dtls_enabled` gives exactly Increment 1's
+    /// DTLS 1.2-only behavior — the 1.3 engine is never stood up and 1.3-offering
+    /// peers fall through to the 1.2 path. Kept separate because the RFC 9147
+    /// transcript interop points are not yet browser-validated (see
+    /// `dtls13_server.zig`).
+    dtls13_enabled: bool = false,
+    /// Opt-in DTLS 1.3 engine (RFC 9147), sharing the 1.2 terminator's cert +
+    /// `a=fingerprint`. A peer offering DTLS 1.3 (supported_versions) routes here;
+    /// 1.2 stays on `dtls`. Pump-thread-owned; null when 1.3 is off/unavailable.
+    dtls13: ?*dtls13_server.Terminator = null,
+    /// Backing session table for `dtls13` (owned; freed alongside it).
+    dtls13_sessions: []dtls13_server.Session = &.{},
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -184,11 +198,48 @@ pub const MediaPlane = struct {
         }
         self.dtls_sessions = sessions;
         self.dtls = term;
+
+        // Stand up the DTLS 1.3 engine (opt-in, sharing the same certificate +
+        // fingerprint). Best-effort: a 1.3 failure leaves the 1.2 path serving.
+        if (self.dtls13_enabled) self.startDtls13(term) catch |e| {
+            self.stopDtls13();
+            std.log.warn("orochi: DTLS 1.3 engine disabled ({s})", .{@errorName(e)});
+        };
     }
 
-    /// Tear down the DTLS terminator (secure-zeroing key material) and free it.
+    /// Allocate + initialise the DTLS 1.3 terminator, sharing the 1.2
+    /// terminator's certificate + key so both version engines present ONE
+    /// `a=fingerprint`. The DER is copied into the 1.3 terminator (no borrow).
+    fn startDtls13(self: *MediaPlane, term12: *const dtls_server.Terminator) !void {
+        var seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        try platform.fillOsEntropy(&seed);
+        const sessions = try self.allocator.alloc(dtls13_server.Session, dtls13_server.default_max_sessions);
+        errdefer self.allocator.free(sessions);
+        const term = try self.allocator.create(dtls13_server.Terminator);
+        errdefer self.allocator.destroy(term);
+        term.* = try dtls13_server.Terminator.init(seed, sessions, term12.certDer(), term12.certKeyPair());
+        self.dtls13_sessions = sessions;
+        self.dtls13 = term;
+    }
+
+    /// Tear down the DTLS 1.3 terminator (secure-zeroing key material) and free it.
+    fn stopDtls13(self: *MediaPlane) void {
+        if (self.dtls13) |term| {
+            term.deinit();
+            self.allocator.destroy(term);
+            self.dtls13 = null;
+        }
+        if (self.dtls13_sessions.len != 0) {
+            self.allocator.free(self.dtls13_sessions);
+            self.dtls13_sessions = &.{};
+        }
+    }
+
+    /// Tear down the DTLS terminators (secure-zeroing key material) and free them.
     fn stopDtls(self: *MediaPlane) void {
         self.dtls_fingerprint_len = 0;
+        self.stopDtls13(); // LIFO: 1.3 was stood up after 1.2
         if (self.dtls) |term| {
             term.deinit();
             self.allocator.destroy(term);
@@ -268,9 +319,18 @@ pub const MediaPlane = struct {
     /// any response flight back to `from`. Terminator state is touched only by
     /// this (pump) thread. The response is a small handshake flight (< 2 KiB).
     fn handleDtls(self: *MediaPlane, sock: *MediaSocket, from: TransportAddress, data: []const u8) void {
-        const term = self.dtls orelse return;
         var out: [2048]u8 = undefined;
         const now = platform.monotonicMillis();
+        // Version dispatch: a peer the 1.3 engine already owns, or a fresh
+        // ClientHello offering DTLS 1.3 (supported_versions), routes to the 1.3
+        // engine; everything else stays on Increment 1's DTLS 1.2 path.
+        if (self.dtls13) |t13| {
+            if (t13.owns(from) or dtls13_server.offersDtls13(data)) {
+                if (t13.handleDatagram(from, data, now, &out)) |resp| sock.sendTo(from, resp);
+                return;
+            }
+        }
+        const term = self.dtls orelse return;
         if (term.handleDatagram(from, data, now, &out)) |resp| {
             sock.sendTo(from, resp);
         }
@@ -405,6 +465,8 @@ const dtls_messages = @import("../proto/dtls12_messages.zig");
 const dtls_record = @import("../proto/dtls12_record.zig");
 const dtls_handshake = @import("../proto/dtls_handshake.zig");
 const dtls_srtp = @import("../proto/dtls_srtp.zig");
+const dtls13_messages = @import("../proto/dtls13_messages.zig");
+const dtls_kx = @import("../proto/dtls_keyexchange.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);
@@ -494,4 +556,50 @@ test "MediaPlane: DTLS-enabled pump demultiplexes a ClientHello into a HelloVeri
     try testing.expectEqual(dtls_record.ContentType.handshake, rdec.hdr.content_type);
     const hh = try dtls_handshake.Header.decode(rdec.fragment);
     try testing.expectEqual(dtls_handshake.HandshakeType.hello_verify_request, hh.hdr.msg_type);
+}
+
+test "MediaPlane: DTLS-SRTP on but dtls13 off leaves the 1.3 engine down (1.2-only)" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true; // dtls13_enabled defaults false
+    try plane.start(loopback_be, 0);
+    try testing.expect(plane.dtls != null); // 1.2 up
+    try testing.expect(plane.dtls13 == null); // 1.3 stays down by default
+}
+
+test "MediaPlane: version seam routes a DTLS 1.3 ClientHello to the 1.3 engine (HRR)" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true;
+    plane.dtls13_enabled = true;
+    try plane.start(loopback_be, 0);
+    // Both engines stood up sharing one certificate → one fingerprint.
+    try testing.expect(plane.dtls != null);
+    try testing.expect(plane.dtls13 != null);
+
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    client.setRecvTimeoutMs(2000);
+
+    // A DTLS 1.3 ClientHello (supported_versions offers 0xfefc) → the pump routes
+    // to the 1.3 engine, which replies with a HelloRetryRequest.
+    var ch_body: [512]u8 = undefined;
+    const chb = try dtls13_messages.buildClientHello13(&ch_body, .{
+        .random = @splat(0x33),
+        .key_share_point = dtls_kx.generateKeyPair(@splat(0x5c)).public,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+    });
+    var dgram: [700]u8 = undefined;
+    const dlen = try dtls13_server.framePlaintext13(&dgram, .client_hello, 0, 0, chb);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+    client.sendTo(server_addr, dgram[0..dlen]);
+
+    var cbuf: [media_socket.max_datagram]u8 = undefined;
+    const got = client.recvFrom(&cbuf) orelse return error.TestUnexpectedResult;
+    const rdec = try dtls_record.RecordHeader.decode(got.data);
+    try testing.expectEqual(dtls_record.ContentType.handshake, rdec.hdr.content_type);
+    const hh = try dtls_handshake.Header.decode(rdec.fragment);
+    const shv = try dtls13_messages.parseServerHello13(rdec.fragment[dtls_handshake.handshake_header_len..][0..hh.hdr.length]);
+    try testing.expect(shv.isHelloRetryRequest());
+    try testing.expectEqual(@as(usize, dtls13_server.cookie_len), shv.cookie.len);
 }

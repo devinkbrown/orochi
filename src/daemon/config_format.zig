@@ -374,6 +374,12 @@ pub const Config = struct {
         /// standard browser/mobile endpoints can key the SRTP leg via a DTLS
         /// handshake. Off by default; when off the media pump is byte-identical.
         dtls_srtp: bool = false,
+        /// Additionally offer the DTLS 1.3 (RFC 9147) handshake on the media
+        /// plane. Requires `dtls_srtp`. Off by default and independent of it: a
+        /// DTLS 1.3-offering peer routes to the 1.3 engine only when this is set,
+        /// otherwise it falls through to the hardened 1.2 path. Kept separate
+        /// pending real-browser interop validation of the 1.3 handshake.
+        dtls13: bool = false,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -852,6 +858,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.ws_media_relay")) |b| cfg.media.ws_media_relay = b;
     if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
     if (doc.getBool("media.dtls_srtp")) |b| cfg.media.dtls_srtp = b;
+    if (doc.getBool("media.dtls13")) |b| cfg.media.dtls13 = b;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
@@ -1562,6 +1569,18 @@ test "parseToml: media.dtls_srtp defaults off and lifts when set" {
     var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[media]\ndtls_srtp = true\n", .{});
     defer cfg.deinit(allocator);
     try testing.expect(cfg.media.dtls_srtp);
+}
+
+test "parseToml: media.dtls13 defaults off and lifts independently of dtls_srtp" {
+    const allocator = testing.allocator;
+    var dflt = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer dflt.deinit(allocator);
+    try testing.expect(!dflt.media.dtls13);
+
+    var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[media]\ndtls_srtp = true\ndtls13 = true\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.media.dtls_srtp);
+    try testing.expect(cfg.media.dtls13);
 }
 
 test "parseToml: media sizing keys default, lift, and validate ranges" {

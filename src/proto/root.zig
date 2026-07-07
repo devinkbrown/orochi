@@ -89,6 +89,8 @@ pub const draft_reply_relay = @import("draft_reply_relay.zig");
 pub const dtls12_messages = @import("dtls12_messages.zig");
 pub const dtls12_record = @import("dtls12_record.zig");
 pub const dtls12_server = @import("dtls12_server.zig");
+pub const dtls13_messages = @import("dtls13_messages.zig");
+pub const dtls13_server = @import("dtls13_server.zig");
 pub const dtls_fingerprint = @import("dtls_fingerprint.zig");
 pub const dtls_handshake = @import("dtls_handshake.zig");
 pub const dtls_keyexchange = @import("dtls_keyexchange.zig");
@@ -431,6 +433,8 @@ test {
     _ = dtls12_messages;
     _ = dtls12_record;
     _ = dtls12_server;
+    _ = dtls13_messages;
+    _ = dtls13_server;
     _ = dtls_fingerprint;
     _ = dtls_handshake;
     _ = dtls_keyexchange;

@@ -1405,6 +1405,9 @@ pub const Config = struct {
     /// alongside the signaled group key. Off by default; when off the media
     /// pump is byte-identical to today (no DTLS demux branch).
     media_dtls_srtp: bool = false,
+    /// Additionally offer the DTLS 1.3 (RFC 9147) handshake on the media plane
+    /// (requires `media_dtls_srtp`). Off by default; independent opt-in.
+    media_dtls13: bool = false,
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
@@ -3241,6 +3244,8 @@ pub const LinuxServer = struct {
 
             // Opt-in DTLS-SRTP termination (RFC 5764). Off = byte-identical pump.
             self.media_plane.dtls_enabled = self.config.media_dtls_srtp;
+            // Independent opt-in for the DTLS 1.3 (RFC 9147) engine.
+            self.media_plane.dtls13_enabled = self.config.media_dtls13;
 
             // Bring the media transport plane online (bind UDP + pump thread). Media
             // is optional: a bind failure logs and the daemon keeps serving IRC.
