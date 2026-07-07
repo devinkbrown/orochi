@@ -1400,6 +1400,11 @@ pub const Config = struct {
     /// verify; the per-stream key is the same `native_stream_key`-derived
     /// `(channel, participant)` key the native UDP leg uses.
     ws_media_require_mac: bool = false,
+    /// Terminate DTLS-SRTP (RFC 5764) on the WebRTC UDP media plane so standard
+    /// browser/mobile endpoints can key the SRTP leg via a DTLS handshake
+    /// alongside the signaled group key. Off by default; when off the media
+    /// pump is byte-identical to today (no DTLS demux branch).
+    media_dtls_srtp: bool = false,
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
@@ -3233,6 +3238,9 @@ pub const LinuxServer = struct {
                 // Bridge native frames to any opt-in WebRTC members of each channel.
                 self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
             }
+
+            // Opt-in DTLS-SRTP termination (RFC 5764). Off = byte-identical pump.
+            self.media_plane.dtls_enabled = self.config.media_dtls_srtp;
 
             // Bring the media transport plane online (bind UDP + pump thread). Media
             // is optional: a bind failure logs and the daemon keeps serving IRC.

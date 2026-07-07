@@ -79,6 +79,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.native_media_require_mac = cfg.media.native_media_require_mac;
     out.ws_media_relay = cfg.media.ws_media_relay;
     out.ws_media_require_mac = cfg.media.ws_media_require_mac;
+    out.media_dtls_srtp = cfg.media.dtls_srtp;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
@@ -475,6 +476,35 @@ test "media enabled maps to server gate and disabled feature" {
     defer enabled.deinit(allocator);
     try testing.expect(enabled.config.media_enabled);
     try testing.expectEqual(@as(usize, 0), enabled.config.disabled_features.len);
+}
+
+test "media dtls_srtp maps to the server config gate" {
+    const allocator = testing.allocator;
+
+    var off = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\enabled = true
+        \\
+    , .{ .port = 6680 }, .{});
+    defer off.deinit(allocator);
+    try testing.expect(!off.config.media_dtls_srtp);
+
+    var on = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\enabled = true
+        \\dtls_srtp = true
+        \\
+    , .{ .port = 6680 }, .{});
+    defer on.deinit(allocator);
+    try testing.expect(on.config.media_dtls_srtp);
 }
 
 test "media stun server overlays discovery config" {

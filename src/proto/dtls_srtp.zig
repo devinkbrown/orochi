@@ -12,6 +12,7 @@
 //! produces the master secret is a separate (larger) layer.
 const std = @import("std");
 const srtp = @import("srtp.zig");
+const hkdf_tls13 = @import("../crypto/hkdf_tls13.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -82,21 +83,45 @@ pub fn exportSrtpKeys(
     client_random: [32]u8,
     server_random: [32]u8,
 ) ExportedKeys {
-    const klen = srtp.master_key_len;
-    const slen = srtp.master_salt_len;
     var seed: [64]u8 = undefined;
     @memcpy(seed[0..32], &client_random);
     @memcpy(seed[32..64], &server_random);
 
-    var km: [2 * (klen + slen)]u8 = undefined;
+    var km: [2 * (srtp.master_key_len + srtp.master_salt_len)]u8 = undefined;
     prfSha256(master_secret, exporter_label, &seed, &km);
+    return splitSrtpKeyMaterial(&km);
+}
 
+/// Split raw SRTP keying material
+/// (`client_key(16) || server_key(16) || client_salt(14) || server_salt(14)`)
+/// into per-direction `ExportedKeys` (RFC 5764 §4.2 ordering). Shared by the
+/// 1.2 (PRF) and 1.3 (exporter) paths.
+fn splitSrtpKeyMaterial(km: *const [2 * (srtp.master_key_len + srtp.master_salt_len)]u8) ExportedKeys {
+    const klen = srtp.master_key_len;
+    const slen = srtp.master_salt_len;
     var out: ExportedKeys = undefined;
     @memcpy(out.client[0..klen], km[0..klen]);
     @memcpy(out.server[0..klen], km[klen .. 2 * klen]);
     @memcpy(out.client[klen..][0..slen], km[2 * klen ..][0..slen]);
     @memcpy(out.server[klen..][0..slen], km[2 * klen + slen ..][0..slen]);
     return out;
+}
+
+/// Extract SRTP keying material from a DTLS 1.3 `exporter_master_secret`
+/// (RFC 9147 keys via the RFC 8446 §7.5 TLS-Exporter) using the RFC 5764 label
+/// "EXTRACTOR-dtls_srtp" with an empty context. The output split matches the 1.2
+/// path (`exportSrtpKeys`); only the derivation differs (TLS 1.3 exporter vs the
+/// 1.2 PRF over the two randoms). Hash is SHA-256 (the WebRTC DTLS 1.3 suite).
+/// Groundwork for the DTLS 1.3 handshake engine (a later increment); the 1.2
+/// termination path uses `exportSrtpKeys`.
+pub fn exportSrtpKeysTls13(exporter_master_secret: [32]u8) hkdf_tls13.Error!ExportedKeys {
+    const KS = hkdf_tls13.KeySchedule(.sha256);
+    var ems = KS.SecretBytes.init(exporter_master_secret);
+    defer ems.wipe();
+    var km: [2 * (srtp.master_key_len + srtp.master_salt_len)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &km);
+    try KS.exportKeyingMaterial(&ems, exporter_label, "", &km);
+    return splitSrtpKeyMaterial(&km);
 }
 
 pub const UseSrtpError = error{ Truncated, BadLength };
@@ -190,6 +215,38 @@ test "exportSrtpKeys is deterministic and feeds srtp round-trip" {
     // Both ends derive SRTP session keys from the *client* master; one protects,
     // the other unprotects — proving the exported material is usable.
     const sk = srtp.deriveSessionKeys(keys.clientMaster(), keys.clientSalt());
+    const rtp = hexBytes("8060000100000064CAFEBABE") ++ "frame".*;
+    var prot: [rtp.len + srtp.auth_tag_len]u8 = undefined;
+    const wire = try srtp.protect(sk, 0, &rtp, &prot);
+    var back: [rtp.len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &rtp, try srtp.unprotect(sk, 0, wire, &back));
+}
+
+test "exportSrtpKeysTls13 is deterministic, input-sensitive, and feeds srtp" {
+    const ems1 = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    var ems2 = ems1;
+    ems2[0] ^= 0xff;
+
+    const a = try exportSrtpKeysTls13(ems1);
+    const b = try exportSrtpKeysTls13(ems1);
+    try testing.expectEqualSlices(u8, &a.client, &b.client); // deterministic
+    try testing.expectEqualSlices(u8, &a.server, &b.server);
+
+    const c = try exportSrtpKeysTls13(ems2);
+    try testing.expect(!std.mem.eql(u8, &a.client, &c.client)); // input-sensitive
+    // Client and server directions differ.
+    try testing.expect(!std.mem.eql(u8, &a.client, &a.server));
+
+    // The 1.3 exporter path yields DIFFERENT material than the 1.2 PRF path even
+    // with the same 48-byte input (different derivation), proving the seam.
+    const ms48 = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344556677");
+    const cr: [32]u8 = @splat(0xA1);
+    const sr: [32]u8 = @splat(0xB2);
+    const via_prf = exportSrtpKeys(&ms48, cr, sr);
+    try testing.expect(!std.mem.eql(u8, &a.client, &via_prf.client));
+
+    // Usable: round-trip an RTP frame with the exported client material.
+    const sk = srtp.deriveSessionKeys(a.clientMaster(), a.clientSalt());
     const rtp = hexBytes("8060000100000064CAFEBABE") ++ "frame".*;
     var prot: [rtp.len + srtp.auth_tag_len]u8 = undefined;
     const wire = try srtp.protect(sk, 0, &rtp, &prot);
