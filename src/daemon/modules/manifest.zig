@@ -21,6 +21,7 @@ const feature_misc = @import("feature_misc.zig");
 const introspect = @import("introspect.zig");
 const upgrade = @import("upgrade.zig");
 const services_ext = @import("services_ext.zig");
+const webhook = @import("webhook.zig");
 
 /// The enabled module set. Order is load/dispatch order for ties.
 pub const enabled = [_]registry.Module{
@@ -35,6 +36,7 @@ pub const enabled = [_]registry.Module{
     introspect.module,
     upgrade.module,
     services_ext.module,
+    webhook.module,
 };
 
 /// Comptime-assembled + comptime-validated live registry. Referencing `Live`

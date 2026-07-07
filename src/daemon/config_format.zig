@@ -58,6 +58,7 @@ pub const Config = struct {
     media: Media = .{},
     stats: Stats = .{},
     metrics: Metrics = .{},
+    webhook: Webhook = .{},
     geoip: Geoip = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
@@ -409,6 +410,35 @@ pub const Config = struct {
         bind: []const u8 = "127.0.0.1",
     };
 
+    /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
+    /// default: when `enabled` is false the listener never binds and the
+    /// `WEBHOOK` command is not registered — the daemon is byte-identical to a
+    /// build without this feature.
+    pub const Webhook = struct {
+        /// Master gate. When false the whole feature is inert.
+        enabled: bool = false,
+        /// TCP port for the plaintext HTTP listener. 0 = OS-ephemeral (the
+        /// feature is gated by `enabled`, not the port; set a fixed port in
+        /// production). Front it with a TLS reverse proxy.
+        listen: u16 = 0,
+        /// Bind address. SECURITY: defaults to loopback `127.0.0.1` (null); set
+        /// a private interface only deliberately.
+        bind: ?[]const u8 = null,
+        /// Path to the TSV binding store (survives restart + USR2). Null = no
+        /// persistence (bindings are lost on restart).
+        store_path: ?[]const u8 = null,
+        /// Max accepted request-body bytes (larger ⇒ 413).
+        max_body_bytes: u32 = 8192,
+        /// Per-webhook sustained rate (requests/min). 0 disables rate limiting.
+        rate_per_min: u32 = 60,
+        /// Per-webhook burst capacity.
+        rate_burst: u32 = 10,
+        /// Public URL base used to render the full webhook URL in the WEBHOOK
+        /// CREATE reply (e.g. `https://irc.example.com`). Null ⇒ derived from the
+        /// bind/port as `http://<bind>:<port>`.
+        public_url_base: ?[]const u8 = null,
+    };
+
     pub const Geoip = struct {
         /// Path to a MaxMind GeoIP database (.mmdb). Empty = GeoIP disabled.
         database: []const u8 = "",
@@ -680,6 +710,9 @@ pub const Config = struct {
         allocator.free(self.stats.dir);
         allocator.free(self.stats.channel_dir);
         allocator.free(self.metrics.bind);
+        if (self.webhook.bind) |value| allocator.free(value);
+        if (self.webhook.store_path) |value| allocator.free(value);
+        if (self.webhook.public_url_base) |value| allocator.free(value);
         allocator.free(self.geoip.database);
         allocator.free(self.geoip.asn_database);
         if (self.cloak.secret) |value| allocator.free(value);
@@ -869,6 +902,16 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // `bind` defaults to loopback (security: not public by default).
     cfg.metrics.listen = try portField(doc, "metrics.listen", cfg.metrics.listen);
     try setStr(allocator, resolver, doc.getString("metrics.bind"), &cfg.metrics.bind);
+
+    // [webhook] — Discord-compatible incoming webhook endpoint. OFF by default.
+    if (doc.getBool("webhook.enabled")) |b| cfg.webhook.enabled = b;
+    cfg.webhook.listen = try portField(doc, "webhook.listen", cfg.webhook.listen);
+    try setOpt(allocator, resolver, doc.getString("webhook.bind"), &cfg.webhook.bind);
+    try setOpt(allocator, resolver, doc.getString("webhook.store_path"), &cfg.webhook.store_path);
+    cfg.webhook.max_body_bytes = @intCast(try uintField(doc, "webhook.max_body_bytes", cfg.webhook.max_body_bytes, 1, 1 << 20));
+    cfg.webhook.rate_per_min = @intCast(try uintField(doc, "webhook.rate_per_min", cfg.webhook.rate_per_min, 0, 1_000_000));
+    cfg.webhook.rate_burst = @intCast(try uintField(doc, "webhook.rate_burst", cfg.webhook.rate_burst, 1, 1_000_000));
+    try setOpt(allocator, resolver, doc.getString("webhook.public_url_base"), &cfg.webhook.public_url_base);
 
     try setStr(allocator, resolver, doc.getString("geoip.database"), &cfg.geoip.database);
     try setStr(allocator, resolver, doc.getString("geoip.asn_database"), &cfg.geoip.asn_database);
