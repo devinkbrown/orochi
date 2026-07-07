@@ -28,6 +28,8 @@ documented defaults. Borderline entries are marked.
 |---|---|---|---|---|---|---|---|
 | src/substrate/kagura_frame.zig:190 | `ReassemblyConfig.window` | 64 | Out-of-order reorder/jitter window depth (frames); frames outside are late-dropped | media.reorder_window_frames | uint | 64 | 8..1024 |
 | src/substrate/media_session.zig:173,196 | `Receiver(256, 64)` / `.{ .window = 16 }` call sites | max_payload 256, window_cap 64, runtime window 16 | Receiver reassembly buffer payload cap + reorder window wiring (borderline: currently only in tests but is the canonical wiring) | media.max_payload_bytes / media.reorder_window_frames | uint | 256 / 16 | 64..65535 / 8..1024 |
+| src/daemon/config_boot.zig:82 | `media_dtls_srtp` | false | Opt-in: terminate DTLS-SRTP (RFC 5764/8122) on the WebRTC UDP plane so standard browser peers key SRTP via a DTLS handshake, and advertise the daemon's cert `fingerprint=`/`setup=passive` in the `MEDIA … TRANSPORT` reply instead of the SDES group key. Off ⇒ signaling + pump byte-identical to legacy. | media.dtls_srtp | bool | false | — |
+| src/daemon/config_boot.zig:83 | `media_dtls13` | false | Opt-in: additionally stand up the DTLS 1.3 (RFC 9147) terminator, sharing the 1.2 cert/fingerprint. Requires `media.dtls_srtp`. | media.dtls13 | bool | false | — |
 
 ## Conference mixer and audio (`[media.audio]`)
 

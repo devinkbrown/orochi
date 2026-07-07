@@ -20,6 +20,7 @@ const rtp_nack = @import("../substrate/rtp_nack.zig");
 const media_bridge = @import("media_bridge.zig");
 const dtls_server = @import("../proto/dtls12_server.zig");
 const dtls13_server = @import("../proto/dtls13_server.zig");
+const peer_verify = @import("../proto/dtls_peer_verify.zig");
 const platform = @import("../substrate/platform.zig");
 const sfu_srtp = @import("sfu_srtp.zig");
 
@@ -129,6 +130,13 @@ pub const MediaPlane = struct {
     /// touched from another thread, so no synchronisation is needed. Set in
     /// `init` (its peer table is allocated lazily on the first established peer).
     srtp_hub: sfu_srtp.SfuSrtp,
+    /// RFC 8122 offered peer fingerprints, keyed by the transport's composite
+    /// "channel\x00participant" key. Written by the signaling layer (MEDIA OFFER /
+    /// ANSWER, reactor threads) and read by the pump thread, so guarded by
+    /// `fp_mutex`. The pump binds an entry into the DTLS terminator (by resolved
+    /// peer address) when that peer's DTLS records arrive.
+    offered_fps: std.StringHashMapUnmanaged([peer_verify.digest_len]u8) = .empty,
+    fp_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -144,6 +152,9 @@ pub const MediaPlane = struct {
     pub fn deinit(self: *MediaPlane) void {
         self.shutdown();
         self.transport.deinit();
+        var it = self.offered_fps.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.offered_fps.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -327,6 +338,10 @@ pub const MediaPlane = struct {
     fn handleDtls(self: *MediaPlane, sock: *MediaSocket, from: TransportAddress, data: []const u8) void {
         var out: [2048]u8 = undefined;
         const now = platform.monotonicMillis();
+        // RFC 8122: bind this peer's signaled fingerprint (if any) into the
+        // terminator before the handshake can complete, so an unverified
+        // certificate fails closed. Idempotent; no-op until ICE binds the peer.
+        self.bindDtlsFingerprintFor(from);
         // Version dispatch: a peer the 1.3 engine already owns, or a fresh
         // ClientHello offering DTLS 1.3 (supported_versions), routes to the 1.3
         // engine; everything else stays on Increment 1's DTLS 1.2 path.
@@ -398,6 +413,83 @@ pub const MediaPlane = struct {
         }
     }
 
+    /// Composite "channel\x00participant" key for the offered-fingerprint map,
+    /// written into `buf`. Returns null when it overflows `buf`.
+    fn fpKey(buf: []u8, channel: []const u8, participant: []const u8) ?[]const u8 {
+        if (channel.len + 1 + participant.len > buf.len) return null;
+        @memcpy(buf[0..channel.len], channel);
+        buf[channel.len] = 0;
+        @memcpy(buf[channel.len + 1 ..][0..participant.len], participant);
+        return buf[0 .. channel.len + 1 + participant.len];
+    }
+
+    /// Store the RFC 8122 fingerprint a participant signaled in its MEDIA OFFER /
+    /// ANSWER (SHA-256 of the certificate it will present). The pump binds this
+    /// into the DTLS terminator by resolved peer address once the peer's DTLS
+    /// records arrive, so the handshake fails closed on a mismatch. Idempotent.
+    pub fn bindOfferedFingerprint(self: *MediaPlane, channel: []const u8, participant: []const u8, digest: [peer_verify.digest_len]u8) !void {
+        var kb: [256]u8 = undefined;
+        const k = fpKey(&kb, channel, participant) orelse return error.NameTooLong;
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        const gop = try self.offered_fps.getOrPut(self.allocator, k);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                _ = self.offered_fps.remove(k);
+                return e;
+            };
+        }
+        gop.value_ptr.* = digest;
+    }
+
+    /// Drop a participant's offered fingerprint (MEDIA LEAVE / disconnect).
+    pub fn dropOfferedFingerprint(self: *MediaPlane, channel: []const u8, participant: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = fpKey(&kb, channel, participant) orelse return;
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        if (self.offered_fps.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// Test/introspection: whether a fingerprint is currently bound for a
+    /// participant (does not touch the terminator).
+    pub fn hasOfferedFingerprint(self: *MediaPlane, channel: []const u8, participant: []const u8) bool {
+        var kb: [256]u8 = undefined;
+        const k = fpKey(&kb, channel, participant) orelse return false;
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        return self.offered_fps.contains(k);
+    }
+
+    /// Bind the offered fingerprint for the peer at `from` (if any) into the DTLS
+    /// terminator(s) by address, so the handshake-completion path can fail closed
+    /// on a certificate mismatch. Runs on the pump thread (sole terminator owner)
+    /// and resolves `from`→participant via the ICE-bound transport index, so it is
+    /// a no-op until the peer's ICE check has bound its address. Idempotent.
+    fn bindDtlsFingerprintFor(self: *MediaPlane, from: TransportAddress) void {
+        // Resolve the composite key under the transport lock, copying it out
+        // before unlocking (it borrows transport-owned memory).
+        var kb: [256]u8 = undefined;
+        var klen: usize = 0;
+        lockSpin(&self.mutex);
+        if (self.transport.compositeForSource(from)) |c| {
+            if (c.len <= kb.len) {
+                @memcpy(kb[0..c.len], c);
+                klen = c.len;
+            }
+        }
+        self.mutex.unlock();
+        if (klen == 0) return;
+
+        lockSpin(&self.fp_mutex);
+        const digest = self.offered_fps.get(kb[0..klen]);
+        self.fp_mutex.unlock();
+        if (digest) |d| {
+            if (self.dtls13) |t13| t13.bindExpectedFingerprint(from, d);
+            if (self.dtls) |t12| t12.bindExpectedFingerprint(from, d);
+        }
+    }
+
     /// Selectively forward an RTP `packet` (from `source`) to the other call
     /// participants; meter + cache it for NACK; bridge to native members.
     ///
@@ -419,7 +511,6 @@ pub const MediaPlane = struct {
             // the packet's own header). Drop on auth/replay/ownership failure.
             .ready => canonical = self.srtp_hub.unprotectRtp(source, packet, &plain_buf) orelse return,
         }
-
         var targets: [media_transport.max_forward]TransportAddress = undefined;
         var chanbuf: [256]u8 = undefined;
         var chanlen: usize = 0;
@@ -568,11 +659,15 @@ pub const MediaPlane = struct {
         return self.transport.ensureGroupKey(channel, self.csprng.random());
     }
 
-    /// Drop a participant's endpoint (MEDIA LEAVE / disconnect).
+    /// Drop a participant's endpoint (MEDIA LEAVE / disconnect), including any
+    /// stored RFC 8122 offered fingerprint.
     pub fn remove(self: *MediaPlane, channel: []const u8, participant: []const u8) void {
-        lockSpin(&self.mutex);
-        defer self.mutex.unlock();
-        self.transport.remove(channel, participant);
+        {
+            lockSpin(&self.mutex);
+            defer self.mutex.unlock();
+            self.transport.remove(channel, participant);
+        }
+        self.dropOfferedFingerprint(channel, participant);
     }
 
     /// Snapshot per-participant transport stats for `channel` into `out`.
@@ -665,6 +760,33 @@ test "MediaPlane: start/shutdown is clean and re-startable port is reported" {
     // After shutdown the socket is closed; re-start binds a fresh ephemeral port.
     try plane.start(loopback_be, 0);
     try testing.expect(plane.port != 0);
+}
+
+test "MediaPlane: offered-fingerprint registry stores, reports, and drops (no leak)" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+
+    const d1 = peer_verify.certDigest("alice presented cert");
+    const d2 = peer_verify.certDigest("bob presented cert");
+
+    try testing.expect(!plane.hasOfferedFingerprint("#c", "alice"));
+    try plane.bindOfferedFingerprint("#c", "alice", d1);
+    try plane.bindOfferedFingerprint("#c", "bob", d2);
+    try testing.expect(plane.hasOfferedFingerprint("#c", "alice"));
+    try testing.expect(plane.hasOfferedFingerprint("#c", "bob"));
+
+    // Re-binding the same participant updates in place (no duplicate key leak).
+    try plane.bindOfferedFingerprint("#c", "alice", d2);
+    try testing.expect(plane.hasOfferedFingerprint("#c", "alice"));
+
+    // remove() drops the participant's endpoint AND its fingerprint.
+    plane.remove("#c", "alice");
+    try testing.expect(!plane.hasOfferedFingerprint("#c", "alice"));
+    try testing.expect(plane.hasOfferedFingerprint("#c", "bob"));
+
+    plane.dropOfferedFingerprint("#c", "bob");
+    try testing.expect(!plane.hasOfferedFingerprint("#c", "bob"));
+    // deinit frees any remainder (testing allocator would flag a leak).
 }
 
 test "MediaPlane: DTLS off leaves the pump with no terminator and no fingerprint" {

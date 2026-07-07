@@ -183,6 +183,15 @@ pub const MediaTransport = struct {
         return composite[0..nul];
     }
 
+    /// The full composite "channel\x00participant" key of the participant bound
+    /// to `source`, or null if the address is unknown. Read-only view into the
+    /// address index; the returned slice borrows the owned endpoint key (valid
+    /// while that endpoint exists). Lets the DTLS layer resolve a peer address to
+    /// its (channel, participant) for RFC 8122 fingerprint binding.
+    pub fn compositeForSource(self: *MediaTransport, source: TransportAddress) ?[]const u8 {
+        return self.by_addr.get(addrKey(source));
+    }
+
     /// Resolve a participant endpoint from the server ufrag carried in a STUN
     /// binding's USERNAME (`<server-ufrag>:<peer-ufrag>`).
     pub fn byServerUfrag(self: *MediaTransport, server_ufrag: []const u8) ?*Endpoint {
@@ -489,6 +498,19 @@ test "channelForSource resolves the channel of a bound peer address" {
     try testing.expectEqualStrings("#call", chan);
     // an unbound address resolves to null
     try testing.expect(mt.channelForSource(testAddr(8, 9999)) == null);
+}
+
+test "compositeForSource resolves the full channel\\0participant key of a bound peer" {
+    var prng = std.Random.DefaultPrng.init(13);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#call", "alice", prng.random());
+    try testing.expect(mt.bindRemote("#call", "alice", testAddr(7, 6100)));
+
+    const composite = mt.compositeForSource(testAddr(7, 6100)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, "#call\x00alice", composite);
+    // an unbound address resolves to null
+    try testing.expect(mt.compositeForSource(testAddr(8, 9999)) == null);
 }
 
 test "handleStunBinding authenticates, binds the peer, and answers" {

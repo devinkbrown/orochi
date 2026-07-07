@@ -58,6 +58,7 @@ const msg13 = @import("dtls13_messages.zig");
 const kx = @import("dtls_keyexchange.zig");
 const dtls_srtp = @import("dtls_srtp.zig");
 const fingerprint = @import("dtls_fingerprint.zig");
+const peer_verify = @import("dtls_peer_verify.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const hkdf_tls13 = @import("../crypto/hkdf_tls13.zig");
 
@@ -122,6 +123,12 @@ pub const Session = struct {
 
     srtp_keys: dtls_srtp.ExportedKeys = undefined,
 
+    /// RFC 8122 peer verification (Increment 3). Mirrors the 1.2 terminator:
+    /// `fp_verified` is set true once a presented certificate matched the expected
+    /// fingerprint bound for this address. Whether an expectation EXISTS is
+    /// evaluated live off `Terminator.verify_bindings` at the accessor.
+    fp_verified: bool = false,
+
     /// Epoch-0 (plaintext) server record sequence; starts at 1 (HRR used 0).
     epoch0_write_seq: u48 = 1,
     /// Next epoch-2 server write sequence number.
@@ -157,6 +164,9 @@ pub const Terminator = struct {
     cookie_secret: [32]u8 = @splat(0),
     csprng: std.Random.DefaultCsprng = undefined,
     sessions: []Session,
+    /// RFC 8122 expected peer fingerprints keyed by remote transport address
+    /// (see `dtls12_server.Terminator`). Fixed-capacity, no alloc.
+    verify_bindings: peer_verify.Bindings(default_max_sessions) = .{},
 
     /// Initialise from a 32-byte entropy seed plus the SHARED cert DER + key
     /// (typically the 1.2 terminator's, so both engines present one fingerprint).
@@ -210,16 +220,47 @@ pub const Terminator = struct {
         return s.state == .established;
     }
 
+    /// Exported SRTP keying material for `addr`, else null. FAILS CLOSED on an
+    /// unverified expected fingerprint (RFC 8122), mirroring the 1.2 terminator.
     pub fn exportedKeys(self: *const Terminator, addr: TransportAddress) ?dtls_srtp.ExportedKeys {
         const s = self.find(addr) orelse return null;
         if (s.state != .established) return null;
+        if (!self.peerVerifiedSession(addr, s)) return null;
         return s.srtp_keys;
     }
 
     pub fn srtpProfile(self: *const Terminator, addr: TransportAddress) ?u16 {
         const s = self.find(addr) orelse return null;
         if (s.state != .established) return null;
+        if (!self.peerVerifiedSession(addr, s)) return null;
         return s.srtp_profile;
+    }
+
+    fn peerVerifiedSession(self: *const Terminator, addr: TransportAddress, s: *const Session) bool {
+        return self.verify_bindings.expectedFor(addr) == null or s.fp_verified;
+    }
+
+    /// Bind the RFC 8122 fingerprint the peer signaled for `addr`. Idempotent.
+    pub fn bindExpectedFingerprint(self: *Terminator, addr: TransportAddress, digest: [peer_verify.digest_len]u8) void {
+        _ = self.verify_bindings.bind(addr, digest);
+    }
+
+    /// Record the peer's presented certificate and verify it against the bound
+    /// expected fingerprint (seam for client-certificate capture). No-op when no
+    /// session exists for `addr`.
+    pub fn recordPeerCertificate(self: *Terminator, addr: TransportAddress, cert_der: []const u8) void {
+        const s = self.find(addr) orelse return;
+        if (self.verify_bindings.expectedFor(addr)) |exp| {
+            s.fp_verified = peer_verify.digestEql(exp, peer_verify.certDigest(cert_der));
+        } else {
+            s.fp_verified = false;
+        }
+    }
+
+    /// Whether the peer at `addr` is RFC 8122 verified (no expectation ⇒ true).
+    pub fn peerVerified(self: *const Terminator, addr: TransportAddress) bool {
+        const s = self.find(addr) orelse return false;
+        return self.peerVerifiedSession(addr, s);
     }
 
     // -- session table -----------------------------------------------------
@@ -245,6 +286,9 @@ pub const Terminator = struct {
             if (s.last_activity_ms < stalest.last_activity_ms) stalest = s;
         }
         const slot = free orelse stalest;
+        // Evicting a live slot for a different peer: drop that peer's stale
+        // fingerprint binding so a reused address never inherits it.
+        if (slot.active and !slot.addr.eql(addr)) self.verify_bindings.clear(slot.addr);
         slot.reset();
         slot.active = true;
         slot.addr = addr;
@@ -1023,6 +1067,39 @@ test "full DTLS 1.3 handshake when the client leads with a non-P-256 key_share (
     // The browser case the reviewer flagged: CH1 carries only a non-secp256r1
     // key_share; the server must send an HRR SELECTING secp256r1, not drop it.
     try driveFullHandshake(&setup.term, testAddr(7, 7020), true);
+}
+
+test "RFC 8122 (1.3): matching fingerprint unlocks keys; mismatch stays fail-closed" {
+    var setup = try makeTerminator(0x7A);
+    defer setup.deinit();
+    var term = &setup.term;
+
+    // Peer A: complete the handshake first (driveFullHandshake asserts keys with
+    // no expectation bound), then bind + present a matching cert. The binding is
+    // evaluated live, so it gates even though it lands after completion.
+    const addr_a = testAddr(5, 7600);
+    const peer_cert = "simulated browser client cert (1.3)";
+    try driveFullHandshake(term, addr_a, false);
+    term.bindExpectedFingerprint(addr_a, peer_verify.certDigest(peer_cert));
+    // Bound but not yet verified ⇒ fail closed.
+    try testing.expect(term.established(addr_a));
+    try testing.expect(!term.peerVerified(addr_a));
+    try testing.expect(term.exportedKeys(addr_a) == null);
+    try testing.expect(term.srtpProfile(addr_a) == null);
+    // Present the matching cert ⇒ verified ⇒ keys unlocked.
+    term.recordPeerCertificate(addr_a, peer_cert);
+    try testing.expect(term.peerVerified(addr_a));
+    try testing.expect(term.exportedKeys(addr_a) != null);
+    try testing.expect(term.srtpProfile(addr_a) != null);
+
+    // Peer B: a mismatched presented cert stays fail-closed.
+    const addr_b = testAddr(6, 7601);
+    try driveFullHandshake(term, addr_b, false);
+    term.bindExpectedFingerprint(addr_b, peer_verify.certDigest("the promised cert"));
+    term.recordPeerCertificate(addr_b, "a completely different cert");
+    try testing.expect(!term.peerVerified(addr_b));
+    try testing.expect(term.exportedKeys(addr_b) == null);
+    try testing.expect(term.srtpProfile(addr_b) == null);
 }
 
 /// Drive a complete DTLS 1.3 handshake with a same-library client. When
