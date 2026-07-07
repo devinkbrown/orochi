@@ -241,6 +241,8 @@ const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
 const command_usage = @import("command_usage.zig");
 const metrics_http = @import("metrics_http.zig");
+const webhook_mod = @import("webhook.zig");
+const webhook_http = @import("webhook_http.zig");
 const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
@@ -1432,6 +1434,26 @@ pub const Config = struct {
     /// Bind address (host byte order) for the `/metrics` listener. Defaults to
     /// loopback `127.0.0.1`; only widened deliberately via `[metrics].bind`.
     metrics_bind_addr: u32 = 0x7f00_0001,
+    /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
+    /// default: when `webhook_enabled` is false the listener never binds and the
+    /// `WEBHOOK` command is not registered — byte-identical to a build without
+    /// the feature. See webhook.zig / webhook_http.zig.
+    webhook_enabled: bool = false,
+    /// TCP port for the plaintext webhook HTTP listener; 0 = OS-ephemeral (the
+    /// feature is gated by `webhook_enabled`, not by the port).
+    webhook_port: u16 = 0,
+    /// Bind address (host byte order) for the webhook listener; loopback default.
+    webhook_bind_addr: u32 = 0x7f00_0001,
+    /// TSV path persisting webhook bindings across restart + USR2. Empty = none.
+    webhook_store_path: []const u8 = "",
+    /// Max accepted webhook request-body bytes (larger ⇒ 413).
+    webhook_max_body: u32 = 8192,
+    /// Per-webhook sustained rate (requests/min); 0 disables rate limiting.
+    webhook_rate_per_min: u32 = 60,
+    /// Per-webhook token-bucket burst capacity.
+    webhook_rate_burst: u32 = 10,
+    /// Public URL base for the WEBHOOK CREATE reply; empty ⇒ derive from bind/port.
+    webhook_public_base: []const u8 = "",
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
@@ -2312,14 +2334,32 @@ fn disabledFeaturePresent(features: []const []const u8, needle: []const u8) bool
 }
 
 fn runtimeDisabledFeatures(allocator: std.mem.Allocator, config: Config) !RuntimeFeatureConfig {
-    if (config.account_services != null or disabledFeaturePresent(config.disabled_features, "accounts")) {
-        return .{ .config = config };
-    }
+    // Conditionally hide feature-gated commands. Each appended tag makes every
+    // `CommandSpec` with that `.feature` return `.disabled` (→ 421), so the
+    // WEBHOOK command is invisible unless `[webhook] enabled` is set — keeping a
+    // webhook-off daemon byte-identical to one built without the feature.
+    const need_accounts = config.account_services == null and
+        !disabledFeaturePresent(config.disabled_features, "accounts");
+    const need_webhook = !config.webhook_enabled and
+        !disabledFeaturePresent(config.disabled_features, "webhook");
+
+    var extra: usize = 0;
+    if (need_accounts) extra += 1;
+    if (need_webhook) extra += 1;
+    if (extra == 0) return .{ .config = config };
 
     var out = config;
-    const merged = try allocator.alloc([]const u8, config.disabled_features.len + 1);
+    const merged = try allocator.alloc([]const u8, config.disabled_features.len + extra);
     @memcpy(merged[0..config.disabled_features.len], config.disabled_features);
-    merged[config.disabled_features.len] = "accounts";
+    var idx = config.disabled_features.len;
+    if (need_accounts) {
+        merged[idx] = "accounts";
+        idx += 1;
+    }
+    if (need_webhook) {
+        merged[idx] = "webhook";
+        idx += 1;
+    }
     out.disabled_features = merged;
     return .{ .config = out, .owned_disabled_features = merged };
 }
@@ -2673,6 +2713,17 @@ pub const LinuxServer = struct {
     /// Started in `start()` when `config.metrics_port != 0`, joined in `deinit()`.
     /// On hot-upgrade it is torn down and re-created on the new process.
     metrics_server: ?metrics_http.MetricsServer = null,
+    /// Discord-compatible incoming webhook bindings (id → channel). Shared
+    /// between the reactor thread (WEBHOOK command create/delete) and the
+    /// off-thread HTTP listener (token verify only); mutex-guarded internally.
+    webhook_store: webhook_mod.WebhookStore = .{},
+    /// Validated, sanitised webhook posts handed from the HTTP listener thread to
+    /// reactor 0, which fans each into its bound channel on-thread. Lock-free MPMC.
+    webhook_posts: webhook_mod.PostQueue = webhook_mod.PostQueue.init(),
+    /// Optional plaintext webhook HTTP listener (loopback by default). Started in
+    /// `start()` when `webhook_enabled` and `webhook_port != 0`; joined in
+    /// `deinit()`. Re-created on the new process across a USR2 hot-upgrade.
+    webhook_server: ?webhook_http.WebhookServer = null,
     /// #33 ACTIVITY: per-channel real-time activity-stream subscribers.
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
@@ -3262,6 +3313,7 @@ pub const LinuxServer = struct {
             self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
         }
         self.startMetrics();
+        self.startWebhook();
     }
 
     /// Stand up the live Prometheus `/metrics` HTTP listener when configured.
@@ -3300,6 +3352,296 @@ pub const LinuxServer = struct {
         defer out.deinit(self.allocator);
         self.stats.writePrometheus(self.allocator, &out) catch return;
         self.metrics_snapshot.set(out.items) catch return;
+    }
+
+    /// The per-webhook rate policy assembled from config.
+    fn webhookRate(self: *const LinuxServer) webhook_mod.RateConfig {
+        return .{ .per_min = self.config.webhook_rate_per_min, .burst = self.config.webhook_rate_burst };
+    }
+
+    /// Stand up the plaintext webhook HTTP listener when enabled + a port is set.
+    /// Loopback-by-default; a bind/spawn failure logs and the daemon keeps serving
+    /// IRC. Restores persisted bindings first so a POST right after boot resolves.
+    fn startWebhook(self: *LinuxServer) void {
+        // `webhook_enabled` is the sole gate; a 0 port binds an OS-ephemeral one
+        // (matching the IRC listener). When disabled this is a no-op and the
+        // daemon is byte-identical to a build without the feature.
+        if (!self.config.webhook_enabled) return;
+        if (self.config.webhook_store_path.len == 0) {
+            srvLog("orochi: webhook endpoint has no [webhook] store_path — bindings will NOT survive a restart or USR2 upgrade\n", .{});
+        }
+        self.loadWebhooks();
+        const sink = webhook_mod.PostSink{ .ctx = self, .submit = webhookSubmit };
+        self.webhook_server = webhook_http.WebhookServer.init(
+            &self.webhook_store,
+            sink,
+            self.config.webhook_port,
+            .{
+                .bind_addr = self.config.webhook_bind_addr,
+                .handler = .{
+                    .max_body = self.config.webhook_max_body,
+                    .rate = self.webhookRate(),
+                },
+            },
+        ) catch |e| {
+            srvLog("orochi: webhook endpoint disabled ({s})\n", .{@errorName(e)});
+            return;
+        };
+        self.webhook_server.?.spawn() catch |e| {
+            srvLog("orochi: webhook endpoint disabled ({s})\n", .{@errorName(e)});
+            self.webhook_server.?.shutdown();
+            self.webhook_server = null;
+            return;
+        };
+        srvLog("orochi: webhook endpoint on TCP :{d}\n", .{self.webhook_server.?.port});
+    }
+
+    /// `PostSink` callback: enqueue a validated post for reactor 0 and nudge it.
+    /// Runs on the HTTP listener thread — it only touches the lock-free MPMC queue
+    /// and the (thread-safe) wake eventfd, never any reactor-owned state. Returns
+    /// false when the queue is full so the HTTP handler answers 429.
+    fn webhookSubmit(ctx: *anyopaque, post: *const webhook_mod.PendingPost) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        if (!self.webhook_posts.push(post.*)) return false;
+        // Wake reactor 0 (it keeps a poll on its wake fd armed each loop) so the
+        // post is drained promptly rather than on the next unrelated completion.
+        if (self.reactors.len > 0) {
+            if (self.reactors[0].wake) |*w| w.wake();
+        }
+        return true;
+    }
+
+    /// Drain pending webhook posts on reactor 0 and fan each into its channel.
+    /// Called every `runOnce` (belt-and-suspenders alongside the wake). Bounded
+    /// per iteration so a flood cannot starve normal I/O.
+    fn drainWebhookPosts(self: *LinuxServer) void {
+        if (self.webhook_server == null) return;
+        if (self.reactors.len == 0 or self.rx() != &self.reactors[0]) return;
+        var drained: usize = 0;
+        while (drained < 64) : (drained += 1) {
+            const post = self.webhook_posts.pop() orelse break;
+            // Injection reads shared world state and drives delivery, so serialize
+            // it under the same coarse `world.lockWrite` that `onCompletion` holds
+            // around normal command processing (Phase B multithreading). The
+            // lock is taken only when a post is actually present, so the common
+            // empty-queue path stays lock-free.
+            self.world.lockWrite();
+            self.injectWebhookPost(&post);
+            self.world.unlockWrite();
+        }
+    }
+
+    /// Fan a validated, pre-sanitised webhook post into its bound channel as a
+    /// synthetic bot sender, mirror it to the mesh, and record it in CHATHISTORY.
+    /// Runs on reactor 0 (the delivery path routes cross-shard via `deliverTagged`).
+    /// Every field is already CR/LF/control-free, so the wire cannot be corrupted.
+    fn injectWebhookPost(self: *LinuxServer, post: *const webhook_mod.PendingPost) void {
+        const chan = post.channel();
+        if (!world_model.isChannelName(chan)) return;
+        if (!self.world.channelExists(chan)) return;
+        // Respect channel modes: a webhook bot holds no membership/voice, so a
+        // moderated (+m) channel drops the post (the HTTP request already 204'd).
+        if (self.world.channelHasFlag(chan, .moderated)) return;
+
+        const nick = post.nick();
+        if (nick.len == 0) return;
+        // Synthetic sender prefix `<nick>!webhook@<server>`. `nick` is sanitised
+        // (no space / CR / LF), so the prefix can never split or forge a line.
+        var prefix_buf: [webhook_mod.max_nick + 96]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}!webhook@{s}", .{
+            nick, protocol_inventory.currentServerName(),
+        }) catch return;
+
+        var lines = std.mem.splitScalar(u8, post.body(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            const message_id = self.msgid_gen.next(&msgid_buf);
+            var time_buf: [40]u8 = undefined;
+            const tags = MsgTags{
+                .time_value = serverTimeValue(&time_buf),
+                .account = null,
+                .msgid = message_id,
+                .is_bot = true,
+            };
+            var msg_buf: [default_reply_bytes]u8 = undefined;
+            const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{chan}, line) catch continue;
+            self.broadcastChannelTagged(chan, tags, msg, null) catch {};
+
+            // Mesh relay so remote members of `chan` see the post too. Loop-guarded.
+            const hlc = self.nextMeshHlc();
+            _ = self.relay_seen.observe(self.config.node_id, hlc);
+            var relay_msg = s2s_link.RelayMessage{
+                .verb = .privmsg,
+                .target = chan,
+                .source_nick = nick,
+                .source_prefix = prefix,
+                .account = "",
+                .tags = "",
+                .text = line,
+                .origin_node = self.config.node_id,
+                .hlc = hlc,
+            };
+            var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+            var sig_buf: [message_relay.sig_len]u8 = undefined;
+            self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+            _ = self.relayToPeers(relay_msg, .{ .channel = chan });
+
+            self.recordHistoryRelay(chan, prefix, message_id, "PRIVMSG", line, null);
+        }
+    }
+
+    /// Persist the webhook binding set to `[webhook] store_path` (best-effort;
+    /// mirrors `persistGrants`). Called after every WEBHOOK create/delete so the
+    /// file is current before any restart or USR2 hot-upgrade.
+    fn persistWebhooks(self: *LinuxServer) void {
+        if (self.config.webhook_store_path.len == 0) return;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        self.webhook_store.serialize(self.allocator, &out) catch return;
+        writeFileAbs(self.allocator, self.config.webhook_store_path, out.items);
+    }
+
+    /// Restore persisted webhook bindings at boot (from `start`). No-op without a
+    /// configured path / readable file.
+    fn loadWebhooks(self: *LinuxServer) void {
+        if (self.config.webhook_store_path.len == 0) return;
+        const io = self.config.crypto_io orelse return;
+        const text = std.Io.Dir.cwd().readFileAlloc(io, self.config.webhook_store_path, self.allocator, .limited(1 << 20)) catch return;
+        defer self.allocator.free(text);
+        const restored = self.webhook_store.load(text, self.nowMs(), self.webhookRate());
+        if (restored != 0) srvLog("orochi: restored {d} webhook binding(s)\n", .{restored});
+    }
+
+    /// `WEBHOOK CREATE <#channel> [name] | LIST <#channel> | DELETE <id>` —
+    /// manage Discord-compatible incoming webhook bindings. Every subcommand that
+    /// names a channel is gated on channel-operator status (network opers bypass).
+    pub fn handleWebhook(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.config.webhook_enabled) {
+            try self.noticeTo(conn, "WEBHOOK: the webhook endpoint is not enabled on this server");
+            return;
+        }
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WEBHOOK"}, "Usage: WEBHOOK CREATE <#channel> [name] | LIST <#channel> | DELETE <id>");
+            return;
+        }
+        const params = parsed.paramSlice();
+        const sub = params[0];
+        if (std.ascii.eqlIgnoreCase(sub, "CREATE")) {
+            try self.webhookCreate(id, conn, params);
+        } else if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            try self.webhookList(id, conn, params);
+        } else if (std.ascii.eqlIgnoreCase(sub, "DELETE")) {
+            try self.webhookDelete(id, conn, params);
+        } else {
+            try self.noticeTo(conn, "WEBHOOK: unknown subcommand (use CREATE, LIST, or DELETE)");
+        }
+    }
+
+    /// Channel-op gate for WEBHOOK subcommands: true if the caller is a channel
+    /// operator (or a network oper). On failure it queues the appropriate numeric
+    /// and returns false. Mirrors the KICK/MODE op predicate.
+    fn webhookChannelOpGate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) bool {
+        if (conn.session.isOper()) return true;
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+            queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel") catch {};
+            return false;
+        };
+        if (!mm.isOperator()) {
+            queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator") catch {};
+            return false;
+        }
+        return true;
+    }
+
+    fn webhookCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, params: []const []const u8) !void {
+        if (params.len < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WEBHOOK"}, "Usage: WEBHOOK CREATE <#channel> [name]");
+            return;
+        }
+        const channel = params[1];
+        if (!world_model.isChannelName(channel)) {
+            try self.noticeTo(conn, "WEBHOOK: that is not a channel name");
+            return;
+        }
+        if (!self.webhookChannelOpGate(id, conn, channel)) return;
+        const name = if (params.len >= 3) params[2] else channel;
+
+        var idm: [webhook_mod.id_bytes]u8 = undefined;
+        var tkm: [webhook_mod.token_bytes]u8 = undefined;
+        secure_fns.randomBytes(&idm);
+        secure_fns.randomBytes(&tkm);
+        const creator = conn.session.account() orelse conn.session.displayName();
+        const now_unix: i64 = @divTrunc(platform.realtimeMillis(), 1000);
+        const creds = self.webhook_store.create(channel, name, creator, now_unix, self.nowMs(), self.webhookRate(), idm, tkm) catch |e| {
+            const msg = switch (e) {
+                error.Full => "WEBHOOK: server webhook limit reached",
+                error.ChannelFull => "WEBHOOK: this channel already has the maximum number of webhooks",
+                error.BadChannel => "WEBHOOK: invalid channel name",
+            };
+            try self.noticeTo(conn, msg);
+            return;
+        };
+        self.persistWebhooks();
+
+        var url_buf: [512]u8 = undefined;
+        const url = self.webhookUrl(&url_buf, &creds.id, &creds.token);
+        var line: [640]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&line, "WEBHOOK: created for {s} — POST Discord webhook JSON to {s}", .{ channel, url }) catch "WEBHOOK: created");
+        try self.noticeTo(conn, "WEBHOOK: this URL contains the secret token and is shown only once — store it now.");
+    }
+
+    fn webhookList(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, params: []const []const u8) !void {
+        if (params.len < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WEBHOOK"}, "Usage: WEBHOOK LIST <#channel>");
+            return;
+        }
+        const channel = params[1];
+        if (!self.webhookChannelOpGate(id, conn, channel)) return;
+        var entries: [webhook_mod.max_per_channel]webhook_mod.ListEntry = undefined;
+        const n = self.webhook_store.list(channel, &entries);
+        if (n == 0) {
+            var b: [128]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&b, "WEBHOOK: no webhooks bound to {s}", .{channel}) catch "WEBHOOK: none");
+            return;
+        }
+        for (entries[0..n]) |*e| {
+            var b: [320]u8 = undefined;
+            // The token is NOT stored in plaintext and is never shown here.
+            try self.noticeTo(conn, std.fmt.bufPrint(&b, "WEBHOOK: id={s} name={s} by={s}", .{ e.id, e.name(), e.creator() }) catch continue);
+        }
+    }
+
+    fn webhookDelete(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, params: []const []const u8) !void {
+        if (params.len < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WEBHOOK"}, "Usage: WEBHOOK DELETE <id>");
+            return;
+        }
+        const wid = params[1];
+        var chbuf: [webhook_mod.max_channel]u8 = undefined;
+        const channel = self.webhook_store.channelOf(wid, &chbuf) orelse {
+            try self.noticeTo(conn, "WEBHOOK: no such webhook id");
+            return;
+        };
+        if (!self.webhookChannelOpGate(id, conn, channel)) return;
+        _ = self.webhook_store.remove(wid);
+        self.persistWebhooks();
+        try self.noticeTo(conn, "WEBHOOK: deleted");
+    }
+
+    /// Render the full webhook URL for the CREATE reply. Uses the configured
+    /// public base (a reverse-proxy origin) when set; otherwise derives
+    /// `http://<bind-ip>:<port>` from the listener config.
+    fn webhookUrl(self: *const LinuxServer, buf: []u8, id: []const u8, token: []const u8) []const u8 {
+        const base = self.config.webhook_public_base;
+        if (base.len != 0) {
+            const trimmed = if (base[base.len - 1] == '/') base[0 .. base.len - 1] else base;
+            return std.fmt.bufPrint(buf, "{s}/api/webhooks/{s}/{s}", .{ trimmed, id, token }) catch buf[0..0];
+        }
+        const a = self.config.webhook_bind_addr;
+        return std.fmt.bufPrint(buf, "http://{d}.{d}.{d}.{d}:{d}/api/webhooks/{s}/{s}", .{
+            (a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff, self.config.webhook_port, id, token,
+        }) catch buf[0..0];
     }
 
     test "server start gates media transports on media_enabled" {
@@ -3404,6 +3746,13 @@ pub const LinuxServer = struct {
         if (self.metrics_server) |*ms| {
             ms.shutdown();
             self.metrics_server = null;
+        }
+        // Stop + join the webhook listener before anything it might touch (the
+        // shared store) is torn down. shutdown() closes the fd and joins; the
+        // store is an inline value with no heap to free.
+        if (self.webhook_server) |*ws| {
+            ws.shutdown();
+            self.webhook_server = null;
         }
         self.metrics_snapshot.deinit();
         if (self.owned_disabled_features) |owned| {
@@ -4430,6 +4779,10 @@ pub const LinuxServer = struct {
         // reactor drains only its own mailbox into its own connections, so this is
         // reactor-local and needs no world lock. No-op in single-reactor mode.
         if (self.fabric != null) self.drainFabric();
+
+        // Drain any off-thread webhook posts addressed to reactor 0 and fan each
+        // into its channel on-thread. Cheap when empty (one lock-free pop).
+        self.drainWebhookPosts();
 
         _ = try self.rx().ring.submit();
     }
@@ -28715,6 +29068,159 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
     try recvUntil(&c, "@label=zed BATCH +", 200);
     try recvUntil(&c, "@batch=", 200);
     try recvUntil(&c, "BATCH -", 200);
+}
+
+test "webhook: a Discord POST is delivered to the bound channel as a bot integration" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .webhook_enabled = true,
+        .webhook_port = 0, // OS-ephemeral
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // start() binds the ephemeral webhook listener + spawns its thread (mirrors
+    // main.zig: start() then runThreaded).
+    server.start();
+    const wh = server.webhook_server orelse return error.SkipZigTest;
+    const webhook_port = wh.port;
+    const irc_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        server.wakeAllReactors();
+        if (connectLoopback(irc_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Register a client and join the target channel.
+    const fd = connectLoopback(irc_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "NICK ann\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&c, " 001 ann ", 200);
+    try writeAllFd(fd, "JOIN #hooks\r\n");
+    try recvUntil(&c, "JOIN #hooks", 200);
+
+    // Seed a binding directly (deterministic credentials; the WEBHOOK command
+    // path is exercised by the op-gating test).
+    const idm: [webhook_mod.id_bytes]u8 = @splat(0x1a);
+    const tkm: [webhook_mod.token_bytes]u8 = @splat(0x2b);
+    const creds = try server.webhook_store.create("#hooks", "ci", "ann", 0, 0, server.webhookRate(), idm, tkm);
+
+    // POST a Discord webhook body to the webhook listener over loopback.
+    const body = "{\"content\":\"deploy ok\",\"username\":\"CI Bot\"}";
+    var reqbuf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&reqbuf, "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n{s}", .{ creds.id, creds.token, body.len, body }) catch unreachable;
+    const hfd = connectLoopback(webhook_port) catch return error.SkipZigTest;
+    defer closeFd(hfd);
+    c.reset();
+    try writeAllFd(hfd, req);
+    var hc = LiveClient{ .fd = hfd };
+    try recvUntil(&hc, "204 No Content", 200);
+
+    // The bot message reaches the channel member, tagged as coming from a
+    // sanitised bot nick.
+    try recvUntil(&c, "PRIVMSG #hooks :deploy ok", 400);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "CI-Bot!webhook@") != null);
+}
+
+test "webhook: CREATE/LIST/DELETE gate on channel operator status" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .webhook_enabled = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const op_id = try addTestLocalClient(&server, "boss", null);
+    const op_conn = server.connFor(op_id).?;
+    const peon_id = try addTestLocalClient(&server, "peon", null);
+    const peon_conn = server.connFor(peon_id).?;
+
+    _ = try server.world.join("#room", worldIdFromClient(op_id));
+    _ = try server.world.setMemberMode("#room", worldIdFromClient(op_id), .op, true);
+    _ = try server.world.join("#room", worldIdFromClient(peon_id));
+
+    // A non-op member cannot CREATE (482 queued, no binding minted).
+    var create_line = try irc_line.parseLine("WEBHOOK CREATE #room ci");
+    try server.handleWebhook(peon_id, peon_conn, &create_line);
+    try expectContains(peon_conn.send_buf[0..peon_conn.send_len], " 482 ");
+    try std.testing.expectEqual(@as(usize, 0), server.webhook_store.len());
+
+    // The channel op can CREATE — the URL is returned in a NOTICE.
+    try server.handleWebhook(op_id, op_conn, &create_line);
+    try expectContains(op_conn.send_buf[0..op_conn.send_len], "/api/webhooks/");
+    try std.testing.expectEqual(@as(usize, 1), server.webhook_store.len());
+
+    // LIST shows the binding to the op.
+    op_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("WEBHOOK LIST #room");
+    try server.handleWebhook(op_id, op_conn, &list_line);
+    try expectContains(op_conn.send_buf[0..op_conn.send_len], "id=");
+
+    // Recover the minted id to DELETE it.
+    var entries: [webhook_mod.max_per_channel]webhook_mod.ListEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), server.webhook_store.list("#room", &entries));
+    var del_buf: [64]u8 = undefined;
+    const del_line_txt = std.fmt.bufPrint(&del_buf, "WEBHOOK DELETE {s}", .{entries[0].id}) catch unreachable;
+
+    // A non-op cannot DELETE (482; binding survives).
+    var del_line = try irc_line.parseLine(del_line_txt);
+    peon_conn.send_len = 0;
+    try server.handleWebhook(peon_id, peon_conn, &del_line);
+    try expectContains(peon_conn.send_buf[0..peon_conn.send_len], " 482 ");
+    try std.testing.expectEqual(@as(usize, 1), server.webhook_store.len());
+
+    // The op deletes it.
+    try server.handleWebhook(op_id, op_conn, &del_line);
+    try std.testing.expectEqual(@as(usize, 0), server.webhook_store.len());
+}
+
+test "webhook disabled: WEBHOOK returns 421 and no listener binds (byte-identical off)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        // webhook_enabled defaults false.
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    // No webhook listener was stood up.
+    try std.testing.expect(server.webhook_server == null);
+
+    const irc_port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        server.wakeAllReactors();
+        if (connectLoopback(irc_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(irc_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "NICK zed\r\nUSER z 0 * :Z\r\n");
+    try recvUntil(&c, " 001 zed ", 200);
+    // The feature-gated command is invisible: 421 ERR_UNKNOWNCOMMAND.
+    c.reset();
+    try writeAllFd(fd, "WEBHOOK CREATE #x\r\n");
+    try recvUntil(&c, " 421 ", 200);
 }
 
 test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass" {

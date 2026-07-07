@@ -92,6 +92,18 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         out.metrics_port = cfg.metrics.listen;
         if (parseIp4Host(cfg.metrics.bind)) |addr| out.metrics_bind_addr = addr;
     }
+    // [webhook] — Discord-compatible incoming webhook endpoint. Fully gated by
+    // `enabled`; the bind defaults to loopback and widens only via an address.
+    out.webhook_enabled = cfg.webhook.enabled;
+    out.webhook_port = cfg.webhook.listen;
+    if (cfg.webhook.bind) |b| {
+        if (parseIp4Host(b)) |addr| out.webhook_bind_addr = addr;
+    }
+    if (cfg.webhook.store_path) |p| out.webhook_store_path = p;
+    out.webhook_max_body = cfg.webhook.max_body_bytes;
+    out.webhook_rate_per_min = cfg.webhook.rate_per_min;
+    out.webhook_rate_burst = cfg.webhook.rate_burst;
+    if (cfg.webhook.public_url_base) |u| out.webhook_public_base = u;
     if (cfg.geoip.database.len != 0) out.geoip_db_path = cfg.geoip.database;
     if (cfg.geoip.asn_database.len != 0) out.geoip_asn_db_path = cfg.geoip.asn_database;
     out.backlog = cfg.limits.backlog;
@@ -446,6 +458,50 @@ test "media listen overlays media port and candidate host" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u16, 7820), loaded.config.media_port);
     try testing.expectEqualStrings("203.0.113.5", loaded.config.media_host);
+}
+
+test "webhook section overlays the server config and parses the bind address" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[webhook]
+        \\enabled = true
+        \\listen = 9140
+        \\bind = "127.0.0.1"
+        \\store_path = "webhooks.tsv"
+        \\max_body_bytes = 4096
+        \\rate_per_min = 30
+        \\rate_burst = 5
+        \\public_url_base = "https://irc.example.com"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.config.webhook_enabled);
+    try testing.expectEqual(@as(u16, 9140), loaded.config.webhook_port);
+    try testing.expectEqual(@as(u32, 0x7f00_0001), loaded.config.webhook_bind_addr);
+    try testing.expectEqualStrings("webhooks.tsv", loaded.config.webhook_store_path);
+    try testing.expectEqual(@as(u32, 4096), loaded.config.webhook_max_body);
+    try testing.expectEqual(@as(u32, 30), loaded.config.webhook_rate_per_min);
+    try testing.expectEqual(@as(u32, 5), loaded.config.webhook_rate_burst);
+    try testing.expectEqualStrings("https://irc.example.com", loaded.config.webhook_public_base);
+}
+
+test "webhook omitted keeps the feature off (byte-identical default)" {
+    const allocator = testing.allocator;
+    var loaded = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(!loaded.config.webhook_enabled);
+    try testing.expectEqual(@as(u16, 0), loaded.config.webhook_port);
 }
 
 test "media enabled maps to server gate and disabled feature" {
