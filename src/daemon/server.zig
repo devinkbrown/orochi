@@ -5563,9 +5563,41 @@ pub const LinuxServer = struct {
                     conn.close_reason = "TLS RX error";
                     return .close;
                 },
-                .key_update => {
-                    // The kernel consumed the KeyUpdate; the conn continues.
+                .key_update => |ku| {
+                    // The kernel consumed the client's KeyUpdate; the conn survives.
                     conn.last_activity_ms = self.nowMs();
+                    if (ku.request_peer) {
+                        // RFC 8446 §4.6.3: an `update_requested` KeyUpdate obliges the
+                        // server to send its OWN KeyUpdate(update_not_requested) AND
+                        // rotate TX *before* its next application record. On a txrx
+                        // conn the server TX is kernel-offloaded, so that reply would
+                        // have to be injected as an in-order handshake control record
+                        // (sendmsg + TLS_SET_RECORD_TYPE) ahead of any io_uring-queued
+                        // app-data send AND paired with a TLS_TX re-install — an
+                        // ordering hazard against the async send path that this
+                        // surgical continuity change does not take on. The spec-safe
+                        // conservative choice is therefore to send NO further app data:
+                        // close cleanly (the reply obligation is honored by silence,
+                        // never violated). `update_not_requested` — the near-universal
+                        // client behavior (Chrome/BoringSSL, OpenSSL periodic rekey) —
+                        // is fully continued below with zero dropped bytes.
+                        conn.close_reason = "TLS RX key_update reply unsupported";
+                        return .close;
+                    }
+                    // Advance the RX key and re-install it on the kernel at seq 0 so the
+                    // client's post-KeyUpdate records (under its rotated send key)
+                    // decrypt. Fail-safe: on any error fall back to the existing clean
+                    // close (the kernel TLS_RX swap is atomic — no half-installed key).
+                    // Guard `conn.tls` rather than unwrap: an RX-offloaded conn always
+                    // holds its engine, but the recv path never panics on it.
+                    const t = conn.tls orelse {
+                        conn.close_reason = "TLS RX rekey failed";
+                        return .close;
+                    };
+                    t.rekeyKtlsRx(conn.fd) catch {
+                        conn.close_reason = "TLS RX rekey failed";
+                        return .close;
+                    };
                     survived = true;
                 },
                 .app_data => |pt| {
@@ -5588,10 +5620,14 @@ pub const LinuxServer = struct {
                     return .close;
                 },
                 .needs_rekey => {
-                    // A post-KeyUpdate app record arrived but the kernel RX key was
-                    // not rotated (RX rekey continuation is a follow-up). Close
-                    // cleanly with a distinct reason rather than spin or corrupt.
-                    conn.close_reason = "TLS RX rekey unsupported";
+                    // EKEYEXPIRED: the kernel needs a fresh RX key. In the ordered
+                    // single-reactor drain the preceding KeyUpdate is demuxed first
+                    // and re-installs the advanced key (`.key_update` above), so a
+                    // post-KeyUpdate app record decrypts and this arm is normally
+                    // unreachable. Reaching it means the rekey signal arrived without a
+                    // demuxable KeyUpdate to advance from — close cleanly, fail-safe,
+                    // rather than spin or corrupt the byte stream.
+                    conn.close_reason = "TLS RX rekey needed";
                     return .close;
                 },
                 .fault => {

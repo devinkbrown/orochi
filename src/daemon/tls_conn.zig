@@ -182,6 +182,32 @@ pub const TlsConn = struct {
         try ktls.attachRx(fd, encoded);
     }
 
+    /// Continuity after a peer KeyUpdate on an RX-offloaded TLS 1.3 conn: advance
+    /// the client→server (RX) key in the engine and RE-INSTALL it on the kernel via
+    /// a second `setsockopt(TLS_RX)` at record seq 0, so the kernel can decrypt the
+    /// client's post-KeyUpdate records (which are under the client's rotated send
+    /// key). The engine's TX secret/state is untouched; only the RX direction moves.
+    ///
+    /// Fail-safe: the kernel TLS_RX swap is atomic — on any error the previous RX
+    /// key stays installed (never a half-installed state) and the caller falls back
+    /// to a clean close. The engine's `client_app_secret` is advanced BEFORE the
+    /// syscall so that a subsequent Helix `exportResume` carries the correct
+    /// (advanced) secret; on a failed re-install the conn is closed anyway, so the
+    /// engine⇄kernel divergence is moot (the conn never survives to be carried).
+    /// Only TLS 1.3 is supported. The error set widens to include the engine's
+    /// `Error` because advancing the traffic secret runs the HKDF derivation; the
+    /// sole caller closes the conn on any error, so every failure is fail-safe.
+    pub fn rekeyKtlsRx(self: *TlsConn, fd: linux.fd_t) (KtlsError || Error)!void {
+        const params = switch (self.engine) {
+            .tls13 => |*s| try s.advanceRxKeyForKtls(),
+            .undecided, .tls12 => return error.KtlsUnsupportedEngine,
+        };
+        var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        const encoded = try encodeKtlsCryptoInfo(params, &buf);
+        // The ULP is already attached (RX offload is live); re-install the RX key.
+        try ktls.attachRx(fd, encoded);
+    }
+
     /// True when a partial inbound TLS record is buffered (an incomplete record
     /// awaiting more socket bytes). kTLS RX offload must NOT attach while this is
     /// true — the kernel would resume mid-record and desync.
@@ -523,12 +549,15 @@ pub const KtlsRxRecord = union(enum) {
     /// the IRC/WS layer exactly as the plain-recv fast path does.
     app_data: []u8,
     /// A TLS 1.3 post-handshake handshake record — a client KeyUpdate. The kernel
-    /// consumed it; the conn continues, no drop. Caveat (see `enableKtlsRx`): a
-    /// KeyUpdate rotates the peer's send key, so the kernel needs the RX
-    /// `crypto_info` re-installed (a second `setsockopt(TLS_RX)` from the advanced
-    /// read keys) to keep decrypting *subsequent* app data. Until that
-    /// continuation lands, a post-KeyUpdate app record surfaces as `.needs_rekey`.
-    key_update,
+    /// consumed it; the conn continues, no drop. The KeyUpdate rotates the peer's
+    /// send key, so the caller re-installs the advanced RX `crypto_info` on the
+    /// kernel (a second `setsockopt(TLS_RX)` at seq 0 — `TlsConn.rekeyKtlsRx`) to
+    /// keep decrypting *subsequent* app data. `request_peer` carries the RFC 8446
+    /// §4.6.3 `update_requested` flag: when true the client obliges the server to
+    /// send its OWN KeyUpdate(update_not_requested) and rotate TX before its next
+    /// application record (the daemon's spec-safe handling of that reply obligation
+    /// lives in the recv loop — see `handleKtlsRxControl`).
+    key_update: struct { request_peer: bool },
     /// A close_notify (or any) alert record — close the conn gracefully.
     close_notify,
     /// TCP EOF — the peer closed the socket.
@@ -542,16 +571,44 @@ pub const KtlsRxRecord = union(enum) {
     fault,
 };
 
+/// TLS 1.3 `HandshakeType.key_update` (RFC 8446 §4.6.3). The only post-handshake
+/// handshake message a compliant peer sends on an established application-data
+/// stream; anything else demuxed as a handshake record is a protocol violation.
+const tls_handshake_key_update: u8 = 24;
+
 /// Pure classifier: map a demuxed TLS content type to the recv-loop action. Split
-/// out from `drainKtlsRxControl` so the policy (handshake ⇒ consume, alert ⇒
+/// out from `drainKtlsRxControl` so the policy (handshake ⇒ KeyUpdate, alert ⇒
 /// close, unexpected ⇒ fail-safe close) is unit-testable without a live socket.
+///
+/// A handshake record on a kTLS-offloaded conn is parsed as a KeyUpdate and the
+/// `update_requested` flag is read from the kernel-delivered plaintext (verified
+/// on this kernel: the 5-byte KeyUpdate message is returned in `plaintext`). Fail
+/// closed: a handshake record that is NOT exactly one well-formed KeyUpdate
+/// (`{key_update(24), uint24 len 1, one-byte request ∈ {0,1}}`) is a protocol
+/// violation ⇒ `.fault` (close), never a silent continue.
 fn classifyKtlsRecord(record_type: u8, plaintext: []u8) KtlsRxRecord {
     return switch (record_type) {
         @intFromEnum(ktls.RecordType.application_data) => .{ .app_data = plaintext },
-        @intFromEnum(ktls.RecordType.handshake) => .key_update,
+        @intFromEnum(ktls.RecordType.handshake) => parseKeyUpdate(plaintext),
         @intFromEnum(ktls.RecordType.alert) => .close_notify,
         // change_cipher_spec (a legal no-op mid-handshake) has no business after
         // the handshake on a kTLS conn, and any other type is unknown — fail-safe.
+        else => .fault,
+    };
+}
+
+/// Strictly parse the plaintext of a demuxed post-handshake handshake record as a
+/// single TLS 1.3 KeyUpdate and extract its `update_requested` flag. Fail closed
+/// on any deviation (wrong type/length, coalesced messages, out-of-range request
+/// value) so a malformed control record can never masquerade as a benign rekey.
+fn parseKeyUpdate(plaintext: []const u8) KtlsRxRecord {
+    // KeyUpdate wire form: type(1)=24, length(uint24)=1, body(1)=request. Exactly.
+    if (plaintext.len != 5) return .fault;
+    if (plaintext[0] != tls_handshake_key_update) return .fault;
+    if (plaintext[1] != 0 or plaintext[2] != 0 or plaintext[3] != 1) return .fault;
+    return switch (plaintext[4]) {
+        0 => .{ .key_update = .{ .request_peer = false } }, // update_not_requested
+        1 => .{ .key_update = .{ .request_peer = true } }, // update_requested
         else => .fault,
     };
 }
@@ -856,12 +913,14 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     // Continuation boundary (see enableKtlsRx / KtlsRxRecord.key_update): the
     // client rotated its send key with the KeyUpdate, so its next app record is
     // under the NEW key while the kernel's RX crypto_info is still the OLD key
-    // (this phase does not re-install it). The kernel therefore does NOT decrypt
-    // that record and never delivers the new-key plaintext as application_data —
-    // it signals the stream needs a rekey (EKEYEXPIRED ⇒ NeedsRekey) rather than
-    // corrupting the byte stream. This pins the exact scope: demux + no-drop
-    // consume is proven; RX-key rotation (a second setsockopt(TLS_RX)) is a
-    // documented follow-up.
+    // (this test deliberately does NOT re-install it). The kernel therefore does
+    // NOT decrypt that record and never delivers the new-key plaintext as
+    // application_data — it signals the stream needs a rekey (EKEYEXPIRED ⇒
+    // NeedsRekey) rather than corrupting the byte stream. This isolates the raw
+    // kernel behavior; the FULL continuity path (advance RX key + a second
+    // setsockopt(TLS_RX) at seq 0 ⇒ the post-rekey record decrypts) is proven in
+    // "kTLS RX rekey continuity: a client KeyUpdate survives with zero dropped
+    // bytes" below.
     const after = try client.encrypt("post-rekey app data");
     defer alloc.free(after);
     {
@@ -886,6 +945,207 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     }
 }
 
+test "advanceRxKeyForKtls advances only the RX key and resets its seq, TX untouched" {
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    const engine = switch (conn.engine) {
+        .tls13 => |*s| s,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Snapshot the pre-advance RX key/iv and the TX key by value (the engine
+    // mutates the RX material in place).
+    const rx0 = engine.ktlsRxParams() orelse return error.TestUnexpectedResult;
+    var rx0_key: [32]u8 = @splat(0);
+    @memcpy(rx0_key[0..rx0.key.len], rx0.key);
+    const rx0_iv = rx0.iv;
+    const rx0_key_len = rx0.key.len;
+    const tx0 = engine.ktlsTxParams() orelse return error.TestUnexpectedResult;
+    var tx0_key: [32]u8 = @splat(0);
+    @memcpy(tx0_key[0..tx0.key.len], tx0.key);
+    const tx0_iv = tx0.iv;
+
+    // Advance the RX key (mirrors the RX half of applyKeyUpdate).
+    const rx1 = try engine.advanceRxKeyForKtls();
+
+    // The rekeyed RX params carry record seq 0 (RFC 8446 §5.3: the sequence resets
+    // on a key change) and a genuinely rotated key/iv.
+    try std.testing.expectEqual(@as(u64, 0), rx1.seq);
+    try std.testing.expectEqual(rx0_key_len, rx1.key.len);
+    try std.testing.expect(!std.mem.eql(u8, rx0_key[0..rx0_key_len], rx1.key));
+    try std.testing.expect(!std.mem.eql(u8, &rx0_iv, &rx1.iv));
+
+    // The TX (server→client) material is untouched — only the RX direction moved.
+    const tx1 = engine.ktlsTxParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, tx0_key[0..tx0.key.len], tx1.key);
+    try std.testing.expectEqualSlices(u8, &tx0_iv, &tx1.iv);
+    try std.testing.expectEqual(tx0.seq, tx1.seq);
+
+    // The engine's advanced RX secret matches the client's own rotated send key, so
+    // a fresh derivation is mutually consistent: encrypt a record on the client
+    // (whose send key we advance to match) and open it with the engine.
+    try client.sendKeyUpdateForTest(); // client rotates its send (our RX) key
+    const ku = (try client.takePendingSend()) orelse return error.TestUnexpectedResult;
+    alloc.free(ku); // discard the KeyUpdate record; we only needed the key rotation
+    const rec = try client.encrypt("after client keyupdate");
+    defer alloc.free(rec);
+    const opened = try engine.decrypt(rec);
+    defer alloc.free(opened);
+    try std.testing.expectEqualStrings("after client keyupdate", opened);
+}
+
+test "kTLS RX rekey continuity: a client KeyUpdate survives with zero dropped bytes" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    // In-memory TLS 1.3 handshake → a connected TlsConn whose keys the client
+    // shares, so the kernel (using our RX crypto_info from the same keys) decrypts
+    // what the client encrypts.
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // Real ESTABLISHED loopback pair.
+    const listen_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(listen_fd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+    addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+    const client_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(client_fd);
+    if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+    const server_fd: linux.fd_t = @intCast(accept_rc);
+    defer _ = linux.close(server_fd);
+
+    conn.enableKtlsRx(server_fd) catch return error.SkipZigTest; // no CONFIG_TLS ⇒ skip
+
+    // Baseline: a pre-KeyUpdate app record decrypts via the kernel (proves the
+    // offload is live before we rotate).
+    {
+        const rec = try client.encrypt("before keyupdate");
+        defer alloc.free(rec);
+        var off: usize = 0;
+        while (off < rec.len) {
+            const wr = linux.write(client_fd, rec[off..].ptr, rec.len - off);
+            if (posix.errno(wr) != .SUCCESS) return error.SkipZigTest;
+            off += @intCast(wr);
+        }
+        var buf: [256]u8 = undefined;
+        switch (drainKtlsRxControl(server_fd, &buf, 0)) {
+            .app_data => |pt| try std.testing.expectEqualStrings("before keyupdate", pt),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // The client emits a KeyUpdate(update_not_requested), rotating its send (our RX)
+    // key, then an app record under the NEW key. Write BOTH before draining so the
+    // kernel must queue the control record ahead of the rotated app record — exactly
+    // the ordering the reactor's drain loop sees.
+    try client.sendKeyUpdateForTest();
+    const ku = (try client.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ku);
+    {
+        var ko: usize = 0;
+        while (ko < ku.len) {
+            const w = linux.write(client_fd, ku[ko..].ptr, ku.len - ko);
+            if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+            ko += @intCast(w);
+        }
+    }
+    const after = try client.encrypt("post-rekey app data");
+    defer alloc.free(after);
+    {
+        var ao: usize = 0;
+        while (ao < after.len) {
+            const w = linux.write(client_fd, after[ao..].ptr, after.len - ao);
+            if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+            ao += @intCast(w);
+        }
+    }
+
+    // Drain #1: the kernel surfaces the KeyUpdate as a handshake control record,
+    // classified as a benign key_update with update_requested=false.
+    var buf1: [256]u8 = undefined;
+    switch (drainKtlsRxControl(server_fd, &buf1, 0)) {
+        .key_update => |k| try std.testing.expect(!k.request_peer),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // THE CRUX: advance the RX key and re-install it on the kernel (a second
+    // setsockopt(TLS_RX) at seq 0). If this kernel rejected the re-install, the
+    // continuity path is genuinely unsupported here — skip rather than fail.
+    conn.rekeyKtlsRx(server_fd) catch |e| switch (e) {
+        error.KtlsRxUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+
+    // Drain #2: the post-KeyUpdate record now decrypts under the re-installed key —
+    // the exact plaintext, intact, with the connection never dropped.
+    var buf2: [256]u8 = undefined;
+    switch (drainKtlsRxControl(server_fd, &buf2, 0)) {
+        .app_data => |pt| try std.testing.expectEqualStrings("post-rekey app data", pt),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // And the stream keeps flowing under the rotated key: a second post-rekey record
+    // decrypts too (no off-by-one in the kernel's re-based record sequence).
+    {
+        const more = try client.encrypt("still flowing");
+        defer alloc.free(more);
+        var mo: usize = 0;
+        while (mo < more.len) {
+            const w = linux.write(client_fd, more[mo..].ptr, more.len - mo);
+            if (posix.errno(w) != .SUCCESS) return error.SkipZigTest;
+            mo += @intCast(w);
+        }
+        var buf3: [256]u8 = undefined;
+        switch (drainKtlsRxControl(server_fd, &buf3, 0)) {
+            .app_data => |pt| try std.testing.expectEqualStrings("still flowing", pt),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "classifyKtlsRecord maps TLS content types to recv-loop actions" {
     var pt = [_]u8{ 1, 2, 3 };
     // application_data ⇒ feed the plaintext buffer.
@@ -893,8 +1153,32 @@ test "classifyKtlsRecord maps TLS content types to recv-loop actions" {
         .app_data => |d| try std.testing.expectEqualSlices(u8, &pt, d),
         else => return error.TestUnexpectedResult,
     }
-    // handshake (a client KeyUpdate) ⇒ consume + continue.
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &pt) == .key_update);
+    // handshake ⇒ a KeyUpdate, with the update_requested flag read from the wire.
+    // update_not_requested(0): continue (advance RX key, no reply owed).
+    var ku_not = [_]u8{ 24, 0, 0, 1, 0 };
+    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &ku_not)) {
+        .key_update => |k| try std.testing.expect(!k.request_peer),
+        else => return error.TestUnexpectedResult,
+    }
+    // update_requested(1): the flag is surfaced so the daemon can honor the reply
+    // obligation (RFC 8446 §4.6.3) — spec-safe close in the offloaded-TX case.
+    var ku_req = [_]u8{ 24, 0, 0, 1, 1 };
+    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &ku_req)) {
+        .key_update => |k| try std.testing.expect(k.request_peer),
+        else => return error.TestUnexpectedResult,
+    }
+    // Fail-closed: a handshake record that is not exactly one well-formed KeyUpdate
+    // ⇒ .fault (close), never a silent continue. Wrong length, wrong type, wrong
+    // uint24 length prefix, and an out-of-range request value are each rejected.
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &pt) == .fault);
+    var bad_type = [_]u8{ 20, 0, 0, 1, 0 }; // finished(20), not key_update
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_type) == .fault);
+    var bad_len = [_]u8{ 24, 0, 0, 2, 0 }; // uint24 length 2, not 1
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_len) == .fault);
+    var bad_req = [_]u8{ 24, 0, 0, 1, 2 }; // request value 2 ∉ {0,1}
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_req) == .fault);
+    var coalesced = [_]u8{ 24, 0, 0, 1, 0, 24, 0, 0, 1, 0 }; // two KeyUpdates
+    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &coalesced) == .fault);
     // alert (close_notify) ⇒ graceful close.
     try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.alert), &pt) == .close_notify);
     // change_cipher_spec / any unknown type post-handshake ⇒ fail-safe close.

@@ -797,6 +797,28 @@ pub const Server = struct {
         };
     }
 
+    /// Advance ONLY the client→server (RX) traffic secret and re-derive the RX
+    /// (client) application keys — the RX equivalent of the `applyKeyUpdate` the
+    /// engine performs when it decrypts a peer KeyUpdate in userspace — WITHOUT
+    /// re-entering the handshake and WITHOUT touching the server→client (TX)
+    /// secret/keys. This is the engine half of a kTLS RX-key rotation: when a conn
+    /// is RX-offloaded the kernel (not this engine) consumes the peer's KeyUpdate
+    /// record, so the engine's `client_app_secret` would otherwise go stale; the
+    /// daemon calls this on the demuxed KeyUpdate to (a) get the fresh RX
+    /// `crypto_info` (advanced key/iv, record seq **0** per RFC 8446 §5.3 — the
+    /// sequence resets on a key change) to re-install on the kernel via a second
+    /// `setsockopt(TLS_RX)`, and (b) keep the engine in lockstep so a later Helix
+    /// USR2 `exportResume` carries the CORRECT (advanced) `client_app_secret`.
+    /// Only the RX direction moves, so the TX offload/state is untouched. Returns
+    /// `error.BadState` unless the session is connected TLS 1.3.
+    pub fn advanceRxKeyForKtls(self: *Server) Error!KtlsTxParams {
+        if (self.state != .connected) return error.BadState;
+        _ = self.selected_suite orelse return error.BadState;
+        try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
+        self.app_read_seq = 0;
+        return self.ktlsRxParams() orelse error.BadState;
+    }
+
     /// True when the current handshake accepted a PSK ticket and used the
     /// abbreviated TLS 1.3 resumption flight.
     pub fn acceptedSessionTicket(self: *const Server) bool {
