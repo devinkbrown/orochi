@@ -143,9 +143,15 @@ const CborCursor = struct {
                 var i: u64 = 0;
                 while (i < arg) : (i += 1) try self.skipDepth(depth + 1);
             },
-            5 => { // map — skip 2*arg items
+            5 => { // map — skip arg key/value pairs (two items each). Iterate the
+                // pair count directly (never `2 * arg`, which overflows for a
+                // hostile `arg` up to u64 max); each inner skip reads ≥1 byte, so
+                // a bogus `arg` runs out of input and returns InvalidEncoding.
                 var i: u64 = 0;
-                while (i < 2 * arg) : (i += 1) try self.skipDepth(depth + 1);
+                while (i < arg) : (i += 1) {
+                    try self.skipDepth(depth + 1); // key
+                    try self.skipDepth(depth + 1); // value
+                }
             },
             6 => try self.skipDepth(depth + 1), // tag — skip the tagged item
             else => return error.InvalidEncoding,
@@ -309,6 +315,61 @@ pub fn parseAuthData(auth_data: []const u8) AuthDataError!AuthData {
         .sign_count = sign_count,
         .attested_credential_data = auth_data[37..],
     };
+}
+
+/// Whether an authenticatorData buffer carries attested credential data (AT
+/// flag, set only on a registration/`navigator.credentials.create` response).
+pub fn hasAttestedCredentialData(auth_data: []const u8) bool {
+    if (auth_data.len < 37) return false;
+    return (auth_data[32] & FLAG_AT) != 0;
+}
+
+/// Attested credential data extracted from a registration authenticatorData.
+/// `credential_id` and `cose_public_key` borrow `auth_data` (no copy); the
+/// COSE key is bounded to its exact CBOR extent so any trailing extension map
+/// (ED flag) is excluded.
+pub const AttestedCredential = struct {
+    aaguid: [16]u8,
+    credential_id: []const u8,
+    cose_public_key: []const u8,
+};
+
+/// Parse the attestedCredentialData region of a registration authenticatorData.
+///
+/// Layout after the 37-byte header (WebAuthn §6.5.1):
+///   aaguid (16) | credentialIdLength (2, big-endian) | credentialId (L) |
+///   credentialPublicKey (COSE_Key CBOR map) [| extensions (CBOR map)]
+///
+/// Fail-closed: every length is bounds-checked before use, and the COSE key
+/// extent is derived by a bounded CBOR skip (rejecting a malformed map) rather
+/// than by trusting the remainder length. Returns `InvalidCredentialData` when
+/// the AT flag is unset or any field would overrun the buffer.
+pub fn parseAttestedCredentialData(auth_data: []const u8) (AuthDataError || CborError)!AttestedCredential {
+    const ad = try parseAuthData(auth_data);
+    if (ad.flags & FLAG_AT == 0) return error.InvalidCredentialData;
+    const rest = ad.attested_credential_data;
+    if (rest.len < 18) return error.InvalidCredentialData; // aaguid(16) + idLen(2)
+    var aaguid: [16]u8 = undefined;
+    @memcpy(&aaguid, rest[0..16]);
+    const id_len: usize = mem.readInt(u16, rest[16..18], .big);
+    const id_start: usize = 18;
+    const id_end = id_start + id_len;
+    if (id_end > rest.len) return error.InvalidCredentialData;
+    const credential_id = rest[id_start..id_end];
+
+    // Bound the COSE public key to its exact CBOR extent so trailing extension
+    // data (when the ED flag is set) is not folded into the stored key.
+    const key_region = rest[id_end..];
+    var cur = CborCursor.init(key_region);
+    // The first item must be a map (the COSE_Key); skip validates + measures it.
+    const head = cur.peek() catch return error.InvalidCredentialData;
+    switch (head) {
+        .map_start => {},
+        else => return error.InvalidCredentialData,
+    }
+    cur.skip() catch return error.InvalidCredentialData;
+    const cose_public_key = key_region[0..cur.pos];
+    return .{ .aaguid = aaguid, .credential_id = credential_id, .cose_public_key = cose_public_key };
 }
 
 // -- Assertion options / state -----------------------------------------------
@@ -782,4 +843,135 @@ test "verifyAssertion: both counters zero allowed (stateless authenticator)" {
         .require_uv = false,
     });
     try testing.expectEqual(@as(u32, 0), new_count);
+}
+
+// Build a registration authenticatorData with attested credential data:
+//   rpIdHash(32) | flags | signCount(4) | aaguid(16) | credIdLen(2) | credId | COSE(77)
+// `out` must be exactly 37 + 16 + 2 + credId.len + 77 bytes.
+fn buildRegAuthDataEs256(
+    rp_id_hash: [32]u8,
+    sign_count: u32,
+    aaguid: [16]u8,
+    cred_id: []const u8,
+    cose77: [77]u8,
+    out: []u8,
+) usize {
+    var i: usize = 0;
+    @memcpy(out[0..32], &rp_id_hash);
+    i = 32;
+    out[i] = FLAG_UP | FLAG_AT; // present + attested credential data
+    i += 1;
+    mem.writeInt(u32, out[i..][0..4], sign_count, .big);
+    i += 4;
+    @memcpy(out[i..][0..16], &aaguid);
+    i += 16;
+    mem.writeInt(u16, out[i..][0..2], @intCast(cred_id.len), .big);
+    i += 2;
+    @memcpy(out[i..][0..cred_id.len], cred_id);
+    i += cred_id.len;
+    @memcpy(out[i..][0..77], &cose77);
+    i += 77;
+    return i;
+}
+
+test "parseAttestedCredentialData: extracts credId + exact COSE key (ES256)" {
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+
+    const rp_id_hash = sha256Str("example.com");
+    const aaguid: [16]u8 = @splat(0xAB);
+    const cred_id = "credential-0001"; // 15 bytes
+    var buf: [37 + 16 + 2 + 15 + 77]u8 = undefined;
+    const n = buildRegAuthDataEs256(rp_id_hash, 7, aaguid, cred_id, cose, &buf);
+    try testing.expectEqual(buf.len, n);
+
+    try testing.expect(hasAttestedCredentialData(buf[0..n]));
+    const att = try parseAttestedCredentialData(buf[0..n]);
+    try testing.expectEqualSlices(u8, &aaguid, &att.aaguid);
+    try testing.expectEqualSlices(u8, cred_id, att.credential_id);
+    // The bounded COSE key must be byte-exact and re-parse to the same key.
+    try testing.expectEqualSlices(u8, &cose, att.cose_public_key);
+    const cpk = try parseCoseKey(att.cose_public_key);
+    switch (cpk) {
+        .es256 => |pk| try testing.expectEqualSlices(u8, &sec1, &pk.toUncompressedSec1()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseAttestedCredentialData: trailing extension bytes are excluded from the COSE key" {
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+
+    const rp_id_hash = sha256Str("example.com");
+    const aaguid: [16]u8 = @splat(0);
+    const cred_id = "id";
+    var buf: [37 + 16 + 2 + 2 + 77 + 3]u8 = undefined;
+    const base = buildRegAuthDataEs256(rp_id_hash, 1, aaguid, cred_id, cose, buf[0 .. buf.len - 3]);
+    // Append a 3-byte CBOR extension map {} placeholder-ish tail (a1 00 00).
+    buf[base] = 0xa1;
+    buf[base + 1] = 0x00;
+    buf[base + 2] = 0x00;
+
+    const att = try parseAttestedCredentialData(&buf);
+    // COSE key must stop at its own CBOR extent, not swallow the tail.
+    try testing.expectEqual(@as(usize, 77), att.cose_public_key.len);
+    try testing.expectEqualSlices(u8, &cose, att.cose_public_key);
+}
+
+test "parseAttestedCredentialData: AT flag absent rejected" {
+    const rp_id_hash = sha256Str("example.com");
+    const auth_data = makeAuthData(rp_id_hash, FLAG_UP, 3); // no AT flag
+    try testing.expect(!hasAttestedCredentialData(&auth_data));
+    try testing.expectError(error.InvalidCredentialData, parseAttestedCredentialData(&auth_data));
+}
+
+test "parseAttestedCredentialData: credIdLength overrun rejected" {
+    var buf: [37 + 18]u8 = undefined;
+    const rp_id_hash = sha256Str("example.com");
+    @memcpy(buf[0..32], &rp_id_hash);
+    buf[32] = FLAG_UP | FLAG_AT;
+    mem.writeInt(u32, buf[33..37], 1, .big);
+    @memset(buf[37..53], 0); // aaguid
+    mem.writeInt(u16, buf[53..55], 9999, .big); // credIdLen far past end
+    try testing.expectError(error.InvalidCredentialData, parseAttestedCredentialData(&buf));
+}
+
+test "parseAttestedCredentialData: COSE map with a huge pair count fails closed (no overflow/panic)" {
+    // A COSE map header claiming 2^63 pairs (major 5, add-info 27 = 8-byte len)
+    // must NOT compute `2 * arg` and overflow — it must run out of input and
+    // return InvalidEncoding cleanly. Attacker-reachable via a registration
+    // authData, so this must be an error, never a panic (safe builds) or UB wrap.
+    const rp_id_hash = sha256Str("example.com");
+    const aaguid: [16]u8 = @splat(0);
+    var buf: [37 + 16 + 2 + 1 + 9]u8 = undefined;
+    @memcpy(buf[0..32], &rp_id_hash);
+    buf[32] = FLAG_UP | FLAG_AT;
+    mem.writeInt(u32, buf[33..37], 1, .big);
+    @memcpy(buf[37..53], &aaguid);
+    mem.writeInt(u16, buf[53..55], 1, .big);
+    buf[55] = 'x'; // credId
+    buf[56] = 0xbb; // map(*) with a 64-bit count
+    mem.writeInt(u64, buf[57..65], 0x8000_0000_0000_0000, .big);
+    try testing.expectError(error.InvalidCredentialData, parseAttestedCredentialData(&buf));
+}
+
+test "parseAttestedCredentialData: malformed COSE map rejected" {
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    _ = kp;
+    const rp_id_hash = sha256Str("example.com");
+    const aaguid: [16]u8 = @splat(0);
+    // credId "x", then a truncated CBOR map header (0xa5 claims 5 pairs, no body).
+    var buf: [37 + 16 + 2 + 1 + 1]u8 = undefined;
+    @memcpy(buf[0..32], &rp_id_hash);
+    buf[32] = FLAG_UP | FLAG_AT;
+    mem.writeInt(u32, buf[33..37], 1, .big);
+    @memcpy(buf[37..53], &aaguid);
+    mem.writeInt(u16, buf[53..55], 1, .big);
+    buf[55] = 'x';
+    buf[56] = 0xa5; // map(5) with no entries following
+    try testing.expectError(error.InvalidCredentialData, parseAttestedCredentialData(&buf));
 }

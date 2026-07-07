@@ -263,6 +263,9 @@ const tls_certs = @import("tls_certs.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
+const webauthn = @import("../crypto/webauthn.zig");
+const webauthn_creds_mod = @import("webauthn_creds.zig");
+const base64url = @import("../proto/base64url.zig");
 const account_register = @import("../proto/account_register.zig");
 const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
@@ -1268,6 +1271,15 @@ pub const Config = struct {
     /// base64url VAPID public key; when set, advertised as ISUPPORT `VAPID=`
     /// so clients can pushManager.subscribe without any round-trip.
     webpush_vapid_pub: []const u8 = "",
+    /// WebAuthn (passkey) Relying Party ID — a registrable domain the passkeys
+    /// are scoped to (`[webauthn] rp_id`). Null ⇒ the WEBAUTHN command fails
+    /// closed (the feature is inert until both this and an origin are set). The
+    /// string is borrowed from the parsed config (process-lifetime).
+    webauthn_rp_id: ?[]const u8 = null,
+    /// Allowed WebAuthn top-level origins (`[webauthn] origins`). A ceremony with
+    /// a clientDataJSON `origin` not on this list is rejected. Empty ⇒ inert.
+    /// Slices borrowed from the parsed config (process-lifetime).
+    webauthn_origins: []const []const u8 = &.{},
     /// Network name advertised in ISUPPORT `NETWORK=` and the welcome burst.
     /// Configurable via `[network] name`; installed into the protocol_inventory
     /// override at boot.
@@ -1988,6 +2000,12 @@ pub const ConnState = struct {
     media_call_channel_len: usize = 0,
     media_call_participant: [media_call_part_max]u8 = undefined,
     media_call_participant_len: usize = 0,
+    /// Per-connection pending WebAuthn (passkey) ceremony challenge. Single-use
+    /// and time-bounded: set by `WEBAUTHN REGISTER`/`AUTH`, consumed (and cleared)
+    /// by the matching `*-FINISH`. Inline (no heap); an in-flight challenge simply
+    /// expires across a USR2 upgrade (fail-closed — a stale challenge is never
+    /// honored). Default `.none` = no ceremony in flight.
+    webauthn_pending: WebauthnPending = .{},
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -2030,6 +2048,71 @@ pub const ConnState = struct {
 /// snapshot used as the per-stream MAC-key context.
 const media_call_chan_max: usize = 128;
 const media_call_part_max: usize = 64;
+
+/// How long a pending WebAuthn challenge stays valid (ms). A ceremony must
+/// complete within this window; a `*-FINISH` after it is rejected as expired.
+const webauthn_challenge_ttl_ms: i64 = 5 * 60 * 1000;
+
+/// Upper bound for a decoded authenticatorData buffer (raw bytes). Covers the
+/// 37-byte header plus attestedCredentialData (aaguid + credId ≤ 256 + a COSE
+/// key ≤ 512 + small extensions) with generous slack.
+const webauthn_authdata_max: usize = 2048;
+
+/// Per-connection pending passkey ceremony state (see `ConnState.webauthn_pending`).
+/// The challenge is the CSPRNG value the client signs; `account` is the target
+/// account for an AUTH ceremony (the caller is not yet identified) and is unused
+/// for REGISTER (the caller's own logged-in account is authoritative).
+pub const WebauthnPending = struct {
+    pub const Kind = enum { none, register, auth };
+
+    kind: Kind = .none,
+    challenge: [webauthn_creds_mod.challenge_len]u8 = undefined,
+    issued_ms: i64 = 0,
+    /// Ceremony context carried from the *-BEGIN into the *-FINISH step:
+    ///   - AUTH: the target account name (the caller is not yet identified);
+    ///   - REGISTER: the user-chosen credential label (may be empty).
+    aux_buf: [webauthn_creds_mod.max_label_bytes]u8 = undefined,
+    aux_len: usize = 0,
+
+    /// Snapshot of the taken challenge + aux (auth account / register label).
+    pub const Taken = struct {
+        challenge: [webauthn_creds_mod.challenge_len]u8,
+        aux_buf: [webauthn_creds_mod.max_label_bytes]u8,
+        aux_len: usize,
+
+        pub fn aux(self: *const Taken) []const u8 {
+            return self.aux_buf[0..self.aux_len];
+        }
+    };
+
+    /// Arm a fresh challenge for `kind`, recording the ceremony `aux` and the
+    /// issue time. Any prior pending challenge is overwritten (one in flight).
+    pub fn arm(self: *WebauthnPending, kind: Kind, challenge: [webauthn_creds_mod.challenge_len]u8, aux: []const u8, now_ms: i64) void {
+        self.kind = kind;
+        self.challenge = challenge;
+        self.issued_ms = now_ms;
+        const n = @min(aux.len, self.aux_buf.len);
+        @memcpy(self.aux_buf[0..n], aux[0..n]);
+        self.aux_len = n;
+    }
+
+    /// Consume the pending challenge for `kind`: on a `kind` match within the
+    /// TTL, return a snapshot of the challenge + aux and CLEAR the pending state
+    /// (single-use — cleared even if the caller then fails verification).
+    /// Returns null (leaving nothing armed) on any mismatch or expiry.
+    pub fn take(self: *WebauthnPending, kind: Kind, now_ms: i64) ?Taken {
+        defer self.clear();
+        if (self.kind != kind) return null;
+        if (now_ms - self.issued_ms > webauthn_challenge_ttl_ms) return null;
+        return .{ .challenge = self.challenge, .aux_buf = self.aux_buf, .aux_len = self.aux_len };
+    }
+
+    pub fn clear(self: *WebauthnPending) void {
+        self.kind = .none;
+        self.aux_len = 0;
+        self.issued_ms = 0;
+    }
+};
 
 const ClientTable = client_model.Table(ConnState, client_model.ClientId);
 
@@ -20927,6 +21010,39 @@ pub const LinuxServer = struct {
         conn.session.loginAs(lower);
     }
 
+    /// Shared post-authentication login sequence, factored so a password-less
+    /// login (WEBAUTHN AUTH-FINISH) fires the same side effects as the IDENTIFY
+    /// success path (`handleIdentify`): bind the session to `account`, emit the
+    /// account-change/registration notices, restore metadata/silence, elevate an
+    /// operator whose account is oper-bound, track the session, and run the login
+    /// deliverables (tegami, autojoin, welcome, nick protection). The caller has
+    /// already verified the credential and cleared the login throttle. This
+    /// mirrors — and is intentionally kept in lockstep with — the tail of
+    /// `handleIdentify`; it does NOT emit the "You are now identified" notice so
+    /// each caller can print its own success line.
+    fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
+        const id = idFromToken(conn.token);
+        // Re-login to a different account: drop the previous account's session
+        // binding first (mirrors handleLogout / handleIdentify) so a stale
+        // SessionStore entry can't keep this connection in the old delivery set.
+        if (conn.session.account()) |old| {
+            if (!std.ascii.eqlIgnoreCase(old, account))
+                _ = self.sessions.remove(old, monitorIdFromClient(id));
+        }
+        loginSession(conn, account);
+        if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
+        self.maybeApplyAccountCloak(id, conn);
+        self.restoreAccountMetadata(conn, account);
+        self.restoreAccountSilence(conn, account);
+        try self.elevateOperFromAccount(conn);
+        self.trackSession(id, conn);
+        try self.deliverTegami(conn);
+        self.applyAutojoin(id, conn);
+        self.deliverWelcome(conn);
+        self.emitClientRegistered(id, conn);
+        self.evaluateNickProtection(conn);
+    }
+
     /// `REGISTER <account> <email|*> <password>` (IRCv3 draft/account-registration).
     /// Immediate registration (no email verification step yet); logs the client in
     /// and applies oper elevation if the account is bound in the registry.
@@ -21649,6 +21765,332 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} removed from {s}\r\n", .{ self.serverName(), conn.session.displayName(), fp, account }) catch return;
         try appendToConn(conn, m);
+    }
+
+    // ── WEBAUTHN: passkey (FIDO2) registration + passwordless login ──────────
+    //
+    // Ceremony state lives in `conn.webauthn_pending` (per-connection, single-
+    // use, TTL-bounded). Durable credential records live in the account store
+    // (`services.webauthn*`, mirroring certfp). Signature/COSE/attested-data
+    // verification lives in `crypto/webauthn.zig`; this handler orchestrates the
+    // challenge issue, clientDataJSON binding (type/challenge/origin), and login.
+
+    /// Resolved `[webauthn]` config, or null when the feature is inert (missing
+    /// rp_id or origins). WEBAUTHN fails closed until both are set.
+    const WebauthnRp = struct { rp_id: []const u8, origins: []const []const u8 };
+    fn webauthnRp(self: *const LinuxServer) ?WebauthnRp {
+        const rp_id = self.config.webauthn_rp_id orelse return null;
+        if (rp_id.len == 0 or self.config.webauthn_origins.len == 0) return null;
+        return .{ .rp_id = rp_id, .origins = self.config.webauthn_origins };
+    }
+
+    /// Emit a structured `:server NOTE WEBAUTHN <body>` line (matches the SESSION
+    /// / SUCCESSOR reply idiom). `body` is a preformatted, CRLF-free payload.
+    fn webauthnNote(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBAUTHN {s}\r\n", .{ self.serverName(), body }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    pub fn handleWebauthn(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse
+            return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const rp = self.webauthnRp() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_CONFIGURED", "Passkey login is not configured on this network");
+        const p = parsed.paramSlice();
+        if (p.len == 0)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS>");
+        const sub = p[0];
+
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS")) return self.webauthnStatus(conn, svc);
+        if (std.ascii.eqlIgnoreCase(sub, "REGISTER")) return self.webauthnRegister(conn, rp, p);
+        if (std.ascii.eqlIgnoreCase(sub, "REGISTER-FINISH")) return self.webauthnRegisterFinish(conn, svc, rp, p);
+        if (std.ascii.eqlIgnoreCase(sub, "AUTH")) return self.webauthnAuth(conn, svc, rp, p);
+        if (std.ascii.eqlIgnoreCase(sub, "AUTH-FINISH")) return self.webauthnAuthFinish(conn, svc, rp, p);
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) return self.webauthnListCmd(conn, svc);
+        if (std.ascii.eqlIgnoreCase(sub, "REMOVE")) return self.webauthnRemove(conn, svc, p);
+        return self.failReply(conn, "WEBAUTHN", "INVALID_SUBCOMMAND", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS>");
+    }
+
+    /// Fill `out` with a fresh CSPRNG challenge. Returns false (fail-closed) when
+    /// no randomness source is configured.
+    fn webauthnChallenge(self: *LinuxServer, out: *[webauthn_creds_mod.challenge_len]u8) bool {
+        const io = self.config.crypto_io orelse return false;
+        io.random(out);
+        return true;
+    }
+
+    fn webauthnStatus(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in to see your passkeys");
+        var entries: [webauthn_creds_mod.max_creds_per_account]services_mod.Services.WebauthnListEntry = undefined;
+        const listed = svc.webauthnList(account, entries[0..]) catch
+            return self.failReply(conn, "WEBAUTHN", "INTERNAL_ERROR", "Could not read passkeys");
+        var b: [128]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "STATUS :{d} passkey(s) registered", .{listed.len}) catch return;
+        try self.webauthnNote(conn, body);
+    }
+
+    /// `WEBAUTHN REGISTER [label]` — issue a registration challenge to the
+    /// caller's own logged-in account.
+    fn webauthnRegister(self: *LinuxServer, conn: *ConnState, rp: WebauthnRp, p: []const []const u8) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before registering a passkey");
+        const label = if (p.len >= 2) p[1] else "";
+        if (label.len > webauthn_creds_mod.max_label_bytes)
+            return self.failReply(conn, "WEBAUTHN", "LABEL_TOO_LONG", "Passkey label is too long");
+        var challenge: [webauthn_creds_mod.challenge_len]u8 = undefined;
+        if (!self.webauthnChallenge(&challenge))
+            return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
+        conn.webauthn_pending.arm(.register, challenge, label, self.nowMs());
+
+        var cb: [base64url.encodedLen(webauthn_creds_mod.challenge_len)]u8 = undefined;
+        const chal_b64 = base64url.encode(&cb, &challenge) catch return;
+        var b: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "REGISTER-CHALLENGE {s} {s} :{s}", .{ chal_b64, rp.rp_id, account }) catch return;
+        try self.webauthnNote(conn, body);
+    }
+
+    /// `WEBAUTHN REGISTER-FINISH <cred_id_b64> <client_data_json_b64> <authdata_b64>`
+    /// — verify the ceremony and store the credential (trust-on-first-use: the
+    /// public key presented at registration is trusted; attestation statements
+    /// are not verified — a documented follow-up).
+    fn webauthnRegisterFinish(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, rp: WebauthnRp, p: []const []const u8) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before registering a passkey");
+        if (p.len < 4)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN REGISTER-FINISH <cred_id> <client_data_json> <authdata>");
+        const cred_id_b64 = p[1];
+        // Consume the single-use challenge FIRST (cleared regardless of outcome).
+        const taken = conn.webauthn_pending.take(.register, self.nowMs()) orelse
+            return self.failReply(conn, "WEBAUTHN", "NO_PENDING", "No pending registration challenge (expired or never issued)");
+        const label = taken.aux();
+
+        if (!webauthn_creds_mod.validCredIdB64(cred_id_b64))
+            return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL_ID", "Malformed credential id");
+
+        // Decode the base64url wire args.
+        var cdj_buf: [webauthn_creds_mod.max_client_data_bytes]u8 = undefined;
+        const client_data_json = base64url.decode(&cdj_buf, p[2]) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_CLIENT_DATA", "clientDataJSON is not valid base64url");
+        var ad_buf: [webauthn_authdata_max]u8 = undefined;
+        const auth_data = base64url.decode(&ad_buf, p[3]) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData is not valid base64url");
+
+        // Bind clientDataJSON: type == webauthn.create, challenge, origin.
+        var json_scratch: [16384]u8 = undefined;
+        const cd = webauthn_creds_mod.parseClientData(client_data_json, &json_scratch) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_CLIENT_DATA", "clientDataJSON did not parse");
+        if (!std.mem.eql(u8, cd.type_str, webauthn_creds_mod.type_create))
+            return self.failReply(conn, "WEBAUTHN", "WRONG_TYPE", "clientDataJSON type is not webauthn.create");
+        if (!webauthn_creds_mod.challengeMatchesB64(&taken.challenge, cd.challenge_b64))
+            return self.failReply(conn, "WEBAUTHN", "CHALLENGE_MISMATCH", "clientDataJSON challenge does not match");
+        if (!webauthn_creds_mod.originAllowed(cd.origin, rp.origins))
+            return self.failReply(conn, "WEBAUTHN", "BAD_ORIGIN", "clientDataJSON origin is not allowed");
+
+        // Bind authenticatorData: rpIdHash == SHA-256(rp_id), UP flag present.
+        const ad = webauthn.parseAuthData(auth_data) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData did not parse");
+        var rp_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(rp.rp_id, &rp_hash, .{});
+        if (!std.mem.eql(u8, &ad.rp_id_hash, &rp_hash))
+            return self.failReply(conn, "WEBAUTHN", "RP_MISMATCH", "authenticatorData rpIdHash does not match rp_id");
+        if (!webauthn.hasAttestedCredentialData(auth_data))
+            return self.failReply(conn, "WEBAUTHN", "NO_CREDENTIAL", "authenticatorData carries no attested credential");
+
+        const att = webauthn.parseAttestedCredentialData(auth_data) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL", "Could not parse attested credential data");
+
+        // Cross-check the embedded credential id against the presented id.
+        var cred_id_raw: [webauthn_creds_mod.max_cred_id_bytes]u8 = undefined;
+        const cred_id = base64url.decode(&cred_id_raw, cred_id_b64) catch
+            return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL_ID", "Malformed credential id");
+        if (!std.mem.eql(u8, cred_id, att.credential_id))
+            return self.failReply(conn, "WEBAUTHN", "CREDENTIAL_ID_MISMATCH", "credential id does not match authenticatorData");
+
+        // Validate the COSE key is a supported public key we can verify later.
+        _ = webauthn.parseCoseKey(att.cose_public_key) catch
+            return self.failReply(conn, "WEBAUTHN", "UNSUPPORTED_KEY", "Unsupported credential public key (need ES256 or Ed25519)");
+
+        // Store, keyed by credential id, bound to the account. The registration
+        // signCount seeds the stored monotonic counter.
+        svc.webauthnBind(account, cred_id_b64, att.cose_public_key, ad.sign_count, label, @divTrunc(platform.realtimeMillis(), 1000)) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.AlreadyExists => "ALREADY_REGISTERED",
+                error.InvalidValue => "BAD_CREDENTIAL",
+                else => "STORE_FAILED",
+            };
+            return self.failReply(conn, "WEBAUTHN", code, "Could not store the passkey");
+        };
+
+        var b: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "REGISTERED {s} :{s}", .{ cred_id_b64, label }) catch return;
+        try self.webauthnNote(conn, body);
+    }
+
+    /// `WEBAUTHN AUTH <account>` — issue an authentication challenge + the
+    /// account's allowed credential ids (caller not yet identified).
+    fn webauthnAuth(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, rp: WebauthnRp, p: []const []const u8) !void {
+        if (p.len < 2)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN AUTH <account>");
+        const account = p[1];
+        if (account.len == 0 or account.len > account_register.MAX_ACCOUNT_BYTES)
+            return self.failReply(conn, "WEBAUTHN", "BAD_ACCOUNT", "Invalid account name");
+
+        // Gate challenge issuance behind the shared login lockout: once an
+        // account/IP is throttled by failed AUTH-FINISH (or password) attempts,
+        // refuse to mint further challenges or disclose credential ids — this
+        // ties the passkey allow-list oracle to the same brute-force backpressure
+        // as every other login surface. (AUTH itself records no failure, so a
+        // legitimate user who abandons a ceremony is never penalised.)
+        if (self.loginLockedFor(conn, account)) |retry_ms| return self.rejectLoginLocked(conn, retry_ms);
+
+        var challenge: [webauthn_creds_mod.challenge_len]u8 = undefined;
+        if (!self.webauthnChallenge(&challenge))
+            return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
+        conn.webauthn_pending.arm(.auth, challenge, account, self.nowMs());
+
+        var cb: [base64url.encodedLen(webauthn_creds_mod.challenge_len)]u8 = undefined;
+        const chal_b64 = base64url.encode(&cb, &challenge) catch return;
+        var b: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "AUTH-CHALLENGE {s} {s} :{s}", .{ chal_b64, rp.rp_id, account }) catch return;
+        try self.webauthnNote(conn, body);
+
+        // Advertise the account's allowed credential ids (for non-discoverable
+        // authenticators). A malformed account or none registered simply yields
+        // an empty allow-list — the ceremony still fails closed at AUTH-FINISH.
+        var entries: [webauthn_creds_mod.max_creds_per_account]services_mod.Services.WebauthnListEntry = undefined;
+        const listed = svc.webauthnList(account, entries[0..]) catch entries[0..0];
+        for (listed) |*e| {
+            var lb: [webauthn_creds_mod.max_cred_id_b64 + 32]u8 = undefined;
+            const line = std.fmt.bufPrint(&lb, "ALLOW-CRED {s}", .{e.credId()}) catch continue;
+            try self.webauthnNote(conn, line);
+        }
+    }
+
+    /// `WEBAUTHN AUTH-FINISH <cred_id> <client_data_json_b64> <authdata_b64> <sig_b64>`
+    /// — verify the assertion and, on success, log the caller into the bound
+    /// account via the shared IDENTIFY login path (`finishLogin`).
+    fn webauthnAuthFinish(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, rp: WebauthnRp, p: []const []const u8) !void {
+        if (p.len < 5)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN AUTH-FINISH <cred_id> <client_data_json> <authdata> <signature>");
+        const cred_id_b64 = p[1];
+        // Consume the single-use challenge FIRST (cleared regardless of outcome).
+        const taken = conn.webauthn_pending.take(.auth, self.nowMs()) orelse
+            return self.failReply(conn, "WEBAUTHN", "NO_PENDING", "No pending authentication challenge (expired or never issued)");
+        const target_account = taken.aux();
+
+        // Brute-force guard: a failed passkey assertion counts against the same
+        // login throttle as a password attempt.
+        if (self.loginLockedFor(conn, target_account)) |retry_ms| return self.rejectLoginLocked(conn, retry_ms);
+
+        if (!webauthn_creds_mod.validCredIdB64(cred_id_b64))
+            return self.webauthnAuthFail(conn, target_account, "BAD_CREDENTIAL_ID", "Malformed credential id");
+
+        // Decode the base64url wire args.
+        var cdj_buf: [webauthn_creds_mod.max_client_data_bytes]u8 = undefined;
+        const client_data_json = base64url.decode(&cdj_buf, p[2]) catch
+            return self.webauthnAuthFail(conn, target_account, "BAD_CLIENT_DATA", "clientDataJSON is not valid base64url");
+        var ad_buf: [webauthn_authdata_max]u8 = undefined;
+        const auth_data = base64url.decode(&ad_buf, p[3]) catch
+            return self.webauthnAuthFail(conn, target_account, "BAD_AUTHDATA", "authenticatorData is not valid base64url");
+        var sig_buf: [256]u8 = undefined;
+        const signature = base64url.decode(&sig_buf, p[4]) catch
+            return self.webauthnAuthFail(conn, target_account, "BAD_SIGNATURE", "signature is not valid base64url");
+
+        // Bind clientDataJSON: type == webauthn.get, challenge, origin.
+        var json_scratch: [16384]u8 = undefined;
+        const cd = webauthn_creds_mod.parseClientData(client_data_json, &json_scratch) catch
+            return self.webauthnAuthFail(conn, target_account, "BAD_CLIENT_DATA", "clientDataJSON did not parse");
+        if (!std.mem.eql(u8, cd.type_str, webauthn_creds_mod.type_get))
+            return self.webauthnAuthFail(conn, target_account, "WRONG_TYPE", "clientDataJSON type is not webauthn.get");
+        if (!webauthn_creds_mod.challengeMatchesB64(&taken.challenge, cd.challenge_b64))
+            return self.webauthnAuthFail(conn, target_account, "CHALLENGE_MISMATCH", "clientDataJSON challenge does not match");
+        if (!webauthn_creds_mod.originAllowed(cd.origin, rp.origins))
+            return self.webauthnAuthFail(conn, target_account, "BAD_ORIGIN", "clientDataJSON origin is not allowed");
+
+        // Look up the stored credential. It MUST be bound to the target account.
+        var cred: services_mod.Services.WebauthnCredential = .{};
+        svc.webauthnLookup(cred_id_b64, &cred) catch
+            return self.webauthnAuthFail(conn, target_account, "UNKNOWN_CREDENTIAL", "No such passkey");
+        if (!std.ascii.eqlIgnoreCase(cred.account(), target_account))
+            return self.webauthnAuthFail(conn, target_account, "CREDENTIAL_ACCOUNT_MISMATCH", "Passkey is not bound to that account");
+
+        const cose_key = webauthn.parseCoseKey(cred.coseKey()) catch
+            return self.webauthnAuthFail(conn, target_account, "STORED_KEY_INVALID", "Stored credential key is unreadable");
+
+        // Verify the assertion: signature + rpIdHash + UP flag + sign_count
+        // monotonic regression (clone detection). verifyAssertion returns the
+        // authenticator's counter on success.
+        const new_count = webauthn.verifyAssertion(auth_data, client_data_json, signature, .{
+            .rp_id = rp.rp_id,
+            .credential_public_key = cose_key,
+            .stored_sign_count = cred.sign_count,
+            .require_uv = false,
+        }) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.CounterRegression => "SIGN_COUNT_REGRESSION",
+                error.RpIdHashMismatch => "RP_MISMATCH",
+                error.UserPresenceRequired => "USER_PRESENCE_REQUIRED",
+                else => "ASSERTION_FAILED",
+            };
+            return self.webauthnAuthFail(conn, target_account, code, "Passkey assertion rejected");
+        };
+
+        // Persist the advanced counter (best-effort; a store hiccup must not
+        // fail an already-verified login, but a monotonic counter is important
+        // for clone detection, so surface nothing and continue on error).
+        if (new_count > cred.sign_count) svc.webauthnUpdateSignCount(cred_id_b64, new_count) catch {};
+
+        // Success: clear the throttle and log the caller in via the shared path.
+        self.loginRecordSuccess(conn, target_account);
+        try self.finishLogin(conn, target_account);
+        var b: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), conn.session.account() orelse target_account }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// Record a failed passkey assertion against the brute-force throttle and
+    /// send a FAIL reply. Shared by every AUTH-FINISH rejection path so a probe
+    /// can't distinguish "wrong account" from "bad signature" by throttle state.
+    fn webauthnAuthFail(self: *LinuxServer, conn: *ConnState, account: []const u8, code: []const u8, reason: []const u8) !void {
+        self.loginRecordFailure(conn, account);
+        return self.failReply(conn, "WEBAUTHN", code, reason);
+    }
+
+    fn webauthnListCmd(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in to list your passkeys");
+        var entries: [webauthn_creds_mod.max_creds_per_account]services_mod.Services.WebauthnListEntry = undefined;
+        const listed = svc.webauthnList(account, entries[0..]) catch
+            return self.failReply(conn, "WEBAUTHN", "INTERNAL_ERROR", "Could not list passkeys");
+        for (listed) |*e| {
+            var b: [webauthn_creds_mod.max_cred_id_b64 + 128]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "CRED {s} {d} :{s}", .{ e.credId(), e.sign_count, e.label() }) catch continue;
+            try self.webauthnNote(conn, body);
+        }
+        var eb: [64]u8 = undefined;
+        const end = std.fmt.bufPrint(&eb, "LIST :end ({d})", .{listed.len}) catch return;
+        try self.webauthnNote(conn, end);
+    }
+
+    fn webauthnRemove(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, p: []const []const u8) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before removing a passkey");
+        if (p.len < 2)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN REMOVE <cred_id|label>");
+        const target = p[1];
+        svc.webauthnDelete(account, target) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.Forbidden => "NOT_OWNED",
+                error.NotFound => "NOT_FOUND",
+                else => "REMOVE_FAILED",
+            };
+            return self.failReply(conn, "WEBAUTHN", code, "No matching passkey bound to your account");
+        };
+        var b: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "REMOVED :{s}", .{target}) catch return;
+        try self.webauthnNote(conn, body);
     }
 
     /// `ACCOUNTSET <account> <password> <field> <value>` — update an account
@@ -28963,6 +29405,302 @@ test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
     try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) != null);
     services.revokeSessionTokens("kain");
     try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) == null);
+}
+
+// ── WEBAUTHN test helpers ────────────────────────────────────────────────────
+// These construct structurally-authentic WebAuthn ceremony artifacts (real
+// clientDataJSON, real authenticatorData bit layout, real ES256 DER signatures)
+// with a test-generated P-256 key. The ECDSA math itself is covered by the
+// Wycheproof KAT suite; these exercise the WEBAUTHN command assembly + login.
+const WaEc = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+fn waBuildCoseEs256(x: [32]u8, y: [32]u8, out: *[77]u8) void {
+    out[0] = 0xa5; // map(5)
+    out[1] = 0x01;
+    out[2] = 0x02; // 1: 2 (EC2)
+    out[3] = 0x03;
+    out[4] = 0x26; // 3: -7 (ES256)
+    out[5] = 0x20;
+    out[6] = 0x01; // -1: 1 (P-256)
+    out[7] = 0x21;
+    out[8] = 0x58;
+    out[9] = 0x20; // -2: bstr(32)
+    @memcpy(out[10..42], &x);
+    out[42] = 0x22;
+    out[43] = 0x58;
+    out[44] = 0x20; // -3: bstr(32)
+    @memcpy(out[45..77], &y);
+}
+
+/// Registration authData: rpIdHash | flags(UP|AT) | signCount | aaguid | credIdLen | credId | COSE(77)
+fn waBuildRegAuthData(rp_id: []const u8, sign_count: u32, cred_id: []const u8, cose: [77]u8, out: []u8) usize {
+    var i: usize = 0;
+    std.crypto.hash.sha2.Sha256.hash(rp_id, out[0..32], .{});
+    i = 32;
+    out[i] = 0x01 | 0x40; // UP | AT
+    i += 1;
+    std.mem.writeInt(u32, out[i..][0..4], sign_count, .big);
+    i += 4;
+    @memset(out[i..][0..16], 0); // aaguid
+    i += 16;
+    std.mem.writeInt(u16, out[i..][0..2], @intCast(cred_id.len), .big);
+    i += 2;
+    @memcpy(out[i..][0..cred_id.len], cred_id);
+    i += cred_id.len;
+    @memcpy(out[i..][0..77], &cose);
+    i += 77;
+    return i;
+}
+
+/// Assertion authData: rpIdHash | flags(UP) | signCount (no attested cred).
+fn waBuildAuthData(rp_id: []const u8, sign_count: u32, out: *[37]u8) void {
+    std.crypto.hash.sha2.Sha256.hash(rp_id, out[0..32], .{});
+    out[32] = 0x01; // UP
+    std.mem.writeInt(u32, out[33..37], sign_count, .big);
+}
+
+fn waSignDer(kp: WaEc.KeyPair, auth_data: []const u8, client_data_json: []const u8, der_out: *[WaEc.Signature.der_encoded_length_max]u8) []const u8 {
+    var cdj_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(client_data_json, &cdj_hash, .{});
+    var signer = kp.signer(null) catch unreachable;
+    signer.update(auth_data);
+    signer.update(&cdj_hash);
+    const sig = signer.finalize() catch unreachable;
+    return sig.toDer(der_out);
+}
+
+fn waTokenAfter(buf: []const u8, marker: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, buf, marker) orelse return null;
+    const start = idx + marker.len;
+    var end = start;
+    while (end < buf.len and buf[end] != ' ' and buf[end] != '\r' and buf[end] != '\n') end += 1;
+    return buf[start..end];
+}
+
+test "WEBAUTHN inert until [webauthn] configured" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-inert.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+    conn.send_len = 0;
+    var lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    lv.params[0] = "REGISTER";
+    lv.param_count = 1;
+    try server.handleWebauthn(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "NOT_CONFIGURED");
+}
+
+test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-e2e.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    const rp_id = "chat.example";
+    const origin = "https://chat.example";
+    const origins = [_][]const u8{origin};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = rp_id,
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // The passkey key pair (would live in the authenticator).
+    const kp = WaEc.KeyPair.generate(std.testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    waBuildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const cred_id_raw = "kain-passkey-01"; // 15 bytes
+    var cred_id_b64_buf: [base64url.encodedLen(cred_id_raw.len)]u8 = undefined;
+    const cred_id_b64 = try base64url.encode(&cred_id_b64_buf, cred_id_raw);
+
+    // ── REGISTER (logged-in client) ─────────────────────────────────────────
+    const reg_id = try addTestLocalClient(&server, "kain", "kain");
+    const reg_conn = server.connFor(reg_id).?;
+    reg_conn.send_len = 0;
+    var reg_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    reg_lv.params[0] = "REGISTER";
+    reg_lv.params[1] = "phone";
+    reg_lv.param_count = 2;
+    try server.handleWebauthn(reg_conn, &reg_lv);
+    const reg_chal = waTokenAfter(reg_conn.send_buf[0..reg_conn.send_len], "REGISTER-CHALLENGE ") orelse return error.TestUnexpectedResult;
+
+    // Build the create clientDataJSON + registration authData (signCount 0).
+    var cdj_buf: [512]u8 = undefined;
+    const create_cdj = try std.fmt.bufPrint(&cdj_buf, "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}", .{ reg_chal, origin });
+    var reg_ad_buf: [256]u8 = undefined;
+    const reg_ad_len = waBuildRegAuthData(rp_id, 0, cred_id_raw, cose, &reg_ad_buf);
+    var cdj_b64_buf: [1024]u8 = undefined;
+    const cdj_b64 = try base64url.encode(&cdj_b64_buf, create_cdj);
+    var ad_b64_buf: [512]u8 = undefined;
+    const ad_b64 = try base64url.encode(&ad_b64_buf, reg_ad_buf[0..reg_ad_len]);
+
+    reg_conn.send_len = 0;
+    var rf_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    rf_lv.params[0] = "REGISTER-FINISH";
+    rf_lv.params[1] = cred_id_b64;
+    rf_lv.params[2] = cdj_b64;
+    rf_lv.params[3] = ad_b64;
+    rf_lv.param_count = 4;
+    try server.handleWebauthn(reg_conn, &rf_lv);
+    try expectContains(reg_conn.send_buf[0..reg_conn.send_len], "REGISTERED");
+    // The credential is now durably bound to "kain".
+    var cred: services_mod.Services.WebauthnCredential = .{};
+    try services.webauthnLookup(cred_id_b64, &cred);
+    try std.testing.expectEqualStrings("kain", cred.account());
+
+    // helper closure to run one AUTH → AUTH-FINISH on a fresh logged-out client.
+    const Ceremony = struct {
+        fn run(
+            srv: *Server,
+            nick: []const u8,
+            keypair: WaEc.KeyPair,
+            cid_b64: []const u8,
+            rpid: []const u8,
+            org: []const u8,
+            sign_count: u32,
+            tamper_sig: bool,
+            wrong_challenge: bool,
+        ) !*ConnState {
+            const cid = try addTestLocalClient(srv, nick, null);
+            const c = srv.connFor(cid).?;
+            c.send_len = 0;
+            var a_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+            a_lv.params[0] = "AUTH";
+            a_lv.params[1] = "kain";
+            a_lv.param_count = 2;
+            try srv.handleWebauthn(c, &a_lv);
+            const chal = waTokenAfter(c.send_buf[0..c.send_len], "AUTH-CHALLENGE ") orelse return error.TestUnexpectedResult;
+
+            var used_chal_buf: [64]u8 = undefined;
+            const used_chal = if (wrong_challenge) blk: {
+                // A syntactically-valid but different 32-byte challenge.
+                var raw: [32]u8 = @splat(0x5a);
+                break :blk try base64url.encode(&used_chal_buf, &raw);
+            } else chal;
+
+            var jbuf: [512]u8 = undefined;
+            const get_cdj = try std.fmt.bufPrint(&jbuf, "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}", .{ used_chal, org });
+            var adbuf: [37]u8 = undefined;
+            waBuildAuthData(rpid, sign_count, &adbuf);
+            var der_buf: [WaEc.Signature.der_encoded_length_max]u8 = undefined;
+            const der = waSignDer(keypair, &adbuf, get_cdj, &der_buf);
+
+            var cdjb: [1024]u8 = undefined;
+            const cdj_enc = try base64url.encode(&cdjb, get_cdj);
+            var adb: [128]u8 = undefined;
+            const ad_enc = try base64url.encode(&adb, &adbuf);
+            var sigb: [256]u8 = undefined;
+            const sig_enc = try base64url.encode(&sigb, der);
+            // Tamper directly in the mutable backing buffer (base64url.encode
+            // returned a const view into `sigb`).
+            if (tamper_sig) sigb[sig_enc.len - 2] = if (sig_enc[sig_enc.len - 2] == 'A') 'B' else 'A';
+
+            c.send_len = 0;
+            var f_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+            f_lv.params[0] = "AUTH-FINISH";
+            f_lv.params[1] = cid_b64;
+            f_lv.params[2] = cdj_enc;
+            f_lv.params[3] = ad_enc;
+            f_lv.params[4] = sig_enc;
+            f_lv.param_count = 5;
+            try srv.handleWebauthn(c, &f_lv);
+            return c;
+        }
+    };
+
+    // ── Successful passwordless login (signCount 10 > stored 0) ──────────────
+    const ok_conn = try Ceremony.run(&server, "logan", kp, cred_id_b64, rp_id, origin, 10, false, false);
+    try std.testing.expectEqualStrings("kain", ok_conn.session.account().?);
+    try expectContains(ok_conn.send_buf[0..ok_conn.send_len], "You are now identified as kain");
+
+    // ── Sign-count regression (5 <= stored 10) → rejected, not logged in ─────
+    const regr_conn = try Ceremony.run(&server, "riley", kp, cred_id_b64, rp_id, origin, 5, false, false);
+    try std.testing.expect(regr_conn.session.account() == null);
+    try expectContains(regr_conn.send_buf[0..regr_conn.send_len], "SIGN_COUNT_REGRESSION");
+
+    // ── Tampered signature → rejected, not logged in ─────────────────────────
+    const tamper_conn = try Ceremony.run(&server, "quinn", kp, cred_id_b64, rp_id, origin, 20, true, false);
+    try std.testing.expect(tamper_conn.session.account() == null);
+    try expectContains(tamper_conn.send_buf[0..tamper_conn.send_len], "ASSERTION_FAILED");
+
+    // ── Wrong challenge → rejected before signature check ────────────────────
+    const wc_conn = try Ceremony.run(&server, "sasha", kp, cred_id_b64, rp_id, origin, 30, false, true);
+    try std.testing.expect(wc_conn.session.account() == null);
+    try expectContains(wc_conn.send_buf[0..wc_conn.send_len], "CHALLENGE_MISMATCH");
+}
+
+test "WEBAUTHN malformed base64 rejected without panic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-bad.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const reg_id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(reg_id).?;
+
+    // Arm a register challenge, then hand REGISTER-FINISH garbage base64. Must be
+    // a graceful FAIL, never a panic, and it consumes the single-use challenge.
+    conn.send_len = 0;
+    var reg_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    reg_lv.params[0] = "REGISTER";
+    reg_lv.param_count = 1;
+    try server.handleWebauthn(conn, &reg_lv);
+
+    conn.send_len = 0;
+    var rf = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    rf.params[0] = "REGISTER-FINISH";
+    rf.params[1] = "validcredid";
+    rf.params[2] = "!!!not-base64!!!";
+    rf.params[3] = "@@@also-bad@@@";
+    rf.param_count = 4;
+    try server.handleWebauthn(conn, &rf);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL WEBAUTHN");
+
+    // Challenge was single-use: a second FINISH now reports NO_PENDING.
+    conn.send_len = 0;
+    try server.handleWebauthn(conn, &rf);
+    try expectContains(conn.send_buf[0..conn.send_len], "NO_PENDING");
 }
 
 test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {

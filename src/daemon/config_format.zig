@@ -68,6 +68,7 @@ pub const Config = struct {
     sts: Sts = .{},
     dnsbl: Dnsbl = .{},
     mail: Mail = .{},
+    webauthn: Webauthn = .{},
 
     /// `[dnsbl]` connect-time DNS blocklist. When enabled with one or more zones,
     /// each non-loopback client IP is checked against the zones off the hot path;
@@ -578,6 +579,21 @@ pub const Config = struct {
         preload: bool = false,
     };
 
+    /// `[webauthn]` — passkey (WebAuthn/FIDO2) registration + passwordless login
+    /// (the `WEBAUTHN` command). Inert until an account uses it; the command
+    /// fails closed until BOTH `rp_id` and one or more `origins` are configured,
+    /// because a passkey ceremony must be bound to the deploy's exact domain.
+    pub const Webauthn = struct {
+        /// The Relying Party ID (a registrable domain, e.g. "chat.example").
+        /// Passkeys are scoped to this; it must match the site the client's
+        /// `navigator.credentials` call runs on. Null ⇒ WEBAUTHN is unavailable.
+        rp_id: ?[]const u8 = null,
+        /// Allowed top-level origins (e.g. ["https://chat.example"]). A ceremony
+        /// whose clientDataJSON `origin` is not on this list is rejected. Empty ⇒
+        /// WEBAUTHN is unavailable.
+        origins: []const []const u8 = &.{},
+    };
+
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
         const host = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(host);
@@ -667,6 +683,8 @@ pub const Config = struct {
         if (self.mail.from) |value| allocator.free(value);
         if (self.mail.user) |value| allocator.free(value);
         if (self.mail.pass) |value| allocator.free(value);
+        if (self.webauthn.rp_id) |value| allocator.free(value);
+        freeStringList(allocator, self.webauthn.origins);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
@@ -806,6 +824,13 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("mail.from"), &cfg.mail.from);
     try setOpt(allocator, resolver, doc.getString("mail.user"), &cfg.mail.user);
     try setOpt(allocator, resolver, doc.getString("mail.pass"), &cfg.mail.pass);
+
+    // [webauthn]
+    try setOpt(allocator, resolver, doc.getString("webauthn.rp_id"), &cfg.webauthn.rp_id);
+    if (doc.getArray("webauthn.origins")) |arr| {
+        freeStringList(allocator, cfg.webauthn.origins);
+        cfg.webauthn.origins = try ownStringArray(allocator, resolver, arr);
+    }
 
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
@@ -1865,6 +1890,34 @@ test "parseToml: [sts] omitted keeps secure defaults" {
     try testing.expectEqual(@as(u32, 2_592_000), cfg.sts.duration);
     try testing.expectEqual(@as(u16, 6697), cfg.sts.port);
     try testing.expect(!cfg.sts.preload);
+}
+
+test "parseToml: [webauthn] section projects rp_id + origins" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[webauthn]
+        \\rp_id = "chat.example"
+        \\origins = ["https://chat.example", "https://alt.example:8443"]
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("chat.example", cfg.webauthn.rp_id.?);
+    try testing.expectEqual(@as(usize, 2), cfg.webauthn.origins.len);
+    try testing.expectEqualStrings("https://chat.example", cfg.webauthn.origins[0]);
+    try testing.expectEqualStrings("https://alt.example:8443", cfg.webauthn.origins[1]);
+}
+
+test "parseToml: [webauthn] omitted leaves the feature inert" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.webauthn.rp_id == null);
+    try testing.expectEqual(@as(usize, 0), cfg.webauthn.origins.len);
 }
 
 test {
