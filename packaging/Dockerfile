@@ -1,0 +1,36 @@
+# Orochi — minimal, reproducible container image.
+#
+# The daemon is a single static x86_64-linux-musl binary with ZERO external
+# dependencies, so the runtime image is just the binary + a quickstart config.
+# The binary's provenance is anchored by dist/SHA256SUMS — anyone can rebuild it
+# and confirm it byte-for-byte with `packaging/verify-release.sh`.
+#
+#   1. Build the verified artifact:   packaging/release.sh
+#   2. Build the image:               docker build -f packaging/Dockerfile -t orochi:latest .
+#   3. Run it:                        docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest
+#
+# The node's sovereign identity key + account store live in /data — mount a
+# volume to persist them across restarts. Point the Onyx web client at
+# ws://<host>:8080 (build Onyx with VITE_IRC_WS, or use a hosted client).
+#
+# (An alternative fully-from-source multi-stage build is possible once Zig 0.17
+# ships a stable release; today's toolchain is a dev build, so we ship the
+# reproducible binary the release script already produces + verifies.)
+FROM alpine:3.20
+
+RUN adduser -D -u 10001 orochi \
+    && mkdir -p /data \
+    && chown orochi:orochi /data
+
+# The reproducible artifact produced by packaging/release.sh.
+COPY dist/orochi-*-x86_64-linux-musl /usr/local/bin/orochi
+COPY packaging/orochi.quickstart.toml /etc/orochi/orochi.toml
+
+USER orochi
+WORKDIR /data
+
+# 6667 = plaintext IRC · 8080 = browser WebSocket (Onyx). Add TLS (6697/wss) via
+# a production config with real certs.
+EXPOSE 6667 8080
+
+ENTRYPOINT ["/usr/local/bin/orochi", "/etc/orochi/orochi.toml"]

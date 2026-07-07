@@ -1,0 +1,38 @@
+# Orochi quickstart — a single self-hosted node for local evaluation.
+#
+# Boots a working node on plaintext ws://<host>:8080 (the Onyx web client) and
+# irc://<host>:6667 (any IRC client). The node's sovereign identity key is
+# generated + persisted (0600) on first run in the working directory (/data in
+# the container image), so there is nothing to configure to get started.
+#
+# For PRODUCTION: point clients at TLS instead — add a [tls] block with real
+# certs (or use the built-in ACME client), set `ws_plain = false`, and set a
+# real `server_name`. See docs/ and packaging/README.md.
+
+[node]
+id = 1 # this node's mesh id; the sovereign identity key self-generates on first run
+
+[network]
+name = "Orochi"
+server_name = "localhost"
+description = "A self-hosted Orochi node."
+
+[listen]
+host = "::" # dual-stack: binds IPv6 + IPv4-mapped
+irc = 6667 # plaintext IRC
+ws = 8080 # browser WebSocket (Onyx)
+ws_plain = true # plaintext ws for LOCAL evaluation — use TLS in production
+
+[sasl]
+enabled = true
+realm = "Orochi"
+account_db = "accounts.db" # relative to the working directory (/data)
+
+[limits]
+num_shards = 1 # single-node quickstart; raise on multi-core hosts
+
+[motd]
+text = """
+Welcome to Orochi, {nick}.
+This is a self-hosted single node — sovereign, mesh-capable, yours.
+Register an account to reserve your nick and unlock services."""
