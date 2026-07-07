@@ -160,6 +160,8 @@ const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
 const media_plane_mod = @import("media_plane.zig");
+const dtls_fingerprint_mod = @import("../proto/dtls_fingerprint.zig");
+const dtls_peer_verify_mod = @import("../proto/dtls_peer_verify.zig");
 const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
@@ -23117,12 +23119,17 @@ pub const LinuxServer = struct {
                 conn,
                 channel,
                 if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
-                if (parsed.param_count >= 4) parsed.paramSlice()[3] else "",
+                if (parsed.param_count >= 4) parsed.paramSlice()[3..] else &.{},
             );
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) {
-            try self.mediaAnswer(conn, channel, if (parsed.param_count >= 3) parsed.paramSlice()[2] else "");
+            try self.mediaAnswer(
+                conn,
+                channel,
+                if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
+                if (parsed.param_count >= 4) parsed.paramSlice()[3..] else &.{},
+            );
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "PROFILE")) {
@@ -23528,18 +23535,107 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// The peer's RFC 8122 DTLS-SRTP request, parsed from a MEDIA OFFER/ANSWER's
+    /// trailing args. `.none` = no fingerprint token (legacy SDES path);
+    /// `.malformed` = a fingerprint token present but invalid (⇒ FAIL MEDIA);
+    /// `.ok` = a well-formed SHA-256 fingerprint of the cert the peer will present.
+    const OfferedFp = union(enum) {
+        none,
+        malformed,
+        ok: [dtls_peer_verify_mod.digest_len]u8,
+    };
+
+    /// Value of a `key=` token within `args`, or null if not present.
+    fn mediaTokenValue(args: []const []const u8, prefix: []const u8) ?[]const u8 {
+        for (args) |a| {
+            if (std.mem.startsWith(u8, a, prefix)) return a[prefix.len..];
+        }
+        return null;
+    }
+
+    /// Parse a `fingerprint=sha-256:<colon-hex>` token from a MEDIA OFFER/ANSWER.
+    /// A single whitespace-delimited token (colon-joined alg) so it survives IRC
+    /// param tokenization; the daemon's TRANSPORT reply renders the RFC 8122
+    /// space form. Fail-closed: any malformed value (bad/unknown alg, wrong hex
+    /// length, non-hex nibble) yields `.malformed` rather than being ignored.
+    fn parseOfferedFingerprint(args: []const []const u8) OfferedFp {
+        const val = mediaTokenValue(args, "fingerprint=") orelse return .none;
+        const colon = std.mem.indexOfScalar(u8, val, ':') orelse return .malformed;
+        const alg = val[0..colon];
+        // Only SHA-256 is accepted (SHA-1 and unknown algs are rejected, not
+        // silently downgraded).
+        if (!std.ascii.eqlIgnoreCase(alg, "sha-256")) return .malformed;
+        const hex = val[colon + 1 ..];
+        var digest: [dtls_peer_verify_mod.digest_len]u8 = undefined;
+        _ = dtls_fingerprint_mod.decodeDigest(.sha256, hex, &digest) catch return .malformed;
+        return .{ .ok = digest };
+    }
+
+    test "parseOfferedFingerprint: none / malformed / ok" {
+        // No fingerprint token → legacy path.
+        try std.testing.expect(parseOfferedFingerprint(&.{ "transport=webrtc", "setup=active" }) == .none);
+        try std.testing.expect(parseOfferedFingerprint(&.{}) == .none);
+
+        // Well-formed sha-256 token → ok, decoded to the raw digest.
+        var fpbuf: [128]u8 = undefined;
+        const line = try dtls_fingerprint_mod.format(.sha256, "some cert der", &fpbuf);
+        const hex = line["sha-256 ".len..];
+        var tokbuf: [160]u8 = undefined;
+        const tok = try std.fmt.bufPrint(&tokbuf, "fingerprint=sha-256:{s}", .{hex});
+        const ok = parseOfferedFingerprint(&.{ "transport=webrtc", tok });
+        try std.testing.expect(ok == .ok);
+        var expect: [dtls_peer_verify_mod.digest_len]u8 = undefined;
+        _ = try dtls_fingerprint_mod.decodeDigest(.sha256, hex, &expect);
+        try std.testing.expectEqualSlices(u8, &expect, &ok.ok);
+
+        // Malformed variants → .malformed (never ignored, never a trap).
+        try std.testing.expect(parseOfferedFingerprint(&.{"fingerprint=sha-256"}) == .malformed); // no colon
+        try std.testing.expect(parseOfferedFingerprint(&.{"fingerprint=sha-1:00:11"}) == .malformed); // unsupported alg
+        try std.testing.expect(parseOfferedFingerprint(&.{"fingerprint=sha-256:00:11:22"}) == .malformed); // short hex
+        try std.testing.expect(parseOfferedFingerprint(&.{"fingerprint="}) == .malformed); // empty value
+    }
+
     /// `MEDIA OFFER <#chan> <codec[,codec...]>` — negotiate the call's codec + FEC
     /// set against the SFU's supported codecs (real sdp/media_session offer/answer),
     /// persist it as the channel's active call profile, and reply with the agreed
     /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
     /// this is the live signaling/negotiation half.
-    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, transport_arg: []const u8) !void {
+    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
             try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
+
+        // RFC 8122 DTLS-SRTP request. Fail-closed BEFORE any wiring: a malformed
+        // fingerprint, or a DTLS request when DTLS-SRTP is disabled/down, is
+        // rejected here so a rejected offer leaves no half-negotiated state.
+        var dtls_mode = false;
+        switch (parseOfferedFingerprint(extra_args)) {
+            .none => {},
+            .malformed => {
+                try self.failReply(conn, "MEDIA", "BAD_FINGERPRINT", "Malformed fingerprint (expected fingerprint=sha-256:<colon-hex>)");
+                return;
+            },
+            .ok => |d| {
+                var fp_probe: [128]u8 = undefined;
+                if (!self.config.media_dtls_srtp or self.media_plane.dtlsFingerprint(&fp_probe) == null) {
+                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server");
+                    return;
+                }
+                // Store the peer's expected fingerprint BEFORE advertising
+                // setup=passive: if storage fails we must NOT advertise DTLS,
+                // because an unbound expectation would let the terminator export
+                // keys to an unverified peer (fail OPEN). Fail closed instead.
+                self.media_plane.bindOfferedFingerprint(channel, conn.session.displayName(), d) catch {
+                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "Could not record the DTLS fingerprint");
+                    return;
+                };
+                dtls_mode = true;
+            },
+        }
+
         const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
         const server_codecs = [_]sdp.Codec{
             .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
@@ -23570,18 +23666,33 @@ pub const LinuxServer = struct {
         // (ufrag/pwd + media candidate) so the client can run STUN to the SFU.
         const nick = conn.session.displayName();
         if (self.media_plane.allocate(channel, nick)) |creds| {
-            // Per-call SRTP group key (SDES), base64'd; safe over the TLS IRC link.
-            const gk = self.media_plane.groupKey(channel);
-            var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
-            const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
             // Prefer the STUN-discovered reflexive candidate over the static host.
             var host_buf: [16]u8 = undefined;
             const cand_host = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
             var tbuf: [400]u8 = undefined;
-            const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
-                protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
-            }) catch return;
-            try appendToConn(conn, tline);
+            if (dtls_mode) {
+                // RFC 8122: advertise the server's DTLS certificate fingerprint +
+                // setup=passive (orochi is the DTLS server) INSTEAD of the SDES
+                // group key. The peer's offered fingerprint was already stored
+                // (fail-closed) above, so the handshake fails closed on a cert
+                // mismatch. `dtls_mode` implies `dtlsFingerprint` is non-null.
+                var fp_buf: [128]u8 = undefined;
+                const server_fp = self.media_plane.dtlsFingerprint(&fp_buf) orelse "";
+                const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive\r\n", .{
+                    protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, server_fp,
+                }) catch return;
+                try appendToConn(conn, tline);
+            } else {
+                // Legacy SDES path (byte-identical to pre-Increment-3): ship the
+                // per-call SRTP group key, base64'd, over the TLS IRC link.
+                const gk = self.media_plane.groupKey(channel);
+                var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
+                const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
+                const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
+                    protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
+                }) catch return;
+                try appendToConn(conn, tline);
+            }
         }
         // Native transport (our own KaguraVox/KaguraVis codec leg): register this caller
         // for the channel's native call and advertise the candidate + the
@@ -23608,16 +23719,20 @@ pub const LinuxServer = struct {
         // client opts into the WebRTC leg with `transport=webrtc` (default native).
         // The bridge lets a native participant and an opt-in-WebRTC participant in
         // the same call hear each other (rewrap only, never transcode).
-        const want_webrtc = isWebrtcTransport(transport_arg);
+        const want_webrtc = dtls_mode or isWebrtcTransport(extra_args);
         const leg: media_bridge_mod.Leg = if (want_webrtc) .webrtc else .native;
         self.bridgeRegister(channel, nick, leg, stream_id);
     }
 
-    /// True when the OFFER's transport token opts into the WebRTC leg
-    /// (`transport=webrtc` or bare `webrtc`); anything else means native.
-    fn isWebrtcTransport(arg: []const u8) bool {
-        const v = if (std.mem.startsWith(u8, arg, "transport=")) arg["transport=".len..] else arg;
-        return std.ascii.eqlIgnoreCase(v, "webrtc");
+    /// True when the OFFER opts into the WebRTC leg via a `transport=webrtc`
+    /// token (or a bare `webrtc` token); anything else means native. A DTLS-SRTP
+    /// request always implies the WebRTC leg.
+    fn isWebrtcTransport(args: []const []const u8) bool {
+        for (args) |a| {
+            const v = if (std.mem.startsWith(u8, a, "transport=")) a["transport=".len..] else a;
+            if (std.ascii.eqlIgnoreCase(v, "webrtc")) return true;
+        }
+        return false;
     }
 
     /// Register (or update) a participant's leg in the channel's bridge roster.
@@ -23692,11 +23807,33 @@ pub const LinuxServer = struct {
     /// `MEDIA ANSWER <#chan> <codec[,codec...]>` — a later participant reconciles
     /// their codec capabilities against the call's active profile (set by OFFER).
     /// Replies with the intersection so everyone converges on a shared media set.
-    fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8) !void {
+    /// A DTLS-SRTP answerer may carry its own `fingerprint=sha-256:<hex>`; it is
+    /// validated (fail-closed) and stored so the answerer's DTLS leg fails closed
+    /// on a certificate mismatch, exactly as the OFFER path.
+    fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
         const prof = self.media_rooms.profileOf(channel) orelse {
             try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile; send MEDIA OFFER first");
             return;
         };
+
+        // Fail-closed fingerprint validation before any codec negotiation.
+        var answer_digest: ?[dtls_peer_verify_mod.digest_len]u8 = null;
+        switch (parseOfferedFingerprint(extra_args)) {
+            .none => {},
+            .malformed => {
+                try self.failReply(conn, "MEDIA", "BAD_FINGERPRINT", "Malformed fingerprint (expected fingerprint=sha-256:<colon-hex>)");
+                return;
+            },
+            .ok => |d| {
+                var fp_probe: [128]u8 = undefined;
+                if (!self.config.media_dtls_srtp or self.media_plane.dtlsFingerprint(&fp_probe) == null) {
+                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server");
+                    return;
+                }
+                answer_digest = d;
+            },
+        }
+
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
@@ -23714,6 +23851,14 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
             return;
         }
+        // Store the answerer's DTLS fingerprint (if any) so its media leg is
+        // verified. Keyed by (channel, participant), consumed by the terminator.
+        // Fail closed on a storage failure rather than leaving the leg unverified.
+        if (answer_digest) |d| self.media_plane.bindOfferedFingerprint(channel, conn.session.displayName(), d) catch {
+            try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "Could not record the DTLS fingerprint");
+            return;
+        };
+
         try mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
     }
 
@@ -34734,6 +34879,117 @@ test "threaded server: media user modes block transmit and hide automatic presen
     try recvUntil(&b, " 221 B :+", 200);
     try std.testing.expect(std.mem.indexOfScalar(u8, b.written(), 'M') != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, b.written(), 'P') != null);
+}
+
+test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs legacy srtp)" {
+    var cfg = multiOperTestConfig(0);
+    cfg.media_enabled = true;
+    cfg.media_dtls_srtp = true; // opt-in DTLS-SRTP keying on
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start(); // bring up the media plane + DTLS terminator
+    // Skip in sandboxes where the media UDP plane cannot bind (no terminator).
+    if (server.media_plane.port == 0) return error.SkipZigTest;
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "JOIN #media\r\n");
+    try recvUntil(&a, " 366 A #media ", 200);
+
+    // Build a well-formed sha-256 fingerprint token (colon-joined single token).
+    var fpbuf: [128]u8 = undefined;
+    const fpline = try dtls_fingerprint_mod.format(.sha256, "peer client certificate", &fpbuf);
+    const peer_hex = fpline["sha-256 ".len..];
+
+    // (a) OFFER requesting DTLS keying → TRANSPORT carries fingerprint=sha-256 …
+    //     + setup=passive and NO srtp= group key.
+    a.reset();
+    var offer_buf: [256]u8 = undefined;
+    const offer = try std.fmt.bufPrint(&offer_buf, "MEDIA OFFER #media kaguravox transport=webrtc fingerprint=sha-256:{s} setup=active\r\n", .{peer_hex});
+    try writeAllFd(fd_a, offer);
+    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    // Drain a beat so the whole TRANSPORT line is buffered before we inspect it.
+    try recvUntil(&a, "setup=passive", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=sha-256 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "setup=passive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") == null);
+
+    // (b) OFFER WITHOUT a fingerprint (feature on, not requested) → byte-identical
+    //     legacy srtp= group-key reply, no fingerprint/setup.
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox transport=webrtc\r\n");
+    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    try recvUntil(&a, "srtp=", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "setup=") == null);
+
+    // (e) Malformed fingerprint → FAIL MEDIA BAD_FINGERPRINT, never a trap.
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox transport=webrtc fingerprint=sha-256:00:11:22 setup=active\r\n");
+    try recvUntil(&a, "FAIL MEDIA BAD_FINGERPRINT", 200);
+}
+
+test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails closed on a fingerprint request" {
+    var cfg = multiOperTestConfig(0);
+    cfg.media_enabled = true;
+    cfg.media_dtls_srtp = false; // DTLS-SRTP disabled (default)
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "JOIN #media\r\n");
+    try recvUntil(&a, " 366 A #media ", 200);
+
+    // With the feature off, a plain OFFER still ships the legacy srtp= group key.
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox transport=webrtc\r\n");
+    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    try recvUntil(&a, "srtp=", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=") == null);
+
+    // A DTLS keying request when the server has it off fails closed (no media,
+    // no leaked group key).
+    var fpbuf: [128]u8 = undefined;
+    const fpline = try dtls_fingerprint_mod.format(.sha256, "peer cert", &fpbuf);
+    a.reset();
+    var offer_buf: [256]u8 = undefined;
+    const offer = try std.fmt.bufPrint(&offer_buf, "MEDIA OFFER #media kaguravox transport=webrtc fingerprint=sha-256:{s} setup=active\r\n", .{fpline["sha-256 ".len..]});
+    try writeAllFd(fd_a, offer);
+    try recvUntil(&a, "FAIL MEDIA DTLS_UNAVAILABLE", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") == null);
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {

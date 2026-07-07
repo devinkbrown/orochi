@@ -35,6 +35,7 @@ const dhs = @import("dtls_handshake.zig");
 const kx = @import("dtls_keyexchange.zig");
 const dtls_srtp = @import("dtls_srtp.zig");
 const fingerprint = @import("dtls_fingerprint.zig");
+const peer_verify = @import("dtls_peer_verify.zig");
 const x509_selfsign = @import("x509_selfsign.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 
@@ -93,6 +94,13 @@ pub const Session = struct {
 
     srtp_keys: dtls_srtp.ExportedKeys = undefined,
 
+    /// RFC 8122 peer verification (Increment 3). `fp_verified` is set true only
+    /// once a presented peer certificate has matched the expected fingerprint
+    /// bound for this address (`recordPeerCertificate`). Whether an expectation
+    /// EXISTS is evaluated live off `Terminator.verify_bindings` at the accessor,
+    /// so a binding registered any time before key export still gates.
+    fp_verified: bool = false,
+
     /// Cached server flights for retransmit (respond to a retransmitted client
     /// flight with the identical bytes rather than re-deriving).
     flight4: [flight4_cap]u8 = undefined,
@@ -122,6 +130,10 @@ pub const Terminator = struct {
     cookie_secret: [32]u8 = @splat(0),
     csprng: std.Random.DefaultCsprng = undefined,
     sessions: []Session,
+    /// RFC 8122 expected peer fingerprints, keyed by remote transport address.
+    /// Bound by the signaling layer (per MEDIA OFFER) before the ClientHello
+    /// arrives; consulted at handshake completion. Fixed-capacity, no alloc.
+    verify_bindings: peer_verify.Bindings(default_max_sessions) = .{},
 
     /// Initialise from a 32-byte entropy seed: mints the self-signed
     /// ECDSA-P256 cert, the cookie secret, and seeds the per-handshake CSPRNG.
@@ -192,18 +204,60 @@ pub const Terminator = struct {
     }
 
     /// Exported SRTP keying material for `addr` once established (Increment 2
-    /// drives the SFU SRTP contexts from this), else null.
+    /// drives the SFU SRTP contexts from this), else null. FAILS CLOSED: when
+    /// the signaling layer bound an expected peer fingerprint (RFC 8122) that
+    /// has not been verified against a presented certificate, no keys are handed
+    /// out — an unverifiable peer gets no media.
     pub fn exportedKeys(self: *const Terminator, addr: TransportAddress) ?dtls_srtp.ExportedKeys {
         const s = self.find(addr) orelse return null;
         if (s.state != .established) return null;
+        if (!self.peerVerifiedSession(addr, s)) return null;
         return s.srtp_keys;
     }
 
-    /// The negotiated SRTP profile for `addr` once established, else null.
+    /// The negotiated SRTP profile for `addr` once established, else null. Fails
+    /// closed on an unverified expected fingerprint, mirroring `exportedKeys`.
     pub fn srtpProfile(self: *const Terminator, addr: TransportAddress) ?u16 {
         const s = self.find(addr) orelse return null;
         if (s.state != .established) return null;
+        if (!self.peerVerifiedSession(addr, s)) return null;
         return s.srtp_profile;
+    }
+
+    /// RFC 8122 verdict for a resolved session: true when no expected fingerprint
+    /// is bound for `addr` (verification not requested) or the presented cert
+    /// matched it. Evaluated live so a binding set at any time before key export
+    /// takes effect.
+    fn peerVerifiedSession(self: *const Terminator, addr: TransportAddress, s: *const Session) bool {
+        return self.verify_bindings.expectedFor(addr) == null or s.fp_verified;
+    }
+
+    /// Bind the RFC 8122 fingerprint the peer signaled for `addr` (SHA-256 of
+    /// the certificate the peer will present). Idempotent; safe to call on every
+    /// inbound datagram before the handshake completes.
+    pub fn bindExpectedFingerprint(self: *Terminator, addr: TransportAddress, digest: [peer_verify.digest_len]u8) void {
+        _ = self.verify_bindings.bind(addr, digest);
+    }
+
+    /// Record the certificate the peer presented in the DTLS handshake and
+    /// verify it against the bound expected fingerprint. This is the seam the
+    /// handshake calls the moment client-certificate capture lands; it is a
+    /// no-op when no session exists for `addr`.
+    pub fn recordPeerCertificate(self: *Terminator, addr: TransportAddress, cert_der: []const u8) void {
+        const s = self.find(addr) orelse return;
+        if (self.verify_bindings.expectedFor(addr)) |exp| {
+            s.fp_verified = peer_verify.digestEql(exp, peer_verify.certDigest(cert_der));
+        } else {
+            s.fp_verified = false;
+        }
+    }
+
+    /// Whether the peer at `addr` is RFC 8122 verified: true when no expected
+    /// fingerprint was bound (verification not requested) or the presented
+    /// certificate matched it. False for a bound-but-unverified peer.
+    pub fn peerVerified(self: *const Terminator, addr: TransportAddress) bool {
+        const s = self.find(addr) orelse return false;
+        return self.peerVerifiedSession(addr, s);
     }
 
     // -- session table -----------------------------------------------------
@@ -229,6 +283,9 @@ pub const Terminator = struct {
             if (s.last_activity_ms < stalest.last_activity_ms) stalest = s;
         }
         const slot = free orelse stalest;
+        // Evicting a live slot for a different peer: drop that peer's stale
+        // fingerprint binding so a reused address never inherits it.
+        if (slot.active and !slot.addr.eql(addr)) self.verify_bindings.clear(slot.addr);
         slot.reset();
         slot.active = true;
         slot.addr = addr;
@@ -788,13 +845,11 @@ const ClientDriver = struct {
     }
 };
 
-test "full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys" {
-    var setup = try makeTerminator(0x77);
-    defer testing.allocator.free(setup.sessions);
-    defer setup.term.deinit();
-    var term = &setup.term;
-    const addr = testAddr(5, 7000);
-
+/// Drive a complete DTLS-SRTP loopback handshake (client role, built from the
+/// same lib) against `term` for `addr`, returning the client driver once the
+/// session is established. Shared by the handshake and RFC 8122 verification
+/// tests.
+fn driveLoopbackHandshake(term: *Terminator, addr: TransportAddress) !ClientDriver {
     var client = ClientDriver.init();
     var out: [2048]u8 = undefined;
     var scratch: [2048]u8 = undefined;
@@ -938,6 +993,16 @@ test "full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys" 
         }
         try testing.expect(verified);
     }
+    return client;
+}
+
+test "full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys" {
+    var setup = try makeTerminator(0x77);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    const addr = testAddr(5, 7000);
+    var client = try driveLoopbackHandshake(term, addr);
 
     // 7) Both sides now export SRTP keys — assert byte-for-byte equality.
     try testing.expect(term.established(addr));
@@ -955,6 +1020,73 @@ test "full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys" 
     const wire = try srtp.protect(sk, 0, &rtp, &prot);
     var back: [rtp.len]u8 = undefined;
     try testing.expectEqualSlices(u8, &rtp, try srtp.unprotect(sk, 0, wire, &back));
+}
+
+test "RFC 8122: an established session with no bound fingerprint exports keys (byte-identical default)" {
+    var setup = try makeTerminator(0x91);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    const addr = testAddr(5, 7300);
+
+    // No bindExpectedFingerprint call: verification is not requested, so the
+    // gate is inert and behavior matches the pre-Increment-3 terminator.
+    var client = try driveLoopbackHandshake(term, addr);
+    _ = &client;
+    try testing.expect(term.established(addr));
+    try testing.expect(term.peerVerified(addr)); // no expectation ⇒ verified
+    try testing.expect(term.exportedKeys(addr) != null);
+    try testing.expect(term.srtpProfile(addr) != null);
+}
+
+test "RFC 8122: a matching peer fingerprint verifies and unlocks the SRTP keys" {
+    var setup = try makeTerminator(0x92);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    const addr = testAddr(5, 7400);
+
+    // The signaling layer bound the fingerprint of the certificate the peer
+    // will present (here a simulated browser client cert DER).
+    const peer_cert = "simulated browser client certificate DER blob";
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest(peer_cert));
+
+    var client = try driveLoopbackHandshake(term, addr);
+    _ = &client;
+
+    // Handshake completed, but the expected fingerprint is not yet verified:
+    // FAIL CLOSED — no keys, no profile, until a presented cert matches.
+    try testing.expect(term.established(addr));
+    try testing.expect(!term.peerVerified(addr));
+    try testing.expect(term.exportedKeys(addr) == null);
+    try testing.expect(term.srtpProfile(addr) == null);
+
+    // The peer presents the matching certificate ⇒ verified ⇒ keys unlocked.
+    term.recordPeerCertificate(addr, peer_cert);
+    try testing.expect(term.peerVerified(addr));
+    try testing.expect(term.exportedKeys(addr) != null);
+    try testing.expect(term.srtpProfile(addr) != null);
+}
+
+test "RFC 8122: a mismatched peer fingerprint stays fail-closed (no keys, no profile)" {
+    var setup = try makeTerminator(0x93);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    var term = &setup.term;
+    const addr = testAddr(5, 7500);
+
+    term.bindExpectedFingerprint(addr, peer_verify.certDigest("the certificate the peer PROMISED"));
+
+    var client = try driveLoopbackHandshake(term, addr);
+    _ = &client;
+
+    // The peer presents a DIFFERENT certificate than it signaled ⇒ mismatch ⇒
+    // the session is rejected: no exported keys, no SRTP context handed out.
+    term.recordPeerCertificate(addr, "an ENTIRELY different certificate DER");
+    try testing.expect(term.established(addr)); // the DTLS layer completed...
+    try testing.expect(!term.peerVerified(addr)); // ...but identity is unverified
+    try testing.expect(term.exportedKeys(addr) == null);
+    try testing.expect(term.srtpProfile(addr) == null);
 }
 
 test "retransmitted second ClientHello resends the cached flight 4 verbatim" {

@@ -129,6 +129,33 @@ fn formattedLen(alg: Algorithm) usize {
     return alg.token().len + 1 + digestHexLen(alg);
 }
 
+/// Validate + decode a colon-separated hex digest (`AA:BB:..:FF`) for `alg`
+/// into raw bytes written to `out`. Fail-closed: rejects wrong length, a
+/// missing/extra colon, or any non-hex nibble (the exact grammar
+/// `validateDigestHex` enforces). Used to turn a peer's signaled RFC 8122
+/// fingerprint into the 32 raw bytes compared against a presented certificate.
+pub fn decodeDigest(alg: Algorithm, digest_hex: []const u8, out: []u8) Error![]const u8 {
+    const n = digestLen(alg);
+    if (out.len < n) return error.BufferTooSmall;
+    try validateDigestHex(alg, digest_hex);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const hi = hexVal(digest_hex[i * 3]) orelse return error.BadFormat;
+        const lo = hexVal(digest_hex[i * 3 + 1]) orelse return error.BadFormat;
+        out[i] = (hi << 4) | lo;
+    }
+    return out[0..n];
+}
+
+fn hexVal(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
 fn isHex(ch: u8) bool {
     return switch (ch) {
         '0'...'9', 'a'...'f', 'A'...'F' => true,
@@ -138,6 +165,42 @@ fn isHex(ch: u8) bool {
 
 fn upperHex(nibble: u8) u8 {
     return "0123456789ABCDEF"[nibble & 0x0f];
+}
+
+test "decodeDigest round-trips a formatted sha-256 fingerprint" {
+    const cert = "orochi dtls certificate";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(cert, &digest, .{});
+
+    // Render to colon-hex, then decode the hex back to the raw digest bytes.
+    var line_buf: [128]u8 = undefined;
+    const line = try format(.sha256, cert, &line_buf);
+    const hex = line["sha-256 ".len..];
+
+    var back: [Sha256.digest_length]u8 = undefined;
+    const decoded = try decodeDigest(.sha256, hex, &back);
+    try std.testing.expectEqualSlices(u8, digest[0..], decoded);
+}
+
+test "decodeDigest is fail-closed on malformed hex" {
+    var back: [Sha256.digest_length]u8 = undefined;
+    // Too short.
+    try std.testing.expectError(error.BadFormat, decodeDigest(.sha256, "AA:BB", &back));
+    // Correct length but a non-hex nibble.
+    var bad: [95]u8 = undefined;
+    @memset(&bad, 'A');
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        if (i != 0) bad[i * 3 - 1] = ':';
+    }
+    bad[0] = 'Z'; // corrupt one nibble
+    try std.testing.expectError(error.BadFormat, decodeDigest(.sha256, &bad, &back));
+    // Output buffer too small.
+    var tiny: [8]u8 = undefined;
+    const cert = "x";
+    var line_buf: [128]u8 = undefined;
+    const line = try format(.sha256, cert, &line_buf);
+    try std.testing.expectError(error.BufferTooSmall, decodeDigest(.sha256, line["sha-256 ".len..], &tiny));
 }
 
 test "compute sha-256 matches std" {
