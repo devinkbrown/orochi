@@ -339,6 +339,10 @@ pub const Terminator = struct {
     ) ?usize {
         const ch = msg.parseClientHello(body) catch return null;
         if (!ch.offers_target_cipher) return null;
+        // Version-dispatch seam (1.2 side): this engine only serves peers that
+        // can speak DTLS 1.2. A 1.3-only peer would be routed to a 1.3 engine by
+        // a facade upstream (a later increment); here it is simply not ours.
+        if (!ch.offers_dtls12) return null;
 
         const expected = self.computeCookie(addr, ch.random);
         const cookie_ok = ch.cookie.len == cookie_len and

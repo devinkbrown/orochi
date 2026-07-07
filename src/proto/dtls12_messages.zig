@@ -28,11 +28,30 @@ pub const sig_scheme_ecdsa_secp256r1_sha256: u16 = 0x0403;
 /// SEC1 uncompressed P-256 point length (`0x04 || X32 || Y32`).
 pub const p256_point_len: usize = 65;
 
-// Extension type codes (RFC 8422 / RFC 5764).
+// Extension type codes (RFC 8422 / RFC 5764 / RFC 8446).
 pub const ext_supported_groups: u16 = 0x000a;
 pub const ext_ec_point_formats: u16 = 0x000b;
 pub const ext_signature_algorithms: u16 = 0x000d;
 pub const ext_use_srtp: u16 = 0x000e;
+pub const ext_supported_versions: u16 = 0x002b;
+
+/// DTLS version codes as they appear in the supported_versions extension and
+/// legacy record/ClientHello version fields.
+pub const dtls_version_12: u16 = 0xfefd;
+pub const dtls_version_13: u16 = 0xfefc;
+
+/// The negotiated DTLS protocol version — the version-dispatch seam between the
+/// 1.2 engine (this module's family) and a future DTLS 1.3 engine.
+pub const Version = enum { dtls12, dtls13 };
+
+/// Select the DTLS version from a parsed ClientHello, honouring
+/// supported_versions (RFC 8446 §4.2.1) when present and preferring 1.3 only if
+/// `support_13` is set. Returns null when we can serve neither offered version.
+pub fn negotiate(view: ClientHelloView, support_13: bool) ?Version {
+    if (support_13 and view.offers_dtls13) return .dtls13;
+    if (view.offers_dtls12) return .dtls12;
+    return null;
+}
 
 pub const Error = error{
     Truncated,
@@ -135,6 +154,9 @@ pub const ClientHelloParams = struct {
     cookie: []const u8 = &.{},
     /// SRTP protection profiles to advertise in the use_srtp extension.
     srtp_profiles: []const u16,
+    /// Versions to advertise in supported_versions (RFC 8446). Empty omits the
+    /// extension (legacy: version negotiated from the 1.2 record/CH version).
+    supported_versions: []const u16 = &.{},
 };
 
 /// Build a ClientHello body offering the ECDHE-ECDSA-AES128-GCM suite plus the
@@ -160,9 +182,16 @@ pub fn buildClientHello(out: []u8, params: ClientHelloParams) Error![]const u8 {
     try writeEcPointFormats(&ext);
     try writeSignatureAlgorithms(&ext);
     try writeUseSrtp(&ext, params.srtp_profiles);
+    if (params.supported_versions.len != 0) try writeSupportedVersions(&ext, params.supported_versions);
     try w.putU16(@intCast(ext.pos));
     try w.put(ext.bytes());
     return w.bytes();
+}
+
+fn writeSupportedVersions(w: *Writer, versions: []const u16) Error!void {
+    try writeExtensionHeader(w, ext_supported_versions, 1 + versions.len * 2);
+    try w.putU8(@intCast(versions.len * 2)); // 1-byte list length
+    for (versions) |v| try w.putU16(v);
 }
 
 fn writeExtensionHeader(w: *Writer, ext_type: u16, body_len: usize) Error!void {
@@ -202,6 +231,11 @@ pub const ClientHelloView = struct {
     offers_target_cipher: bool,
     /// use_srtp extension body (borrows the input), empty if absent.
     use_srtp_body: []const u8,
+    /// Whether the peer can speak DTLS 1.2 (from supported_versions, or the
+    /// legacy client_version when the extension is absent).
+    offers_dtls12: bool,
+    /// Whether the peer offered DTLS 1.3 in supported_versions.
+    offers_dtls13: bool,
 };
 
 /// Parse a ClientHello body. Fail-closed on any structural violation.
@@ -221,9 +255,16 @@ pub fn parseClientHello(body: []const u8) Error!ClientHelloView {
     _ = try r.readVec8(); // compression_methods
 
     var use_srtp_body: []const u8 = &.{};
+    var offers_12 = version == dtls_version_12; // legacy default
+    var offers_13 = false;
     if (r.remaining() > 0) {
         const exts = try r.readVec16();
         use_srtp_body = try findExtension(exts, ext_use_srtp) orelse &.{};
+        if (try findExtension(exts, ext_supported_versions)) |sv| {
+            const scan = try scanSupportedVersions(sv);
+            offers_12 = scan.has_12;
+            offers_13 = scan.has_13;
+        }
     }
 
     var out: ClientHelloView = .{
@@ -232,9 +273,27 @@ pub fn parseClientHello(body: []const u8) Error!ClientHelloView {
         .cookie = cookie,
         .offers_target_cipher = offers,
         .use_srtp_body = use_srtp_body,
+        .offers_dtls12 = offers_12,
+        .offers_dtls13 = offers_13,
     };
     @memcpy(&out.random, rand[0..32]);
     return out;
+}
+
+/// Scan a ClientHello supported_versions body (1-byte list length + u16 list).
+fn scanSupportedVersions(body: []const u8) Error!struct { has_12: bool, has_13: bool } {
+    var r = Reader{ .buf = body };
+    const list = try r.readVec8();
+    if (list.len % 2 != 0) return error.BadLength;
+    var has_12 = false;
+    var has_13 = false;
+    var i: usize = 0;
+    while (i + 2 <= list.len) : (i += 2) {
+        const v = std.mem.readInt(u16, list[i..][0..2], .big);
+        if (v == dtls_version_12) has_12 = true;
+        if (v == dtls_version_13) has_13 = true;
+    }
+    return .{ .has_12 = has_12, .has_13 = has_13 };
 }
 
 /// Locate the body of extension `ext_type` in an extension list, or null.
@@ -475,6 +534,49 @@ test "ClientHello with empty cookie parses" {
     const body = try buildClientHello(&buf, .{ .random = rnd, .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80} });
     const view = try parseClientHello(body);
     try testing.expectEqual(@as(usize, 0), view.cookie.len);
+    // No supported_versions extension → legacy 1.2 detection from client_version.
+    try testing.expect(view.offers_dtls12);
+    try testing.expect(!view.offers_dtls13);
+}
+
+test "version negotiation seam honours supported_versions and support_13" {
+    const rnd: [32]u8 = @splat(1);
+    var buf: [512]u8 = undefined;
+
+    // Peer offers both 1.3 and 1.2.
+    const both = try buildClientHello(&buf, .{
+        .random = rnd,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+        .supported_versions = &.{ dtls_version_13, dtls_version_12 },
+    });
+    const v_both = try parseClientHello(both);
+    try testing.expect(v_both.offers_dtls12 and v_both.offers_dtls13);
+    // With 1.3 support we pick 1.3; without, we fall back to 1.2.
+    try testing.expectEqual(@as(?Version, .dtls13), negotiate(v_both, true));
+    try testing.expectEqual(@as(?Version, .dtls12), negotiate(v_both, false));
+
+    // Peer offers ONLY 1.2 in supported_versions.
+    var buf2: [512]u8 = undefined;
+    const only12 = try buildClientHello(&buf2, .{
+        .random = rnd,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+        .supported_versions = &.{dtls_version_12},
+    });
+    const v12 = try parseClientHello(only12);
+    try testing.expect(v12.offers_dtls12 and !v12.offers_dtls13);
+    try testing.expectEqual(@as(?Version, .dtls12), negotiate(v12, true));
+
+    // Peer offers ONLY 1.3 but we lack 1.3 support → cannot serve.
+    var buf3: [512]u8 = undefined;
+    const only13 = try buildClientHello(&buf3, .{
+        .random = rnd,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+        .supported_versions = &.{dtls_version_13},
+    });
+    const v13 = try parseClientHello(only13);
+    try testing.expect(v13.offers_dtls13 and !v13.offers_dtls12);
+    try testing.expectEqual(@as(?Version, null), negotiate(v13, false));
+    try testing.expectEqual(@as(?Version, .dtls13), negotiate(v13, true));
 }
 
 test "ServerHello round-trips the chosen cipher and profile" {
