@@ -21,6 +21,7 @@ const media_bridge = @import("media_bridge.zig");
 const dtls_server = @import("../proto/dtls12_server.zig");
 const dtls13_server = @import("../proto/dtls13_server.zig");
 const platform = @import("../substrate/platform.zig");
+const sfu_srtp = @import("sfu_srtp.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -122,6 +123,12 @@ pub const MediaPlane = struct {
     dtls13: ?*dtls13_server.Terminator = null,
     /// Backing session table for `dtls13` (owned; freed alongside it).
     dtls13_sessions: []dtls13_server.Session = &.{},
+    /// Per-peer SRTP/SRTCP crypto contexts for the DTLS-SRTP SFU leg. Built
+    /// lazily from the terminator's exported keys, keyed by transport address.
+    /// Pump-thread-owned (the sole thread that drives DTLS + relays media); never
+    /// touched from another thread, so no synchronisation is needed. Set in
+    /// `init` (its peer table is allocated lazily on the first established peer).
+    srtp_hub: sfu_srtp.SfuSrtp,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -130,6 +137,7 @@ pub const MediaPlane = struct {
             .allocator = allocator,
             .transport = MediaTransport.init(allocator),
             .csprng = std.Random.DefaultCsprng.init(seed),
+            .srtp_hub = sfu_srtp.SfuSrtp.init(allocator),
         };
     }
 
@@ -239,6 +247,7 @@ pub const MediaPlane = struct {
     /// Tear down the DTLS terminators (secure-zeroing key material) and free them.
     fn stopDtls(self: *MediaPlane) void {
         self.dtls_fingerprint_len = 0;
+        self.srtp_hub.wipe(); // secure-zero any cached per-peer SRTP session keys
         self.stopDtls13(); // LIFO: 1.3 was stood up after 1.2
         if (self.dtls) |term| {
             term.deinit();
@@ -294,14 +303,11 @@ pub const MediaPlane = struct {
                 if (got.data.len < rtp_profile.header_len or (got.data[0] & 0xC0) != 0x80) continue;
                 const b1 = got.data[1];
                 if (isRtcp(b1)) {
-                    // Terminate Generic NACK (RTPFB PT=205, FMT=1) locally from the
-                    // retransmit cache; other RTCP is relayed like media.
-                    if (b1 == 205 and (got.data[0] & 0x1f) == 1 and got.data.len >= 12) {
-                        const media_ssrc = std.mem.readInt(u32, got.data[8..12], .big);
-                        self.handleNack(sock, got.from, media_ssrc, got.data[12..]);
-                        continue;
-                    }
-                    self.relay(sock, got.from, got.data, 0, null, false);
+                    // RTCP: decrypt from a DTLS peer FIRST, then terminate a NACK
+                    // or relay. The Generic-NACK media SSRC + FCI live past the
+                    // clear SRTCP header (byte 8+), so they are ciphertext until
+                    // decrypted — reading them raw only works for a plaintext peer.
+                    self.handleRtcp(sock, got.from, got.data);
                 } else {
                     var ssrc: u32 = 0;
                     var seq: ?u16 = null;
@@ -309,7 +315,7 @@ pub const MediaPlane = struct {
                         ssrc = dh.header.ssrc;
                         seq = dh.header.sequence;
                     } else |_| {}
-                    self.relay(&sock.*, got.from, got.data, ssrc, seq, true);
+                    self.relay(&sock.*, got.from, got.data, ssrc, seq);
                 }
             }
         }
@@ -348,30 +354,151 @@ pub const MediaPlane = struct {
         return out[0..n];
     }
 
-    /// Selectively forward `packet` (from `source`) to the other call
-    /// participants; meter + (for RTP, `seq` non-null) cache it for NACK.
-    fn relay(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16, bridge_media: bool) void {
+    /// A transport address's DTLS-SRTP status for the SFU crypto path.
+    const DtlsState = enum {
+        /// Not a DTLS-SRTP peer (DTLS off, or not an established DTLS session):
+        /// the group-key/native plaintext path applies (byte-identical off).
+        not_dtls,
+        /// An established DTLS-SRTP peer with a live crypto context.
+        ready,
+        /// A DTLS-SRTP peer whose context could not be installed (table full):
+        /// its media must be DROPPED, never forwarded in the clear.
+        unavailable,
+    };
+
+    /// Resolve `addr`'s DTLS-SRTP crypto status, reconciling the hub against the
+    /// terminator each call (pump-thread-only): a departed/rekeyed session is
+    /// evicted, a live one is (re)installed. Always re-reading the terminator is
+    /// what re-keys a re-handshake at the same address and keeps a stale key from
+    /// silently blackholing a peer.
+    fn dtlsState(self: *MediaPlane, addr: TransportAddress) DtlsState {
+        if (!self.dtls_enabled) return .not_dtls;
+        const term = self.dtls orelse return .not_dtls;
+        const keys = term.exportedKeys(addr) orelse {
+            // Session gone (or handshake not complete) ⇒ drop any stale context.
+            self.srtp_hub.evict(addr);
+            return .not_dtls;
+        };
+        if (self.srtp_hub.noteEstablished(addr, keys)) return .ready;
+        // Table full: reclaim slots held by peers whose DTLS session is gone
+        // (departed via MEDIA LEAVE/disconnect — `remove` cannot touch the
+        // pump-owned hub), then retry. Because the hub is sized to the
+        // terminator's session cap, a genuinely new peer always frees a slot.
+        self.reconcileHub(term);
+        return if (self.srtp_hub.noteEstablished(addr, keys)) .ready else .unavailable;
+    }
+
+    /// Evict any hub peer whose DTLS session no longer exists in the terminator
+    /// (secure-zeroing its keys). Pump-thread-only; bounded by the hub size.
+    fn reconcileHub(self: *MediaPlane, term: *dtls_server.Terminator) void {
+        var addrs: [sfu_srtp.max_peers]TransportAddress = undefined;
+        const n = self.srtp_hub.activePeerAddrs(&addrs);
+        for (addrs[0..n]) |a| {
+            if (term.exportedKeys(a) == null) self.srtp_hub.evict(a);
+        }
+    }
+
+    /// Selectively forward an RTP `packet` (from `source`) to the other call
+    /// participants; meter + cache it for NACK; bridge to native members.
+    ///
+    /// DTLS-SRTP is layered on top: a packet from a DTLS peer is decrypted once
+    /// under that peer's inbound key (auth-fail/replay ⇒ dropped, never
+    /// forwarded), and the plaintext "canonical" packet is what feeds the forward
+    /// decision, the NACK cache, the native bridge, and each group-key recipient.
+    /// A recipient that is itself a DTLS peer gets the canonical packet
+    /// re-encrypted under its OWN outbound key. When DTLS-SRTP is off (or no
+    /// address on the call is a DTLS peer) the canonical packet IS the input, so
+    /// this path is byte-identical to the pre-DTLS relay.
+    fn relay(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16) void {
+        var plain_buf: [media_socket.max_datagram]u8 = undefined;
+        var canonical: []const u8 = packet;
+        switch (self.dtlsState(source)) {
+            .not_dtls => {}, // plaintext source: canonical IS the input packet
+            .unavailable => return, // DTLS source with no context ⇒ drop (fail-closed)
+            // Inbound is SRTP under the source's key (the hub reads ssrc/seq from
+            // the packet's own header). Drop on auth/replay/ownership failure.
+            .ready => canonical = self.srtp_hub.unprotectRtp(source, packet, &plain_buf) orelse return,
+        }
+
         var targets: [media_transport.max_forward]TransportAddress = undefined;
         var chanbuf: [256]u8 = undefined;
         var chanlen: usize = 0;
         lockSpin(&self.mutex);
-        const n = self.transport.forwardFromSource(source, packet, ssrc, seq, &targets);
-        if (bridge_media) {
-            // Copy the source's channel out under the lock so the cross-leg sink
-            // can use it after we unlock (the composite key may be freed).
-            if (self.transport.channelForSource(source)) |chan| {
-                if (chan.len <= chanbuf.len) {
-                    @memcpy(chanbuf[0..chan.len], chan);
-                    chanlen = chan.len;
-                }
+        const n = self.transport.forwardFromSource(source, canonical, ssrc, seq, &targets);
+        // Copy the source's channel out under the lock so the cross-leg sink can
+        // use it after we unlock (the composite key may be freed).
+        if (self.transport.channelForSource(source)) |chan| {
+            if (chan.len <= chanbuf.len) {
+                @memcpy(chanbuf[0..chan.len], chan);
+                chanlen = chan.len;
             }
         }
         self.mutex.unlock();
-        for (targets[0..n]) |dst| sock.sendTo(dst, packet);
 
-        // Bridge the same RTP frame to any native members of this channel.
-        if (bridge_media and chanlen != 0) {
-            if (self.cross) |sink| sink.onRtpFrame(chanbuf[0..chanlen], packet, false);
+        var enc_buf: [media_socket.max_datagram + sfu_srtp.rtp_overhead]u8 = undefined;
+        for (targets[0..n]) |dst| {
+            switch (self.dtlsState(dst)) {
+                .not_dtls => sock.sendTo(dst, canonical), // group-key/plaintext leg
+                .unavailable => {}, // DTLS peer with no context ⇒ skip (never send it plaintext)
+                // DTLS recipient: re-encrypt under ITS OWN outbound key. The
+                // per-recipient replay window (keyed by the packet's own SSRC)
+                // makes a nonce repeat impossible.
+                .ready => if (self.srtp_hub.protectRtp(dst, canonical, &enc_buf)) |wire| {
+                    sock.sendTo(dst, wire);
+                },
+            }
+        }
+
+        // Bridge the same (plaintext) RTP frame to any native members.
+        if (chanlen != 0) {
+            if (self.cross) |sink| sink.onRtpFrame(chanbuf[0..chanlen], canonical, false);
+        }
+    }
+
+    /// Handle one inbound RTCP `packet` (from `source`): decrypt it if the source
+    /// is a DTLS-SRTP peer (drop on auth failure), then either terminate a
+    /// Generic NACK locally from the retransmit cache or relay it to the other
+    /// participants. Decrypting FIRST is what makes NACK work for DTLS peers (the
+    /// media SSRC + FCI are SRTCP-encrypted on the wire).
+    fn handleRtcp(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8) void {
+        var plain_buf: [media_socket.max_datagram]u8 = undefined;
+        var canonical: []const u8 = packet;
+        switch (self.dtlsState(source)) {
+            .not_dtls => {},
+            .unavailable => return, // DTLS source with no context ⇒ drop
+            .ready => canonical = self.srtp_hub.unprotectRtcp(source, packet, &plain_buf) orelse return,
+        }
+
+        // Terminate a Generic NACK (RTPFB PT=205, FMT=1) from the retransmit
+        // cache using the DECRYPTED media SSRC + FCI. Not relayed onward.
+        if (canonical.len >= 12 and (canonical[0] & 0xC0) == 0x80 and
+            canonical[1] == 205 and (canonical[0] & 0x1f) == 1)
+        {
+            const media_ssrc = std.mem.readInt(u32, canonical[8..12], .big);
+            self.handleNack(sock, source, media_ssrc, canonical[12..]);
+            return;
+        }
+        self.forwardRtcp(sock, source, canonical);
+    }
+
+    /// Relay an already-decrypted (canonical) RTCP `packet` to the other call
+    /// participants: re-encrypt per DTLS recipient (SRTCP), plain-forward to
+    /// group-key peers. Not cached for NACK nor bridged to native.
+    fn forwardRtcp(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, canonical: []const u8) void {
+        var targets: [media_transport.max_forward]TransportAddress = undefined;
+        lockSpin(&self.mutex);
+        const n = self.transport.forwardFromSource(source, canonical, 0, null, &targets);
+        self.mutex.unlock();
+
+        var enc_buf: [media_socket.max_datagram + sfu_srtp.rtcp_overhead]u8 = undefined;
+        for (targets[0..n]) |dst| {
+            switch (self.dtlsState(dst)) {
+                .not_dtls => sock.sendTo(dst, canonical),
+                .unavailable => {}, // skip: never send a DTLS peer plaintext RTCP
+                .ready => if (self.srtp_hub.protectRtcp(dst, canonical, &enc_buf)) |wire| {
+                    sock.sendTo(dst, wire);
+                },
+            }
         }
     }
 
@@ -381,11 +508,38 @@ pub const MediaPlane = struct {
         const missing = rtp_nack.parseNackFci(self.allocator, fci) catch return;
         defer self.allocator.free(missing);
         var scratch: [media_socket.max_datagram]u8 = undefined;
+        var enc_buf: [media_socket.max_datagram + sfu_srtp.rtp_overhead]u8 = undefined;
+        // The retransmit cache holds the canonical (plaintext, for a DTLS source)
+        // packet. The requester's leg decides the on-wire form: a group-key peer
+        // gets the cached bytes verbatim (byte-identical when DTLS-SRTP is off); a
+        // DTLS peer gets it re-protected under ITS OWN outbound key.
+        //
+        // DTLS caveat (by design): `protectRtp`'s per-recipient replay window
+        // refuses to re-encrypt an index it already sent to this recipient — so a
+        // retransmit of a packet the recipient RECEIVED-then-lost is fail-closed
+        // (returns null, nothing sent), since re-using an SRTP nonce is forbidden.
+        // A packet never forwarded to the recipient (e.g. a mid-join gap) still
+        // retransmits. Loss-recovery for already-sent DTLS packets needs RFC 4588
+        // RTX (a distinct retransmission SSRC) — deferred to a later increment.
+        const req_state = self.dtlsState(requester);
+        if (req_state == .unavailable) return; // DTLS peer with no context ⇒ nothing to send
         for (missing) |seq| {
             lockSpin(&self.mutex);
             const got = self.transport.copyRetransmit(media_ssrc, seq, &scratch);
             self.mutex.unlock();
-            if (got) |len| sock.sendTo(requester, scratch[0..len]);
+            if (got) |len| {
+                const canonical = scratch[0..len];
+                switch (req_state) {
+                    // Re-protect under the requester's own key. The hub derives
+                    // the SRTP nonce from `canonical`'s header, and copyRetransmit
+                    // guarantees that header carries `media_ssrc` — so the replay
+                    // window and the nonce can never diverge on the NACK path.
+                    .ready => if (self.srtp_hub.protectRtp(requester, canonical, &enc_buf)) |wire| {
+                        sock.sendTo(requester, wire);
+                    },
+                    else => sock.sendTo(requester, canonical),
+                }
+            }
         }
     }
 
@@ -467,6 +621,7 @@ const dtls_handshake = @import("../proto/dtls_handshake.zig");
 const dtls_srtp = @import("../proto/dtls_srtp.zig");
 const dtls13_messages = @import("../proto/dtls13_messages.zig");
 const dtls_kx = @import("../proto/dtls_keyexchange.zig");
+const srtp = @import("../proto/srtp.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);
@@ -602,4 +757,163 @@ test "MediaPlane: version seam routes a DTLS 1.3 ClientHello to the 1.3 engine (
     const shv = try dtls13_messages.parseServerHello13(rdec.fragment[dtls_handshake.handshake_header_len..][0..hh.hdr.length]);
     try testing.expect(shv.isHelloRetryRequest());
     try testing.expectEqual(@as(usize, dtls13_server.cookie_len), shv.cookie.len);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: two DTLS-SRTP peers handshake through the LIVE pump, then a
+// forwarded SRTP frame from A is decrypted under A's key, re-encrypted under
+// B's OWN key, and recovered by B — proving the decrypt -> forward -> per-peer
+// re-encrypt path over real UDP.
+// ---------------------------------------------------------------------------
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Complete a short-term-credential STUN binding so the SFU learns the peer's
+/// media address (required before it will forward the peer's RTP).
+fn stunBindPeer(client: *MediaSocket, server_addr: TransportAddress, creds: Creds) !void {
+    var user_buf: [media_transport.ufrag_len + 6]u8 = undefined;
+    const user = try std.fmt.bufPrint(&user_buf, "{s}:peer", .{creds.ufragSlice()});
+    const tx: stun.TransactionId = .{ 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24 };
+    const req = try stun.buildBindingRequest(testing.allocator, tx, .{
+        .username = user,
+        .integrity_key = creds.pwdSlice(),
+        .fingerprint = true,
+    });
+    defer testing.allocator.free(req);
+    client.sendTo(server_addr, req);
+    var buf: [media_socket.max_datagram]u8 = undefined;
+    const got = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    var decoded = try stun.decode(testing.allocator, got.data);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(stun.MessageType.binding_success_response, decoded.typ);
+}
+
+/// Drive a DTLS 1.2 client handshake to completion against the live pump and
+/// return the exported SRTP keying material for the leg.
+fn dtlsHandshakeClient(client: *MediaSocket, server_addr: TransportAddress, seed: u8, client_random: [32]u8) !dtls_srtp.ExportedKeys {
+    const ecdhe_seed: [32]u8 = @splat(seed);
+    const ecdhe = dtls_kx.generateKeyPair(ecdhe_seed);
+    var out: [2048]u8 = undefined;
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+
+    // 1) ClientHello (no cookie) -> HelloVerifyRequest(cookie).
+    var ch1_body: [512]u8 = undefined;
+    const ch1b = try dtls_messages.buildClientHello(&ch1_body, .{ .random = client_random, .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80} });
+    const ch1_len = try dtls_server.framePlaintextHandshake(&out, .client_hello, 0, 0, 0, ch1b);
+    client.sendTo(server_addr, out[0..ch1_len]);
+    var cookie: [64]u8 = undefined;
+    var cookie_len: usize = 0;
+    {
+        const got = client.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+        const rdec = try dtls_record.RecordHeader.decode(got.data);
+        const hh = try dtls_handshake.Header.decode(rdec.fragment);
+        if (hh.hdr.msg_type != .hello_verify_request) return error.TestUnexpectedResult;
+        const c = try dtls_handshake.parseHelloVerifyRequest(rdec.fragment[dtls_handshake.handshake_header_len..][0..hh.hdr.length]);
+        @memcpy(cookie[0..c.len], c);
+        cookie_len = c.len;
+    }
+
+    // 2) ClientHello (cookie) -> flight 4. Begin the client transcript with CH2.
+    var transcript = Sha256.init(.{});
+    var ch2_body: [600]u8 = undefined;
+    const ch2b = try dtls_messages.buildClientHello(&ch2_body, .{ .random = client_random, .cookie = cookie[0..cookie_len], .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80} });
+    dtls_server.feedTranscript(&transcript, .client_hello, 1, ch2b);
+    const ch2_len = try dtls_server.framePlaintextHandshake(&out, .client_hello, 1, 0, 1, ch2b);
+    client.sendTo(server_addr, out[0..ch2_len]);
+
+    var server_random: [32]u8 = @splat(0);
+    var server_point: [dtls_messages.p256_point_len]u8 = @splat(0);
+    {
+        const got = client.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+        var off: usize = 0;
+        while (off < got.data.len) {
+            const rdec = try dtls_record.RecordHeader.decode(got.data[off..]);
+            off += rdec.consumed;
+            const hh = try dtls_handshake.Header.decode(rdec.fragment);
+            const mbody = rdec.fragment[dtls_handshake.handshake_header_len..][0..hh.hdr.length];
+            switch (hh.hdr.msg_type) {
+                .server_hello => {
+                    const sh = try dtls_messages.parseServerHello(mbody);
+                    server_random = sh.random;
+                },
+                .server_key_exchange => {
+                    const ske = try dtls_messages.parseServerKeyExchange(mbody);
+                    server_point = ske.point;
+                },
+                else => {},
+            }
+            dtls_server.feedTranscript(&transcript, hh.hdr.msg_type, hh.hdr.message_seq, mbody);
+        }
+    }
+
+    // 3) Derive the shared secret, master secret, and key block.
+    const pre_master = try dtls_kx.computeSharedSecret(ecdhe.secret, server_point);
+    const master_secret = dtls_kx.masterSecret(&pre_master, client_random, server_random);
+    const key_block = dtls_messages.deriveKeyBlock(&master_secret, client_random, server_random);
+
+    // 4) flight 5: ClientKeyExchange + ChangeCipherSpec + Finished (all in one).
+    var flight5: [512]u8 = undefined;
+    var f5: usize = 0;
+    var cke_body: [80]u8 = undefined;
+    const cke = try dtls_messages.buildClientKeyExchange(&cke_body, ecdhe.public);
+    dtls_server.feedTranscript(&transcript, .client_key_exchange, 2, cke);
+    f5 += try dtls_server.framePlaintextHandshake(flight5[f5..], .client_key_exchange, 2, 0, 2, cke);
+    f5 += (try dtls_record.writePlaintext(.change_cipher_spec, 0, 3, &.{0x01}, flight5[f5..])).len;
+    const client_hash = transcript.peek();
+    const client_vd = dtls_kx.verifyData(&master_secret, "client finished", client_hash);
+    f5 += try dtls_server.frameEncryptedHandshake(flight5[f5..], key_block.client_write_key, key_block.client_write_iv, 1, 0, .finished, 3, &client_vd);
+    client.sendTo(server_addr, flight5[0..f5]);
+    // Drain flight 6 (server ChangeCipherSpec + Finished): the session is now
+    // established and the SFU can key the leg on the peer's first media packet.
+    _ = client.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+
+    return dtls_srtp.exportSrtpKeys(&master_secret, client_random, server_random);
+}
+
+test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted per peer" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true;
+    try plane.start(loopback_be, 0);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+
+    const credsA = plane.allocate("#call", "alice") orelse return error.TestUnexpectedResult;
+    const credsB = plane.allocate("#call", "bob") orelse return error.TestUnexpectedResult;
+
+    var a = try MediaSocket.bind(loopback_be, 0);
+    defer a.deinit();
+    a.setRecvTimeoutMs(3000);
+    var b = try MediaSocket.bind(loopback_be, 0);
+    defer b.deinit();
+    b.setRecvTimeoutMs(3000);
+
+    var ar: [32]u8 = undefined;
+    for (&ar, 0..) |*x, i| x.* = @intCast((i *% 3) +% 1);
+    var br: [32]u8 = undefined;
+    for (&br, 0..) |*x, i| x.* = @intCast((i *% 5) +% 2);
+
+    // Both peers bind (STUN) and complete a DTLS-SRTP handshake with the SFU.
+    try stunBindPeer(&a, server_addr, credsA);
+    try stunBindPeer(&b, server_addr, credsB);
+    const keysA = try dtlsHandshakeClient(&a, server_addr, 0xA5, ar);
+    const keysB = try dtlsHandshakeClient(&b, server_addr, 0x5A, br);
+    // Distinct handshakes ⇒ distinct SRTP keying material per leg.
+    try testing.expect(!std.mem.eql(u8, &keysA.client, &keysB.server));
+
+    // A publishes an SRTP frame protected with A's client-write context.
+    const a_out = srtp.deriveSessionKeys(keysA.clientMaster(), keysA.clientSalt());
+    const rtp = [_]u8{ 0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0xA1, 0xA1, 0xA1, 0xA1 } ++ "kaguravox-voice".*;
+    var wire_buf: [rtp.len + srtp.auth_tag_len]u8 = undefined;
+    const wireA = try srtp.protect(a_out, 0, &rtp, &wire_buf);
+    a.sendTo(server_addr, wireA);
+
+    // B receives the frame re-encrypted under ITS OWN server-write context.
+    var rcv: [media_socket.max_datagram]u8 = undefined;
+    const got = b.recvFrom(&rcv) orelse return error.TestUnexpectedResult;
+    // Per-recipient key ⇒ the bytes B sees are NOT the bytes A sent.
+    try testing.expect(!std.mem.eql(u8, got.data, wireA));
+    const b_in = srtp.deriveSessionKeys(keysB.serverMaster(), keysB.serverSalt());
+    var plain: [rtp.len]u8 = undefined;
+    const recovered = try srtp.unprotect(b_in, 0, got.data, &plain);
+    try testing.expectEqualSlices(u8, &rtp, recovered);
 }

@@ -319,12 +319,19 @@ pub const MediaTransport = struct {
     }
 
     /// Copy a cached RTP packet (by media SSRC + sequence) into `out` for NACK
-    /// retransmission, returning its length, or null if not retained.
+    /// retransmission, returning its length, or null if not retained. The cached
+    /// packet's own header SSRC MUST equal `media_ssrc`: the retransmit buffer is
+    /// seq-keyed and an endpoint may publish multiple SSRCs (e.g. simulcast
+    /// audio+video sharing the seq space), so returning a different-SSRC packet
+    /// would let a caller re-protect it under a nonce that disagrees with its
+    /// replay-window key. Reject the mismatch rather than emit a wrong packet.
     pub fn copyRetransmit(self: *MediaTransport, media_ssrc: u32, seq: u16, out: []u8) ?usize {
         const key = self.by_ssrc.get(media_ssrc) orelse return null;
         const ep = self.endpoints.getPtr(key) orelse return null;
         const bytes = ep.rtx.lookup(seq) orelse return null;
         if (bytes.len > out.len) return null;
+        if (bytes.len < srtp.rtp_header_len) return null;
+        if (std.mem.readInt(u32, bytes[8..12], .big) != media_ssrc) return null;
         @memcpy(out[0..bytes.len], bytes);
         return bytes.len;
     }
@@ -583,6 +590,33 @@ test "forwardFromSource routes an RTP packet to the other peers" {
     mt.remove("#c", "alice");
     try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, &pkt, 0, null, &out));
     try testing.expect(mt.copyRetransmit(0xAA, 7, &rtx) == null);
+}
+
+test "copyRetransmit rejects a cached packet whose header SSRC differs from the request" {
+    var prng = std.Random.DefaultPrng.init(0x7ac0);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#c", "alice", prng.random());
+    const alice = testAddr(1, 5001);
+    try testing.expect(mt.bindRemote("#c", "alice", alice));
+    _ = try mt.allocate("#c", "bob", prng.random());
+    try testing.expect(mt.bindRemote("#c", "bob", testAddr(2, 5002)));
+
+    // Alice publishes ssrc 0xAA (seq 10) — indexed for NACK — and, on the same
+    // 5-tuple, a second stream ssrc 0xBB (seq 11). The retransmit cache is
+    // seq-keyed, so both land in alice's buffer; only 0xAA is SSRC-indexed.
+    const pkt_aa = [_]u8{ 0x80, 0x60, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0xAA, 1, 2, 3 };
+    const pkt_bb = [_]u8{ 0x80, 0x60, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0xBB, 4, 5, 6 };
+    var out: [8]TransportAddress = undefined;
+    _ = mt.forwardFromSource(alice, &pkt_aa, 0xAA, 10, &out);
+    _ = mt.forwardFromSource(alice, &pkt_bb, 0xBB, 11, &out);
+
+    var rtx: [64]u8 = undefined;
+    // A NACK for 0xAA/10 returns the matching packet.
+    const ok = mt.copyRetransmit(0xAA, 10, &rtx) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &pkt_aa, rtx[0..ok]);
+    // A NACK for 0xAA/11 must NOT return the 0xBB-header packet cached at seq 11.
+    try testing.expect(mt.copyRetransmit(0xAA, 11, &rtx) == null);
 }
 
 test "group key is stable per call and released when it empties" {

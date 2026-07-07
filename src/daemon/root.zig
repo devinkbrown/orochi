@@ -91,6 +91,7 @@ pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
 pub const services = @import("services.zig");
 pub const sessions = @import("sessions.zig");
+pub const sfu_srtp = @import("sfu_srtp.zig");
 pub const shard = @import("shard.zig");
 pub const shun = @import("shun.zig");
 pub const spamtrap = @import("spamtrap.zig");
@@ -223,6 +224,7 @@ test {
     _ = server_stats;
     _ = services;
     _ = sessions;
+    _ = sfu_srtp;
     _ = shard;
     _ = shun;
     _ = spamtrap;
