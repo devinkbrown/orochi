@@ -26,6 +26,7 @@ const transcript_mod = @import("transcript.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
+const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("config_format requires a 64-bit target");
@@ -278,6 +279,9 @@ pub const Config = struct {
         realm: []const u8 = "",
         trust_roots: []const []const u8 = &.{},
         mesh_pass: ?[]const u8 = null,
+        /// Runtime Suimyaku peer-driver limits/timers/capacities projected from
+        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]`.
+        s2s: s2s_peer_mod.Config = .{},
         /// Peers this node dials automatically at boot (and re-dials while the
         /// link is down), each a "host:port" string (IPv6 hosts bracketed,
         /// e.g. "[::1]:6900"). Empty = no auto-connect.
@@ -962,6 +966,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
     if (doc.getBool("mesh.require_secured")) |b| cfg.mesh.require_secured = b;
+    try parseMeshS2sConfig(doc, &cfg.mesh.s2s);
 
     // [dnsbl]
     if (doc.getBool("dnsbl.enabled")) |b| cfg.dnsbl.enabled = b;
@@ -1505,6 +1510,46 @@ fn parseKtlsMode(s: []const u8) ?Config.KtlsMode {
     return null;
 }
 
+fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!void {
+    cfg.routes.max_nicks = @intCast(try uintField(doc, "mesh.routing.max_nicks", cfg.routes.max_nicks, 64, 10_000_000));
+    cfg.routes.max_channels = @intCast(try uintField(doc, "mesh.routing.max_channels", cfg.routes.max_channels, 16, 1_000_000));
+    cfg.routes.max_nodes_per_channel = @intCast(try uintField(doc, "mesh.routing.max_nodes_per_channel", cfg.routes.max_nodes_per_channel, 4, 4096));
+    cfg.routes.max_name_len = @intCast(try uintField(doc, "mesh.routing.max_name_len", cfg.routes.max_name_len, 16, 256));
+    cfg.registry.max_nodes = @intCast(try uintField(doc, "mesh.routing.max_servers", cfg.registry.max_nodes, 8, 65536));
+    cfg.registry.max_name_len = @intCast(try uintField(doc, "mesh.routing.max_server_name_len", cfg.registry.max_name_len, 16, 255));
+    cfg.registry.max_description_len = @intCast(try uintField(doc, "mesh.routing.max_server_desc_len", cfg.registry.max_description_len, 32, 1024));
+
+    cfg.link.gossip_config.fanout = @intCast(try uintField(doc, "mesh.gossip.round_fanout", cfg.link.gossip_config.fanout, 1, 64));
+    cfg.link.gossip_config.max_member_deltas = @intCast(try uintField(doc, "mesh.gossip.max_member_deltas", cfg.link.gossip_config.max_member_deltas, 1, 1024));
+    cfg.link.gossip_config.max_suspicions = @intCast(try uintField(doc, "mesh.gossip.max_suspicions", cfg.link.gossip_config.max_suspicions, 1, 1024));
+    cfg.link.view_config.active_capacity = @intCast(try uintField(doc, "mesh.gossip.view_active_capacity", cfg.link.view_config.active_capacity, 2, 64));
+    cfg.link.view_config.passive_capacity = @intCast(try uintField(doc, "mesh.gossip.view_passive_capacity", cfg.link.view_config.passive_capacity, cfg.link.view_config.active_capacity + 1, 4096));
+    cfg.link.view_config.shuffle_active_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_active", cfg.link.view_config.shuffle_active_count, 0, cfg.link.view_config.active_capacity));
+    cfg.link.view_config.shuffle_passive_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_passive", cfg.link.view_config.shuffle_passive_count, 0, cfg.link.view_config.passive_capacity));
+
+    cfg.link.swim_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.swim.sazanami_suspicion_timeout_ms", @as(u64, @intCast(cfg.link.swim_config.suspicion_timeout_ms)), 0, 120_000));
+    cfg.link.swim_config.witness_quorum = @intCast(try uintField(doc, "mesh.swim.sazanami_witness_quorum", cfg.link.swim_config.witness_quorum, 1, 16));
+
+    cfg.link.peer_link_config.send_credit = @intCast(try uintField(doc, "mesh.link.send_credit_bytes", cfg.link.peer_link_config.send_credit, 4096, 16_777_216));
+    cfg.link.peer_link_config.replay_window = try uintField(doc, "mesh.link.replay_window", cfg.link.peer_link_config.replay_window, 8, 4096);
+    cfg.link.peer_link_config.handshake_timeout_ms = try uintField(doc, "mesh.link.handshake_timeout_ms", cfg.link.peer_link_config.handshake_timeout_ms, 1000, 120_000);
+    cfg.link.peer_link_config.heartbeat_interval_ms = try uintField(doc, "mesh.link.heartbeat_interval_ms", cfg.link.peer_link_config.heartbeat_interval_ms, 1000, 120_000);
+    cfg.link.peer_link_config.idle_timeout_ms = try uintField(doc, "mesh.link.idle_timeout_ms", cfg.link.peer_link_config.idle_timeout_ms, 5000, 600_000);
+    cfg.link.peer_link_config.drain_timeout_ms = try uintField(doc, "mesh.link.drain_timeout_ms", cfg.link.peer_link_config.drain_timeout_ms, 500, 60_000);
+    cfg.link.gossip_interval_ms = try uintField(doc, "mesh.link.gossip_interval_ms", cfg.link.gossip_interval_ms, 100, 60_000);
+    cfg.link.repair_interval_ms = try uintField(doc, "mesh.link.repair_interval_ms", cfg.link.repair_interval_ms, 200, 120_000);
+    cfg.link.gossip_config.fanout = @intCast(try uintField(doc, "mesh.link.gossip_fanout", cfg.link.gossip_config.fanout, 1, 64));
+    cfg.link.view_config.active_capacity = @intCast(try uintField(doc, "mesh.link.view_active_capacity", cfg.link.view_config.active_capacity, 2, 64));
+    cfg.link.view_config.passive_capacity = @intCast(try uintField(doc, "mesh.link.view_passive_capacity", cfg.link.view_config.passive_capacity, cfg.link.view_config.active_capacity + 1, 4096));
+    cfg.link.burst_limits.max_burst_bytes = @intCast(try uintField(doc, "mesh.link.burst_max_bytes", cfg.link.burst_limits.max_burst_bytes, 4096, 16_777_216));
+    cfg.link.burst_limits.max_records = @intCast(try uintField(doc, "mesh.link.burst_max_records", cfg.link.burst_limits.max_records, 16, 65536));
+
+    if (cfg.link.view_config.passive_capacity <= cfg.link.view_config.active_capacity) return error.ParseError;
+    if (cfg.link.view_config.shuffle_active_count + cfg.link.view_config.shuffle_passive_count == 0) return error.ParseError;
+    if (cfg.link.view_config.shuffle_active_count > cfg.link.view_config.active_capacity) return error.ParseError;
+    if (cfg.link.view_config.shuffle_passive_count > cfg.link.view_config.passive_capacity) return error.ParseError;
+}
+
 fn uintField(doc: toml.Document, path: []const u8, current: u64, min: u64, max: u64) TomlError!u64 {
     const v = doc.getInt(path) orelse return current;
     if (v < 0) return error.ParseError;
@@ -2000,6 +2045,109 @@ test "parseToml: [mesh].require_secured projects onto Config and defaults false"
         defer cfg.deinit(allocator);
         try testing.expect(!cfg.mesh.require_secured);
     }
+}
+
+test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh.routing]
+        \\max_nicks = 8192
+        \\max_channels = 2048
+        \\max_nodes_per_channel = 128
+        \\max_name_len = 80
+        \\max_servers = 1024
+        \\max_server_name_len = 90
+        \\max_server_desc_len = 512
+        \\[mesh.gossip]
+        \\round_fanout = 5
+        \\max_member_deltas = 128
+        \\max_suspicions = 96
+        \\view_active_capacity = 10
+        \\view_passive_capacity = 80
+        \\view_shuffle_active = 3
+        \\view_shuffle_passive = 6
+        \\[mesh.swim]
+        \\sazanami_suspicion_timeout_ms = 9000
+        \\sazanami_witness_quorum = 4
+        \\[mesh.link]
+        \\send_credit_bytes = 131072
+        \\replay_window = 128
+        \\handshake_timeout_ms = 11000
+        \\heartbeat_interval_ms = 16000
+        \\idle_timeout_ms = 60000
+        \\drain_timeout_ms = 6000
+        \\gossip_interval_ms = 1500
+        \\repair_interval_ms = 3000
+        \\gossip_fanout = 2
+        \\view_active_capacity = 4
+        \\view_passive_capacity = 12
+        \\burst_max_bytes = 262144
+        \\burst_max_records = 1024
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 8192), cfg.mesh.s2s.routes.max_nicks);
+    try testing.expectEqual(@as(usize, 2048), cfg.mesh.s2s.routes.max_channels);
+    try testing.expectEqual(@as(usize, 128), cfg.mesh.s2s.routes.max_nodes_per_channel);
+    try testing.expectEqual(@as(usize, 80), cfg.mesh.s2s.routes.max_name_len);
+    try testing.expectEqual(@as(usize, 1024), cfg.mesh.s2s.registry.max_nodes);
+    try testing.expectEqual(@as(usize, 90), cfg.mesh.s2s.registry.max_name_len);
+    try testing.expectEqual(@as(usize, 512), cfg.mesh.s2s.registry.max_description_len);
+    try testing.expectEqual(@as(u32, 131072), cfg.mesh.s2s.link.peer_link_config.send_credit);
+    try testing.expectEqual(@as(u64, 128), cfg.mesh.s2s.link.peer_link_config.replay_window);
+    try testing.expectEqual(@as(u64, 11000), cfg.mesh.s2s.link.peer_link_config.handshake_timeout_ms);
+    try testing.expectEqual(@as(u64, 16000), cfg.mesh.s2s.link.peer_link_config.heartbeat_interval_ms);
+    try testing.expectEqual(@as(u64, 60000), cfg.mesh.s2s.link.peer_link_config.idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 6000), cfg.mesh.s2s.link.peer_link_config.drain_timeout_ms);
+    try testing.expectEqual(@as(u64, 1500), cfg.mesh.s2s.link.gossip_interval_ms);
+    try testing.expectEqual(@as(u64, 3000), cfg.mesh.s2s.link.repair_interval_ms);
+    try testing.expectEqual(@as(usize, 2), cfg.mesh.s2s.link.gossip_config.fanout);
+    try testing.expectEqual(@as(usize, 128), cfg.mesh.s2s.link.gossip_config.max_member_deltas);
+    try testing.expectEqual(@as(usize, 96), cfg.mesh.s2s.link.gossip_config.max_suspicions);
+    try testing.expectEqual(@as(usize, 4), cfg.mesh.s2s.link.view_config.active_capacity);
+    try testing.expectEqual(@as(usize, 12), cfg.mesh.s2s.link.view_config.passive_capacity);
+    try testing.expectEqual(@as(usize, 3), cfg.mesh.s2s.link.view_config.shuffle_active_count);
+    try testing.expectEqual(@as(usize, 6), cfg.mesh.s2s.link.view_config.shuffle_passive_count);
+    try testing.expectEqual(@as(i64, 9000), cfg.mesh.s2s.link.swim_config.suspicion_timeout_ms);
+    try testing.expectEqual(@as(u8, 4), cfg.mesh.s2s.link.swim_config.witness_quorum);
+    try testing.expectEqual(@as(usize, 262144), cfg.mesh.s2s.link.burst_limits.max_burst_bytes);
+    try testing.expectEqual(@as(usize, 1024), cfg.mesh.s2s.link.burst_limits.max_records);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh.link]
+        \\send_credit_bytes = 4095
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh.routing]
+        \\max_servers = 7
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh.gossip]
+        \\view_shuffle_active = 5
+        \\[mesh.link]
+        \\view_active_capacity = 4
+        \\
+    , .{}));
 }
 
 test "parseToml: env: indirection resolves through the Resolver" {

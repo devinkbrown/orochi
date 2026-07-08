@@ -243,6 +243,59 @@ realm = "local"
 # than falling back to clear. Default false keeps the plaintext fallback.
 # require_secured = true
 
+# Runtime Suimyaku routing/registry capacities used by plaintext S2S and by the
+# inner CRDT stream of secured S2S.
+[mesh.routing]
+# Max tracked remote nicknames in one peer route table.
+max_nicks = 4096
+# Max tracked remote channels in one peer route table.
+max_channels = 1024
+# Max member nodes recorded for one remote channel.
+max_nodes_per_channel = 64
+# Max nick/channel name bytes accepted by the route table.
+max_name_len = 64
+# Max servers tracked in the peer server registry.
+max_servers = 512
+# Max server-name bytes accepted by the registry.
+max_server_name_len = 63
+# Max server-description bytes accepted by the registry.
+max_server_desc_len = 255
+
+[mesh.gossip]
+# S2S gossip fanout and payload bounds.
+round_fanout = 3
+max_member_deltas = 64
+max_suspicions = 64
+# Bounded membership-view capacities used by the S2S gossip round.
+view_active_capacity = 8
+view_passive_capacity = 64
+view_shuffle_active = 2
+view_shuffle_passive = 4
+
+[mesh.swim]
+# Sazanami gossip-side suspect reaping. The standalone swim.zig probe driver is
+# not on the daemon S2S path; these are the live failure-detector knobs.
+sazanami_suspicion_timeout_ms = 3000
+sazanami_witness_quorum = 2
+
+[mesh.link]
+# Peer-link transport timers/credit plus S2S session cadence.
+send_credit_bytes = 65536
+replay_window = 64
+handshake_timeout_ms = 10000
+heartbeat_interval_ms = 15000
+idle_timeout_ms = 45000
+drain_timeout_ms = 5000
+gossip_interval_ms = 1000
+repair_interval_ms = 2000
+# Per-link overrides applied after [mesh.gossip] defaults.
+gossip_fanout = 1
+view_active_capacity = 4
+view_passive_capacity = 8
+# Full-state CRDT burst bounds.
+burst_max_bytes = 65536
+burst_max_records = 512
+
 
 # --- [dnsbl] — connect-time DNS blocklist ------------------------------------
 # Each non-loopback client IP is checked against the listed DNSBL zones off the

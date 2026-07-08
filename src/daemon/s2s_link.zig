@@ -36,6 +36,7 @@ const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 pub const NodeId = s2s_peer.NodeId;
 pub const ChannelCrdt = s2s_peer.ChannelCrdt;
 pub const ChannelModeStateEvent = s2s_peer.ChannelModeStateEvent;
+pub const PeerConfig = s2s_peer.Config;
 
 /// Caller-supplied identity/config for one S2S link. The sovereign node_id is the
 /// single mesh identity (no legacy server-id): it keys the registry and is the
@@ -48,6 +49,8 @@ pub const Options = struct {
     server_name: []const u8,
     description: []const u8 = "",
     channel_name: []const u8 = "#suimyaku",
+    /// Suimyaku peer-driver limits/timers/capacities from daemon config.
+    config: s2s_peer.Config = .{},
     now_ms: u64 = 0,
     /// Optional node Ed25519 signing keypair for end-to-end origin
     /// authentication of direct-owned state frames (secured links pass the node
@@ -110,6 +113,8 @@ pub const S2sLink = struct {
             .server_name = opts.server_name,
             .description = opts.description,
             .channel_name = opts.channel_name,
+            .initial_send_credit = opts.config.link.peer_link_config.send_credit,
+            .config = opts.config,
             .signing_key = opts.signing_key,
         });
     }
@@ -203,6 +208,8 @@ pub const S2sLink = struct {
             .server_name = opts.server_name,
             .description = opts.description,
             .channel_name = opts.channel_name,
+            .initial_send_credit = opts.config.link.peer_link_config.send_credit,
+            .config = opts.config,
             .signing_key = opts.signing_key,
         }, hdr, remote_name, opts.now_ms, rng_seed);
     }
@@ -1252,4 +1259,47 @@ test "consumeOutbound drops a partial-send prefix" {
     try std.testing.expectEqual(total - 1, link.outbound().len);
     link.clearOutbound();
     try std.testing.expectEqual(@as(usize, 0), link.outbound().len);
+}
+
+test "S2sLink.init threads peer driver config into live link state" {
+    const allocator = std.testing.allocator;
+    var cfg = PeerConfig{};
+    cfg.routes.max_nicks = 128;
+    cfg.registry.max_nodes = 32;
+    cfg.link.peer_link_config.send_credit = 8192;
+    cfg.link.peer_link_config.replay_window = 128;
+    cfg.link.peer_link_config.handshake_timeout_ms = 7000;
+    cfg.link.peer_link_config.heartbeat_interval_ms = 8000;
+    cfg.link.peer_link_config.idle_timeout_ms = 9000;
+    cfg.link.peer_link_config.drain_timeout_ms = 1000;
+    cfg.link.gossip_interval_ms = 1500;
+    cfg.link.repair_interval_ms = 2500;
+    cfg.link.gossip_config.fanout = 2;
+    cfg.link.view_config.active_capacity = 4;
+    cfg.link.view_config.passive_capacity = 12;
+
+    var link: S2sLink = undefined;
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "a.orochi",
+        .config = cfg,
+    });
+    defer link.deinit();
+
+    try std.testing.expectEqual(@as(usize, 128), link.peer.config.routes.max_nicks);
+    try std.testing.expectEqual(@as(usize, 32), link.peer.config.registry.max_nodes);
+    try std.testing.expectEqual(@as(u32, 8192), link.peer.session.link.send_credit);
+    try std.testing.expectEqual(@as(u64, 128), link.peer.session.link.replay_window);
+    try std.testing.expectEqual(@as(u64, 7000), link.peer.session.link.handshake_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 8000), link.peer.session.link.heartbeat_interval_ms);
+    try std.testing.expectEqual(@as(u64, 9000), link.peer.session.link.idle_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 1000), link.peer.session.link.drain_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 1500), link.peer.session.config.gossip_interval_ms);
+    try std.testing.expectEqual(@as(u64, 2500), link.peer.session.config.repair_interval_ms);
+    try std.testing.expectEqual(@as(usize, 2), link.peer.session.config.gossip_config.fanout);
+    try std.testing.expectEqual(@as(usize, 4), link.peer.session.config.view_config.active_capacity);
+    try std.testing.expectEqual(@as(usize, 12), link.peer.session.config.view_config.passive_capacity);
 }

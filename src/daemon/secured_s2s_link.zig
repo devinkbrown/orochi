@@ -91,6 +91,8 @@ pub const Options = struct {
     description: []const u8 = "",
     local_epoch_ms: u64 = 1000,
     channel_name: []const u8 = "#suimyaku",
+    /// Config for the inner Suimyaku CRDT link created after the AKE.
+    inner_config: s2s_link.PeerConfig = .{},
     /// Optional trust pin: require the peer's node id to equal this. Null = TOFU.
     expected_remote: ?[20]u8 = null,
     /// Optional trust pins: require the peer's node id to match one entry. Empty
@@ -117,6 +119,7 @@ pub const SecuredLink = struct {
     description: []const u8,
     local_epoch_ms: u64,
     channel_name: []const u8,
+    inner_config: s2s_link.PeerConfig,
 
     phase: Phase,
     session: ?tsumugi_session.Session = null,
@@ -170,6 +173,7 @@ pub const SecuredLink = struct {
             .description = opts.description,
             .local_epoch_ms = opts.local_epoch_ms,
             .channel_name = opts.channel_name,
+            .inner_config = opts.inner_config,
             .phase = if (opts.role == .responder) .ake else .await_prekey,
         };
         if (opts.role == .responder) {
@@ -236,6 +240,7 @@ pub const SecuredLink = struct {
             .description = opts.description,
             .local_epoch_ms = opts.local_epoch_ms,
             .channel_name = opts.channel_name,
+            .inner_config = opts.inner_config,
             .phase = .established,
             .resumed_established = rs.established,
             .send_counter = rs.send_counter,
@@ -258,6 +263,7 @@ pub const SecuredLink = struct {
             .server_name = self.server_name,
             .description = self.description,
             .channel_name = self.channel_name,
+            .config = self.inner_config,
             .now_ms = rs.now_ms,
             .signing_key = self.identity.sign_kp,
         }, rs.inner, rs.remote_name, rs.rng_seed);
@@ -846,6 +852,7 @@ pub const SecuredLink = struct {
             .server_name = self.server_name,
             .description = self.description,
             .channel_name = self.channel_name,
+            .config = self.inner_config,
             .now_ms = now_ms,
             // End-to-end frame signing: hand the inner peer this node's signing
             // key so direct-owned state frames carry a self-certifying origin
@@ -1055,6 +1062,54 @@ test "secured link: TOFU preamble + IK handshake + CRDT over a whole-buffer stre
 
 test "secured link survives 1-byte fragmentation of every handshake message" {
     try runScenario(true);
+}
+
+test "secured link threads inner peer config after AKE" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x32)), "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x7777 };
+    var inner_cfg = s2s_link.PeerConfig{};
+    inner_cfg.routes.max_nicks = 256;
+    inner_cfg.link.peer_link_config.send_credit = 16384;
+    inner_cfg.link.peer_link_config.replay_window = 96;
+    inner_cfg.link.gossip_interval_ms = 1750;
+    inner_cfg.link.gossip_config.fanout = 2;
+
+    var a = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.orochi",
+        .inner_config = inner_cfg,
+    });
+    defer a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = &idb,
+        .local_prekey = pre_b,
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.orochi",
+        .inner_config = inner_cfg,
+    });
+    defer b.deinit();
+
+    try pump(&a, &b, false);
+    try testing.expect(a.established());
+    try testing.expect(b.established());
+    try testing.expectEqual(@as(usize, 256), a.inner.?.peer.config.routes.max_nicks);
+    try testing.expectEqual(@as(u32, 16384), a.inner.?.peer.config.link.peer_link_config.send_credit);
+    try testing.expectEqual(@as(u64, 96), a.inner.?.peer.session.link.replay_window);
+    try testing.expectEqual(@as(u64, 1750), a.inner.?.peer.session.config.gossip_interval_ms);
+    try testing.expectEqual(@as(usize, 2), a.inner.?.peer.session.config.gossip_config.fanout);
 }
 
 /// Fully-built initiator/responder pair sharing the test allocator. Drives the

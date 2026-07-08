@@ -1734,6 +1734,10 @@ pub const Config = struct {
     /// supplies the handshake CSPRNG.
     node_identity: ?*const node_identity.NodeIdentity = null,
     crypto_io: ?std.Io = null,
+    /// Runtime Suimyaku peer-driver limits/timers/capacities for plaintext and
+    /// secured inner S2S links. Configurable via `[mesh.routing]`,
+    /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]` Sazanami keys.
+    s2s_config: s2s_link.PeerConfig = .{},
     mesh_pass: []const u8 = "",
     /// `[mesh].require_secured` — when true, refuse plaintext S2S entirely: reject
     /// inbound plaintext peers and never dial plaintext outbound links. Only the
@@ -5300,6 +5304,7 @@ pub const LinuxServer = struct {
                 .remote_node_id = 0,
                 .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
                 .server_name = self.serverName(),
+                .config = self.config.s2s_config,
             });
             errdefer link.deinit();
             link.setLocalNickResolver(self.localNickResolver());
@@ -5850,6 +5855,7 @@ pub const LinuxServer = struct {
             .server_name = self.serverName(),
             .description = self.config.server_description,
             .local_epoch_ms = wall,
+            .inner_config = self.config.s2s_config,
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         });
@@ -16275,6 +16281,7 @@ pub const LinuxServer = struct {
             .server_name = self.serverName(),
             .description = self.config.server_description,
             .local_epoch_ms = wall,
+            .inner_config = self.config.s2s_config,
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         }, .{
@@ -16596,6 +16603,7 @@ pub const LinuxServer = struct {
             .remote_node_id = 0,
             .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
             .server_name = self.serverName(),
+            .config = self.config.s2s_config,
         });
         errdefer link.deinit();
         link.setLocalNickResolver(self.localNickResolver());

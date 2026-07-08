@@ -150,6 +150,49 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 
 Plaintext S2S applies when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
 
+### `[mesh.routing]`
+
+Live Suimyaku route-table and server-registry capacities. These keys are parsed into `Config.mesh.s2s`, projected to `server.Config.s2s_config`, and used for both plaintext S2S links and the secured S2S inner CRDT stream.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `max_nicks` | integer | `4096` | `64..10000000` | Max tracked nicknames in one peer route table. |
+| `max_channels` | integer | `1024` | `16..1000000` | Max tracked channels in one peer route table. |
+| `max_nodes_per_channel` | integer | `64` | `4..4096` | Max member nodes recorded for one remote channel. |
+| `max_name_len` | integer | `64` | `16..256` | Max nick/channel name bytes accepted by the route table. |
+| `max_servers` | integer | `512` | `8..65536` | Max servers tracked in the peer server registry. |
+| `max_server_name_len` | integer | `63` | `16..255` | Max server-name bytes accepted by the registry. |
+| `max_server_desc_len` | integer | `255` | `32..1024` | Max server-description bytes accepted by the registry. |
+
+### `[mesh.gossip]`, `[mesh.swim]`, `[mesh.link]`
+
+Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-capacity overrides are applied after `[mesh.gossip]` defaults.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `mesh.gossip.round_fanout` | integer | `3` | `1..64` | Gossip round push fanout. |
+| `mesh.gossip.max_member_deltas` | integer | `64` | `1..1024` | Max membership deltas packed per gossip payload. |
+| `mesh.gossip.max_suspicions` | integer | `64` | `1..1024` | Max suspicion records packed per gossip payload. |
+| `mesh.gossip.view_active_capacity` | integer | `8` | `2..64` | Bounded membership-view active capacity. |
+| `mesh.gossip.view_passive_capacity` | integer | `64` | `active+1..4096` | Bounded membership-view passive capacity. |
+| `mesh.gossip.view_shuffle_active` | integer | `2` | `0..active` | Active entries sampled per shuffle. |
+| `mesh.gossip.view_shuffle_passive` | integer | `4` | `0..passive` | Passive entries sampled per shuffle. |
+| `mesh.swim.sazanami_suspicion_timeout_ms` | integer | `3000` | `0..120000` | Gossip-side suspect to dead reaping timeout. |
+| `mesh.swim.sazanami_witness_quorum` | integer | `2` | `1..16` | Witness quorum for Sazanami dead declaration. |
+| `mesh.link.send_credit_bytes` | integer | `65536` | `4096..16777216` | Initial peer-link flow-control send credit. |
+| `mesh.link.replay_window` | integer | `64` | `8..4096` | Anti-replay sequence window. |
+| `mesh.link.handshake_timeout_ms` | integer | `10000` | `1000..120000` | Peer-link handshake completion timeout. |
+| `mesh.link.heartbeat_interval_ms` | integer | `15000` | `1000..120000` | Heartbeat send interval when idle. |
+| `mesh.link.idle_timeout_ms` | integer | `45000` | `5000..600000` | No-receive idle timeout before drain. |
+| `mesh.link.drain_timeout_ms` | integer | `5000` | `500..60000` | Drain-to-close grace timeout. |
+| `mesh.link.gossip_interval_ms` | integer | `1000` | `100..60000` | S2S session gossip-round cadence. |
+| `mesh.link.repair_interval_ms` | integer | `2000` | `200..120000` | S2S anti-entropy repair cadence. |
+| `mesh.link.gossip_fanout` | integer | `1` | `1..64` | Per-link gossip fanout override. |
+| `mesh.link.view_active_capacity` | integer | `4` | `2..64` | Per-link active-view capacity override. |
+| `mesh.link.view_passive_capacity` | integer | `8` | `active+1..4096` | Per-link passive-view capacity override. |
+| `mesh.link.burst_max_bytes` | integer | `65536` | `4096..16777216` | Max bytes for a serialized full-state CRDT burst. |
+| `mesh.link.burst_max_records` | integer | `512` | `16..65536` | Max records in one full-state CRDT burst. |
+
 ## `[dnsbl]`
 
 Source: `Dnsbl` struct + parsing in `src/daemon/config_format.zig`; resolver in `src/daemon/dnsbl_resolver.zig`; construction in `src/main.zig`; enforcement in `src/daemon/server.zig` (`enforceDnsbl`).

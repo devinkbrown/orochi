@@ -161,6 +161,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         .max_pattern_len = @intCast(cfg.filter.koshi_pattern_max_len),
     };
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
+    out.s2s_config = cfg.mesh.s2s;
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
@@ -498,6 +499,16 @@ test "config text overlays the server config" {
         \\[mesh]
         \\trust_roots = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
         \\connect = ["ircx.us:6900"]
+        \\[mesh.routing]
+        \\max_nicks = 8192
+        \\max_servers = 1024
+        \\[mesh.link]
+        \\send_credit_bytes = 131072
+        \\gossip_interval_ms = 1500
+        \\[mesh.gossip]
+        \\round_fanout = 5
+        \\[mesh.swim]
+        \\sazanami_witness_quorum = 4
         \\[media]
         \\enabled = true
         \\max_upload_bytes = 12345
@@ -550,6 +561,12 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_trust_roots.len);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_connect.len);
     try testing.expectEqualStrings("ircx.us:6900", loaded.config.mesh_connect[0]);
+    try testing.expectEqual(@as(usize, 8192), loaded.config.s2s_config.routes.max_nicks);
+    try testing.expectEqual(@as(usize, 1024), loaded.config.s2s_config.registry.max_nodes);
+    try testing.expectEqual(@as(u32, 131072), loaded.config.s2s_config.link.peer_link_config.send_credit);
+    try testing.expectEqual(@as(u64, 1500), loaded.config.s2s_config.link.gossip_interval_ms);
+    try testing.expectEqual(@as(usize, 5), loaded.config.s2s_config.link.gossip_config.fanout);
+    try testing.expectEqual(@as(u8, 4), loaded.config.s2s_config.link.swim_config.witness_quorum);
     try testing.expect(loaded.config.media_enabled);
     try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
