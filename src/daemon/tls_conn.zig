@@ -275,10 +275,14 @@ pub const TlsConn = struct {
         if (std.meta.activeTag(self.engine) == .undecided) {
             switch (try self.detectVersion()) {
                 .need_more => return .{ .handshake_bytes = &.{}, .plaintext = &.{} },
-                .tls13 => self.engine = .{ .tls13 = try tls_server.Server.init(self.allocator, self.cfg13) },
+                .tls13 => {
+                    const s13 = try tls_server.Server.init(self.allocator, self.cfg13);
+                    self.engine = .{ .tls13 = s13 };
+                },
                 .tls12 => {
                     const c12 = self.cfg12 orelse return error.ProtocolVersion;
-                    self.engine = .{ .tls12 = try tls12_server.Server.init(self.allocator, c12) };
+                    const s12 = try tls12_server.Server.init(self.allocator, c12);
+                    self.engine = .{ .tls12 = s12 };
                 },
             }
         }
@@ -1574,6 +1578,47 @@ test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
     const got = try client.decrypt(cipher);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("reply 1.2", got);
+}
+
+test "version-dispatch: failed TLS 1.2 init leaves engine undecided" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x56)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp); // 1.3 leg (unused here)
+
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ec_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 5, 6, 7, 8 },
+        .key_pair = ec_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var conn = TlsConn.initDual(
+        alloc,
+        .{ .cert_chain = &.{der}, .signing_key = kp },
+        .{ .cert_chain = &.{ec_der} },
+    );
+    defer conn.deinit();
+
+    var client = try tls12_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{ec_der},
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try std.testing.expectError(error.NoSigningKey, conn.onInbound(ch));
+    try std.testing.expect(conn.negotiatedVersion() == null);
+    const alert = conn.takeAlert(error.NoSigningKey) orelse return error.TestUnexpectedResult;
+    defer alloc.free(alert);
+    try std.testing.expect(alert.len != 0);
 }
 
 test "TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)" {
