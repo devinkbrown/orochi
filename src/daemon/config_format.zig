@@ -17,8 +17,10 @@ const acme_cli = @import("acme_cli.zig");
 const acme_http01_listener = @import("acme_http01_listener.zig");
 const acme_runner = @import("acme_runner.zig");
 const conn_class = @import("conn_class.zig");
+const content_filter_mod = @import("content_filter.zig");
 const services_mod = @import("services.zig");
 const shard = @import("shard.zig");
+const tegami_mod = @import("tegami.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
@@ -65,6 +67,8 @@ pub const Config = struct {
     backup: Backup = .{},
     metrics: Metrics = .{},
     accounts: Accounts = .{},
+    bouncer: Bouncer = .{},
+    filter: Filter = .{},
     webhook: Webhook = .{},
     geoip: Geoip = .{},
     sasl: Sasl = .{},
@@ -444,6 +448,26 @@ pub const Config = struct {
     pub const Accounts = struct {
         /// PBKDF2-HMAC-SHA256 iteration count for account password hashes.
         pbkdf2_rounds: u32 = services_mod.default_pbkdf2_rounds,
+    };
+
+    /// `[bouncer]` — per-account bouncer/offline-message retention limits.
+    pub const Bouncer = struct {
+        /// Max offline DM body length (bytes).
+        tegami_text_max_len: u64 = tegami_mod.default_max_text_bytes,
+        /// Max sender-name length on an offline DM (bytes).
+        tegami_from_max_len: u64 = tegami_mod.default_max_from_bytes,
+        /// Offline mailbox depth cap per account (entries).
+        tegami_mailbox_depth: u64 = tegami_mod.default_max_per_account,
+        /// Max distinct offline mailboxes.
+        tegami_max_accounts: u64 = tegami_mod.default_max_accounts,
+    };
+
+    /// `[filter]` — oper-managed moderation filter sizing.
+    pub const Filter = struct {
+        /// Max oper-curated Koshi filter patterns.
+        koshi_max_patterns: u64 = content_filter_mod.default_max_patterns,
+        /// Max length of a single Koshi pattern (bytes).
+        koshi_pattern_max_len: u64 = content_filter_mod.default_max_pattern_len,
     };
 
     /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
@@ -996,6 +1020,16 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [accounts]
     cfg.accounts.pbkdf2_rounds = @intCast(try uintField(doc, "accounts.pbkdf2_rounds", cfg.accounts.pbkdf2_rounds, 10_000, 10_000_000));
+
+    // [bouncer]
+    cfg.bouncer.tegami_text_max_len = try uintField(doc, "bouncer.tegami_text_max_len", cfg.bouncer.tegami_text_max_len, 64, 2048);
+    cfg.bouncer.tegami_from_max_len = try uintField(doc, "bouncer.tegami_from_max_len", cfg.bouncer.tegami_from_max_len, 16, 128);
+    cfg.bouncer.tegami_mailbox_depth = try uintField(doc, "bouncer.tegami_mailbox_depth", cfg.bouncer.tegami_mailbox_depth, 8, 1024);
+    cfg.bouncer.tegami_max_accounts = try uintField(doc, "bouncer.tegami_max_accounts", cfg.bouncer.tegami_max_accounts, 1024, 1048576);
+
+    // [filter]
+    cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);
+    cfg.filter.koshi_pattern_max_len = try uintField(doc, "filter.koshi_pattern_max_len", cfg.filter.koshi_pattern_max_len, 16, 1024);
 
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
@@ -1722,6 +1756,96 @@ test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {
         \\irc = 6680
         \\[accounts]
         \\pbkdf2_rounds = 10000001
+        \\
+    , .{}));
+}
+
+test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[bouncer]
+        \\tegami_text_max_len = 512
+        \\tegami_from_max_len = 48
+        \\tegami_mailbox_depth = 16
+        \\tegami_max_accounts = 2048
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 512), cfg.bouncer.tegami_text_max_len);
+    try testing.expectEqual(@as(u64, 48), cfg.bouncer.tegami_from_max_len);
+    try testing.expectEqual(@as(u64, 16), cfg.bouncer.tegami_mailbox_depth);
+    try testing.expectEqual(@as(u64, 2048), cfg.bouncer.tegami_max_accounts);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(@as(u64, tegami_mod.default_max_text_bytes), omitted.bouncer.tegami_text_max_len);
+    try testing.expectEqual(@as(u64, tegami_mod.default_max_from_bytes), omitted.bouncer.tegami_from_max_len);
+    try testing.expectEqual(@as(u64, tegami_mod.default_max_per_account), omitted.bouncer.tegami_mailbox_depth);
+    try testing.expectEqual(@as(u64, tegami_mod.default_max_accounts), omitted.bouncer.tegami_max_accounts);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[bouncer]
+        \\tegami_text_max_len = 63
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[bouncer]
+        \\tegami_mailbox_depth = 1025
+        \\
+    , .{}));
+}
+
+test "parseToml: [filter] koshi limits project with bounded policy ranges" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[filter]
+        \\koshi_max_patterns = 512
+        \\koshi_pattern_max_len = 128
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 512), cfg.filter.koshi_max_patterns);
+    try testing.expectEqual(@as(u64, 128), cfg.filter.koshi_pattern_max_len);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_patterns), omitted.filter.koshi_max_patterns);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_pattern_len), omitted.filter.koshi_pattern_max_len);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[filter]
+        \\koshi_max_patterns = 15
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[filter]
+        \\koshi_pattern_max_len = 1025
         \\
     , .{}));
 }

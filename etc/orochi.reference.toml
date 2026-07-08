@@ -414,6 +414,20 @@ max_per_account = 64   # live sessions per account (1..1000000)
 pbkdf2_rounds = 100000  # password hashing iterations (10000..10000000)
 
 
+# --- [bouncer] — per-account bouncer/offline-message limits ------------------
+[bouncer]
+tegami_text_max_len = 400       # offline DM body bytes (64..2048)
+tegami_from_max_len = 64        # stored sender-label bytes (16..128)
+tegami_mailbox_depth = 64       # offline messages per account (8..1024)
+tegami_max_accounts = 65536     # accounts with offline mailboxes (1024..1048576)
+
+
+# --- [filter] — oper-managed Koshi moderation filter sizing ------------------
+[filter]
+koshi_max_patterns = 256        # oper-curated filter patterns (16..4096)
+koshi_pattern_max_len = 256     # bytes per filter pattern (16..1024)
+
+
 # --- [sasl] — SASL authentication + account store ----------------------------
 [sasl]
 # Enable SASL (PLAIN/SCRAM-SHA-256/EXTERNAL). Explicit false disables SASL even

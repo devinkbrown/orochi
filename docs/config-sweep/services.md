@@ -47,10 +47,10 @@ Tegami offline-mail and announcement board fan-out are the per-account buffer/re
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
-| tegami.zig:10 | `max_text_bytes` | `400` | max offline DM body length | `bouncer.tegami_text_max_len` | uint | 400 | 64..2048 |
-| tegami.zig:11 | `max_from_bytes` | `64` | max sender-name length on an offline DM | `bouncer.tegami_from_max_len` | uint | 64 | 16..128 |
-| tegami.zig:12 | `max_per_account` | `64` | offline mailbox depth cap per account (buffer cap) | `bouncer.tegami_mailbox_depth` | uint | 64 | 8..1024 |
-| tegami.zig:13 | `max_accounts` | `65536` | max distinct offline mailboxes | `bouncer.tegami_max_accounts` | uint | 65536 | 1024..1048576 |
+| config_format.zig / tegami.zig | `bouncer.tegami_text_max_len` / `max_text_bytes` | `400` | max offline DM body length | `bouncer.tegami_text_max_len` *(schema-backed)* | uint | 400 | 64..2048 |
+| config_format.zig / tegami.zig | `bouncer.tegami_from_max_len` / `max_from_bytes` | `64` | max sender-name length on an offline DM | `bouncer.tegami_from_max_len` *(schema-backed)* | uint | 64 | 16..128 |
+| config_format.zig / tegami.zig | `bouncer.tegami_mailbox_depth` / `max_per_account` | `64` | offline mailbox depth cap per account (buffer cap) | `bouncer.tegami_mailbox_depth` *(schema-backed)* | uint | 64 | 8..1024 |
+| config_format.zig / tegami.zig | `bouncer.tegami_max_accounts` / `max_accounts` | `65536` | max distinct offline mailboxes | `bouncer.tegami_max_accounts` *(schema-backed)* | uint | 65536 | 1024..1048576 |
 | announce_board.zig:13 | `max_announcements` | `512` | retained announcement board cap (FIFO eviction) | `bouncer.announce_max_entries` | uint | 512 | 32..8192 |
 | announce_board.zig:14 | `max_category_len` | `32` | max announcement category tag length | `bouncer.announce_category_max_len` | uint | 32 | 8..128 |
 | announce_board.zig:15 | `max_title_len` | `120` | max announcement headline length | `bouncer.announce_title_max_len` | uint | 120 | 16..256 |
@@ -73,8 +73,8 @@ per-channel/per-account posting gates, grouped here as moderation limits.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
-| content_filter.zig:14 | `max_patterns` | `256` | max oper-curated Koshi filter patterns (Aho-Corasick set) | `filter.koshi_max_patterns` | uint | 256 | 16..4096 |
-| content_filter.zig:15 | `max_pattern_len` | `256` | max length of a single Koshi filter pattern | `filter.koshi_pattern_max_len` | uint | 256 | 16..1024 |
+| config_format.zig / content_filter.zig | `filter.koshi_max_patterns` / `max_patterns` | `256` | max oper-curated Koshi filter patterns (Aho-Corasick set) | `filter.koshi_max_patterns` *(schema-backed)* | uint | 256 | 16..4096 |
+| config_format.zig / content_filter.zig | `filter.koshi_pattern_max_len` / `max_pattern_len` | `256` | max length of a single Koshi filter pattern | `filter.koshi_pattern_max_len` *(schema-backed)* | uint | 256 | 16..1024 |
 | duplicate_filter.zig:4 | `DuplicateFilter.max_entries` | `4096` | dedup FIFO window size (recent message-hash memory) | `filter.dedup_window` | uint | 4096 | 256..65536 |
 | announcement_mode.zig:7 | `max_channels` | `4096` | max channels with announcement-only mode state | `filter.announce_mode_max_channels` | uint | 4096 | 256..65536 |
 | announcement_mode.zig:8 | `max_channel_bytes` | `128` | max channel-name length for announcement-mode gate | `filter.announce_mode_channel_max_len` | uint | 128 | 8..256 |

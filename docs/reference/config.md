@@ -282,6 +282,30 @@ Durable account-services policy. These settings take effect when `[sasl].account
 |---|---|---:|---|---|
 | `pbkdf2_rounds` | integer | `100000` | `10000..10000000` | PBKDF2-HMAC-SHA256 iteration count for new password hashes and password verification timing equalization. |
 
+## `[bouncer]`
+
+Source: struct `Bouncer` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live Tegami store construction in `src/daemon/server.zig`.
+
+Per-account bouncer/offline-message retention limits. These values construct the live Tegami offline-mail store at daemon boot.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `tegami_text_max_len` | integer | `400` | `64..2048` | Max offline DM body length accepted by `TEGAMI SEND`. |
+| `tegami_from_max_len` | integer | `64` | `16..128` | Max sender label length stored on an offline DM. |
+| `tegami_mailbox_depth` | integer | `64` | `8..1024` | Per-account offline mailbox depth before new Tegami delivery fails closed. |
+| `tegami_max_accounts` | integer | `65536` | `1024..1048576` | Max distinct accounts with live offline mailboxes. |
+
+## `[filter]`
+
+Source: struct `Filter` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live Koshi content-filter construction in `src/daemon/server.zig`.
+
+Oper-managed Koshi moderation filter sizing. These values construct the live content-filter store at daemon boot.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `koshi_max_patterns` | integer | `256` | `16..4096` | Max oper-curated Koshi filter patterns. |
+| `koshi_pattern_max_len` | integer | `256` | `16..1024` | Max length of a single Koshi pattern. |
+
 ## `[sessions]`
 
 Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/config_format.zig:384`, mapping at `src/daemon/config_boot.zig:58`.

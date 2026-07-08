@@ -144,6 +144,16 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
+    out.tegami_config = .{
+        .max_text_bytes = @intCast(cfg.bouncer.tegami_text_max_len),
+        .max_from_bytes = @intCast(cfg.bouncer.tegami_from_max_len),
+        .max_per_account = @intCast(cfg.bouncer.tegami_mailbox_depth),
+        .max_accounts = @intCast(cfg.bouncer.tegami_max_accounts),
+    };
+    out.content_filter_config = .{
+        .max_patterns = @intCast(cfg.filter.koshi_max_patterns),
+        .max_pattern_len = @intCast(cfg.filter.koshi_pattern_max_len),
+    };
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
@@ -491,6 +501,14 @@ test "config text overlays the server config" {
         \\native_media_require_mac = true
         \\[io]
         \\cqe_batch = 512
+        \\[bouncer]
+        \\tegami_text_max_len = 512
+        \\tegami_from_max_len = 48
+        \\tegami_mailbox_depth = 16
+        \\tegami_max_accounts = 4096
+        \\[filter]
+        \\koshi_max_patterns = 512
+        \\koshi_pattern_max_len = 128
         \\[backup]
         \\dir = "/var/backups/orochi"
         \\interval = "6h"
@@ -533,6 +551,12 @@ test "config text overlays the server config" {
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
     try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);
+    try testing.expectEqual(@as(usize, 512), loaded.config.tegami_config.max_text_bytes);
+    try testing.expectEqual(@as(usize, 48), loaded.config.tegami_config.max_from_bytes);
+    try testing.expectEqual(@as(usize, 16), loaded.config.tegami_config.max_per_account);
+    try testing.expectEqual(@as(usize, 4096), loaded.config.tegami_config.max_accounts);
+    try testing.expectEqual(@as(usize, 512), loaded.config.content_filter_config.max_patterns);
+    try testing.expectEqual(@as(usize, 128), loaded.config.content_filter_config.max_pattern_len);
     try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);
     try testing.expectEqual(@as(i64, 6 * 60 * 60 * 1000), loaded.config.backup_interval_ms);
     try testing.expectEqualStrings("/var/lib/orochi/accounts.db", loaded.config.account_store_path);

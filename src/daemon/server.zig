@@ -1597,6 +1597,10 @@ pub const Config = struct {
     /// Multi-session/bouncer registry sizing.
     session_max_accounts: u64 = 65536,
     session_max_per_account: u32 = 64,
+    /// Runtime Tegami offline-mailbox limits. Configurable via `[bouncer]`.
+    tegami_config: tegami_mod.Config = .{},
+    /// Runtime Koshi content-filter limits. Configurable via `[filter]`.
+    content_filter_config: content_filter_mod.Config = .{},
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -3378,13 +3382,13 @@ pub const LinuxServer = struct {
                 .max_accounts = @intCast(config.session_max_accounts),
                 .max_sessions_per_account = config.session_max_per_account,
             }),
-            .content_filter = content_filter_mod.ContentFilter.init(allocator),
+            .content_filter = content_filter_mod.ContentFilter.initWithConfig(allocator, config.content_filter_config),
             .media_rooms = media_room.MediaRooms.initConfig(allocator, .{
                 .max_participants = config.media_max_participants,
             }),
             .media_plane = media_plane_mod.MediaPlane.init(allocator),
             .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
-            .tegami = tegami_mod.TegamiBox.init(allocator),
+            .tegami = tegami_mod.TegamiBox.initWithConfig(allocator, config.tegami_config),
             .memo_forward = svc_memo_forward.MemoForwardStore.init(allocator),
             .memo_ignore = svc_memo_ignore.MemoIgnoreList.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
@@ -3843,6 +3847,39 @@ pub const LinuxServer = struct {
         if (media_on.media_plane.port == 0 or media_on.native_media.port == 0) return error.SkipZigTest;
         try std.testing.expect(media_on.media_plane.port != 0);
         try std.testing.expect(media_on.native_media.port != 0);
+    }
+
+    test "Server.init threads content filter and tegami configs" {
+        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        const allocator = std.testing.allocator;
+
+        var server = LinuxServer.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .content_filter_config = .{
+                .max_patterns = 1,
+                .max_pattern_len = 4,
+            },
+            .tegami_config = .{
+                .max_text_bytes = 4,
+                .max_from_bytes = 16,
+                .max_per_account = 1,
+                .max_accounts = 1,
+            },
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        try std.testing.expect(try server.content_filter.add("abcd"));
+        try std.testing.expect(!try server.content_filter.add("abcde"));
+        try std.testing.expect(!try server.content_filter.add("wxyz"));
+
+        try std.testing.expectEqual(@as(usize, 1), try server.tegami.send("acct", "sender", "1234", 0));
+        try std.testing.expectError(error.MessageInvalid, server.tegami.send("acct", "sender", "12345", 0));
+        try std.testing.expectError(error.MailboxFull, server.tegami.send("acct", "sender", "next", 0));
+        try std.testing.expectError(error.TooManyAccounts, server.tegami.send("other", "sender", "ok", 0));
     }
 
     /// Build the TLS 1.3 config for one accepted client. Certificate material is
