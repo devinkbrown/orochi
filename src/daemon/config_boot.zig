@@ -78,12 +78,16 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.media_max_frame_bytes = cfg.media.max_frame_bytes;
     out.media_reorder_window_frames = cfg.media.reorder_window_frames;
     out.media_max_participants = cfg.media.max_participants;
+    out.media_sfu_max_breakout_label_bytes = @intCast(cfg.media.sfu_max_breakout_label_bytes);
     out.transcript_config = .{
         .max_text_bytes = @intCast(cfg.media.captions_max_text_bytes),
         .max_speaker_bytes = @intCast(cfg.media.captions_max_speaker_bytes),
         .max_per_channel = @intCast(cfg.media.captions_ring_depth_per_channel),
         .max_channels = @intCast(cfg.media.captions_max_channels),
     };
+    out.media_pins_max_per_channel = @intCast(cfg.media.pins_max_per_channel);
+    out.media_pins_max_msgid_bytes = @intCast(cfg.media.pins_max_msgid_bytes);
+    out.media_reactions_max_token_bytes = @intCast(cfg.media.reactions_max_token_bytes);
     out.native_media_require_mac = cfg.media.native_media_require_mac;
     out.ws_media_relay = cfg.media.ws_media_relay;
     out.ws_media_require_mac = cfg.media.ws_media_require_mac;
@@ -520,6 +524,13 @@ test "config text overlays the server config" {
         \\captions_ring_depth_per_channel = 16
         \\captions_max_channels = 128
         \\native_media_require_mac = true
+        \\[media.sfu]
+        \\max_breakout_label_bytes = 16
+        \\[media.pins]
+        \\max_per_channel = 10
+        \\max_msgid_bytes = 32
+        \\[media.reactions]
+        \\max_token_bytes = 24
         \\[io]
         \\cqe_batch = 512
         \\[bouncer]
@@ -572,10 +583,14 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
     try testing.expectEqual(@as(u32, 32), loaded.config.media_reorder_window_frames);
     try testing.expectEqual(@as(usize, 2), loaded.config.media_max_participants);
+    try testing.expectEqual(@as(usize, 16), loaded.config.media_sfu_max_breakout_label_bytes);
     try testing.expectEqual(@as(usize, 512), loaded.config.transcript_config.max_text_bytes);
     try testing.expectEqual(@as(usize, 32), loaded.config.transcript_config.max_speaker_bytes);
     try testing.expectEqual(@as(usize, 16), loaded.config.transcript_config.max_per_channel);
     try testing.expectEqual(@as(usize, 128), loaded.config.transcript_config.max_channels);
+    try testing.expectEqual(@as(usize, 10), loaded.config.media_pins_max_per_channel);
+    try testing.expectEqual(@as(usize, 32), loaded.config.media_pins_max_msgid_bytes);
+    try testing.expectEqual(@as(usize, 24), loaded.config.media_reactions_max_token_bytes);
     const reassembly_cfg = server.mediaReassemblyConfig(loaded.config);
     try testing.expectEqual(@as(u32, 32), reassembly_cfg.window);
     var rx = media_session.Receiver(media_session.default_max_payload_bytes, kagura_frame.window_cap).init(reassembly_cfg);

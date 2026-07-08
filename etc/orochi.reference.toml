@@ -659,6 +659,20 @@ ws_media_require_mac = false
 # stun_host = "stun.example.net"
 # stun_port = 3478
 
+[media.sfu]
+# Max MEDIA BREAKOUT label bytes. Longer labels are truncated in the room state.
+max_breakout_label_bytes = 32
+
+[media.pins]
+# Live PINS channel-prop bounds. PINS is a comma-separated msgid list; the prop is
+# persisted and mesh-propagated by the generic channel-prop store.
+max_per_channel = 50
+max_msgid_bytes = 64
+
+[media.reactions]
+# Max MEDIA REACT token bytes. Reactions are ephemeral event broadcasts only.
+max_token_bytes = 32
+
 
 # --- [stats] — web stats publication -----------------------------------------
 [stats]

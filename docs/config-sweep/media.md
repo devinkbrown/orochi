@@ -72,7 +72,7 @@ This section covers `suimyaku/media.zig` `AbrConfig` and `abrHint`.
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 | src/daemon/media_room.zig:12 | `max_participants` (`media.Session(64)`) | 64 | Max participants per channel media call (SFU roster size) | media.sfu.max_participants_per_room | uint | 64 | 2..1024 |
-| src/daemon/media_room.zig:36 | `max_breakout_bytes` | 32 | Max length of a breakout (sub-room) label | media.sfu.max_breakout_label_bytes | uint | 32 | 8..256 |
+| src/daemon/media_room.zig / config_format.zig | `max_breakout_bytes` | 32 | done; max length of a live MEDIA BREAKOUT label | media.sfu.max_breakout_label_bytes | uint | 32 | 8..256 |
 | src/substrate/suimyaku/media.zig:9 | `max_participant_id_bytes` | 64 | Max participant identifier length | media.sfu.max_participant_id_bytes | uint | 64 | 16..256 |
 | src/substrate/suimyaku/media.zig:10 | `max_rid_bytes` | 16 | Max simulcast RID length | media.sfu.max_rid_bytes | uint | 16 | 4..64 |
 | src/substrate/suimyaku/media.zig:11 | `max_codecs` | 8 | Max codecs per media capability set | media.sfu.max_codecs | uint | 8 | 1..32 |
@@ -105,6 +105,8 @@ This section covers `suimyaku/media.zig` `AbrConfig` and `abrHint`.
 | src/daemon/media_pin.zig:6 | `max_channel_len` | 128 | Max channel-name length (pins) | media.pins.max_channel_bytes | uint | 128 | 16..512 |
 | src/daemon/media_pin.zig:7 | `max_url_len` | 2048 | Max pinned media URL length | media.pins.max_url_bytes | uint | 2048 | 64..16384 |
 | src/daemon/media_pin.zig:8 | `max_actor_len` | 128 | Max actor (pinned-by) name length | media.pins.max_actor_bytes | uint | 128 | 16..512 |
+| src/daemon/server.zig / config_format.zig | live `PINS` count bound | 50 | done; max msgids accepted in the live PINS channel prop | media.pins.max_per_channel | uint | 50 | 1..1024 |
+| src/daemon/server.zig / config_format.zig | live `PINS` msgid bound | 64 | done; max bytes per msgid in the live PINS channel prop | media.pins.max_msgid_bytes | uint | 64 | 8..256 |
 
 ## Recording consent store and session index (`[media.recording]`)
 
@@ -127,6 +129,7 @@ This section covers `suimyaku/media.zig` `AbrConfig` and `abrHint`.
 | src/daemon/reaction_tally.zig:6 | `max_reactor_len` | 128 | Max reactor name length | media.reactions.max_reactor_bytes | uint | 128 | 16..512 |
 | src/daemon/reaction_tally.zig:7 | `max_emojis_per_message` | 64 | Distinct emojis per message | media.reactions.max_emojis_per_message | uint | 64 | 1..1024 |
 | src/daemon/reaction_tally.zig:8 | `max_reactors_per_emoji` | 1024 | Max reactors per (message,emoji) bucket | media.reactions.max_reactors_per_emoji | uint | 1024 | 8..65536 |
+| src/daemon/server.zig / config_format.zig | live `MEDIA REACT` token bound | 32 | done; max ephemeral reaction token bytes | media.reactions.max_token_bytes | uint | 32 | 8..256 |
 
 ## Borderline and wire-adjacent constants (included per instructions, lift with caution)
 

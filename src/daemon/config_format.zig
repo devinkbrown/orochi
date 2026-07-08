@@ -391,10 +391,14 @@ pub const Config = struct {
         max_frame_bytes: u64 = 64 * 1024,
         reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
         max_participants: u32 = @intCast(media_room.default_max_participants),
+        sfu_max_breakout_label_bytes: u64 = media_room.max_breakout_bytes,
         captions_max_text_bytes: u64 = transcript_mod.max_text_bytes,
         captions_max_speaker_bytes: u64 = transcript_mod.max_speaker_bytes,
         captions_ring_depth_per_channel: u64 = transcript_mod.max_per_channel,
         captions_max_channels: u64 = transcript_mod.max_channels,
+        pins_max_per_channel: u64 = 50,
+        pins_max_msgid_bytes: u64 = 64,
+        reactions_max_token_bytes: u64 = 32,
         /// Require HMAC-tagged native KaguraVox/KaguraVis datagrams. Defaults off until
         /// clients implement the matching Kagura-frame tag contract.
         native_media_require_mac: bool = false,
@@ -1065,10 +1069,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
     cfg.media.reorder_window_frames = @intCast(try uintField(doc, "media.reorder_window_frames", cfg.media.reorder_window_frames, 1, kagura_frame.window_cap));
     cfg.media.max_participants = @intCast(try uintField(doc, "media.max_participants", cfg.media.max_participants, 1, media_room.max_participants));
+    cfg.media.sfu_max_breakout_label_bytes = try uintField(doc, "media.sfu.max_breakout_label_bytes", cfg.media.sfu_max_breakout_label_bytes, 8, 256);
     cfg.media.captions_max_text_bytes = try uintField(doc, "media.captions_max_text_bytes", cfg.media.captions_max_text_bytes, 64, 4000);
     cfg.media.captions_max_speaker_bytes = try uintField(doc, "media.captions_max_speaker_bytes", cfg.media.captions_max_speaker_bytes, 16, 256);
     cfg.media.captions_ring_depth_per_channel = try uintField(doc, "media.captions_ring_depth_per_channel", cfg.media.captions_ring_depth_per_channel, 16, 4096);
     cfg.media.captions_max_channels = try uintField(doc, "media.captions_max_channels", cfg.media.captions_max_channels, 64, 1048576);
+    cfg.media.pins_max_per_channel = try uintField(doc, "media.pins.max_per_channel", cfg.media.pins_max_per_channel, 1, 1024);
+    cfg.media.pins_max_msgid_bytes = try uintField(doc, "media.pins.max_msgid_bytes", cfg.media.pins_max_msgid_bytes, 8, 256);
+    cfg.media.reactions_max_token_bytes = try uintField(doc, "media.reactions.max_token_bytes", cfg.media.reactions_max_token_bytes, 8, 256);
     if (doc.getBool("media.native_media_require_mac")) |b| cfg.media.native_media_require_mac = b;
     if (doc.getBool("media.ws_media_relay")) |b| cfg.media.ws_media_relay = b;
     if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
@@ -2321,6 +2329,10 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     try testing.expectEqual(@as(u64, transcript_mod.max_speaker_bytes), dflt.media.captions_max_speaker_bytes);
     try testing.expectEqual(@as(u64, transcript_mod.max_per_channel), dflt.media.captions_ring_depth_per_channel);
     try testing.expectEqual(@as(u64, transcript_mod.max_channels), dflt.media.captions_max_channels);
+    try testing.expectEqual(@as(u64, media_room.max_breakout_bytes), dflt.media.sfu_max_breakout_label_bytes);
+    try testing.expectEqual(@as(u64, 50), dflt.media.pins_max_per_channel);
+    try testing.expectEqual(@as(u64, 64), dflt.media.pins_max_msgid_bytes);
+    try testing.expectEqual(@as(u64, 32), dflt.media.reactions_max_token_bytes);
 
     const text =
         \\[node]
@@ -2334,6 +2346,13 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
         \\captions_max_speaker_bytes = 32
         \\captions_ring_depth_per_channel = 16
         \\captions_max_channels = 128
+        \\[media.sfu]
+        \\max_breakout_label_bytes = 16
+        \\[media.pins]
+        \\max_per_channel = 10
+        \\max_msgid_bytes = 32
+        \\[media.reactions]
+        \\max_token_bytes = 24
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
@@ -2344,6 +2363,10 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     try testing.expectEqual(@as(u64, 32), cfg.media.captions_max_speaker_bytes);
     try testing.expectEqual(@as(u64, 16), cfg.media.captions_ring_depth_per_channel);
     try testing.expectEqual(@as(u64, 128), cfg.media.captions_max_channels);
+    try testing.expectEqual(@as(u64, 16), cfg.media.sfu_max_breakout_label_bytes);
+    try testing.expectEqual(@as(u64, 10), cfg.media.pins_max_per_channel);
+    try testing.expectEqual(@as(u64, 32), cfg.media.pins_max_msgid_bytes);
+    try testing.expectEqual(@as(u64, 24), cfg.media.reactions_max_token_bytes);
 
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\nreorder_window_frames = 0\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\nmax_participants = 0\n", .{}));
@@ -2351,6 +2374,10 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\ncaptions_max_speaker_bytes = 15\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\ncaptions_ring_depth_per_channel = 15\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\ncaptions_max_channels = 63\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.sfu]\nmax_breakout_label_bytes = 7\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.pins]\nmax_per_channel = 0\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.pins]\nmax_msgid_bytes = 7\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.reactions]\nmax_token_bytes = 7\n", .{}));
 
     const too_wide_window = try std.fmt.allocPrint(allocator, "{s}[media]\nreorder_window_frames = {d}\n", .{ base, kagura_frame.window_cap + 1 });
     defer allocator.free(too_wide_window);

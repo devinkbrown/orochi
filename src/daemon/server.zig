@@ -1438,9 +1438,17 @@ pub const Config = struct {
     /// Runtime SFU participant cap per room, bounded by the inline roster
     /// ceiling in media_room/native media link.
     media_max_participants: usize = media_room.default_max_participants,
+    /// Runtime cap for MEDIA BREAKOUT label bytes. Configurable via
+    /// `[media.sfu].max_breakout_label_bytes`.
+    media_sfu_max_breakout_label_bytes: usize = media_room.max_breakout_bytes,
     /// Runtime transcript/caption retention limits. Configurable via `[media]`
     /// caption keys.
     transcript_config: transcript_mod.Config = .{},
+    /// Runtime PINS channel-prop bounds. Configurable via `[media.pins]`.
+    media_pins_max_per_channel: usize = 50,
+    media_pins_max_msgid_bytes: usize = 64,
+    /// Runtime MEDIA REACT token byte cap. Configurable via `[media.reactions]`.
+    media_reactions_max_token_bytes: usize = 32,
     /// Require the native KaguraVox/KaguraVis UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
@@ -3392,6 +3400,7 @@ pub const LinuxServer = struct {
             .content_filter = content_filter_mod.ContentFilter.initWithConfig(allocator, config.content_filter_config),
             .media_rooms = media_room.MediaRooms.initConfig(allocator, .{
                 .max_participants = config.media_max_participants,
+                .max_breakout_bytes = config.media_sfu_max_breakout_label_bytes,
             }),
             .media_plane = media_plane_mod.MediaPlane.init(allocator),
             .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
@@ -3863,6 +3872,7 @@ pub const LinuxServer = struct {
         var server = LinuxServer.init(allocator, .{
             .host = "127.0.0.1",
             .port = 0,
+            .media_sfu_max_breakout_label_bytes = 8,
             .content_filter_config = .{
                 .max_patterns = 1,
                 .max_pattern_len = 4,
@@ -3888,6 +3898,10 @@ pub const LinuxServer = struct {
         try std.testing.expect(try server.content_filter.add("abcd"));
         try std.testing.expect(!try server.content_filter.add("abcde"));
         try std.testing.expect(!try server.content_filter.add("wxyz"));
+
+        try server.media_rooms.join("#a", "alice", .voice);
+        try server.media_rooms.setBreakout("#a", "alice", "engineering");
+        try std.testing.expectEqualStrings("engineer", server.media_rooms.breakoutOf("#a", "alice"));
 
         try std.testing.expectEqual(@as(usize, 1), try server.tegami.send("acct", "sender", "1234", 0));
         try std.testing.expectError(error.MessageInvalid, server.tegami.send("acct", "sender", "12345", 0));
@@ -19315,7 +19329,7 @@ pub const LinuxServer = struct {
             // as a plain prop (`.not_handled`). Clients render a pins drawer and
             // resolve each msgid against their history. 0-length = no pins.
             if (deleting) return .not_handled;
-            if (!validPinsValue(value)) return .bad_value;
+            if (!validPinsValueWithLimits(value, self.config.media_pins_max_per_channel, self.config.media_pins_max_msgid_bytes)) return .bad_value;
             return .not_handled;
         }
         if (std.ascii.eqlIgnoreCase(key, topic_tag.registry_key)) {
@@ -19396,21 +19410,20 @@ pub const LinuxServer = struct {
     const ephemeral_min_secs: u64 = 60;
     const ephemeral_max_secs: u64 = 30 * 24 * 60 * 60;
 
-    /// Pinned-message limits: bounded so the PINS prop stays small enough to
-    /// mesh-propagate and render cheaply.
-    const pins_max_count: usize = 50;
-    const pins_msgid_max: usize = 64;
-
     /// A PINS value is a comma-separated list of msgid tokens: each printable,
-    /// non-empty, ≤64 chars, no whitespace/commas; at most `pins_max_count`.
+    /// non-empty, bounded, no whitespace/commas.
     fn validPinsValue(value: []const u8) bool {
+        return validPinsValueWithLimits(value, 50, 64);
+    }
+
+    fn validPinsValueWithLimits(value: []const u8, max_count: usize, max_msgid_bytes: usize) bool {
         if (value.len == 0) return true;
         var count: usize = 0;
         var it = std.mem.splitScalar(u8, value, ',');
         while (it.next()) |tok| {
-            if (tok.len == 0 or tok.len > pins_msgid_max) return false;
+            if (tok.len == 0 or tok.len > max_msgid_bytes) return false;
             count += 1;
-            if (count > pins_max_count) return false;
+            if (count > max_count) return false;
             for (tok) |c| {
                 if (c <= 0x20 or c == 0x7f or c == ',') return false;
             }
@@ -24729,7 +24742,7 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "REACT")) {
-            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0 or parsed.paramSlice()[2].len > 32) {
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0 or parsed.paramSlice()[2].len > self.config.media_reactions_max_token_bytes) {
                 try self.failReply(conn, "MEDIA", "INVALID_REACTION", "Usage: MEDIA REACT <#chan> <reaction>");
                 return;
             }
@@ -31414,11 +31427,19 @@ test "pinned messages: PINS prop value validation" {
         w.print("m{d}", .{i}) catch unreachable;
     }
     try std.testing.expect(!LinuxServer.validPinsValue(w.buffered()));
+    try std.testing.expect(LinuxServer.validPinsValueWithLimits("a,b", 2, 3));
+    try std.testing.expect(!LinuxServer.validPinsValueWithLimits("a,b,c", 2, 3));
+    try std.testing.expect(!LinuxServer.validPinsValueWithLimits("abcd", 2, 3));
 }
 
 test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the generic prop" {
     if (comptime builtin.os.tag == .linux) {
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        var server = Server.init(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .media_pins_max_per_channel = 2,
+            .media_pins_max_msgid_bytes = 4,
+        }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
@@ -31429,6 +31450,8 @@ test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the ge
         try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "msg1,msg2", false), .not_handled);
         // Malformed → bad_value.
         try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "bad token", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "msg1,msg2,msg3", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "PINS", "too-long", false), .bad_value);
         // Round-trips through the generic store.
         _ = try server.props.setProp(chan, "PINS", "msg1,msg2", .{ .id = "op", .access = .owner });
         const ev = try server.props.getProp(chan, "PINS");
@@ -37416,7 +37439,9 @@ test "threaded server: oper-only and admin-only channel join gates" {
 }
 
 test "threaded server: media user modes block transmit and hide automatic presence" {
-    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+    var cfg = multiOperTestConfig(0);
+    cfg.media_reactions_max_token_bytes = 4;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -37468,6 +37493,9 @@ test "threaded server: media user modes block transmit and hide automatic presen
     a.reset();
     try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
     try recvUntil(&a, "NOTE MEDIA #media ROSTER B voice", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA REACT #media abcde\r\n");
+    try recvUntil(&b, "FAIL MEDIA INVALID_REACTION", 200);
 
     b.reset();
     try writeAllFd(fd_a, "MODE B +M\r\n");
