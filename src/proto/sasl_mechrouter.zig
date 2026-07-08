@@ -157,6 +157,7 @@ pub const Callbacks = struct {
 pub const Router = struct {
     callbacks: Callbacks,
     server_nonce: []const u8,
+    raw_message_limit: usize = MAX_RAW_MESSAGE,
     tls_certfp: ?[]const u8 = null,
     tls_exporter: ?[scram512.tls_exporter_len]u8 = null,
     state: State = .idle,
@@ -178,9 +179,14 @@ pub const Router = struct {
     };
 
     pub fn init(callbacks: Callbacks, server_nonce: []const u8) Router {
+        return initWithLimit(callbacks, server_nonce, MAX_RAW_MESSAGE);
+    }
+
+    pub fn initWithLimit(callbacks: Callbacks, server_nonce: []const u8, raw_message_limit: usize) Router {
         return .{
             .callbacks = callbacks,
             .server_nonce = server_nonce,
+            .raw_message_limit = @min(raw_message_limit, MAX_RAW_MESSAGE),
         };
     }
 
@@ -228,6 +234,9 @@ pub const Router = struct {
         if (client_chunk_b64.len == MAX_AUTHENTICATE_CHUNK) return .{ .continue_ = "" };
 
         const pending = self.pending_b64[0..self.pending_len];
+        if ((decodedBase64Len(pending) catch return self.failReset(.invalid_message)) > self.raw_message_limit) {
+            return self.failReset(.too_long);
+        }
         const raw = decodeBase64(pending, &self.decode_buf) catch return self.failReset(.invalid_message);
         self.pending_len = 0;
 
@@ -385,16 +394,23 @@ pub const Router = struct {
 
 fn decodeBase64(src: []const u8, out: []u8) ![]const u8 {
     if (std.mem.eql(u8, src, "+")) return out[0..0];
-    const padded_size = std.base64.standard.Decoder.calcSizeForSlice(src) catch null;
-    if (padded_size) |size| {
+    if (std.base64.standard.Decoder.calcSizeForSlice(src)) |size| {
         if (size > out.len) return error.NoSpaceLeft;
         try std.base64.standard.Decoder.decode(out[0..size], src);
         return out[0..size];
-    }
+    } else |_| {}
     const size = try std.base64.standard_no_pad.Decoder.calcSizeForSlice(src);
     if (size > out.len) return error.NoSpaceLeft;
     try std.base64.standard_no_pad.Decoder.decode(out[0..size], src);
     return out[0..size];
+}
+
+fn decodedBase64Len(src: []const u8) !usize {
+    if (std.mem.eql(u8, src, "+")) return 0;
+    if (std.base64.standard.Decoder.calcSizeForSlice(src)) |size| {
+        return size;
+    } else |_| {}
+    return std.base64.standard_no_pad.Decoder.calcSizeForSlice(src);
 }
 
 fn encodeBase64(src: []const u8, out: []u8) ![]const u8 {
@@ -448,6 +464,28 @@ test "PLAIN accepts and rejects through router" {
     try std.testing.expectEqualStrings("+", router.start("plain").continue_);
     const rejected = router.receive(&good, &out);
     try std.testing.expectEqual(Failure.invalid_credentials, rejected.fail);
+}
+
+test "router enforces configured decoded message limit" {
+    const Db = struct {
+        fn verify(_: *anyopaque, _: sasl.PlainCredentials) ?[]const u8 {
+            return "kain";
+        }
+    };
+
+    var token: u8 = 0;
+    var router = Router.initWithLimit(.{ .plain = .{ .ptr = &token, .verifyFn = Db.verify } }, "serverNonce", 8);
+    try std.testing.expectEqualStrings("+", router.start("PLAIN").continue_);
+
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    const too_large = b64("authz\x00kain\x00correct");
+    const rejected = router.receive(&too_large, &out);
+    try std.testing.expectEqual(Failure.too_long, rejected.fail);
+
+    router = Router.initWithLimit(.{ .plain = .{ .ptr = &token, .verifyFn = Db.verify } }, "serverNonce", 64);
+    try std.testing.expectEqualStrings("+", router.start("PLAIN").continue_);
+    const accepted = router.receive(&too_large, &out);
+    try std.testing.expectEqualStrings("kain", accepted.success.account);
 }
 
 test "SCRAM-SHA-256 round trip accepts and rejects tampered proof through router" {

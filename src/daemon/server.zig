@@ -1739,6 +1739,10 @@ pub const Config = struct {
     /// currently emit a realm challenge, but keeping this in runtime config makes
     /// REHASH/config diagnostics honest.
     sasl_realm: []const u8 = "",
+    /// Max decoded SASL AUTHENTICATE payload bytes. Defaults to the protocol
+    /// router's compiled ceiling; config may lower it, but never raise past the
+    /// fixed per-session buffers.
+    sasl_decode_max_bytes: u32 = sasl_mechrouter.MAX_RAW_MESSAGE,
     /// Operator registry from config `[oper]` blocks (account -> class/privileges).
     /// Oper is SASL-only: a client is elevated on SASL login if its account has a
     /// binding here. Null/empty = no operators (the OPER command never grants).
@@ -7270,6 +7274,7 @@ pub const LinuxServer = struct {
         if (self.config.sasl_session_token) |tok| conn.session.sasl_session_token = tok;
         if (self.config.sasl_oauthbearer) |oauth| conn.session.sasl_oauthbearer = oauth;
         conn.session.sasl_allow_anonymous = self.config.sasl_allow_anonymous;
+        conn.session.sasl_decode_max_bytes = @min(@as(usize, self.config.sasl_decode_max_bytes), sasl_mechrouter.MAX_RAW_MESSAGE);
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
@@ -19815,7 +19820,7 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, ack);
                 return;
             }
-            var router = sasl_mechrouter.Router.init(.{
+            var router = sasl_mechrouter.Router.initWithLimit(.{
                 .plain = ircxPlainAdapter(&conn.session),
                 .external = conn.session.sasl_external,
                 .scram256 = conn.session.sasl_scram256,
@@ -19823,7 +19828,7 @@ pub const LinuxServer = struct {
                 .session_token = conn.session.sasl_session_token,
                 .oauthbearer = conn.session.sasl_oauthbearer,
                 .anonymous = conn.session.sasl_allow_anonymous,
-            }, conn.session.sasl_server_nonce);
+            }, conn.session.sasl_server_nonce, conn.session.sasl_decode_max_bytes);
             router.tls_certfp = conn.session.tls_certfp;
             router.tls_exporter = conn.session.tls_exporter;
             switch (router.start(mech)) {

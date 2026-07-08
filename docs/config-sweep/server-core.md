@@ -39,7 +39,7 @@ mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
 | server.zig:712 | `Config.reputation_refuse_threshold` | `0` (disabled) | decaying-penalty score at which accept is refused | `limits.reputation_refuse_threshold` *(schema-backed)* | uint | 0 | 0..1000000 |
 | server.zig:714 | `Config.reputation_half_life_ms` | `60_000` | half-life of IP-reputation penalty decay | `limits.reputation_half_life` *(schema-backed; default 60s)* | duration | 60s | >=1s |
 | server.zig:531 | `timer_interval_ms` | `2_000` | period of the io_uring timeout-sweep timer (drives reg/ping/idle enforcement granularity) | `limits.sweep_interval` (NEW) | duration | 2s | 100ms..60s |
-| dispatch.zig:956 | `sasl_decode_cap` | `8192` | max decoded SASL AUTHENTICATE payload bytes (oversize fails closed) — borderline (security cap) | `limits.sasl_decode_max_bytes` (NEW) | uint | 8192 | 256..65536 |
+| dispatch.zig / sasl_mechrouter.zig | `MAX_RAW_MESSAGE` | `512` | max decoded SASL AUTHENTICATE payload bytes for preregistration SASL and IRCX AUTH. The TOML value can lower, but not raise above, the fixed protocol buffer. | `limits.sasl_decode_max_bytes` *(schema-backed; default 512)* | uint | 512 | 64..512 |
 | config_format.zig:239 | `Config.nick_delay_ms` | `0` (disabled) | hold window for released nicks after owner exits; prevents nick-camping; `0` = disabled | `limits.nick_delay` *(schema-backed)* | duration | 0 | 0..– |
 
 ## [io] (new): io_uring and transport tuning

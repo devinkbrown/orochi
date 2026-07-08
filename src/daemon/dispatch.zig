@@ -822,6 +822,9 @@ pub const ClientSession = struct {
     sasl_totp_gate: ?sasl.TotpGate = null,
     /// Config gate for SASL ANONYMOUS. Default false.
     sasl_allow_anonymous: bool = false,
+    /// Effective maximum decoded SASL message bytes for this session. The router
+    /// has a compile-time hard cap; config may lower it for stricter deployments.
+    sasl_decode_max_bytes: usize = sasl_mechrouter.MAX_RAW_MESSAGE,
     /// Per-session SASL mechanism router. Lazily initialized on the first
     /// AUTHENTICATE <mech> line so the heavy fixed buffers cost nothing for
     /// connections that never authenticate. Reset to null on abort/failure so a
@@ -1798,7 +1801,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             return;
         }
 
-        var router = sasl_mechrouter.Router.init(.{
+        var router = sasl_mechrouter.Router.initWithLimit(.{
             .plain = saslPlainAdapter(ctx.session),
             .external = ctx.session.sasl_external,
             .scram256 = ctx.session.sasl_scram256,
@@ -1806,7 +1809,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             .session_token = ctx.session.sasl_session_token,
             .oauthbearer = ctx.session.sasl_oauthbearer,
             .anonymous = ctx.session.sasl_allow_anonymous,
-        }, ctx.session.sasl_server_nonce);
+        }, ctx.session.sasl_server_nonce, ctx.session.sasl_decode_max_bytes);
         router.tls_certfp = ctx.session.tls_certfp;
         router.tls_exporter = ctx.session.tls_exporter;
 

@@ -147,6 +147,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
+    out.sasl_decode_max_bytes = cfg.limits.sasl_decode_max_bytes;
     out.sasl_allow_anonymous = cfg.sasl.allow_anonymous;
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;

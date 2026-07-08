@@ -15,6 +15,7 @@ const std = @import("std");
 const toml = @import("../proto/toml.zig");
 const conn_class = @import("conn_class.zig");
 const shard = @import("shard.zig");
+const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
 
@@ -331,6 +332,9 @@ pub const Config = struct {
         /// Period of the io_uring timeout-sweep timer; sets the enforcement
         /// granularity of registration/ping/idle timeouts.
         sweep_interval_ms: u64 = 2_000,
+        /// Max decoded SASL AUTHENTICATE payload bytes. May be lowered by config
+        /// but not raised above the router's fixed protocol buffer.
+        sasl_decode_max_bytes: u32 = sasl_mechrouter.MAX_RAW_MESSAGE,
     };
 
     /// One `[class.<name>]` connection class as parsed from TOML (owned strings).
@@ -948,6 +952,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("limits.ping_timeout")) |s| cfg.limits.ping_timeout_ms = try durationMs(s);
     if (doc.getString("limits.reputation_half_life")) |s| cfg.limits.reputation_half_life_ms = try durationMs(s);
     if (doc.getString("limits.sweep_interval")) |s| cfg.limits.sweep_interval_ms = try durationMs(s);
+    cfg.limits.sasl_decode_max_bytes = @intCast(try uintField(doc, "limits.sasl_decode_max_bytes", cfg.limits.sasl_decode_max_bytes, 64, sasl_mechrouter.MAX_RAW_MESSAGE));
 
     // [io]
     cfg.io.ring_entries = @intCast(try uintField(doc, "io.ring_entries", cfg.io.ring_entries, 8, 4096));
@@ -1744,6 +1749,7 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
         \\irc = 6680
         \\[limits]
         \\sweep_interval = "500ms"
+        \\sasl_decode_max_bytes = 256
         \\[io]
         \\ring_entries = 256
         \\[reputation]
@@ -1754,11 +1760,14 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
     try testing.expectEqual(@as(u64, 500), cfg.limits.sweep_interval_ms);
+    try testing.expectEqual(@as(u32, 256), cfg.limits.sasl_decode_max_bytes);
     try testing.expectEqual(@as(u32, 256), cfg.io.ring_entries);
     try testing.expectEqual(@as(f64, 80.0), cfg.reputation.registration_timeout_penalty);
     try testing.expectEqual(@as(f64, 10.0), cfg.reputation.clone_refuse_penalty);
     // out-of-range ring_entries rejected
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\nring_entries=4\n", .{}));
+    // Cannot promise SASL payloads beyond the compiled router buffer.
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nsasl_decode_max_bytes=4096\n", .{}));
 }
 
 test "parseToml: num_shards lifts and defaults to 1" {

@@ -212,6 +212,7 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 | `reputation_refuse_threshold` | integer | `0` | `0..1000000` | Refuse connects at or above decaying reputation score; `0` disables (`src/daemon/server.zig:1012`). |
 | `reputation_half_life` | duration string | `"1m"` | positive `ms/s/m/h` duration | IP reputation score decay half-life (`src/daemon/config_boot.zig:53`). |
 | `sweep_interval` | duration string | `"2s"` | positive `ms/s/m/h` duration | Timeout sweep timer granularity (`src/daemon/config_boot.zig:54`). |
+| `sasl_decode_max_bytes` | integer | `512` | `64..512` | Maximum decoded SASL AUTHENTICATE payload bytes for registration SASL and IRCX AUTH. The upper bound is the router's compiled protocol buffer; lower it only for hardened deployments. |
 
 ## `[class.<name>]`
 

@@ -293,6 +293,7 @@ handshake_timeout = "30s"   # registration must complete within this
 ping_interval = "2m"        # idle interval before a PING is sent
 ping_timeout = "1m"         # unanswered-PING grace before disconnect
 sweep_interval = "2s"       # timeout-sweep timer granularity
+sasl_decode_max_bytes = 512 # max decoded SASL payload bytes (64..512)
 # Advertised + enforced length/count limits (also appear in ISUPPORT 005):
 topiclen = 390         # TOPICLEN  (1..8192)
 awaylen = 256          # AWAYLEN   (1..256)
