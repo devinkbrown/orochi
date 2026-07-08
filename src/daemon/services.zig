@@ -34,6 +34,11 @@ const hash_hex_len = hash_len * 2;
 const generation_len = 16;
 const generation_hex_len = generation_len * 2;
 pub const default_pbkdf2_rounds: u32 = 100_000;
+pub const default_password_min_len: usize = 8;
+pub const default_password_max_len: usize = 512;
+pub const password_policy_min_len_max: usize = 64;
+pub const password_policy_max_len_min: usize = 64;
+pub const password_policy_max_len: usize = 4096;
 
 /// Runtime-tunable account/credential policy. Defaults preserve the historical
 /// hardcoded behaviour; the orchestrator overlays the `[accounts]` TOML section
@@ -41,12 +46,28 @@ pub const default_pbkdf2_rounds: u32 = 100_000;
 pub const Config = struct {
     /// PBKDF2-HMAC-SHA256 iteration count for account password hashing.
     pbkdf2_rounds: u32 = default_pbkdf2_rounds,
+    /// Minimum length for newly registered or changed account passwords.
+    password_min_len: usize = default_password_min_len,
+    /// Maximum length for newly registered or changed account passwords.
+    password_max_len: usize = default_password_max_len,
 
     /// Overlay `[accounts]` keys from a parsed TOML document onto `cfg`. Missing
     /// keys leave the current value untouched. Pure: no I/O, never fails.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
         if (doc.getUint("accounts.pbkdf2_rounds")) |v| {
             if (v >= 1 and v <= std.math.maxInt(u32)) cfg.pbkdf2_rounds = @intCast(v);
+        }
+        var min_len = cfg.password_min_len;
+        var max_len = cfg.password_max_len;
+        if (doc.getUint("accounts.password_min_len")) |v| {
+            if (v >= 1 and v <= password_policy_min_len_max) min_len = @intCast(v);
+        }
+        if (doc.getUint("accounts.password_max_len")) |v| {
+            if (v >= password_policy_max_len_min and v <= password_policy_max_len) max_len = @intCast(v);
+        }
+        if (min_len <= max_len) {
+            cfg.password_min_len = min_len;
+            cfg.password_max_len = max_len;
         }
     }
 };
@@ -416,6 +437,10 @@ pub const Services = struct {
         defer self.lock.unlockExclusive();
 
         try self.store.snapshotAndTruncate();
+    }
+
+    fn validateNewPassword(self: *const Services, password: []const u8) ServiceError!void {
+        try validatePasswordPolicy(password, self.cfg.password_min_len, self.cfg.password_max_len);
     }
 
     /// Bind a TLS certfp to an account (the CERTADD command). Caller has verified
@@ -930,7 +955,7 @@ pub const Services = struct {
         const key = try accountKey(name);
         if (self.accountForbiddenUnlocked(key.asSlice())) return error.Forbidden;
         if (self.store.family(.accounts).get(key.asSlice()) != null) return error.AlreadyExists;
-        try validatePassword(password);
+        try self.validateNewPassword(password);
 
         var salt: [salt_len]u8 = undefined;
         self.store.io.randomSecure(&salt) catch self.store.io.random(&salt);
@@ -1060,7 +1085,7 @@ pub const Services = struct {
 
         var record = try self.loadAccount(name);
         try verifyPassword(record, old_password, self.cfg.pbkdf2_rounds);
-        try validatePassword(new_password);
+        try self.validateNewPassword(new_password);
         // A change must actually change the password.
         if (std.mem.eql(u8, old_password, new_password)) return error.InvalidPassword;
 
@@ -1099,7 +1124,7 @@ pub const Services = struct {
         defer self.lock.unlockExclusive();
 
         var record = try self.loadAccount(name);
-        try validatePassword(new_password);
+        try self.validateNewPassword(new_password);
 
         var salt: [salt_len]u8 = undefined;
         self.store.io.randomSecure(&salt) catch self.store.io.random(&salt);
@@ -2476,7 +2501,11 @@ pub const Services = struct {
 };
 
 fn validatePassword(password: []const u8) ServiceError!void {
-    if (password.len < 8 or password.len > 512) return error.InvalidPassword;
+    try validatePasswordPolicy(password, default_password_min_len, default_password_max_len);
+}
+
+fn validatePasswordPolicy(password: []const u8, min_len: usize, max_len: usize) ServiceError!void {
+    if (password.len < min_len or password.len > max_len) return error.InvalidPassword;
     for (password) |byte| if (byte == 0 or byte == '\n' or byte == '\r') return error.InvalidPassword;
 }
 
@@ -3997,19 +4026,26 @@ test "state hook fires on channel register and drop" {
     try std.testing.expectEqualStrings("#orochi", rec.dropped[0..rec.dropped_len]);
 }
 
-test "Config default preserves historical pbkdf2 rounds" {
+test "Config default preserves historical account policy" {
     const cfg = Config{};
     try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
     try std.testing.expectEqual(@as(u32, 100_000), cfg.pbkdf2_rounds);
+    try std.testing.expectEqual(default_password_min_len, cfg.password_min_len);
+    try std.testing.expectEqual(default_password_max_len, cfg.password_max_len);
 }
 
-test "Config.applyToml overlays accounts.pbkdf2_rounds" {
-    var doc = try toml.parse(std.testing.allocator, "[accounts]\npbkdf2_rounds = 250000\n");
+test "Config.applyToml overlays account password policy" {
+    var doc = try toml.parse(
+        std.testing.allocator,
+        "[accounts]\npbkdf2_rounds = 250000\npassword_min_len = 12\npassword_max_len = 1024\n",
+    );
     defer doc.deinit(std.testing.allocator);
 
     var cfg = Config{};
     cfg.applyToml(&doc);
     try std.testing.expectEqual(@as(u32, 250_000), cfg.pbkdf2_rounds);
+    try std.testing.expectEqual(@as(usize, 12), cfg.password_min_len);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.password_max_len);
 }
 
 test "Config.applyToml leaves defaults when keys absent" {
@@ -4019,6 +4055,8 @@ test "Config.applyToml leaves defaults when keys absent" {
     var cfg = Config{};
     cfg.applyToml(&doc);
     try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
+    try std.testing.expectEqual(default_password_min_len, cfg.password_min_len);
+    try std.testing.expectEqual(default_password_max_len, cfg.password_max_len);
 }
 
 test "Config.applyToml ignores out-of-range rounds" {
@@ -4068,15 +4106,21 @@ test "registerAccount without a SCRAM store leaves SCRAM unprovisioned" {
     try std.testing.expect(services.scram == null);
 }
 
-test "initWithConfig threads custom rounds into hashing" {
+test "initWithConfig threads custom account policy into hashing and password validation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store = try openTestStore(tmp, "services-cfg-rounds.wal");
     defer store.deinit();
-    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 4096 });
+    var services = Services.initWithConfig(&store, null, .{
+        .pbkdf2_rounds = 4096,
+        .password_min_len = 12,
+        .password_max_len = 32,
+    });
     var scratch: [record_max]u8 = undefined;
 
+    try std.testing.expectError(error.InvalidPassword, services.registerAccount("too_short", "short", &scratch));
+    try std.testing.expectError(error.InvalidPassword, services.registerAccount("too_long", "this password is longer than twenty four bytes", &scratch));
     _ = try services.registerAccount("Bob", "correct horse battery staple", &scratch);
     const identified = try services.identifyAccount("bob", "correct horse battery staple");
     try std.testing.expectEqualStrings("bob", identified.identified.name.asSlice());

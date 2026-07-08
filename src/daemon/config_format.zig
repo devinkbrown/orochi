@@ -450,6 +450,10 @@ pub const Config = struct {
     pub const Accounts = struct {
         /// PBKDF2-HMAC-SHA256 iteration count for account password hashes.
         pbkdf2_rounds: u32 = services_mod.default_pbkdf2_rounds,
+        /// Minimum length for newly registered or changed account passwords.
+        password_min_len: u64 = services_mod.default_password_min_len,
+        /// Maximum length for newly registered or changed account passwords.
+        password_max_len: u64 = services_mod.default_password_max_len,
     };
 
     /// `[bouncer]` — per-account bouncer/offline-message retention limits.
@@ -1022,6 +1026,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [accounts]
     cfg.accounts.pbkdf2_rounds = @intCast(try uintField(doc, "accounts.pbkdf2_rounds", cfg.accounts.pbkdf2_rounds, 10_000, 10_000_000));
+    cfg.accounts.password_min_len = try uintField(doc, "accounts.password_min_len", cfg.accounts.password_min_len, 1, 64);
+    cfg.accounts.password_max_len = try uintField(doc, "accounts.password_max_len", cfg.accounts.password_max_len, 64, 4096);
+    if (cfg.accounts.password_min_len > cfg.accounts.password_max_len) return error.ParseError;
 
     // [bouncer]
     cfg.bouncer.tegami_text_max_len = try uintField(doc, "bouncer.tegami_text_max_len", cfg.bouncer.tegami_text_max_len, 64, 2048);
@@ -1737,15 +1744,21 @@ test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {
         \\irc = 6680
         \\[accounts]
         \\pbkdf2_rounds = 250000
+        \\password_min_len = 12
+        \\password_max_len = 1024
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
     try testing.expectEqual(@as(u32, 250_000), cfg.accounts.pbkdf2_rounds);
+    try testing.expectEqual(@as(u64, 12), cfg.accounts.password_min_len);
+    try testing.expectEqual(@as(u64, 1024), cfg.accounts.password_max_len);
 
     var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
     defer omitted.deinit(allocator);
     try testing.expectEqual(services_mod.default_pbkdf2_rounds, omitted.accounts.pbkdf2_rounds);
+    try testing.expectEqual(@as(u64, services_mod.default_password_min_len), omitted.accounts.password_min_len);
+    try testing.expectEqual(@as(u64, services_mod.default_password_max_len), omitted.accounts.password_max_len);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]
@@ -1763,6 +1776,24 @@ test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {
         \\irc = 6680
         \\[accounts]
         \\pbkdf2_rounds = 10000001
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[accounts]
+        \\password_min_len = 65
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[accounts]
+        \\password_max_len = 63
         \\
     , .{}));
 }

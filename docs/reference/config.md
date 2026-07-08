@@ -281,6 +281,8 @@ Durable account-services policy. These settings take effect when `[sasl].account
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `pbkdf2_rounds` | integer | `100000` | `10000..10000000` | PBKDF2-HMAC-SHA256 iteration count for new password hashes and password verification timing equalization. |
+| `password_min_len` | integer | `8` | `1..64` | Minimum length for newly registered or changed account passwords. |
+| `password_max_len` | integer | `512` | `64..4096` | Maximum length for newly registered or changed account passwords. Existing account login keeps the historical verifier bounds to avoid lockout after tightening policy. |
 
 ## `[bouncer]`
 

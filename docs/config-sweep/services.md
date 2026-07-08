@@ -21,8 +21,8 @@ wire constants and is not included; the operational store tunables live in store
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
 | config_format.zig / services.zig | `accounts.pbkdf2_rounds` / `default_pbkdf2_rounds` | `100_000` | PBKDF2-HMAC-SHA256 iteration count for account password hashing (tunable policy — explicitly in scope) | `accounts.pbkdf2_rounds` *(schema-backed)* | uint | 100000 | 10000..10000000 |
-| services.zig:488 | `validatePassword` min | `8` | minimum account password length | `accounts.password_min_len` | uint | 8 | 1..64 |
-| services.zig:488 | `validatePassword` max | `512` | maximum account password length | `accounts.password_max_len` | uint | 512 | 64..4096 |
+| config_format.zig / services.zig | `accounts.password_min_len` / `validateNewPassword` | `8` | minimum new account password length | `accounts.password_min_len` *(schema-backed)* | uint | 8 | 1..64 |
+| config_format.zig / services.zig | `accounts.password_max_len` / `validateNewPassword` | `512` | maximum new account password length | `accounts.password_max_len` *(schema-backed)* | uint | 512 | 64..4096 |
 | services.zig:8 | `account_max` | `32` | max account name length | `accounts.name_max_len` | uint | 32 | 8..128 |
 | services.zig:11 | `email_max` | `96` | max stored account email length | `accounts.email_max_len` | uint | 96 | 32..256 |
 | services.zig:9 | `channel_max` | `64` | max registered channel name length | `accounts.channel_name_max_len` | uint | 64 | 8..128 |

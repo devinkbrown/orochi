@@ -389,6 +389,8 @@ pub fn main(init: std.process.Init) !void {
                 account_store = store;
                 account_services = orochi.daemon.services.Services.initWithConfig(&account_store.?, null, .{
                     .pbkdf2_rounds = h.parsed.accounts.pbkdf2_rounds,
+                    .password_min_len = @intCast(h.parsed.accounts.password_min_len),
+                    .password_max_len = @intCast(h.parsed.accounts.password_max_len),
                 });
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);

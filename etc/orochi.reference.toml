@@ -412,6 +412,8 @@ max_per_account = 64   # live sessions per account (1..1000000)
 # --- [accounts] — durable account-services policy ---------------------------
 [accounts]
 pbkdf2_rounds = 100000  # password hashing iterations (10000..10000000)
+password_min_len = 8    # new password minimum length (1..64)
+password_max_len = 512  # new password maximum length (64..4096)
 
 
 # --- [bouncer] — per-account bouncer/offline-message limits ------------------
