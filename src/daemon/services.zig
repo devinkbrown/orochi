@@ -33,7 +33,7 @@ const salt_hex_len = salt_len * 2;
 const hash_hex_len = hash_len * 2;
 const generation_len = 16;
 const generation_hex_len = generation_len * 2;
-const default_pbkdf2_rounds: u32 = 100_000;
+pub const default_pbkdf2_rounds: u32 = 100_000;
 
 /// Runtime-tunable account/credential policy. Defaults preserve the historical
 /// hardcoded behaviour; the orchestrator overlays the `[accounts]` TOML section

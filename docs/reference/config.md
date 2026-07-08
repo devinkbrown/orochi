@@ -272,6 +272,16 @@ Source: struct at `src/daemon/config_format.zig:158`, parsing at `src/daemon/con
 | `registration_timeout_penalty` | float | `50.0` | `0..1000` | Reputation penalty for unfinished registration (`src/daemon/server.zig:1020`). |
 | `clone_refuse_penalty` | float | `25.0` | `0..1000` | Reputation penalty for clone-limit refusal (`src/daemon/server.zig:1022`). |
 
+## `[accounts]`
+
+Source: struct `Accounts` in `src/daemon/config_format.zig`, parsing in `src/daemon/config_format.zig`, services construction in `src/main.zig`.
+
+Durable account-services policy. These settings take effect when `[sasl].account_db` is configured and the daemon opens the account store.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `pbkdf2_rounds` | integer | `100000` | `10000..10000000` | PBKDF2-HMAC-SHA256 iteration count for new password hashes and password verification timing equalization. |
+
 ## `[sessions]`
 
 Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/config_format.zig:384`, mapping at `src/daemon/config_boot.zig:58`.

@@ -17,6 +17,7 @@ const acme_cli = @import("acme_cli.zig");
 const acme_http01_listener = @import("acme_http01_listener.zig");
 const acme_runner = @import("acme_runner.zig");
 const conn_class = @import("conn_class.zig");
+const services_mod = @import("services.zig");
 const shard = @import("shard.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
@@ -63,6 +64,7 @@ pub const Config = struct {
     stats: Stats = .{},
     backup: Backup = .{},
     metrics: Metrics = .{},
+    accounts: Accounts = .{},
     webhook: Webhook = .{},
     geoip: Geoip = .{},
     sasl: Sasl = .{},
@@ -435,6 +437,13 @@ pub const Config = struct {
         /// private interface (or "0.0.0.0") only deliberately; front it with a
         /// firewall / reverse proxy for remote scraping.
         bind: []const u8 = "127.0.0.1",
+    };
+
+    /// `[accounts]` — durable services/account policy. These values are applied
+    /// when main opens `[sasl].account_db` and constructs the Services layer.
+    pub const Accounts = struct {
+        /// PBKDF2-HMAC-SHA256 iteration count for account password hashes.
+        pbkdf2_rounds: u32 = services_mod.default_pbkdf2_rounds,
     };
 
     /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
@@ -984,6 +993,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [reputation]
     cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
     cfg.reputation.clone_refuse_penalty = try floatField(doc, "reputation.clone_refuse_penalty", cfg.reputation.clone_refuse_penalty, 0, 1000);
+
+    // [accounts]
+    cfg.accounts.pbkdf2_rounds = @intCast(try uintField(doc, "accounts.pbkdf2_rounds", cfg.accounts.pbkdf2_rounds, 10_000, 10_000_000));
 
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
@@ -1673,6 +1685,45 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     try testing.expect(!omitted.sasl.enabled_explicit);
     try testing.expect(!omitted.sasl.allow_anonymous);
     try testing.expect(omitted.sasl.oauth_account_claim == null);
+}
+
+test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[accounts]
+        \\pbkdf2_rounds = 250000
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 250_000), cfg.accounts.pbkdf2_rounds);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(services_mod.default_pbkdf2_rounds, omitted.accounts.pbkdf2_rounds);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[accounts]
+        \\pbkdf2_rounds = 9999
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[accounts]
+        \\pbkdf2_rounds = 10000001
+        \\
+    , .{}));
 }
 
 test "parseToml: [sasl] rejects multiple OAuth key sources" {

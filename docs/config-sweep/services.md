@@ -20,7 +20,7 @@ wire constants and is not included; the operational store tunables live in store
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
-| services.zig:22 | `pbkdf2_rounds` | `100_000` | PBKDF2-HMAC-SHA256 iteration count for account password hashing (tunable policy — explicitly in scope) | `accounts.pbkdf2_rounds` | uint | 100000 | 10000..10000000 |
+| config_format.zig / services.zig | `accounts.pbkdf2_rounds` / `default_pbkdf2_rounds` | `100_000` | PBKDF2-HMAC-SHA256 iteration count for account password hashing (tunable policy — explicitly in scope) | `accounts.pbkdf2_rounds` *(schema-backed)* | uint | 100000 | 10000..10000000 |
 | services.zig:488 | `validatePassword` min | `8` | minimum account password length | `accounts.password_min_len` | uint | 8 | 1..64 |
 | services.zig:488 | `validatePassword` max | `512` | maximum account password length | `accounts.password_max_len` | uint | 512 | 64..4096 |
 | services.zig:8 | `account_max` | `32` | max account name length | `accounts.name_max_len` | uint | 32 | 8..128 |

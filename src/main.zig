@@ -387,7 +387,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (h.parsed.sasl.account_db) |db| {
             if (orochi.daemon.services.OroStore.open(allocator, init.io, std.Io.Dir.cwd(), db)) |store| {
                 account_store = store;
-                account_services = orochi.daemon.services.Services.init(&account_store.?, null);
+                account_services = orochi.daemon.services.Services.initWithConfig(&account_store.?, null, .{
+                    .pbkdf2_rounds = h.parsed.accounts.pbkdf2_rounds,
+                });
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works
