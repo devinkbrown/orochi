@@ -198,6 +198,9 @@ enable_resumption = false
 # Maximum 0-RTT early data bytes advertised in tickets. 0 disables early data
 # while still allowing resumption when enable_resumption is true.
 early_data_max_size = 0
+# RFC 7250 server raw public keys. Off keeps the normal X.509 Certificate path;
+# on lets clients that explicitly offer RawPublicKey receive the leaf SPKI.
+raw_public_key = false
 # Server-side Encrypted Client Hello acceptance. The ECHConfigList is published
 # out-of-band (for example DNS HTTPS RR); the daemon only consumes the local copy
 # and the matching X25519 HPKE private key. Omit to keep ECH off.

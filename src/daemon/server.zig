@@ -1666,6 +1666,10 @@ pub const Config = struct {
     /// Server-side Encrypted Client Hello keys loaded by main.zig. Empty ⇒ ECH is
     /// not accepted, preserving the existing outer-ClientHello behavior.
     tls_ech_keys: []const tls_server.EchKey = &.{},
+    /// RFC 7250 server raw public keys. Default false preserves X.509 Certificate
+    /// messages; when true, clients that explicitly offer RawPublicKey may receive
+    /// the leaf SPKI instead of the certificate chain.
+    tls_raw_public_key: bool = false,
     /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
     /// TLS listener. Default false keeps the listener's historical full-handshake
     /// behavior byte-identical.
@@ -3860,6 +3864,7 @@ pub const LinuxServer = struct {
             .request_client_cert = request_client_cert,
             .sni_certs = self.config.tls_sni_certs,
             .ech_keys = self.config.tls_ech_keys,
+            .enable_raw_public_key = self.config.tls_raw_public_key,
         };
         if (self.config.tls_ocsp_staple) |staple| cfg.ocsp_staple = staple;
         if (self.config.tls_enable_resumption) {
@@ -29223,6 +29228,19 @@ test "banContextFor carries TLS state for secure extbans" {
         try std.testing.expect(ctx.certfp != null);
         try std.testing.expectEqualStrings(fp, ctx.certfp.?);
     }
+}
+
+test "tls13Config carries raw-public-key negotiation gate" {
+    var server: LinuxServer = undefined;
+    server.config = .{ .port = 0, .tls_raw_public_key = true };
+
+    const cfg = server.tls13Config(false);
+    try std.testing.expect(cfg.enable_raw_public_key);
+    try std.testing.expect(!cfg.request_client_cert);
+
+    const mtls_cfg = server.tls13Config(true);
+    try std.testing.expect(mtls_cfg.enable_raw_public_key);
+    try std.testing.expect(mtls_cfg.request_client_cert);
 }
 
 /// Whether `text` contains a CTCP request that `+C` should block. CTCP ACTION

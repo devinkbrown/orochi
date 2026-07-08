@@ -555,6 +555,10 @@ pub const Config = struct {
         /// Maximum accepted TLS 1.3 0-RTT early application bytes advertised in
         /// issued tickets. Zero disables early data while keeping PSK resumption.
         early_data_max_size: u32 = 0,
+        /// RFC 7250 server raw public keys. When true, a client that offers
+        /// `server_certificate_type = RawPublicKey` may receive the leaf SPKI
+        /// instead of the X.509 chain. Default false keeps the classic path.
+        raw_public_key: bool = false,
         /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
         ktls: KtlsMode = .off,
         /// Additional SNI-selectable certificates (`[[tls.sni]]`, owned). When a
@@ -1043,6 +1047,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("tls.enable_tls12")) |b| cfg.tls.enable_tls12 = b;
     if (doc.getBool("tls.enable_resumption")) |b| cfg.tls.enable_resumption = b;
     cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
+    if (doc.getBool("tls.raw_public_key")) |b| cfg.tls.raw_public_key = b;
     if (doc.getString("tls.ktls")) |s| cfg.tls.ktls = parseKtlsMode(s) orelse return error.ParseError;
 
     // [[tls.sni]] — additional SNI-selectable certificates. Each entry pairs one
@@ -1892,6 +1897,7 @@ test "parseToml: [tls] section projects onto Config" {
         \\enable_tls12 = true
         \\enable_resumption = true
         \\early_data_max_size = 16384
+        \\raw_public_key = true
         \\ktls = "tx"
         \\[[tls.ech_keys]]
         \\config_path = "/etc/orochi/echconfig.bin"
@@ -1914,6 +1920,7 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expect(cfg.tls.enable_tls12);
     try testing.expect(cfg.tls.enable_resumption);
     try testing.expectEqual(@as(u32, 16384), cfg.tls.early_data_max_size);
+    try testing.expect(cfg.tls.raw_public_key);
     try testing.expectEqual(Config.KtlsMode.tx, cfg.tls.ktls);
     try testing.expectEqual(@as(usize, 1), cfg.tls.ech_keys.len);
     try testing.expectEqualStrings("/etc/orochi/echconfig.bin", cfg.tls.ech_keys[0].config_path);

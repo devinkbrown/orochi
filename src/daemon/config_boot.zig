@@ -266,6 +266,7 @@ pub const TlsBootConfig = struct {
     enable_tls12: bool = false,
     enable_resumption: bool = false,
     early_data_max_size: u32 = 0,
+    raw_public_key: bool = false,
     ktls: config_format.Config.KtlsMode = .off,
     /// Additional SNI-selectable certificates (`[[tls.sni]]`). Strings borrow
     /// `parsed`; `main.zig` loads each entry's cert+key and hands the material to
@@ -290,6 +291,7 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .enable_tls12 = cfg.tls.enable_tls12,
         .enable_resumption = cfg.tls.enable_resumption,
         .early_data_max_size = cfg.tls.early_data_max_size,
+        .raw_public_key = cfg.tls.raw_public_key,
         .ktls = cfg.tls.ktls,
         .sni = cfg.tls.sni,
         .ech_keys = cfg.tls.ech_keys,
@@ -474,6 +476,7 @@ test "config text overlays the server config" {
         \\realm = "ircxnet"
         \\[tls]
         \\enabled = true
+        \\raw_public_key = true
         \\[[tls.ech_keys]]
         \\config_path = "/etc/orochi/echconfig.bin"
         \\private_key = "2222222222222222222222222222222222222222222222222222222222222222"
@@ -512,6 +515,7 @@ test "config text overlays the server config" {
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
     try testing.expect(loaded.tls.enabled);
+    try testing.expect(loaded.tls.raw_public_key);
     try testing.expectEqual(@as(usize, 1), loaded.tls.ech_keys.len);
     try testing.expectEqualStrings("/etc/orochi/echconfig.bin", loaded.tls.ech_keys[0].config_path);
     try testing.expectEqual(@as([32]u8, @splat(0x22)), loaded.tls.ech_keys[0].private_key);

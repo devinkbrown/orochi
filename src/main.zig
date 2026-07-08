@@ -628,6 +628,7 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
                 srv_cfg.tls_sni_certs = tls_sni_certs;
                 if (tls_ech_loaded) |e| srv_cfg.tls_ech_keys = e.keys;
+                srv_cfg.tls_raw_public_key = h.tls.raw_public_key;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
