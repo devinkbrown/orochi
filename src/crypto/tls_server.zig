@@ -521,6 +521,13 @@ pub const Server = struct {
     /// length it will accept. Default 2^14+1 = "no restriction beyond the protocol
     /// max". Outbound application records are fragmented to honor it.
     peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
+    /// RFC 8449 §4: the client offered `record_size_limit` in its ClientHello.
+    /// The server MUST NOT send its own `record_size_limit` in EncryptedExtensions
+    /// unless the client offered one (RFC 8446 §4.2: no unsolicited extension
+    /// responses). Re-derived per ClientHello so a HelloRetryRequest's second
+    /// ClientHello is authoritative. Emitting it unconditionally made strict
+    /// clients (BoringSSL/Chrome) abort the handshake as an unexpected extension.
+    record_size_limit_offered: bool = false,
     /// The client offered the status_request extension (wants an OCSP staple).
     /// When true AND `config.ocsp_staple` is non-empty, the leaf CertificateEntry
     /// carries the staple.
@@ -1455,6 +1462,7 @@ pub const Server = struct {
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
+        var offered_record_size_limit = false; // RFC 8449: echo only when offered
         var dc_accepted = false; // RFC 9345: client's delegated_credential accepts our DC's scheme
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
@@ -1501,6 +1509,7 @@ pub const Server = struct {
                     const limit = std.mem.readInt(u16, ext.data[0..2], .big);
                     if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
                     self.peer_record_size_limit = limit;
+                    offered_record_size_limit = true;
                 },
                 .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
                 .delegated_credential => {
@@ -1546,6 +1555,7 @@ pub const Server = struct {
             self.sni_cert = self.selectSniCert(sni_name);
         }
         self.resumed = false;
+        self.record_size_limit_offered = offered_record_size_limit;
         self.early_data_offered = offered_early_data;
         self.early_data_accepted = false;
         self.early_data_done = !offered_early_data;
@@ -1857,12 +1867,18 @@ pub const Server = struct {
             );
         }
         if (self.early_data_accepted) try ext_builder.addTyped(.early_data, "");
-        // RFC 8449: advertise the max TLSInnerPlaintext we accept (full-size
-        // records — our recv path handles them). Enforcement of the PEER's limit
-        // happens on our send path (see `encrypt`).
-        var rsl_buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
-        try ext_builder.addTyped(.record_size_limit, &rsl_buf);
+        // RFC 8449 §4: advertise the max TLSInnerPlaintext we accept (full-size
+        // records — our recv path handles them), but ONLY as a response to the
+        // client's own `record_size_limit` offer. RFC 8446 §4.2 forbids sending
+        // an extension the peer did not solicit, and strict clients (BoringSSL/
+        // Chrome, which does not offer it in its WebSocket ClientHello) abort the
+        // handshake on the unsolicited extension. Enforcement of the PEER's limit
+        // happens on our send path (see `encrypt`) regardless of whether we echo.
+        if (self.record_size_limit_offered) {
+            var rsl_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
+            try ext_builder.addTyped(.record_size_limit, &rsl_buf);
+        }
         try self.emit(out, .encrypted_extensions, try ext_builder.finish());
     }
 
@@ -4670,6 +4686,71 @@ test "buildTicketExtensions omits early_data when 0-RTT disabled (BoringSSL regr
     try std.testing.expectEqual(@as(usize, 4), first.data.len);
     try std.testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, first.data[0..4], .big));
     try std.testing.expect((try it1.next()) == null);
+}
+
+test "EncryptedExtensions omit record_size_limit + early_data when client offered neither (BoringSSL regression)" {
+    // Chrome/BoringSSL's WebSocket ClientHello offers neither early_data nor
+    // record_size_limit. RFC 8446 §4.2 forbids the server from sending an
+    // extension the client did not solicit, and RFC 8449 §4 forbids an
+    // unsolicited record_size_limit. Emitting either made BoringSSL abort the
+    // handshake (SSL_R_UNEXPECTED_EXTENSION). This drives writeEncryptedExtensions
+    // directly and asserts the PLAINTEXT EncryptedExtensions carries an EMPTY
+    // extensions vector — no early_data (42), no record_size_limit (28).
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6B)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6B, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+
+    // Simulate the browser ClientHello: no ALPN, no RawPublicKey, no 0-RTT, and
+    // — the load-bearing part — no record_size_limit offer.
+    server.selected_alpn = null;
+    server.server_cert_type_rpk = false;
+    server.resumed = false;
+    server.early_data_accepted = false;
+    server.record_size_limit_offered = false;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try server.writeEncryptedExtensions(&out);
+
+    // out = [msg_type:1][len:3][ext_vec_len:2][extensions…].
+    try std.testing.expect(out.items.len >= 6);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(HandshakeType.encrypted_extensions)), out.items[0]);
+    const ext_len = std.mem.readInt(u16, out.items[4..6], .big);
+    try std.testing.expectEqual(@as(u16, 0), ext_len);
+    var it = tls_extension.Iterator.init(out.items[6..]);
+    try std.testing.expect((try it.next()) == null);
+
+    // Positive control: a client that DID offer record_size_limit gets it echoed
+    // (and still no early_data on a fresh handshake).
+    server.transcript.clearRetainingCapacity();
+    server.record_size_limit_offered = true;
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(alloc);
+    try server.writeEncryptedExtensions(&out2);
+    try std.testing.expect(out2.items.len >= 6);
+    const ext_len2 = std.mem.readInt(u16, out2.items[4..6], .big);
+    try std.testing.expect(ext_len2 > 0);
+    var it2 = tls_extension.Iterator.init(out2.items[6..]);
+    var saw_rsl = false;
+    while (try it2.next()) |ext| {
+        if (ext.typed() == .record_size_limit) saw_rsl = true;
+        try std.testing.expect(ext.typed() != .early_data);
+    }
+    try std.testing.expect(saw_rsl);
 }
 
 test "loopback: fresh (non-0-RTT) handshake with tickets on but 0-RTT off issues an early_data-free ticket" {
