@@ -2284,6 +2284,29 @@ pub const Server = struct {
         try KS.exportKeyingMaterial(&exporter_master, label, context, out);
     }
 
+    /// Build the NewSessionTicket extensions block (RFC 8446 §4.6.1).
+    ///
+    /// The `early_data` extension (a 4-byte `max_early_data_size`) advertises
+    /// that this ticket MAY be used for 0-RTT. It is emitted ONLY when 0-RTT is
+    /// actually enabled; with `max_early_data_size == 0` the ticket carries an
+    /// EMPTY extensions block. Emitting a stray 4-byte `early_data` here even
+    /// when 0-RTT was disabled made strict clients (BoringSSL/Chrome) abort the
+    /// handshake as an unexpected/unsolicited extension (SSL_R_UNEXPECTED_
+    /// EXTENSION), while lenient stacks (OpenSSL, GnuTLS, undici) silently
+    /// ignored it — the exact bug that broke the browser `wss://` listener.
+    ///
+    /// `storage` backs the returned slice (a view into it); the block includes
+    /// its own leading 2-byte total-length prefix, as `Builder.finish` returns.
+    fn buildTicketExtensions(storage: *[16]u8, max_early_data_size: u32) Error![]const u8 {
+        var builder = try tls_extension.Builder.begin(storage);
+        if (max_early_data_size > 0) {
+            var early_ext: [4]u8 = undefined;
+            std.mem.writeInt(u32, &early_ext, max_early_data_size, .big);
+            try builder.addTyped(.early_data, &early_ext);
+        }
+        return builder.finish();
+    }
+
     fn queueNewSessionTicket(self: *Server) Error!void {
         const suite = self.selected_suite orelse return error.BadState;
         var ticket_nonce: [tls_resumption.ticket_nonce_len]u8 = undefined;
@@ -2314,11 +2337,7 @@ pub const Server = struct {
         defer self.allocator.free(sealed);
 
         var ticket_ext_storage: [16]u8 = undefined;
-        var ticket_ext_builder = try tls_extension.Builder.begin(&ticket_ext_storage);
-        var early_ext: [4]u8 = undefined;
-        std.mem.writeInt(u32, &early_ext, self.config.max_early_data_size, .big);
-        try ticket_ext_builder.addTyped(.early_data, &early_ext);
-        const ticket_extensions = try ticket_ext_builder.finish();
+        const ticket_extensions = try buildTicketExtensions(&ticket_ext_storage, self.config.max_early_data_size);
 
         var ticket_body_buf: [512]u8 = undefined;
         const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
@@ -4627,6 +4646,93 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
     try std.testing.expect(resumed_client.handshakeDone());
     _ = try resumed_server.feed(rcfin);
     try std.testing.expect(resumed_server.handshakeDone());
+}
+
+test "buildTicketExtensions omits early_data when 0-RTT disabled (BoringSSL regression)" {
+    // 0-RTT disabled (max_early_data_size == 0): the extensions block MUST be
+    // empty — just the 2-byte total-length prefix of 0x0000, no early_data. A
+    // stray 4-byte early_data here is what strict clients (BoringSSL/Chrome)
+    // reject as an unexpected extension, breaking the browser wss:// listener.
+    var buf0: [16]u8 = undefined;
+    const ext0 = try Server.buildTicketExtensions(&buf0, 0);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00 }, ext0);
+    {
+        var it = tls_extension.Iterator.init(ext0[2..]);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // 0-RTT enabled: exactly one early_data extension carrying the u32 limit.
+    var buf1: [16]u8 = undefined;
+    const ext1 = try Server.buildTicketExtensions(&buf1, 4096);
+    var it1 = tls_extension.Iterator.init(ext1[2..]);
+    const first = (try it1.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.typed() == .early_data);
+    try std.testing.expectEqual(@as(usize, 4), first.data.len);
+    try std.testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, first.data[0..4], .big));
+    try std.testing.expect((try it1.next()) == null);
+}
+
+test "loopback: fresh (non-0-RTT) handshake with tickets on but 0-RTT off issues an early_data-free ticket" {
+    // Regression guard for the browser wss:// bug: a fresh ClientHello (no PSK,
+    // no early_data) against a server with session tickets enabled but 0-RTT
+    // disabled (max_early_data_size == 0) must (a) never emit `early_data` in
+    // EncryptedExtensions and (b) issue a NewSessionTicket that carries no
+    // early_data extension. Both are asserted below; the handshake completing
+    // proves the wire stayed well-formed for our own (lenient) client, and the
+    // helper test above pins the exact bytes a strict client would reject.
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5E)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5E, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 0,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+    // A fresh (non-resumption) handshake never accepts 0-RTT, so the server
+    // must not have emitted `early_data` in EncryptedExtensions.
+    try std.testing.expect(!server.earlyDataAccepted());
+
+    // Deliver the NewSessionTicket and confirm the client parsed it with a zero
+    // early-data limit (a nonzero limit would mean a stray early_data leaked).
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+    const decoded = try tls_resumption.decodeStoredSession(stored);
+    try std.testing.expectEqual(@as(u32, 0), decoded.max_early_data_size);
 }
 
 test "loopback: tls_client completes a handshake against tls_server with ECDSA-P256 leaf" {
