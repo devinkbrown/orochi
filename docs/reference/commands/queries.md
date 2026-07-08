@@ -50,13 +50,13 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 
 ## WHO
 
-- Syntax: `WHO <channel|nick> [%fields[,token]]`
-- Description: Plain WHO emits channel or nick rows. When the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead.
+- Syntax: `WHO <channel|nick> [%fields[,token]]`; `WHOX <channel|nick> %fields[,token]`
+- Description: Plain WHO emits channel or nick rows. When the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead. `WHOX` is a command-name alias for clients that send the extended form directly.
 - Privileges: Registered client.
 - Parameters: Target; optional WHOX selector.
 - Replies: Plain `RPL_WHOREPLY 352` and `RPL_ENDOFWHO 315`; WHOX `RPL_WHOSPCRPL 354` and `RPL_ENDOFWHO 315`.
 - Errors: `ERR_NEEDMOREPARAMS 461`.
-- Example: `WHO #zig %tcuhsnfar`
+- Example: `WHOX #zig %tcuhsnfar`
 - Sources: `src/daemon/modules/user_query.zig:76`, `src/daemon/server.zig:4741`, `src/daemon/server.zig:4663`
 
 ## WHOWAS

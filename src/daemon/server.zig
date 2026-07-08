@@ -40920,6 +40920,11 @@ test "threaded server: WHOX field-selected reply" {
     try writeAllFd(fd_a, "WHO #w %cnuhs\r\n");
     try recvUntil(&a, " 354 A ", 200);
     try recvUntil(&a, " 315 A #w ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "WHOX #w %cnuhs\r\n");
+    try recvUntil(&a, " 354 A ", 200);
+    try recvUntil(&a, " 315 A #w ", 200);
 }
 
 test "threaded server: WHO and WHOX emit no blank lines" {

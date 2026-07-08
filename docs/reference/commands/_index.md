@@ -45,6 +45,7 @@ Registry commands default to registered-client access unless the command table s
 | `WHOIS` | Return local WHOIS sequence. | [queries.md](queries.md#whois) |
 | `LIST` | List visible channels. | [queries.md](queries.md#list) |
 | `WHO` | Return WHO or WHOX rows. | [queries.md](queries.md#who) |
+| `WHOX` | Alias for WHOX-style field-selected WHO rows. | [queries.md](queries.md#who) |
 | `WHOWAS` | Query WHOWAS history. | [queries.md](queries.md#whowas) |
 | `AWAY` | Set or clear away state. | [queries.md](queries.md#away) |
 | `SETNAME` | Change realname and notify capable peers. | [queries.md](queries.md#setname) |

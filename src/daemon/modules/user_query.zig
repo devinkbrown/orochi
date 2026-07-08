@@ -77,6 +77,7 @@ pub const module = registry.Module{
         .{ .name = "WHOIS", .handler = whois },
         .{ .name = "LIST", .handler = list },
         .{ .name = "WHO", .handler = who },
+        .{ .name = "WHOX", .handler = who },
         .{ .name = "WHOWAS", .handler = whowas },
         .{ .name = "AWAY", .handler = away },
         .{ .name = "SETNAME", .handler = setname },
