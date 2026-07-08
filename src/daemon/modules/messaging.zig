@@ -29,7 +29,7 @@ fn edit(c: *anyopaque, _: I) anyerror!void {
 }
 fn chathistory(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleChathistory(x.id, x.conn, x.line);
+    try x.server.handleChathistory(x.id, x.conn, x.parsed, x.line);
 }
 fn search(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);

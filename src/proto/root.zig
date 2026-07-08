@@ -311,6 +311,7 @@ pub const tls_supported_versions = @import("tls_supported_versions.zig");
 pub const tls_transcript = @import("tls_transcript.zig");
 pub const toml = @import("toml.zig");
 pub const topic_event = @import("topic_event.zig");
+pub const topic_tag = @import("topic_tag.zig");
 pub const trace = @import("trace.zig");
 pub const tsumugi_props = @import("tsumugi_props.zig");
 pub const tsumugi = @import("tsumugi.zig");

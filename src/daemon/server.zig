@@ -124,6 +124,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
+const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
@@ -13802,6 +13803,7 @@ pub const LinuxServer = struct {
         ref: []const u8,
         target: []const u8,
         messages: []const lotus.Message,
+        topic_filter: ?[]const u8,
     ) ![]const u8 {
         // Ephemeral rooms: a channel with the EPHEMERAL prop set drops any
         // message older than its TTL from EVERY replay path (this is the single
@@ -13814,6 +13816,14 @@ pub const LinuxServer = struct {
         if (use_batch) try writer.print("BATCH +{s} chathistory {s}\r\n", .{ ref, target });
         for (messages) |message| {
             if (message.timestamp < floor) continue;
+            // Named-conversation filter: when a topic label is requested, replay
+            // only messages carrying a matching (decoded) `+orochi/topic` tag.
+            // Absent filter => every message, byte-identical to before.
+            if (topic_filter) |want| {
+                var mbuf: [topic_tag.max_label_len]u8 = undefined;
+                const have = if (message.client_tags) |ct| topic_tag.labelFromTags(ct, &mbuf) else null;
+                if (have == null or !std.mem.eql(u8, have.?, want)) continue;
+            }
             if (!historyMessageVisibleTo(&conn.session, message)) continue;
             try writeHistoryReplayLine(&writer, &conn.session, target, message);
         }
@@ -13908,7 +13918,7 @@ pub const LinuxServer = struct {
         if (found.len == 0) return;
         if (!historyReplayHasVisible(conn, found)) return;
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "rewind", channel, found) catch {
+        const replay = self.renderHistoryReplay(conn, &out_buf, "rewind", channel, found, null) catch {
             self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "Bouncer rewind is too large; request fewer messages") catch {};
             return;
         };
@@ -13981,7 +13991,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, writer.buffered());
     }
 
-    pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+    pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView, line: []const u8) !void {
         if (!conn.session.hasCap(.chathistory)) {
             try self.failReply(conn, "CHATHISTORY", "NEED_REGISTRATION", "You must negotiate the draft/chathistory capability");
             return;
@@ -14007,6 +14017,11 @@ pub const LinuxServer = struct {
         var buf: [64]lotus.Message = undefined;
         var target: []const u8 = "";
         var found: []const lotus.Message = buf[0..0];
+        // Optional named-conversation filter: a `+orochi/topic=<label>` message
+        // tag on the CHATHISTORY command restricts replay to one conversation.
+        // Absent/invalid => null (all messages, exactly as before).
+        var topic_buf: [topic_tag.max_label_len]u8 = undefined;
+        const topic_filter: ?[]const u8 = if (parsed.tags_raw) |tr| topic_tag.labelFromTags(tr, &topic_buf) else null;
         switch (req) {
             .latest => |r| {
                 target = r.target;
@@ -14101,7 +14116,7 @@ pub const LinuxServer = struct {
         }
 
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "1", target, found) catch {
+        const replay = self.renderHistoryReplay(conn, &out_buf, "1", target, found, topic_filter) catch {
             try self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "History replay is too large; request fewer messages");
             return;
         };
@@ -14241,7 +14256,7 @@ pub const LinuxServer = struct {
         }
 
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "search", target, ordered[0..found_len]) catch {
+        const replay = self.renderHistoryReplay(conn, &out_buf, "search", target, ordered[0..found_len], null) catch {
             try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
             return;
         };
@@ -18865,6 +18880,15 @@ pub const LinuxServer = struct {
             if (!validPinsValue(value)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, topic_tag.registry_key)) {
+            // Per-channel topic registry: a comma-separated bounded set of
+            // conversation labels. Auto-added by the daemon on first use and
+            // op-manageable via PROP; validated here, then persisted+propagated
+            // as a plain prop (`.not_handled`), like PINS/EPHEMERAL. Empty clears.
+            if (deleting) return .not_handled;
+            if (!topic_tag.validRegistryValue(value)) return .bad_value;
+            return .not_handled;
+        }
         return .not_handled;
     }
 
@@ -18893,6 +18917,38 @@ pub const LinuxServer = struct {
             }
         }
         return true;
+    }
+
+    /// Record a conversation label into a channel's browsable topic registry (the
+    /// `orochi.topics` channel PROP). Best-effort and bounded: no-op if the label
+    /// is already registered or the registry is full. A change is written through
+    /// the generic channel-prop store and mesh-propagated with the same signed
+    /// CRDT sequence a local PROP SET uses, so the registry converges across the
+    /// mesh and survives a peer relink/USR2 via the channel-prop burst.
+    ///
+    /// The registry is a comma-string under LWW-per-value (like PINS): concurrent
+    /// first-uses of two distinct labels on two nodes resolve by HLC, transiently
+    /// dropping one until its next message re-adds it — self-healing, and messages
+    /// are never lost. We deliberately do NOT emit a live `notifyLocalPropChange`
+    /// here: auto-registration fires per first-use message and a push per message
+    /// would be a storm; clients pick up new labels on their next PROP query.
+    fn registerChannelTopic(self: *LinuxServer, channel: []const u8, label: []const u8) void {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const current: []const u8 = if (self.props.getProp(entity, topic_tag.registry_key)) |ev| ev.value else |_| "";
+        var next_buf: [topic_tag.registry_max_bytes]u8 = undefined;
+        const next = topic_tag.addToRegistry(current, label, &next_buf) orelse return;
+
+        // Server-authored write: the owner is this node's server name so the mesh
+        // origin is consistent; `.server` access clears the generic host gate.
+        const setter = ircx_prop_store.Setter{ .id = self.serverName(), .access = .server };
+        const ev = self.props.setProp(entity, topic_tag.registry_key, next, setter) catch return;
+        const hlc = self.nextChannelPropHlc();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const ps = self.signLocalChannelProp(true, ev.entity.id, ev.key, ev.value, ev.owner, hlc, &pk_buf, &sig_buf);
+        if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) {
+            self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
+        }
     }
 
     /// Broadcast the equivalent MODE change after a PROP built-in linked to a
@@ -27180,9 +27236,27 @@ pub const LinuxServer = struct {
         // delivery-failure numerics below are suppressed for NOTICE.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
         var clean_tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        var topic_strip_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        var topic_label_buf: [topic_tag.max_label_len]u8 = undefined;
+        // Named conversations ("topics"): a channel message may carry a
+        // `+orochi/topic=<label>` client-only tag. A valid label is kept verbatim
+        // (it rides the ordinary client-tag path to members, echo, mesh and
+        // history) and captured for the per-channel topic registry; an
+        // oversized/invalid label is stripped fail-closed so it never reaches the
+        // wire, store, or registry. No topic tag => byte-identical to before.
+        var topic_label: ?[]const u8 = null;
         const clean_client_tags: ?[]const u8 = if (client_tags) |raw| blk: {
             const clean = clientOnlyTags(raw, &clean_tag_buf);
-            break :blk if (clean.len == 0) null else clean;
+            if (clean.len == 0) break :blk null;
+            if (topic_tag.present(clean)) {
+                if (topic_tag.labelFromTags(clean, &topic_label_buf)) |lbl| {
+                    topic_label = lbl;
+                } else {
+                    const stripped = topic_tag.stripTag(clean, &topic_strip_buf);
+                    break :blk if (stripped.len == 0) null else stripped;
+                }
+            }
+            break :blk clean;
         } else null;
 
         // STATUSMSG: a leading prefix (!/./@/+) before a channel name restricts
@@ -27275,7 +27349,14 @@ pub const LinuxServer = struct {
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
             // chan). Only the message body + sender prefix are stored.
-            if (min_rank == 0) self.recordHistory(chan, conn, message_id, command, eff_text, clean_client_tags);
+            if (min_rank == 0) {
+                self.recordHistory(chan, conn, message_id, command, eff_text, clean_client_tags);
+                // Record the conversation label in the channel's browsable topic
+                // registry (mesh-propagated channel PROP), gated to rank-0 so the
+                // registry stays aligned with the history CHATHISTORY can filter
+                // (a STATUSMSG's op-only line is not browsable). Best-effort.
+                if (topic_label) |lbl| self.registerChannelTopic(chan, lbl);
+            }
             return;
         }
 
@@ -30858,7 +30939,7 @@ test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones
         var out_buf: [4096]u8 = undefined;
         var hbuf: [8]lotus.Message = undefined;
         const all = server.history.latest("#eph", hbuf.len, &hbuf) catch &.{};
-        const before_prop = try server.renderHistoryReplay(member, &out_buf, "t", "#eph", all);
+        const before_prop = try server.renderHistoryReplay(member, &out_buf, "t", "#eph", all, null);
         try expectContains(before_prop, "ancient");
         try expectContains(before_prop, "recent");
 
@@ -30866,10 +30947,174 @@ test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones
         const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#eph" };
         _ = try server.props.setProp(chan, "EPHEMERAL", "3600", .{ .id = "op", .access = .owner });
         var out_buf2: [4096]u8 = undefined;
-        const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all);
+        const after_prop = try server.renderHistoryReplay(member, &out_buf2, "t", "#eph", all, null);
         try std.testing.expect(std.mem.indexOf(u8, after_prop, "ancient") == null);
         try expectContains(after_prop, "recent");
     } else return error.SkipZigTest;
+}
+
+test "topics: registry PROP gates, auto-adds, records a mesh clock, and is CRDT-portable" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#topics" };
+        // channelBuiltinSet validates then defers to the generic (persisted,
+        // mesh-propagated) store, exactly like PINS/EPHEMERAL.
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, topic_tag.registry_key, "general,random", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, topic_tag.registry_key, "bad\rlabel", false), .bad_value);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, topic_tag.registry_key, "a,,b", false), .bad_value);
+
+        // Auto-add: the first sighting registers the label AND authors a channel
+        // -prop CRDT clock (the fact that mesh-propagates + survives peer relink).
+        server.registerChannelTopic("#topics", "general");
+        try std.testing.expectEqualStrings("general", (try server.props.getProp(chan, topic_tag.registry_key)).value);
+        try std.testing.expect(server.channelPropClock("#topics", topic_tag.registry_key) != null);
+
+        // Idempotent re-add; a distinct label appends.
+        server.registerChannelTopic("#topics", "general");
+        server.registerChannelTopic("#topics", "random");
+        try std.testing.expectEqualStrings("general,random", (try server.props.getProp(chan, topic_tag.registry_key)).value);
+
+        // CRDT-portable: a remote node's `orochi.topics` fact (unsigned legacy
+        // path) applies locally through the ordinary channel-prop receive path.
+        try std.testing.expect(server.applyRemoteChannelProp(.{
+            .channel = "#remote",
+            .key = topic_tag.registry_key,
+            .value = "release plan,general",
+            .owner = "peer",
+            .hlc = @as(u64, 100),
+            .present = true,
+            .origin_node = @as(u64, 0),
+            .origin_pubkey = @as([]const u8, ""),
+            .origin_sig = @as([]const u8, ""),
+        }));
+        const rentity = ircx_prop_store.Entity{ .kind = .channel, .id = "#remote" };
+        try std.testing.expectEqualStrings("release plan,general", (try server.props.getProp(rentity, topic_tag.registry_key)).value);
+    } else return error.SkipZigTest;
+}
+
+test "topics: CHATHISTORY topic filter replays only the matching conversation" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const member_id = try addTestLocalClient(&server, "Reader", null);
+        const member = server.connFor(member_id).?;
+
+        const now: u64 = @intCast(platform.realtimeMillis());
+        _ = server.history.append("#tf", .{ .msgid = "g1", .sender = "a!u@h", .text = "in-general-one", .timestamp = now, .client_tags = "+orochi/topic=general" }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "r1", .sender = "b!u@h", .text = "in-random-one", .timestamp = now, .client_tags = "+orochi/topic=random" }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "n1", .sender = "c!u@h", .text = "no-topic-here", .timestamp = now }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "g2", .sender = "d!u@h", .text = "in-general-two", .timestamp = now, .client_tags = "+orochi/topic=general" }) catch {};
+
+        var hbuf: [16]lotus.Message = undefined;
+        const all = server.history.latest("#tf", hbuf.len, &hbuf) catch &.{};
+
+        // No filter → every message (backward-compatible funnel).
+        var out_buf: [8192]u8 = undefined;
+        const unfiltered = try server.renderHistoryReplay(member, &out_buf, "t", "#tf", all, null);
+        try expectContains(unfiltered, "in-general-one");
+        try expectContains(unfiltered, "in-random-one");
+        try expectContains(unfiltered, "no-topic-here");
+        try expectContains(unfiltered, "in-general-two");
+
+        // Filter "general" → only the two general messages; nothing else.
+        var out_buf2: [8192]u8 = undefined;
+        const filtered = try server.renderHistoryReplay(member, &out_buf2, "t", "#tf", all, "general");
+        try expectContains(filtered, "in-general-one");
+        try expectContains(filtered, "in-general-two");
+        try std.testing.expect(std.mem.indexOf(u8, filtered, "in-random-one") == null);
+        try std.testing.expect(std.mem.indexOf(u8, filtered, "no-topic-here") == null);
+
+        // A topic nobody used → empty replay (no message lines).
+        var out_buf3: [8192]u8 = undefined;
+        const none = try server.renderHistoryReplay(member, &out_buf3, "t", "#tf", all, "nonexistent");
+        try std.testing.expect(std.mem.indexOf(u8, none, "PRIVMSG") == null);
+    } else return error.SkipZigTest;
+}
+
+test "topics: CHATHISTORY topic filter is extracted from the command's message tag" {
+    // Locks the extraction contract renderHistoryReplay depends on: the daemon's
+    // inline parser exposes an @-stripped, +-preserving `tags_raw`, and
+    // `handleChathistory` reads the filter from it via `topic_tag.labelFromTags`.
+    const tagged = try irc_line.parseLine("@+orochi/topic=general CHATHISTORY LATEST #t * 50");
+    var tbuf: [topic_tag.max_label_len]u8 = undefined;
+    const filter = if (tagged.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
+    try std.testing.expectEqualStrings("general", filter.?);
+
+    // Escaped value decodes (\s -> space) just as on the message path.
+    const escaped = try irc_line.parseLine("@+orochi/topic=release\\splan CHATHISTORY LATEST #t * 50");
+    const escaped_filter = if (escaped.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
+    try std.testing.expectEqualStrings("release plan", escaped_filter.?);
+
+    // No tag → null → the funnel replays everything (backward-compatible).
+    const plain = try irc_line.parseLine("CHATHISTORY LATEST #t * 50");
+    try std.testing.expect((if (plain.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null) == null);
+}
+
+test "threaded server: +orochi/topic tag rides fanout + echo; untagged is unchanged" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch |err| switch (err) {
+        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // Both negotiate message-tags; the sender also negotiates echo-message.
+    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "CAP REQ :message-tags\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #t\r\n");
+    try recvUntil(&a, " 366 A #t ", 200);
+    try writeAllFd(fd_b, "JOIN #t\r\n");
+    try recvUntil(&b, " 366 B #t ", 200);
+
+    // A tagged channel message: B (a member with message-tags) sees the topic
+    // tag, and A's echo carries it too.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "@+orochi/topic=general PRIVMSG #t :hi\r\n");
+    try recvUntil(&b, "PRIVMSG #t :hi\r\n", 200);
+    try expectContains(b.written(), "+orochi/topic=general");
+    try recvUntil(&a, "PRIVMSG #t :hi\r\n", 200); // echo-message
+    try expectContains(a.written(), "+orochi/topic=general");
+
+    // An untagged message is unchanged: no topic tag appears anywhere.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG #t :plain\r\n");
+    try recvUntil(&b, "PRIVMSG #t :plain\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+    try recvUntil(&a, "PRIVMSG #t :plain\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "+orochi/topic") == null);
 }
 
 test "status.json: emits node health + mesh peers for the public status page" {
