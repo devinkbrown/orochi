@@ -57,6 +57,7 @@ pub const Config = struct {
     sessions: Sessions = .{},
     media: Media = .{},
     stats: Stats = .{},
+    backup: Backup = .{},
     metrics: Metrics = .{},
     webhook: Webhook = .{},
     geoip: Geoip = .{},
@@ -408,6 +409,15 @@ pub const Config = struct {
         interval_ms: i64 = 30_000,
     };
 
+    /// Periodic local backup publication. Off unless `dir` is set.
+    pub const Backup = struct {
+        /// Directory that receives timestamped account-store and chanstats snapshot
+        /// copies plus `latest.json`. Empty = disabled.
+        dir: []const u8 = "",
+        /// Minimum interval between backup sets, in ms.
+        interval_ms: i64 = 24 * 60 * 60 * 1000,
+    };
+
     /// Live Prometheus `/metrics` HTTP endpoint. Off unless `listen` is set.
     pub const Metrics = struct {
         /// TCP port for the `/metrics` listener. 0 (or absent) = disabled.
@@ -547,6 +557,9 @@ pub const Config = struct {
         /// layer presents that entry's cert instead of the default leaf above.
         /// Empty ⇒ SNI is not consulted (byte-identical to single-cert behavior).
         sni: []SniCertDef = &.{},
+        /// Server-side Encrypted Client Hello keys (`[[tls.ech_keys]]`, owned).
+        /// Empty ⇒ ECH acceptance is off and the TLS wire stays byte-identical.
+        ech_keys: []EchKeyDef = &.{},
     };
 
     /// One `[[tls.sni]]` entry. `main.zig` loads `cert_path` + `key_path` with the
@@ -561,6 +574,13 @@ pub const Config = struct {
         cert_path: []const u8 = "",
         /// PEM/DER private key path.
         key_path: []const u8 = "",
+    };
+
+    /// One server-side ECH key declaration. `config_path` points at a single-entry
+    /// ECHConfigList; `private_key` is the matching X25519 HPKE recipient key.
+    pub const EchKeyDef = struct {
+        config_path: []const u8 = "",
+        private_key: [32]u8 = @splat(0),
     };
 
     /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
@@ -655,6 +675,8 @@ pub const Config = struct {
         errdefer allocator.free(stats_dir);
         const stats_channel_dir = try allocator.dupe(u8, "");
         errdefer allocator.free(stats_channel_dir);
+        const backup_dir = try allocator.dupe(u8, "");
+        errdefer allocator.free(backup_dir);
         const metrics_bind = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(metrics_bind);
         const geoip_db = try allocator.dupe(u8, "");
@@ -677,6 +699,7 @@ pub const Config = struct {
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
             .stats = .{ .dir = stats_dir, .channel_dir = stats_channel_dir },
+            .backup = .{ .dir = backup_dir },
             .metrics = .{ .bind = metrics_bind },
             .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
             .webpush = .{ .subject = webpush_subject, .vapid_key_path = webpush_vapid_key_path },
@@ -750,6 +773,7 @@ pub const Config = struct {
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.stats.channel_dir);
+        allocator.free(self.backup.dir);
         allocator.free(self.metrics.bind);
         if (self.webhook.bind) |value| allocator.free(value);
         if (self.webhook.store_path) |value| allocator.free(value);
@@ -769,6 +793,11 @@ pub const Config = struct {
             allocator.free(s.key_path);
         }
         allocator.free(self.tls.sni);
+        for (self.tls.ech_keys) |*key| {
+            allocator.free(key.config_path);
+            std.crypto.secureZero(u8, &key.private_key);
+        }
+        allocator.free(self.tls.ech_keys);
         allocator.free(self.acme.directory_url);
         allocator.free(self.webpush.subject);
         allocator.free(self.webpush.vapid_key_path);
@@ -948,6 +977,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setStr(allocator, resolver, doc.getString("stats.channel_dir"), &cfg.stats.channel_dir);
     if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
 
+    try setStr(allocator, resolver, doc.getString("backup.dir"), &cfg.backup.dir);
+    if (doc.getString("backup.interval")) |s| cfg.backup.interval_ms = @intCast(try durationMs(s));
+
     // [metrics] — live Prometheus /metrics endpoint. `listen` = 0/absent off;
     // `bind` defaults to loopback (security: not public by default).
     cfg.metrics.listen = try portField(doc, "metrics.listen", cfg.metrics.listen);
@@ -1034,6 +1066,35 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
             try list.append(allocator, .{ .server_names = names, .cert_path = cert_path, .key_path = key_path });
         }
         cfg.tls.sni = try list.toOwnedSlice(allocator);
+    }
+
+    // [[tls.ech_keys]] — server-side ECH acceptance material. The TLS engine wants
+    // bytes from a published ECHConfigList plus the matching X25519 private key;
+    // main.zig loads the config bytes and tls_server validates the key match before
+    // wiring the listener.
+    if (doc.getArray("tls.ech_keys")) |arr| {
+        var list: std.ArrayList(Config.EchKeyDef) = .empty;
+        errdefer {
+            for (list.items) |*key| {
+                allocator.free(key.config_path);
+                std.crypto.secureZero(u8, &key.private_key);
+            }
+            list.deinit(allocator);
+        }
+        for (arr) |*item| {
+            const config_path = try resolveStr(allocator, resolver, item.getString("config_path") orelse return error.ParseError);
+            errdefer allocator.free(config_path);
+            const private_key_hex_owned = try resolveStr(allocator, resolver, item.getString("private_key") orelse return error.ParseError);
+            defer allocator.free(private_key_hex_owned);
+            const private_key_hex = std.mem.trim(u8, private_key_hex_owned, " \t\r\n");
+            var private_key: [32]u8 = undefined;
+            if (private_key_hex.len != private_key.len * 2) return error.ParseError;
+            _ = std.fmt.hexToBytes(&private_key, private_key_hex) catch return error.ParseError;
+            errdefer std.crypto.secureZero(u8, &private_key);
+            try list.append(allocator, .{ .config_path = config_path, .private_key = private_key });
+            std.crypto.secureZero(u8, &private_key);
+        }
+        cfg.tls.ech_keys = try list.toOwnedSlice(allocator);
     }
 
     // [acme]
@@ -1396,6 +1457,24 @@ test "parseToml: core sections project onto Config" {
     // Unspecified optional fields keep their defaults.
     try testing.expectEqual(@as(u64, 60_000), cfg.limits.ping_timeout_ms);
     try testing.expectEqualStrings("local", cfg.mesh.realm);
+}
+
+test "parseToml: backup section projects directory and cadence" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[backup]
+        \\dir = "/var/backups/orochi"
+        \\interval = "12h"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("/var/backups/orochi", cfg.backup.dir);
+    try testing.expectEqual(@as(i64, 12 * 60 * 60 * 1000), cfg.backup.interval_ms);
 }
 
 test "parseToml: [[opers]] array-of-tables + trust_roots list" {
@@ -1800,6 +1879,9 @@ test "parseToml: [tls] section projects onto Config" {
         \\enable_resumption = true
         \\early_data_max_size = 16384
         \\ktls = "tx"
+        \\[[tls.ech_keys]]
+        \\config_path = "/etc/orochi/echconfig.bin"
+        \\private_key = "1111111111111111111111111111111111111111111111111111111111111111"
         \\
     ;
 
@@ -1819,6 +1901,27 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expect(cfg.tls.enable_resumption);
     try testing.expectEqual(@as(u32, 16384), cfg.tls.early_data_max_size);
     try testing.expectEqual(Config.KtlsMode.tx, cfg.tls.ktls);
+    try testing.expectEqual(@as(usize, 1), cfg.tls.ech_keys.len);
+    try testing.expectEqualStrings("/etc/orochi/echconfig.bin", cfg.tls.ech_keys[0].config_path);
+    try testing.expectEqual(@as([32]u8, @splat(0x11)), cfg.tls.ech_keys[0].private_key);
+}
+
+test "parseToml: [[tls.ech_keys]] rejects malformed private key" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\[[tls.ech_keys]]
+        \\config_path = "/etc/orochi/echconfig.bin"
+        \\private_key = "abcd"
+        \\
+    ;
+
+    try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
 }
 
 test "parseToml: [[tls.sni]] projects additional SNI certs onto Config" {

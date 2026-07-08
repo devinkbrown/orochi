@@ -88,6 +88,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
     if (cfg.stats.channel_dir.len != 0) out.chanstats_dir = cfg.stats.channel_dir;
     if (cfg.stats.interval_ms != 0) out.stats_interval_ms = cfg.stats.interval_ms;
+    if (cfg.backup.dir.len != 0) out.backup_dir = cfg.backup.dir;
+    if (cfg.backup.interval_ms != 0) out.backup_interval_ms = cfg.backup.interval_ms;
+    if (cfg.sasl.account_db) |db| out.account_store_path = db;
     // [metrics] — live Prometheus /metrics endpoint. Off unless a port is set;
     // the bind defaults to loopback and is only widened by an explicit address.
     if (cfg.metrics.listen != 0) {
@@ -266,6 +269,10 @@ pub const TlsBootConfig = struct {
     /// `parsed`; `main.zig` loads each entry's cert+key and hands the material to
     /// the TLS listener. Empty ⇒ no SNI certs (single-cert behavior).
     sni: []const config_format.Config.SniCertDef = &.{},
+    /// Server-side ECH acceptance material (`[[tls.ech_keys]]`). Config paths and
+    /// key bytes borrow `parsed`; `main.zig` loads the ECHConfigList bytes and the
+    /// TLS engine validates the public/private match before wiring the listener.
+    ech_keys: []const config_format.Config.EchKeyDef = &.{},
 };
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
@@ -283,6 +290,7 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .early_data_max_size = cfg.tls.early_data_max_size,
         .ktls = cfg.tls.ktls,
         .sni = cfg.tls.sni,
+        .ech_keys = cfg.tls.ech_keys,
     };
 }
 
@@ -453,9 +461,18 @@ test "config text overlays the server config" {
         \\reorder_window_frames = 32
         \\max_participants = 2
         \\native_media_require_mac = true
+        \\[backup]
+        \\dir = "/var/backups/orochi"
+        \\interval = "6h"
         \\[sasl]
         \\enabled = false
+        \\account_db = "/var/lib/orochi/accounts.db"
         \\realm = "ircxnet"
+        \\[tls]
+        \\enabled = true
+        \\[[tls.ech_keys]]
+        \\config_path = "/etc/orochi/echconfig.bin"
+        \\private_key = "2222222222222222222222222222222222222222222222222222222222222222"
         \\
     ;
     const base = server.Config{ .port = 6680 };
@@ -484,8 +501,15 @@ test "config text overlays the server config" {
     var rx = media_session.Receiver(media_session.default_max_payload_bytes, kagura_frame.window_cap).init(reassembly_cfg);
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
+    try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);
+    try testing.expectEqual(@as(i64, 6 * 60 * 60 * 1000), loaded.config.backup_interval_ms);
+    try testing.expectEqualStrings("/var/lib/orochi/accounts.db", loaded.config.account_store_path);
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
+    try testing.expect(loaded.tls.enabled);
+    try testing.expectEqual(@as(usize, 1), loaded.tls.ech_keys.len);
+    try testing.expectEqualStrings("/etc/orochi/echconfig.bin", loaded.tls.ech_keys[0].config_path);
+    try testing.expectEqual(@as([32]u8, @splat(0x22)), loaded.tls.ech_keys[0].private_key);
 }
 
 test "media listen overlays media port and candidate host" {

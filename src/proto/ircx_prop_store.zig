@@ -130,6 +130,9 @@ pub const ChannelPropKey = enum {
     account,
     clientguid,
     servicepath,
+    no_ai,
+    local_only,
+    server_ai_ok,
 
     pub fn token(self: ChannelPropKey) []const u8 {
         return switch (self) {
@@ -154,6 +157,9 @@ pub const ChannelPropKey = enum {
             .account => "ACCOUNT",
             .clientguid => "CLIENTGUID",
             .servicepath => "SERVICEPATH",
+            .no_ai => "no-ai",
+            .local_only => "local-only",
+            .server_ai_ok => "server-ai-ok",
         };
     }
 };
@@ -200,6 +206,10 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         .lag => .{ .key = key, .max_value = 1, .min_setter = .owner },
         .account => .{ .key = key, .max_value = 31, .min_setter = .sysop_manager },
         .clientguid, .servicepath => .{ .key = key, .max_value = default_max_value, .min_setter = .owner },
+        // AI policy flags are intentionally small, public channel props: later
+        // AI/plugin/MCP paths can enforce them without inventing a second policy
+        // store. The daemon validates values as boolean tokens before storage.
+        .no_ai, .local_only, .server_ai_ok => .{ .key = key, .max_value = 1, .min_setter = .host },
     };
 }
 
@@ -879,6 +889,9 @@ test "secret channel props stay hidden except raw internal lookup" {
     // FOUNDERKEY is a secret tier key too — hidden from getProp, visible RAW.
     _ = try store.setProp(entity, "FOUNDERKEY", "topkey", .{ .id = "owner", .access = .owner });
     try std.testing.expect((channelPropInfo("FOUNDERKEY").?).secret);
+    try std.testing.expect(channelPropKey("no-ai") == .no_ai);
+    try std.testing.expect(channelPropKey("LOCAL-ONLY") == .local_only);
+    try std.testing.expect(channelPropKey("server-ai-ok") == .server_ai_ok);
     try std.testing.expectError(error.PropMissing, store.getProp(entity, "FOUNDERKEY"));
     try std.testing.expectEqualStrings("topkey", (try store.getPropRaw(entity, "FOUNDERKEY")).value);
 

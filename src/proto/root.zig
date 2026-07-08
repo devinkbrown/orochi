@@ -268,6 +268,7 @@ pub const server_about = @import("server_about.zig");
 pub const serverinfo = @import("serverinfo.zig");
 pub const server_time_skew = @import("server_time_skew.zig");
 pub const services_alias = @import("services_alias.zig");
+pub const tegami_push_relay = @import("tegami_push_relay.zig");
 pub const session_reclaim_mesh = @import("session_reclaim_mesh.zig");
 pub const setname_chghost_notify = @import("setname_chghost_notify.zig");
 pub const sframe = @import("sframe.zig");
@@ -613,6 +614,7 @@ test {
     _ = serverinfo;
     _ = server_time_skew;
     _ = services_alias;
+    _ = tegami_push_relay;
     _ = session_reclaim_mesh;
     _ = setname_chghost_notify;
     _ = sframe;

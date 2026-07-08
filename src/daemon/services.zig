@@ -408,6 +408,16 @@ pub const Services = struct {
         self.certfp_binds = binds;
     }
 
+    /// Force the backing OroStore into a compact snapshot for external backup.
+    /// The caller may copy `store.snapshot_path` after this returns. Serialized with
+    /// normal services mutations so the snapshot represents a whole store state.
+    pub fn compactStoreForBackup(self: *Services) !void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        try self.store.snapshotAndTruncate();
+    }
+
     /// Bind a TLS certfp to an account (the CERTADD command). Caller has verified
     /// the account is the caller's own logged-in account.
     pub fn bindCertfp(self: *Services, account: []const u8, fingerprint: []const u8) certfp_bind_mod.CertfpBindError!void {

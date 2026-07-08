@@ -217,6 +217,13 @@ pub const S2sLink = struct {
         return self.peer.takeResyncRequest();
     }
 
+    /// Consume a repair-triggered daemon resync request. A valid repair response
+    /// updated the peer driver's CRDT shadow; the daemon bridges it to live state
+    /// through the existing full-burst protocol.
+    pub fn takeRepairResyncRequest(self: *S2sLink) bool {
+        return self.peer.takeRepairResyncRequest();
+    }
+
     /// Install (or clear) the borrowed local-world nick predicate used for
     /// cross-namespace NICK collision resolution (a remote nick that matches a
     /// LOCAL one is renamed to its mesh UID rather than overwriting the holder).
@@ -532,6 +539,19 @@ pub const S2sLink = struct {
     /// slice and the outer slice; decode with `warden.decodeWire`).
     pub fn takeWards(self: *S2sLink) ![][]u8 {
         return self.peer.takeWards();
+    }
+
+    /// Emit a signed, signing-required Web Push hint for an offline Tegami/DM.
+    /// The peer driver no-ops for non-signing peers so this never rides legacy
+    /// plaintext S2S.
+    pub fn sendTegamiPush(self: *S2sLink, account: []const u8, from: []const u8, text: []const u8) !void {
+        try self.peer.sendTegamiPush(self.sink(), account, from, text);
+    }
+
+    /// Drain queued TEGAMI_PUSH payloads from this peer (caller owns + frees each
+    /// slice and the outer slice; decode with `tegami_push_relay.decode`).
+    pub fn takeTegamiPushes(self: *S2sLink) ![][]u8 {
+        return self.peer.takeTegamiPushes();
     }
 
     /// Copy this peer's known-server topology into `out` for partition analysis.

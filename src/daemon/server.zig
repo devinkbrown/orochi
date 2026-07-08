@@ -231,6 +231,7 @@ fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyfr
 }
 const tegami_mod = @import("tegami.zig");
 const webpush_mod = @import("webpush.zig");
+const tegami_push_relay = @import("../proto/tegami_push_relay.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
 const bot_registry_mod = @import("bot_registry.zig");
@@ -1470,6 +1471,14 @@ pub const Config = struct {
     chanstats_dir: []const u8 = "",
     /// Minimum interval between web-stats writes, in ms.
     stats_interval_ms: i64 = 30_000,
+    /// Directory for periodic local backup sets. Empty = disabled. When enabled,
+    /// reactor 0 copies the compacted account-store snapshot and chanstats binary
+    /// snapshot here on `backup_interval_ms`.
+    backup_dir: []const u8 = "",
+    /// Minimum interval between backup sets, in ms. Defaults to daily.
+    backup_interval_ms: i64 = 24 * 60 * 60 * 1000,
+    /// Configured `[sasl] account_db` path, used only for backup manifests.
+    account_store_path: []const u8 = "",
     /// TCP port for the live Prometheus `/metrics` HTTP listener. 0 = disabled.
     /// When non-zero, a loopback-by-default listener thread is started in
     /// `start()` and torn down in `deinit()`. See metrics_http.zig.
@@ -1649,6 +1658,9 @@ pub const Config = struct {
     /// that entry's chain+key instead of the default leaf. Borrowed for the server's
     /// lifetime. Empty ⇒ SNI is not consulted (byte-identical single-cert handshake).
     tls_sni_certs: []const tls_server.SniCert = &.{},
+    /// Server-side Encrypted Client Hello keys loaded by main.zig. Empty ⇒ ECH is
+    /// not accepted, preserving the existing outer-ClientHello behavior.
+    tls_ech_keys: []const tls_server.EchKey = &.{},
     /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
     /// TLS listener. Default false keeps the listener's historical full-handshake
     /// behavior byte-identical.
@@ -2735,6 +2747,8 @@ pub const LinuxServer = struct {
     /// on the stats interval. Only active when `config.chanstats_dir` is set.
     chanstats: chanstats_mod.ChanStats,
     chanstats_last_write_ms: i64 = 0,
+    /// Throttle stamp for periodic local backup sets (reactor 0).
+    backup_last_write_ms: i64 = 0,
     /// Throttle stamp for the Event Spine history-ring snapshot save (reactor 0).
     event_history_last_write_ms: i64 = 0,
     warden: warden.Registry,
@@ -3471,7 +3485,29 @@ pub const LinuxServer = struct {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         self.stats.writePrometheus(self.allocator, &out) catch return;
+        self.writeNodeHealthPrometheus(self.allocator, &out) catch return;
         self.metrics_snapshot.set(out.items) catch return;
+    }
+
+    fn writePromGauge(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        name: []const u8,
+        help: []const u8,
+        value: anytype,
+    ) !void {
+        try out.print(allocator, "# HELP {s} {s}\n", .{ name, help });
+        try out.print(allocator, "# TYPE {s} gauge\n", .{name});
+        try out.print(allocator, "{s} {d}\n", .{ name, value });
+    }
+
+    fn writeNodeHealthPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const health = self.currentNodeHealth();
+        try writePromGauge(allocator, out, "orochi_mesh_quorum", "Whether this node currently holds mesh quorum (1=yes, 0=no)", @as(u8, if (health.mesh_quorum) 1 else 0));
+        try writePromGauge(allocator, out, "orochi_mesh_partitioned", "Whether this node sees a mesh partition (1=yes, 0=no)", @as(u8, if (health.mesh_partitioned) 1 else 0));
+        try writePromGauge(allocator, out, "orochi_mesh_components", "Mesh connected components known to this node", health.mesh_components);
+        try writePromGauge(allocator, out, "orochi_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
+        try writePromGauge(allocator, out, "orochi_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
     }
 
     /// The per-webhook rate policy assembled from config.
@@ -3814,6 +3850,7 @@ pub const LinuxServer = struct {
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = request_client_cert,
             .sni_certs = self.config.tls_sni_certs,
+            .ech_keys = self.config.tls_ech_keys,
         };
         if (self.config.tls_ocsp_staple) |staple| cfg.ocsp_staple = staple;
         if (self.config.tls_enable_resumption) {
@@ -4404,6 +4441,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        self.maybeRunBackups();
         // Event Spine history snapshot, gated to reactor 0 (writeFileAbs is not
         // atomic, so a single writer avoids interleaved writes) and throttled to
         // the stats cadence. The ring is shared across reactors, so reactor 0's
@@ -4551,6 +4589,7 @@ pub const LinuxServer = struct {
             .messages_total = self.stats.messages_in_total.load(.monotonic),
             .bytes_in = self.stats.bytes_in_total.load(.monotonic),
             .bytes_out = self.stats.bytes_out_total.load(.monotonic),
+            .node_health = self.currentNodeHealth(),
             .history = hist_buf[0..hc],
             .top_channels = tops[0..ntop],
             .top_countries = top_countries[0..nctry],
@@ -4599,6 +4638,84 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn maybeRunBackups(self: *LinuxServer) void {
+        if (self.config.backup_dir.len == 0 or self.rx() != &self.reactors[0]) return;
+        const io = self.config.crypto_io orelse return;
+        const now = self.nowMs();
+        if (self.backup_last_write_ms != 0 and now - self.backup_last_write_ms < self.config.backup_interval_ms) return;
+        if (self.writeBackupSet(io)) {
+            self.backup_last_write_ms = now;
+        }
+    }
+
+    fn appendBackupManifestFile(
+        w: *std.Io.Writer,
+        first: *bool,
+        kind: []const u8,
+        name: []const u8,
+        source: []const u8,
+    ) !void {
+        if (!first.*) try w.writeByte(',');
+        first.* = false;
+        try w.writeAll("{\"kind\":");
+        try writeJsonEscaped(w, kind);
+        try w.writeAll(",\"name\":");
+        try writeJsonEscaped(w, name);
+        try w.writeAll(",\"source\":");
+        try writeJsonEscaped(w, source);
+        try w.writeByte('}');
+    }
+
+    fn writeBackupSet(self: *LinuxServer, io: std.Io) bool {
+        const max_backup_file_bytes: usize = 512 << 20;
+        const generated_unix = @divTrunc(platform.realtimeMillis(), 1000);
+        var manifest_buf: [2048]u8 = undefined;
+        var w = std.Io.Writer.fixed(&manifest_buf);
+        w.writeAll("{\"generated_at\":") catch return false;
+        w.print("{d}", .{generated_unix}) catch return false;
+        w.writeAll(",\"files\":[") catch return false;
+        var first = true;
+        var failed = false;
+
+        if (self.account_services) |svc| {
+            if (svc.compactStoreForBackup()) {
+                var name_buf: [96]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "accounts-{d}.db.snap", .{generated_unix}) catch "";
+                if (name.len != 0 and self.copyFileToBackup(io, svc.store.snapshot_path, name, max_backup_file_bytes)) {
+                    const source = if (self.config.account_store_path.len != 0) self.config.account_store_path else svc.store.snapshot_path;
+                    appendBackupManifestFile(&w, &first, "accounts", name, source) catch return false;
+                } else {
+                    failed = true;
+                }
+            } else |_| {
+                failed = true;
+            }
+        }
+
+        if (self.config.chanstats_dir.len != 0) {
+            chanstats_mod.saveSnapshot(&self.chanstats, io, self.config.chanstats_dir);
+            var src_buf: [1024]u8 = undefined;
+            const src = std.fmt.bufPrint(&src_buf, "{s}/.chanstats.snapshot", .{self.config.chanstats_dir}) catch "";
+            var name_buf: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "chanstats-{d}.snapshot", .{generated_unix}) catch "";
+            if (src.len != 0 and name.len != 0 and self.copyFileToBackup(io, src, name, max_backup_file_bytes)) {
+                appendBackupManifestFile(&w, &first, "chanstats", name, src) catch return false;
+            } else {
+                failed = true;
+            }
+        }
+
+        if (failed) return false;
+        w.writeAll("]}") catch return false;
+        return writeFileAtomicStatus(io, self.config.backup_dir, "latest.json", w.buffered());
+    }
+
+    fn copyFileToBackup(self: *LinuxServer, io: std.Io, source_path: []const u8, name: []const u8, limit: usize) bool {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(limit)) catch return false;
+        defer self.allocator.free(bytes);
+        return writeFileAtomicStatus(io, self.config.backup_dir, name, bytes);
+    }
+
     /// Sanitize a channel name into a filename slug (keep [A-Za-z0-9_-], map the
     /// rest to '_'); returns the byte length written. Never empty.
     fn statsSlug(name: []const u8, out: *[64]u8) usize {
@@ -4640,6 +4757,30 @@ pub const LinuxServer = struct {
             .connecting, .handshaking => "connecting",
             .draining => "draining",
             .down => "down",
+        };
+    }
+
+    fn currentNodeHealth(self: *LinuxServer) stats_report.NodeHealth {
+        var peers_total: u32 = 0;
+        var peers_up: u32 = 0;
+        for (&self.peer_health.slots) |*slot| {
+            if (!slot.used) continue;
+            peers_total += 1;
+            if (slot.health.state == .established) peers_up += 1;
+        }
+        const status: []const u8 = if (!self.partition_quorum)
+            "degraded"
+        else if (self.partition_split or peers_up < peers_total)
+            "warning"
+        else
+            "ok";
+        return .{
+            .status = status,
+            .mesh_quorum = self.partition_quorum,
+            .mesh_partitioned = self.partition_split,
+            .mesh_components = @intCast(@min(self.partition_components, std.math.maxInt(u32))),
+            .mesh_peers_up = peers_up,
+            .mesh_peers_total = peers_total,
         };
     }
 
@@ -4701,15 +4842,25 @@ pub const LinuxServer = struct {
     }
 
     fn writeStatsFileAtomic(io: anytype, dir: []const u8, name: []const u8, data: []const u8) void {
+        _ = writeFileAtomicStatus(io, dir, name, data);
+    }
+
+    fn writeFileAtomicStatus(io: anytype, dir: []const u8, name: []const u8, data: []const u8) bool {
         var path_buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return;
-        var tmp_buf: [1024]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/.{s}.tmp", .{ dir, name }) catch return;
-        const cwd = std.Io.Dir.cwd();
-        cwd.writeFile(io, .{ .sub_path = tmp, .data = data }) catch return;
-        cwd.rename(tmp, cwd, path, io) catch {
-            cwd.deleteFile(io, tmp) catch {};
-        };
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return false;
+        var atomic = std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true }) catch return false;
+        defer atomic.deinit(io);
+        atomic.file.writeStreamingAll(io, data) catch return false;
+        atomic.file.sync(io) catch return false;
+        atomic.replace(io) catch return false;
+        syncIoDir(atomic.dir, io) catch return false;
+        return true;
+    }
+
+    fn syncIoDir(dir: std.Io.Dir, io: std.Io) !void {
+        var dir_file = try dir.openFile(io, ".", .{ .mode = .read_only, .allow_directory = true });
+        defer dir_file.close(io);
+        try dir_file.sync(io);
     }
 
     /// Apply any TEMPMODE reverts whose timer has elapsed as real `-mode` MODE
@@ -5718,6 +5869,8 @@ pub const LinuxServer = struct {
         self.drainObserveEvents(link);
         self.drainKills(link);
         self.drainWards(link);
+        self.drainTegamiPushes(link);
+        self.drainRepairResync(conn, link, true);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -5864,11 +6017,36 @@ pub const LinuxServer = struct {
         self.drainObserveEvents(link);
         self.drainKills(link);
         self.drainWards(link);
+        self.drainRepairResync(conn, link, false);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
             self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
         }
+    }
+
+    /// Bridge a valid Merkle/RBSR repair response to live daemon state using the
+    /// existing full-state resync path. The repair frame updates only the pure
+    /// peer-driver CRDT shadow; user-visible roster/mode/prop state still arrives
+    /// through normal daemon-drained S2S frame families.
+    fn drainRepairResync(self: *LinuxServer, conn: *ConnState, link: anytype, secured: bool) void {
+        if (!link.established() or !link.takeRepairResyncRequest()) return;
+        self.traceLog(.info, .s2s, "s2s repair applied; requesting full state resync");
+        link.sendResync() catch {
+            conn.closing = true;
+            return;
+        };
+        self.flushS2sOutbound(conn, link.outbound()) catch {
+            conn.closing = true;
+            return;
+        };
+        link.clearOutbound();
+        self.sendMeshStateBurstTo(conn);
+        if (secured) {
+            self.rebroadcastLocalOpers();
+            self.sendMeshWardsTo(conn);
+        }
+        self.sendCloneAntiEntropy(conn, link);
     }
 
     /// Completion for an outbound S2S connect: on success open the handshake from
@@ -15342,6 +15520,7 @@ pub const LinuxServer = struct {
         if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
         if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
         if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
+        if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
 
         var snap = s2s_snapshot.Snapshot{
             .fd = conn.fd,
@@ -16049,6 +16228,7 @@ pub const LinuxServer = struct {
                 .peer_supports_signing = (snap.caps & s2s_snapshot.cap_signing) != 0,
                 .peer_supports_account = (snap.caps & s2s_snapshot.cap_account) != 0,
                 .peer_supports_oper_info = (snap.caps & s2s_snapshot.cap_oper_info) != 0,
+                .peer_supports_repair = (snap.caps & s2s_snapshot.cap_repair) != 0,
             },
             .remote_name = snap.remote_name,
             .rec_inbuf = snap.rec_inbuf,
@@ -19070,7 +19250,68 @@ pub const LinuxServer = struct {
             if (!topic_tag.validRegistryValue(value)) return .bad_value;
             return .not_handled;
         }
+        if (isAiPolicyProp(key)) {
+            // Room-level AI consent policy. Persist + mesh-propagate through the
+            // ordinary channel PROP CRDT; validate here so later AI/plugin
+            // paths can trust the values as boolean flags.
+            if (deleting) return .not_handled;
+            if (!validAiPolicyValue(value)) return .bad_value;
+            return .not_handled;
+        }
         return .not_handled;
+    }
+
+    pub const AiPolicy = enum { unspecified, no_ai, local_only, server_ai_ok };
+    pub const AiPolicyUse = enum { local_inference, server_plaintext };
+    pub const AiPolicyDeny = enum { no_ai, local_only, server_ai_not_enabled };
+    pub const AiPolicyDecision = struct {
+        policy: AiPolicy,
+        allowed: bool,
+        deny: ?AiPolicyDeny = null,
+    };
+
+    fn isAiPolicyProp(key: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(key, "no-ai") or
+            std.ascii.eqlIgnoreCase(key, "local-only") or
+            std.ascii.eqlIgnoreCase(key, "server-ai-ok");
+    }
+
+    fn validAiPolicyValue(value: []const u8) bool {
+        return std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "1");
+    }
+
+    pub fn channelAiPolicy(self: *LinuxServer, channel: []const u8) AiPolicy {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return .unspecified;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        if (propEnabled(self.props.getProp(entity, "no-ai") catch null)) return .no_ai;
+        if (propEnabled(self.props.getProp(entity, "local-only") catch null)) return .local_only;
+        if (propEnabled(self.props.getProp(entity, "server-ai-ok") catch null)) return .server_ai_ok;
+        return .unspecified;
+    }
+
+    /// Server-side AI policy hook for future bot/plugin/WASM control paths. The
+    /// room flags are intentionally stored as ordinary public channel PROP values,
+    /// but all server-side plaintext processing must ask this helper so
+    /// precedence and fail-closed defaults stay centralized.
+    pub fn checkChannelAiPolicy(self: *LinuxServer, channel: []const u8, use: AiPolicyUse) AiPolicyDecision {
+        const policy = self.channelAiPolicy(channel);
+        return switch (use) {
+            .local_inference => switch (policy) {
+                .no_ai => .{ .policy = policy, .allowed = false, .deny = .no_ai },
+                .unspecified, .local_only, .server_ai_ok => .{ .policy = policy, .allowed = true },
+            },
+            .server_plaintext => switch (policy) {
+                .server_ai_ok => .{ .policy = policy, .allowed = true },
+                .no_ai => .{ .policy = policy, .allowed = false, .deny = .no_ai },
+                .local_only => .{ .policy = policy, .allowed = false, .deny = .local_only },
+                .unspecified => .{ .policy = policy, .allowed = false, .deny = .server_ai_not_enabled },
+            },
+        };
+    }
+
+    fn propEnabled(entry: ?ircx_prop_store.EntryView) bool {
+        const ev = entry orelse return false;
+        return std.mem.eql(u8, ev.value, "1");
     }
 
     /// EPHEMERAL TTL bounds: at least a minute (below that, history is useless),
@@ -23981,6 +24222,7 @@ pub const LinuxServer = struct {
             // Reach: the recipient has no attached session — nudge their
             // browser(s) through Web Push (best-effort; tegami holds the DM).
             self.webpushNotify(delivery, from, text);
+            self.meshBroadcastTegamiPush(delivery, from, text);
             if (decision.forwarded) {
                 var fb: [192]u8 = undefined;
                 const msg = std.fmt.bufPrint(&fb, "TEGAMI: message stored (forwarded to {s})", .{delivery}) catch "TEGAMI: message stored for delivery";
@@ -24174,6 +24416,39 @@ pub const LinuxServer = struct {
         w.writeAll("}") catch return;
 
         for (live[0..n]) |s_| worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
+    }
+
+    /// Ask every secured mesh peer to run its own account-local Web Push worker
+    /// for a stored offline Tegami/DM. This intentionally does NOT copy Tegami
+    /// storage or push subscriptions; the peer only delivers if it already owns a
+    /// local subscription for `account`.
+    fn meshBroadcastTegamiPush(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendTegamiPush(account, from, text) catch continue;
+                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    /// Decode inbound secured TEGAMI_PUSH hints and run local Web Push delivery.
+    /// No re-fan and no Tegami storage: the original node remains the memo source
+    /// of truth, while this node can notify browsers subscribed here.
+    fn drainTegamiPushes(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeTegamiPushes() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const ev = tegami_push_relay.decode(p) catch continue;
+            self.webpushNotify(ev.account, ev.from, ev.text);
+        }
     }
 
     /// Emit the caller's pending tegami as NOTE lines (without clearing).
@@ -26957,7 +27232,10 @@ pub const LinuxServer = struct {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) return;
         const raw_tags = parsed.tags_raw orelse return; // nothing to relay
         var tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
-        const tags = clientOnlyTags(raw_tags, &tag_buf);
+        var topic_strip_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        var topic_label_buf: [topic_tag.max_label_len]u8 = undefined;
+        const client_tags = clientOnlyTags(raw_tags, &tag_buf);
+        const tags = sanitizeTopicClientTags(client_tags, &topic_strip_buf, null, &topic_label_buf);
         if (tags.len == 0) return;
         const target = parsed.paramSlice()[0];
 
@@ -27429,15 +27707,8 @@ pub const LinuxServer = struct {
         const clean_client_tags: ?[]const u8 = if (client_tags) |raw| blk: {
             const clean = clientOnlyTags(raw, &clean_tag_buf);
             if (clean.len == 0) break :blk null;
-            if (topic_tag.present(clean)) {
-                if (topic_tag.labelFromTags(clean, &topic_label_buf)) |lbl| {
-                    topic_label = lbl;
-                } else {
-                    const stripped = topic_tag.stripTag(clean, &topic_strip_buf);
-                    break :blk if (stripped.len == 0) null else stripped;
-                }
-            }
-            break :blk clean;
+            const sanitized = sanitizeTopicClientTags(clean, &topic_strip_buf, &topic_label, &topic_label_buf);
+            break :blk if (sanitized.len == 0) null else sanitized;
         } else null;
 
         // STATUSMSG: a leading prefix (!/./@/+) before a channel name restricts
@@ -28074,6 +28345,7 @@ fn findTagValue(tags_raw: []const u8, key: []const u8) ?[]const u8 {
 
 fn clientTagAllowedForSession(session: *const dispatch.ClientSession, key: []const u8) bool {
     if (session.hasCap(.message_tags)) return true;
+    if (std.mem.eql(u8, key, topic_tag.tag_key)) return session.hasCap(.orochi_topics);
     if (msgedit.isTypingTag(key)) return session.hasCap(.typing);
     if (std.mem.eql(u8, key, "+draft/react") or std.mem.eql(u8, key, "+draft/unreact")) return session.hasCap(.react);
     if (std.mem.eql(u8, key, "+draft/reply")) return session.hasCap(.reply);
@@ -28094,6 +28366,20 @@ fn clientTagsForSession(session: *const dispatch.ClientSession, raw: []const u8,
         any = true;
     }
     return b.written();
+}
+
+fn sanitizeTopicClientTags(
+    tags: []const u8,
+    strip_out: []u8,
+    label_out: ?*?[]const u8,
+    label_buf: []u8,
+) []const u8 {
+    if (!topic_tag.present(tags)) return tags;
+    if (topic_tag.labelFromTags(tags, label_buf)) |label| {
+        if (label_out) |out| out.* = label;
+        return tags;
+    }
+    return topic_tag.stripTag(tags, strip_out);
 }
 
 fn sessionCanUseTagmsg(session: *const dispatch.ClientSession) bool {
@@ -31099,6 +31385,101 @@ test "ephemeral room: TTL reader parses the prop; DMs never expire" {
     } else return error.SkipZigTest;
 }
 
+test "AI policy: channel PROP flags validate, persist, and resolve precedence" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#ai" };
+        for ([_][]const u8{ "no-ai", "local-only", "server-ai-ok" }) |key| {
+            try std.testing.expectEqual(server.channelBuiltinSet(chan, key, "0", false), .not_handled);
+            try std.testing.expectEqual(server.channelBuiltinSet(chan, key, "1", false), .not_handled);
+            try std.testing.expectEqual(server.channelBuiltinSet(chan, key, "", true), .not_handled);
+            try std.testing.expectEqual(server.channelBuiltinSet(chan, key, "true", false), .bad_value);
+            try std.testing.expectEqual(server.channelBuiltinSet(chan, key, "2", false), .bad_value);
+        }
+
+        try std.testing.expectEqual(LinuxServer.AiPolicy.unspecified, server.channelAiPolicy("#ai"));
+        try std.testing.expect(server.checkChannelAiPolicy("#ai", .local_inference).allowed);
+        {
+            const decision = server.checkChannelAiPolicy("#ai", .server_plaintext);
+            try std.testing.expect(!decision.allowed);
+            try std.testing.expectEqual(LinuxServer.AiPolicyDeny.server_ai_not_enabled, decision.deny.?);
+        }
+        _ = try server.props.setProp(chan, "server-ai-ok", "1", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.AiPolicy.server_ai_ok, server.channelAiPolicy("#ai"));
+        try std.testing.expect(server.checkChannelAiPolicy("#ai", .server_plaintext).allowed);
+        _ = try server.props.setProp(chan, "local-only", "1", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.AiPolicy.local_only, server.channelAiPolicy("#ai"));
+        try std.testing.expect(server.checkChannelAiPolicy("#ai", .local_inference).allowed);
+        {
+            const decision = server.checkChannelAiPolicy("#ai", .server_plaintext);
+            try std.testing.expect(!decision.allowed);
+            try std.testing.expectEqual(LinuxServer.AiPolicyDeny.local_only, decision.deny.?);
+        }
+        _ = try server.props.setProp(chan, "no-ai", "1", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.AiPolicy.no_ai, server.channelAiPolicy("#ai"));
+        {
+            const decision = server.checkChannelAiPolicy("#ai", .local_inference);
+            try std.testing.expect(!decision.allowed);
+            try std.testing.expectEqual(LinuxServer.AiPolicyDeny.no_ai, decision.deny.?);
+        }
+        {
+            const decision = server.checkChannelAiPolicy("#ai", .server_plaintext);
+            try std.testing.expect(!decision.allowed);
+            try std.testing.expectEqual(LinuxServer.AiPolicyDeny.no_ai, decision.deny.?);
+        }
+
+        _ = try server.props.setProp(chan, "no-ai", "0", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.AiPolicy.local_only, server.channelAiPolicy("#ai"));
+        try std.testing.expectEqual(LinuxServer.AiPolicy.unspecified, server.channelAiPolicy("Nick"));
+    } else return error.SkipZigTest;
+}
+
+test "AI policy: public PROP visibility reaches non-op channel members" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const op_id = try addTestLocalClient(&server, "Op", null);
+        const op_conn = server.connFor(op_id).?;
+        op_conn.ircx = true;
+        const member_id = try addTestLocalClient(&server, "Member", null);
+        const member_conn = server.connFor(member_id).?;
+        member_conn.ircx = true;
+
+        _ = try server.world.join("#aivis", worldIdFromClient(op_id));
+        _ = try server.world.setMemberMode("#aivis", worldIdFromClient(op_id), .op, true);
+        _ = try server.world.join("#aivis", worldIdFromClient(member_id));
+
+        var set_line = try irc_line.parseLine("PROP #aivis no-ai :1");
+        try server.handleProp(op_id, op_conn, &set_line);
+        try std.testing.expectEqual(LinuxServer.AiPolicy.no_ai, server.channelAiPolicy("#aivis"));
+
+        member_conn.send_len = 0;
+        var get_line = try irc_line.parseLine("PROP #aivis GET no-ai,local-only,server-ai-ok");
+        try server.handleProp(member_id, member_conn, &get_line);
+        const get_written = member_conn.send_buf[0..member_conn.send_len];
+        try expectContains(get_written, " 818 Member #aivis no-ai :1");
+        try expectContains(get_written, " 819 Member #aivis ");
+        try std.testing.expect(std.mem.indexOf(u8, get_written, "local-only") == null);
+        try std.testing.expect(std.mem.indexOf(u8, get_written, "server-ai-ok") == null);
+
+        member_conn.send_len = 0;
+        var list_line = try irc_line.parseLine("PROP #aivis");
+        try server.handleProp(member_id, member_conn, &list_line);
+        const list_written = member_conn.send_buf[0..member_conn.send_len];
+        try expectContains(list_written, " 818 Member #aivis no-ai :1");
+        try expectContains(list_written, " 819 Member #aivis ");
+    } else return error.SkipZigTest;
+}
+
 test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -31298,6 +31679,62 @@ test "threaded server: +orochi/topic tag rides fanout + echo; untagged is unchan
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "+orochi/topic") == null);
 }
 
+test "threaded server: orochi/topics receives topic tags without generic message-tags" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch |err| switch (err) {
+        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "CAP REQ :orochi/topics\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try recvUntil(&c, " 001 C ", 200);
+
+    try writeAllFd(fd_a, "JOIN #topiccap\r\n");
+    try recvUntil(&a, " 366 A #topiccap ", 200);
+    try writeAllFd(fd_b, "JOIN #topiccap\r\n");
+    try recvUntil(&b, " 366 B #topiccap ", 200);
+    try writeAllFd(fd_c, "JOIN #topiccap\r\n");
+    try recvUntil(&c, " 366 C #topiccap ", 200);
+
+    b.reset();
+    c.reset();
+    try writeAllFd(fd_a, "@+orochi/topic=general;+draft/react=ok PRIVMSG #topiccap :hi\r\n");
+    try recvUntil(&b, "PRIVMSG #topiccap :hi\r\n", 200);
+    try expectContains(b.written(), "+orochi/topic=general");
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+draft/react") == null);
+
+    try recvUntil(&c, "PRIVMSG #topiccap :hi\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+draft/react") == null);
+}
+
 test "status.json: emits node health + mesh peers for the public status page" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -31322,6 +31759,56 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+    } else return error.SkipZigTest;
+}
+
+test "stats node health summarizes peer and quorum state" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        server.markPeerHealth("up.example", .established);
+        server.markPeerHealth("down.example", .down);
+        server.partition_split = true;
+        server.partition_quorum = false;
+        server.partition_components = 2;
+
+        const health = server.currentNodeHealth();
+        try std.testing.expectEqualStrings("degraded", health.status);
+        try std.testing.expect(!health.mesh_quorum);
+        try std.testing.expect(health.mesh_partitioned);
+        try std.testing.expectEqual(@as(u32, 2), health.mesh_components);
+        try std.testing.expectEqual(@as(u32, 1), health.mesh_peers_up);
+        try std.testing.expectEqual(@as(u32, 2), health.mesh_peers_total);
+    } else return error.SkipZigTest;
+}
+
+test "prometheus export includes mesh health gauges" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        server.markPeerHealth("up.example", .established);
+        server.markPeerHealth("down.example", .down);
+        server.partition_split = true;
+        server.partition_quorum = false;
+        server.partition_components = 2;
+
+        server.refreshMetricsSnapshot();
+        var buf: [8192]u8 = undefined;
+        const text = try server.metrics_snapshot.copyInto(&buf);
+        try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE orochi_mesh_quorum gauge") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_quorum 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_partitioned 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_components 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_peers_up 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_peers_total 2") != null);
     } else return error.SkipZigTest;
 }
 
@@ -34622,6 +35109,50 @@ test "threaded server: CHATHISTORY replays TAGMSG without BATCH when batch cap i
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "BATCH -") == null);
 }
 
+test "threaded server: TAGMSG strips invalid orochi topic tag before live delivery and replay" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :orochi/topics draft/typing draft/chathistory\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #topicmsg\r\n");
+    try recvUntil(&a, " 366 A #topicmsg ", 200);
+    try writeAllFd(fd_b, "JOIN #topicmsg\r\n");
+    try recvUntil(&b, " 366 B #topicmsg ", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "@+orochi/topic=bad,label;+typing=active TAGMSG #topicmsg\r\n");
+    try recvUntil(&b, "+typing=active :A!alice@localhost TAGMSG #topicmsg\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #topicmsg * 10\r\n");
+    try recvUntil(&b, "+typing=active :A!alice@localhost TAGMSG #topicmsg\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+}
+
 test "threaded server: TAGMSG strips forged server tags and duplicate client tags" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -37271,9 +37802,9 @@ test "threaded server: +U OPMODERATE routes a muted member's message to ops only
 }
 
 test "threaded server: +U OPMODERATE held message surfaces a POLICY event to opers" {
-    // operTestConfig defaults to one shard, so the muted member and the oper
-    // share a reactor (publishOperEvent reaches same-reactor subscribers — a
-    // pre-existing limitation under num_shards>1, out of scope here).
+    // The live loopback path covers the +U trigger; the two-shard fabric
+    // regression below pins the Event Spine fan-out contract independently of
+    // SO_REUSEPORT's host-specific accept distribution.
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -37318,6 +37849,45 @@ test "threaded server: +U OPMODERATE held message surfaces a POLICY event to ope
     a.reset();
     try writeAllFd(fd_b, "PRIVMSG #o :held-here\r\n");
     try recvUntil(&a, "#o held message from B: held-here", 200);
+}
+
+test "event spine: +U OPMODERATE POLICY fan-out reaches oper on another shard" {
+    if (comptime builtin.os.tag == .linux) {
+        var cfg = operTestConfig(0);
+        cfg.num_shards = 2;
+        var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        if (server.reactors.len < 2) return error.SkipZigTest;
+        server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+            error.ReactorWakeUnsupported => return error.SkipZigTest,
+            else => return err,
+        };
+
+        const prev_reactor = current_reactor;
+        defer current_reactor = prev_reactor;
+
+        current_reactor = &server.reactors[1];
+        const oper_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const oper_conn = server.rx().clients.get(oper_id).?;
+        oper_conn.token = try tokenFromId(oper_id);
+        try oper_conn.session.setNick("RemoteOper");
+        oper_conn.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+        oper_conn.session.setEventMask(event_spine.CategoryMask.only(.policy));
+
+        current_reactor = &server.reactors[0];
+        var muted = ConnState.init(-1);
+        try muted.session.setNick("B");
+        server.publishModerationHeld("#o", &muted, "held-cross-shard");
+
+        current_reactor = &server.reactors[1];
+        server.drainFabric();
+        const written = oper_conn.send_buf[0..oper_conn.send_len];
+        try expectContains(written, " EVENT RemoteOper ");
+        try expectContains(written, "#o held message from B: held-cross-shard");
+    } else return error.SkipZigTest;
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {

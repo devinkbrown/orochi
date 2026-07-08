@@ -29,6 +29,16 @@ pub const CountryCount = struct {
     clients: u32,
 };
 
+/// Public node/mesh health summary shown on the stats index and stats.json.
+pub const NodeHealth = struct {
+    status: []const u8 = "ok",
+    mesh_quorum: bool = true,
+    mesh_partitioned: bool = false,
+    mesh_components: u32 = 1,
+    mesh_peers_up: u32 = 0,
+    mesh_peers_total: u32 = 0,
+};
+
 /// One member row on a channel detail page.
 pub const Member = struct {
     nick: []const u8,
@@ -66,6 +76,7 @@ pub const Snapshot = struct {
     messages_total: u64 = 0,
     bytes_in: u64 = 0,
     bytes_out: u64 = 0,
+    node_health: NodeHealth = .{},
     /// Recent client-count samples, oldest first, for the sparkline.
     history: []const u32 = &.{},
     /// Busiest channels, already sorted by membership descending by the caller.
@@ -97,6 +108,15 @@ pub fn renderJson(snapshot: Snapshot, writer: anytype) !void {
     try writer.print(",\n  \"messages_total\": {d}", .{snapshot.messages_total});
     try writer.print(",\n  \"bytes_in\": {d}", .{snapshot.bytes_in});
     try writer.print(",\n  \"bytes_out\": {d}", .{snapshot.bytes_out});
+    try writer.writeAll(",\n  \"node_health\": {\"status\": ");
+    try jsonString(writer, snapshot.node_health.status);
+    try writer.print(", \"mesh_quorum\": {s}, \"mesh_partitioned\": {s}, \"mesh_components\": {d}, \"mesh_peers_up\": {d}, \"mesh_peers_total\": {d}}}", .{
+        if (snapshot.node_health.mesh_quorum) "true" else "false",
+        if (snapshot.node_health.mesh_partitioned) "true" else "false",
+        snapshot.node_health.mesh_components,
+        snapshot.node_health.mesh_peers_up,
+        snapshot.node_health.mesh_peers_total,
+    });
     try writer.writeAll(",\n  \"history\": [");
     for (snapshot.history, 0..) |h, i| {
         if (i != 0) try writer.writeAll(", ");
@@ -168,6 +188,9 @@ pub fn renderHtml(snapshot: Snapshot, writer: anytype) !void {
     try statCard(writer, "Channels", snapshot.channels);
     try statCard(writer, "Operators", snapshot.opers);
     try statCard(writer, "Servers", snapshot.servers);
+    try textCard(writer, "Node health", snapshot.node_health.status);
+    try textCard(writer, "Mesh quorum", if (snapshot.node_health.mesh_quorum) "held" else "lost");
+    try pairCard(writer, "Mesh peers", snapshot.node_health.mesh_peers_up, snapshot.node_health.mesh_peers_total);
     try statCard(writer, "Peak clients", snapshot.max_clients);
     try uptimeCard(writer, snapshot.uptime_secs);
 
@@ -280,6 +303,16 @@ fn byteCard(writer: anytype, label: []const u8, bytes: u64) !void {
     var u: usize = 0;
     while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
     try writer.print("<div class=\"card\"><div class=\"v\">{d:.1} {s}</div><div class=\"l\">{s}</div></div>\n", .{ v, units[u], label });
+}
+
+fn textCard(writer: anytype, label: []const u8, value: []const u8) !void {
+    try writer.writeAll("<div class=\"card\"><div class=\"v\">");
+    try htmlText(writer, value);
+    try writer.print("</div><div class=\"l\">{s}</div></div>\n", .{label});
+}
+
+fn pairCard(writer: anytype, label: []const u8, value: u32, total: u32) !void {
+    try writer.print("<div class=\"card\"><div class=\"v\">{d}/{d}</div><div class=\"l\">{s}</div></div>\n", .{ value, total, label });
 }
 
 /// Inline, dependency-free SVG sparkline. `data` is oldest→newest; the viewBox
@@ -420,6 +453,36 @@ test "country distribution renders in JSON and HTML" {
     const html = try renderToBuf(renderHtml, snap);
     try testing.expect(std.mem.indexOf(u8, html, "Clients by country") != null);
     try testing.expect(std.mem.indexOf(u8, html, ">US<") != null);
+}
+
+test "node health renders in JSON and stats index" {
+    const snap = Snapshot{
+        .server_name = "s",
+        .node_health = .{
+            .status = "degraded",
+            .mesh_quorum = false,
+            .mesh_partitioned = true,
+            .mesh_components = 2,
+            .mesh_peers_up = 1,
+            .mesh_peers_total = 3,
+        },
+    };
+
+    const json = try renderToBuf(renderJson, snap);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const health = parsed.value.object.get("node_health").?.object;
+    try testing.expectEqualStrings("degraded", health.get("status").?.string);
+    try testing.expect(!health.get("mesh_quorum").?.bool);
+    try testing.expect(health.get("mesh_partitioned").?.bool);
+    try testing.expectEqual(@as(i64, 2), health.get("mesh_components").?.integer);
+    try testing.expectEqual(@as(i64, 1), health.get("mesh_peers_up").?.integer);
+    try testing.expectEqual(@as(i64, 3), health.get("mesh_peers_total").?.integer);
+
+    const html = try renderToBuf(renderHtml, snap);
+    try testing.expect(std.mem.indexOf(u8, html, "Node health") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "degraded") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "1/3") != null);
 }
 
 test "renderChannelHtml lists members and escapes" {

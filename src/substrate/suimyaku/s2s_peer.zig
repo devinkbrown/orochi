@@ -17,6 +17,7 @@ const channel_crdt = @import("channel_crdt.zig");
 const gossip_round = @import("gossip_round.zig");
 const anti_entropy_repair = @import("anti_entropy_repair.zig");
 const membership_view = @import("membership_view.zig");
+const merkle = @import("merkle.zig");
 const peer_link = @import("peer_link.zig");
 const message_relay = @import("message_relay.zig");
 const toml = @import("../../proto/toml.zig");
@@ -61,12 +62,16 @@ const cap_member_account: u8 = 1 << 1;
 /// so they must never traverse a plaintext S2S leg. Gated like `member_account`:
 /// the extra trailing bytes are appended only to a peer that advertised support.
 const cap_member_oper_info: u8 = 1 << 2;
+/// The peer understands Merkle-guided anti-entropy repair frames
+/// (REPAIR_SUMMARY/REQUEST/RESPONSE).
+const cap_repair_frames: u8 = 1 << 3;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
 const observe_event = @import("../../proto/observe_event.zig");
 const kill_relay = @import("../../proto/kill_relay.zig");
+const tegami_push_relay = @import("../../proto/tegami_push_relay.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -174,6 +179,10 @@ pub const S2sPeer = struct {
     /// its full membership/mode/prop/topic burst to this conn. Substrate-pure: the
     /// driver only records the request; the daemon owns the burst.
     resync_requested: bool = false,
+    /// A valid REPAIR_RESPONSE updated the substrate CRDT shadow. The daemon drains
+    /// this as a conservative live-state bridge: request and send the existing full
+    /// state burst rather than surfacing repair records directly.
+    repair_resync_requested: bool = false,
     ping_rx_count: usize = 0,
     pong_rx_count: usize = 0,
     config: Config,
@@ -195,6 +204,10 @@ pub const S2sPeer = struct {
     /// capable link). Gates emission of the optional real_host/certfp blocks on
     /// MEMBERSHIP events so they only ever ride a secured leg to a capable peer.
     peer_supports_oper_info: bool = false,
+    /// Whether the remote peer advertised Merkle/RBSR anti-entropy repair frames.
+    /// Gated because these are newer S2S frame tags; older peers keep relying on
+    /// the daemon's coarse full-state re-burst fallback.
+    peer_supports_repair: bool = false,
     /// In-scope frames rejected because their signed-envelope verification failed
     /// or the self-certified origin did not match the claimed origin. Folded into
     /// the same audit drain as `rejected_origin_frames` (see `acceptsDirectOrigin`).
@@ -261,6 +274,10 @@ pub const S2sPeer = struct {
     /// decode + apply (add/remove) into its local Warden store. Substrate-pure:
     /// never decoded here.
     wards: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified TEGAMI_PUSH payloads received from this peer, awaiting the daemon
+    /// to decode and run local Web Push delivery. These are signing-required:
+    /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
+    tegami_pushes: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -325,6 +342,7 @@ pub const S2sPeer = struct {
         peer_supports_signing: bool,
         peer_supports_account: bool,
         peer_supports_oper_info: bool,
+        peer_supports_repair: bool,
     };
 
     pub fn snapshotResume(self: *const S2sPeer) ResumeHeader {
@@ -335,6 +353,7 @@ pub const S2sPeer = struct {
             .peer_supports_signing = self.peer_supports_signing,
             .peer_supports_account = self.peer_supports_account,
             .peer_supports_oper_info = self.peer_supports_oper_info,
+            .peer_supports_repair = self.peer_supports_repair,
         };
     }
 
@@ -419,6 +438,7 @@ pub const S2sPeer = struct {
             .peer_supports_signing = hdr.peer_supports_signing,
             .peer_supports_account = hdr.peer_supports_account,
             .peer_supports_oper_info = hdr.peer_supports_oper_info,
+            .peer_supports_repair = hdr.peer_supports_repair,
             .config = options.config,
             .signing_key = options.signing_key,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
@@ -461,6 +481,8 @@ pub const S2sPeer = struct {
         self.kills.deinit(self.allocator);
         for (self.wards.items) |m| self.allocator.free(m);
         self.wards.deinit(self.allocator);
+        for (self.tegami_pushes.items) |m| self.allocator.free(m);
+        self.tegami_pushes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -514,6 +536,14 @@ pub const S2sPeer = struct {
         return self.resync_requested;
     }
 
+    /// Consume a pending daemon-side resync bridge requested by a valid repair
+    /// response. The repair frame updates the pure CRDT shadow; live server state
+    /// reconverges through the existing full-burst frame families.
+    pub fn takeRepairResyncRequest(self: *S2sPeer) bool {
+        defer self.repair_resync_requested = false;
+        return self.repair_resync_requested;
+    }
+
     pub fn tick(self: *S2sPeer, sink: ByteSink, now_ms: u64, rng_seed: u64, peers: []const NodeId) !void {
         if (self.session.link.tick() == .heartbeat_due) {
             try emitFrame(self.allocator, sink, .PING, "");
@@ -528,11 +558,18 @@ pub const S2sPeer = struct {
             self.config.link.gossip_config,
         );
         defer result.deinit(self.allocator);
-        if (!containsNode(result.peers.items, self.remote_node_id)) return;
+        if (containsNode(result.peers.items, self.remote_node_id)) {
+            const payload = try encodeGossip(self.allocator, &result.payload);
+            defer self.allocator.free(payload);
+            try emitFrame(self.allocator, sink, .GOSSIP, payload);
+        }
 
-        const payload = try encodeGossip(self.allocator, &result.payload);
-        defer self.allocator.free(payload);
-        try emitFrame(self.allocator, sink, .GOSSIP, payload);
+        if (self.peer_supports_repair and elapsed(now_ms, self.session.last_repair_ms) >= self.config.link.repair_interval_ms) {
+            const payload = try encodeRepairSummary(self.allocator, self.state);
+            defer self.allocator.free(payload);
+            try self.emitSignable(sink, .REPAIR_SUMMARY, payload);
+            self.session.last_repair_ms = now_ms;
+        }
     }
 
     pub fn linkState(self: *const S2sPeer) peer_link.State {
@@ -627,6 +664,10 @@ pub const S2sPeer = struct {
             .KILL => try self.recvKill(frame.payload),
             .WARD => try self.recvWard(frame.payload),
             .RESYNC => self.resync_requested = true,
+            .REPAIR_SUMMARY => try self.recvRepairSummary(frame.payload, sink),
+            .REPAIR_REQUEST => try self.recvRepairRequest(frame.payload, sink),
+            .REPAIR_RESPONSE => try self.recvRepairResponse(frame.payload),
+            .TEGAMI_PUSH => try self.recvTegamiPush(frame.payload),
         }
     }
 
@@ -797,6 +838,34 @@ pub const S2sPeer = struct {
     /// established.
     pub fn sendWard(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
         try self.emitSignable(sink, .WARD, wire);
+    }
+
+    /// Queue a verified inbound TEGAMI_PUSH hint for daemon-side Web Push
+    /// delivery. Unlike older direct-owned frames, this is signing-required:
+    /// peers that did not negotiate frame signing are ignored, because the payload
+    /// carries a DM preview and should only ride the secured node-identity path.
+    fn recvTegamiPush(self: *S2sPeer, frame_payload: []const u8) !void {
+        if (!self.peer_supports_signing) return;
+        const payload = self.verifiedPayload(.TEGAMI_PUSH, frame_payload) orelse return;
+        _ = tegami_push_relay.decode(payload) catch return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.tegami_pushes.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued TEGAMI_PUSH payloads (caller owns + frees each slice and the
+    /// outer slice). Each decodes with `tegami_push_relay.decode`.
+    pub fn takeTegamiPushes(self: *S2sPeer) ![][]u8 {
+        return self.tegami_pushes.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed TEGAMI_PUSH hint to this peer. No-op unless the peer
+    /// negotiated frame signing and this node has a signing key; this avoids
+    /// leaking DM previews onto legacy/plaintext S2S links.
+    pub fn sendTegamiPush(self: *S2sPeer, sink: ByteSink, account: []const u8, from: []const u8, text: []const u8) !void {
+        if (!self.peer_supports_signing or self.signing_key == null) return;
+        var buf: [tegami_push_relay.max_encoded_len]u8 = undefined;
+        const wire = try tegami_push_relay.encode(.{ .account = account, .from = from, .text = text }, &buf);
+        try self.emitSignable(sink, .TEGAMI_PUSH, wire);
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
@@ -1902,6 +1971,7 @@ pub const S2sPeer = struct {
         self.peer_supports_signing = (hs.caps & cap_frame_signing) != 0;
         self.peer_supports_account = (hs.caps & cap_member_account) != 0;
         self.peer_supports_oper_info = (hs.caps & cap_member_oper_info) != 0;
+        self.peer_supports_repair = (hs.caps & cap_repair_frames) != 0;
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);
@@ -1941,7 +2011,7 @@ pub const S2sPeer = struct {
         // so they never advertise it and stay on the legacy unsigned path.
         // We always understand the optional member-account block, so advertise it
         // unconditionally; emission still only happens to a peer that does too.
-        var caps: u8 = cap_member_account;
+        var caps: u8 = cap_member_account | cap_repair_frames;
         // Frame signing AND oper-info ride ONLY a secured link (one holding a node
         // signing key). real_host/certfp are sensitive, so a plaintext leg never
         // advertises — and thus never receives — them.
@@ -1979,6 +2049,43 @@ pub const S2sPeer = struct {
         defer gossip_payload.deinit(self.allocator);
         var rng = membership_view.Rng.init(mixSeed(rng_seed, self.local_node_id, self.remote_node_id));
         try self.session.gossip.applyPayload(&gossip_payload, try i64Ms(now_ms), &rng);
+    }
+
+    fn recvRepairSummary(self: *S2sPeer, frame_payload: []const u8, sink: ByteSink) !void {
+        const payload = self.verifiedPayload(.REPAIR_SUMMARY, frame_payload) orelse return;
+        var remote = decodeRepairSummary(self.allocator, payload) catch return;
+        defer remote.deinit();
+        var local = anti_entropy_repair.summarize(self.allocator, self.state) catch return;
+        defer local.deinit();
+        var ranges = anti_entropy_repair.diff(self.allocator, &local, &remote) catch return;
+        defer ranges.deinit();
+        if (ranges.ranges.len == 0) return;
+        var request = anti_entropy_repair.buildRepairRequest(self.allocator, &ranges) catch return;
+        defer request.deinit();
+        const bytes = encodeRepairRequest(self.allocator, &request) catch return;
+        defer self.allocator.free(bytes);
+        try self.emitSignable(sink, .REPAIR_REQUEST, bytes);
+    }
+
+    fn recvRepairRequest(self: *S2sPeer, frame_payload: []const u8, sink: ByteSink) !void {
+        const payload = self.verifiedPayload(.REPAIR_REQUEST, frame_payload) orelse return;
+        var request = decodeRepairRequest(self.allocator, payload) catch return;
+        defer request.deinit();
+        var response = anti_entropy_repair.buildRepairResponse(self.allocator, self.state, &request) catch return;
+        defer response.deinit();
+        if (response.records.len == 0) return;
+        const bytes = encodeRepairResponse(self.allocator, &response) catch return;
+        defer self.allocator.free(bytes);
+        try self.emitSignable(sink, .REPAIR_RESPONSE, bytes);
+    }
+
+    fn recvRepairResponse(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.REPAIR_RESPONSE, frame_payload) orelse return;
+        var response = decodeRepairResponse(self.allocator, payload) catch return;
+        defer response.deinit();
+        anti_entropy_repair.applyRepairResponse(self.allocator, self.state, &response) catch return;
+        if (response.records.len != 0) self.repair_resync_requested = true;
+        try self.refreshChannelRoute();
     }
 
     fn refreshChannelRoute(self: *S2sPeer) !void {
@@ -2098,6 +2205,121 @@ fn decodeGossip(allocator: Allocator, bytes: []const u8) !gossip_round.GossipPay
     return out;
 }
 
+fn encodeRepairSummary(allocator: Allocator, state: *const ChannelCrdt) ![]u8 {
+    var summary = try anti_entropy_repair.summarize(allocator, state);
+    defer summary.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try writeVarint(&out, allocator, summary.entries.items.len);
+    for (summary.entries.items) |entry| {
+        try writeBytes(&out, allocator, entry.key);
+        try out.appendSlice(allocator, &entry.hash);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn decodeRepairSummary(allocator: Allocator, bytes: []const u8) !anti_entropy_repair.Summary {
+    var r = Reader{ .buf = bytes };
+    var out = anti_entropy_repair.Summary{
+        .allocator = allocator,
+        .tree = merkle.MerkleTree.init(allocator),
+    };
+    errdefer out.deinit();
+
+    const count = try r.readVarint();
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const key_view = try r.readBytes();
+        const hash = try r.readHash();
+        const key = try allocator.dupe(u8, key_view);
+        errdefer allocator.free(key);
+        try out.tree.put(key, hash);
+        try out.entries.append(allocator, .{ .key = key, .hash = hash });
+    }
+    if (!r.done()) return error.TrailingBytes;
+    return out;
+}
+
+fn encodeRepairRequest(allocator: Allocator, request: *const anti_entropy_repair.RepairRequest) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try writeVarint(&out, allocator, request.keys.len);
+    for (request.keys) |key| try writeBytes(&out, allocator, key);
+    return out.toOwnedSlice(allocator);
+}
+
+fn decodeRepairRequest(allocator: Allocator, bytes: []const u8) !anti_entropy_repair.RepairRequest {
+    var r = Reader{ .buf = bytes };
+    var keys = std.ArrayList([]u8).empty;
+    errdefer {
+        for (keys.items) |key| allocator.free(key);
+        keys.deinit(allocator);
+    }
+    const count = try r.readVarint();
+    var i: usize = 0;
+    while (i < count) : (i += 1) try keys.append(allocator, try allocator.dupe(u8, try r.readBytes()));
+    if (!r.done()) return error.TrailingBytes;
+    return .{ .allocator = allocator, .keys = try keys.toOwnedSlice(allocator) };
+}
+
+fn encodeRepairResponse(allocator: Allocator, response: *const anti_entropy_repair.RepairResponse) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try writeU64(&out, allocator, response.hlc.toU64());
+    try writeVersionVector(&out, allocator, response.vv);
+    try writeVarint(&out, allocator, response.records.len);
+    for (response.records) |record| {
+        try out.append(allocator, @intFromEnum(record.kind));
+        try writeBytes(&out, allocator, record.key);
+        try writeBytes(&out, allocator, record.payload);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn decodeRepairResponse(allocator: Allocator, bytes: []const u8) !anti_entropy_repair.RepairResponse {
+    var r = Reader{ .buf = bytes };
+    const hlc = hlcFromKey(try r.readU64());
+    const vv = try r.readVersionVector();
+    var records = std.ArrayList(anti_entropy_repair.RepairRecord).empty;
+    errdefer {
+        for (records.items) |record| {
+            allocator.free(record.key);
+            allocator.free(record.payload);
+        }
+        records.deinit(allocator);
+    }
+    const count = try r.readVarint();
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const kind: anti_entropy_repair.RecordKind = switch (try r.readByte()) {
+            1 => .member,
+            2 => .mode,
+            else => return error.InvalidRepairRecord,
+        };
+        const key = try allocator.dupe(u8, try r.readBytes());
+        errdefer allocator.free(key);
+        const payload = try allocator.dupe(u8, try r.readBytes());
+        errdefer allocator.free(payload);
+        try records.append(allocator, .{ .kind = kind, .key = key, .payload = payload });
+    }
+    if (!r.done()) return error.TrailingBytes;
+    return .{ .allocator = allocator, .hlc = hlc, .vv = vv, .records = try records.toOwnedSlice(allocator) };
+}
+
+fn writeVersionVector(out: *std.ArrayList(u8), allocator: Allocator, vv: channel_crdt.VersionVector) !void {
+    try writeVarint(out, allocator, vv.len);
+    for (vv.entries[0..vv.len]) |entry| {
+        try writeU64(out, allocator, entry.replica);
+        try writeU64(out, allocator, entry.counter);
+    }
+}
+
+fn writeBytes(out: *std.ArrayList(u8), allocator: Allocator, bytes: []const u8) !void {
+    try writeVarint(out, allocator, bytes.len);
+    try out.appendSlice(allocator, bytes);
+}
+
 fn writeBytes16(out: *std.ArrayList(u8), allocator: Allocator, bytes: []const u8) !void {
     try writeU16(out, allocator, @intCast(bytes.len));
     try out.appendSlice(allocator, bytes);
@@ -2169,6 +2391,32 @@ const Reader = struct {
         return self.readFixed(try self.readU16());
     }
 
+    fn readBytes(self: *Reader) ![]const u8 {
+        return self.readFixed(try self.readVarint());
+    }
+
+    fn readHash(self: *Reader) !anti_entropy_repair.Hash {
+        const bytes = try self.readFixed(@sizeOf(anti_entropy_repair.Hash));
+        var out: anti_entropy_repair.Hash = undefined;
+        @memcpy(&out, bytes);
+        return out;
+    }
+
+    fn readVersionVector(self: *Reader) !channel_crdt.VersionVector {
+        var out = channel_crdt.VersionVector.init();
+        const count = try self.readVarint();
+        if (count > out.entries.len) return error.Oversize;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            out.entries[i] = .{
+                .replica = try self.readU64(),
+                .counter = try self.readU64(),
+            };
+        }
+        out.len = count;
+        return out;
+    }
+
     fn readFixed(self: *Reader, len: usize) ![]const u8 {
         if (self.pos + len > self.buf.len) return error.Truncated;
         const out = self.buf[self.pos .. self.pos + len];
@@ -2192,6 +2440,10 @@ fn containsNode(nodes: []const NodeId, node: NodeId) bool {
     return false;
 }
 
+fn elapsed(now_ms: u64, since_ms: u64) u64 {
+    return if (now_ms > since_ms) now_ms - since_ms else 0;
+}
+
 /// Clamp an identity string to its wire limit (an over-long local value is
 /// propagated truncated rather than failing the whole announcement).
 fn truncated(s: []const u8, max: usize) []const u8 {
@@ -2201,6 +2453,10 @@ fn truncated(s: []const u8, max: usize) []const u8 {
 fn i64Ms(ms: u64) !i64 {
     if (ms > @as(u64, @intCast(std.math.maxInt(i64)))) return error.TimeOutOfRange;
     return @intCast(ms);
+}
+
+fn hlcFromKey(key: u64) channel_crdt.Hlc {
+    return .{ .wall_ms = @intCast(key >> 16), .logical = @intCast(key & 0xffff) };
 }
 
 fn mixSeed(a: u64, b: u64, c: u64) u64 {
@@ -2335,6 +2591,134 @@ test "two s2s peer drivers handshake and converge channel CRDT state" {
     try a.sendDelta(&delta, a_to_b.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xD317A);
     try std.testing.expect(ChannelCrdt.eql(&a_state, &b_state));
+}
+
+test "two s2s peer drivers repair divergent state without explicit delta send" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    discard(try a_state.localJoin(10, .{ .voice = true }, 10));
+    discard(try b_state.localJoin(20, .{ .op = true }, 11));
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+    try std.testing.expect(a.peer_supports_repair);
+    try std.testing.expect(b.peer_supports_repair);
+    try std.testing.expect(ChannelCrdt.eql(&a_state, &b_state));
+
+    discard(try a_state.localJoin(30, .{ .founder = true }, 30));
+    discard(try a_state.localSetMode(.{ .secret = true }, 31));
+    discard(try b_state.localJoin(40, .{ .voice = true }, 32));
+    discard(try b_state.localSetMode(.{ .topic_protected = true }, 33));
+    a_to_b.clear();
+    b_to_a.clear();
+
+    tc.now_ms += 25;
+    const peers = [_]NodeId{ 1, 2 };
+    try a.tick(a_to_b.sink(), tc.now_ms, 0xCAFE, &peers);
+    try b.tick(b_to_a.sink(), tc.now_ms, 0xBEEF, &peers);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xD00D);
+
+    try std.testing.expect(a.takeRepairResyncRequest());
+    try std.testing.expect(b.takeRepairResyncRequest());
+    try std.testing.expect(!a.takeRepairResyncRequest());
+    try std.testing.expect(!b.takeRepairResyncRequest());
+    try std.testing.expect(ChannelCrdt.eql(&a_state, &b_state));
+    try std.testing.expect(a_state.containsMember(30));
+    try std.testing.expect(a_state.containsMember(40));
+    try std.testing.expect(b_state.containsMember(30));
+    try std.testing.expect(b_state.containsMember(40));
+}
+
+test "malformed repair frames are dropped without closing the peer driver" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+    try std.testing.expect(b.peer_supports_repair);
+
+    a_to_b.clear();
+    b_to_a.clear();
+    try emitFrame(allocator, a_to_b.sink(), .REPAIR_SUMMARY, "bad");
+    try emitFrame(allocator, a_to_b.sink(), .REPAIR_REQUEST, "bad");
+    try emitFrame(allocator, a_to_b.sink(), .REPAIR_RESPONSE, "bad");
+    try b.feed(a_to_b.bytes.items, b_to_a.sink(), tc.now_ms, 0xBAD);
+
+    try std.testing.expectEqual(peer_link.State.established, b.linkState());
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+    try std.testing.expect(!b.takeRepairResyncRequest());
+}
+
+test "s2s peer resume header preserves repair capability" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+
+    const hdr = a.snapshotResume();
+    try std.testing.expect(hdr.peer_supports_repair);
+
+    var resumed_state = ChannelCrdt.init(allocator, 1);
+    defer resumed_state.deinit();
+    var resumed = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &resumed_state,
+        .clock = tc.clock(),
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 3000,
+        .server_name = "a.test",
+        .description = "test",
+        .config = a.config,
+    }, hdr, a.remoteName(), tc.now_ms + 1, 0xC0DE);
+    defer resumed.deinit();
+
+    try std.testing.expect(resumed.peer_supports_repair);
+    try std.testing.expectEqual(@as(?NodeId, 2), resumed.remoteNodeId());
 }
 
 test "PING emits matching PONG" {
@@ -2849,6 +3233,48 @@ test "signing peers round-trip a signed WARD frame" {
     }
     try std.testing.expectEqual(@as(usize, 1), wards.len);
     try std.testing.expectEqualStrings(ward_wire, wards[0]);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "signing peers round-trip a signed TEGAMI_PUSH frame" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x61);
+    const kp_b = try signingKeyFor(0x62);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EE);
+
+    try a.sendTegamiPush(a_to_b.sink(), "alice", "bob", "offline dm preview");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);
+
+    const pushes = try b.takeTegamiPushes();
+    defer {
+        for (pushes) |p| allocator.free(p);
+        allocator.free(pushes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), pushes.len);
+    const ev = try tegami_push_relay.decode(pushes[0]);
+    try std.testing.expectEqualStrings("alice", ev.account);
+    try std.testing.expectEqualStrings("bob", ev.from);
+    try std.testing.expectEqualStrings("offline dm preview", ev.text);
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 

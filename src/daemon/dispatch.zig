@@ -255,6 +255,7 @@ pub const CapId = enum(u6) {
     account_tag,
     orochi_session_sync,
     orochi_bouncer,
+    orochi_topics,
     chghost,
     no_implicit_names,
     chathistory,
@@ -340,6 +341,10 @@ const cap_specs = [_]CapSpec{
     // history on (re)join, bounded by the client's read marker). Multi-session
     // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
     .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
+    // orochi/topics: opt in to Orochi's named-conversation surface. A receiver
+    // gets the `+orochi/topic=<label>` client-only tag without needing generic
+    // message-tags, and clients can discover the topic-filtered CHATHISTORY path.
+    .{ .id = .orochi_topics, .name = "orochi/topics" },
     // chghost: receive a native CHGHOST line when a common user's host changes
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
@@ -2328,6 +2333,7 @@ test "CAP negotiation holds registration until CAP END" {
     try expectContains(replies.written(), "utf8-only");
     try expectContains(replies.written(), "draft/netsplit");
     try expectContains(replies.written(), "draft/netjoin");
+    try expectContains(replies.written(), "orochi/topics");
     replies.clear();
 
     try dispatchText(&session, &replies, "NICK kain");
@@ -2414,6 +2420,16 @@ test "CAP REQ accepts bare and value-bearing tokens" {
     try expectContains(replies.written(), " CAP * ACK :server-time sasl=PLAIN\r\n");
     try std.testing.expect(session.cap.negotiated.contains(.server_time));
     try std.testing.expect(session.cap.negotiated.contains(.sasl));
+}
+
+test "CAP REQ accepts orochi/topics discovery cap" {
+    var session = ClientSession.init();
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP REQ :orochi/topics");
+    try expectContains(replies.written(), " CAP * ACK :orochi/topics\r\n");
+    try std.testing.expect(session.cap.negotiated.contains(.orochi_topics));
 }
 
 test "CAP REQ accepts SASL EXTERNAL value when available" {

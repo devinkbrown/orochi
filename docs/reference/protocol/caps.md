@@ -21,6 +21,7 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `account-tag` | none | Enables account tags. | `src/daemon/dispatch.zig:305` |
 | `orochi/session-sync` | none | Orochi vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
 | `orochi/bouncer` | none | Orochi vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
+| `orochi/topics` | none | Orochi vendor cap for named conversations: clients can receive `+orochi/topic=<label>` without generic `message-tags`, and discover topic-filtered CHATHISTORY. | `src/daemon/dispatch.zig` (`orochi_topics`) |
 | `chghost` | none | Receive CHGHOST lines for common-user host changes. | `src/daemon/dispatch.zig:316` |
 | `no-implicit-names` | none | Suppress automatic NAMES burst on JOIN for capable clients. | `src/daemon/dispatch.zig:319` |
 | `draft/chathistory` | none | CHATHISTORY command and chathistory BATCH replies. | `src/daemon/dispatch.zig:331` |
@@ -57,4 +58,4 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 
 ## Vendor caps
 
-The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync` and `orochi/bouncer` (`src/daemon/dispatch.zig:308`, `src/daemon/dispatch.zig:312`). No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.
+The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync`, `orochi/bouncer`, and `orochi/topics`. No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.

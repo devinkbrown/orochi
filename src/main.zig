@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const orochi = @import("orochi");
+const delegated_credential_cli = @import("daemon/delegated_credential_cli.zig");
 
 /// Shared context for the config-string resolver. Both `env:NAME` and
 /// `@file:path` indirection run through a single `?*anyopaque` ctx, so it
@@ -39,6 +40,56 @@ fn validateTlsChain(chain: []const []const u8) anyerror!void {
     // ships leaf + intermediates, never a self-signed root, and its intermediate
     // may use a key type the server does not sign with). See validateServerChainAt.
     try orochi.crypto.x509_verify.validateServerChainAt(chain, now_unix);
+}
+
+const LoadedEchKeys = struct {
+    configs: [][]u8 = &.{},
+    keys: []orochi.crypto.tls_server.EchKey = &.{},
+
+    fn deinit(self: *LoadedEchKeys, allocator: std.mem.Allocator) void {
+        for (self.keys) |*key| std.crypto.secureZero(u8, &key.private_key);
+        allocator.free(self.keys);
+        for (self.configs) |bytes| allocator.free(bytes);
+        allocator.free(self.configs);
+        self.* = .{};
+    }
+};
+
+fn loadTlsEchKeys(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    defs: []const orochi.daemon.config_format.Config.EchKeyDef,
+) !LoadedEchKeys {
+    var configs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (configs.items) |bytes| allocator.free(bytes);
+        configs.deinit(allocator);
+    }
+    var keys: std.ArrayList(orochi.crypto.tls_server.EchKey) = .empty;
+    errdefer {
+        for (keys.items) |*key| std.crypto.secureZero(u8, &key.private_key);
+        keys.deinit(allocator);
+    }
+
+    for (defs) |def| {
+        const config = try std.Io.Dir.cwd().readFileAlloc(io, def.config_path, allocator, .limited(64 * 1024));
+        var config_unlisted = true;
+        errdefer if (config_unlisted) allocator.free(config);
+        try configs.append(allocator, config);
+        config_unlisted = false;
+        try keys.append(allocator, .{ .config = config, .private_key = def.private_key });
+    }
+
+    const key_slice = try keys.toOwnedSlice(allocator);
+    errdefer {
+        for (key_slice) |*key| std.crypto.secureZero(u8, &key.private_key);
+        allocator.free(key_slice);
+    }
+    const config_slice = try configs.toOwnedSlice(allocator);
+    return .{
+        .configs = config_slice,
+        .keys = key_slice,
+    };
 }
 
 /// Services → live-world bridge: a channel registration marks the live channel
@@ -165,6 +216,26 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("acme-issue is only supported on Linux\n", .{});
                 return;
             }
+        } else
+        // `orochi delegated-credential inspect|validate ...` inspects a raw RFC
+        // 9345 DelegatedCredential and optionally validates it against the leaf
+        // certificate that signed it. It never boots the daemon or binds ports.
+        if (std.mem.eql(u8, first, "delegated-credential")) {
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            while (args.next()) |a| try rest.append(allocator, a);
+            const opts = delegated_credential_cli.parseArgs(rest.items) catch |err| {
+                std.debug.print("delegated-credential args error: {s}\n", .{@errorName(err)});
+                delegated_credential_cli.usage();
+                std.process.exit(2);
+            } orelse {
+                delegated_credential_cli.usage();
+                std.process.exit(2);
+            };
+            if (!try delegated_credential_cli.run(allocator, init.io, opts)) {
+                std.process.exit(1);
+            }
+            return;
         } else {
             config_path_arg = first;
         }
@@ -484,6 +555,8 @@ pub fn main(init: std.process.Init) !void {
     }
     var tls_sni_certs: []orochi.crypto.tls_server.SniCert = &.{};
     defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
+    var tls_ech_loaded: ?LoadedEchKeys = null;
+    defer if (tls_ech_loaded) |*e| e.deinit(allocator);
     if (held) |h| {
         if (h.tls.enabled) {
             if (orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
@@ -527,14 +600,34 @@ pub fn main(init: std.process.Init) !void {
                         break :tls_material;
                     };
                     tls_sni_certs = built;
-                    srv_cfg.tls_sni_certs = tls_sni_certs;
                     std.debug.print("orochi: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
+                }
+                if (h.tls.ech_keys.len != 0) {
+                    tls_ech_loaded = loadTlsEchKeys(allocator, init.io, h.tls.ech_keys) catch |err| {
+                        std.debug.print("orochi: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        break :tls_material;
+                    };
+                    var probe = orochi.crypto.tls_server.Server.init(allocator, .{
+                        .cert_chain = tls_loaded.?.cert_chain,
+                        .signing_key = tls_loaded.?.signing_key,
+                        .ecdsa_p256_signing_key = tls_loaded.?.ecdsa_p256_signing_key,
+                        .rsa_signing_key = tls_loaded.?.rsa_signing_key,
+                        .sni_certs = tls_sni_certs,
+                        .ech_keys = tls_ech_loaded.?.keys,
+                    }) catch |err| {
+                        std.debug.print("orochi: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        break :tls_material;
+                    };
+                    probe.deinit();
+                    std.debug.print("orochi: {d} ECH key(s) loaded\n", .{tls_ech_loaded.?.keys.len});
                 }
                 srv_cfg.tls_port = h.tls.port;
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
                 srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
                 srv_cfg.tls_rsa_signing_key = tls_loaded.?.rsa_signing_key;
                 srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
+                srv_cfg.tls_sni_certs = tls_sni_certs;
+                if (tls_ech_loaded) |e| srv_cfg.tls_ech_keys = e.keys;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;

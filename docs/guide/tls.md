@@ -37,10 +37,32 @@ A hardened TLS 1.2 client and server engine also exists as standalone modules (`
 | HelloRetryRequest | The client handles HRR (cookie echo, RFC 5280 group rules, synthetic `message_hash` transcript, second-HRR-fatal). |
 | Post-handshake KeyUpdate | Honored in both directions: the receiving side rotates its traffic keys and replies with its own KeyUpdate when requested. |
 | Mutual TLS | The server can request an Ed25519 client certificate; its fingerprint (CertFP) backs SASL EXTERNAL (see below). |
+| Delegated credentials | TLS client/server consume RFC 9345 delegated credentials when explicitly configured/offered. The out-of-band helper `orochi delegated-credential inspect|validate` parses ready-made DC wire bytes and can validate the leaf signature, DelegationUsage, KeyUsage, and lifetime window against a leaf certificate. Minting/rotation is still not shipped because it needs production private-key loading and safe DC key-output policy. |
 
 **Certificate validation (client):** chain-to-trust-anchor signature checks (RSA-PSS/PKCS#1, ECDSA P-256/P-384, Ed25519), SAN dNSName matching, validity-window enforcement when a wall clock is supplied (the live HTTPS and ACME paths pass one), ExtendedKeyUsage `serverAuth` on the leaf, `keyCertSign` plus basicConstraints on path CAs, and X.509 Name Constraints (permitted/excluded dNSName subtrees).
 
 **Revocation and transparency parsers:** clean-room, fail-closed parsing modules exist for OCSP responses (`crypto/ocsp.zig`, RFC 6960), X.509 CRLs (`crypto/crl.zig`, RFC 5280), and Certificate Transparency SCTs (`crypto/sct.zig`, RFC 6962). These parse and expose status and structure; cryptographic signature verification and live wiring into the handshake are not yet enabled.
+
+## Delegated credential helper
+
+The helper is an offline inspection/validation path. It never starts the daemon,
+binds a listener, loads the server's private key, or mints new credentials.
+
+```sh
+orochi delegated-credential inspect --dc dc.wire
+orochi delegated-credential validate --dc dc.wire --cert fullchain.pem
+orochi delegated-credential validate --dc dc.wire --cert fullchain.pem --time 1704067200
+```
+
+`--dc` is the raw `DelegatedCredential` extension payload. `inspect` validates
+the wire framing and prints `valid_time`, `dc_cert_verify_algorithm`, outer
+signature `algorithm`, SPKI length, and signature length. Supplying `--cert`, or
+using `validate`, additionally checks the first certificate in the PEM/DER chain:
+it must carry RFC 9345 DelegationUsage and digitalSignature KeyUsage, the DC
+expiry (`leaf.notBefore + valid_time`) must be live, within the seven-day
+remaining-lifetime cap, and before the leaf `notAfter`, and the DC signature must
+verify under the leaf SPKI. The supported leaf-signature schemes are Ed25519,
+ECDSA P-256/SHA-256, and RSA-PSS-RSAE-SHA256.
 
 ## STS
 

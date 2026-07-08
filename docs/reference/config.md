@@ -303,7 +303,17 @@ Source: struct at `src/daemon/config_format.zig:180`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `dir` | string | `""` | any string | Directory for `stats.json` and `index.html`; empty disables (`src/daemon/server.zig:958`). |
+| `channel_dir` | string | `""` | any string | Directory for channel-stats JSON plus the durable `.chanstats.snapshot`; empty disables chanstats publication. |
 | `interval` | duration string | `"30s"` | positive `ms/s/m/h` duration | Minimum interval between stats writes (`src/daemon/config_format.zig:395`). |
+
+## `[backup]`
+
+Source: struct at `src/daemon/config_format.zig`, parsing in `parseToml`, mapping at `src/daemon/config_boot.zig`, writer at `src/daemon/server.zig`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `dir` | string | `""` | any string | Directory for timestamped local backup sets. Empty disables backup publication. |
+| `interval` | duration string | `"24h"` | positive `ms/s/m/h` duration | Minimum interval between backup sets. Reactor 0 compacts the account store under the services lock, copies the account snapshot and chanstats snapshot when present, and writes `latest.json`. |
 
 ## `[metrics]`
 
@@ -390,6 +400,7 @@ Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/con
 | `enable_tls12` | bool | `false` | `true` or `false` | Also accept hardened TLS 1.2 ECDHE-AEAD clients through version dispatch. Off by default (`src/daemon/config_format.zig:324`, `src/daemon/config_boot.zig:174`, `src/main.zig:347`). |
 | `enable_resumption` | bool | `false` | `true` or `false` | Enable TLS 1.3 PSK session tickets/resumption on the live TLS listener (`src/daemon/config_format.zig:330`, `src/daemon/config_boot.zig:175`). |
 | `early_data_max_size` | integer | `0` | `0..4294967295` | Maximum TLS 1.3 0-RTT bytes advertised in issued tickets. `0` disables early data while still allowing resumption (`src/daemon/config_format.zig:334`, `src/daemon/config_boot.zig:176`). |
+| `[[tls.ech_keys]]` | array of tables | empty | `config_path` plus 64-hex-byte `private_key` | Opt-in server ECH acceptance. `config_path` is a single-entry ECHConfigList file; `private_key` is the matching X25519 HPKE recipient key. Bad files or key/config mismatches disable TLS at boot before the listener is wired. Empty keeps ECH off and preserves existing ClientHelloOuter behavior. |
 
 Orochi has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
 

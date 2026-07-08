@@ -198,6 +198,12 @@ enable_resumption = false
 # Maximum 0-RTT early data bytes advertised in tickets. 0 disables early data
 # while still allowing resumption when enable_resumption is true.
 early_data_max_size = 0
+# Server-side Encrypted Client Hello acceptance. The ECHConfigList is published
+# out-of-band (for example DNS HTTPS RR); the daemon only consumes the local copy
+# and the matching X25519 HPKE private key. Omit to keep ECH off.
+# [[tls.ech_keys]]
+# config_path = "/etc/orochi/tls/echconfig.bin"
+# private_key = "0000000000000000000000000000000000000000000000000000000000000000"
 
 
 # --- [sts] — IRCv3 Strict Transport Security ---------------------------------
@@ -556,7 +562,18 @@ ws_media_require_mac = false
 # Directory to publish stats.json + index.html into (e.g. an nginx root).
 # Empty = disabled.
 # dir = "/var/www/orochi"
+# Directory to publish channel statistics JSON and .chanstats.snapshot.
+# Empty = disabled.
+# channel_dir = "/var/www/orochi/stats/data"
 interval = "30s"       # minimum interval between stats writes
+
+
+# --- [backup] — local account/chanstats backup sets ---------------------------
+[backup]
+# Directory that receives timestamped accounts-*.db.snap, chanstats-*.snapshot,
+# and latest.json. Empty = disabled. Point this at a vault/sync-managed path.
+# dir = "/var/backups/orochi"
+interval = "24h"
 
 
 # --- [metrics] — live Prometheus endpoint ------------------------------------

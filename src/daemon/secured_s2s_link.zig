@@ -346,6 +346,13 @@ pub const SecuredLink = struct {
         const link = self.inner orelse return false;
         return link.takeResyncRequest();
     }
+
+    /// Consume a repair-triggered daemon resync request from the inner link.
+    pub fn takeRepairResyncRequest(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeRepairResyncRequest();
+    }
+
     /// Install (or clear) the borrowed local-world nick predicate for
     /// cross-namespace NICK collision resolution. Retained across the lazy inner
     /// stand-up and applied immediately when `inner` already exists.
@@ -712,6 +719,21 @@ pub const SecuredLink = struct {
     pub fn takeWards(self: *SecuredLink) anyerror![][]u8 {
         const link = self.inner orelse return &.{};
         return link.takeWards();
+    }
+
+    /// Emit a signed Web Push hint for an offline Tegami/DM over the encrypted
+    /// S2S leg. The inner peer requires frame signing, so old/non-signing peers
+    /// silently get no hint.
+    pub fn sendTegamiPush(self: *SecuredLink, account: []const u8, from: []const u8, text: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendTegamiPush(account, from, text);
+        try self.drainInner();
+    }
+
+    /// Drain queued TEGAMI_PUSH payloads decoded by the inner link.
+    pub fn takeTegamiPushes(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeTegamiPushes();
     }
 
     /// Copy this peer's known-server topology into `out` for partition analysis

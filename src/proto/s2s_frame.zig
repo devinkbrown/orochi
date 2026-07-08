@@ -94,6 +94,18 @@ pub const FrameType = enum(u8) {
     /// sends), reconverging the resumed node without any visible netsplit. Empty
     /// payload; unsigned (a trivial control trigger carrying no trusted state).
     RESYNC = 0x18,
+    /// Merkle/RBSR anti-entropy repair summary for the peer's channel CRDT.
+    /// Capability-gated by the S2S handshake; older peers skip unknown tags.
+    REPAIR_SUMMARY = 0x19,
+    /// Request records whose hashes differ from a received repair summary.
+    REPAIR_REQUEST = 0x1A,
+    /// Repair records that backfill the requested CRDT entities.
+    REPAIR_RESPONSE = 0x1B,
+    /// Signed, secured-only Web Push hint for an offline Tegami/DM notification.
+    /// Carries a bounded `tegami_push_relay` record: {account, from, text preview}.
+    /// The receiving node only runs its LOCAL Web Push worker/subscription store;
+    /// no Tegami message or subscription state is replicated by this frame.
+    TEGAMI_PUSH = 0x1C,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -125,6 +137,10 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.KILL) => .KILL,
             @intFromEnum(FrameType.WARD) => .WARD,
             @intFromEnum(FrameType.RESYNC) => .RESYNC,
+            @intFromEnum(FrameType.REPAIR_SUMMARY) => .REPAIR_SUMMARY,
+            @intFromEnum(FrameType.REPAIR_REQUEST) => .REPAIR_REQUEST,
+            @intFromEnum(FrameType.REPAIR_RESPONSE) => .REPAIR_RESPONSE,
+            @intFromEnum(FrameType.TEGAMI_PUSH) => .TEGAMI_PUSH,
             else => null,
         };
     }
@@ -268,6 +284,11 @@ const all_frame_types = [_]FrameType{
     .OBSERVE_EVENT,
     .KILL,
     .WARD,
+    .RESYNC,
+    .REPAIR_SUMMARY,
+    .REPAIR_REQUEST,
+    .REPAIR_RESPONSE,
+    .TEGAMI_PUSH,
 };
 
 test "encode/decode round-trip each type" {
