@@ -46,8 +46,8 @@ mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| server.zig:689 | `Config.ring_entries` | `32` | io_uring submission/completion queue depth | `io.ring_entries` (NEW) | uint | 32 | 8..4096 |
-| server.zig:331 | `ringlane.default_cqe_batch` | `256` | max CQEs reaped per event-loop drain (`cqes` array in loop) | `io.cqe_batch` (NEW) | uint | 256 | 16..4096 |
+| server.zig:689 | `Config.ring_entries` | `32` | io_uring submission/completion queue depth | `io.ring_entries` *(schema-backed; default 32)* | uint | 32 | 8..4096 |
+| server.zig / `runOnce` | `Config.cqe_batch` | `256` | max CQEs reaped per event-loop drain (`cqes` array in loop) | `io.cqe_batch` *(schema-backed; default 256)* | uint | 256 | 16..4096 |
 | server.zig:537 | `default_reply_bytes` | `8192` | per-connection send buffer size (`ConnState.send_buf`) — borderline (struct buffer, but perf/queue-meaningful) | `io.send_buf_bytes` (NEW) | uint | 8192 | 512..262144 |
 | server.zig:538 | `default_recv_bytes` | `4096` | per-connection recv buffer size (`ConnState.recv_buf`) — borderline | `io.recv_buf_bytes` (NEW) | uint | 4096 | 512..262144 |
 

@@ -662,6 +662,7 @@ const ringlane = struct {
     const IoUring = linux.IoUring;
 
     pub const default_cqe_batch: usize = 256;
+    pub const max_cqe_batch: usize = 4096;
 
     pub const RingFeatures = struct {
         multishot_accept: bool = false,
@@ -1526,6 +1527,10 @@ pub const Config = struct {
     resume_arena_fd: ?linux.fd_t = null,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
+    /// Max CQEs reaped per io_uring completion-drain. Larger values reduce
+    /// syscall/loop overhead during bursts; smaller values bound per-iteration
+    /// latency. Configurable via `[io].cqe_batch`.
+    cqe_batch: u16 = ringlane.default_cqe_batch,
     /// Hard cap on concurrent connections. The client table reserves this many
     /// slots up front so ConnState buffers (targeted by in-flight io_uring I/O)
     /// never move; accepts past the cap are refused.
@@ -5044,8 +5049,9 @@ pub const LinuxServer = struct {
         _ = try self.rx().ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
-        var cqes: [ringlane.default_cqe_batch]linux.io_uring_cqe = undefined;
-        _ = try self.rx().ring.reapCompletions(&cqes, 0, &handler);
+        var cqes: [ringlane.max_cqe_batch]linux.io_uring_cqe = undefined;
+        const cqe_batch = @min(@as(usize, self.config.cqe_batch), cqes.len);
+        _ = try self.rx().ring.reapCompletions(cqes[0..cqe_batch], 0, &handler);
         if (handler.err) |err| return err;
 
         // Belt-and-suspenders against a lost wake: drain any cross-shard handoffs

@@ -354,6 +354,7 @@ pub const Config = struct {
     /// io_uring / per-connection transport tuning.
     pub const Io = struct {
         ring_entries: u32 = 32,
+        cqe_batch: u32 = 256,
     };
 
     /// Decaying IP-reputation penalty weights.
@@ -956,6 +957,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [io]
     cfg.io.ring_entries = @intCast(try uintField(doc, "io.ring_entries", cfg.io.ring_entries, 8, 4096));
+    cfg.io.cqe_batch = @intCast(try uintField(doc, "io.cqe_batch", cfg.io.cqe_batch, 16, 4096));
 
     // [reputation]
     cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
@@ -1752,6 +1754,7 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
         \\sasl_decode_max_bytes = 256
         \\[io]
         \\ring_entries = 256
+        \\cqe_batch = 512
         \\[reputation]
         \\registration_timeout_penalty = 80.0
         \\clone_refuse_penalty = 10
@@ -1762,10 +1765,12 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
     try testing.expectEqual(@as(u64, 500), cfg.limits.sweep_interval_ms);
     try testing.expectEqual(@as(u32, 256), cfg.limits.sasl_decode_max_bytes);
     try testing.expectEqual(@as(u32, 256), cfg.io.ring_entries);
+    try testing.expectEqual(@as(u32, 512), cfg.io.cqe_batch);
     try testing.expectEqual(@as(f64, 80.0), cfg.reputation.registration_timeout_penalty);
     try testing.expectEqual(@as(f64, 10.0), cfg.reputation.clone_refuse_penalty);
     // out-of-range ring_entries rejected
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\nring_entries=4\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\ncqe_batch=8\n", .{}));
     // Cannot promise SASL payloads beyond the compiled router buffer.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nsasl_decode_max_bytes=4096\n", .{}));
 }

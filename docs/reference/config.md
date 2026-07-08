@@ -261,6 +261,7 @@ Source: struct at `src/daemon/config_format.zig:153`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `ring_entries` | integer | `32` | `8..4096` | io_uring SQ entries per reactor (`src/daemon/server.zig:981`). |
+| `cqe_batch` | integer | `256` | `16..4096` | Maximum io_uring completion events reaped per event-loop drain. Larger values improve burst throughput; smaller values cap per-iteration work. |
 
 ## `[reputation]`
 

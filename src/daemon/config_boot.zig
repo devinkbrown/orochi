@@ -139,6 +139,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.limits.reputation_half_life_ms != 0) out.reputation_half_life_ms = @intCast(cfg.limits.reputation_half_life_ms);
     if (cfg.limits.sweep_interval_ms != 0) out.sweep_interval_ms = @intCast(cfg.limits.sweep_interval_ms);
     out.ring_entries = @intCast(cfg.io.ring_entries);
+    out.cqe_batch = @intCast(cfg.io.cqe_batch);
     out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
@@ -462,6 +463,8 @@ test "config text overlays the server config" {
         \\reorder_window_frames = 32
         \\max_participants = 2
         \\native_media_require_mac = true
+        \\[io]
+        \\cqe_batch = 512
         \\[backup]
         \\dir = "/var/backups/orochi"
         \\interval = "6h"
@@ -502,6 +505,7 @@ test "config text overlays the server config" {
     var rx = media_session.Receiver(media_session.default_max_payload_bytes, kagura_frame.window_cap).init(reassembly_cfg);
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
+    try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);
     try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);
     try testing.expectEqual(@as(i64, 6 * 60 * 60 * 1000), loaded.config.backup_interval_ms);
     try testing.expectEqualStrings("/var/lib/orochi/accounts.db", loaded.config.account_store_path);

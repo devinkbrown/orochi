@@ -341,6 +341,7 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 # --- [io] — io_uring tuning --------------------------------------------------
 [io]
 ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
+cqe_batch = 256        # max CQEs reaped per event-loop drain (16..4096)
 
 
 # --- [reputation] — decaying IP-reputation penalty weights -------------------
