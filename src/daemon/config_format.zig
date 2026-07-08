@@ -13,6 +13,9 @@
 //! defaults stand. Required: `[node].id` and `[listen].irc`.
 const std = @import("std");
 const toml = @import("../proto/toml.zig");
+const acme_cli = @import("acme_cli.zig");
+const acme_http01_listener = @import("acme_http01_listener.zig");
+const acme_runner = @import("acme_runner.zig");
 const conn_class = @import("conn_class.zig");
 const shard = @import("shard.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
@@ -614,6 +617,18 @@ pub const Config = struct {
         contact: ?[]const u8 = null,
         renew_before_days: u16 = 30,
         check_interval_ms: u64 = 12 * 60 * 60 * 1000,
+        ca_bundle_path: []const u8 = acme_cli.default_ca_bundle,
+        ca_bundle_max_bytes: u64 = acme_cli.default_ca_bundle_max_bytes,
+        challenge_port: u16 = acme_cli.default_challenge_port,
+        max_steps: u32 = @intCast(acme_runner.default_max_steps),
+        debug: bool = false,
+        max_response_bytes: u64 = acme_runner.default_max_response_bytes,
+        error_body_preview_bytes: u64 = acme_runner.default_error_body_preview_bytes,
+        resolv_conf_max_bytes: u64 = acme_runner.default_resolv_conf_max_bytes,
+        dns_port: u16 = acme_runner.default_dns_port,
+        http01_listen_backlog: u32 = acme_http01_listener.default_listen_backlog,
+        http01_accept_poll_ms: u32 = acme_http01_listener.default_accept_poll_ms,
+        http01_conn_read_timeout_sec: u32 = acme_http01_listener.default_conn_read_timeout_sec,
     };
 
     /// Server-side OCSP stapling. When `enabled` and the `[tls]` leaf carries an
@@ -694,6 +709,8 @@ pub const Config = struct {
         errdefer allocator.free(geoip_asn_db);
         const acme_directory_url = try allocator.dupe(u8, acme_default_directory_url);
         errdefer allocator.free(acme_directory_url);
+        const acme_ca_bundle_path = try allocator.dupe(u8, acme_cli.default_ca_bundle);
+        errdefer allocator.free(acme_ca_bundle_path);
         const webpush_subject = try allocator.dupe(u8, "mailto:ops@eshmaki.me");
         errdefer allocator.free(webpush_subject);
         const webpush_vapid_key_path = try allocator.dupe(u8, "orochi-webpush-vapid.key");
@@ -712,7 +729,7 @@ pub const Config = struct {
             .metrics = .{ .bind = metrics_bind },
             .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
             .webpush = .{ .subject = webpush_subject, .vapid_key_path = webpush_vapid_key_path },
-            .acme = .{ .directory_url = acme_directory_url },
+            .acme = .{ .directory_url = acme_directory_url, .ca_bundle_path = acme_ca_bundle_path },
         };
     }
 
@@ -808,6 +825,7 @@ pub const Config = struct {
         }
         allocator.free(self.tls.ech_keys);
         allocator.free(self.acme.directory_url);
+        allocator.free(self.acme.ca_bundle_path);
         allocator.free(self.webpush.subject);
         allocator.free(self.webpush.vapid_key_path);
         if (self.acme.domain) |value| allocator.free(value);
@@ -1116,6 +1134,28 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("acme.contact"), &cfg.acme.contact);
     cfg.acme.renew_before_days = @intCast(try uintField(doc, "acme.renew_before_days", cfg.acme.renew_before_days, 1, 89));
     if (doc.getString("acme.check_interval")) |s| cfg.acme.check_interval_ms = try durationMs(s);
+    try setStr(allocator, resolver, doc.getString("acme.ca_bundle_path"), &cfg.acme.ca_bundle_path);
+    cfg.acme.ca_bundle_max_bytes = try uintField(doc, "acme.ca_bundle_max_bytes", cfg.acme.ca_bundle_max_bytes, 64 * 1024, 64 * 1024 * 1024);
+    cfg.acme.challenge_port = try portField(doc, "acme.challenge_port", cfg.acme.challenge_port);
+    if (cfg.acme.challenge_port == 0) return error.ParseError;
+    cfg.acme.max_steps = @intCast(try uintField(doc, "acme.max_steps", cfg.acme.max_steps, 8, 1024));
+    if (doc.getBool("acme.debug")) |b| cfg.acme.debug = b;
+    cfg.acme.max_response_bytes = try uintField(doc, "acme.max_response_bytes", cfg.acme.max_response_bytes, 16 * 1024, 4 * 1024 * 1024);
+    cfg.acme.error_body_preview_bytes = try uintField(doc, "acme.error_body_preview_bytes", cfg.acme.error_body_preview_bytes, 0, 4096);
+    cfg.acme.resolv_conf_max_bytes = try uintField(doc, "acme.resolv_conf_max_bytes", cfg.acme.resolv_conf_max_bytes, 4 * 1024, 1024 * 1024);
+    cfg.acme.dns_port = try portField(doc, "acme.dns_port", cfg.acme.dns_port);
+    if (cfg.acme.dns_port == 0) return error.ParseError;
+    cfg.acme.http01_listen_backlog = @intCast(try uintField(doc, "acme.http01_listen_backlog", cfg.acme.http01_listen_backlog, 1, 1024));
+    if (doc.getString("acme.http01_accept_poll")) |s| {
+        const ms = try durationMs(s);
+        if (ms < 50 or ms > 5000) return error.ParseError;
+        cfg.acme.http01_accept_poll_ms = @intCast(ms);
+    }
+    if (doc.getString("acme.http01_conn_read_timeout")) |s| {
+        const ms = try durationMs(s);
+        if (ms < 1000 or ms > 60_000 or ms % 1000 != 0) return error.ParseError;
+        cfg.acme.http01_conn_read_timeout_sec = @intCast(ms / 1000);
+    }
 
     // [ocsp]
     if (doc.getBool("ocsp.enabled")) |b| cfg.ocsp.enabled = b;
@@ -2062,6 +2102,18 @@ test "parseToml: [acme] section projects onto Config" {
         \\contact = "mailto:admin@example.test"
         \\renew_before_days = 45
         \\check_interval = "6h"
+        \\ca_bundle_path = "/etc/orochi/acme-ca.pem"
+        \\ca_bundle_max_bytes = 1048576
+        \\challenge_port = 14403
+        \\max_steps = 96
+        \\debug = true
+        \\max_response_bytes = 131072
+        \\error_body_preview_bytes = 256
+        \\resolv_conf_max_bytes = 32768
+        \\dns_port = 5353
+        \\http01_listen_backlog = 32
+        \\http01_accept_poll = "500ms"
+        \\http01_conn_read_timeout = "10s"
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
@@ -2073,6 +2125,18 @@ test "parseToml: [acme] section projects onto Config" {
     try testing.expectEqualStrings("mailto:admin@example.test", cfg.acme.contact.?);
     try testing.expectEqual(@as(u16, 45), cfg.acme.renew_before_days);
     try testing.expectEqual(@as(u64, 6 * 60 * 60 * 1000), cfg.acme.check_interval_ms);
+    try testing.expectEqualStrings("/etc/orochi/acme-ca.pem", cfg.acme.ca_bundle_path);
+    try testing.expectEqual(@as(u64, 1048576), cfg.acme.ca_bundle_max_bytes);
+    try testing.expectEqual(@as(u16, 14403), cfg.acme.challenge_port);
+    try testing.expectEqual(@as(u32, 96), cfg.acme.max_steps);
+    try testing.expect(cfg.acme.debug);
+    try testing.expectEqual(@as(u64, 131072), cfg.acme.max_response_bytes);
+    try testing.expectEqual(@as(u64, 256), cfg.acme.error_body_preview_bytes);
+    try testing.expectEqual(@as(u64, 32768), cfg.acme.resolv_conf_max_bytes);
+    try testing.expectEqual(@as(u16, 5353), cfg.acme.dns_port);
+    try testing.expectEqual(@as(u32, 32), cfg.acme.http01_listen_backlog);
+    try testing.expectEqual(@as(u32, 500), cfg.acme.http01_accept_poll_ms);
+    try testing.expectEqual(@as(u32, 10), cfg.acme.http01_conn_read_timeout_sec);
 }
 
 test "parseToml: [acme] omitted keeps renewal disabled defaults and validates ranges" {
@@ -2086,6 +2150,18 @@ test "parseToml: [acme] omitted keeps renewal disabled defaults and validates ra
     try testing.expectEqual(@as(?[]const u8, null), cfg.acme.contact);
     try testing.expectEqual(@as(u16, 30), cfg.acme.renew_before_days);
     try testing.expectEqual(@as(u64, 12 * 60 * 60 * 1000), cfg.acme.check_interval_ms);
+    try testing.expectEqualStrings(acme_cli.default_ca_bundle, cfg.acme.ca_bundle_path);
+    try testing.expectEqual(@as(u64, acme_cli.default_ca_bundle_max_bytes), cfg.acme.ca_bundle_max_bytes);
+    try testing.expectEqual(acme_cli.default_challenge_port, cfg.acme.challenge_port);
+    try testing.expectEqual(@as(u32, @intCast(acme_runner.default_max_steps)), cfg.acme.max_steps);
+    try testing.expect(!cfg.acme.debug);
+    try testing.expectEqual(@as(u64, acme_runner.default_max_response_bytes), cfg.acme.max_response_bytes);
+    try testing.expectEqual(@as(u64, acme_runner.default_error_body_preview_bytes), cfg.acme.error_body_preview_bytes);
+    try testing.expectEqual(@as(u64, acme_runner.default_resolv_conf_max_bytes), cfg.acme.resolv_conf_max_bytes);
+    try testing.expectEqual(acme_runner.default_dns_port, cfg.acme.dns_port);
+    try testing.expectEqual(@as(u32, acme_http01_listener.default_listen_backlog), cfg.acme.http01_listen_backlog);
+    try testing.expectEqual(acme_http01_listener.default_accept_poll_ms, cfg.acme.http01_accept_poll_ms);
+    try testing.expectEqual(acme_http01_listener.default_conn_read_timeout_sec, cfg.acme.http01_conn_read_timeout_sec);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]

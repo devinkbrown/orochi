@@ -60,6 +60,8 @@ pub const Resolver = struct {
 /// Default maximum bytes accepted for a single HTTP response (ACME payloads are
 /// small). Operationally tunable via `[acme].max_response_bytes`.
 pub const default_max_response_bytes: usize = 256 * 1024;
+/// Default max ACME state-machine steps before aborting.
+pub const default_max_steps: usize = 64;
 /// Default max bytes of an RFC 7807 problem body logged on error/debug.
 pub const default_error_body_preview_bytes: usize = 512;
 /// Default max bytes read from /etc/resolv.conf by the built-in resolver.
@@ -333,7 +335,7 @@ pub const IssueConfig = struct {
     /// TLS server (nginx) to consume. Null skips writing the key.
     key_out_path: ?[]const u8 = null,
     /// Max state-machine steps before giving up (defends against loops/hangs).
-    max_steps: usize = 64,
+    max_steps: usize = default_max_steps,
     /// Log every HTTP exchange (errors are always logged regardless).
     debug: bool = false,
     /// Max bytes accepted for a single ACME HTTP response.

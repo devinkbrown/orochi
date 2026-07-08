@@ -528,6 +528,18 @@ enabled = false
 # contact = "mailto:admin@example.net"
 renew_before_days = 30        # renew when the leaf is within N days of expiry (1..89)
 check_interval = "12h"        # how often to check the leaf expiry
+# ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt"
+# ca_bundle_max_bytes = 4194304
+# challenge_port = 14402       # loopback HTTP-01 port nginx proxies to
+# max_steps = 64
+# debug = false
+# max_response_bytes = 262144
+# error_body_preview_bytes = 512
+# resolv_conf_max_bytes = 65536
+# dns_port = 53
+# http01_listen_backlog = 16
+# http01_accept_poll = "250ms"
+# http01_conn_read_timeout = "5s"
 
 
 # --- [media] — voice/video (SFU) ---------------------------------------------

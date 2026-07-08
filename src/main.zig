@@ -834,7 +834,7 @@ pub fn main(init: std.process.Init) !void {
                     break :webpush_blk;
                 }
                 // Trust anchors + resolver live for the process lifetime.
-                const bundle_text = std.Io.Dir.cwd().readFileAlloc(init.io, orochi.daemon.acme_cli.default_ca_bundle, allocator, .limited(orochi.daemon.acme_cli.default_ca_bundle_max_bytes)) catch |err| {
+                const bundle_text = std.Io.Dir.cwd().readFileAlloc(init.io, h.parsed.acme.ca_bundle_path, allocator, .limited(@intCast(h.parsed.acme.ca_bundle_max_bytes))) catch |err| {
                     std.debug.print("orochi: [webpush] CA bundle read failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
@@ -848,7 +848,12 @@ pub fn main(init: std.process.Init) !void {
                     break :webpush_blk;
                 };
                 const resolver = try allocator.create(orochi.daemon.acme_runner.SystemResolver);
-                resolver.* = .{ .allocator = allocator, .io = init.io };
+                resolver.* = .{
+                    .allocator = allocator,
+                    .io = init.io,
+                    .resolv_conf_max_bytes = @intCast(h.parsed.acme.resolv_conf_max_bytes),
+                    .dns_port = h.parsed.acme.dns_port,
+                };
                 webpush_resolver = resolver;
                 const w = try allocator.create(WebpushWorker);
                 w.* = .{

@@ -134,20 +134,24 @@ pub const Service = struct {
     }
 
     fn runIssue(self: *Service, domain: []const u8, cert_path: []const u8, key_path: []const u8) !bool {
-        const bundle_text = try std.Io.Dir.cwd().readFileAlloc(self.io, acme_cli.default_ca_bundle, self.allocator, .limited(acme_cli.default_ca_bundle_max_bytes));
+        const bundle_text = try std.Io.Dir.cwd().readFileAlloc(self.io, self.acme.ca_bundle_path, self.allocator, .limited(@intCast(self.acme.ca_bundle_max_bytes)));
         defer self.allocator.free(bundle_text);
 
         var anchors = try acme_cli.loadTrustAnchors(self.allocator, bundle_text);
         defer freeTrustAnchors(self.allocator, &anchors);
         if (anchors.items.len == 0) return error.NoTrustAnchors;
-        dlog.log("orochi: acme loaded {d} trust anchors from {s}\n", .{ anchors.items.len, acme_cli.default_ca_bundle });
+        dlog.log("orochi: acme loaded {d} trust anchors from {s}\n", .{ anchors.items.len, self.acme.ca_bundle_path });
 
         const account_key = ecdsa_p256.KeyPair.generate(self.io);
         const cert_key = ecdsa_p256.KeyPair.generate(self.io);
 
         var store = http01.TokenStore.init(self.allocator);
         defer store.deinit();
-        var challenge = try listener.ChallengeServer.init(&store, acme_cli.default_challenge_port);
+        var challenge = try listener.ChallengeServer.initWithConfig(&store, self.acme.challenge_port, .{
+            .listen_backlog = @intCast(self.acme.http01_listen_backlog),
+            .accept_poll_ms = self.acme.http01_accept_poll_ms,
+            .conn_read_timeout_sec = self.acme.http01_conn_read_timeout_sec,
+        });
         try challenge.spawn();
         defer challenge.shutdown();
         dlog.log("orochi: acme HTTP-01 listener on 127.0.0.1:{d}\n", .{challenge.port});
@@ -166,6 +170,12 @@ pub const Service = struct {
             .trust_anchors = anchors.items,
             .cert_out_path = cert_path,
             .key_out_path = key_path,
+            .max_steps = self.acme.max_steps,
+            .debug = self.acme.debug,
+            .max_response_bytes = @intCast(self.acme.max_response_bytes),
+            .error_body_preview_bytes = @intCast(self.acme.error_body_preview_bytes),
+            .resolv_conf_max_bytes = @intCast(self.acme.resolv_conf_max_bytes),
+            .dns_port = self.acme.dns_port,
         }, account_key, cert_key, &store, null);
         return result.cert_written;
     }

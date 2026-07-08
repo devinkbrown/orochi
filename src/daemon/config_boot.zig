@@ -307,6 +307,18 @@ pub const AcmeBootConfig = struct {
     contact: ?[]const u8 = null,
     renew_before_days: u16 = 30,
     check_interval_ms: u64 = 12 * 60 * 60 * 1000,
+    ca_bundle_path: []const u8 = (config_format.Config.Acme{}).ca_bundle_path,
+    ca_bundle_max_bytes: u64 = (config_format.Config.Acme{}).ca_bundle_max_bytes,
+    challenge_port: u16 = (config_format.Config.Acme{}).challenge_port,
+    max_steps: u32 = (config_format.Config.Acme{}).max_steps,
+    debug: bool = false,
+    max_response_bytes: u64 = (config_format.Config.Acme{}).max_response_bytes,
+    error_body_preview_bytes: u64 = (config_format.Config.Acme{}).error_body_preview_bytes,
+    resolv_conf_max_bytes: u64 = (config_format.Config.Acme{}).resolv_conf_max_bytes,
+    dns_port: u16 = (config_format.Config.Acme{}).dns_port,
+    http01_listen_backlog: u32 = (config_format.Config.Acme{}).http01_listen_backlog,
+    http01_accept_poll_ms: u32 = (config_format.Config.Acme{}).http01_accept_poll_ms,
+    http01_conn_read_timeout_sec: u32 = (config_format.Config.Acme{}).http01_conn_read_timeout_sec,
 };
 
 pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
@@ -317,6 +329,18 @@ pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
         .contact = cfg.acme.contact,
         .renew_before_days = cfg.acme.renew_before_days,
         .check_interval_ms = cfg.acme.check_interval_ms,
+        .ca_bundle_path = cfg.acme.ca_bundle_path,
+        .ca_bundle_max_bytes = cfg.acme.ca_bundle_max_bytes,
+        .challenge_port = cfg.acme.challenge_port,
+        .max_steps = cfg.acme.max_steps,
+        .debug = cfg.acme.debug,
+        .max_response_bytes = cfg.acme.max_response_bytes,
+        .error_body_preview_bytes = cfg.acme.error_body_preview_bytes,
+        .resolv_conf_max_bytes = cfg.acme.resolv_conf_max_bytes,
+        .dns_port = cfg.acme.dns_port,
+        .http01_listen_backlog = cfg.acme.http01_listen_backlog,
+        .http01_accept_poll_ms = cfg.acme.http01_accept_poll_ms,
+        .http01_conn_read_timeout_sec = cfg.acme.http01_conn_read_timeout_sec,
     };
 }
 
@@ -799,6 +823,18 @@ test "acme section lifts onto the boot config" {
         \\contact = "mailto:admin@example.test"
         \\renew_before_days = 15
         \\check_interval = "2h"
+        \\ca_bundle_path = "/etc/orochi/acme-ca.pem"
+        \\ca_bundle_max_bytes = 1048576
+        \\challenge_port = 14403
+        \\max_steps = 96
+        \\debug = true
+        \\max_response_bytes = 131072
+        \\error_body_preview_bytes = 256
+        \\resolv_conf_max_bytes = 32768
+        \\dns_port = 5353
+        \\http01_listen_backlog = 32
+        \\http01_accept_poll = "500ms"
+        \\http01_conn_read_timeout = "10s"
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
@@ -810,6 +846,18 @@ test "acme section lifts onto the boot config" {
     try testing.expectEqualStrings("mailto:admin@example.test", loaded.acme.contact.?);
     try testing.expectEqual(@as(u16, 15), loaded.acme.renew_before_days);
     try testing.expectEqual(@as(u64, 2 * 60 * 60 * 1000), loaded.acme.check_interval_ms);
+    try testing.expectEqualStrings("/etc/orochi/acme-ca.pem", loaded.acme.ca_bundle_path);
+    try testing.expectEqual(@as(u64, 1048576), loaded.acme.ca_bundle_max_bytes);
+    try testing.expectEqual(@as(u16, 14403), loaded.acme.challenge_port);
+    try testing.expectEqual(@as(u32, 96), loaded.acme.max_steps);
+    try testing.expect(loaded.acme.debug);
+    try testing.expectEqual(@as(u64, 131072), loaded.acme.max_response_bytes);
+    try testing.expectEqual(@as(u64, 256), loaded.acme.error_body_preview_bytes);
+    try testing.expectEqual(@as(u64, 32768), loaded.acme.resolv_conf_max_bytes);
+    try testing.expectEqual(@as(u16, 5353), loaded.acme.dns_port);
+    try testing.expectEqual(@as(u32, 32), loaded.acme.http01_listen_backlog);
+    try testing.expectEqual(@as(u32, 500), loaded.acme.http01_accept_poll_ms);
+    try testing.expectEqual(@as(u32, 10), loaded.acme.http01_conn_read_timeout_sec);
 }
 
 test "oper groups project configured privileges and titles" {

@@ -62,11 +62,15 @@ pub const Config = struct {
         if (doc.getUint("acme.http01_listen_backlog")) |v| {
             if (v >= 1 and v <= std.math.maxInt(u31)) self.listen_backlog = @intCast(v);
         }
-        if (doc.getUint("acme.http01_accept_poll_ms")) |v| {
-            if (v != 0 and v <= std.math.maxInt(u32)) self.accept_poll_ms = @intCast(v);
+        if (doc.getString("acme.http01_accept_poll")) |s| {
+            if (parseDurationMs(s)) |v| {
+                if (v >= 50 and v <= 5000) self.accept_poll_ms = v;
+            } else |_| {}
         }
-        if (doc.getUint("acme.http01_conn_read_timeout_sec")) |v| {
-            if (v != 0 and v <= std.math.maxInt(u32)) self.conn_read_timeout_sec = @intCast(v);
+        if (doc.getString("acme.http01_conn_read_timeout")) |s| {
+            if (parseDurationMs(s)) |v| {
+                if (v >= 1000 and v <= 60_000 and v % 1000 == 0) self.conn_read_timeout_sec = v / 1000;
+            } else |_| {}
         }
     }
 };
@@ -208,6 +212,23 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) void {
     }
 }
 
+fn parseDurationMs(text: []const u8) !u32 {
+    const units = [_]struct { suffix: []const u8, scale: u32 }{
+        .{ .suffix = "ms", .scale = 1 },
+        .{ .suffix = "s", .scale = 1000 },
+        .{ .suffix = "m", .scale = 60_000 },
+    };
+    for (units) |unit| {
+        if (std.mem.endsWith(u8, text, unit.suffix)) {
+            const digits = text[0 .. text.len - unit.suffix.len];
+            const n = try std.fmt.parseInt(u32, digits, 10);
+            if (n == 0 or n > std.math.maxInt(u32) / unit.scale) return error.Overflow;
+            return n * unit.scale;
+        }
+    }
+    return error.InvalidDuration;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -271,8 +292,8 @@ test "Config.applyToml overlays listener tunables and skips bind address" {
     const src =
         \\[acme]
         \\http01_listen_backlog = 64
-        \\http01_accept_poll_ms = 500
-        \\http01_conn_read_timeout_sec = 10
+        \\http01_accept_poll = "500ms"
+        \\http01_conn_read_timeout = "10s"
         \\http01_bind_address = "0.0.0.0"
     ;
     var doc = try toml.parse(allocator, src);
