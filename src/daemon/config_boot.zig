@@ -19,6 +19,8 @@ const og_mod = @import("operator_groups.zig");
 const event_spine = @import("event_spine.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
+const certfp_bind = @import("certfp_bind.zig");
+const certfp = @import("../proto/certfp.zig");
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -191,6 +193,41 @@ pub const StsBootConfig = struct {
     port: u16 = 6697,
     preload: bool = false,
 };
+
+/// Seed every `[[opers]].certfp` fingerprint into the certfp bind store, binding
+/// it to that oper's `account`, so SASL EXTERNAL resolves certfp-only without a
+/// prior runtime `CERTADD`. Idempotent: re-applying the same config seed each boot
+/// is a no-op replace, and it COEXISTS with runtime `CERTADD` binds (the store is
+/// never wiped). Fail-closed per entry: a fingerprint that is not 64 lowercase-hex
+/// chars (after case normalization), or whose account is empty/oversize, is
+/// skipped with a boot warning rather than aborting. Returns the number of
+/// fingerprints successfully bound.
+pub fn seedOperCertfpBinds(binds: *certfp_bind.CertfpBindStore, opers: []const config_format.Config.Oper) usize {
+    var bound: usize = 0;
+    for (opers) |o| {
+        if (o.certfp.len == 0) continue;
+        if (o.account.len == 0) {
+            dlog.log("orochi: skipping certfp seed: oper binding has an empty account\n", .{});
+            continue;
+        }
+        for (o.certfp) |raw| {
+            if (raw.len != certfp.fingerprint_len) {
+                dlog.log("orochi: skipping malformed certfp for account '{s}': expected {d} hex chars, got {d}\n", .{ o.account, certfp.fingerprint_len, raw.len });
+                continue;
+            }
+            // Normalize case to lowercase into a fixed buffer; validateFingerprint
+            // (via bind) then rejects any non-hex byte fail-closed.
+            var lowered: [certfp.fingerprint_len]u8 = undefined;
+            for (raw, 0..) |ch, i| lowered[i] = std.ascii.toLower(ch);
+            binds.bind(o.account, &lowered) catch |err| {
+                dlog.log("orochi: skipping invalid certfp for account '{s}': {s}\n", .{ o.account, @errorName(err) });
+                continue;
+            };
+            bound += 1;
+        }
+    }
+    return bound;
+}
 
 /// Project the parsed `[sts]` config onto the neutral boot struct. Unlike
 /// `mapToServerConfig`, this copies fields verbatim (no zero-means-default
@@ -771,6 +808,65 @@ test "oper groups project configured privileges and titles" {
     try testing.expect(grant.privileges.has(.audit_read));
     try testing.expect(!grant.privileges.has(.server_admin));
     try testing.expectEqualStrings("Network Guardian", grant.title);
+}
+
+test "oper certfp seeds the bind store at boot (string + array, normalized, malformed skipped)" {
+    const allocator = testing.allocator;
+    // alice: a single lowercase fingerprint. bob: an array with one UPPERCASE
+    // fingerprint (must normalize to lowercase) plus one malformed entry (skipped).
+    const fp_alice = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const fp_bob_upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+    const fp_bob_lower = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[oper_groups]]
+        \\name = "admin"
+        \\privileges = ["server_rehash"]
+        \\[[opers]]
+        \\account = "alice"
+        \\class = "admin"
+        \\certfp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\[[opers]]
+        \\account = "bob"
+        \\class = "admin"
+        \\certfp = ["ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", "not-a-valid-fingerprint"]
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+
+    // The parser owns both certfp forms verbatim.
+    try testing.expectEqual(@as(usize, 1), loaded.parsed.opers[0].certfp.len);
+    try testing.expectEqualStrings(fp_alice, loaded.parsed.opers[0].certfp[0]);
+    try testing.expectEqual(@as(usize, 2), loaded.parsed.opers[1].certfp.len);
+
+    var binds = certfp_bind.CertfpBindStore.init(allocator);
+    defer binds.deinit();
+    // A pre-existing runtime CERTADD binding must survive the config seed.
+    const fp_runtime = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try binds.bind("carol", fp_runtime);
+
+    const seeded = seedOperCertfpBinds(&binds, loaded.parsed.opers);
+    try testing.expectEqual(@as(usize, 2), seeded); // alice's 1 + bob's 1 valid (malformed skipped)
+
+    // A subsequent SASL EXTERNAL with either bound fingerprint resolves the account.
+    try testing.expectEqualStrings("alice", binds.accountForFingerprint(fp_alice).?);
+    try testing.expectEqualStrings("bob", binds.accountForFingerprint(fp_bob_lower).?); // uppercase normalized
+    _ = fp_bob_upper;
+    // The malformed entry never bound anything.
+    try testing.expect(binds.accountForFingerprint("not-a-valid-fingerprint") == null);
+    // Runtime binding untouched (config seed coexists, never wipes).
+    try testing.expectEqualStrings("carol", binds.accountForFingerprint(fp_runtime).?);
+
+    // Re-applying the same seed each boot is idempotent (no double count issue at
+    // the store level: same account replaces the same key).
+    const reseeded = seedOperCertfpBinds(&binds, loaded.parsed.opers);
+    try testing.expectEqual(@as(usize, 2), reseeded);
+    try testing.expectEqualStrings("alice", binds.accountForFingerprint(fp_alice).?);
+    try testing.expectEqualStrings("carol", binds.accountForFingerprint(fp_runtime).?);
 }
 
 test "minimal config: unspecified optional fields keep defaults" {

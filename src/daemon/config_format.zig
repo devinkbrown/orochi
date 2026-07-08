@@ -250,6 +250,14 @@ pub const Config = struct {
         /// (e.g. `["ANNOUNCE", "KILL"]`, or `["ALL"]`). Empty = none — the oper
         /// opts in per-category with `EVENT ADD`.
         presubscribe: []const []const u8 = &.{},
+        /// TLS client-certificate fingerprints (lowercase-hex SHA-256, 64 chars)
+        /// pre-bound to this oper's `account` at boot, so SASL EXTERNAL works
+        /// without a prior runtime `CERTADD` (fixes the chicken-and-egg when a
+        /// user authenticates certfp-only). Accepts a single string or an array
+        /// of strings; each is seeded into the certfp bind store and COEXISTS with
+        /// runtime `CERTADD` bindings. Malformed entries are skipped with a boot
+        /// warning rather than failing the boot. Case is normalized to lowercase.
+        certfp: []const []const u8 = &.{},
     };
 
     pub const Mesh = struct {
@@ -704,6 +712,7 @@ pub const Config = struct {
             allocator.free(oper.class);
             allocator.free(oper.title);
             freeStringList(allocator, oper.presubscribe);
+            freeStringList(allocator, oper.certfp);
         }
         allocator.free(self.opers);
         for (self.oper_groups) |g| {
@@ -1059,6 +1068,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 allocator.free(o.class);
                 allocator.free(o.title);
                 freeStringList(allocator, o.presubscribe);
+                freeStringList(allocator, o.certfp);
             }
             list.deinit(allocator);
         }
@@ -1080,7 +1090,13 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 try ownStringArray(allocator, resolver, parr)
             else
                 &.{};
-            try list.append(allocator, .{ .account = account, .class = class, .title = title, .presubscribe = presubscribe });
+            errdefer freeStringList(allocator, presubscribe);
+            // `certfp` accepts a single string or an array of strings; both are
+            // owned verbatim here (validation/normalization happens at seed time
+            // so a malformed entry warns-and-skips rather than failing the boot).
+            const certfp_list: []const []const u8 = try ownStringOrArray(allocator, resolver, item, "certfp");
+            errdefer freeStringList(allocator, certfp_list);
+            try list.append(allocator, .{ .account = account, .class = class, .title = title, .presubscribe = presubscribe, .certfp = certfp_list });
         }
         cfg.opers = try list.toOwnedSlice(allocator);
     }
@@ -1269,6 +1285,30 @@ fn ownStringArray(allocator: std.mem.Allocator, resolver: Resolver, arr: []const
     return list.toOwnedSlice(allocator);
 }
 
+/// Own a TOML field that may be either a single string OR an array of strings
+/// (e.g. `certfp = "abc…"` or `certfp = ["abc…", "def…"]`). Returns an owned,
+/// resolved string list; an absent field yields the empty slice.
+fn ownStringOrArray(
+    allocator: std.mem.Allocator,
+    resolver: Resolver,
+    item: *const toml.Value,
+    key: []const u8,
+) TomlError![]const []const u8 {
+    if (item.getArray(key)) |arr| return ownStringArray(allocator, resolver, arr);
+    if (item.getString(key)) |s| {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |v| allocator.free(v);
+            list.deinit(allocator);
+        }
+        const owned = try resolveStr(allocator, resolver, s);
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+        return list.toOwnedSlice(allocator);
+    }
+    return &.{};
+}
+
 fn portField(doc: toml.Document, path: []const u8, current: u16) TomlError!u16 {
     const v = doc.getInt(path) orelse return current;
     if (v < 0 or v > 65535) return error.ParseError;
@@ -1389,6 +1429,40 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     try testing.expectEqualStrings("netadmin", cfg.opers[0].class);
     try testing.expectEqualStrings("helper", cfg.opers[1].account);
     try testing.expectEqualStrings("", cfg.opers[1].class);
+}
+
+test "parseToml: [[opers]] certfp accepts a single string or an array" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[opers]]
+        \\account = "single"
+        \\class = "admin"
+        \\certfp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\[[opers]]
+        \\account = "multi"
+        \\class = "admin"
+        \\certfp = ["aaaa", "bbbb"]
+        \\[[opers]]
+        \\account = "none"
+        \\class = "admin"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(usize, 3), cfg.opers.len);
+    // Single string -> one-element list.
+    try testing.expectEqual(@as(usize, 1), cfg.opers[0].certfp.len);
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", cfg.opers[0].certfp[0]);
+    // Array -> multi-element list (owned verbatim; validation is at seed time).
+    try testing.expectEqual(@as(usize, 2), cfg.opers[1].certfp.len);
+    try testing.expectEqualStrings("aaaa", cfg.opers[1].certfp[0]);
+    try testing.expectEqualStrings("bbbb", cfg.opers[1].certfp[1]);
+    // Omitted -> empty (default), no allocation.
+    try testing.expectEqual(@as(usize, 0), cfg.opers[2].certfp.len);
 }
 
 test "parseToml: [dnsbl] enabled + zones + action project onto Config" {

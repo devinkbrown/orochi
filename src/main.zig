@@ -319,6 +319,11 @@ pub fn main(init: std.process.Init) !void {
                 account_services = orochi.daemon.services.Services.init(&account_store.?, null);
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);
+                // Seed config-declared oper certfp bindings so SASL EXTERNAL works
+                // certfp-only without a prior runtime CERTADD. Coexists with (never
+                // wipes) runtime CERTADD binds; malformed entries warn-and-skip.
+                const seeded = orochi.daemon.config_boot.seedOperCertfpBinds(&certfp_binds, h.parsed.opers);
+                if (seeded != 0) std.debug.print("orochi: seeded {d} oper certfp binding(s) from config\n", .{seeded});
                 // Backfill SCRAM credentials from the durable mirror on a miss,
                 // so a SCRAM-SHA-256 login resolves after a restart.
                 scram_store.setLoader(account_services.scramLoader());
