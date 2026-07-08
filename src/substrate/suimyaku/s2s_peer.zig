@@ -27,6 +27,8 @@ pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
 pub const MemberInfo = route_table.Member;
 pub const MemberIdentity = route_table.MemberIdentity;
+pub const ChannelModeFlags = route_table.ChannelModeFlags;
+pub const ChannelNameIterator = route_table.RouteTable.ChannelNameIterator;
 pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
@@ -1874,6 +1876,13 @@ pub const S2sPeer = struct {
 
     pub fn channelModeFlags(self: *const S2sPeer, channel: []const u8) ?route_table.ChannelModeFlags {
         return self.routes.channelModeFlags(channel);
+    }
+
+    /// Iterator over channel names with a live remote roster on this peer (used
+    /// by LIST/LISTX for mesh-wide channel enumeration). Borrowed names, valid
+    /// until the next membership mutation.
+    pub fn channelNames(self: *const S2sPeer) ChannelNameIterator {
+        return self.routes.channelNames();
     }
 
     fn recvHandshake(self: *S2sPeer, payload: []const u8, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {

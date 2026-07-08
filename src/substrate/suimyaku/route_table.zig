@@ -783,6 +783,27 @@ pub const RouteTable = struct {
         return list.entries.items;
     }
 
+    /// Iterator over every channel name for which this table currently holds a
+    /// remote member roster — the mesh-wide channel-name enumeration used by
+    /// LIST/LISTX to surface channels whose members are all remote. Names are
+    /// borrowed from the table and stay valid until the next
+    /// `applyMembership`/eviction mutates the roster map.
+    pub const ChannelNameIterator = struct {
+        inner: std.StringHashMap(MemberList).Iterator,
+
+        pub fn next(self: *ChannelNameIterator) ?[]const u8 {
+            if (self.inner.next()) |entry| return entry.key_ptr.*;
+            return null;
+        }
+    };
+
+    /// Enumerate the channel names with a live remote roster (see
+    /// `ChannelNameIterator`). Includes internal routing pseudo-channels such as
+    /// the presence roster; callers filter to real channel names.
+    pub fn channelNames(self: *const Self) ChannelNameIterator {
+        return .{ .inner = self.channel_members.iterator() };
+    }
+
     /// Apply a CHANNEL_LIST event for +b/+e/+I state, last-writer-wins by `hlc`
     /// for the tuple (channel, kind, mask). Newer tombstones are retained so an
     /// older add frame cannot resurrect a removed mask.
@@ -1292,6 +1313,39 @@ test "applyMembership part removes a member and prunes an empty channel" {
     // Newer part removes; the now-empty channel is pruned.
     _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{}, 0);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
+}
+
+test "channelNames enumerates channels with a live remote roster (LIST union input)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    _ = try table.applyMembership("#alpha", "alice", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#beta", "bob", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#beta", "carol", 10, 0, 2, true, .{}, 0);
+
+    var saw_alpha = false;
+    var saw_beta = false;
+    var count: usize = 0;
+    var it = table.channelNames();
+    while (it.next()) |name| {
+        count += 1;
+        if (std.mem.eql(u8, name, "#alpha")) saw_alpha = true;
+        if (std.mem.eql(u8, name, "#beta")) saw_beta = true;
+    }
+    try std.testing.expect(saw_alpha);
+    try std.testing.expect(saw_beta);
+    // Each channel appears exactly once regardless of member count.
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // Parting the last member prunes the channel, so it drops out of enumeration.
+    _ = try table.applyMembership("#alpha", "alice", 10, 0, 2, false, .{}, 0);
+    var remaining: usize = 0;
+    var it2 = table.channelNames();
+    while (it2.next()) |name| {
+        remaining += 1;
+        try std.testing.expect(!std.mem.eql(u8, name, "#alpha"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), remaining);
 }
 
 test "applyMembership maintains the nick->node routing index for PRIVMSG relay" {

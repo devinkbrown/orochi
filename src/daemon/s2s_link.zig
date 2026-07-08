@@ -354,6 +354,19 @@ pub const S2sLink = struct {
         return self.peer.channelMembers(channel);
     }
 
+    /// Aggregate mesh-replicated channel MODE flags for `channel` (null if the
+    /// peer has never gossiped an aggregate for it). Bit layout matches the
+    /// daemon's `channel_mode_flag_specs`.
+    pub fn channelModeFlags(self: *const S2sLink, channel: []const u8) ?s2s_peer.ChannelModeFlags {
+        return self.peer.channelModeFlags(channel);
+    }
+
+    /// Iterator over channel names with a live remote roster on this peer (used
+    /// by LIST/LISTX for mesh-wide channel enumeration).
+    pub fn channelNames(self: *const S2sLink) s2s_peer.ChannelNameIterator {
+        return self.peer.channelNames();
+    }
+
     /// Distinct remote nicks announced across this link (mesh user-count input).
     pub fn remoteNickCount(self: *const S2sLink) usize {
         return self.peer.remoteNickCount();

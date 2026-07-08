@@ -473,6 +473,28 @@ const ConnLineSinkCRLF = struct {
     }
 };
 
+/// ASCII case-insensitive `[]const u8`-keyed hash context, matching the world's
+/// channel casemapping so mesh-wide LIST/LISTX deduplication treats "#Room" and
+/// "#room" as one channel.
+const CiNameContext = struct {
+    pub fn hash(_: CiNameContext, key: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (key) |c| {
+            const lc = std.ascii.toLower(c);
+            h.update(std.mem.asBytes(&lc));
+        }
+        return h.final();
+    }
+    pub fn eql(_: CiNameContext, a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+/// Case-insensitive channel-name set used to deduplicate the mesh-wide channel
+/// union in LIST/LISTX. Keys are borrowed from world/peer state, valid for the
+/// enumerating handler turn.
+const CiNameSet = std.HashMap([]const u8, void, CiNameContext, std.hash_map.default_max_load_percentage);
+
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
     pub const MAX_LINE_BODY: usize = 8191;
@@ -8071,6 +8093,16 @@ pub const LinuxServer = struct {
     };
     const local_channel_policy_flag_mask: u16 = (1 << 2) | (1 << 3) | (1 << 12) | (1 << 13);
 
+    /// The `+s` (secret) bit within the mesh-replicated channel MODE aggregate,
+    /// derived from `channel_mode_flag_specs` so it can never drift from the wire
+    /// layout. Used to hide a remote-only secret channel from LIST/LISTX.
+    const channel_secret_flag_bit: u16 = blk: {
+        for (channel_mode_flag_specs) |spec| {
+            if (spec.mode == .secret) break :blk spec.bit;
+        }
+        @compileError("no secret flag in channel_mode_flag_specs");
+    };
+
     fn channelModeFlagBits(self: *LinuxServer, channel: []const u8) u16 {
         var flags: u16 = 0;
         for (channel_mode_flag_specs) |spec| {
@@ -10378,6 +10410,83 @@ pub const LinuxServer = struct {
         return total;
     }
 
+    /// Whether a channel that has NO local world record should still be hidden
+    /// from LIST/LISTX because the mesh gossiped a `+s` (secret) aggregate for
+    /// it. Hidden (`+h`)/private (`+p`) state materializes a local world record
+    /// via `ensureRemoteListChannel` on the CHANNEL_MODE_STATE burst, so a
+    /// channel reaching this path can only be gated by the secret bit carried in
+    /// the separate CHANNEL_MODE_FLAGS aggregate (which never materializes a
+    /// world record). Any established peer asserting secret wins (fail-closed).
+    fn remoteChannelSecret(self: *LinuxServer, channel: []const u8) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const flags: ?u16 = blk: {
+                    if (slot.value.s2s_secured) |link| {
+                        if (link.established()) break :blk if (link.channelModeFlags(channel)) |f| f.flags else null;
+                    } else if (slot.value.s2s) |link| {
+                        if (link.established()) break :blk if (link.channelModeFlags(channel)) |f| f.flags else null;
+                    }
+                    break :blk null;
+                };
+                if (flags) |f| {
+                    if ((f & channel_secret_flag_bit) != 0) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Collect the mesh-wide set of channel names that exist ONLY on remote peers
+    /// — i.e. every channel with a live remote roster on an established S2S link
+    /// (secured or plaintext) that has no local world record — deduplicated
+    /// case-insensitively across links. Internal routing pseudo-channels (the
+    /// presence roster, and anything not a real channel name) are excluded. The
+    /// returned name slices are borrowed from peer route tables and stay valid
+    /// for the calling handler turn; the OUTER slice is owned by the caller and
+    /// must be freed with `self.allocator`.
+    fn remoteOnlyChannelNames(self: *LinuxServer) std.mem.Allocator.Error![]const []const u8 {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer names.deinit(self.allocator);
+        var seen = CiNameSet.init(self.allocator);
+        defer seen.deinit();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (link.channelNames()) |it_| {
+                        var it = it_;
+                        try self.collectRemoteChannelNames(&it, &names, &seen);
+                    }
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    var it = link.channelNames();
+                    try self.collectRemoteChannelNames(&it, &names, &seen);
+                }
+            }
+        }
+        return names.toOwnedSlice(self.allocator);
+    }
+
+    /// Drain one peer's channel-name iterator into the deduped union, skipping
+    /// non-channel routing names and any channel already present in the local
+    /// world (those are emitted from the world pass instead).
+    fn collectRemoteChannelNames(
+        self: *LinuxServer,
+        it: anytype,
+        names: *std.ArrayListUnmanaged([]const u8),
+        seen: *CiNameSet,
+    ) std.mem.Allocator.Error!void {
+        while (it.next()) |name| {
+            if (!world_model.isChannelName(name)) continue; // skips ~presence~ etc.
+            if (self.world.channelExists(name)) continue; // handled by the world pass
+            const gop = try seen.getOrPut(name);
+            if (gop.found_existing) continue;
+            try names.append(self.allocator, name);
+        }
+    }
+
     fn broadcastJoin(self: *LinuxServer, channel: []const u8, conn: *ConnState) !void {
         var prefix_buf: [256]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -12068,7 +12177,10 @@ pub const LinuxServer = struct {
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
     /// channels are hidden. Malformed filters return a numeric instead of
     /// falling back to listing every channel. C/T filters use wall-clock seconds
-    /// from the channel creation and topic timestamps.
+    /// from the channel creation and topic timestamps. Enumerates the mesh-wide
+    /// union of channels: the local world PLUS channels whose members live only
+    /// on remote peers, so browse-all is identical regardless of which mesh node
+    /// the client attached to.
     pub fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = list.parseList(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LIST"}, "Invalid LIST filter");
@@ -12080,9 +12192,15 @@ pub const LinuxServer = struct {
             return;
         };
         defer filters.deinit(self.allocator);
+        // Channels present only on remote peers (no local world record). Borrowed
+        // name slices, valid for this handler turn; the outer slice is owned here.
+        const remote_only = self.remoteOnlyChannelNames() catch &.{};
+        defer self.allocator.free(remote_only);
         const Adapter = struct {
             server: *LinuxServer,
             it: world_model.World.ChannelViewIterator,
+            remote: []const []const u8,
+            remote_idx: usize = 0,
             filters: *const elist.FilterSet,
             now_seconds: i64,
             fn ageSeconds(now_seconds: i64, then_seconds: i64) u64 {
@@ -12090,6 +12208,7 @@ pub const LinuxServer = struct {
                 return @intCast(now_seconds - then_seconds);
             }
             pub fn next(s: *@This()) ?list.ChannelInfo {
+                // Phase 1: local world channels.
                 while (s.it.next()) |v| {
                     if (v.secret or v.hidden) continue;
                     // Count members mesh-wide (local + remote peer roster), so the
@@ -12106,11 +12225,28 @@ pub const LinuxServer = struct {
                         .topic_set_at = if (v.topic_time > 0) v.topic_time else null,
                     };
                 }
+                // Phase 2: remote-only channels. Topic/created/topic-age are not
+                // replicated for a channel with no local record, so degrade to
+                // empty/0 (the count still aggregates correctly). Secret is honored
+                // via the gossiped MODE aggregate; hidden/private materialize a
+                // world record so cannot reach this phase. Eventual-consistency
+                // note: a freshly-created remote +s/+h channel can be briefly
+                // visible here between its MEMBERSHIP burst and the MODE-flags/state
+                // burst that follows — it self-heals once those converge.
+                while (s.remote_idx < s.remote.len) {
+                    const name = s.remote[s.remote_idx];
+                    s.remote_idx += 1;
+                    if (s.server.remoteChannelSecret(name)) continue;
+                    const users = s.server.globalMemberCount(name, 0);
+                    if (users == 0) continue; // no live members anywhere: nothing to show
+                    if (!s.filters.matches(.{ .name = name, .users = @intCast(users), .created_ago = 0, .topic_age = 0 })) continue;
+                    return .{ .name = name, .users = @intCast(users), .topic = "", .created_at = 0, .topic_set_at = null };
+                }
                 return null;
             }
         };
         const now_seconds = @divFloor(platform.realtimeMillis(), 1000);
-        var adapter = Adapter{ .server = self, .it = self.world.channelIterator(), .filters = &filters, .now_seconds = now_seconds };
+        var adapter = Adapter{ .server = self, .it = self.world.channelIterator(), .remote = remote_only, .filters = &filters, .now_seconds = now_seconds };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
         list.emitList(Adapter, &adapter, request, .{ .server_name = self.serverName(), .requester = conn.session.displayName(), .now_seconds = now_seconds }, &scratch, &sink) catch return;
@@ -12120,24 +12256,45 @@ pub const LinuxServer = struct {
     /// RPL_LISTXTRUNC (816). Bounds pathological replies on large networks.
     const listx_max_results: usize = 1024;
 
+    /// Write one LISTX entry (812) plus its optional PICS line (817) for `info`.
+    /// PICS/SUBJECT/LANGUAGE come from the IRCX PROP store, keyed by channel name
+    /// — so they resolve for remote-only channels too when the props replicated.
+    fn emitListxEntry(self: *LinuxServer, conn: *ConnState, ctx: listx.ReplyContext, info: listx.ChannelInfo) !void {
+        var ebuf: [default_reply_bytes]u8 = undefined;
+        if (listx.writeListxEntry(&ebuf, ctx, info)) |line| try appendToConn(conn, line) else |_| {}
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = info.name };
+        if (self.props.getProp(entity, "PICS")) |ev| {
+            if (ev.value.len != 0) {
+                var pbuf: [default_reply_bytes]u8 = undefined;
+                if (listx.writeListxPics(&pbuf, ctx, info.name, ev.value)) |line| try appendToConn(conn, line) else |_| {}
+            }
+        } else |_| {}
+    }
+
     /// LISTX [<filter>] — IRCX extended channel list (811/812/816/817). Every
     /// draft filter term is honored against real channel data: member-count,
     /// name/topic/subject/language masks, creation-age (`C`) and topic-age (`T`)
     /// thresholds, and the registered (`R=`) flag. Creation/topic ages are
     /// computed in wall-clock ms from the channel's `created_unix`/`topic_time`
     /// (unix seconds); SUBJECT/LANGUAGE come from the IRCX PROP store. The reply
-    /// is capped at `listx_max_results`, emitting 816 when truncated.
+    /// is capped at `listx_max_results`, emitting 816 when truncated. Enumerates
+    /// the mesh-wide union of channels (local world PLUS remote-only channels),
+    /// so browse-all is identical from any mesh node.
     pub fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = listx.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
             return;
         };
         const ctx = listx.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
+        // Channels present only on remote peers (no local world record).
+        const remote_only = self.remoteOnlyChannelNames() catch &.{};
+        defer self.allocator.free(remote_only);
         var buf: [default_reply_bytes]u8 = undefined;
         if (listx.writeListxStart(&buf, ctx)) |line| try appendToConn(conn, line) else |_| {}
         const now_ms: u64 = @intCast(@max(0, platform.realtimeMillis()));
         var emitted: usize = 0;
         var truncated = false;
+        // Phase 1: local world channels.
         var it = self.world.channelIterator();
         while (it.next()) |v| {
             if (v.secret or v.hidden) continue;
@@ -12160,15 +12317,39 @@ pub const LinuxServer = struct {
                 truncated = true;
                 break;
             }
-            var ebuf: [default_reply_bytes]u8 = undefined;
-            if (listx.writeListxEntry(&ebuf, ctx, info)) |line| try appendToConn(conn, line) else |_| {}
-            if (self.props.getProp(entity, "PICS")) |ev| {
-                if (ev.value.len != 0) {
-                    var pbuf: [default_reply_bytes]u8 = undefined;
-                    if (listx.writeListxPics(&pbuf, ctx, info.name, ev.value)) |line| try appendToConn(conn, line) else |_| {}
-                }
-            } else |_| {}
+            try self.emitListxEntry(conn, ctx, info);
             emitted += 1;
+        }
+        // Phase 2: remote-only channels. Topic/created are not replicated for a
+        // channel with no local record, so degrade to empty/0 (count still
+        // aggregates). Secret is honored via the gossiped MODE aggregate;
+        // hidden/private materialize a world record so cannot reach this phase.
+        if (!truncated) {
+            for (remote_only) |name| {
+                if (self.remoteChannelSecret(name)) continue;
+                const members = self.globalMemberCount(name, 0);
+                if (members == 0) continue;
+                const entity = ircx_prop_store.Entity{ .kind = .channel, .id = name };
+                const subject = if (self.props.getProp(entity, "SUBJECT")) |ev| ev.value else |_| "";
+                const language = if (self.props.getProp(entity, "LANGUAGE")) |ev| ev.value else |_| "";
+                const info = listx.ChannelInfo{
+                    .name = name,
+                    .members = @intCast(members),
+                    .topic = "",
+                    .created_ms = 0,
+                    .topic_ms = null,
+                    .subject = subject,
+                    .language = language,
+                    .registered = false,
+                };
+                if (!request.matches(info, now_ms)) continue;
+                if (emitted >= listx_max_results) {
+                    truncated = true;
+                    break;
+                }
+                try self.emitListxEntry(conn, ctx, info);
+                emitted += 1;
+            }
         }
         if (truncated) {
             var tbuf: [default_reply_bytes]u8 = undefined;
@@ -32050,6 +32231,125 @@ test "remote channel mode state applies params and respects local MLOCK" {
         try std.testing.expectEqualStrings("sekret", server.world.channelKey("#param").?);
         try std.testing.expectEqual(@as(?u32, 42), server.world.channelLimit("#param"));
     } else return error.SkipZigTest;
+}
+
+/// Pump a plaintext S2S link pair to convergence: shuttle each side's outbound
+/// bytes to the other's `feed` until both stop producing output (or the round cap
+/// is hit). Used by mesh tests to establish a link and propagate membership/mode
+/// frames without a live socket.
+fn pumpLinkPair(a: *s2s_link.S2sLink, b: *s2s_link.S2sLink, alloc: std.mem.Allocator) !void {
+    var now: u64 = 100;
+    var rounds: usize = 0;
+    while (rounds < 128) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try alloc.dupe(u8, a_out);
+        defer alloc.free(a_copy);
+        const b_copy = try alloc.dupe(u8, b_out);
+        defer alloc.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+}
+
+test "mesh LIST: remote-only channels join the union with the global count, secret hidden, deduped" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A locally-homed channel #local (present in the world).
+    const local_id = try addTestLocalClient(&server, "Local", null);
+    _ = try server.world.join("#local", worldIdFromClient(local_id));
+
+    // Peer side of the mesh link (node 1) — announces the remote channels.
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi" });
+    defer peer.deinit();
+
+    // Server side of the link (node 2), attached to a conn slot; server.deinit
+    // tears it down (deinit + destroy) as it would any real peer link.
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi" });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    // #remote: 2 remote members, no local presence. #secret: 1 remote member +
+    // an aggregate +s. #local: also announced remotely (must dedup, not double).
+    try peer.sendMembership("#remote", "ricky", 0, 100, true, .{ .username = "ricky", .host = "h" }, "");
+    try peer.sendMembership("#remote", "ralph", 0, 100, true, .{ .username = "ralph", .host = "h" }, "");
+    try peer.sendMembership("#secret", "sam", 0, 100, true, .{ .username = "sam", .host = "h" }, "");
+    try peer.sendMembership("#local", "leo", 0, 100, true, .{ .username = "leo", .host = "h" }, "");
+    try peer.sendChannelModeFlags("#secret", Server.channel_secret_flag_bit, 100); // +s aggregate
+    try pumpLinkPair(&peer, link, alloc);
+
+    try std.testing.expect(link.established());
+    try std.testing.expectEqual(@as(usize, 2), link.channelMembers("#remote").len);
+
+    // The mesh-wide union: #remote and #secret are remote-only; #local is dropped
+    // (dedup vs the local world record, emitted from the world pass instead).
+    const names = try server.remoteOnlyChannelNames();
+    defer alloc.free(names);
+    var saw_remote: usize = 0;
+    var saw_secret: usize = 0;
+    var saw_local: usize = 0;
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(n, "#remote")) saw_remote += 1;
+        if (std.ascii.eqlIgnoreCase(n, "#secret")) saw_secret += 1;
+        if (std.ascii.eqlIgnoreCase(n, "#local")) saw_local += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), saw_remote); // exactly once (dedup)
+    try std.testing.expectEqual(@as(usize, 1), saw_secret);
+    try std.testing.expectEqual(@as(usize, 0), saw_local);
+
+    // The global count for a remote-only channel aggregates its remote roster.
+    try std.testing.expectEqual(@as(usize, 2), server.globalMemberCount("#remote", 0));
+    // Secret gating: only the +s aggregate hides.
+    try std.testing.expect(!server.remoteChannelSecret("#remote"));
+    try std.testing.expect(server.remoteChannelSecret("#secret"));
+
+    // End-to-end LIST wire output for a requesting local client.
+    const asker_id = try addTestLocalClient(&server, "Asker", null);
+    const asker = server.rx().clients.get(asker_id).?;
+
+    const plain = try irc_line.parseLine("LIST");
+    try server.handleList(asker, &plain);
+    {
+        const out = asker.send_buf[0..asker.send_len];
+        // #remote surfaces with its mesh-wide count; #secret stays hidden.
+        try expectContains(out, " 322 Asker #remote 2 :");
+        try std.testing.expect(std.mem.indexOf(u8, out, "#secret") == null);
+        // #remote appears exactly once across the whole reply (no duplicate line).
+        var scan = out;
+        var occurrences: usize = 0;
+        while (std.mem.indexOf(u8, scan, "322 Asker #remote ")) |idx| {
+            occurrences += 1;
+            scan = scan[idx + "322 Asker #remote ".len ..];
+        }
+        try std.testing.expectEqual(@as(usize, 1), occurrences);
+    }
+
+    // ELIST >N filter runs against the GLOBAL count: >1 keeps #remote (2 users),
+    // >5 drops it.
+    asker.send_len = 0;
+    asker.send_offset = 0;
+    const keep = try irc_line.parseLine("LIST >1");
+    try server.handleList(asker, &keep);
+    try expectContains(asker.send_buf[0..asker.send_len], " 322 Asker #remote 2 :");
+
+    asker.send_len = 0;
+    asker.send_offset = 0;
+    const drop = try irc_line.parseLine("LIST >5");
+    try server.handleList(asker, &drop);
+    try std.testing.expect(std.mem.indexOf(u8, asker.send_buf[0..asker.send_len], "#remote") == null);
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the

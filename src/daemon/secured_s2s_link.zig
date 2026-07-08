@@ -390,6 +390,19 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.channelMembers(channel) else &.{};
     }
 
+    /// Aggregate mesh-replicated channel MODE flags for `channel` (null if never
+    /// gossiped, or the inner link is not yet established).
+    pub fn channelModeFlags(self: *const SecuredLink, channel: []const u8) ?s2s_peer.ChannelModeFlags {
+        return if (self.inner) |l| l.channelModeFlags(channel) else null;
+    }
+
+    /// Iterator over channel names with a live remote roster on this peer, or
+    /// null when the inner link is absent. Used by LIST/LISTX for mesh-wide
+    /// channel enumeration.
+    pub fn channelNames(self: *const SecuredLink) ?s2s_peer.ChannelNameIterator {
+        return if (self.inner) |l| l.channelNames() else null;
+    }
+
     /// Distinct remote nicks announced across this link (mesh user-count input).
     pub fn remoteNickCount(self: *const SecuredLink) usize {
         return if (self.inner) |l| l.remoteNickCount() else 0;
