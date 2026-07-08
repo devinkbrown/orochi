@@ -1,18 +1,20 @@
 # Orochi daemon core hardcoded operational/tuning constant sweep
 
-This read-only survey maps daemon-core operational constants to existing or proposed TOML controls.
+This survey maps daemon-core operational constants to existing or proposed TOML controls.
 
 Scope: `src/daemon/server.zig`, `src/daemon/dispatch.zig`, `src/daemon/client.zig`
 (accept-loop, timeout sweep, and listener logic all live in `server.zig`).
 Excludes IRC numerics, wire/protocol-fixed sizes, enum discriminants,
 struct-layout array widths, and pure test literals.
 
-Existing schema sections (`config_format.zig` Schema): `[node] [listen] [oper]
-[mesh] [limits] [media] [sasl] [cloak]`.
+Relevant schema sections (`config_format.zig`): `[node] [network] [listen]
+[oper] [mesh] [limits] [io] [reputation] [media] [sasl] [cloak]
+and `[class.<name>]`.
 
 Legend: rows whose proposed key already exists in the schema are tagged
 *(schema-backed)*. The literal is the hardcoded default in `Config`/code and is
-mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
+mapped through `config_boot.zig`. Rows moved to "Excluded constants" are
+intentionally not lifted via TOML.
 
 ---
 
@@ -38,18 +40,16 @@ mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
 | server.zig:709 | `Config.max_clones_per_net` | `0` (unlimited) | max concurrent conns across /24 (v4) or /64 (v6) | `limits.max_clones_per_net` *(schema-backed)* | uint | 0 | 0..65535 |
 | server.zig:712 | `Config.reputation_refuse_threshold` | `0` (disabled) | decaying-penalty score at which accept is refused | `limits.reputation_refuse_threshold` *(schema-backed)* | uint | 0 | 0..1000000 |
 | server.zig:714 | `Config.reputation_half_life_ms` | `60_000` | half-life of IP-reputation penalty decay | `limits.reputation_half_life` *(schema-backed; default 60s)* | duration | 60s | >=1s |
-| server.zig:531 | `timer_interval_ms` | `2_000` | period of the io_uring timeout-sweep timer (drives reg/ping/idle enforcement granularity) | `limits.sweep_interval` (NEW) | duration | 2s | 100ms..60s |
+| server.zig:982 / config_format.zig:334 | `Config.sweep_interval_ms` | `2_000` | period of the io_uring timeout-sweep timer (drives reg/ping/idle enforcement granularity) | `limits.sweep_interval` *(schema-backed; default 2s)* | duration | 2s | >=1ms |
 | dispatch.zig / sasl_mechrouter.zig | `MAX_RAW_MESSAGE` | `512` | max decoded SASL AUTHENTICATE payload bytes for preregistration SASL and IRCX AUTH. The TOML value can lower, but not raise above, the fixed protocol buffer. | `limits.sasl_decode_max_bytes` *(schema-backed; default 512)* | uint | 512 | 64..512 |
 | config_format.zig:239 | `Config.nick_delay_ms` | `0` (disabled) | hold window for released nicks after owner exits; prevents nick-camping; `0` = disabled | `limits.nick_delay` *(schema-backed)* | duration | 0 | 0..– |
 
-## [io] (new): io_uring and transport tuning
+## [io]: io_uring tuning
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 | server.zig:689 | `Config.ring_entries` | `32` | io_uring submission/completion queue depth | `io.ring_entries` *(schema-backed; default 32)* | uint | 32 | 8..4096 |
 | server.zig / `runOnce` | `Config.cqe_batch` | `256` | max CQEs reaped per event-loop drain (`cqes` array in loop) | `io.cqe_batch` *(schema-backed; default 256)* | uint | 256 | 16..4096 |
-| server.zig:537 | `default_reply_bytes` | `8192` | per-connection send buffer size (`ConnState.send_buf`) — borderline (struct buffer, but perf/queue-meaningful) | `io.send_buf_bytes` (NEW) | uint | 8192 | 512..262144 |
-| server.zig:538 | `default_recv_bytes` | `4096` | per-connection recv buffer size (`ConnState.recv_buf`) — borderline | `io.recv_buf_bytes` (NEW) | uint | 4096 | 512..262144 |
 
 ## [node]
 
@@ -58,24 +58,26 @@ mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
 | server.zig:728 | `Config.node_id` | `1` (placeholder) | sovereign mesh identity; keys registry/CRDT/gossip; seeds snowflake generator | `node.id` *(schema-backed; required, min 1)* | uint | 1 | 1..(u64 max) |
 | server.zig:739 | `Config.mesh_pass` | `""` | shared mesh auth password for plaintext S2S | `mesh.mesh_pass` *(schema-backed)* | string | "" | – |
 
-## [reputation] (new): IP-reputation penalty weights
+## [reputation]: IP-reputation penalty weights
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| server.zig:534 | `reg_timeout_penalty` | `50.0` | reputation penalty added when a conn never completes registration (scan signature) | `reputation.registration_timeout_penalty` (NEW) | float | 50.0 | 0..1000 |
-| server.zig:536 | `clone_refuse_penalty` | `25.0` | reputation penalty added when accept refused by clone limiter | `reputation.clone_refuse_penalty` (NEW) | float | 25.0 | 0..1000 |
+| server.zig:1595 / config_format.zig:362 | `Config.reg_timeout_penalty` | `50.0` | reputation penalty added when a conn never completes registration (scan signature) | `reputation.registration_timeout_penalty` *(schema-backed)* | float | 50.0 | 0..1000 |
+| server.zig:1596 / config_format.zig:363 | `Config.clone_refuse_penalty` | `25.0` | reputation penalty added when accept refused by clone limiter | `reputation.clone_refuse_penalty` *(schema-backed)* | float | 25.0 | 0..1000 |
 
-## Borderline and informational hardcoded identity strings
+## Network identity strings
 
-These values likely belong in config but are placeholders today.
+These defaults are schema-backed through `[network]`. `main.zig` also installs
+the configured values into `protocol_inventory` so dispatch-layer replies use
+the same runtime identity.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| server.zig:540 | `server_name` | `"orochi.local"` | server name in numerics/prefixes/ERROR lines — borderline (identity, not tuning) | `node.server_name` (NEW) | string | orochi.local | – |
-| dispatch.zig:20 | `SERVER_NAME` | `"orochi.local"` | server name in dispatch-layer replies (isolation/test path mirror) — borderline | `node.server_name` (reuse) | string | orochi.local | – |
-| dispatch.zig:21 | `NETWORK_NAME` | `"Orochi"` | network name advertised in ISUPPORT — borderline (identity) | `node.network_name` (NEW) | string | Orochi | – |
+| server.zig:999 / config_format.zig:124 | `server_name` | `"orochi.local"` | server name in numerics/prefixes/ERROR lines and S2S identity | `network.server_name` *(schema-backed; optional)* | string | orochi.local | – |
+| protocol_inventory.zig:40 / main.zig:285 | `protocol_inventory.server_name` | `"orochi.local"` | dispatch-layer fallback for server-originated replies | `network.server_name` *(schema-backed; installed at boot)* | string | orochi.local | – |
+| protocol_inventory.zig:19 / main.zig:284 | `protocol_inventory.network_name` | `"Orochi"` | network name advertised in ISUPPORT and welcome burst | `network.name` *(schema-backed; default "Orochi")* | string | Orochi | – |
 
-## [class.<name>] (new): Per-connection policy classes
+## [class.<name>]: Per-connection policy classes
 
 Source: `Policy`/`ClassDef` at `src/daemon/conn_class.zig`, config parsing at `src/daemon/config_format.zig:247`, registry bootstrap at `src/daemon/config_boot.zig`, live inspection at `STATS Y` (numeric 218 RPL_STATSYLINE).
 
@@ -100,6 +102,10 @@ See `docs/reference/config.md` (`[class.<name>]` section) and `etc/orochi.refere
   and `dispatch.zig` MAX_* + MAX_PARAMS=15 — protocol/struct-layout fixed sizes.
 - `dispatch.zig` CAP reply buffers (`[8]CapReply`, `[2048]`, `[512]` storage) and
   `[3]u8` numeric code buffer — IO-scratch / struct layout, not operational tuning.
+- `server.zig` `default_reply_bytes = 8192` and `default_recv_bytes = 4096` —
+  fixed inline scratch/physical buffers in `ConnState` and stack reply builders,
+  intentionally not TOML-lifted. Queue policy is already configurable via
+  `[class.<name>] sendq` / `recvq`; rewriting the fixed buffers is out of scope.
 - `server.zig:539` `default_line_bytes = MAX_LINE_BODY + 2` — RFC line-length derived.
 - `secs * 1000`, `/ 1000` uptime/expiry math; snowflake masks; numeric enum codes.
 - Test-only literals: `budget_ms`/`max_polls*25`/`20_000` (server.zig:7806),
