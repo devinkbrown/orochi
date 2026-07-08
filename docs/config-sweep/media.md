@@ -82,10 +82,10 @@ This section covers `suimyaku/media.zig` `AbrConfig` and `abrHint`.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| src/daemon/transcript.zig:8 | `max_text_bytes` | 400 | Max caption text length | media.captions.max_text_bytes | uint | 400 | 64..4000 |
-| src/daemon/transcript.zig:9 | `max_speaker_bytes` | 64 | Max caption speaker-name length | media.captions.max_speaker_bytes | uint | 64 | 16..256 |
-| src/daemon/transcript.zig:10 | `max_per_channel` | 128 | Retained caption ring depth per channel (FIFO eviction) | media.captions.ring_depth_per_channel | uint | 128 | 16..4096 |
-| src/daemon/transcript.zig:11 | `max_channels` | 4096 | Max channels holding live transcripts | media.captions.max_channels | uint | 4096 | 64..1048576 |
+| src/daemon/config_format.zig / transcript.zig | `media.captions_max_text_bytes` / `max_text_bytes` | 400 | Max caption text length | `media.captions_max_text_bytes` *(schema-backed; flattened daemon key)* | uint | 400 | 64..4000 |
+| src/daemon/config_format.zig / transcript.zig | `media.captions_max_speaker_bytes` / `max_speaker_bytes` | 64 | Max caption speaker-name length | `media.captions_max_speaker_bytes` *(schema-backed; flattened daemon key)* | uint | 64 | 16..256 |
+| src/daemon/config_format.zig / transcript.zig | `media.captions_ring_depth_per_channel` / `max_per_channel` | 128 | Retained caption ring depth per channel (FIFO eviction) | `media.captions_ring_depth_per_channel` *(schema-backed; flattened daemon key)* | uint | 128 | 16..4096 |
+| src/daemon/config_format.zig / transcript.zig | `media.captions_max_channels` / `max_channels` | 4096 | Max channels holding live transcripts | `media.captions_max_channels` *(schema-backed; flattened daemon key)* | uint | 4096 | 64..1048576 |
 
 ## Spotlight sets (`[media.spotlight]`)
 

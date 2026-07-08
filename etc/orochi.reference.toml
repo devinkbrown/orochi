@@ -580,6 +580,11 @@ max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
 max_participants = 64
 # Kagura media reorder/reassembly window in frames, clamped to 1..64. Default 64.
 reorder_window_frames = 64
+# Live transcript/caption ring limits.
+captions_max_text_bytes = 400             # caption text bytes (64..4000)
+captions_max_speaker_bytes = 64           # caption speaker bytes (16..256)
+captions_ring_depth_per_channel = 128     # retained captions/channel (16..4096)
+captions_max_channels = 4096              # channels with live transcripts (64..1048576)
 # Require an authenticated per-datagram MAC on native (OPVOX/OPVIS) media. Default
 # false (accept untagged) for back-compat; when true, untagged or bad-tag datagrams
 # are dropped before the SFU learns the sender. Requires matching client support

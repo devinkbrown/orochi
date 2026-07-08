@@ -1438,6 +1438,9 @@ pub const Config = struct {
     /// Runtime SFU participant cap per room, bounded by the inline roster
     /// ceiling in media_room/native media link.
     media_max_participants: usize = media_room.default_max_participants,
+    /// Runtime transcript/caption retention limits. Configurable via `[media]`
+    /// caption keys.
+    transcript_config: transcript_mod.Config = .{},
     /// Require the native KaguraVox/KaguraVis UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
@@ -3391,7 +3394,7 @@ pub const LinuxServer = struct {
             .tegami = tegami_mod.TegamiBox.initWithConfig(allocator, config.tegami_config),
             .memo_forward = svc_memo_forward.MemoForwardStore.init(allocator),
             .memo_ignore = svc_memo_ignore.MemoIgnoreList.init(allocator),
-            .transcript = transcript_mod.TranscriptLog.init(allocator),
+            .transcript = transcript_mod.TranscriptLog.initConfig(allocator, config.transcript_config),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -3866,6 +3869,12 @@ pub const LinuxServer = struct {
                 .max_per_account = 1,
                 .max_accounts = 1,
             },
+            .transcript_config = .{
+                .max_text_bytes = 4,
+                .max_speaker_bytes = 8,
+                .max_per_channel = 1,
+                .max_channels = 1,
+            },
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -3880,6 +3889,13 @@ pub const LinuxServer = struct {
         try std.testing.expectError(error.MessageInvalid, server.tegami.send("acct", "sender", "12345", 0));
         try std.testing.expectError(error.MailboxFull, server.tegami.send("acct", "sender", "next", 0));
         try std.testing.expectError(error.TooManyAccounts, server.tegami.send("other", "sender", "ok", 0));
+
+        try std.testing.expectEqual(@as(usize, 1), try server.transcript.push("#a", "speaker", "1234", 0));
+        try std.testing.expectError(error.CaptionInvalid, server.transcript.push("#a", "speaker", "12345", 0));
+        try std.testing.expectError(error.CaptionInvalid, server.transcript.push("#a", "speaker-too-long", "ok", 0));
+        try std.testing.expectEqual(@as(usize, 1), try server.transcript.push("#a", "speaker", "next", 1));
+        try std.testing.expectEqualStrings("next", server.transcript.recent("#a")[0].text);
+        try std.testing.expectError(error.TooManyChannels, server.transcript.push("#b", "speaker", "ok", 0));
     }
 
     /// Build the TLS 1.3 config for one accepted client. Certificate material is
