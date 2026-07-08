@@ -36149,6 +36149,112 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
     } else return error.SkipZigTest;
 }
 
+test "threaded server: implicit-TLS raw public key negotiates and registers" {
+    if (comptime builtin.os.tag == .linux) {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const tls_client = @import("../crypto/tls_client.zig");
+        const tls_extension = @import("../proto/tls_extension.zig");
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const alloc = std.testing.allocator;
+
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x72)));
+        var cert_buf: [1024]u8 = undefined;
+        const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x72, 0x50 },
+            .key_pair = kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const chain = [_][]const u8{der};
+
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = kp,
+            .tls_raw_public_key = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const tls_port = try server.tlsBoundPort();
+        const plain_port = try server.boundPort();
+
+        var run = std.atomic.Value(bool).init(true);
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer {
+            run.store(false, .release);
+            if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+            thr.join();
+        }
+
+        const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
+        defer closeFd(fd);
+
+        var client = try tls_client.Client.init(alloc, .{
+            .server_name = "irc.test",
+            .trust_anchors = &.{},
+            .offer_raw_public_key = true,
+        });
+        defer client.deinit();
+
+        const ch = try client.start();
+        defer alloc.free(ch);
+        try writeAllFd(fd, ch);
+        var rbuf: [4096]u8 = undefined;
+        var guard: usize = 0;
+        while (!client.handshakeDone()) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            switch (try client.feed(rbuf[0..n])) {
+                .bytes_to_send => |b| {
+                    defer alloc.free(b);
+                    try writeAllFd(fd, b);
+                },
+                .need_more => {},
+            }
+        }
+        try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, client.server_cert_type);
+
+        const reg = try client.encrypt("NICK RPK\r\nUSER rpk 0 * :Raw Key\r\n");
+        defer alloc.free(reg);
+        try writeAllFd(fd, reg);
+
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        var cipher: std.ArrayList(u8) = .empty;
+        defer cipher.deinit(alloc);
+        guard = 0;
+        while (std.mem.indexOf(u8, plain.items, " 001 RPK ") == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(alloc, rbuf[0..n]);
+            while (cipher.items.len >= 5) {
+                const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+                const wire_len = 5 + @as(usize, body_len);
+                if (cipher.items.len < wire_len) break;
+                switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                    .application_data => |pt| {
+                        defer alloc.free(pt);
+                        try plain.appendSlice(alloc, pt);
+                    },
+                    .control => {},
+                }
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+            }
+        }
+        try expectContains(plain.items, " 001 RPK ");
+    } else return error.SkipZigTest;
+}
+
 test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 276)" {
     if (comptime builtin.os.tag == .linux) {
         const Ed25519 = std.crypto.sign.Ed25519;
