@@ -1610,6 +1610,9 @@ pub const Config = struct {
     session_max_per_account: u32 = 64,
     /// Runtime Tegami offline-mailbox limits. Configurable via `[bouncer]`.
     tegami_config: tegami_mod.Config = .{},
+    /// Runtime draft/search inverted-index limits. Configurable via
+    /// `[history.search]`.
+    search_index_config: search_index_mod.SearchIndex.Config = .{},
     /// Runtime Koshi content-filter limits. Configurable via `[filter]`.
     content_filter_config: content_filter_mod.Config = .{},
     features: RingFeatureSet = RingFeatureSet.baseline,
@@ -3356,7 +3359,7 @@ pub const LinuxServer = struct {
             .reset_store = password_reset.ResetStore.init(allocator, .{ .token_bytes = reset_token_hex_len }),
             .totp = totp_auth.TotpStore.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
-            .search_index = search_index_mod.SearchIndex.init(allocator),
+            .search_index = search_index_mod.SearchIndex.initWithConfig(allocator, config.search_index_config),
             .chanstats = chanstats_mod.ChanStats.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
@@ -3883,6 +3886,11 @@ pub const LinuxServer = struct {
                 .max_per_account = 1,
                 .max_accounts = 1,
             },
+            .search_index_config = .{
+                .max_words = 1,
+                .max_ids_per_word = 1,
+                .max_token_bytes = 4,
+            },
             .transcript_config = .{
                 .max_text_bytes = 4,
                 .max_speaker_bytes = 8,
@@ -3907,6 +3915,11 @@ pub const LinuxServer = struct {
         try std.testing.expectError(error.MessageInvalid, server.tegami.send("acct", "sender", "12345", 0));
         try std.testing.expectError(error.MailboxFull, server.tegami.send("acct", "sender", "next", 0));
         try std.testing.expectError(error.TooManyAccounts, server.tegami.send("other", "sender", "ok", 0));
+
+        try server.search_index.index("m1", "abcd");
+        try std.testing.expectEqual(@as(usize, 1), server.search_index.find("abcd").len);
+        try std.testing.expectError(error.TokenTooLong, server.search_index.index("m2", "abcde"));
+        try std.testing.expectError(error.TooManyWords, server.search_index.index("m3", "wxyz"));
 
         try std.testing.expectEqual(@as(usize, 1), try server.transcript.push("#a", "speaker", "1234", 0));
         try std.testing.expectError(error.CaptionInvalid, server.transcript.push("#a", "speaker", "12345", 0));

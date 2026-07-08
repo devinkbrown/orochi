@@ -154,6 +154,11 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
+    out.search_index_config = .{
+        .max_words = @intCast(cfg.history.search_max_words),
+        .max_ids_per_word = @intCast(cfg.history.search_max_ids_per_word),
+        .max_token_bytes = @intCast(cfg.history.search_max_token_bytes),
+    };
     out.tegami_config = .{
         .max_text_bytes = @intCast(cfg.bouncer.tegami_text_max_len),
         .max_from_bytes = @intCast(cfg.bouncer.tegami_from_max_len),
@@ -513,6 +518,10 @@ test "config text overlays the server config" {
         \\round_fanout = 5
         \\[mesh.swim]
         \\sazanami_witness_quorum = 4
+        \\[history.search]
+        \\max_words = 4096
+        \\max_ids_per_word = 128
+        \\max_token_bytes = 32
         \\[media]
         \\enabled = true
         \\max_upload_bytes = 12345
@@ -601,6 +610,9 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 48), loaded.config.tegami_config.max_from_bytes);
     try testing.expectEqual(@as(usize, 16), loaded.config.tegami_config.max_per_account);
     try testing.expectEqual(@as(usize, 4096), loaded.config.tegami_config.max_accounts);
+    try testing.expectEqual(@as(usize, 4096), loaded.config.search_index_config.max_words);
+    try testing.expectEqual(@as(usize, 128), loaded.config.search_index_config.max_ids_per_word);
+    try testing.expectEqual(@as(usize, 32), loaded.config.search_index_config.max_token_bytes);
     try testing.expectEqual(@as(usize, 512), loaded.config.content_filter_config.max_patterns);
     try testing.expectEqual(@as(usize, 128), loaded.config.content_filter_config.max_pattern_len);
     try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);

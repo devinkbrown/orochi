@@ -372,6 +372,18 @@ Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/con
 | `max_accounts` | integer | `65536` | `1..4294967295` | Multi-session/bouncer account registry size (`src/daemon/server.zig:1024`). |
 | `max_per_account` | integer | `64` | `1..1000000` | Max live sessions per account (`src/daemon/server.zig:1024`). |
 
+## `[history.search]`
+
+Source: struct `History` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live `SearchIndex` construction in `src/daemon/server.zig`.
+
+Live draft/search inverted-index sizing. These values construct the in-memory `SEARCH` index used by the daemon's CHATHISTORY-backed search path at boot.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `max_words` | integer | `8192` | `256..1048576` | Max distinct normalized words held in the live search index. |
+| `max_ids_per_word` | integer | `1024` | `16..65536` | Max message ids retained per indexed word. |
+| `max_token_bytes` | integer | `64` | `8..256` | Max bytes in a normalized search token accepted for indexing/search. |
+
 ## `[media]`
 
 Source: struct at `src/daemon/config_format.zig:245`, parsing at `src/daemon/config_format.zig:553`, mapping at `src/daemon/config_boot.zig:59`.

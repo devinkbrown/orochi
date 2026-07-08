@@ -462,6 +462,13 @@ max_accounts = 65536   # distinct accounts tracked (1..2^32)
 max_per_account = 64   # live sessions per account (1..1000000)
 
 
+# --- [history.search] — draft/search inverted-index sizing ------------------
+[history.search]
+max_words = 8192              # distinct normalized words retained (256..1048576)
+max_ids_per_word = 1024       # message ids retained per word (16..65536)
+max_token_bytes = 64          # bytes per normalized search token (8..256)
+
+
 # --- [accounts] — durable account-services policy ---------------------------
 [accounts]
 pbkdf2_rounds = 100000  # password hashing iterations (10000..10000000)

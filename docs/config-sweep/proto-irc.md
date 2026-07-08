@@ -93,6 +93,9 @@ Note: most `MAX_*_BYTES` values for nick/user/host/server/channel in per-feature
 | msgedit.zig:17 | MAX_TEXT_VALUE_LEN | 1024 | Edit/reason text cap | history.msgedit_text_len | uint | 1024 | 100..8191 |
 | msgedit_store.zig:11 | MAX_NOTIFICATION_LEN | 8191 | Msg-edit notification line cap | borderline (wire) | uint | 8191 | – |
 | activity.zig:26 | max_reaction_len | 64 | TAGMSG reaction cap | history.activity_reaction_len | uint | 64 | 1..256 |
+| search_index.zig / config_format.zig | `SearchIndex.Config.max_words` | 8192 | done; max distinct words in the live draft/search inverted index | history.search.max_words | uint | 8192 | 256..1048576 |
+| search_index.zig / config_format.zig | `SearchIndex.Config.max_ids_per_word` | 1024 | done; max retained msgids per indexed word | history.search.max_ids_per_word | uint | 1024 | 16..65536 |
+| search_index.zig / config_format.zig | `SearchIndex.Config.max_token_bytes` | 64 | done; max bytes in a live SEARCH/index token | history.search.max_token_bytes | uint | 64 | 8..256 |
 | msgtags.zig:10 | MSGID_LEN | 22 | Generated msgid length | borderline ircv3.msgid_len | uint | 22 | 16..64 |
 | msgtags.zig:11 / server_time_skew.zig:34 | SERVER_TIME_LEN | 24 | server-time tag length | borderline (fixed format) | uint | 24 | – |
 

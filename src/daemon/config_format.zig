@@ -27,6 +27,9 @@ const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
+const search_index_mod = @import("search_index.zig");
+
+const default_search_index_config = search_index_mod.SearchIndex.Config{};
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("config_format requires a 64-bit target");
@@ -65,6 +68,7 @@ pub const Config = struct {
     io: Io = .{},
     reputation: Reputation = .{},
     sessions: Sessions = .{},
+    history: History = .{},
     media: Media = .{},
     stats: Stats = .{},
     backup: Backup = .{},
@@ -383,6 +387,13 @@ pub const Config = struct {
     pub const Sessions = struct {
         max_accounts: u64 = 65536,
         max_per_account: u32 = 64,
+    };
+
+    /// `[history.search]` — live draft/search inverted-index sizing.
+    pub const History = struct {
+        search_max_words: u64 = default_search_index_config.max_words,
+        search_max_ids_per_word: u64 = default_search_index_config.max_ids_per_word,
+        search_max_token_bytes: u64 = default_search_index_config.max_token_bytes,
     };
 
     pub const Media = struct {
@@ -1062,6 +1073,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
     cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, 1_000_000));
+
+    // [history.search]
+    cfg.history.search_max_words = try uintField(doc, "history.search.max_words", cfg.history.search_max_words, 256, 1_048_576);
+    cfg.history.search_max_ids_per_word = try uintField(doc, "history.search.max_ids_per_word", cfg.history.search_max_ids_per_word, 16, 65_536);
+    cfg.history.search_max_token_bytes = try uintField(doc, "history.search.max_token_bytes", cfg.history.search_max_token_bytes, 8, 256);
 
     // [media]
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
@@ -1946,6 +1962,61 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\irc = 6680
         \\[filter]
         \\koshi_pattern_max_len = 1025
+        \\
+    , .{}));
+}
+
+test "parseToml: [history.search] limits project with bounded policy ranges" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[history.search]
+        \\max_words = 4096
+        \\max_ids_per_word = 128
+        \\max_token_bytes = 32
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 4096), cfg.history.search_max_words);
+    try testing.expectEqual(@as(u64, 128), cfg.history.search_max_ids_per_word);
+    try testing.expectEqual(@as(u64, 32), cfg.history.search_max_token_bytes);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    const defaults = search_index_mod.SearchIndex.Config{};
+    try testing.expectEqual(@as(u64, defaults.max_words), omitted.history.search_max_words);
+    try testing.expectEqual(@as(u64, defaults.max_ids_per_word), omitted.history.search_max_ids_per_word);
+    try testing.expectEqual(@as(u64, defaults.max_token_bytes), omitted.history.search_max_token_bytes);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[history.search]
+        \\max_words = 255
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[history.search]
+        \\max_ids_per_word = 15
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[history.search]
+        \\max_token_bytes = 257
         \\
     , .{}));
 }
