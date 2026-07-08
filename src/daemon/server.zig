@@ -1282,6 +1282,14 @@ pub const Config = struct {
     /// a clientDataJSON `origin` not on this list is rejected. Empty ⇒ inert.
     /// Slices borrowed from the parsed config (process-lifetime).
     webauthn_origins: []const []const u8 = &.{},
+    /// Require the UV (User-Verified) flag — not just UP — in authData for both
+    /// registration and passwordless login (`[webauthn] require_uv`). Opt-in;
+    /// default false leaves the UP-only behaviour byte-identical.
+    webauthn_require_uv: bool = false,
+    /// Require a verified attestation statement at registration, rejecting `none`
+    /// (`[webauthn] require_attestation`). Opt-in; default false keeps
+    /// trust-on-first-use while still verifying any attestation that IS present.
+    webauthn_require_attestation: bool = false,
     /// Network name advertised in ISUPPORT `NETWORK=` and the welcome burst.
     /// Configurable via `[network] name`; installed into the protocol_inventory
     /// override at boot.
@@ -2079,6 +2087,12 @@ const webauthn_challenge_ttl_ms: i64 = 5 * 60 * 1000;
 /// 37-byte header plus attestedCredentialData (aaguid + credId ≤ 256 + a COSE
 /// key ≤ 512 + small extensions) with generous slack.
 const webauthn_authdata_max: usize = 2048;
+
+/// Upper bound for a decoded registration `attestationObject` (CBOR: {fmt,
+/// attStmt, authData}). Covers the authData bound above plus a `packed`/`fido-u2f`
+/// attStmt carrying an x5c leaf attestation certificate, with slack. Attacker-
+/// bounded: base64url decode caps the input before this buffer is touched.
+const webauthn_attobj_max: usize = 8192;
 
 /// Per-connection pending passkey ceremony state (see `ConnState.webauthn_pending`).
 /// The challenge is the CSPRNG value the client signs; `account` is the target
@@ -22130,11 +22144,21 @@ pub const LinuxServer = struct {
 
     /// Resolved `[webauthn]` config, or null when the feature is inert (missing
     /// rp_id or origins). WEBAUTHN fails closed until both are set.
-    const WebauthnRp = struct { rp_id: []const u8, origins: []const []const u8 };
+    const WebauthnRp = struct {
+        rp_id: []const u8,
+        origins: []const []const u8,
+        require_uv: bool,
+        require_attestation: bool,
+    };
     fn webauthnRp(self: *const LinuxServer) ?WebauthnRp {
         const rp_id = self.config.webauthn_rp_id orelse return null;
         if (rp_id.len == 0 or self.config.webauthn_origins.len == 0) return null;
-        return .{ .rp_id = rp_id, .origins = self.config.webauthn_origins };
+        return .{
+            .rp_id = rp_id,
+            .origins = self.config.webauthn_origins,
+            .require_uv = self.config.webauthn_require_uv,
+            .require_attestation = self.config.webauthn_require_attestation,
+        };
     }
 
     /// Emit a structured `:server NOTE WEBAUTHN <body>` line (matches the SESSION
@@ -22204,15 +22228,21 @@ pub const LinuxServer = struct {
         try self.webauthnNote(conn, body);
     }
 
-    /// `WEBAUTHN REGISTER-FINISH <cred_id_b64> <client_data_json_b64> <authdata_b64>`
-    /// — verify the ceremony and store the credential (trust-on-first-use: the
-    /// public key presented at registration is trusted; attestation statements
-    /// are not verified — a documented follow-up).
+    /// `WEBAUTHN REGISTER-FINISH <cred_id_b64> <client_data_json_b64> <authdata_b64> [attestation_object_b64]`
+    /// — verify the ceremony and store the credential.
+    ///
+    /// When the optional 4th arg (`attestationObject`, CBOR {fmt, attStmt,
+    /// authData}) is present, the attestation statement is cryptographically
+    /// verified (packed self/basic, fido-u2f; `none` accepted as unattested
+    /// unless `[webauthn] require_attestation`). When absent, the legacy
+    /// trust-on-first-use path runs over the raw `authData` (3-arg form) — this
+    /// keeps existing clients byte-identical. `[webauthn] require_uv` (when set)
+    /// additionally requires the UV flag on either path.
     fn webauthnRegisterFinish(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, rp: WebauthnRp, p: []const []const u8) !void {
         const account = conn.session.account() orelse
             return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before registering a passkey");
         if (p.len < 4)
-            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN REGISTER-FINISH <cred_id> <client_data_json> <authdata>");
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN REGISTER-FINISH <cred_id> <client_data_json> <authdata> [attestation_object]");
         const cred_id_b64 = p[1];
         // Consume the single-use challenge FIRST (cleared regardless of outcome).
         const taken = conn.webauthn_pending.take(.register, self.nowMs()) orelse
@@ -22222,13 +22252,10 @@ pub const LinuxServer = struct {
         if (!webauthn_creds_mod.validCredIdB64(cred_id_b64))
             return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL_ID", "Malformed credential id");
 
-        // Decode the base64url wire args.
+        // Decode clientDataJSON.
         var cdj_buf: [webauthn_creds_mod.max_client_data_bytes]u8 = undefined;
         const client_data_json = base64url.decode(&cdj_buf, p[2]) catch
             return self.failReply(conn, "WEBAUTHN", "BAD_CLIENT_DATA", "clientDataJSON is not valid base64url");
-        var ad_buf: [webauthn_authdata_max]u8 = undefined;
-        const auth_data = base64url.decode(&ad_buf, p[3]) catch
-            return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData is not valid base64url");
 
         // Bind clientDataJSON: type == webauthn.create, challenge, origin.
         var json_scratch: [16384]u8 = undefined;
@@ -22241,18 +22268,54 @@ pub const LinuxServer = struct {
         if (!webauthn_creds_mod.originAllowed(cd.origin, rp.origins))
             return self.failReply(conn, "WEBAUTHN", "BAD_ORIGIN", "clientDataJSON origin is not allowed");
 
-        // Bind authenticatorData: rpIdHash == SHA-256(rp_id), UP flag present.
-        const ad = webauthn.parseAuthData(auth_data) catch
-            return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData did not parse");
-        var rp_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(rp.rp_id, &rp_hash, .{});
-        if (!std.mem.eql(u8, &ad.rp_id_hash, &rp_hash))
-            return self.failReply(conn, "WEBAUTHN", "RP_MISMATCH", "authenticatorData rpIdHash does not match rp_id");
-        if (!webauthn.hasAttestedCredentialData(auth_data))
-            return self.failReply(conn, "WEBAUTHN", "NO_CREDENTIAL", "authenticatorData carries no attested credential");
+        // clientDataHash binds the attestation signature (attestation path).
+        var client_data_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(client_data_json, &client_data_hash, .{});
 
-        const att = webauthn.parseAttestedCredentialData(auth_data) catch
-            return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL", "Could not parse attested credential data");
+        const has_attestation = p.len >= 5;
+        if (rp.require_attestation and !has_attestation)
+            return self.failReply(conn, "WEBAUTHN", "ATTESTATION_REQUIRED", "This network requires a passkey attestation object");
+
+        // Decode buffers live at function scope: `att` borrows whichever buffer
+        // the taken branch fills, and that borrow must survive through
+        // webauthnBind in the common tail below.
+        var ao_buf: [webauthn_attobj_max]u8 = undefined;
+        var ad_buf: [webauthn_authdata_max]u8 = undefined;
+        var att: webauthn.AttestedCredential = undefined;
+        var reg_sign_count: u32 = undefined;
+
+        if (has_attestation) {
+            const att_obj = base64url.decode(&ao_buf, p[4]) catch
+                return self.failReply(conn, "WEBAUTHN", "BAD_ATTESTATION", "attestationObject is not valid base64url");
+            const verified = webauthn.verifyAttestation(att_obj, .{
+                .rp_id = rp.rp_id,
+                .client_data_hash = client_data_hash,
+                .require_uv = rp.require_uv,
+                .require_attestation = rp.require_attestation,
+            }) catch |err|
+                return self.failReply(conn, "WEBAUTHN", webauthnAttestationFailCode(err), "Attestation verification failed");
+            att = verified.credential;
+            reg_sign_count = verified.sign_count;
+        } else {
+            // Legacy trust-on-first-use: verify authData binding only. Behaviour
+            // is byte-identical to the pre-attestation command unless require_uv
+            // is set (the sole added check on this path).
+            const auth_data = base64url.decode(&ad_buf, p[3]) catch
+                return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData is not valid base64url");
+            const ad = webauthn.parseAuthData(auth_data) catch
+                return self.failReply(conn, "WEBAUTHN", "BAD_AUTHDATA", "authenticatorData did not parse");
+            var rp_hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(rp.rp_id, &rp_hash, .{});
+            if (!std.mem.eql(u8, &ad.rp_id_hash, &rp_hash))
+                return self.failReply(conn, "WEBAUTHN", "RP_MISMATCH", "authenticatorData rpIdHash does not match rp_id");
+            if (rp.require_uv and !webauthn.userVerified(ad))
+                return self.failReply(conn, "WEBAUTHN", "USER_VERIFICATION_REQUIRED", "This network requires user verification (UV)");
+            if (!webauthn.hasAttestedCredentialData(auth_data))
+                return self.failReply(conn, "WEBAUTHN", "NO_CREDENTIAL", "authenticatorData carries no attested credential");
+            att = webauthn.parseAttestedCredentialData(auth_data) catch
+                return self.failReply(conn, "WEBAUTHN", "BAD_CREDENTIAL", "Could not parse attested credential data");
+            reg_sign_count = ad.sign_count;
+        }
 
         // Cross-check the embedded credential id against the presented id.
         var cred_id_raw: [webauthn_creds_mod.max_cred_id_bytes]u8 = undefined;
@@ -22267,7 +22330,7 @@ pub const LinuxServer = struct {
 
         // Store, keyed by credential id, bound to the account. The registration
         // signCount seeds the stored monotonic counter.
-        svc.webauthnBind(account, cred_id_b64, att.cose_public_key, ad.sign_count, label, @divTrunc(platform.realtimeMillis(), 1000)) catch |err| {
+        svc.webauthnBind(account, cred_id_b64, att.cose_public_key, reg_sign_count, label, @divTrunc(platform.realtimeMillis(), 1000)) catch |err| {
             const code: []const u8 = switch (err) {
                 error.AlreadyExists => "ALREADY_REGISTERED",
                 error.InvalidValue => "BAD_CREDENTIAL",
@@ -22279,6 +22342,27 @@ pub const LinuxServer = struct {
         var b: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "REGISTERED {s} :{s}", .{ cred_id_b64, label }) catch return;
         try self.webauthnNote(conn, body);
+    }
+
+    /// Map a `webauthn.verifyAttestation` error to a stable FAIL code for the
+    /// `:server NOTE WEBAUTHN` reply. The `else` default covers the folded
+    /// signature/encoding failure sets (all render as a generic verify failure).
+    fn webauthnAttestationFailCode(err: webauthn.AttestationError) []const u8 {
+        return switch (err) {
+            error.RpIdHashMismatch => "RP_MISMATCH",
+            error.UserPresenceRequired => "USER_PRESENCE_REQUIRED",
+            error.UserVerificationRequired => "USER_VERIFICATION_REQUIRED",
+            error.AttestationRequired => "ATTESTATION_REQUIRED",
+            error.UnsupportedFormat => "UNSUPPORTED_ATTESTATION",
+            error.AttestationAlgMismatch => "ATTESTATION_ALG_MISMATCH",
+            error.UnsupportedAttestationKey => "UNSUPPORTED_ATTESTATION_KEY",
+            error.InvalidCredentialData => "NO_CREDENTIAL",
+            error.TooShort => "BAD_AUTHDATA",
+            error.MalformedAttestation, error.MissingAttestationField => "BAD_ATTESTATION",
+            error.Overflow, error.InvalidEncoding, error.UnexpectedType, error.MapKeyNotFound => "BAD_ATTESTATION",
+            error.UnsupportedAlgorithm, error.MissingField, error.InvalidKeyType, error.InvalidCurve, error.InvalidKeyLength => "UNSUPPORTED_KEY",
+            else => "ATTESTATION_VERIFY_FAILED",
+        };
     }
 
     /// `WEBAUTHN AUTH <account>` — issue an authentication challenge + the
@@ -22379,12 +22463,13 @@ pub const LinuxServer = struct {
             .rp_id = rp.rp_id,
             .credential_public_key = cose_key,
             .stored_sign_count = cred.sign_count,
-            .require_uv = false,
+            .require_uv = rp.require_uv,
         }) catch |err| {
             const code: []const u8 = switch (err) {
                 error.CounterRegression => "SIGN_COUNT_REGRESSION",
                 error.RpIdHashMismatch => "RP_MISMATCH",
                 error.UserPresenceRequired => "USER_PRESENCE_REQUIRED",
+                error.UserVerificationRequired => "USER_VERIFICATION_REQUIRED",
                 else => "ASSERTION_FAILED",
             };
             return self.webauthnAuthFail(conn, target_account, code, "Passkey assertion rejected");

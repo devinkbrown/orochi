@@ -151,6 +151,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         if (v.len != 0) out.webauthn_rp_id = v;
     }
     if (cfg.webauthn.origins.len != 0) out.webauthn_origins = cfg.webauthn.origins;
+    out.webauthn_require_uv = cfg.webauthn.require_uv;
+    out.webauthn_require_attestation = cfg.webauthn.require_attestation;
     return out;
 }
 

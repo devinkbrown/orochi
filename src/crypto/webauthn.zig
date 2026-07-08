@@ -28,6 +28,7 @@ pub const AuthDataError = error{
     TooShort,
     RpIdHashMismatch,
     UserPresenceRequired,
+    UserVerificationRequired,
     CounterRegression,
     InvalidCredentialData,
 };
@@ -203,6 +204,29 @@ const CborCursor = struct {
             else => error.UnexpectedType,
         };
     }
+
+    /// Read the next item as a CBOR text string (major type 3), returning the
+    /// bytes (borrowing `data`). Used for the string keys of the top-level
+    /// attestationObject map and the `attStmt` map. `next()` deliberately does
+    /// not decode text strings, so this is a dedicated reader.
+    fn nextTextString(self: *CborCursor) CborError![]const u8 {
+        const ib = try self.readByte();
+        if (ib >> 5 != 3) return error.UnexpectedType;
+        const arg = try self.readArgument(ib & 0x1f);
+        const len: usize = std.math.cast(usize, arg) orelse return error.Overflow;
+        if (len > self.data.len - self.pos) return error.InvalidEncoding;
+        const slice = self.data[self.pos .. self.pos + len];
+        self.pos += len;
+        return slice;
+    }
+
+    /// Read the next item as a CBOR array header (major type 4), returning the
+    /// element count. The elements themselves are consumed by the caller.
+    fn nextArrayLen(self: *CborCursor) CborError!u64 {
+        const ib = try self.readByte();
+        if (ib >> 5 != 4) return error.UnexpectedType;
+        return self.readArgument(ib & 0x1f);
+    }
 };
 
 /// Look up a COSE map key (integer) in a CBOR map and return the value bytes.
@@ -324,6 +348,16 @@ pub fn hasAttestedCredentialData(auth_data: []const u8) bool {
     return (auth_data[32] & FLAG_AT) != 0;
 }
 
+/// Whether parsed authData asserts User Presence (UP).
+pub fn userPresent(ad: AuthData) bool {
+    return ad.flags & FLAG_UP != 0;
+}
+
+/// Whether parsed authData asserts User Verification (UV).
+pub fn userVerified(ad: AuthData) bool {
+    return ad.flags & FLAG_UV != 0;
+}
+
 /// Attested credential data extracted from a registration authenticatorData.
 /// `credential_id` and `cose_public_key` borrow `auth_data` (no copy); the
 /// COSE key is bounded to its exact CBOR extent so any trailing extension map
@@ -370,6 +404,334 @@ pub fn parseAttestedCredentialData(auth_data: []const u8) (AuthDataError || Cbor
     cur.skip() catch return error.InvalidCredentialData;
     const cose_public_key = key_region[0..cur.pos];
     return .{ .aaguid = aaguid, .credential_id = credential_id, .cose_public_key = cose_public_key };
+}
+
+// -- Registration attestation ------------------------------------------------
+
+const x509 = @import("x509.zig");
+
+/// Errors specific to attestation-statement verification (registration). Folds
+/// in the CBOR / authData / COSE / signature error sets so a caller can map one
+/// union to a FAIL code.
+pub const AttestationError = error{
+    /// The attestation `fmt` is not one this build verifies (none/packed/fido-u2f).
+    UnsupportedFormat,
+    /// The attStmt map is structurally wrong (missing/oversized/garbled).
+    MalformedAttestation,
+    /// `fmt` is "none" but the policy requires a real attestation statement.
+    AttestationRequired,
+    /// A required attStmt field (alg/sig/x5c) is absent.
+    MissingAttestationField,
+    /// The attStmt `alg` does not match the key used to sign (credential key for
+    /// self-attestation, or the leaf cert key for basic/AttCA).
+    AttestationAlgMismatch,
+    /// The x5c leaf certificate uses a key family we cannot verify against.
+    UnsupportedAttestationKey,
+} || CborError || AuthDataError || CoseError ||
+    crypto.errors.SignatureVerificationError ||
+    crypto.errors.EncodingError ||
+    crypto.errors.NonCanonicalError ||
+    crypto.errors.IdentityElementError ||
+    crypto.errors.WeakPublicKeyError;
+
+/// Supported attestation statement formats (WebAuthn §8).
+pub const AttestationFormat = enum { none, @"packed", fido_u2f };
+
+fn attestationFormat(fmt: []const u8) ?AttestationFormat {
+    if (mem.eql(u8, fmt, "none")) return .none;
+    if (mem.eql(u8, fmt, "packed")) return .@"packed";
+    if (mem.eql(u8, fmt, "fido-u2f")) return .fido_u2f;
+    return null;
+}
+
+/// The three top-level members of an attestationObject (WebAuthn §6.5). All
+/// slices borrow the source CBOR; `att_stmt` is the exact CBOR extent of the
+/// attStmt map (header included) so it can be re-walked.
+pub const AttestationObject = struct {
+    fmt: []const u8,
+    att_stmt: []const u8,
+    auth_data: []const u8,
+};
+
+/// Parse the CBOR `attestationObject` = {"fmt": tstr, "attStmt": map,
+/// "authData": bstr}. Member order is not fixed by CBOR, so each key is matched
+/// by name. Fail-closed: a missing member is `MapKeyNotFound`; any structural
+/// defect is a `CborError`. Never panics on hostile bytes.
+pub fn parseAttestationObject(cbor: []const u8) CborError!AttestationObject {
+    var cur = CborCursor.init(cbor);
+    const head = try cur.next();
+    const pairs = switch (head) {
+        .map_start => |n| n,
+        else => return error.UnexpectedType,
+    };
+    var fmt: ?[]const u8 = null;
+    var att_stmt: ?[]const u8 = null;
+    var auth_data: ?[]const u8 = null;
+    var i: u64 = 0;
+    while (i < pairs) : (i += 1) {
+        const key = try cur.nextTextString();
+        if (mem.eql(u8, key, "fmt")) {
+            fmt = try cur.nextTextString();
+        } else if (mem.eql(u8, key, "authData")) {
+            auth_data = try cur.nextBytes();
+        } else if (mem.eql(u8, key, "attStmt")) {
+            const start = cur.pos;
+            try cur.skip(); // validate + measure the attStmt map extent
+            att_stmt = cbor[start..cur.pos];
+        } else {
+            try cur.skip(); // ignore unknown members
+        }
+    }
+    return .{
+        .fmt = fmt orelse return error.MapKeyNotFound,
+        .att_stmt = att_stmt orelse return error.MapKeyNotFound,
+        .auth_data = auth_data orelse return error.MapKeyNotFound,
+    };
+}
+
+/// The decoded fields of a `packed`/`fido-u2f` attStmt map. `pair_count` lets
+/// the `none` branch assert an empty map.
+const AttStmt = struct {
+    alg: ?i64 = null,
+    sig: ?[]const u8 = null,
+    /// The first (leaf) certificate of the x5c array, if present.
+    x5c_leaf: ?[]const u8 = null,
+    x5c_present: bool = false,
+    pair_count: u64 = 0,
+};
+
+fn parseAttStmt(att_stmt: []const u8) CborError!AttStmt {
+    var cur = CborCursor.init(att_stmt);
+    const head = try cur.next();
+    const pairs = switch (head) {
+        .map_start => |n| n,
+        else => return error.UnexpectedType,
+    };
+    var out = AttStmt{ .pair_count = pairs };
+    var i: u64 = 0;
+    while (i < pairs) : (i += 1) {
+        const key = try cur.nextTextString();
+        if (mem.eql(u8, key, "alg")) {
+            out.alg = try cur.nextInt();
+        } else if (mem.eql(u8, key, "sig")) {
+            out.sig = try cur.nextBytes();
+        } else if (mem.eql(u8, key, "x5c")) {
+            out.x5c_present = true;
+            const n = try cur.nextArrayLen();
+            if (n != 0) {
+                out.x5c_leaf = try cur.nextBytes(); // leaf attestation cert
+                var j: u64 = 1;
+                while (j < n) : (j += 1) try cur.skip(); // skip chain remainder
+            }
+        } else {
+            try cur.skip();
+        }
+    }
+    return out;
+}
+
+/// Verify an ECDSA-P256 or Ed25519 signature over (`msg1` || `msg2`) with a
+/// COSE credential public key, requiring `alg` to name that key family.
+fn verifyCoseSig(
+    cose_key: CosePublicKey,
+    alg: i64,
+    signature: []const u8,
+    msg1: []const u8,
+    msg2: []const u8,
+) AttestationError!void {
+    switch (cose_key) {
+        .es256 => |pk| {
+            if (alg != COSE_ALG_ES256) return error.AttestationAlgMismatch;
+            const sig = EcdsaP256Sha256.Signature.fromDer(signature) catch
+                return error.InvalidEncoding;
+            var vrf = sig.verifier(pk) catch |e| return e;
+            vrf.update(msg1);
+            vrf.update(msg2);
+            try vrf.verify();
+        },
+        .eddsa => |pk| {
+            if (alg != COSE_ALG_EDDSA) return error.AttestationAlgMismatch;
+            if (signature.len != Ed25519.Signature.encoded_length) return error.InvalidEncoding;
+            const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+            var vrf = sig.verifier(pk) catch |e| return e;
+            vrf.update(msg1);
+            vrf.update(msg2);
+            try vrf.verify();
+        },
+    }
+}
+
+/// Extract the P-256 / Ed25519 public key from an x5c leaf certificate. RSA and
+/// every other family fail closed as `UnsupportedAttestationKey` (this build
+/// verifies ECDSA-P256 and Ed25519 attestation certs only).
+fn leafCertKey(leaf_der: []const u8) AttestationError!CosePublicKey {
+    const cert = x509.parse(leaf_der) catch return error.MalformedAttestation;
+    const spk = x509.extractPublicKey(cert.spki_der) catch return error.UnsupportedAttestationKey;
+    return switch (spk) {
+        .ecdsa_p256 => |sec1| .{ .es256 = EcdsaP256Sha256.PublicKey.fromSec1(sec1) catch
+            return error.UnsupportedAttestationKey },
+        .ed25519 => |raw| blk: {
+            if (raw.len != 32) return error.UnsupportedAttestationKey;
+            break :blk .{ .eddsa = Ed25519.PublicKey.fromBytes(raw[0..32].*) catch
+                return error.UnsupportedAttestationKey };
+        },
+        .rsa => error.UnsupportedAttestationKey,
+    };
+}
+
+/// Verify a `packed` attStmt (WebAuthn §8.2). Self-attestation (no x5c) checks
+/// the signature over (authData || clientDataHash) with the credential key and
+/// requires alg == the credential key's algorithm. Basic/AttCA (x5c present)
+/// verifies the same signed data against the leaf attestation certificate's key.
+///
+/// NOTE: basic attestation additionally requires anchoring the x5c chain to a
+/// trusted attestation root and matching the AAGUID — this build does NOT run a
+/// chain-to-root check (no bundled FIDO metadata trust store). The attestation
+/// signature is cryptographically verified against the presented leaf, which is
+/// tamper-evident, but the leaf is not proven to be a genuine authenticator
+/// root. Callers wanting hard attestation guarantees must add a trust store.
+fn verifyPacked(
+    att_stmt: []const u8,
+    auth_data: []const u8,
+    client_data_hash: [32]u8,
+    cose_key: CosePublicKey,
+) AttestationError!void {
+    const st = try parseAttStmt(att_stmt);
+    const alg = st.alg orelse return error.MissingAttestationField;
+    const sig = st.sig orelse return error.MissingAttestationField;
+    if (st.x5c_present) {
+        const leaf = st.x5c_leaf orelse return error.MalformedAttestation;
+        const leaf_key = try leafCertKey(leaf);
+        try verifyCoseSig(leaf_key, alg, sig, auth_data, &client_data_hash);
+    } else {
+        try verifyCoseSig(cose_key, alg, sig, auth_data, &client_data_hash);
+    }
+}
+
+/// Verify a `fido-u2f` attStmt (WebAuthn §8.6). verificationData =
+/// 0x00 || rpIdHash || clientDataHash || credentialId || (0x04||x||y); the
+/// signature is ECDSA-SHA256 over it with the x5c leaf cert (which MUST be
+/// P-256). The credential key MUST be EC2 P-256 (U2F predates other curves).
+fn verifyFidoU2f(
+    att_stmt: []const u8,
+    rp_id_hash: [32]u8,
+    client_data_hash: [32]u8,
+    cred: AttestedCredential,
+) AttestationError!void {
+    const st = try parseAttStmt(att_stmt);
+    const sig = st.sig orelse return error.MissingAttestationField;
+    const leaf = st.x5c_leaf orelse return error.MissingAttestationField;
+
+    // U2F authenticators have no AAGUID: a conformant fido-u2f authData carries
+    // an all-zero AAGUID (WebAuthn §8.6). Reject a non-zero one fail-closed.
+    for (cred.aaguid) |b| {
+        if (b != 0) return error.MalformedAttestation;
+    }
+
+    const cose_key = try parseCoseKey(cred.cose_public_key);
+    const pub_u2f: [65]u8 = switch (cose_key) {
+        .es256 => |pk| pk.toUncompressedSec1(),
+        else => return error.AttestationAlgMismatch,
+    };
+
+    const leaf_key = try leafCertKey(leaf);
+    const leaf_pk = switch (leaf_key) {
+        .es256 => |pk| pk, // U2F attestation certs are P-256
+        else => return error.UnsupportedAttestationKey,
+    };
+    const s = EcdsaP256Sha256.Signature.fromDer(sig) catch return error.InvalidEncoding;
+    var vrf = s.verifier(leaf_pk) catch |e| return e;
+    const zero = [_]u8{0x00};
+    vrf.update(&zero);
+    vrf.update(&rp_id_hash);
+    vrf.update(&client_data_hash);
+    vrf.update(cred.credential_id);
+    vrf.update(&pub_u2f);
+    try vrf.verify();
+}
+
+/// Options controlling registration attestation verification.
+pub const AttestationOptions = struct {
+    /// Relying-party id; the authData rpIdHash must equal SHA-256(rp_id).
+    rp_id: []const u8,
+    /// SHA-256(clientDataJSON) — bound into the attestation signature.
+    client_data_hash: [32]u8,
+    /// Require the UV flag in authData (opt-in).
+    require_uv: bool,
+    /// Reject `fmt == "none"` (require a real, verified attestation statement).
+    require_attestation: bool,
+};
+
+/// The result of a successful attestation verification. Slices borrow the
+/// attestationObject CBOR passed to `verifyAttestation`.
+pub const VerifiedAttestation = struct {
+    format: AttestationFormat,
+    /// false only for `none` (unattested / trust-on-first-use).
+    attested: bool,
+    /// The attested credential (aaguid, credentialId, COSE key) from authData.
+    credential: AttestedCredential,
+    /// The registration authenticator signature counter (seeds the store).
+    sign_count: u32,
+};
+
+/// Verify a registration `attestationObject` (navigator.credentials.create).
+///
+/// Binds rpIdHash, UP (always) and UV (when `require_uv`), then verifies the
+/// attestation statement for its format:
+///   - `none`      → accepted as unattested (TOFU) unless `require_attestation`;
+///                   the attStmt MUST be an empty map.
+///   - `packed`    → self-attestation (credential key) or basic (x5c leaf key).
+///   - `fido-u2f`  → U2F verificationData signed by the x5c leaf (P-256).
+///
+/// Fail-closed on a present-but-invalid attestation. Never panics on hostile
+/// CBOR/attestation bytes.
+pub fn verifyAttestation(
+    attestation_object: []const u8,
+    opts: AttestationOptions,
+) AttestationError!VerifiedAttestation {
+    const obj = try parseAttestationObject(attestation_object);
+    const ad = try parseAuthData(obj.auth_data);
+
+    // rpIdHash == SHA-256(rp_id)
+    var expected_hash: [32]u8 = undefined;
+    Sha256.hash(opts.rp_id, &expected_hash, .{});
+    if (!mem.eql(u8, &ad.rp_id_hash, &expected_hash)) return error.RpIdHashMismatch;
+
+    // Presence is always required; verification is opt-in.
+    if (ad.flags & FLAG_UP == 0) return error.UserPresenceRequired;
+    if (opts.require_uv and (ad.flags & FLAG_UV == 0)) return error.UserVerificationRequired;
+    if (ad.flags & FLAG_AT == 0) return error.InvalidCredentialData;
+
+    const cred = try parseAttestedCredentialData(obj.auth_data);
+    // Ensure the COSE key is one we can store + verify later.
+    const cose_key = try parseCoseKey(cred.cose_public_key);
+
+    const fmt = attestationFormat(obj.fmt) orelse return error.UnsupportedFormat;
+    var attested = false;
+    switch (fmt) {
+        .none => {
+            if (opts.require_attestation) return error.AttestationRequired;
+            // A `none` attStmt MUST be an empty map (WebAuthn §8.7); a stuffed
+            // map is malformed.
+            const st = try parseAttStmt(obj.att_stmt);
+            if (st.pair_count != 0) return error.MalformedAttestation;
+        },
+        .@"packed" => {
+            try verifyPacked(obj.att_stmt, obj.auth_data, opts.client_data_hash, cose_key);
+            attested = true;
+        },
+        .fido_u2f => {
+            try verifyFidoU2f(obj.att_stmt, ad.rp_id_hash, opts.client_data_hash, cred);
+            attested = true;
+        },
+    }
+
+    return .{
+        .format = fmt,
+        .attested = attested,
+        .credential = cred,
+        .sign_count = ad.sign_count,
+    };
 }
 
 // -- Assertion options / state -----------------------------------------------
@@ -420,9 +782,9 @@ pub fn verifyAssertion(
         return error.UserPresenceRequired;
     }
 
-    // 4. Optionally require UV flag
+    // 4. Optionally require UV flag (opt-in; UV is a superset of presence).
     if (opts.require_uv and (ad.flags & FLAG_UV == 0)) {
-        return error.UserPresenceRequired; // reuse error; UV is a superset of presence
+        return error.UserVerificationRequired;
     }
 
     // 5. Verify signature counter (monotonic, unless both are 0)
@@ -974,4 +1336,639 @@ test "parseAttestedCredentialData: malformed COSE map rejected" {
     buf[55] = 'x';
     buf[56] = 0xa5; // map(5) with no entries following
     try testing.expectError(error.InvalidCredentialData, parseAttestedCredentialData(&buf));
+}
+
+// -- Attestation verification tests ------------------------------------------
+//
+// These build GENUINE attestation objects: real ECDSA-P256 / Ed25519 keys sign
+// real (authData || clientDataHash) data, and basic/u2f attestations embed real
+// self-signed P-256 leaf certificates (via x509_selfsign). The underlying
+// primitives (ECDSA, SHA-256, DER) are KAT-verified elsewhere in the tree
+// (wycheproof); these vectors exercise the attestation *verification path*
+// (CBOR walk, format dispatch, signed-data construction) the way the existing
+// verifyAssertion tests exercise the assertion path. No published third-party
+// binary "packed" vector is embedded — none with a recoverable trust context
+// exists for a self/basic statement — so genuine constructions are used and
+// their provenance is stated here.
+
+/// Minimal CBOR writer for building test attestation objects.
+const CborW = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn init(buf: []u8) CborW {
+        return .{ .buf = buf };
+    }
+    fn byte(self: *CborW, b: u8) void {
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+    fn head(self: *CborW, major: u8, arg: u64) void {
+        const m: u8 = major << 5;
+        if (arg < 24) {
+            self.byte(m | @as(u8, @intCast(arg)));
+        } else if (arg < 0x100) {
+            self.byte(m | 24);
+            self.byte(@intCast(arg));
+        } else if (arg < 0x10000) {
+            self.byte(m | 25);
+            self.byte(@intCast(arg >> 8));
+            self.byte(@intCast(arg & 0xff));
+        } else {
+            self.byte(m | 26);
+            self.byte(@intCast(arg >> 24));
+            self.byte(@intCast((arg >> 16) & 0xff));
+            self.byte(@intCast((arg >> 8) & 0xff));
+            self.byte(@intCast(arg & 0xff));
+        }
+    }
+    fn nint(self: *CborW, v: i64) void {
+        self.head(1, @intCast(-1 - v));
+    }
+    fn bstr(self: *CborW, b: []const u8) void {
+        self.head(2, b.len);
+        @memcpy(self.buf[self.len..][0..b.len], b);
+        self.len += b.len;
+    }
+    fn tstr(self: *CborW, t: []const u8) void {
+        self.head(3, t.len);
+        @memcpy(self.buf[self.len..][0..t.len], t);
+        self.len += t.len;
+    }
+    fn arr(self: *CborW, n: u64) void {
+        self.head(4, n);
+    }
+    fn map(self: *CborW, n: u64) void {
+        self.head(5, n);
+    }
+    fn slice(self: *CborW) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+// Build registration authData with the ES256 credential key `cred_kp` and the
+// given flags, returning the bytes in `out` and the credential cose bytes.
+fn regAuthDataEs256(
+    rp_id_hash: [32]u8,
+    flags: u8,
+    sign_count: u32,
+    aaguid: [16]u8,
+    cred_id: []const u8,
+    cose77: [77]u8,
+    out: []u8,
+) usize {
+    var i: usize = 0;
+    @memcpy(out[0..32], &rp_id_hash);
+    i = 32;
+    out[i] = flags;
+    i += 1;
+    mem.writeInt(u32, out[i..][0..4], sign_count, .big);
+    i += 4;
+    @memcpy(out[i..][0..16], &aaguid);
+    i += 16;
+    mem.writeInt(u16, out[i..][0..2], @intCast(cred_id.len), .big);
+    i += 2;
+    @memcpy(out[i..][0..cred_id.len], cred_id);
+    i += cred_id.len;
+    @memcpy(out[i..][0..77], &cose77);
+    i += 77;
+    return i;
+}
+
+test "verifyAttestation: fmt=none accepted as TOFU, rejected when attestation required" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    const cred_id = "cred-none";
+    var ad_buf: [37 + 16 + 2 + 9 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 4, aaguid, cred_id, cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{\"type\":\"webauthn.create\"}", &cdh, .{});
+
+    var ao: [1024]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("none");
+    w.tstr("attStmt");
+    w.map(0);
+    w.tstr("authData");
+    w.bstr(auth_data);
+    const att_obj = w.slice();
+
+    // TOFU: accepted when attestation is not required.
+    const v = try verifyAttestation(att_obj, .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = false,
+    });
+    try testing.expectEqual(AttestationFormat.none, v.format);
+    try testing.expect(!v.attested);
+    try testing.expectEqualSlices(u8, cred_id, v.credential.credential_id);
+
+    // Rejected when attestation is required.
+    try testing.expectError(error.AttestationRequired, verifyAttestation(att_obj, .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    }));
+}
+
+test "verifyAttestation: fmt=none with a stuffed attStmt is malformed" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    var ad_buf: [37 + 16 + 2 + 2 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 1, aaguid, "id", cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{}", &cdh, .{});
+
+    var ao: [1024]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("none");
+    w.tstr("attStmt");
+    w.map(1); // non-empty: illegal for `none`
+    w.tstr("x");
+    w.head(0, 1);
+    w.tstr("authData");
+    w.bstr(auth_data);
+
+    try testing.expectError(error.MalformedAttestation, verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = false,
+    }));
+}
+
+test "verifyAttestation: packed self-attestation (ES256) verifies; tamper rejected" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    const cred_id = "cred-packed-self";
+    var ad_buf: [37 + 16 + 2 + 16 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_UV | FLAG_AT, 9, aaguid, cred_id, cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{\"type\":\"webauthn.create\",\"challenge\":\"c\"}", &cdh, .{});
+
+    var signer = try kp.signer(null);
+    signer.update(auth_data);
+    signer.update(&cdh);
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    var ao: [2048]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("packed");
+    w.tstr("attStmt");
+    w.map(2);
+    w.tstr("alg");
+    w.nint(-7);
+    w.tstr("sig");
+    w.bstr(der);
+    w.tstr("authData");
+    w.bstr(auth_data);
+    const att_obj = w.slice();
+
+    const v = try verifyAttestation(att_obj, .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = true,
+        .require_attestation = true,
+    });
+    try testing.expectEqual(AttestationFormat.@"packed", v.format);
+    try testing.expect(v.attested);
+    try testing.expectEqual(@as(u32, 9), v.sign_count);
+    try testing.expectEqualSlices(u8, cred_id, v.credential.credential_id);
+
+    // Tamper the DER signature's last byte → verification fails.
+    var der_bad_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    @memcpy(der_bad_buf[0..der.len], der);
+    der_bad_buf[der.len - 1] ^= 0xff;
+    var ao2: [2048]u8 = undefined;
+    var w2 = CborW.init(&ao2);
+    w2.map(3);
+    w2.tstr("fmt");
+    w2.tstr("packed");
+    w2.tstr("attStmt");
+    w2.map(2);
+    w2.tstr("alg");
+    w2.nint(-7);
+    w2.tstr("sig");
+    w2.bstr(der_bad_buf[0..der.len]);
+    w2.tstr("authData");
+    w2.bstr(auth_data);
+    try testing.expectError(error.SignatureVerificationFailed, verifyAttestation(w2.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    }));
+}
+
+test "verifyAttestation: packed self-attestation with wrong alg is rejected" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    var ad_buf: [37 + 16 + 2 + 2 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 1, aaguid, "id", cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{}", &cdh, .{});
+    var signer = try kp.signer(null);
+    signer.update(auth_data);
+    signer.update(&cdh);
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    var ao: [2048]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("packed");
+    w.tstr("attStmt");
+    w.map(2);
+    w.tstr("alg");
+    w.nint(-8); // EdDSA alg for an ES256 credential key → mismatch
+    w.tstr("sig");
+    w.bstr(der);
+    w.tstr("authData");
+    w.bstr(auth_data);
+    try testing.expectError(error.AttestationAlgMismatch, verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    }));
+}
+
+test "verifyAttestation: packed basic attestation (x5c ES256 leaf) verifies" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+
+    // Credential key is distinct from the attestation key.
+    const cred_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const csec1 = cred_kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(csec1[1..33].*, csec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0x11);
+    const cred_id = "cred-basic";
+    var ad_buf: [37 + 16 + 2 + 10 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 3, aaguid, cred_id, cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{\"type\":\"webauthn.create\"}", &cdh, .{});
+
+    // Genuine self-signed P-256 attestation certificate + key.
+    const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "Orochi Test Attestation",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = att_kp,
+    });
+
+    var signer = try att_kp.signer(null);
+    signer.update(auth_data);
+    signer.update(&cdh);
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    var ao: [4096]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("packed");
+    w.tstr("attStmt");
+    w.map(3);
+    w.tstr("alg");
+    w.nint(-7);
+    w.tstr("sig");
+    w.bstr(der);
+    w.tstr("x5c");
+    w.arr(1);
+    w.bstr(cert_der);
+    w.tstr("authData");
+    w.bstr(auth_data);
+
+    const v = try verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    });
+    try testing.expect(v.attested);
+    try testing.expectEqualSlices(u8, cred_id, v.credential.credential_id);
+
+    // A signature made by the WRONG key (the credential key, not the cert key)
+    // must fail against the leaf cert.
+    var bad_signer = try cred_kp.signer(null);
+    bad_signer.update(auth_data);
+    bad_signer.update(&cdh);
+    const bad_sig = try bad_signer.finalize();
+    var bad_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const bad_der = bad_sig.toDer(&bad_der_buf);
+    var ao2: [4096]u8 = undefined;
+    var w2 = CborW.init(&ao2);
+    w2.map(3);
+    w2.tstr("fmt");
+    w2.tstr("packed");
+    w2.tstr("attStmt");
+    w2.map(3);
+    w2.tstr("alg");
+    w2.nint(-7);
+    w2.tstr("sig");
+    w2.bstr(bad_der);
+    w2.tstr("x5c");
+    w2.arr(1);
+    w2.bstr(cert_der);
+    w2.tstr("authData");
+    w2.bstr(auth_data);
+    try testing.expectError(error.SignatureVerificationFailed, verifyAttestation(w2.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    }));
+}
+
+test "verifyAttestation: fido-u2f (x5c P-256 leaf) verifies" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+
+    const cred_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const csec1 = cred_kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(csec1[1..33].*, csec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    const cred_id = "u2f-cred-id-01";
+    var ad_buf: [37 + 16 + 2 + 14 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 0, aaguid, cred_id, cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{\"type\":\"webauthn.create\"}", &cdh, .{});
+
+    const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "Orochi Test U2F",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x02},
+        .key_pair = att_kp,
+    });
+
+    // verificationData = 0x00 || rpIdHash || clientDataHash || credId || (0x04||x||y)
+    var signer = try att_kp.signer(null);
+    signer.update(&[_]u8{0x00});
+    signer.update(&rp_id_hash);
+    signer.update(&cdh);
+    signer.update(cred_id);
+    signer.update(&csec1); // 0x04 || x || y
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    var ao: [4096]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("fido-u2f");
+    w.tstr("attStmt");
+    w.map(2);
+    w.tstr("sig");
+    w.bstr(der);
+    w.tstr("x5c");
+    w.arr(1);
+    w.bstr(cert_der);
+    w.tstr("authData");
+    w.bstr(auth_data);
+
+    const v = try verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    });
+    try testing.expectEqual(AttestationFormat.fido_u2f, v.format);
+    try testing.expect(v.attested);
+    try testing.expectEqualSlices(u8, cred_id, v.credential.credential_id);
+}
+
+test "verifyAttestation: fido-u2f with a non-zero AAGUID is rejected" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+
+    const cred_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const csec1 = cred_kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(csec1[1..33].*, csec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0x01); // illegal for U2F
+    const cred_id = "u2f-bad-aaguid";
+    var ad_buf: [37 + 16 + 2 + 14 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 0, aaguid, cred_id, cose, &ad_buf);
+    const auth_data = ad_buf[0..ad_len];
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{\"type\":\"webauthn.create\"}", &cdh, .{});
+
+    const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    var cert_buf: [2048]u8 = undefined;
+    const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "Orochi Test U2F",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x03},
+        .key_pair = att_kp,
+    });
+    var signer = try att_kp.signer(null);
+    signer.update(&[_]u8{0x00});
+    signer.update(&rp_id_hash);
+    signer.update(&cdh);
+    signer.update(cred_id);
+    signer.update(&csec1);
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    var ao: [4096]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("fido-u2f");
+    w.tstr("attStmt");
+    w.map(2);
+    w.tstr("sig");
+    w.bstr(der);
+    w.tstr("x5c");
+    w.arr(1);
+    w.bstr(cert_der);
+    w.tstr("authData");
+    w.bstr(auth_data);
+    try testing.expectError(error.MalformedAttestation, verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = true,
+    }));
+}
+
+test "verifyAttestation: require_uv rejects UV-absent, accepts UV-present (registration)" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+
+    // UP-only authData (no UV).
+    var ad_up: [37 + 16 + 2 + 2 + 77]u8 = undefined;
+    const up_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 1, aaguid, "id", cose, &ad_up);
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{}", &cdh, .{});
+    var ao: [1024]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("none");
+    w.tstr("attStmt");
+    w.map(0);
+    w.tstr("authData");
+    w.bstr(ad_up[0..up_len]);
+    try testing.expectError(error.UserVerificationRequired, verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = true,
+        .require_attestation = false,
+    }));
+
+    // UV-present authData is accepted.
+    var ad_uv: [37 + 16 + 2 + 2 + 77]u8 = undefined;
+    const uv_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_UV | FLAG_AT, 1, aaguid, "id", cose, &ad_uv);
+    var ao2: [1024]u8 = undefined;
+    var w2 = CborW.init(&ao2);
+    w2.map(3);
+    w2.tstr("fmt");
+    w2.tstr("none");
+    w2.tstr("attStmt");
+    w2.map(0);
+    w2.tstr("authData");
+    w2.bstr(ad_uv[0..uv_len]);
+    const v = try verifyAttestation(w2.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = true,
+        .require_attestation = false,
+    });
+    try testing.expect(!v.attested);
+}
+
+test "verifyAttestation: malformed / truncated attestationObject fails closed (no panic)" {
+    const opts = AttestationOptions{
+        .rp_id = "example.com",
+        .client_data_hash = @splat(0),
+        .require_uv = false,
+        .require_attestation = false,
+    };
+    try testing.expectError(error.InvalidEncoding, verifyAttestation("", opts));
+    try testing.expectError(error.InvalidEncoding, verifyAttestation(&[_]u8{0xa3}, opts)); // map(3), no body
+    // A map whose first key claims a 2^63-byte text string must not overflow.
+    var buf: [10]u8 = undefined;
+    buf[0] = 0xa3; // map(3)
+    buf[1] = 0x7b; // text string, 8-byte length follows
+    mem.writeInt(u64, buf[2..10], 0x7fff_ffff_ffff_ffff, .big);
+    try testing.expectError(error.InvalidEncoding, verifyAttestation(&buf, opts));
+}
+
+test "verifyAttestation: rpIdHash mismatch rejected" {
+    const rp_id = "example.com";
+    const wrong_hash = sha256Str("evil.com");
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    var ad_buf: [37 + 16 + 2 + 2 + 77]u8 = undefined;
+    const ad_len = regAuthDataEs256(wrong_hash, FLAG_UP | FLAG_AT, 1, aaguid, "id", cose, &ad_buf);
+    var cdh: [32]u8 = undefined;
+    Sha256.hash("{}", &cdh, .{});
+    var ao: [1024]u8 = undefined;
+    var w = CborW.init(&ao);
+    w.map(3);
+    w.tstr("fmt");
+    w.tstr("none");
+    w.tstr("attStmt");
+    w.map(0);
+    w.tstr("authData");
+    w.bstr(ad_buf[0..ad_len]);
+    try testing.expectError(error.RpIdHashMismatch, verifyAttestation(w.slice(), .{
+        .rp_id = rp_id,
+        .client_data_hash = cdh,
+        .require_uv = false,
+        .require_attestation = false,
+    }));
+}
+
+test "verifyAssertion: require_uv rejects a UV-absent assertion with UserVerificationRequired" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const auth_data = makeAuthData(rp_id_hash, FLAG_UP, 1); // UP but no UV
+    const client_data_json = "{\"type\":\"webauthn.get\"}";
+    var cdj_hash: [32]u8 = undefined;
+    Sha256.hash(client_data_json, &cdj_hash, .{});
+
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    var signer = try kp.signer(null);
+    signer.update(&auth_data);
+    signer.update(&cdj_hash);
+    const sig = try signer.finalize();
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose_buf: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose_buf);
+    const cpk = try parseCoseKey(&cose_buf);
+
+    try testing.expectError(error.UserVerificationRequired, verifyAssertion(&auth_data, client_data_json, der, .{
+        .rp_id = rp_id,
+        .credential_public_key = cpk,
+        .stored_sign_count = 0,
+        .require_uv = true,
+    }));
 }

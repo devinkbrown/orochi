@@ -622,6 +622,20 @@ pub const Config = struct {
         /// whose clientDataJSON `origin` is not on this list is rejected. Empty ⇒
         /// WEBAUTHN is unavailable.
         origins: []const []const u8 = &.{},
+        /// Require the User-Verified (UV) flag — not just User-Present (UP) — in
+        /// authenticatorData for BOTH registration and passwordless login. Opt-in
+        /// (default false); when off the wire behaviour is byte-identical to the
+        /// UP-only default.
+        require_uv: bool = false,
+        /// Require a verified attestation statement at registration: REGISTER-FINISH
+        /// must carry an attestationObject and its `fmt` may not be "none". Opt-in
+        /// (default false); when off, registration keeps trust-on-first-use and a
+        /// present attestation is still verified fail-closed. NOTE: the attestation
+        /// SIGNATURE is verified against the presented statement (self key, or the
+        /// x5c leaf cert for packed-basic/fido-u2f), but the x5c leaf is NOT anchored
+        /// to a trusted attestation root — there is no bundled FIDO metadata trust
+        /// store, so this proves tamper-evidence, not hardware provenance.
+        require_attestation: bool = false,
     };
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
@@ -864,6 +878,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         freeStringList(allocator, cfg.webauthn.origins);
         cfg.webauthn.origins = try ownStringArray(allocator, resolver, arr);
     }
+    if (doc.getBool("webauthn.require_uv")) |b| cfg.webauthn.require_uv = b;
+    if (doc.getBool("webauthn.require_attestation")) |b| cfg.webauthn.require_attestation = b;
 
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
@@ -1953,6 +1969,29 @@ test "parseToml: [webauthn] section projects rp_id + origins" {
     try testing.expectEqual(@as(usize, 2), cfg.webauthn.origins.len);
     try testing.expectEqualStrings("https://chat.example", cfg.webauthn.origins[0]);
     try testing.expectEqualStrings("https://alt.example:8443", cfg.webauthn.origins[1]);
+    // Hardening flags default off.
+    try testing.expect(!cfg.webauthn.require_uv);
+    try testing.expect(!cfg.webauthn.require_attestation);
+}
+
+test "parseToml: [webauthn] require_uv + require_attestation project when set" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[webauthn]
+        \\rp_id = "chat.example"
+        \\origins = ["https://chat.example"]
+        \\require_uv = true
+        \\require_attestation = true
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.webauthn.require_uv);
+    try testing.expect(cfg.webauthn.require_attestation);
 }
 
 test "parseToml: [webauthn] omitted leaves the feature inert" {
@@ -1961,6 +2000,8 @@ test "parseToml: [webauthn] omitted leaves the feature inert" {
     defer cfg.deinit(allocator);
     try testing.expect(cfg.webauthn.rp_id == null);
     try testing.expectEqual(@as(usize, 0), cfg.webauthn.origins.len);
+    try testing.expect(!cfg.webauthn.require_uv);
+    try testing.expect(!cfg.webauthn.require_attestation);
 }
 
 test {
