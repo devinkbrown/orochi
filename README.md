@@ -27,6 +27,7 @@ native **Suimyaku + Tsumugi** cryptographic mesh.
 - **Pure Zig, top to bottom** — substrate, crypto, TLS, and daemon, with zero C dependencies.
 - **Post-quantum mesh** — a CRDT state mesh over an X25519 + ML-KEM-768 forward-secret ratchet, replacing TS6.
 - **Full IRCv3 + IRCX + SASL** — including CHATHISTORY, the Event Spine, and in-process channel/nick services (no pseudo-clients).
+- **Passwordless + interop-friendly** — WebAuthn/passkey login (with attestation verification), named conversations (topics) inside a channel, and Discord-compatible incoming webhooks.
 - **Browser-native** — a first-class WebSocket listener and a voice/video media plane.
 - **Operates like a daemon should** — class-based admission policy, layered anti-abuse, and session-preserving `USR2` hot-upgrades.
 

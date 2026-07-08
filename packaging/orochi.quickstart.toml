@@ -28,6 +28,15 @@ enabled = true
 realm = "Orochi"
 account_db = "accounts.db" # relative to the working directory (/data)
 
+# Passwordless login (WebAuthn / passkeys) via the WEBAUTHN command. Inert until
+# configured. rp_id must be the web client's domain and origins must list its
+# exact https origin(s) — so this needs a real TLS deployment, not plaintext.
+# [webauthn]
+# rp_id = "chat.example.com"
+# origins = ["https://chat.example.com"]
+# require_uv = false          # require authenticator user-verification (PIN/biometric)
+# require_attestation = false # require + verify a registration attestation statement
+
 [limits]
 num_shards = 1 # single-node quickstart; raise on multi-core hosts
 
