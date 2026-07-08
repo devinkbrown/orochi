@@ -62,9 +62,9 @@ OroStore append-only log, snapshot, and changefeed.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
-| store.zig:10 | `max_record_len` | `16 * 1024 * 1024` (16 MiB) | max single WAL/snapshot record payload size | `storage.max_record_bytes` | uint | 16777216 | 65536..268435456 |
-| store.zig:11 | `max_wal_len` | `256 * 1024 * 1024` (256 MiB) | max WAL file size accepted on replay (rejects oversize log) | `storage.max_wal_bytes` | uint | 268435456 | 1048576..4294967296 |
-| store.zig:98 | `ChangeFeed.init(allocator, 64)` | `64` | bounded recent-mutation changefeed ring size (service-sync feed) | `storage.changefeed_capacity` | uint | 64 | 8..4096 |
+| config_format.zig / store.zig | `storage.max_record_bytes` / `max_record_bytes` | `16 * 1024 * 1024` (16 MiB) | max single WAL/snapshot record payload size | `storage.max_record_bytes` *(schema-backed)* | uint | 16777216 | 65536..268435456 |
+| config_format.zig / store.zig | `storage.max_wal_bytes` / `max_wal_bytes` | `256 * 1024 * 1024` (256 MiB) | max WAL file size accepted on replay (rejects oversize log) | `storage.max_wal_bytes` *(schema-backed)* | uint | 268435456 | 1048576..4294967296 |
+| config_format.zig / store.zig | `storage.changefeed_capacity` / `ChangeFeed.init` | `64` | bounded recent-mutation changefeed ring size (service-sync feed) | `storage.changefeed_capacity` *(schema-backed)* | uint | 64 | 8..4096 |
 
 ## [filter]
 

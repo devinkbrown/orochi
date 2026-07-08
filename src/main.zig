@@ -385,7 +385,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("orochi: SASL account store configured but [sasl].enabled=false; SASL disabled\n", .{});
             }
         } else if (h.parsed.sasl.account_db) |db| {
-            if (orochi.daemon.services.OroStore.open(allocator, init.io, std.Io.Dir.cwd(), db)) |store| {
+            if (orochi.daemon.services.OroStore.openWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)) |store| {
                 account_store = store;
                 account_services = orochi.daemon.services.Services.initWithConfig(&account_store.?, null, .{
                     .pbkdf2_rounds = h.parsed.accounts.pbkdf2_rounds,

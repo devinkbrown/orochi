@@ -306,6 +306,18 @@ Oper-managed Koshi moderation filter sizing. These values construct the live con
 | `koshi_max_patterns` | integer | `256` | `16..4096` | Max oper-curated Koshi filter patterns. |
 | `koshi_pattern_max_len` | integer | `256` | `16..1024` | Max length of a single Koshi pattern. |
 
+## `[storage]`
+
+Source: `store.Config` in `src/daemon/store.zig`, parsing in `src/daemon/config_format.zig`, account-store open in `src/main.zig`.
+
+OroStore append-only WAL/snapshot and recent-mutation feed limits. These values are applied when `[sasl].account_db` opens the durable account store.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `max_record_bytes` | integer | `16777216` | `65536..268435456` | Max single WAL/snapshot record payload size. |
+| `max_wal_bytes` | integer | `268435456` | `1048576..4294967296` | Max WAL size accepted on replay; long-lived stores compact at half this budget. |
+| `changefeed_capacity` | integer | `64` | `8..4096` | Bounded recent-mutation feed capacity for service-sync consumers. |
+
 ## `[sessions]`
 
 Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/config_format.zig:384`, mapping at `src/daemon/config_boot.zig:58`.
@@ -526,8 +538,3 @@ key is accepted before it changes live behavior, add it here in the same change.
 | Operator class name length | `64` bytes | `src/daemon/oper.zig:11` |
 | Operator group inheritance depth | `32` links | `src/daemon/operator_groups.zig:11` |
 | IRCv3 multiline max bytes/lines/ref/target | `4096`, `24`, `64`, `128` | `src/daemon/server.zig:1096` |
-| OroStore default max record bytes | `16 MiB` | `src/daemon/store.zig:11` |
-| OroStore default max WAL bytes | `256 MiB` | `src/daemon/store.zig:12` |
-| OroStore default changefeed capacity | `64` | `src/daemon/store.zig:13` |
-
-OroStore has its own internal `Config.applyToml` helper for `[storage]`, but `[storage]` is not part of the current daemon `config_format.Config` sections covered here (`src/daemon/store.zig:26`, `src/daemon/store.zig:37`).

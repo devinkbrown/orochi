@@ -20,6 +20,7 @@ const conn_class = @import("conn_class.zig");
 const content_filter_mod = @import("content_filter.zig");
 const services_mod = @import("services.zig");
 const shard = @import("shard.zig");
+const store_mod = @import("store.zig");
 const tegami_mod = @import("tegami.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
@@ -69,6 +70,7 @@ pub const Config = struct {
     accounts: Accounts = .{},
     bouncer: Bouncer = .{},
     filter: Filter = .{},
+    storage: store_mod.Config = .{},
     webhook: Webhook = .{},
     geoip: Geoip = .{},
     sasl: Sasl = .{},
@@ -1031,6 +1033,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);
     cfg.filter.koshi_pattern_max_len = try uintField(doc, "filter.koshi_pattern_max_len", cfg.filter.koshi_pattern_max_len, 16, 1024);
 
+    // [storage]
+    cfg.storage.max_record_bytes = @intCast(try uintField(doc, "storage.max_record_bytes", cfg.storage.max_record_bytes, 65536, 268435456));
+    cfg.storage.max_wal_bytes = @intCast(try uintField(doc, "storage.max_wal_bytes", cfg.storage.max_wal_bytes, 1048576, 4294967296));
+    cfg.storage.changefeed_capacity = @intCast(try uintField(doc, "storage.changefeed_capacity", cfg.storage.changefeed_capacity, 8, 4096));
+
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
     cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, 1_000_000));
@@ -1846,6 +1853,61 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\irc = 6680
         \\[filter]
         \\koshi_pattern_max_len = 1025
+        \\
+    , .{}));
+}
+
+test "parseToml: [storage] store limits project with bounded policy ranges" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[storage]
+        \\max_record_bytes = 131072
+        \\max_wal_bytes = 2097152
+        \\changefeed_capacity = 128
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(usize, 131072), cfg.storage.max_record_bytes);
+    try testing.expectEqual(@as(usize, 2097152), cfg.storage.max_wal_bytes);
+    try testing.expectEqual(@as(usize, 128), cfg.storage.changefeed_capacity);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    const store_defaults = store_mod.Config{};
+    try testing.expectEqual(store_defaults.max_record_bytes, omitted.storage.max_record_bytes);
+    try testing.expectEqual(store_defaults.max_wal_bytes, omitted.storage.max_wal_bytes);
+    try testing.expectEqual(store_defaults.changefeed_capacity, omitted.storage.changefeed_capacity);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[storage]
+        \\max_record_bytes = 65535
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[storage]
+        \\max_wal_bytes = 4294967297
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[storage]
+        \\changefeed_capacity = 7
         \\
     , .{}));
 }

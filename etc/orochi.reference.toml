@@ -428,6 +428,13 @@ koshi_max_patterns = 256        # oper-curated filter patterns (16..4096)
 koshi_pattern_max_len = 256     # bytes per filter pattern (16..1024)
 
 
+# --- [storage] — OroStore WAL/snapshot limits --------------------------------
+[storage]
+max_record_bytes = 16777216     # max record payload bytes (65536..268435456)
+max_wal_bytes = 268435456       # max WAL replay bytes (1048576..4294967296)
+changefeed_capacity = 64        # recent mutation feed entries (8..4096)
+
+
 # --- [sasl] — SASL authentication + account store ----------------------------
 [sasl]
 # Enable SASL (PLAIN/SCRAM-SHA-256/EXTERNAL). Explicit false disables SASL even
