@@ -109,6 +109,7 @@ const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
 const msgid_mod = @import("../proto/msgid.zig");
 const multiline = @import("../proto/multiline.zig");
+const meshpass = @import("../proto/meshpass.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
 const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
@@ -1755,7 +1756,11 @@ pub const Config = struct {
     /// secured inner S2S links. Configurable via `[mesh.routing]`,
     /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]` Sazanami keys.
     s2s_config: s2s_link.PeerConfig = .{},
+    mesh_realm: []const u8 = "local",
     mesh_pass: []const u8 = "",
+    /// Encoded `[mesh].admission_token` text (hex or base64). Decoded once at
+    /// server init into `LinuxServer.mesh_admission_token`.
+    mesh_admission_token: []const u8 = "",
     /// `[mesh].require_secured` — when true, refuse plaintext S2S entirely: reject
     /// inbound plaintext peers and never dial plaintext outbound links. Only the
     /// Tsumugi-secured path is permitted; if secured S2S is not configured/available
@@ -1765,6 +1770,10 @@ pub const Config = struct {
     /// `[mesh].trust_roots` as configured strings; decoded at init into
     /// Ed25519 node signing keys for secured-S2S peer allowlisting.
     mesh_trust_roots: []const []const u8 = &.{},
+    /// `[mesh].admission_roots`: signer roots for MeshPass signed-capability
+    /// tokens. Distinct from peer node identity pins.
+    mesh_admission_roots: []const []const u8 = &.{},
+    mesh_admission_min_revocation_epoch: u64 = 0,
     /// `[mesh].connect` — peers ("host:port"; IPv6 hosts bracketed) this node
     /// dials automatically at boot and re-dials while the link is down, so the
     /// S2S mesh stays up without an oper CONNECT. Strings are borrowed (owned
@@ -2701,6 +2710,11 @@ pub const LinuxServer = struct {
     /// Decoded `[mesh].trust_roots` Ed25519 node signing keys. Empty preserves
     /// TOFU; non-empty requires secured peers to present one of these keys.
     mesh_trusted_node_keys: [][32]u8 = &.{},
+    /// Decoded `[mesh].admission_roots` MeshPass token signer roots. Empty keeps
+    /// the shared-secret admission path; non-empty requires signed tokens.
+    meshpass_roots: []meshpass.TrustRoot = &.{},
+    /// Decoded local `[mesh].admission_token` bytes sent in encrypted M1.
+    mesh_admission_token: []u8 = &.{},
     /// One-shot boot-dial latch. Written only by reactor 0's thread; the boot
     /// check confirms "this is reactor 0" before reading it, so no other shard
     /// ever touches the flag.
@@ -3315,6 +3329,42 @@ pub const LinuxServer = struct {
         }
         errdefer if (mesh_trusted_node_keys.len != 0) allocator.free(mesh_trusted_node_keys);
 
+        var meshpass_roots: []meshpass.TrustRoot = &.{};
+        if (config.mesh_admission_roots.len != 0) {
+            var valid_roots: usize = 0;
+            for (config.mesh_admission_roots) |root| {
+                if (decodeMeshTrustRoot(root) != null) {
+                    valid_roots += 1;
+                } else {
+                    srvLog("orochi: mesh admission root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
+                }
+            }
+            if (valid_roots != 0) {
+                const roots = try allocator.alloc(meshpass.TrustRoot, valid_roots);
+                var n: usize = 0;
+                for (config.mesh_admission_roots) |root| {
+                    if (decodeMeshTrustRoot(root)) |key| {
+                        roots[n] = .{
+                            .public_key = key,
+                            .realm = config.mesh_realm,
+                            .min_revocation_epoch = config.mesh_admission_min_revocation_epoch,
+                        };
+                        n += 1;
+                    }
+                }
+                meshpass_roots = roots;
+            } else {
+                return error.InvalidMeshAdmissionRoot;
+            }
+        }
+        errdefer if (meshpass_roots.len != 0) allocator.free(meshpass_roots);
+
+        var mesh_admission_token: []u8 = &.{};
+        if (config.mesh_admission_token.len != 0) {
+            mesh_admission_token = try decodeMeshAdmissionToken(allocator, config.mesh_admission_token);
+        }
+        errdefer if (mesh_admission_token.len != 0) allocator.free(mesh_admission_token);
+
         const geo_ptr = try allocator.create(geo_services.Service);
         errdefer allocator.destroy(geo_ptr);
         geo_ptr.* = geo_services.Service.init(allocator, .{
@@ -3340,6 +3390,8 @@ pub const LinuxServer = struct {
             .reactors = reactors,
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
+            .meshpass_roots = meshpass_roots,
+            .mesh_admission_token = mesh_admission_token,
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
             .world = blk: {
                 var w = world_model.World.init(allocator);
@@ -4177,6 +4229,8 @@ pub const LinuxServer = struct {
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         if (self.mesh_trusted_node_keys.len != 0) self.allocator.free(self.mesh_trusted_node_keys);
+        if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
+        if (self.mesh_admission_token.len != 0) self.allocator.free(self.mesh_admission_token);
         if (self.fabric) |*f| f.deinit();
         self.* = undefined;
     }
@@ -5880,7 +5934,8 @@ pub const LinuxServer = struct {
                 .realm = ident.realm,
                 .supported_bands = s2s_bands,
                 .supported_features = s2s_features,
-                .mesh_pass = self.config.mesh_pass,
+                .mesh_pass = if (self.mesh_admission_token.len != 0) self.mesh_admission_token else self.config.mesh_pass,
+                .meshpass_roots = self.meshpass_roots,
                 .now_ms = wall,
             },
             .rng = self.config.crypto_io.?,
@@ -16307,7 +16362,8 @@ pub const LinuxServer = struct {
                 .realm = ident.realm,
                 .supported_bands = s2s_bands,
                 .supported_features = s2s_features,
-                .mesh_pass = self.config.mesh_pass,
+                .mesh_pass = if (self.mesh_admission_token.len != 0) self.mesh_admission_token else self.config.mesh_pass,
+                .meshpass_roots = self.meshpass_roots,
                 .now_ms = wall,
             },
             .rng = io,
@@ -29552,6 +29608,24 @@ fn decodeMeshTrustRoot(text: []const u8) ?[32]u8 {
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(text) catch return null;
     if (decoded_len != out.len) return null;
     std.base64.standard.Decoder.decode(&out, text) catch return null;
+    return out;
+}
+
+fn decodeMeshAdmissionToken(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidMeshAdmissionToken;
+    if (trimmed.len % 2 == 0 and trimmed.len / 2 <= meshpass.max_token_len) {
+        const out = try allocator.alloc(u8, trimmed.len / 2);
+        errdefer allocator.free(out);
+        if (std.fmt.hexToBytes(out, trimmed)) |_| return out else |_| {
+            allocator.free(out);
+        }
+    }
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(trimmed) catch return error.InvalidMeshAdmissionToken;
+    if (decoded_len == 0 or decoded_len > meshpass.max_token_len) return error.InvalidMeshAdmissionToken;
+    const out = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(out);
+    std.base64.standard.Decoder.decode(out, trimmed) catch return error.InvalidMeshAdmissionToken;
     return out;
 }
 

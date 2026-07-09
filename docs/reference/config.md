@@ -144,7 +144,10 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 |---|---|---:|---|---|
 | `realm` | string | `"local"` | any string | Realm fed into node identity derivation for secured S2S (`src/main.zig:149`). |
 | `trust_roots` | array of strings | `[]` | hex/base64 Ed25519 public keys | Parsed, mapped to `server.Config.mesh_trust_roots`, decoded at server init, and used as the expected secured-S2S peer key allowlist (`src/daemon/config_format.zig:177`, `src/daemon/config_boot.zig:101`, `src/daemon/server.zig:2272`, `src/daemon/server.zig:3833`). |
-| `mesh_pass` | string or null | unset | any string | Shared passphrase carried into S2S handshake config when node identity is configured (`src/main.zig:152`, `src/daemon/server.zig:1074`). |
+| `mesh_pass` | string or null | unset | any string | Shared MeshPass fallback gate. When no signed admission roots are configured, secured-S2S responders constant-time-compare this value against the encrypted M1 bytes; plaintext mesh-session reclaim also uses it as its seal key. |
+| `admission_token` | string or null | unset | hex or standard base64 MeshPass token, max 448 decoded bytes | This node's signed MeshPass capability token. When set, secured-S2S initiators send the decoded token bytes inside encrypted Tsumugi M1. |
+| `admission_roots` | array of strings | `[]` | hex/base64 Ed25519 public keys | MeshPass token signer roots. When non-empty, secured-S2S responders require the peer M1 token to verify against one root, match the authenticated peer node key, have relay role, and allow control/sync/irc_app/tsumugi frame families. |
+| `admission_min_revocation_epoch` | integer | `0` | `0..u64_max` | Minimum accepted MeshPass token revocation epoch for all configured `admission_roots`. |
 | `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 

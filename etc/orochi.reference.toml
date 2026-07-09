@@ -226,12 +226,20 @@ preload = false
 [mesh]
 # Mesh realm; peers must share a realm to link. Default: "local".
 realm = "local"
-# Shared passphrase for plaintext S2S admission (MeshPass). For secured links
-# use [node].secret_key instead.
+# Shared passphrase for MeshPass admission when signed admission roots are not
+# configured. Used by plaintext S2S and as the secured-link fallback gate.
 # mesh_pass = "env:OROCHI_MESH_PASS"
 # Trusted peer identity roots (array of hex/base64 Ed25519 public keys), for
 # secured links. When set, secured S2S expects peers to match these keys.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
+# Signed MeshPass admission. `admission_token` is this node's encoded MeshPass
+# token (hex or standard base64) sent inside encrypted Tsumugi M1. When
+# `admission_roots` is non-empty, secured-S2S responders require peers to
+# present a token signed by one of these Ed25519 roots, bound to the peer node
+# key, carrying relay role and control/sync/irc_app/tsumugi frame families.
+# admission_token = "env:OROCHI_MESHPASS_TOKEN"
+# admission_roots = ["env:OROCHI_MESHPASS_ROOT"]
+# admission_min_revocation_epoch = 0
 # Auto-connect peers: each "host:port" is dialed at boot and re-dialed while
 # its S2S link is down, so the mesh stays linked without an oper CONNECT.
 # Hostnames resolve via DNS (A record); IPv6 hosts are bracketed ("[::1]:6900").

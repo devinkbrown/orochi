@@ -285,6 +285,13 @@ pub const Config = struct {
         realm: []const u8 = "",
         trust_roots: []const []const u8 = &.{},
         mesh_pass: ?[]const u8 = null,
+        /// Encoded MeshPass signed-capability token this node presents in the
+        /// encrypted Tsumugi M1. Accepts hex or standard base64 text.
+        admission_token: ?[]const u8 = null,
+        /// Ed25519 signer roots accepted for signed MeshPass admission tokens.
+        /// Distinct from `trust_roots`, which pins peer node identities.
+        admission_roots: []const []const u8 = &.{},
+        admission_min_revocation_epoch: u64 = 0,
         /// Runtime Suimyaku peer-driver limits/timers/capacities projected from
         /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]`.
         s2s: s2s_peer_mod.Config = .{},
@@ -853,6 +860,7 @@ pub const Config = struct {
         allocator.free(self.classes);
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
+        freeStringList(allocator, self.mesh.admission_roots);
         freeStringList(allocator, self.mesh.connect);
         freeStringList(allocator, self.dnsbl.zones);
         if (self.mail.relay_host) |value| allocator.free(value);
@@ -862,6 +870,7 @@ pub const Config = struct {
         if (self.webauthn.rp_id) |value| allocator.free(value);
         freeStringList(allocator, self.webauthn.origins);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
+        if (self.mesh.admission_token) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.sasl.oauth_issuer) |value| allocator.free(value);
@@ -983,10 +992,22 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [mesh]
     try setStr(allocator, resolver, doc.getString("mesh.realm"), &cfg.mesh.realm);
     try setOpt(allocator, resolver, doc.getString("mesh.mesh_pass"), &cfg.mesh.mesh_pass);
+    try setOpt(allocator, resolver, doc.getString("mesh.admission_token"), &cfg.mesh.admission_token);
     if (doc.getArray("mesh.trust_roots")) |arr| {
         freeStringList(allocator, cfg.mesh.trust_roots);
         cfg.mesh.trust_roots = try ownStringArray(allocator, resolver, arr);
     }
+    if (doc.getArray("mesh.admission_roots")) |arr| {
+        freeStringList(allocator, cfg.mesh.admission_roots);
+        cfg.mesh.admission_roots = try ownStringArray(allocator, resolver, arr);
+    }
+    cfg.mesh.admission_min_revocation_epoch = try uintField(
+        doc,
+        "mesh.admission_min_revocation_epoch",
+        cfg.mesh.admission_min_revocation_epoch,
+        0,
+        std.math.maxInt(u64),
+    );
     if (doc.getArray("mesh.connect")) |arr| {
         freeStringList(allocator, cfg.mesh.connect);
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
@@ -1693,7 +1714,11 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
         \\irc = 6680
         \\[mesh]
         \\realm = "ircxnet"
+        \\mesh_pass = "shared-secret"
         \\trust_roots = ["root-a", "root-b"]
+        \\admission_token = "aabbcc"
+        \\admission_roots = ["signer-a", "signer-b"]
+        \\admission_min_revocation_epoch = 7
         \\connect = ["ircx.us:6900", "[::1]:7900"]
         \\[[opers]]
         \\account = "admin"
@@ -1705,8 +1730,13 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
     try testing.expectEqualStrings("ircxnet", cfg.mesh.realm);
+    try testing.expectEqualStrings("shared-secret", cfg.mesh.mesh_pass.?);
     try testing.expectEqual(@as(usize, 2), cfg.mesh.trust_roots.len);
     try testing.expectEqualStrings("root-b", cfg.mesh.trust_roots[1]);
+    try testing.expectEqualStrings("aabbcc", cfg.mesh.admission_token.?);
+    try testing.expectEqual(@as(usize, 2), cfg.mesh.admission_roots.len);
+    try testing.expectEqualStrings("signer-b", cfg.mesh.admission_roots[1]);
+    try testing.expectEqual(@as(u64, 7), cfg.mesh.admission_min_revocation_epoch);
     try testing.expectEqual(@as(usize, 2), cfg.mesh.connect.len);
     try testing.expectEqualStrings("ircx.us:6900", cfg.mesh.connect[0]);
     try testing.expectEqualStrings("[::1]:7900", cfg.mesh.connect[1]);

@@ -14,6 +14,7 @@ const Secret = @import("secret.zig").Secret;
 const sign = @import("sign.zig");
 const xwing = @import("xwing.zig");
 const toml = @import("../proto/toml.zig");
+const meshpass = @import("../proto/meshpass.zig");
 
 const Allocator = std.mem.Allocator;
 const Blake3 = std.crypto.hash.Blake3;
@@ -69,6 +70,8 @@ pub const Error = error{
     NoCommonBands,
     MeshPassTooLarge,
     MeshPassMismatch,
+    MeshPassTokenMissing,
+    MeshPassTokenInvalid,
 } || Allocator.Error || xwing.Error || sign.SignError || sign.VerifyError || hash.HkdfError;
 
 pub const Config = struct {
@@ -76,6 +79,7 @@ pub const Config = struct {
     supported_bands: u128,
     supported_features: u128 = 0,
     mesh_pass: []const u8 = &.{},
+    meshpass_roots: []const meshpass.TrustRoot = &.{},
     now_ms: u64 = 0,
 };
 
@@ -420,14 +424,17 @@ pub const Responder = struct {
         const sig_digest = digest2(m1.prefix, body.signed, "");
         if (!try sign.verifyCtx(m1_sig_domain, &sig_digest, body.sig, body.node_key)) return error.BadSignature;
 
-        // Shared-secret gate. Only enforced when this responder is configured
-        // with a MeshPass; an empty local secret fails OPEN so an upgraded node
-        // can still link with a not-yet-configured peer (no mesh-flap on rollout).
-        // The compare runs only after the M1 signature is verified, so an
-        // unauthenticated peer can never probe the secret.
-        if (self.cfg.mesh_pass.len != 0 and
+        // Admission gate. Signer roots switch MeshPass into capability-token
+        // mode: the encrypted M1 bytes must be a signed token for the peer's
+        // authenticated node key, with enough frame-family authority to run S2S.
+        // Without signer roots, keep the existing shared-secret gate.
+        if (self.cfg.meshpass_roots.len != 0) {
+            try verifyMeshPassToken(self.cfg.meshpass_roots, self.cfg.now_ms, body.mesh_pass, body.node_key);
+        } else if (self.cfg.mesh_pass.len != 0 and
             !constantTimeEqlBytes(body.mesh_pass, self.cfg.mesh_pass))
+        {
             return error.MeshPassMismatch;
+        }
 
         self.state = .m1_recv;
         var enc2 = try xwing.encapsulate(body.prekey.public_key, rng);
@@ -803,6 +810,23 @@ fn constantTimeEqlBytes(a: []const u8, b: []const u8) bool {
     return diff == 0;
 }
 
+fn verifyMeshPassToken(
+    roots: []const meshpass.TrustRoot,
+    now_ms: u64,
+    token_bytes: []const u8,
+    peer_node_key: sign.PublicKey,
+) Error!void {
+    if (token_bytes.len == 0) return error.MeshPassTokenMissing;
+    const token = meshpass.decode(token_bytes) catch return error.MeshPassTokenInvalid;
+    const required = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi });
+    for (roots) |root| {
+        const fields = meshpass.bindDecodedToken(token, root, now_ms, peer_node_key, required) catch continue;
+        if (!meshpass.hasRole(fields, .relay)) return error.MeshPassTokenInvalid;
+        return;
+    }
+    return error.MeshPassTokenInvalid;
+}
+
 fn makeFixture(allocator: Allocator) !struct {
     i_node: sign.KeyPair,
     r_node: sign.KeyPair,
@@ -1017,6 +1041,30 @@ fn meshPassHandshakeResult(
     allocator.free(m2);
 }
 
+fn meshPassTokenHandshakeResult(
+    allocator: Allocator,
+    fx: anytype,
+    initiator_pass: []const u8,
+    roots: []const meshpass.TrustRoot,
+    seed: u64,
+) Error!void {
+    var rng = DeterministicIo{ .s = seed };
+    var cfg_i = fx.cfg_i;
+    cfg_i.mesh_pass = initiator_pass;
+    var cfg_r = fx.cfg_r;
+    cfg_r.meshpass_roots = roots;
+
+    var initr = Initiator.init(allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, cfg_i);
+    defer initr.deinit();
+    var respr = Responder.init(allocator, &fx.r_node, fx.r_pre, &fx.r_kem.secret_key, cfg_r);
+    defer respr.deinit();
+
+    const m1 = try initr.start(rng.io());
+    defer allocator.free(m1);
+    const m2 = try respr.recv(m1, rng.io());
+    allocator.free(m2);
+}
+
 test "matching MeshPass on both nodes completes the handshake" {
     var fx = try makeFixture(std.testing.allocator);
     defer fx.deinit();
@@ -1038,6 +1086,63 @@ test "unconfigured responder MeshPass fails open and accepts a configured peer" 
     // Backward-compat rollout: an upgraded node presenting a secret must still
     // link with a peer that has not yet set [mesh].mesh_pass.
     try meshPassHandshakeResult(std.testing.allocator, &fx, "node-a secret", "", 0x3333);
+}
+
+test "signed MeshPass token admits a peer bound to the initiator node key" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    const issuer = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x61)));
+    const token = try meshpass.issue(issuer, .{
+        .node_pubkey = fx.i_node.public_key,
+        .realm = "local",
+        .roles = meshpass.roles(&.{.relay}),
+        .issued_ms = 10,
+        .expiry_ms = 100,
+        .allowed_frame_families = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi }),
+        .max_fanout = 8,
+    });
+    var token_buf: [meshpass.max_token_len]u8 = undefined;
+    const token_bytes = token_buf[0..try meshpass.encode(&token_buf, token)];
+    const roots = [_]meshpass.TrustRoot{.{ .public_key = issuer.public_key.toBytes(), .realm = "local" }};
+
+    try meshPassTokenHandshakeResult(std.testing.allocator, &fx, token_bytes, &roots, 0x4444);
+}
+
+test "signed MeshPass admission requires a token when roots are configured" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    const issuer = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x62)));
+    const roots = [_]meshpass.TrustRoot{.{ .public_key = issuer.public_key.toBytes(), .realm = "local" }};
+
+    try std.testing.expectError(
+        error.MeshPassTokenMissing,
+        meshPassTokenHandshakeResult(std.testing.allocator, &fx, "", &roots, 0x5555),
+    );
+}
+
+test "signed MeshPass admission rejects peer key mismatch" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    const issuer = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x63)));
+    var other = try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x64)));
+    defer other.deinit();
+    var token_buf: [meshpass.max_token_len]u8 = undefined;
+    const token = try meshpass.issue(issuer, .{
+        .node_pubkey = other.public_key,
+        .realm = "local",
+        .roles = meshpass.roles(&.{.relay}),
+        .issued_ms = 10,
+        .expiry_ms = 100,
+        .allowed_frame_families = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi }),
+        .max_fanout = 8,
+    });
+    const token_bytes = token_buf[0..try meshpass.encode(&token_buf, token)];
+    const roots = [_]meshpass.TrustRoot{.{ .public_key = issuer.public_key.toBytes(), .realm = "local" }};
+
+    try std.testing.expectError(
+        error.MeshPassTokenInvalid,
+        meshPassTokenHandshakeResult(std.testing.allocator, &fx, token_bytes, &roots, 0x6666),
+    );
 }
 
 test "configured responder rejects a peer that presents no MeshPass" {

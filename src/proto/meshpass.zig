@@ -108,6 +108,11 @@ pub const VerifyError = error{
     Revoked,
 };
 
+pub const BindError = VerifyError || error{
+    PeerKeyMismatch,
+    MissingFrameFamily,
+};
+
 /// Build a role bitset from a comptime list.
 pub fn roles(comptime list: []const Role) u64 {
     var bits: u64 = 0;
@@ -164,6 +169,23 @@ pub fn verify(token: Token, trust_root: anytype, now_ms: u64) VerifyError!void {
     if (!std.mem.eql(u8, token.fields.realm, root.realm)) return error.WrongRealm;
     if (token.fields.revocation_epoch < root.min_revocation_epoch) return error.Revoked;
     if (now_ms > token.fields.expiry_ms) return error.Expired;
+}
+
+/// Verify a decoded token, then bind it to the authenticated peer node key and
+/// require every requested SUIMYAKU frame family bit to be present.
+pub fn bindDecodedToken(
+    token: Token,
+    trust_root: anytype,
+    now_ms: u64,
+    peer_node_pubkey: PublicKeyBytes,
+    required_frame_families: u32,
+) BindError!Fields {
+    try verify(token, trust_root, now_ms);
+    if (!std.mem.eql(u8, &token.fields.node_pubkey, &peer_node_pubkey)) return error.PeerKeyMismatch;
+    if ((token.fields.allowed_frame_families & required_frame_families) != required_frame_families) {
+        return error.MissingFrameFamily;
+    }
+    return token.fields;
 }
 
 /// Return true when `fields` carries `role`.
@@ -330,6 +352,67 @@ test "issue and verify happy path" {
     try std.testing.expect(withinFanout(token.fields, 8));
     try std.testing.expect(!withinFanout(token.fields, 9));
     try std.testing.expect(hasMediaRight(token.fields, .voice));
+}
+
+test "bind decoded token accepts matching peer and required frame families" {
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x32)));
+    const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
+    var buf: [max_token_len]u8 = undefined;
+    const decoded = try decode(buf[0..try encode(&buf, token)]);
+
+    const fields = try bindDecodedToken(
+        decoded,
+        issuer.public_key.toBytes(),
+        2_000,
+        node.public_key.toBytes(),
+        frameFamilies(&.{ .control, .sync, .tsumugi }),
+    );
+    try std.testing.expectEqualSlices(u8, &node.public_key.toBytes(), &fields.node_pubkey);
+}
+
+test "bind decoded token rejects peer public key mismatch" {
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x34)));
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x35)));
+    const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
+
+    try std.testing.expectError(error.PeerKeyMismatch, bindDecodedToken(
+        token,
+        issuer.public_key.toBytes(),
+        2_000,
+        other.public_key.toBytes(),
+        frameFamilies(&.{.control}),
+    ));
+}
+
+test "bind decoded token rejects missing required frame family" {
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x36)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x37)));
+    const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
+
+    try std.testing.expectError(error.MissingFrameFamily, bindDecodedToken(
+        token,
+        issuer.public_key.toBytes(),
+        2_000,
+        node.public_key.toBytes(),
+        frameFamilies(&.{ .control, .media }),
+    ));
+}
+
+test "bind decoded token verifies signature before binding" {
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x38)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x39)));
+    var token = try issue(issuer, sampleFields(node.public_key.toBytes()));
+    token.fields.max_fanout += 1;
+
+    try std.testing.expectError(error.BadSig, bindDecodedToken(
+        token,
+        issuer.public_key.toBytes(),
+        2_000,
+        node.public_key.toBytes(),
+        frameFamilies(&.{.control}),
+    ));
 }
 
 test "tampered field or signature fails as BadSig" {

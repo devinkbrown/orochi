@@ -176,14 +176,13 @@ bands/features, and M1 signature (`src/crypto/tsumugi_handshake.zig:299`,
 `src/crypto/tsumugi_handshake.zig:311`, `src/crypto/tsumugi_handshake.zig:312`,
 `src/crypto/tsumugi_handshake.zig:313`).
 
-Current-state note: `cfg.mesh_pass` is included in encrypted M1 and is not
-cleartext in the M1 test (`src/crypto/tsumugi_handshake.zig:799`,
-`src/crypto/tsumugi_handshake.zig:807`, `src/crypto/tsumugi_handshake.zig:809`),
-but the decoder currently reads and discards the MeshPass bytes rather than
-comparing or verifying them (`src/crypto/tsumugi_handshake.zig:642`,
-`src/crypto/tsumugi_handshake.zig:643`, `src/crypto/tsumugi_handshake.zig:644`).
-Do not describe M1 as enforcing MeshPass admission beyond encrypted transport
-of those bytes unless that code changes.
+Current-state note: `cfg.mesh_pass` is included in encrypted M1. When the
+responder has configured MeshPass signer roots, those bytes must decode to a
+signed MeshPass token whose signed node public key matches the authenticated M1
+node key and whose capabilities include relay role plus the control/sync/irc_app
+/tsumugi frame families. Without signer roots, the responder uses the same
+encrypted bytes as the shared-secret fallback gate and returns
+`MeshPassMismatch` on mismatch.
 
 ### M2
 
@@ -351,9 +350,9 @@ structures. Examples:
 
 Two similarly named surfaces share the MeshPass name:
 
-1. `tsumugi_handshake.Config.mesh_pass`: arbitrary bytes inserted into encrypted
-   M1 with a length cap, currently read and discarded by the responder as noted
-   above.
+1. `tsumugi_handshake.Config.mesh_pass`: bytes inserted into encrypted M1 with a
+   length cap. With configured signer roots these bytes are a signed MeshPass
+   admission token; otherwise they are the shared-secret fallback.
 2. `src/proto/meshpass.zig`: a signed admission/capability token format.
 
 The `meshpass.zig` token is the actual MeshPass admission/capability envelope.
@@ -612,4 +611,4 @@ The following former guardrails are now OBSOLETE — the capabilities they cauti
 
 - **TLS server PQ/hybrid groups:** `tls_server.zig` selects `x25519mlkem768` and performs the real X25519 ECDH + ML-KEM decapsulation when a client offers the hybrid share (the modern-Chrome PQ-only path).
 - **`secured_s2s_link` encrypts CRDT frames:** a Post-AKE AEAD record layer (ChaCha20-Poly1305) seals every byte with the Tsumugi `Established` `send_key`/`recv_key` and opens with per-record counters.
-- **`Config.mesh_pass` enforced by the Tsumugi responder:** M1 carries it encrypted and the responder constant-time-compares it, returning `MeshPassMismatch` on a mismatch (`tsumugi_handshake.zig` ~line 360).
+- **MeshPass enforced by the Tsumugi responder:** M1 carries admission bytes encrypted. Configured signer roots require a signed token bound to the peer node key and S2S frame-family capabilities; otherwise the responder constant-time-compares the shared-secret fallback.

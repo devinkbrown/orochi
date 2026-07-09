@@ -175,7 +175,12 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     };
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     out.s2s_config = cfg.mesh.s2s;
+    if (cfg.mesh.realm.len != 0) out.mesh_realm = cfg.mesh.realm;
+    if (cfg.mesh.mesh_pass) |v| out.mesh_pass = v;
+    if (cfg.mesh.admission_token) |v| out.mesh_admission_token = v;
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
+    if (cfg.mesh.admission_roots.len != 0) out.mesh_admission_roots = cfg.mesh.admission_roots;
+    out.mesh_admission_min_revocation_epoch = cfg.mesh.admission_min_revocation_epoch;
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
     out.sasl_decode_max_bytes = cfg.limits.sasl_decode_max_bytes;
@@ -510,7 +515,12 @@ test "config text overlays the server config" {
         \\[limits]
         \\max_clients = 2048
         \\[mesh]
+        \\realm = "ircxnet"
+        \\mesh_pass = "shared-secret"
         \\trust_roots = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+        \\admission_token = "aabbcc"
+        \\admission_roots = ["1111111111111111111111111111111111111111111111111111111111111111"]
+        \\admission_min_revocation_epoch = 9
         \\connect = ["ircx.us:6900"]
         \\[mesh.routing]
         \\max_nicks = 8192
@@ -587,7 +597,12 @@ test "config text overlays the server config" {
     try testing.expectEqualStrings("127.0.0.1", loaded.config.trusted_proxies[0]);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+    try testing.expectEqualStrings("ircxnet", loaded.config.mesh_realm);
+    try testing.expectEqualStrings("shared-secret", loaded.config.mesh_pass);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_trust_roots.len);
+    try testing.expectEqualStrings("aabbcc", loaded.config.mesh_admission_token);
+    try testing.expectEqual(@as(usize, 1), loaded.config.mesh_admission_roots.len);
+    try testing.expectEqual(@as(u64, 9), loaded.config.mesh_admission_min_revocation_epoch);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_connect.len);
     try testing.expectEqualStrings("ircx.us:6900", loaded.config.mesh_connect[0]);
     try testing.expectEqual(@as(usize, 8192), loaded.config.s2s_config.routes.max_nicks);

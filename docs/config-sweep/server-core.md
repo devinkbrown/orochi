@@ -56,7 +56,11 @@ intentionally not lifted via TOML.
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 | server.zig:728 | `Config.node_id` | `1` (placeholder) | sovereign mesh identity; keys registry/CRDT/gossip; seeds snowflake generator | `node.id` *(schema-backed; required, min 1)* | uint | 1 | 1..(u64 max) |
-| server.zig:739 | `Config.mesh_pass` | `""` | shared mesh auth password for plaintext S2S | `mesh.mesh_pass` *(schema-backed)* | string | "" | – |
+| server.zig | `Config.mesh_realm` | `"local"` | MeshPass token realm and secured-S2S node identity realm name | `mesh.realm` *(schema-backed)* | string | local | – |
+| server.zig | `Config.mesh_pass` | `""` | shared MeshPass fallback gate and mesh-session reclaim seal key | `mesh.mesh_pass` *(schema-backed)* | string | "" | – |
+| server.zig | `Config.mesh_admission_token` | `""` | local signed MeshPass token sent inside encrypted Tsumugi M1 | `mesh.admission_token` *(schema-backed)* | hex/base64 string | "" | decoded 1..448 bytes |
+| server.zig | `Config.mesh_admission_roots` | `[]` | MeshPass signer roots that switch secured-S2S responder admission to signed-token verification | `mesh.admission_roots` *(schema-backed)* | array(string) | [] | 32-byte keys |
+| server.zig | `Config.mesh_admission_min_revocation_epoch` | `0` | minimum accepted MeshPass token revocation epoch | `mesh.admission_min_revocation_epoch` *(schema-backed)* | uint | 0 | 0..u64 max |
 
 ## [reputation]: IP-reputation penalty weights
 
