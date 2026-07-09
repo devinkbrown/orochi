@@ -23,7 +23,7 @@ This page documents current source only. The advertised channel-mode token is `C
 | `Q` | no-forward | client-writable | User. | User opt-out of channel forward behavior. | `src/proto/usermode.zig:150` |
 | `H` | hide-oper | client-writable | User. | Hides operator status from WHOIS/WHO for non-opers. | `src/proto/usermode.zig:151` |
 
-Orochi divergence: legacy wallops and snomask do not use user `+w`. Operator notifications ride the Event Spine as `NOTE EVENT ...`; the source comment states explicitly that this replaces legacy snote/wallops broadcast channels (`src/daemon/server.zig:10009`).
+Orochi divergence: legacy wallops and snomask do not use user `+w`. Operator notifications ride the Event Spine as raw `EVENT` lines, replacing legacy snote/wallops broadcast channels.
 
 ## Member status modes and prefixes
 

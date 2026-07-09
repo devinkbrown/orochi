@@ -100,8 +100,8 @@ the Ophion CAP names:
 
 ### IRCX parity
 
-- **EVENT numeric fidelity is intentionally different today.** Orochi uses the
-  `NOTE EVENT` wire form and subject globs; Ophion has the 808/809/810 and
+- **EVENT numeric fidelity is intentionally different today.** Orochi uses raw
+  Event Spine `EVENT` delivery and subject globs; Ophion has the 808/809/810 and
   821-825 numeric families. Treat this as a compatibility gap only for clients
   that need Ophion numerics.
 - **LISTX picture numeric `813` is not implemented.** Orochi has no channel

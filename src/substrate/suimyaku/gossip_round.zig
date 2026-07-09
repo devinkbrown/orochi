@@ -372,7 +372,9 @@ pub const GossipRound = struct {
                         payload.origin,
                         now_ms,
                     );
-                    try self.markFailed(delta.id, now_ms, rng);
+                    if (self.membership.get(delta.id)) |member| {
+                        if (member.state == .dead) try self.markFailed(delta.id, now_ms, rng);
+                    }
                 },
                 .left => {
                     _ = try self.membership.applyLeft(delta.id, delta.incarnation);
@@ -688,6 +690,38 @@ test "suspicion reports transition to confirmed dead deterministically" {
     try c.membership.tick(2_000, &reaped);
     try testing.expectEqual(MemberState.dead, c.membership.get(4).?.state);
     try testing.expectEqual(@as(usize, 1), reaped.items.len);
+}
+
+test "single dead witness does not evict active peer before quorum" {
+    var c = try newRound(3, 4);
+    defer c.deinit();
+
+    try c.observeJoin(4, 0, 1);
+    try testing.expect(c.view.isActive(4));
+
+    var payload = GossipPayload{
+        .origin = 1,
+        .origin_incarnation = 0,
+    };
+    defer payload.deinit(testing.allocator);
+    try payload.member_deltas.append(testing.allocator, .{
+        .id = 4,
+        .state = .dead,
+        .incarnation = 0,
+    });
+
+    var rng = membership_view.Rng.init(9);
+    try c.applyPayload(&payload, 0, &rng);
+
+    const member = c.membership.get(4) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(MemberState.suspect, member.state);
+    try testing.expect(c.view.isActive(4));
+
+    var reaped: std.ArrayList(Reaped) = .empty;
+    defer reaped.deinit(testing.allocator);
+    try c.membership.tick(2_000, &reaped);
+    try testing.expectEqual(@as(usize, 0), reaped.items.len);
+    try testing.expect(c.view.isActive(4));
 }
 
 test "rounds are deterministic with the same seed" {

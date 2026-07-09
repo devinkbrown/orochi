@@ -412,7 +412,7 @@ pub const max_event_line_len: usize = 8191;
 ///
 /// Modeled after the MS Exchange 5.5 Chat Service (chatsvc), whose event
 /// notifications are raw `:<srv> EVENT <target> <TYPE> <SUBTYPE> <args>` lines —
-/// NOT the IRCv3 `NOTE EVENT`/draft-numeric form. `target` is the recipient (the
+/// not the older draft-note or numeric form. `target` is the recipient (the
 /// subscribed oper's nick); `message` is the structured payload the caller built,
 /// e.g. "USER CONNECT n!u@h", "USER DISCONNECT n!u@h :quit", "MEMBER JOIN #c nick",
 /// "SERVER LINK ircx.us". The subscription category is applied upstream for

@@ -165,7 +165,7 @@ Orochi's current IRCX surface is live but narrower by name:
 - Ophion `GAG` maps conceptually to Orochi `MODE <nick> +z`,
   `SHUN`/`UNSHUN`, and service access entries, but not by command name.
 - Ophion `EVENT` numeric families are not wire-compatible; Orochi uses its
-  Event Spine and `NOTE EVENT` style delivery.
+  Event Spine raw `EVENT` delivery.
 
 ### Ophion LADON/media commands missing by name
 

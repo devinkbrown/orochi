@@ -68,6 +68,11 @@ pub const DeliverMsg = struct {
     /// `broadcast_category` Event-Spine path (different subscription model). `to` is
     /// ignored. Keeps cross-reactor client iteration on each reactor's own thread.
     broadcast_observe: bool = false,
+    /// The carried bytes are already an application-layer frame for the target
+    /// transport (currently: a server-to-client binary WebSocket media frame).
+    /// The owning reactor must append them through the TLS/kTLS seam directly
+    /// instead of treating them as plaintext IRC bytes that need WS text framing.
+    preframed_secure: bool = false,
 
     /// The carried subject slice (empty when none was set).
     pub fn broadcastSubject(self: *const DeliverMsg) []const u8 {

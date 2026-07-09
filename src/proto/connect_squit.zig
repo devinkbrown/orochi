@@ -166,7 +166,7 @@ pub fn writeNoSuchServerWith(
     return b.slice();
 }
 
-/// Build an Event Spine oper-action note for a parsed CONNECT or SQUIT request.
+/// Build an Event Spine oper-action event for a parsed CONNECT or SQUIT request.
 pub fn writeOperActionNotice(out: []u8, ctx: OperNoticeContext, request: Request) Error![]const u8 {
     return writeOperActionNoticeWith(.{}, out, ctx, request);
 }
@@ -186,7 +186,9 @@ pub fn writeOperActionNoticeWith(
     try b.appendUnsigned(ctx.timestamp_ms);
     try b.appendBytes(" :");
     try b.appendBytes(ctx.server_name);
-    try b.appendBytes(" NOTE EVENT OPER_ACTION :");
+    try b.appendBytes(" EVENT ");
+    try b.appendBytes(ctx.operator);
+    try b.appendBytes(" OPER_ACTION ");
     try b.appendBytes(ctx.operator);
     try b.appendBytes(" requested ");
     switch (request) {
@@ -419,7 +421,7 @@ test "builds reply bytes" {
         .remote = "hub.remote",
     } });
     try std.testing.expectEqualStrings(
-        "@event-category=oper_action;event-severity=notice;event-timestamp-ms=17000042 :irc.local NOTE EVENT OPER_ACTION :alice requested CONNECT irc.remote 6697 hub.remote\r\n",
+        "@event-category=oper_action;event-severity=notice;event-timestamp-ms=17000042 :irc.local EVENT alice OPER_ACTION alice requested CONNECT irc.remote 6697 hub.remote\r\n",
         notice,
     );
 }

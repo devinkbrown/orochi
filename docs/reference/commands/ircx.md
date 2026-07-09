@@ -108,7 +108,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
   functionality rides `EVENT BROADCAST`; it is not a `+w` user-mode path.
 - Privileges: Oper checked inside handler.
 - Parameters: Subcommand; categories or observe arguments as needed.
-- Replies: Raw `EVENT LIST` lines, `NOTE EVENT` observe/broadcast lines, and server notices.
+- Replies: Raw `EVENT LIST` lines, raw Event Spine observe/broadcast `EVENT` lines, and server notices.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `EVENT BROADCAST :network maintenance`
 - Sources: `src/daemon/modules/ircx.zig:56`, `src/daemon/server.zig:6543`, `src/daemon/server.zig:6645`

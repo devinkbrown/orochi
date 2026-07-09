@@ -4460,7 +4460,14 @@ pub const LinuxServer = struct {
                     self.closeConn(tok, msg.close_reason) catch {};
                     continue;
                 }
-                appendToConn(conn, bytes) catch continue;
+                if (msg.preframed_secure) {
+                    appendSecuredToConn(conn, bytes) catch {
+                        conn.closing = true;
+                        continue;
+                    };
+                } else {
+                    appendToConn(conn, bytes) catch continue;
+                }
                 self.armSendIfNeeded(conn) catch {};
                 if (msg.close_after) {
                     conn.close_reason = msg.close_reason;
@@ -6743,6 +6750,14 @@ pub const LinuxServer = struct {
         return self.enqueueDeliveryMaybeClose(id, bytes, false, "Client quit");
     }
 
+    fn enqueuePreframedSecureDelivery(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
+        return self.enqueueDeliveryMaybeCloseEx(id, bytes, .{
+            .close_after = false,
+            .close_reason = "Client quit",
+            .preframed_secure = true,
+        });
+    }
+
     fn enqueueDeliveryThenClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_reason: []const u8) !void {
         return self.enqueueDeliveryMaybeClose(id, bytes, true, close_reason);
     }
@@ -6762,6 +6777,20 @@ pub const LinuxServer = struct {
     }
 
     fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) !void {
+        return self.enqueueDeliveryMaybeCloseEx(id, bytes, .{
+            .close_after = close_after,
+            .close_reason = close_reason,
+            .preframed_secure = false,
+        });
+    }
+
+    const DeliveryOptions = struct {
+        close_after: bool,
+        close_reason: []const u8,
+        preframed_secure: bool,
+    };
+
+    fn enqueueDeliveryMaybeCloseEx(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, opts: DeliveryOptions) !void {
         // Local fast path (always taken in single-reactor mode, where shard_id==0
         // and every id carries shard 0).
         if (id.shard == self.rx().shard_id) {
@@ -6771,7 +6800,11 @@ pub const LinuxServer = struct {
             // close that recipient (SendQ exceeded) and report success, so a
             // channel fan-out keeps delivering to the remaining members instead
             // of faulting the SENDER and black-holing the rest of the broadcast.
-            appendToConn(conn, bytes) catch |err| switch (err) {
+            const append_result = if (opts.preframed_secure)
+                appendSecuredToConn(conn, bytes)
+            else
+                appendToConn(conn, bytes);
+            append_result catch |err| switch (err) {
                 error.OutputTooSmall => {
                     conn.closing = true;
                     return;
@@ -6779,8 +6812,8 @@ pub const LinuxServer = struct {
                 else => return err,
             };
             try self.armSendIfNeeded(conn);
-            if (close_after) {
-                conn.close_reason = close_reason;
+            if (opts.close_after) {
+                conn.close_reason = opts.close_reason;
                 conn.closing = true;
             }
             return;
@@ -6806,9 +6839,15 @@ pub const LinuxServer = struct {
             // Likewise retry a full inbox briefly, then drop to avoid a stall.
             var pushed = false;
             var psp: usize = 0;
-            const is_last = close_after and end == bytes.len;
+            const is_last = opts.close_after and end == bytes.len;
             while (psp < 4096) : (psp += 1) {
-                if (fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = is_last, .close_reason = close_reason })) {
+                if (fabric.sendTo(id.shard, .{
+                    .to = id,
+                    .buf = buf,
+                    .close_after = is_last,
+                    .close_reason = opts.close_reason,
+                    .preframed_secure = opts.preframed_secure,
+                })) {
                     pushed = true;
                     break;
                 }
@@ -25321,10 +25360,11 @@ pub const LinuxServer = struct {
     }
 
     /// Fan a validated media datagram out to the channel's other call participants
-    /// that are local to THIS reactor (same-shard) over a binary WS frame. The
-    /// frame is encoded once and reused for every recipient. Cross-shard (opt-in
-    /// multi-reactor) and cross-node (mesh) media relay are out of scope for v1;
-    /// the default single-reactor deployment reaches every member here.
+    /// over a binary WS frame. The frame is encoded once and reused for every
+    /// same-node recipient; cross-shard recipients ride the reactor fabric as a
+    /// preframed secure payload so the owning shard applies TLS/kTLS without
+    /// re-wrapping the bytes as a text WebSocket IRC line. Cross-node mesh media
+    /// relay remains a later SFU-cascade slice.
     fn relayWsMediaDatagram(self: *LinuxServer, sender: client_model.ClientId, channel: []const u8, datagram: []const u8) void {
         if (datagram.len > WsState.max_media_frame) return; // exceeds the media frame ceiling
         // A media datagram (video keyframe) can be ~1.3 MB — far too large for a
@@ -25338,17 +25378,12 @@ pub const LinuxServer = struct {
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
             if (mid.eql(sender)) continue;
-            if (mid.shard != self.rx().shard_id) continue; // same-shard only (v1)
             const mconn = self.connFor(mid) orelse continue;
             if (mconn.closing) continue;
             if (mconn.ws == null) continue; // browser media only goes to WS peers
             // Deliver to actual call participants, not every channel member.
             if (!self.media_rooms.isParticipant(channel, mconn.session.displayName())) continue;
-            appendSecuredToConn(mconn, ws_frame) catch {
-                mconn.closing = true;
-                continue;
-            };
-            self.armSendIfNeeded(mconn) catch {};
+            self.enqueuePreframedSecureDelivery(mid, ws_frame) catch continue;
         }
     }
 
@@ -37814,6 +37849,25 @@ test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" 
         }
         try expectContains(lines.items, " 001 WSS ");
     } else return error.SkipZigTest;
+}
+
+test "WebSocket preframed media bytes bypass IRC text framing" {
+    var ws = WsState{ .phase = .open };
+    var conn = ConnState{};
+    conn.ws = &ws;
+
+    var frame_buf: [32]u8 = undefined;
+    const frame = try websocket.encodeFrame(WsState.max_media_frame, .{ .opcode = .binary }, "abc", &frame_buf);
+    try appendSecuredToConn(&conn, frame);
+    try std.testing.expectEqualSlices(u8, frame, conn.send_buf[0..conn.send_len]);
+
+    var text_ws = WsState{ .phase = .open };
+    var text_conn = ConnState{};
+    text_conn.ws = &text_ws;
+    try appendToConn(&text_conn, "PING :1\r\n");
+    const decoded = try websocket.decodeFrame(128, .server_to_client, text_conn.send_buf[0..text_conn.send_len], &.{});
+    try std.testing.expectEqual(websocket.Opcode.text, decoded.frame.opcode);
+    try std.testing.expectEqualStrings("PING :1", decoded.frame.payload);
 }
 
 test "threaded server: ws listener rejects a non-upgrade HTTP request" {
