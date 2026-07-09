@@ -61,16 +61,14 @@ appends the resulting leaf to the existing Merkle Mountain Range substrate
 `src/daemon/key_transparency.zig:69`, `src/daemon/key_transparency.zig:85`,
 `src/daemon/key_transparency.zig:105`).
 
-The services layer can attach a `KeyTransparencyLog`; when attached, CERTFP
+The daemon's live account-services path attaches a `KeyTransparencyLog`; CERTFP
 bind/delete and WebAuthn bind/delete append canonical events under the services
-mutation lock (`src/daemon/services.zig:437`, `src/daemon/services.zig:439`,
-`src/daemon/services.zig:477`, `src/daemon/services.zig:623`,
-`src/daemon/services.zig:774`, `src/daemon/services.zig:2431`). WebAuthn events
-hash the raw COSE public key material, while CERTFP events hash the fingerprint
-string. This is not yet exposed as a client command, gossip feed, or public
-audit API; current source provides the append log, root, and inclusion-proof
-verification primitives (`src/daemon/key_transparency.zig:65`,
-`src/daemon/key_transparency.zig:80`, `src/daemon/key_transparency.zig:105`).
+mutation lock (`src/main.zig`, `src/daemon/services.zig`). WebAuthn events hash
+the raw COSE public key material, while CERTFP events hash the fingerprint
+string. The public `status.json` feed exposes whether key transparency is live,
+the current append count, and the current MMR root; the underlying module
+provides root and inclusion-proof verification primitives
+(`src/daemon/server.zig`, `src/daemon/key_transparency.zig`).
 
 ## ProofMark moderation proofs
 
@@ -81,10 +79,13 @@ and expiry. The module now also derives a public proof id from the canonical
 proof body plus detached Ed25519 signature, so audit output can cite a stable
 identifier without exposing the full reason text beyond its hash.
 
-The live oper audit ring can store that proof id alongside each privileged
-action. `LinuxServer.recordOperAudit` mints the proof id when the node has a mesh
-signing key, and `AUDIT` renders `proof=<id>` on signed records; nodes without a
-mesh key keep the existing unsigned audit line.
+The live oper audit ring stores the proof id plus detached signature, public key,
+reason hash, policy version, issue time, and expiry for signed privileged
+actions. `LinuxServer.recordOperAudit` mints that evidence when the node has a
+mesh signing key, `AUDIT` renders `proof=<id>` on signed records, and
+`AUDIT PROOF <id>` lets an operator inspect the stored proof material after the
+server re-verifies the signature and proof id. Nodes without a mesh key keep the
+existing unsigned audit line.
 
 ## Node identity
 

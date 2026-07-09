@@ -25937,27 +25937,44 @@ pub const LinuxServer = struct {
         self.recordOperAudit(conn.session.displayName(), .other, target, msg);
     }
 
-    fn operProofId(
+    fn operProofEvidence(
         self: *LinuxServer,
         ts: i64,
         oper: []const u8,
         action: svc_operaudit.Action,
         target: []const u8,
         reason: []const u8,
-        out: *[proofmark.proof_id_hex_len]u8,
-    ) ?[]const u8 {
+        id_out: *[proofmark.proof_id_hex_len]u8,
+        sig_out: *[@sizeOf(proofmark.Signature) * 2]u8,
+        pub_out: *[@sizeOf(proofmark.PublicKey) * 2]u8,
+    ) ?svc_operaudit.ProofEvidence {
         const kp = self.meshSignKey() orelse return null;
+        const reason_hash = proofmark.reasonHash(reason);
         const proof = proofmark.Proof{
             .actor = oper,
             .target = target,
             .action = action.proofCode(),
-            .reason_hash = proofmark.reasonHash(reason),
+            .reason_hash = reason_hash,
             .policy_version = 1,
             .issued_ms = ts,
             .expiry_ms = std.math.maxInt(i64),
         };
         const sig = proofmark.sign(proof, kp.secret_key.toBytes()) catch return null;
-        return proofmark.proofIdHex(proof, sig, out) catch null;
+        const proof_id = proofmark.proofIdHex(proof, sig, id_out) catch return null;
+        const sig_hex = std.fmt.bytesToHex(sig, .lower);
+        @memcpy(sig_out, &sig_hex);
+        const pub_hex = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
+        @memcpy(pub_out, &pub_hex);
+        return .{
+            .id = proof_id,
+            .signature = sig_out[0..],
+            .public_key = pub_out[0..],
+            .reason_hash = reason_hash,
+            .policy_version = proof.policy_version,
+            .action = proof.action,
+            .issued_ms = proof.issued_ms,
+            .expiry_ms = proof.expiry_ms,
+        };
     }
 
     /// Append one privileged action to the oper-action audit ring. When this node
@@ -25968,8 +25985,86 @@ pub const LinuxServer = struct {
     fn recordOperAudit(self: *LinuxServer, oper: []const u8, action: svc_operaudit.Action, target: []const u8, reason: []const u8) void {
         const ts = self.nowMs();
         var proof_id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
-        const proof_id = self.operProofId(ts, oper, action, target, reason, &proof_id_buf) orelse "";
-        _ = self.oper_audit.recordWithProof(ts, oper, action, target, reason, proof_id) catch {};
+        var proof_sig_buf: [@sizeOf(proofmark.Signature) * 2]u8 = undefined;
+        var proof_pub_buf: [@sizeOf(proofmark.PublicKey) * 2]u8 = undefined;
+        const proof = self.operProofEvidence(ts, oper, action, target, reason, &proof_id_buf, &proof_sig_buf, &proof_pub_buf);
+        _ = self.oper_audit.recordWithProofEvidence(ts, oper, action, target, reason, proof) catch {};
+    }
+
+    fn proofHashHex(hash: proofmark.Digest, out: *[proofmark.proof_id_hex_len]u8) []const u8 {
+        const hex = std.fmt.bytesToHex(hash, .lower);
+        @memcpy(out, &hex);
+        return out[0..];
+    }
+
+    fn auditProofVerified(entry: *const svc_operaudit.Entry) bool {
+        if (entry.proof_id.len != proofmark.proof_id_hex_len) return false;
+        if (entry.proof_signature.len != @sizeOf(proofmark.Signature) * 2) return false;
+        if (entry.proof_public_key.len != @sizeOf(proofmark.PublicKey) * 2) return false;
+        var sig: proofmark.Signature = undefined;
+        var public_key: proofmark.PublicKey = undefined;
+        _ = std.fmt.hexToBytes(&sig, entry.proof_signature) catch return false;
+        _ = std.fmt.hexToBytes(&public_key, entry.proof_public_key) catch return false;
+        const proof = proofmark.Proof{
+            .actor = entry.oper,
+            .target = entry.target,
+            .action = entry.proof_action,
+            .reason_hash = entry.proof_reason_hash,
+            .policy_version = entry.proof_policy_version,
+            .issued_ms = entry.proof_issued_ms,
+            .expiry_ms = entry.proof_expiry_ms,
+        };
+        if (!proofmark.verify(proof, sig, public_key)) return false;
+        var id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+        const id = proofmark.proofIdHex(proof, sig, &id_buf) catch return false;
+        return std.mem.eql(u8, id, entry.proof_id);
+    }
+
+    fn handleAuditProof(self: *LinuxServer, conn: *ConnState, proof_id: []const u8) !void {
+        const entry = self.oper_audit.findByProofId(proof_id) orelse {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE AUDIT :Proof {s} not found\r\n", .{ self.serverName(), proof_id }) catch return;
+            try appendToConn(conn, line);
+            return;
+        };
+        if (entry.proof_signature.len == 0 or entry.proof_public_key.len == 0) {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE AUDIT :Proof {s} has no stored evidence\r\n", .{ self.serverName(), proof_id }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+        const target = if (entry.target.len != 0) entry.target else "-";
+        const verified = auditProofVerified(entry);
+        var hash_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+        const reason_hash = proofHashHex(entry.proof_reason_hash, &hash_buf);
+        var line1: [default_reply_bytes]u8 = undefined;
+        const out1 = std.fmt.bufPrint(&line1, ":{s} NOTE AUDIT :Proof {s} seq={d} valid={s} actor={s} action={s}/{d} target={s}\r\n", .{
+            self.serverName(),
+            entry.proof_id,
+            entry.seq,
+            if (verified) "true" else "false",
+            entry.oper,
+            entry.action.label(),
+            entry.proof_action,
+            target,
+        }) catch return;
+        try appendToConn(conn, out1);
+        var line2: [default_reply_bytes]u8 = undefined;
+        const out2 = std.fmt.bufPrint(&line2, ":{s} NOTE AUDIT :Proof policy={d} issued_ms={d} expiry_ms={d} reason_hash={s}\r\n", .{
+            self.serverName(),
+            entry.proof_policy_version,
+            entry.proof_issued_ms,
+            entry.proof_expiry_ms,
+            reason_hash,
+        }) catch return;
+        try appendToConn(conn, out2);
+        var line3: [default_reply_bytes]u8 = undefined;
+        const out3 = std.fmt.bufPrint(&line3, ":{s} NOTE AUDIT :Proof public_key={s} signature={s}\r\n", .{
+            self.serverName(),
+            entry.proof_public_key,
+            entry.proof_signature,
+        }) catch return;
+        try appendToConn(conn, out3);
     }
 
     /// `AUDIT [oper] [count]` — dump the oper-action audit ring, most recent first.
@@ -25978,6 +26073,14 @@ pub const LinuxServer = struct {
     pub fn handleAudit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!self.requirePriv(conn, .audit_read)) return;
         const params = parsed.paramSlice();
+        if (params.len >= 1 and std.ascii.eqlIgnoreCase(params[0], "PROOF")) {
+            if (params.len < 2) {
+                try self.noticeTo(conn, "AUDIT PROOF: usage AUDIT PROOF <proof-id>");
+                return;
+            }
+            try self.handleAuditProof(conn, params[1]);
+            return;
+        }
         var oper_filter: ?[]const u8 = null;
         var count: usize = 20;
         if (params.len >= 1) {
@@ -38875,7 +38978,12 @@ test "threaded server: local KILL disconnects the victim; unknown nick is 401" {
 }
 
 test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x9a)), "local");
+    defer ident.deinit();
+    var cfg = operTestConfig(0);
+    cfg.node_id = ident.shortId();
+    cfg.node_identity = &ident;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -38910,9 +39018,22 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     // AUDIT (newest first) shows both actions with actor/target/reason.
     o.reset();
     try writeAllFd(fd_o, "AUDIT\r\n");
-    try recvUntil(&o, "O jupe evil.example.net :rogue", 300);
+    try recvUntil(&o, "O jupe evil.example.net proof=", 300);
     try recvUntil(&o, "End of audit", 300);
-    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O kill V :spam") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O kill V proof=") != null);
+
+    const marker = "proof=";
+    const proof_start = (std.mem.indexOf(u8, o.written(), marker) orelse return error.TestExpectedEqual) + marker.len;
+    const proof_end = proof_start + proofmark.proof_id_hex_len;
+    try std.testing.expect(proof_end <= o.written().len);
+    const proof_id = o.written()[proof_start..proof_end];
+    var proof_cmd_buf: [96]u8 = undefined;
+    const proof_cmd = try std.fmt.bufPrint(&proof_cmd_buf, "AUDIT PROOF {s}\r\n", .{proof_id});
+    o.reset();
+    try writeAllFd(fd_o, proof_cmd);
+    try recvUntil(&o, "valid=true", 300);
+    try recvUntil(&o, "public_key=", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "signature=") != null);
 
     // Filtering by a different oper yields no entries.
     o.reset();

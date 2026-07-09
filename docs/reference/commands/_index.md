@@ -73,6 +73,7 @@ Registry commands default to registered-client access unless the command table s
 | `GRANT` | Grant a registered account operator authority network-wide. | [oper-moderation.md](oper-moderation.md#grant) |
 | `REVOKE` | Revoke a runtime operator grant network-wide. | [oper-moderation.md](oper-moderation.md#revoke) |
 | `GRANTS` | List live runtime operator grants. | [oper-moderation.md](oper-moderation.md#grants) |
+| `AUDIT` | Inspect privileged-action audit records and ProofMark evidence. | [oper-moderation.md](oper-moderation.md#audit) |
 | `KILL` | Disconnect a user. | [oper-moderation.md](oper-moderation.md#kill) |
 | `CLOSE` | Close unknown/unregistered clients. | [oper-moderation.md](oper-moderation.md#close) |
 | `DRAIN` | Toggle listener drain state. | [oper-moderation.md](oper-moderation.md#drain) |

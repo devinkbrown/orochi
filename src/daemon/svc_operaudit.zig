@@ -18,6 +18,7 @@
 //! so the ring never aliases caller memory and frees everything on eviction/deinit.
 
 const std = @import("std");
+const proofmark = @import("proofmark.zig");
 
 /// Classification of the privileged action being recorded.
 ///
@@ -97,6 +98,26 @@ pub const Entry = struct {
     /// Optional ProofMark id. Empty means this record was not cryptographically
     /// signed, usually because the node has no mesh signing key.
     proof_id: []u8,
+    /// Optional detached ProofMark signature/public key in lowercase hex. Present
+    /// only for records created through `recordWithProofEvidence`.
+    proof_signature: []u8,
+    proof_public_key: []u8,
+    proof_reason_hash: proofmark.Digest = @splat(0),
+    proof_policy_version: u32 = 0,
+    proof_action: u8 = 0,
+    proof_issued_ms: i64 = 0,
+    proof_expiry_ms: i64 = 0,
+};
+
+pub const ProofEvidence = struct {
+    id: []const u8,
+    signature: []const u8,
+    public_key: []const u8,
+    reason_hash: proofmark.Digest,
+    policy_version: u32,
+    action: u8,
+    issued_ms: i64,
+    expiry_ms: i64,
 };
 
 /// Fixed-capacity, oldest-evicted ring of oper actions.
@@ -141,6 +162,8 @@ pub const OperAudit = struct {
         self.allocator.free(entry.target);
         self.allocator.free(entry.reason);
         self.allocator.free(entry.proof_id);
+        self.allocator.free(entry.proof_signature);
+        self.allocator.free(entry.proof_public_key);
     }
 
     /// Record one oper action. Strings are duped into the ring. When the ring
@@ -166,6 +189,27 @@ pub const OperAudit = struct {
         reason: []const u8,
         proof_id: []const u8,
     ) !u64 {
+        return self.recordWithProofEvidence(ts, oper, action, target, reason, if (proof_id.len == 0) null else .{
+            .id = proof_id,
+            .signature = "",
+            .public_key = "",
+            .reason_hash = @splat(0),
+            .policy_version = 0,
+            .action = action.proofCode(),
+            .issued_ms = ts,
+            .expiry_ms = 0,
+        });
+    }
+
+    pub fn recordWithProofEvidence(
+        self: *OperAudit,
+        ts: i64,
+        oper: []const u8,
+        action: Action,
+        target: []const u8,
+        reason: []const u8,
+        proof: ?ProofEvidence,
+    ) !u64 {
         const owned_oper = try self.allocator.dupe(u8, oper);
         errdefer self.allocator.free(owned_oper);
 
@@ -175,8 +219,18 @@ pub const OperAudit = struct {
         const owned_reason = try self.allocator.dupe(u8, reason);
         errdefer self.allocator.free(owned_reason);
 
+        const proof_id = if (proof) |p| p.id else "";
+        const proof_signature = if (proof) |p| p.signature else "";
+        const proof_public_key = if (proof) |p| p.public_key else "";
+
         const owned_proof = try self.allocator.dupe(u8, proof_id);
         errdefer self.allocator.free(owned_proof);
+
+        const owned_signature = try self.allocator.dupe(u8, proof_signature);
+        errdefer self.allocator.free(owned_signature);
+
+        const owned_public_key = try self.allocator.dupe(u8, proof_public_key);
+        errdefer self.allocator.free(owned_public_key);
 
         const seq = self.next_seq;
         // Saturate rather than overflow on an absurdly long-lived process.
@@ -201,6 +255,13 @@ pub const OperAudit = struct {
             .target = owned_target,
             .reason = owned_reason,
             .proof_id = owned_proof,
+            .proof_signature = owned_signature,
+            .proof_public_key = owned_public_key,
+            .proof_reason_hash = if (proof) |p| p.reason_hash else @splat(0),
+            .proof_policy_version = if (proof) |p| p.policy_version else 0,
+            .proof_action = if (proof) |p| p.action else action.proofCode(),
+            .proof_issued_ms = if (proof) |p| p.issued_ms else ts,
+            .proof_expiry_ms = if (proof) |p| p.expiry_ms else 0,
         };
         return seq;
     }
@@ -216,6 +277,18 @@ pub const OperAudit = struct {
         if (i >= self.count) return null;
         const idx = (self.start + i) % cap;
         return &(self.slots[idx].?);
+    }
+
+    pub fn findByProofId(self: *const OperAudit, proof_id: []const u8) ?*const Entry {
+        if (proof_id.len == 0) return null;
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const logical = self.count - 1 - i;
+            const idx = (self.start + logical) % cap;
+            const entry = &(self.slots[idx].?);
+            if (std.mem.eql(u8, entry.proof_id, proof_id)) return entry;
+        }
+        return null;
     }
 
     /// Copy up to `n` of the most recent entries, newest-first, into a caller-
@@ -327,6 +400,34 @@ test "recordWithProof stores proof id" {
     const out = try audit.render(testing.allocator, 1);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, " proof=0123456789abcdef ") != null);
+}
+
+test "recordWithProofEvidence stores inspectable proof material" {
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+
+    const reason_hash: proofmark.Digest = @splat(0xab);
+    const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const sig = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const public_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try testing.expectEqual(@as(u64, 1), try audit.recordWithProofEvidence(100, "alice", .kline, "*@bad", "abuse", .{
+        .id = id,
+        .signature = sig,
+        .public_key = public_key,
+        .reason_hash = reason_hash,
+        .policy_version = 7,
+        .action = 2,
+        .issued_ms = 100,
+        .expiry_ms = 200,
+    }));
+
+    const entry = audit.findByProofId(id).?;
+    try testing.expectEqualStrings(sig, entry.proof_signature);
+    try testing.expectEqualStrings(public_key, entry.proof_public_key);
+    try testing.expectEqualSlices(u8, &reason_hash, &entry.proof_reason_hash);
+    try testing.expectEqual(@as(u32, 7), entry.proof_policy_version);
+    try testing.expectEqual(@as(u8, 2), entry.proof_action);
+    try testing.expect(audit.findByProofId("missing") == null);
 }
 
 test "ring evicts oldest when over capacity" {
