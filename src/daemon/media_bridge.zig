@@ -211,18 +211,43 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             };
         }
 
+        fn memberByStableId(self: *const Self, id: u64) ?Member {
+            for (self.members[0..self.len]) |m| {
+                if (memberStableId(m.id()) == id) return m;
+            }
+            return null;
+        }
+
+        fn crossTargetsForParticipant(self: *Self, from_leg: Leg, from_participant: ?u64, out: []Member) usize {
+            const other: Leg = if (from_leg == .native) .webrtc else .native;
+            if (from_participant) |pid| {
+                var egress: [max_participants]kakehashi_session.Egress = undefined;
+                const en = self.session.forwardTargets(pid, &egress);
+                var n: usize = 0;
+                for (egress[0..en]) |target| {
+                    if (target.leg != other) continue;
+                    const member = self.memberByStableId(target.id) orelse continue;
+                    if (n >= out.len) break;
+                    out[n] = member;
+                    n += 1;
+                }
+                return n;
+            }
+            return self.crossTargets(from_leg, "", out);
+        }
+
         /// Rewrap a native kagura `datagram` ONCE (keeping the source publisher's
         /// stream_id as the RTP ssrc, so receivers can demux) and send the same
         /// RTP packet to each WebRTC member of the call. Header-only; opaque
         /// payload shared verbatim. The `send` callback resolves each target's
         /// live address.
         pub fn fanoutNativeToWebrtc(self: *Self, datagram: []const u8, send_ctx: *anyopaque, send: SendFn) void {
-            var targets: [max_participants]Member = undefined;
-            const n = self.crossTargets(.native, "", &targets);
-            if (n == 0) return;
             const view = kagura_frame.decode(datagram) catch return;
             const bf = kakehashi.fromNative(view);
             if (!self.codecAllowed(bf.codec)) return;
+            var targets: [max_participants]Member = undefined;
+            const n = self.crossTargetsForParticipant(.native, self.ssrcs.participantForStream(view.stream_id), &targets);
+            if (n == 0) return;
             const ssrc = self.ssrcs.ssrcForStream(view.stream_id) orelse view.stream_id;
             var scratch: [max_rewrap]u8 = undefined;
             const rtp = kakehashi.toRtp(bf, &self.ptmap, ssrc, &scratch) catch return;
@@ -233,12 +258,12 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         /// source ssrc as the native stream_id) and send to each native member.
         /// Used by the WebRTC relay to bridge to native peers.
         pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
-            var targets: [max_participants]Member = undefined;
-            const n = self.crossTargets(.webrtc, "", &targets);
-            if (n == 0) return;
             const dh = rtp_profile.decodeHeader(rtp) catch return;
             const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
             if (!self.codecAllowed(bf.codec)) return;
+            var targets: [max_participants]Member = undefined;
+            const n = self.crossTargetsForParticipant(.webrtc, self.ssrcs.participantForSsrc(dh.header.ssrc), &targets);
+            if (n == 0) return;
             const stream_id = self.ssrcs.streamForSsrc(dh.header.ssrc) orelse dh.header.ssrc;
             const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, stream_id);
             var scratch: [max_rewrap]u8 = undefined;
@@ -443,6 +468,33 @@ test "fanout translates RTP ssrc to native stream id through ssrc_map" {
     const native_frame = try kagura_frame.decode(ctx.written());
     try testing.expectEqual(@as(u32, 80), native_frame.stream_id);
     try testing.expectEqual(kagura_frame.CodecTag.kaguravox_audio, native_frame.codec);
+}
+
+test "fanout honors kakehashi_session connected target policy" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
+    native.setCodecs(&.{.kaguravox});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
+    webrtc.setCodecs(&.{.kaguravox});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    br.session.get(memberStableId("mob")).?.connected = false;
+
+    var src: [128]u8 = undefined;
+    const slen = try kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+        .stream_id = 7,
+        .sequence = 1,
+        .timestamp = 960,
+        .keyframe = false,
+        .codec = .kaguravox_audio,
+        .payload = "audio",
+    }, &src);
+
+    var ctx = CountSendCtx{};
+    br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
+    try testing.expectEqual(@as(usize, 0), ctx.count);
 }
 
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {

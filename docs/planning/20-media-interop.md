@@ -76,12 +76,12 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live media-kind denial (wired) | `MEDIA OFFER`/`MEDIA ANSWER` emit targeted `MEDIA KIND-DENIED kind=<voice|video> reason=no_common_codec` replies for advertised kinds that cannot join the negotiated transcode-free codec set. |
 | Live shared-codec bridge gate (wired) | Cross-leg `media_bridge` registrations carry participant codec capabilities, maintain a per-call `kakehashi_session`, and only rewrap/fan out frames when a shared codec exists; incompatible calls drop instead of transcoding. |
 | Live stream/SSRC identity map (wired) | `media_bridge` maintains `ssrc_map` bindings for each registered participant and translates native `stream_id` ↔ RTP `ssrc` during cross-leg rewrap. |
+| Live per-target bridge policy (wired) | Cross-leg fanout resolves the source participant through `ssrc_map` and asks `kakehashi_session.forwardTargets` for connected egress targets before rewrapping. |
 
 ## Remaining live wiring
 
-1. **Finish Kakehashi in the SFU forward path:** replace the remaining coarse target
-   selection with full per-target `kakehashi_session.forwardTargets` policy; drive
-   `simulcast_select` from `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
+1. **Finish Kakehashi in the SFU forward path:** drive `simulcast_select` from
+   `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
 
 ## Non-goals
 
