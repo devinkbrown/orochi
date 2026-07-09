@@ -890,7 +890,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
         \\allowed_caps = ["reply", "log", "hooks"]
-        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified" }]
+        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\disabled_plugins = ["bridge-discord", "bad.wasm"]
         \\
     ;
@@ -907,6 +907,8 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expectEqual(@as(usize, 1), loaded.config.wasm_registry.len);
     try testing.expectEqualStrings("guard", loaded.config.wasm_registry[0].name);
     try testing.expectEqual(wasm_bridge.TrustTier.verified, loaded.config.wasm_registry[0].tier);
+    try testing.expect(loaded.config.wasm_registry[0].publisher != null);
+    try testing.expect(loaded.config.wasm_registry[0].signature != null);
     try testing.expectEqual(@as(usize, 2), loaded.config.wasm_disabled_plugins.len);
     try testing.expectEqualStrings("bridge-discord", loaded.config.wasm_disabled_plugins[0]);
     try testing.expectEqualStrings("bad.wasm", loaded.config.wasm_disabled_plugins[1]);

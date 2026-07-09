@@ -24,6 +24,7 @@ const store_mod = @import("store.zig");
 const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
+const crypto_sign = @import("../crypto/sign.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
 const multiline_mod = @import("../proto/multiline.zig");
@@ -1600,15 +1601,27 @@ fn parseWasmRegistry(allocator: std.mem.Allocator, resolver: Resolver, arr: []co
         const raw_name = item.getString("name") orelse return error.ParseError;
         const raw_hash = item.getString("blake3") orelse return error.ParseError;
         const raw_tier = item.getString("tier") orelse "listed";
+        const raw_publisher = item.getString("publisher");
+        const raw_signature = item.getString("signature");
         if (raw_hash.len != std.crypto.hash.Blake3.digest_length * 2) return error.ParseError;
         var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, raw_hash) catch return error.ParseError;
         const tier = wasm_bridge.TrustTier.fromToken(raw_tier) orelse return error.ParseError;
+        if ((raw_publisher == null) != (raw_signature == null)) return error.ParseError;
+        const publisher = if (raw_publisher) |raw| try parseHexArray(crypto_sign.public_key_len, raw) else null;
+        const signature = if (raw_signature) |raw| try parseHexArray(crypto_sign.signature_len, raw) else null;
         const name = try resolveStr(allocator, resolver, raw_name);
         errdefer allocator.free(name);
-        try list.append(allocator, .{ .name = name, .blake3 = digest, .tier = tier });
+        try list.append(allocator, .{ .name = name, .blake3 = digest, .tier = tier, .publisher = publisher, .signature = signature });
     }
     return list.toOwnedSlice(allocator);
+}
+
+fn parseHexArray(comptime len: usize, raw: []const u8) TomlError![len]u8 {
+    if (raw.len != len * 2) return error.ParseError;
+    var out: [len]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, raw) catch return error.ParseError;
+    return out;
 }
 
 fn freeWasmRegistry(allocator: std.mem.Allocator, pins: []const wasm_bridge.RegistryPin) void {
@@ -1822,7 +1835,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "STORE", "hooks"]
-        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified" }]
+        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\disabled_plugins = ["bad", "bridge-discord.wasm"]
         \\
     ;
@@ -1835,6 +1848,10 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expectEqual(@as(usize, 1), cfg.wasm.registry.len);
     try testing.expectEqualStrings("guard", cfg.wasm.registry[0].name);
     try testing.expectEqual(wasm_bridge.TrustTier.verified, cfg.wasm.registry[0].tier);
+    try testing.expect(cfg.wasm.registry[0].publisher != null);
+    try testing.expect(cfg.wasm.registry[0].signature != null);
+    try testing.expectEqual(@as(u8, 0x11), cfg.wasm.registry[0].publisher.?[0]);
+    try testing.expectEqual(@as(u8, 0x22), cfg.wasm.registry[0].signature.?[0]);
     try testing.expectEqual(@as(usize, 2), cfg.wasm.disabled_plugins.len);
     try testing.expectEqualStrings("bad", cfg.wasm.disabled_plugins[0]);
     try testing.expectEqualStrings("bridge-discord.wasm", cfg.wasm.disabled_plugins[1]);
@@ -1846,6 +1863,16 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "net:outbound"]
+        \\
+    , .{}));
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", publisher = "1111111111111111111111111111111111111111111111111111111111111111" }]
         \\
     , .{}));
 }

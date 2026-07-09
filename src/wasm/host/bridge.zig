@@ -13,11 +13,13 @@ const abi = @import("abi.zig");
 const interp = @import("interp.zig");
 const plugin = @import("plugin.zig");
 const registry = @import("../../daemon/registry.zig");
+const crypto_sign = @import("../../crypto/sign.zig");
 
 pub const default_fuel: u64 = 16 * 1024;
 pub const max_plugin_bytes: usize = 8 * 1024 * 1024;
 pub const default_max_memory_bytes: usize = 64 * 1024;
 pub const default_allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .log, .time });
+pub const registry_signature_domain = "orowasm-registry-v1";
 
 /// Host callbacks the daemon supplies so a plugin's granted hostcalls reach the
 /// live connection. Opaque ctx is the daemon's per-invocation context.
@@ -36,6 +38,7 @@ pub const RuntimeInfo = struct {
     host_function_count: usize,
     allowed_caps: abi.CapabilitySet,
     registry_pin_count: usize,
+    signed_registry_pin_count: usize,
     disabled_plugin_count: usize,
     blocked_load_count: usize,
     max_memory_bytes: usize,
@@ -71,6 +74,8 @@ pub const RegistryPin = struct {
     name: []const u8,
     blake3: [std.crypto.hash.Blake3.digest_length]u8,
     tier: TrustTier = .listed,
+    publisher: ?crypto_sign.PublicKey = null,
+    signature: ?crypto_sign.Signature = null,
 };
 
 pub const Options = struct {
@@ -87,6 +92,7 @@ pub const PluginSummary = struct {
     name: []const u8,
     grants: abi.CapabilitySet,
     trust_tier: TrustTier,
+    publisher_signed: bool,
     command_count: usize,
     hook_count: usize,
 };
@@ -224,6 +230,7 @@ pub const Bridge = struct {
             .host_function_count = abi.host_functions.len,
             .allowed_caps = self.store.policy.allowed_caps,
             .registry_pin_count = self.options.registry.len,
+            .signed_registry_pin_count = self.signedRegistryPinCount(),
             .disabled_plugin_count = self.options.disabled_plugins.len,
             .blocked_load_count = self.blocked_loads,
             .max_memory_bytes = self.options.max_memory_bytes,
@@ -243,6 +250,7 @@ pub const Bridge = struct {
             .name = item.name,
             .grants = item.grants,
             .trust_tier = self.pluginTier(item.name),
+            .publisher_signed = self.pluginPublisherSigned(item.name),
             .command_count = self.store.commandCount(item.handle),
             .hook_count = self.store.hookCount(item.handle),
         };
@@ -286,6 +294,26 @@ pub const Bridge = struct {
             self.blocked_loads += 1;
             return error.PluginHashMismatch;
         }
+        if (pin.publisher != null or pin.signature != null) {
+            const public_key = pin.publisher orelse {
+                self.blocked_loads += 1;
+                return error.PluginSignatureIncomplete;
+            };
+            const signature = pin.signature orelse {
+                self.blocked_loads += 1;
+                return error.PluginSignatureIncomplete;
+            };
+            var transcript_buf: [1024]u8 = undefined;
+            const transcript = registryPinTranscript(&transcript_buf, pin) catch {
+                self.blocked_loads += 1;
+                return error.PluginSignatureInvalid;
+            };
+            const ok = crypto_sign.verifyCtx(registry_signature_domain, transcript, signature, public_key) catch false;
+            if (!ok) {
+                self.blocked_loads += 1;
+                return error.PluginSignatureInvalid;
+            }
+        }
     }
 
     fn findRegistryPin(self: *const Bridge, name: []const u8) ?RegistryPin {
@@ -298,6 +326,18 @@ pub const Bridge = struct {
     fn pluginTier(self: *const Bridge, name: []const u8) TrustTier {
         return if (self.findRegistryPin(name)) |pin| pin.tier else .unlisted;
     }
+
+    fn pluginPublisherSigned(self: *const Bridge, name: []const u8) bool {
+        return if (self.findRegistryPin(name)) |pin| pin.publisher != null and pin.signature != null else false;
+    }
+
+    fn signedRegistryPinCount(self: *const Bridge) usize {
+        var total: usize = 0;
+        for (self.options.registry) |pin| {
+            if (pin.publisher != null and pin.signature != null) total += 1;
+        }
+        return total;
+    }
 };
 
 fn pluginNameMatches(name: []const u8, candidate: []const u8) bool {
@@ -306,6 +346,25 @@ fn pluginNameMatches(name: []const u8, candidate: []const u8) bool {
         return std.ascii.eqlIgnoreCase(name, candidate[0 .. candidate.len - ".wasm".len]);
     }
     return false;
+}
+
+pub fn registryPinTranscript(out: []u8, pin: RegistryPin) error{NoSpaceLeft}![]const u8 {
+    var digest_hex: [std.crypto.hash.Blake3.digest_length * 2]u8 = undefined;
+    hexLower(pin.blake3[0..], &digest_hex);
+    return std.fmt.bufPrint(out, "name={s}\nblake3={s}\ntier={s}\n", .{
+        pin.name,
+        digest_hex[0..],
+        pin.tier.token(),
+    });
+}
+
+fn hexLower(bytes: []const u8, out: []u8) void {
+    std.debug.assert(out.len >= bytes.len * 2);
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = alphabet[b >> 4];
+        out[i * 2 + 1] = alphabet[b & 0x0f];
+    }
 }
 
 const HostcallContext = struct {
@@ -686,13 +745,16 @@ test "bridge dispatchHook routes hook exports and honors stop return" {
 test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     var mod_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
     std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &mod_digest, .{});
+    var kp = try crypto_sign.KeyPair.fromSeed(@as([crypto_sign.seed_len]u8, @splat(0x31)));
+    defer kp.deinit();
+    const signed_pin = try signedRegistryPin("mod.wasm", mod_digest, .verified, &kp);
 
     var bridge = Bridge.initWithOptions(std.testing.allocator, .{
         .max_plugin_bytes = 4096,
         .max_memory_bytes = 128 * 1024,
         .default_fuel = 1234,
         .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .hooks }),
-        .registry = &.{.{ .name = "mod.wasm", .blake3 = mod_digest, .tier = .verified }},
+        .registry = &.{signed_pin},
         .disabled_plugins = &.{"blocked"},
     });
     defer bridge.deinit();
@@ -707,6 +769,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(info.allowed_caps.has(.hooks));
     try std.testing.expect(!info.allowed_caps.has(.time));
     try std.testing.expectEqual(@as(usize, 1), info.registry_pin_count);
+    try std.testing.expectEqual(@as(usize, 1), info.signed_registry_pin_count);
     try std.testing.expectEqual(@as(usize, 1), info.disabled_plugin_count);
     try std.testing.expectEqual(@as(usize, 2), info.blocked_load_count);
     try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
@@ -719,6 +782,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     const summary = bridge.pluginSummary(0).?;
     try std.testing.expectEqualStrings("mod", summary.name);
     try std.testing.expectEqual(TrustTier.verified, summary.trust_tier);
+    try std.testing.expect(summary.publisher_signed);
     try std.testing.expectEqual(@as(usize, 0), summary.command_count);
     try std.testing.expectEqual(@as(usize, 1), summary.hook_count);
     try std.testing.expect(bridge.pluginSummary(1) == null);
@@ -733,4 +797,59 @@ test "registry pins reject hash mismatches" {
 
     try std.testing.expectError(error.PluginHashMismatch, bridge.loadBytes("guard", &stop_hook_wasm_bytes));
     try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().blocked_load_count);
+}
+
+test "registry pins verify publisher signatures" {
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &digest, .{});
+    var kp = try crypto_sign.KeyPair.fromSeed(@as([crypto_sign.seed_len]u8, @splat(0x41)));
+    defer kp.deinit();
+    var signed_pin = try signedRegistryPin("guard", digest, .verified, &kp);
+
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{signed_pin},
+    });
+    defer bridge.deinit();
+    try bridge.loadBytes("guard", &stop_hook_wasm_bytes);
+    try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().signed_registry_pin_count);
+
+    signed_pin.signature.?[0] ^= 0xff;
+    var rejecting_bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{signed_pin},
+    });
+    defer rejecting_bridge.deinit();
+    try std.testing.expectError(error.PluginSignatureInvalid, rejecting_bridge.loadBytes("guard", &stop_hook_wasm_bytes));
+    try std.testing.expectEqual(@as(usize, 1), rejecting_bridge.runtimeInfo().blocked_load_count);
+}
+
+test "registry pins require complete publisher signature metadata" {
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &digest, .{});
+    var kp = try crypto_sign.KeyPair.fromSeed(@as([crypto_sign.seed_len]u8, @splat(0x51)));
+    defer kp.deinit();
+
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{.{ .name = "guard", .blake3 = digest, .tier = .listed, .publisher = kp.public_key }},
+    });
+    defer bridge.deinit();
+    try std.testing.expectError(error.PluginSignatureIncomplete, bridge.loadBytes("guard", &stop_hook_wasm_bytes));
+    try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().blocked_load_count);
+}
+
+fn signedRegistryPin(
+    name: []const u8,
+    digest: [std.crypto.hash.Blake3.digest_length]u8,
+    tier: TrustTier,
+    keypair: *const crypto_sign.KeyPair,
+) !RegistryPin {
+    var pin = RegistryPin{
+        .name = name,
+        .blake3 = digest,
+        .tier = tier,
+        .publisher = keypair.public_key,
+    };
+    var transcript_buf: [1024]u8 = undefined;
+    const transcript = try registryPinTranscript(&transcript_buf, pin);
+    pin.signature = try keypair.signCtx(registry_signature_domain, transcript);
+    return pin;
 }

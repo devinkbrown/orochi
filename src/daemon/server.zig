@@ -18,6 +18,7 @@ const module_manifest = @import("modules/manifest.zig");
 const mod_registry = @import("registry.zig");
 const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
+const crypto_sign = @import("../crypto/sign.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
@@ -35591,7 +35592,13 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     cfg.wasm_allowed_caps = wasm_abi.CapabilitySet.initMany(&.{ .reply, .hooks });
     var guard_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
     std.crypto.hash.Blake3.hash(wasm_bridge.testing.stop_hook_wasm, &guard_digest, .{});
-    const registry_pins = [_]wasm_bridge.RegistryPin{.{ .name = "guard", .blake3 = guard_digest, .tier = .verified }};
+    var publisher = try crypto_sign.KeyPair.fromSeed(@as([crypto_sign.seed_len]u8, @splat(0x61)));
+    defer publisher.deinit();
+    var registry_pin = wasm_bridge.RegistryPin{ .name = "guard", .blake3 = guard_digest, .tier = .verified, .publisher = publisher.public_key };
+    var transcript_buf: [1024]u8 = undefined;
+    const transcript = try wasm_bridge.registryPinTranscript(&transcript_buf, registry_pin);
+    registry_pin.signature = try publisher.signCtx(wasm_bridge.registry_signature_domain, transcript);
+    const registry_pins = [_]wasm_bridge.RegistryPin{registry_pin};
     cfg.wasm_registry = &registry_pins;
     cfg.wasm_disabled_plugins = &.{"bad"};
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
@@ -35630,7 +35637,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
-    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks registry_pins=1 disabled_plugins=1 blocked_loads=1", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks registry_pins=1 signed_pins=1 disabled_plugins=1 blocked_loads=1", 200);
     try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();
@@ -35640,7 +35647,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");
-    try recvUntil(&admin, "handle=1 name=guard tier=verified commands=0 hooks=1 grants=(none)", 200);
+    try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none)", 200);
 }
 
 test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {

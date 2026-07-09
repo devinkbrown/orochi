@@ -585,7 +585,7 @@ OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format
 | `max_memory_bytes` | integer | `65536` | `65536..16777216` | Maximum linear memory bytes available to one plugin instance. |
 | `default_fuel` | integer | `16384` | `1..10000000` | Instruction fuel budget for each plugin command or hook dispatch. |
 | `allowed_caps` | array of strings | `["reply","log","time"]` | `reply`, `log`, `time`, `rand`, `store`, `lookup`, `hooks` | Hostcall capability classes a plugin may receive after manifest negotiation. Omitted keeps the minimal control-plane set; `[]` denies every hostcall. |
-| `registry` | array of inline tables | `[]` | `{ name, blake3, tier }` | Content-addressed plugin registry pins. When non-empty, only named plugins whose BLAKE3-256 digest matches load. `tier` is `unlisted`, `listed`, or `verified` and is shown in `OROWASM PLUGINS`. |
+| `registry` | array of inline tables | `[]` | `{ name, blake3, tier, publisher, signature }` | Content-addressed plugin registry pins. When non-empty, only named plugins whose BLAKE3-256 digest matches load. `tier` is `unlisted`, `listed`, or `verified` and is shown in `OROWASM PLUGINS`. Optional `publisher` and `signature` are Ed25519 hex fields over the canonical registry pin transcript; when either is set both are required and verified before load. |
 | `disabled_plugins` | array of strings | `[]` | plugin names or `.wasm` filenames | Local plugin kill-switch. Matching names are refused before the file is read and are counted in `OROWASM STATUS` as blocked loads. |
 
 ## `[[opers]]`
