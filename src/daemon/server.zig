@@ -14163,7 +14163,8 @@ pub const LinuxServer = struct {
         return dmHistoryKey(conn.session.displayName(), conn.session.account(), target, peer_account, out) orelse target;
     }
 
-    fn chathistoryChannelVisibleTo(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, target: []const u8) bool {
+    fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
+        if (!world_model.isChannelName(target)) return true;
         const wid = worldIdFromClient(id);
         const channel_exists = self.world.channelExists(target);
         const is_member = self.world.isMember(target, wid);
@@ -14171,13 +14172,12 @@ pub const LinuxServer = struct {
             !self.world.channelHasFlag(target, .secret) and
             !self.world.isPrivate(target) and
             !self.world.isHidden(target);
-        if (!chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible)) return false;
-        return self.historyPolicyAllows(target, is_member, conn.session.isOper());
-    }
-
-    fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
-        if (!world_model.isChannelName(target)) return true;
-        if (self.chathistoryChannelVisibleTo(id, conn, target)) return true;
+        if (!chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible)) {
+            try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
+            return false;
+        }
+        if (self.historyPolicyAllows(target, is_member, conn.session.isOper())) return true;
+        self.publishHistoryPolicyDeny(target, conn);
         try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
         return false;
     }
@@ -26457,6 +26457,16 @@ pub const LinuxServer = struct {
         const held = if (text.len > 200) text[0..200] else text;
         const msg = std.fmt.bufPrint(&buf, "{s} held message from {s}: {s}", .{ channel, conn.session.displayName(), held }) catch return;
         self.publishOperEvent(.policy, .notice, msg) catch {};
+    }
+
+    /// Surface an Aegis-lite history-policy denial to the Event Spine. The client
+    /// still receives the ordinary CHATHISTORY failure; this gives operators a
+    /// structured reason without reporting unrelated hidden/secret channel probes.
+    fn publishHistoryPolicyDeny(self: *LinuxServer, channel: []const u8, conn: *ConnState) void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const policy = @tagName(self.channelHistoryPolicy(channel));
+        const msg = std.fmt.bufPrint(&buf, "{s} CHATHISTORY denied by history-policy={s} for {s}", .{ channel, policy, conn.session.displayName() }) catch return;
+        self.publishOperEventSubject(.policy, .notice, msg, channel) catch {};
     }
 
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
@@ -42302,6 +42312,50 @@ test "threaded server: history-policy prop gates CHATHISTORY for non-members" {
     try recvUntil(&b, "BATCH +1 chathistory #histpolicy", 200);
     try recvUntil(&b, "PRIVMSG #histpolicy :visible-before-policy", 200);
     try recvUntil(&b, "BATCH -1", 200);
+}
+
+test "threaded server: history-policy denial emits POLICY event" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "JOIN #histpolicy-event\r\n");
+    try recvUntil(&a, " 366 A #histpolicy-event ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #histpolicy-event history-policy :members\r\n");
+    try recvUntil(&a, " 819 A #histpolicy-event ", 200);
+
+    try writeAllFd(fd_b, "CAP REQ :draft/chathistory batch\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #histpolicy-event * 10\r\n");
+    try recvUntil(&b, "FAIL CHATHISTORY ACCESS_DENIED", 200);
+    try recvUntil(&a, "#histpolicy-event CHATHISTORY denied by history-policy=members for B", 200);
 }
 
 test "threaded server: draft/event-playback replays TOPIC events only to capable clients" {
