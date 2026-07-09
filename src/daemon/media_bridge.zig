@@ -53,9 +53,15 @@ pub const SendFn = *const fn (ctx: *anyopaque, target: *const Member, bytes: []c
 pub const CrossLegSink = struct {
     ctx: *anyopaque,
     on_native_frame: *const fn (ctx: *anyopaque, channel: []const u8, datagram: []const u8) void,
+    on_native_feedback: ?*const fn (ctx: *anyopaque, channel: []const u8, sender_stream_id: u32, feedback: []const u8) bool = null,
 
     pub fn onNativeFrame(self: CrossLegSink, channel: []const u8, datagram: []const u8) void {
         self.on_native_frame(self.ctx, channel, datagram);
+    }
+
+    pub fn onNativeFeedback(self: CrossLegSink, channel: []const u8, sender_stream_id: u32, feedback: []const u8) bool {
+        const cb = self.on_native_feedback orelse return false;
+        return cb(self.ctx, channel, sender_stream_id, feedback);
     }
 };
 
@@ -311,6 +317,47 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
                     return true;
                 },
                 .other => return false,
+            }
+        }
+
+        /// Translate authenticated native feedback into RTCP and send it to the
+        /// WebRTC publisher named by the native stream id. The authentication
+        /// envelope is stripped by `native_media_transport` before this point.
+        pub fn fanoutNativeFeedbackToWebrtc(self: *Self, sender_stream_id: u32, feedback: []const u8, send_ctx: *anyopaque, send: SendFn) bool {
+            const sender_pid = self.ssrcs.participantForStream(sender_stream_id) orelse return false;
+            const sender = self.memberByStableId(sender_pid) orelse return false;
+            if (sender.leg != .native) return false;
+            const sender_ssrc = self.ssrcs.ssrcForStream(sender_stream_id) orelse sender_stream_id;
+            var seqs32: [max_feedback_seqs]u32 = undefined;
+            const msg = native_feedback.parse(feedback, &seqs32) catch return false;
+            switch (msg) {
+                .keyframe_request => |k| {
+                    const pid = self.ssrcs.participantForStream(k.stream_id) orelse return false;
+                    var target = self.memberByStableId(pid) orelse return false;
+                    if (target.leg != .webrtc) return false;
+                    const ssrc = self.ssrcs.ssrcForStream(k.stream_id) orelse target.ssrc;
+                    var out: [64]u8 = undefined;
+                    const rtcp = rtcp_translate.buildKeyframeRequest(sender_ssrc, ssrc, &out) catch return false;
+                    send(send_ctx, &target, rtcp);
+                    return true;
+                },
+                .nack => |nack| {
+                    const pid = self.ssrcs.participantForStream(nack.stream_id) orelse return false;
+                    var target = self.memberByStableId(pid) orelse return false;
+                    if (target.leg != .webrtc) return false;
+                    if (nack.seqs.len == 0 or nack.seqs.len > max_feedback_seqs) return false;
+                    const ssrc = self.ssrcs.ssrcForStream(nack.stream_id) orelse target.ssrc;
+                    var seqs16: [max_feedback_seqs]u16 = undefined;
+                    for (nack.seqs, 0..) |seq, i| {
+                        if (seq > std.math.maxInt(u16)) return false;
+                        seqs16[i] = @intCast(seq);
+                    }
+                    var out: [12 + max_feedback_seqs * 4]u8 = undefined;
+                    const rtcp = rtcp_translate.buildNack(sender_ssrc, ssrc, seqs16[0..nack.seqs.len], &out) catch return false;
+                    send(send_ctx, &target, rtcp);
+                    return true;
+                },
+                .receiver_report => return false,
             }
         }
 
@@ -612,6 +659,72 @@ test "feedback translates WebRTC NACK to native NACK" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "feedback translates authenticated native keyframe request to WebRTC PLI" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var fb_buf: [64]u8 = undefined;
+    const fb = try native_feedback.encodeKeyframeRequest(0xB200, &fb_buf);
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(br.fanoutNativeFeedbackToWebrtc(100, fb, &ctx, FeedbackCaptureCtx.send));
+    try testing.expectEqualStrings("mob", ctx.target());
+    try testing.expectEqual(@as(u32, 0xA100), std.mem.readInt(u32, ctx.written()[4..8], .big));
+
+    var seq_out: [4]u16 = undefined;
+    const rtcp = try rtcp_translate.parse(ctx.written(), &seq_out);
+    switch (rtcp) {
+        .keyframe_request => |k| try testing.expectEqual(@as(u32, 0xB200), k.media_ssrc),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "feedback translates authenticated native NACK to WebRTC NACK" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var fb_buf: [64]u8 = undefined;
+    const fb = try native_feedback.encodeNack(0xB200, &.{ 30, 31 }, &fb_buf);
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(br.fanoutNativeFeedbackToWebrtc(100, fb, &ctx, FeedbackCaptureCtx.send));
+    try testing.expectEqual(@as(u32, 0xA100), std.mem.readInt(u32, ctx.written()[4..8], .big));
+
+    var seq_out: [4]u16 = undefined;
+    const rtcp = try rtcp_translate.parse(ctx.written(), &seq_out);
+    switch (rtcp) {
+        .nack => |n| {
+            try testing.expectEqual(@as(u32, 0xB200), n.media_ssrc);
+            try testing.expectEqualSlices(u16, &.{ 30, 31 }, n.seqs);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "feedback rejects native NACK sequences outside RTP range" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var fb_buf: [64]u8 = undefined;
+    const fb = try native_feedback.encodeNack(0xB200, &.{std.math.maxInt(u16) + 1}, &fb_buf);
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(!br.fanoutNativeFeedbackToWebrtc(100, fb, &ctx, FeedbackCaptureCtx.send));
+    try testing.expectEqual(@as(usize, 0), ctx.count);
 }
 
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {

@@ -102,6 +102,21 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return null;
         }
 
+        /// Bind or verify the transport address for `stream_id`. Used by native
+        /// control feedback, which does not carry a kagura frame but still needs
+        /// the same anti-spoofing address ownership as media datagrams.
+        pub fn bindAddressForStream(self: *Self, stream_id: u32, from: TransportAddress) bool {
+            for (self.entries[0..self.len]) |*e| {
+                if (e.live and e.stream_id == stream_id) {
+                    if (e.addr_bound and !e.addr.eql(from)) return false;
+                    e.addr = from;
+                    e.addr_bound = true;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /// Register (or update) a participant: join the forwarding session and
         /// record its publishing `stream_id` and current `TransportAddress`.
         /// Re-registering the same id updates its address/stream/kind in place.

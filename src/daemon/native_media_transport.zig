@@ -22,6 +22,7 @@ const native_media_link = @import("native_media_link.zig");
 const media_bridge = @import("media_bridge.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
+const native_feedback = @import("../substrate/native_feedback.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
 pub const TransportAddress = native_media_link.TransportAddress;
@@ -152,6 +153,10 @@ pub const NativeMediaTransport = struct {
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
             // Require kagura framing so the port is not an open UDP reflector.
             if (got.data.len > self.max_frame_bytes) continue;
+            if (native_feedback.isEnvelope(got.data)) {
+                self.handleFeedback(got.from, got.data);
+                continue;
+            }
             if (got.data.len < kagura_frame.MIN_FRAME_WIRE_BYTES) continue;
             const frame_bytes = kagura_frame.authenticatedFrameBytes(got.data) catch continue;
             const view = kagura_frame.decode(frame_bytes) catch continue;
@@ -190,6 +195,46 @@ pub const NativeMediaTransport = struct {
                 if (self.cross) |sink| sink.onNativeFrame(chanbuf[0..chanlen], bridge_datagram);
             }
         }
+    }
+
+    fn handleFeedback(self: *NativeMediaTransport, from: TransportAddress, datagram: []const u8) void {
+        if (!self.mac_key_configured) return;
+        const peek = native_feedback.peekEnvelope(datagram) catch return;
+
+        var channel_buf: [256]u8 = undefined;
+        var channel_len: usize = 0;
+        var participant_buf: [64]u8 = undefined;
+        var participant_len: usize = 0;
+        lockSpin(&self.mutex);
+        if (self.stream_index.get(peek.sender_stream_id)) |channel| {
+            if (channel.len <= channel_buf.len) {
+                if (self.channels.getPtr(channel)) |link| {
+                    if (link.idForStream(peek.sender_stream_id)) |participant| {
+                        if (participant.len <= participant_buf.len and link.bindAddressForStream(peek.sender_stream_id, from)) {
+                            @memcpy(channel_buf[0..channel.len], channel);
+                            channel_len = channel.len;
+                            @memcpy(participant_buf[0..participant.len], participant);
+                            participant_len = participant.len;
+                        }
+                    }
+                }
+            }
+        }
+        self.mutex.unlock();
+        if (channel_len == 0 or participant_len == 0) return;
+
+        var key: [native_feedback.envelope_key_len]u8 = undefined;
+        kagura_frame.deriveNativeMediaMacKey(
+            &self.mac_stream_key,
+            channel_buf[0..channel_len],
+            participant_buf[0..participant_len],
+            &key,
+        );
+        defer std.crypto.secureZero(u8, key[0..]);
+        const opened = native_feedback.openEnvelope(datagram, &key) catch return;
+        if (opened.sender_stream_id != peek.sender_stream_id) return;
+
+        if (self.cross) |sink| _ = sink.onNativeFeedback(channel_buf[0..channel_len], opened.sender_stream_id, opened.payload);
     }
 
     fn authenticateDatagram(
@@ -588,6 +633,21 @@ const TestXCtx = struct {
     }
 };
 
+const TestFeedbackCtx = struct {
+    sock: *MediaSocket,
+    dest: TransportAddress,
+
+    fn onNativeFrame(_: *anyopaque, _: []const u8, _: []const u8) void {}
+
+    fn onNativeFeedback(ctx: *anyopaque, channel: []const u8, sender_stream_id: u32, feedback: []const u8) bool {
+        _ = sender_stream_id;
+        if (!std.mem.eql(u8, channel, "#call")) return false;
+        const self: *TestFeedbackCtx = @ptrCast(@alignCast(ctx));
+        self.sock.sendTo(self.dest, feedback);
+        return true;
+    }
+};
+
 test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RTP" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
@@ -621,6 +681,85 @@ test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RT
     const got = mob.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, rtp_profile.header_len + 4), got.data.len);
     try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, got.data[rtp_profile.header_len..]);
+}
+
+test "NativeMediaTransport: pump accepts authenticated native feedback envelope" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const root = @as([16]u8, @splat(0x4B));
+    nmt.configureMac(&root, false);
+
+    var capture = try MediaSocket.bind(loopback_be, 0);
+    defer capture.deinit();
+    capture.setRecvTimeoutMs(2000);
+    const capture_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try capture.localPort());
+
+    var feedback_ctx = TestFeedbackCtx{ .sock = &capture, .dest = capture_addr };
+    nmt.setCrossLegSink(.{
+        .ctx = &feedback_ctx,
+        .on_native_frame = TestFeedbackCtx.onNativeFrame,
+        .on_native_feedback = TestFeedbackCtx.onNativeFeedback,
+    });
+    try nmt.start(loopback_be, 0);
+
+    try nmt.register("#call", "alice", .voice, 100, .{});
+
+    var key: [native_feedback.envelope_key_len]u8 = undefined;
+    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    defer std.crypto.secureZero(u8, key[0..]);
+
+    var payload_buf: [32]u8 = undefined;
+    const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);
+    var env_buf: [96]u8 = undefined;
+    const envelope = try native_feedback.encodeEnvelope(100, payload, &key, &env_buf);
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    alice.sendTo(server_addr, envelope);
+
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+    const got = capture.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, payload, got.data);
+}
+
+test "NativeMediaTransport: pump rejects native feedback with a bad tag" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const root = @as([16]u8, @splat(0x4B));
+    nmt.configureMac(&root, false);
+
+    var capture = try MediaSocket.bind(loopback_be, 0);
+    defer capture.deinit();
+    capture.setRecvTimeoutMs(400);
+    const capture_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try capture.localPort());
+
+    var feedback_ctx = TestFeedbackCtx{ .sock = &capture, .dest = capture_addr };
+    nmt.setCrossLegSink(.{
+        .ctx = &feedback_ctx,
+        .on_native_frame = TestFeedbackCtx.onNativeFrame,
+        .on_native_feedback = TestFeedbackCtx.onNativeFeedback,
+    });
+    try nmt.start(loopback_be, 0);
+    try nmt.register("#call", "alice", .voice, 100, .{});
+
+    var key: [native_feedback.envelope_key_len]u8 = undefined;
+    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    defer std.crypto.secureZero(u8, key[0..]);
+
+    var payload_buf: [32]u8 = undefined;
+    const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);
+    var env_buf: [96]u8 = undefined;
+    const envelope = try native_feedback.encodeEnvelope(100, payload, &key, &env_buf);
+    env_buf[envelope.len - 1] ^= 0x80;
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    alice.sendTo(server_addr, envelope);
+
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+    try testing.expect(capture.recvFrom(&rbuf) == null);
 }
 
 test "NativeMediaTransport: start/shutdown is clean and re-startable" {

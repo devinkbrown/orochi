@@ -20,7 +20,7 @@ When verification is on, the server advertises `mac=hmac-sha256-128` on the
 targeted native-media `EVENT <nick> MEDIA NATIVE …` line. Clients should tag when
 they see this.
 
-## Wire format
+## Media frame wire format
 
 A 16-byte MAC tag is appended after the Kagura frame; it is not included in the
 frame's `payload-length` prefix:
@@ -70,3 +70,30 @@ participant ids cannot contain NUL), giving sound domain separation.
 - Truncating HMAC-SHA256 to 128 bits is standard (RFC 2104 §5) and ample for an
   online media MAC.
 - The key never appears in a datagram; only the 16-byte tag is transmitted.
+
+## Native feedback envelope
+
+Native control-plane feedback is always authenticated, independent of
+`native_media_require_mac`, and is not encoded as a Kagura media frame. Clients
+wrap `native_feedback` payloads in this envelope:
+
+```text
+[ "ONFB" magic              ]  4 bytes
+[ version                  ]  u8, currently 1
+[ sender_stream_id         ]  u32be
+[ payload_len              ]  u16be
+[ native_feedback payload  ]  payload_len bytes
+[ mac_tag                  ]  16 bytes
+```
+
+The MAC input is every byte before `mac_tag`:
+
+```text
+mac_tag = HMAC-SHA256(mac_key, envelope_without_tag)[0..16]
+```
+
+`sender_stream_id` identifies the participant whose per-participant MAC key
+verifies the envelope and whose source address is learned/checked. The payload's
+own `stream_id` remains the target media stream that needs a keyframe, NACK, or
+receiver report. Bad magic, version, sender stream, address ownership, or tag
+drops the feedback datagram without affecting the IRC session or media call.

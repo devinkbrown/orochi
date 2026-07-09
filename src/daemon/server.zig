@@ -205,6 +205,15 @@ fn bridgeSendToWebrtc(ctx: *anyopaque, target: *const media_bridge_mod.Member, b
         s.server.media_plane.sendTo(addr, bytes);
 }
 
+/// Resolve a WebRTC target's live address and send canonical RTCP feedback
+/// there. DTLS-SRTP egress fails closed inside MediaPlane until the pump owns a
+/// queued protected-RTCP send path.
+fn bridgeSendFeedbackToWebrtc(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
+    const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
+    if (s.server.media_plane.remoteFor(s.channel, target.id())) |addr|
+        s.server.media_plane.sendRtcpTo(addr, bytes);
+}
+
 /// Cross-leg sink invoked by the native pump: rewrap the native frame to RTP and
 /// fan it out to the channel's WebRTC members (live addresses resolved per peer).
 fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u8) void {
@@ -214,6 +223,17 @@ fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u
     const br = self.media_bridges.getPtr(channel) orelse return;
     var sctx = BridgeSendCtx{ .server = self, .channel = channel };
     br.fanoutNativeToWebrtc(datagram, &sctx, bridgeSendToWebrtc);
+}
+
+/// Cross-leg sink invoked by the native pump for authenticated native feedback:
+/// translate keyframe/NACK control intent into RTCP for the WebRTC publisher.
+fn bridgeOnNativeFeedback(ctx: *anyopaque, channel: []const u8, sender_stream_id: u32, feedback: []const u8) bool {
+    const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+    lockSpin(&self.media_bridges_mu);
+    defer self.media_bridges_mu.unlock();
+    const br = self.media_bridges.getPtr(channel) orelse return false;
+    var sctx = BridgeSendCtx{ .server = self, .channel = channel };
+    return br.fanoutNativeFeedbackToWebrtc(sender_stream_id, feedback, &sctx, bridgeSendFeedbackToWebrtc);
 }
 
 /// Resolve a native target's learned address from the native transport and send
@@ -3579,7 +3599,7 @@ pub const LinuxServer = struct {
             if (self.native_media.port != 0) {
                 srvLog("orochi: native media on UDP :{d} (codec KaguraVox/KaguraVis)\n", .{self.native_media.port});
                 // Bridge native frames to any opt-in WebRTC members of each channel.
-                self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
+                self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback });
             }
 
             // Opt-in DTLS-SRTP termination (RFC 5764). Off = byte-identical pump.

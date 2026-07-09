@@ -79,11 +79,13 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live per-target bridge policy (wired) | Cross-leg fanout resolves the source participant through `ssrc_map` and asks `kakehashi_session.forwardTargets` for connected egress targets before rewrapping. |
 | Live ABR-driven simulcast selection (wired) | `MEDIA ABR` accepts receiver BWE/loss/RTT/NACK reports, runs the Suimyaku ABR hint through `simulcast_select`, and applies the result as the receiver's native layer ceiling without decoding or transcoding media. |
 | Live WebRTC-to-native feedback bridge (wired) | The WebRTC media plane now feeds decrypted RTCP PLI/FIR/NACK through `rtcp_translate`, maps media SSRCs through the bridge `ssrc_map`, encodes `native_feedback`, and sends it only to the native publisher. |
+| Live authenticated native-origin feedback ingress (wired) | The native UDP pump accepts `ONFB` feedback envelopes signed with the participant's native-media MAC key, verifies sender stream/address ownership, and translates native PLI/NACK into RTCP for the WebRTC publisher. |
 
 ## Remaining live wiring
 
-1. **Native-origin feedback ingress:** add an authenticated native control
-   envelope before accepting native feedback into the live WebRTC RTCP path.
+1. **Protected RTCP egress from non-pump threads:** queue native-origin RTCP
+   feedback through the media pump so DTLS-SRTP recipients receive SRTCP; the
+   current cross-thread helper fails closed when DTLS-SRTP is enabled.
 
 ## Non-goals
 

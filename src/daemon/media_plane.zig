@@ -708,6 +708,14 @@ pub const MediaPlane = struct {
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
 
+    /// Send canonical RTCP to a WebRTC peer from outside the media pump. The
+    /// DTLS/SRTCP crypto hub is pump-thread-owned, so cross-thread RTCP egress
+    /// fails closed when DTLS-SRTP is enabled rather than leaking plaintext.
+    pub fn sendRtcpTo(self: *MediaPlane, dest: TransportAddress, bytes: []const u8) void {
+        if (self.dtls_enabled) return;
+        if (self.socket) |*s| s.sendTo(dest, bytes);
+    }
+
     /// The bound remote address of a WebRTC participant (learned via STUN), or
     /// null if unknown/unbound. Lets the cross-leg sink resolve a live target
     /// address rather than a stale one.
@@ -974,6 +982,34 @@ test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound Web
     var got_buf: [media_socket.max_datagram]u8 = undefined;
     const got = capture.recvFrom(&got_buf) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, pli, got.data);
+}
+
+test "MediaPlane: cross-thread RTCP egress sends plaintext only when DTLS is off" {
+    var capture = try MediaSocket.bind(loopback_be, 0);
+    defer capture.deinit();
+    capture.setRecvTimeoutMs(400);
+    const capture_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try capture.localPort());
+    const rtcp = [_]u8{ 0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2 };
+
+    {
+        var plane = MediaPlane.init(testing.allocator);
+        defer plane.deinit();
+        try plane.start(loopback_be, 0);
+        plane.sendRtcpTo(capture_addr, &rtcp);
+        var got_buf: [media_socket.max_datagram]u8 = undefined;
+        const got = capture.recvFrom(&got_buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, &rtcp, got.data);
+    }
+
+    {
+        var plane = MediaPlane.init(testing.allocator);
+        defer plane.deinit();
+        plane.dtls_enabled = true;
+        try plane.start(loopback_be, 0);
+        plane.sendRtcpTo(capture_addr, &rtcp);
+        var got_buf: [media_socket.max_datagram]u8 = undefined;
+        try testing.expect(capture.recvFrom(&got_buf) == null);
+    }
 }
 
 /// Drive a DTLS 1.2 client handshake to completion against the live pump and
