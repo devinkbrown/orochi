@@ -49,6 +49,29 @@ what is implemented.
 | Session reclaim | Canonical length-prefixed fields with trailing HMAC-SHA256 tag. | `src/proto/session_reclaim_mesh.zig:1`, `src/proto/session_reclaim_mesh.zig:8`, `src/proto/session_reclaim_mesh.zig:9`, `src/proto/session_reclaim_mesh.zig:19` |
 | CoilPack | Canonical self-describing binary atoms and a canonical value layer for stable signing. | `src/proto/coilpack.zig:1`, `src/proto/coilpack.zig:3`, `src/proto/coilpack.zig:5`, `src/proto/coilpack_value.zig:1`, `src/proto/coilpack_value.zig:10`, `src/proto/coilpack_value.zig:11` |
 
+## Account key transparency
+
+`src/daemon/key_transparency.zig` is the server-side substrate for verifiable
+account identity. It defines credential events for CERTFP and WebAuthn/passkey
+bind/delete mutations, hashes each event with BLAKE3 under the
+`OROCHI-KT-EVENT-v1` domain, length-frames account and key identifiers, and
+appends the resulting leaf to the existing Merkle Mountain Range substrate
+(`src/daemon/key_transparency.zig:19`, `src/daemon/key_transparency.zig:24`,
+`src/daemon/key_transparency.zig:29`, `src/daemon/key_transparency.zig:49`,
+`src/daemon/key_transparency.zig:69`, `src/daemon/key_transparency.zig:85`,
+`src/daemon/key_transparency.zig:105`).
+
+The services layer can attach a `KeyTransparencyLog`; when attached, CERTFP
+bind/delete and WebAuthn bind/delete append canonical events under the services
+mutation lock (`src/daemon/services.zig:437`, `src/daemon/services.zig:439`,
+`src/daemon/services.zig:477`, `src/daemon/services.zig:623`,
+`src/daemon/services.zig:774`, `src/daemon/services.zig:2431`). WebAuthn events
+hash the raw COSE public key material, while CERTFP events hash the fingerprint
+string. This is not yet exposed as a client command, gossip feed, or public
+audit API; current source provides the append log, root, and inclusion-proof
+verification primitives (`src/daemon/key_transparency.zig:65`,
+`src/daemon/key_transparency.zig:80`, `src/daemon/key_transparency.zig:105`).
+
 ## Node identity
 
 `src/daemon/node_identity.zig` derives all live Tsumugi identity material from

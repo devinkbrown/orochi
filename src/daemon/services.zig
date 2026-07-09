@@ -10,6 +10,7 @@ const scram_store_mod = @import("scram_store.zig");
 const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn_creds = @import("webauthn_creds.zig");
+const key_transparency = @import("key_transparency.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
@@ -401,6 +402,10 @@ pub const Services = struct {
     /// In-memory companion (see certfp_bind.zig); null = EXTERNAL has nothing to
     /// match and fails closed.
     certfp_binds: ?*certfp_bind_mod.CertfpBindStore = null,
+    /// Optional append-only key-transparency log for account credential changes.
+    /// The log must outlive `self`; append failures are non-fatal until the log is
+    /// exposed as a client/operator contract.
+    key_transparency: ?*key_transparency.KeyTransparencyLog = null,
     lock: rwlock.RwLock = .{},
 
     pub fn init(store: *OroStore, state: ?StateHook) Services {
@@ -427,6 +432,15 @@ pub const Services = struct {
         defer self.lock.unlockExclusive();
 
         self.certfp_binds = binds;
+    }
+
+    /// Attach the account credential transparency log. Credential mutations
+    /// append canonical events under the services lock.
+    pub fn attachKeyTransparencyLog(self: *Services, log: *key_transparency.KeyTransparencyLog) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        self.key_transparency = log;
     }
 
     /// Force the backing OroStore into a compact snapshot for external backup.
@@ -460,6 +474,7 @@ pub const Services = struct {
             self.store.family(.props).put(k, account) catch {};
         }
         self.addCertfpListEntry(account, fingerprint) catch {};
+        self.recordKeyTransparency(account, .certfp, .bind, fingerprint, fingerprint, 0);
     }
 
     /// List certfps bound to `account` by CERTADD. Output slices borrow durable
@@ -497,6 +512,7 @@ pub const Services = struct {
         var fp_key_buf: [certfp_key_max]u8 = undefined;
         if (certfpKey(&fp_key_buf, fingerprint)) |fp_key| self.store.family(.props).delete(fp_key) catch {};
         try self.removeCertfpListEntry(key.asSlice(), fingerprint);
+        self.recordKeyTransparency(key.asSlice(), .certfp, .delete, fingerprint, fingerprint, 0);
     }
 
     // -- WebAuthn (passkey) credentials --------------------------------------
@@ -604,6 +620,7 @@ pub const Services = struct {
             self.store.family(.props).delete(cred_key) catch {};
             return e;
         };
+        self.recordKeyTransparency(key.asSlice(), .webauthn, .bind, cred_id_b64, cose_key, now_unix * 1000);
     }
 
     /// Look up a credential by id, copying its account, COSE key, counter, and
@@ -741,6 +758,8 @@ pub const Services = struct {
         const value = self.store.family(.props).get(cred_key) orelse return error.NotFound;
         const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
         if (!std.ascii.eqlIgnoreCase(rec.account, key.asSlice())) return error.Forbidden;
+        var cose_key_buf: [webauthn_creds.max_cose_key_bytes]u8 = undefined;
+        const cose_key = rec.decodeCoseKey(&cose_key_buf) catch return error.InvalidRecord;
 
         // Remove from the list, then delete the record.
         var new_list_buf: [webauthn_creds.account_list_value_max]u8 = undefined;
@@ -752,6 +771,7 @@ pub const Services = struct {
             try self.store.family(.props).put(list_key, new_list);
         }
         self.store.family(.props).delete(cred_key) catch {};
+        self.recordKeyTransparency(key.asSlice(), .webauthn, .delete, target, cose_key, 0);
     }
 
     /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
@@ -2408,6 +2428,26 @@ pub const Services = struct {
         }
     }
 
+    fn recordKeyTransparency(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        timestamp_ms: i64,
+    ) void {
+        const log = self.key_transparency orelse return;
+        _ = log.append(.{
+            .account = account,
+            .kind = kind,
+            .action = action,
+            .key_id = key_id,
+            .key_hash = key_transparency.materialHash(material),
+            .timestamp_ms = timestamp_ms,
+        }) catch {};
+    }
+
     fn accountSuspendedUnlocked(self: *Services, account: []const u8) ServiceError!bool {
         const key = try accountKey(account);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse return false;
@@ -3471,6 +3511,41 @@ test "certfp list and delete enforce account ownership" {
     listed = try services.listCertfps("alice", listed_buf[0..]);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
     try std.testing.expect(services.accountForCertfp(fp_alice) == null);
+}
+
+test "key transparency log records certfp and passkey binding changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-key-transparency.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+    services.attachKeyTransparencyLog(&kt);
+
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01 };
+    try services.bindCertfp("Alice", fp);
+    try services.webauthnBind("Alice", "credAAA", &cose, 5, "phone", 1_700_000_000);
+    try services.webauthnDelete("Alice", "credAAA");
+    try services.deleteCertfp("Alice", fp);
+
+    try std.testing.expectEqual(@as(usize, 4), kt.len());
+    const root = kt.root();
+    const webauthn_bind = key_transparency.Event{
+        .account = "alice",
+        .kind = .webauthn,
+        .action = .bind,
+        .key_id = "credAAA",
+        .key_hash = key_transparency.materialHash(&cose),
+        .timestamp_ms = 1_700_000_000_000,
+    };
+    var proof = try kt.proof(1);
+    defer proof.deinit(std.testing.allocator);
+    try std.testing.expect(key_transparency.verifyInclusion(root, webauthn_bind, proof, 1, kt.len()));
 }
 
 test "webauthn bind/lookup/list/delete round-trip" {

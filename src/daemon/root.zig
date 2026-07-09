@@ -140,9 +140,11 @@ pub const world = @import("world.zig");
 // Subsystem packages in subdirectories that genroots does not auto-import
 // (modules/ has no root.zig; helix/ is auto-imported by genroots).
 pub const module_manifest = @import("modules/manifest.zig");
+pub const key_transparency = @import("key_transparency.zig");
 
 test {
     _ = module_manifest;
+    _ = key_transparency;
     // gen:tests:begin
     _ = account_verify;
     _ = acme_cli;
