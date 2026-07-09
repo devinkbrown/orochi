@@ -201,6 +201,17 @@ early_data_max_size = 0
 # RFC 7250 server raw public keys. Off keeps the normal X.509 Certificate path;
 # on lets clients that explicitly offer RawPublicKey receive the leaf SPKI.
 raw_public_key = false
+# Linux kTLS offload intent: "off", "tx", or "txrx". The daemon only enables it
+# when the running kernel advertises the TLS ULP; otherwise TLS stays userspace.
+ktls = "off"
+# Additional SNI-selectable certificates. Each entry is loaded with the same
+# cert/key loader as the default certificate and is validated before the TLS
+# listener is wired. A bad entry disables TLS startup rather than running with a
+# partial certificate set.
+# [[tls.sni]]
+# server_names = ["irc.example.net", "*.example.net"]
+# cert_path = "/etc/orochi/tls/example.pem"
+# key_path  = "/etc/orochi/tls/example.key"
 # Server-side Encrypted Client Hello acceptance. The ECHConfigList is published
 # out-of-band (for example DNS HTTPS RR); the daemon only consumes the local copy
 # and the matching X25519 HPKE private key. Omit to keep ECH off.
