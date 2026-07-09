@@ -300,6 +300,13 @@ configured (`src/daemon/server.zig:2582`, `src/daemon/server.zig:2583`,
 `src/daemon/server.zig:6327`, `src/daemon/server.zig:6330`,
 `src/daemon/server.zig:6335`, `src/daemon/server.zig:6338`).
 
+Inside the CRDT peer driver, secured links pass the node Ed25519 signing key into
+`S2sPeer`, which advertises `frame_signing` and signs direct-owned state frames.
+`mesh.require_signed_frames` defaults true: when this node has a signing key, a
+remote peer that does not advertise signing is rejected during handshake, and
+unsigned direct-owned state frames are dropped unless the operator explicitly
+sets that key false for a mixed rollout (`src/substrate/suimyaku/s2s_peer.zig`).
+
 ## opssl TLS library and daemon use
 
 In Orochi naming, "opssl" refers to the pure-Zig successor library in

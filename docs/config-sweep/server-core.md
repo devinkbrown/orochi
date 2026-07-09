@@ -61,6 +61,7 @@ intentionally not lifted via TOML.
 | server.zig | `Config.mesh_admission_token` | `""` | local signed MeshPass token sent inside encrypted Tsumugi M1 | `mesh.admission_token` *(schema-backed)* | hex/base64 string | "" | decoded 1..448 bytes |
 | server.zig | `Config.mesh_admission_roots` | `[]` | MeshPass signer roots that switch secured-S2S responder admission to signed-token verification | `mesh.admission_roots` *(schema-backed)* | array(string) | [] | 32-byte keys |
 | server.zig | `Config.mesh_admission_min_revocation_epoch` | `0` | minimum accepted MeshPass token revocation epoch | `mesh.admission_min_revocation_epoch` *(schema-backed)* | uint | 0 | 0..u64 max |
+| s2s_peer.zig | `Config.require_signed_frames` | `true` | require signing-capable secured peers and reject unsigned direct-owned mesh state frames | `mesh.require_signed_frames` *(schema-backed)* | bool | true | true/false |
 
 ## [reputation]: IP-reputation penalty weights
 

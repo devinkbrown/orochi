@@ -304,6 +304,10 @@ pub const Config = struct {
         /// is permitted; if secured S2S is unavailable, all S2S is dropped rather
         /// than falling back to clear. Default false keeps the plaintext fallback.
         require_secured: bool = false,
+        /// When a secured S2S link has a node signing key, require the remote
+        /// peer to advertise signed-frame support and reject unsigned state
+        /// frames. Default true; explicit false keeps the old mixed-rollout path.
+        require_signed_frames: bool = true,
     };
 
     pub const Limits = struct {
@@ -1013,7 +1017,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
     if (doc.getBool("mesh.require_secured")) |b| cfg.mesh.require_secured = b;
+    if (doc.getBool("mesh.require_signed_frames")) |b| cfg.mesh.require_signed_frames = b;
     try parseMeshS2sConfig(doc, &cfg.mesh.s2s);
+    cfg.mesh.s2s.require_signed_frames = cfg.mesh.require_signed_frames;
 
     // [dnsbl]
     if (doc.getBool("dnsbl.enabled")) |b| cfg.dnsbl.enabled = b;
@@ -2216,11 +2222,14 @@ test "parseToml: [mesh].require_secured projects onto Config and defaults false"
             \\[mesh]
             \\realm = "ircxnet"
             \\require_secured = true
+            \\require_signed_frames = false
             \\
         ;
         var cfg = try parseToml(allocator, text, .{});
         defer cfg.deinit(allocator);
         try testing.expect(cfg.mesh.require_secured);
+        try testing.expect(!cfg.mesh.require_signed_frames);
+        try testing.expect(!cfg.mesh.s2s.require_signed_frames);
     }
     // Omitted → backward-compatible default (plaintext fallback allowed).
     {
@@ -2236,6 +2245,8 @@ test "parseToml: [mesh].require_secured projects onto Config and defaults false"
         var cfg = try parseToml(allocator, text, .{});
         defer cfg.deinit(allocator);
         try testing.expect(!cfg.mesh.require_secured);
+        try testing.expect(cfg.mesh.require_signed_frames);
+        try testing.expect(cfg.mesh.s2s.require_signed_frames);
     }
 }
 

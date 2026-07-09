@@ -101,6 +101,10 @@ pub const Config = struct {
     },
     registry: server_registry.Config = .{},
     routes: route_table.Config = .{},
+    /// When this peer has a node signing key, require the remote handshake to
+    /// advertise frame signing and reject unsigned direct-owned state frames.
+    /// Plaintext peers with no signing key cannot enforce this gate.
+    require_signed_frames: bool = true,
 
     /// Consolidated applier for the EFFECTIVE production path
     /// (`s2s_peer` → `link_session` → peer-link/gossip/swim/burst). Overlays
@@ -119,6 +123,7 @@ pub const Config = struct {
         cfg.link.applyToml(doc);
         cfg.registry.applyToml(doc);
         cfg.routes.applyToml(doc);
+        if (doc.getBool("mesh.require_signed_frames")) |b| cfg.require_signed_frames = b;
     }
 };
 
@@ -138,7 +143,7 @@ pub const Options = struct {
     /// of direct-owned state frames. When set (secured links pass the node
     /// identity's key), this peer advertises `frame_signing` in its handshake and
     /// signs every in-scope outbound frame; receivers self-certify the origin.
-    /// Null (plaintext links) keeps the legacy unsigned path unchanged.
+    /// Null (plaintext links) cannot enforce `require_signed_frames`.
     ///
     /// INVARIANT for self-certification to hold: when a key is supplied,
     /// `local_node_id` MUST equal `signed_frame.originShortId(key.public_key)`
@@ -363,6 +368,10 @@ pub const S2sPeer = struct {
     /// replica. The caller must send a RESYNC to the peer to refill the converged
     /// roster/props/topics, and re-burst its own local state.
     pub fn resumeEstablished(options: Options, hdr: ResumeHeader, remote_name: []const u8, now_ms: u64, rng_seed: u64) !S2sPeer {
+        if (options.config.require_signed_frames and options.signing_key != null and !hdr.peer_supports_signing) {
+            return error.SignedFramesRequired;
+        }
+
         const server_name = try options.allocator.dupe(u8, options.server_name);
         errdefer options.allocator.free(server_name);
         const description = try options.allocator.dupe(u8, options.description);
@@ -1175,14 +1184,20 @@ pub const S2sPeer = struct {
         return false;
     }
 
+    fn signedFramesRequired(self: *const S2sPeer) bool {
+        return self.config.require_signed_frames and self.signing_key != null;
+    }
+
     /// Emit an in-scope direct-owned frame, wrapping it in a `signed_frame`
     /// envelope (origin pubkey + signature over `type ++ payload`) when the peer
-    /// advertised signing AND we hold a signing key. Otherwise it is emitted
-    /// exactly as before (legacy unsigned path) so non-signing peers see no
-    /// change. The wrap allocates a `header_len`-larger scratch; on any wrap
-    /// failure we fall back to faulting the link (the caller's `try`).
+    /// advertised signing AND we hold a signing key. If signing is required, a
+    /// non-signing peer faults instead of receiving unsigned state. Otherwise it
+    /// is emitted as before for explicitly-permitted unsigned deployments. The
+    /// wrap allocates a `header_len`-larger scratch; on any wrap failure we fall
+    /// back to faulting the link (the caller's `try`).
     fn emitSignable(self: *S2sPeer, sink: ByteSink, frame_type: s2s_frame.FrameType, payload: []const u8) !void {
         if (!self.peer_supports_signing or self.signing_key == null) {
+            if (self.signedFramesRequired()) return error.SignedFramesRequired;
             return emitFrame(self.allocator, sink, frame_type, payload);
         }
         const kp = &self.signing_key.?;
@@ -1201,9 +1216,16 @@ pub const S2sPeer = struct {
     ///   * the self-certified origin `shortId(nodeIdFromPublicKey(pubkey))` did
     ///     not equal the remote peer's authenticated node id.
     /// Every rejection increments the signature-audit counter. For a non-signing
-    /// peer the raw payload is returned unchanged (legacy path, no regression).
+    /// peer the raw payload is returned unchanged only when unsigned operation is
+    /// explicitly permitted.
     fn verifiedPayload(self: *S2sPeer, frame_type: s2s_frame.FrameType, payload: []const u8) ?[]const u8 {
-        if (!self.peer_supports_signing) return payload; // legacy unsigned peer
+        if (!self.peer_supports_signing) {
+            if (self.signedFramesRequired()) {
+                self.rejected_signature_frames +|= 1;
+                return null;
+            }
+            return payload;
+        }
         const u = signed_frame.unwrap(payload) catch {
             // A signing-capable peer's in-scope frame MUST be a signed envelope.
             self.rejected_signature_frames +|= 1;
@@ -1972,6 +1994,9 @@ pub const S2sPeer = struct {
         self.peer_supports_account = (hs.caps & cap_member_account) != 0;
         self.peer_supports_oper_info = (hs.caps & cap_member_oper_info) != 0;
         self.peer_supports_repair = (hs.caps & cap_repair_frames) != 0;
+        if (self.signedFramesRequired() and !self.peer_supports_signing) {
+            return error.SignedFramesRequired;
+        }
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);
@@ -2839,6 +2864,8 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
         \\[mesh.link]
         \\gossip_interval_ms = 1750
         \\idle_timeout_ms = 90000
+        \\[mesh]
+        \\require_signed_frames = false
         \\[mesh.routing]
         \\max_servers = 256
         \\max_nicks = 2048
@@ -2853,6 +2880,7 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
     // [mesh.link] session cadence + transport.
     try std.testing.expectEqual(@as(u64, 1750), cfg.link.gossip_interval_ms);
     try std.testing.expectEqual(@as(u64, 90000), cfg.link.peer_link_config.idle_timeout_ms);
+    try std.testing.expect(!cfg.require_signed_frames);
     // [mesh.routing] registry + routes.
     try std.testing.expectEqual(@as(usize, 256), cfg.registry.max_nodes);
     try std.testing.expectEqual(@as(usize, 2048), cfg.routes.max_nicks);
@@ -3392,9 +3420,9 @@ test "a forged frame (attacker key, origin mismatch) is rejected and counted" {
     try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }
 
-test "a non-signing (v1-style) peer still interoperates unsigned" {
-    // A has no signing key (plaintext-style peer); B has one. They handshake and
-    // A's UNSIGNED in-scope frame is accepted as before — graceful rollout.
+test "a signing peer rejects a non-signing peer by default" {
+    // A has no signing key (plaintext-style peer); B has one and requires signed
+    // frames, so B rejects A during capability negotiation.
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
@@ -3418,11 +3446,34 @@ test "a non-signing (v1-style) peer still interoperates unsigned" {
     defer b_to_a.deinit(allocator);
     try a.startHandshake(a_to_b.sink());
     try b.startHandshake(b_to_a.sink());
+    try std.testing.expectError(error.SignedFramesRequired, pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A0));
+}
+
+test "explicitly-permitted non-signing peers still interoperate unsigned" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    const kp_b = try signingKeyFor(0x62);
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, 1, 2000, "b.test");
+    defer b.deinit();
+    b.config.require_signed_frames = false;
+    a.remote_node_id = signed_frame.originShortId(kp_b.public_key);
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A0);
 
-    // A never advertised signing, so B treats A as a legacy unsigned peer.
     try std.testing.expect(!b.peer_supports_signing);
-    // B DID advertise signing, but A (no key) won't wrap — fine for a v1 peer.
     try std.testing.expect(a.peer_supports_signing);
 
     // A sends an UNSIGNED membership; B accepts it (legacy path, no rejection).

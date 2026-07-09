@@ -252,6 +252,10 @@ realm = "local"
 # is not configured (no [node].secret_key / key file), ALL S2S is dropped rather
 # than falling back to clear. Default false keeps the plaintext fallback.
 # require_secured = true
+# Require signed direct-owned mesh state frames once the secured S2S path has a
+# node signing key. Default true; set false only for an explicit mixed-rollout
+# window with older peers.
+require_signed_frames = true
 
 # Runtime Suimyaku routing/registry capacities used by plaintext S2S and by the
 # inner CRDT stream of secured S2S.

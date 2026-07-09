@@ -150,6 +150,7 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `admission_min_revocation_epoch` | integer | `0` | `0..u64_max` | Minimum accepted MeshPass token revocation epoch for all configured `admission_roots`. |
 | `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
+| `require_signed_frames` | bool | `true` | `true`/`false` | For secured S2S peers with a node signing key, require the remote handshake to advertise signed-frame support and reject unsigned direct-owned mesh state frames. Set false only for an explicit mixed-rollout window. |
 
 Plaintext S2S applies when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`). Signed MeshPass admission is not available on plaintext S2S: if `admission_roots` is non-empty but the secured S2S identity path is unavailable, server initialization fails closed.
 
