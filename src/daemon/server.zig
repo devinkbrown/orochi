@@ -5807,6 +5807,21 @@ pub const LinuxServer = struct {
         return self.config.reputation_refuse_threshold != 0;
     }
 
+    /// Publish a SECURITY-category Event Spine event for pre-registration
+    /// admission refusals. These happen before a stable client prefix exists, so
+    /// identify the source by the real peer IP/host rather than nick!user@host.
+    fn publishSecurityAdmissionRefusal(self: *LinuxServer, conn: *const ConnState, kind: []const u8, detail: []const u8) void {
+        var addr_buf: [128]u8 = undefined;
+        const source = if (conn.peer_addr) |addr|
+            addrText(addr, &addr_buf) orelse conn.session.realHost()
+        else
+            conn.session.realHost();
+        const src = if (source.len != 0) source else "unknown";
+        var mbuf: [640]u8 = undefined;
+        const msg = std.fmt.bufPrint(&mbuf, "{s} refused {s} ({s})", .{ kind, src, detail }) catch return;
+        self.publishOperEvent(.security, .warn, msg) catch {};
+    }
+
     fn trustedProxyMatches(addr: dns.Address, text: []const u8) bool {
         if (std.Io.net.IpAddress.parseIp4(text, 0)) |parsed| {
             return switch (addr) {
@@ -5847,7 +5862,10 @@ pub const LinuxServer = struct {
         var refuse = self.draining;
         if (!refuse and self.reputationOn()) {
             if (conn.peer_addr) |addr| {
-                if (self.reputation.shouldRefuse(addr, self.nowU64())) refuse = true;
+                if (self.reputation.shouldRefuse(addr, self.nowU64())) {
+                    self.publishSecurityAdmissionRefusal(conn, "REPUTATION", "threshold exceeded");
+                    refuse = true;
+                }
             }
         }
         // Connection-rate throttle: too many new connects from one source IP in
@@ -5863,6 +5881,7 @@ pub const LinuxServer = struct {
                         .allow => conn.throttle_counted = true,
                         .connect_throttled, .clone_limited => {
                             self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                            self.publishSecurityAdmissionRefusal(conn, "CONNECTION_THROTTLE", if (decision == .connect_throttled) "connect rate exceeded" else "concurrent connection limit exceeded");
                             refuse = true;
                         },
                     }
@@ -5876,6 +5895,7 @@ pub const LinuxServer = struct {
                 } else |err| switch (err) {
                     error.TooManyPerIp, error.TooManyPerNet => {
                         self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                        self.publishSecurityAdmissionRefusal(conn, "CLONE_LIMIT", if (err == error.TooManyPerIp) "per-IP cap exceeded" else "per-network cap exceeded");
                         refuse = true;
                     },
                     error.NoSpaceLeft => {},
@@ -5993,6 +6013,7 @@ pub const LinuxServer = struct {
         if (self.reputationOn()) {
             if (conn.peer_addr) |addr| {
                 if (self.reputation.shouldRefuse(addr, self.nowU64())) {
+                    self.publishSecurityAdmissionRefusal(conn, "REPUTATION", "threshold exceeded");
                     emitServerLine(conn, "ERROR :Connection refused (reputation)");
                     conn.close_reason = "Reputation";
                     conn.closing = true;
@@ -6008,6 +6029,7 @@ pub const LinuxServer = struct {
             } else |err| switch (err) {
                 error.TooManyPerIp, error.TooManyPerNet => {
                     self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                    self.publishSecurityAdmissionRefusal(conn, "CLONE_LIMIT", if (err == error.TooManyPerIp) "per-IP cap exceeded" else "per-network cap exceeded");
                     emitServerLine(conn, "ERROR :Too many connections from your host");
                     conn.close_reason = "Too many connections";
                     conn.closing = true;
@@ -39783,6 +39805,41 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try writeAllFd(fd_o, "AUDIT nobody\r\n");
     try recvUntil(&o, "End of audit (0)", 300);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
+}
+
+test "threaded server: clone-limit admission refusals publish security events" {
+    var cfg = operTestConfig(0);
+    cfg.max_clones_per_ip = 1;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    var o = LiveClient{ .fd = fd_o };
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300);
+    o.reset();
+    try writeAllFd(fd_o, "EVENT ADD SECURITY\r\n");
+    try recvUntil(&o, "Event categories:", 300);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try recvUntil(&b, "ERROR :Too many connections from your host", 300);
+    try recvUntil(&o, "CLONE_LIMIT refused", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O CLONE_LIMIT refused") != null);
 }
 
 test "threaded server: IDENTIFY brute-force throttle locks after repeated failures" {
