@@ -28,9 +28,9 @@ The call has three layers:
   C: JOIN #call
   C: MEDIA JOIN #call voice            ; (optional roster presence; see §7)
   C: MEDIA OFFER #call kaguravox,kaguravis     ; codec list you support, comma-separated
-  S: :server NOTE MEDIA #call OFFER-ACK codecs=kaguravox,kaguravis fec=rs_block
-  S: :server NOTE MEDIA #call TRANSPORT ufrag=<U> pwd=<P> candidate=<IP>:<PORT> srtp=<B64>
-     (other members also receive: NOTE MEDIA #call PROFILE codecs=... fec=...)
+  S: :server EVENT you MEDIA OFFER-ACK #call codecs=kaguravox,kaguravis fec=rs_block
+  S: :server EVENT you MEDIA TRANSPORT #call ufrag=<U> pwd=<P> candidate=<IP>:<PORT> srtp=<B64>
+     (subscribed members also receive: EVENT <nick> MEDIA PROFILE #call codecs=... fec=...)
 
   -- now switch to UDP to <IP>:<PORT> --
   C→S (UDP): STUN Binding Request, USERNAME="<U>:<anything>", integrity key = <P>
@@ -49,7 +49,8 @@ Keep the UDP socket you used for the STUN check; **send media from the same loca
 
 ## 2. Signaling
 
-All server→client media lines have the form `:<server> NOTE MEDIA <#chan> <VERB> <args>`.
+All server→client media signaling lines have Event Spine wire form:
+`:<server> EVENT <target> MEDIA <VERB> <#chan> <args>`.
 
 ### MEDIA OFFER
 `MEDIA OFFER <#chan> <codec[,codec...]>` — codecs from `{kaguravox, kaguravis, raw}` (kaguravox = audio,
@@ -71,16 +72,16 @@ profile (set by the first OFFER). Reply `ANSWER-ACK codecs=<intersection> fec=..
 
 ### MEDIA PROFILE and MEDIA STATS
 - `MEDIA PROFILE <#chan>` → `PROFILE codecs=... fec=...` or `FAIL MEDIA NO_OFFER`.
-- `MEDIA STATS <#chan>` → one line per participant:
+- `MEDIA STATS <#chan>` -> one line per participant:
   `STATS <nick> ice=<connected|pending> ssrc=<hex> rx_pkts=<n> rx_bytes=<n>`, then
-  `:<server> NOTE MEDIA <#chan> :End of media stats (<count>)`.
+  `STATS-END count=<count>`.
 
 ### TRANSPORT fields
 
 Parse this line:
 
 ```text
-:orochi.local NOTE MEDIA #call TRANSPORT ufrag=dHD3gY59 pwd=LsaRAE0Yzxz1xYSd9++9E+u6 candidate=127.0.0.1:37190 srtp=14K23wcnM2X9VEfpw3tvX+RQs7rRzb7Y/qbezPQI
+:orochi.local EVENT you MEDIA TRANSPORT #call ufrag=dHD3gY59 pwd=LsaRAE0Yzxz1xYSd9++9E+u6 candidate=127.0.0.1:37190 srtp=14K23wcnM2X9VEfpw3tvX+RQs7rRzb7Y/qbezPQI
 ```
 
 | Field | Meaning |
@@ -236,7 +237,8 @@ the payload to your kaguravox/kaguravis decoder.
 
 Independent of transport; render the call UI from these. `MEDIA JOIN|LEAVE|MUTE|UNMUTE|
 SPEAKING <#chan> [voice|video|screen]` change your state and broadcast
-`NOTE MEDIA <#chan> <VERB> <nick> [kind]` to members. Also: `ROSTER` (list participants),
+`EVENT <nick> MEDIA <VERB> <#chan> <participant> [kind]` to subscribed members.
+Also: `ROSTER` (list participants),
 `BREAKOUT <room>`, `POS <x> <y>` (spatial audio), `HAND up|down`, `REACT <emoji>`,
 `CAPTION :<text>` + `TRANSCRIPT` (live captions). These are presence only — no media.
 

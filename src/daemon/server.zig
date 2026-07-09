@@ -17437,10 +17437,10 @@ pub const LinuxServer = struct {
     /// Publish a MEDIA (voice/video) presence/state transition as a first-class
     /// IRCX EVENT: `"MEDIA <action> <channel> <nick> [detail]"`. Routes through the
     /// Event Spine — local subscribers across all shards + every mesh peer — so
-    /// call presence converges network-wide (the old local-only `NOTE MEDIA`
+    /// call presence converges network-wide (the old local-only media notice
     /// broadcast did not). Subject is the channel so MEDIA subscribers' channel-glob
     /// masks match; delivery to a NON-oper additionally requires channel membership
-    /// (see `mediaEventAllowed`), preserving the member-only visibility the NOTE had.
+    /// (see `mediaEventAllowed`), preserving member-only visibility.
     fn publishMediaEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: []const u8) !void {
         var msg_buf: [512]u8 = undefined;
         const message = if (detail.len != 0)
@@ -17448,6 +17448,26 @@ pub const LinuxServer = struct {
         else
             std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s}", .{ action, channel, nick }) catch return error.OutputTooSmall;
         try self.publishOperEventSubject(.service, .notice, message, channel);
+    }
+
+    /// Render a caller-only MEDIA response in Event Spine wire form. Transport
+    /// credentials and MAC keys are intentionally targeted to the requesting
+    /// session instead of published to all MEDIA subscribers.
+    fn sendMediaEventReply(self: *LinuxServer, conn: *ConnState, action: []const u8, channel: []const u8, detail: []const u8) !void {
+        var msg_buf: [event_spine.max_event_line_len]u8 = undefined;
+        const message = if (detail.len != 0)
+            std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s}", .{ action, channel, detail }) catch return error.OutputTooSmall
+        else
+            std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s}", .{ action, channel }) catch return error.OutputTooSmall;
+
+        var tag_buf: [128]u8 = undefined;
+        const tags = if (conn.session.hasCap(.message_tags))
+            event_spine.buildEventTags(&tag_buf, .service, .notice) catch ""
+        else
+            "";
+        var line_buf: [event_spine.max_event_line_len]u8 = undefined;
+        const line = event_spine.renderEventTagged(tags, self.serverName(), conn.session.displayName(), message, &line_buf) catch return error.OutputTooSmall;
+        try appendToConn(conn, line);
     }
 
     /// The channel of a `"MEDIA <action> <channel> …"` event body (the 3rd token),
@@ -17461,10 +17481,9 @@ pub const LinuxServer = struct {
 
     /// Whether `message` may be delivered to the recipient identified by `id` /
     /// `session`. MEDIA events are channel-scoped call presence: a non-oper must be
-    /// a member of the event's channel to receive it (mirrors the old member-only
-    /// NOTE MEDIA broadcast, so a non-member can't snoop calls in a channel they are
-    /// not in — including a +s/private channel). Every non-media event, and every
-    /// oper, passes unconditionally.
+    /// a member of the event's channel to receive it, so a non-member can't snoop
+    /// calls in a channel they are not in — including a +s/private channel. Every
+    /// non-media event, and every oper, passes unconditionally.
     fn mediaEventAllowed(self: *LinuxServer, id: client_model.ClientId, session: *const dispatch.ClientSession, message: []const u8) bool {
         if (event_spine.IrcxEventType.fromMessage(message) != .media) return true;
         if (session.isOper()) return true;
@@ -24735,9 +24754,9 @@ pub const LinuxServer = struct {
 
     /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind] [arg]` —
     /// Orochi media control plane. Drives the per-channel SFU participant model and
-    /// broadcasts room presence to channel members as `NOTE MEDIA` events so
-    /// clients can render the call. The media bytes flow over the transport
-    /// substrate, not this control socket. Caller must be a channel member.
+    /// emits call state through the MEDIA Event Spine plane. The media bytes flow
+    /// over the transport substrate, not this control socket. Caller must be a
+    /// channel member.
     pub fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind]");
@@ -24783,7 +24802,7 @@ pub const LinuxServer = struct {
         }
         if (std.ascii.eqlIgnoreCase(sub, "PROFILE")) {
             if (self.media_rooms.profileOf(channel)) |prof|
-                try mediaNegotiatedReply(conn, channel, "PROFILE", prof.slice(), prof.fec)
+                try self.mediaNegotiatedReply(conn, channel, "PROFILE", prof.slice(), prof.fec)
             else
                 try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile for this channel");
             return;
@@ -24815,11 +24834,9 @@ pub const LinuxServer = struct {
                 return;
             };
             self.native_media.setSelection(channel, nick, .{ .max_spatial = max_spatial, .max_temporal = max_temporal });
-            var lbuf: [160]u8 = undefined;
-            const lline = std.fmt.bufPrint(&lbuf, ":{s} NOTE MEDIA {s} LAYER spatial<={d} temporal<={d}\r\n", .{
-                protocol_inventory.currentServerName(), channel, max_spatial, max_temporal,
-            }) catch return;
-            try appendToConn(conn, lline);
+            var detail_buf: [64]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "spatial<={d} temporal<={d}", .{ max_spatial, max_temporal }) catch return;
+            try self.sendMediaEventReply(conn, "LAYER", channel, detail);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
@@ -24885,12 +24902,12 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "TRANSCRIPT")) {
             for (self.transcript.recent(channel)) |c| {
                 var buf: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} TRANSCRIPT {s} :{s}\r\n", .{ self.serverName(), channel, c.speaker, c.text }) catch continue;
-                try appendToConn(conn, line);
+                const detail = std.fmt.bufPrint(&buf, "{s} :{s}", .{ c.speaker, c.text }) catch continue;
+                try self.sendMediaEventReply(conn, "TRANSCRIPT", channel, detail);
             }
             var end_buf: [default_reply_bytes]u8 = undefined;
-            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of transcript ({d})\r\n", .{ self.serverName(), channel, self.transcript.recent(channel).len }) catch return;
-            try appendToConn(conn, end);
+            const end = std.fmt.bufPrint(&end_buf, "count={d}", .{self.transcript.recent(channel).len}) catch return;
+            try self.sendMediaEventReply(conn, "TRANSCRIPT-END", channel, end);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "HAND")) {
@@ -24994,7 +25011,7 @@ pub const LinuxServer = struct {
     /// EVENT plane: `MEDIA <verb> <#chan> <nick> [kind]`, delivered as
     /// `:server EVENT <member> MEDIA …` to MEDIA-subscribed members across all
     /// shards AND every mesh peer (call presence now converges network-wide). The
-    /// old local-only `NOTE MEDIA` broadcast is gone; clients consume EVENT MEDIA.
+    /// old local-only media notice broadcast is gone; clients consume EVENT MEDIA.
     fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
         if (self.mediaPresencePrivate(nick)) return;
         try self.publishMediaEvent(verb, channel, nick, kind);
@@ -25058,9 +25075,9 @@ pub const LinuxServer = struct {
     }
 
     /// Derive this participant's per-stream MAC key and hand it to them over the
-    /// authenticated WS as `:server NOTE MEDIA <#chan> MACKEY <base64 K32>`. Only
-    /// the owning participant ever receives its own key; the server re-derives to
-    /// verify (stateless).
+    /// authenticated WS as a caller-only MEDIA Event Spine reply. Only the owning
+    /// participant ever receives its own key; the server re-derives to verify
+    /// (stateless).
     fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
         var k32: [kagura_frame.MAC_KEY_BYTES]u8 = undefined;
         kagura_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
@@ -25069,9 +25086,9 @@ pub const LinuxServer = struct {
         var b64: [std.base64.standard.Encoder.calcSize(kagura_frame.MAC_KEY_BYTES)]u8 = undefined;
         const enc = std.base64.standard.Encoder.encode(&b64, &k32);
 
-        var line: [default_reply_bytes]u8 = undefined;
-        const out = std.fmt.bufPrint(&line, ":{s} NOTE MEDIA {s} MACKEY {s}\r\n", .{ self.serverName(), channel, enc }) catch return;
-        appendToConn(conn, out) catch {
+        var detail_buf: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}", .{enc}) catch return;
+        self.sendMediaEventReply(conn, "MACKEY", channel, detail) catch {
             conn.closing = true;
             return;
         };
@@ -25103,8 +25120,8 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Emit the current call roster for `channel` to the caller: one
-    /// `NOTE MEDIA <#chan> ROSTER <nick> <kinds>` line per participant.
+    /// Emit the current call roster for `channel` to the caller as targeted
+    /// MEDIA Event Spine replies.
     fn codecTagName(tag: sdp.CodecTag) []const u8 {
         return switch (tag) {
             .kaguravox => "kaguravox",
@@ -25142,27 +25159,6 @@ pub const LinuxServer = struct {
         return n;
     }
 
-    /// Format `:server NOTE MEDIA <#chan> <label> codecs=<list> fec=<scheme>\r\n`
-    /// into `buf`, returning the written slice (null if it would not fit).
-    fn formatMediaCodecLine(buf: []u8, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) ?[]const u8 {
-        var w = Buf{ .storage = buf };
-        w.append(":") catch return null;
-        w.append(protocol_inventory.currentServerName()) catch return null;
-        w.append(" NOTE MEDIA ") catch return null;
-        w.append(channel) catch return null;
-        w.appendByte(' ') catch return null;
-        w.append(label) catch return null;
-        w.append(" codecs=") catch return null;
-        for (codecs, 0..) |c, i| {
-            if (i != 0) w.appendByte(',') catch return null;
-            w.append(codecTagName(c.tag)) catch return null;
-        }
-        w.append(" fec=") catch return null;
-        w.append(fecSchemeName(fec.scheme)) catch return null;
-        w.append("\r\n") catch return null;
-        return w.written();
-    }
-
     /// Format just `codecs=<list> fec=<scheme>` (no wire prefix) — the detail body
     /// of a MEDIA PROFILE event. Returns the written slice, or null if it overflows.
     fn formatMediaCodecDetail(buf: []u8, codecs: []const sdp.Codec, fec: sdp.Fec) ?[]const u8 {
@@ -25177,11 +25173,12 @@ pub const LinuxServer = struct {
         return w.written();
     }
 
-    /// Emit `:server NOTE MEDIA <#chan> <label> codecs=<list> fec=<scheme>`.
-    fn mediaNegotiatedReply(conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
+    /// Emit `MEDIA <label> <#chan> codecs=<list> fec=<scheme>` to the caller as an
+    /// Event Spine reply.
+    fn mediaNegotiatedReply(self: *LinuxServer, conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
         var buf: [320]u8 = undefined;
-        const line = formatMediaCodecLine(&buf, channel, label, codecs, fec) orelse return;
-        try appendToConn(conn, line);
+        const detail = formatMediaCodecDetail(&buf, codecs, fec) orelse return;
+        try self.sendMediaEventReply(conn, label, channel, detail);
     }
 
     /// The peer's RFC 8122 DTLS-SRTP request, parsed from a MEDIA OFFER/ANSWER's
@@ -25302,18 +25299,25 @@ pub const LinuxServer = struct {
         }
         // Persist the agreed set as the call profile a later ANSWER negotiates against.
         self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
-        try mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
+        try self.mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
         // Converge the negotiated codec profile across the whole channel via the
         // MEDIA EVENT plane (typed, mesh-propagated, member-gated) — same path as
-        // call presence. The old local-only NOTE MEDIA broadcast (broadcastChannel)
-        // never reached members on other mesh nodes, so they never learned the
-        // call's codec set. The offerer still gets its point-to-point OFFER-ACK above.
+        // call presence. The old local-only media notice never reached members
+        // on other mesh nodes, so they never learned the call's codec set. The
+        // offerer still gets its targeted OFFER-ACK above.
         var pbuf: [256]u8 = undefined;
         if (formatMediaCodecDetail(&pbuf, negotiated.codecs, negotiated.fec)) |detail|
             self.publishMediaEvent("PROFILE", channel, conn.session.displayName(), detail) catch {};
-        // Allocate this caller's ICE endpoint and advertise the server transport
-        // (ufrag/pwd + media candidate) so the client can run STUN to the SFU.
+        try self.provisionMediaTransports(conn, channel, dtls_mode, extra_args);
+    }
+
+    fn provisionMediaTransports(self: *LinuxServer, conn: *ConnState, channel: []const u8, dtls_mode: bool, extra_args: []const []const u8) !void {
         const nick = conn.session.displayName();
+
+        // Allocate this participant's ICE endpoint and advertise the server
+        // transport (ufrag/pwd + media candidate) so the client can run STUN to
+        // the SFU. OFFER and ANSWER both call this: negotiation is useless if
+        // the answerer never receives reachable transport credentials.
         if (self.media_plane.allocate(channel, nick)) |creds| {
             // Prefer the STUN-discovered reflexive candidate over the static host.
             var host_buf: [16]u8 = undefined;
@@ -25327,26 +25331,27 @@ pub const LinuxServer = struct {
                 // mismatch. `dtls_mode` implies `dtlsFingerprint` is non-null.
                 var fp_buf: [128]u8 = undefined;
                 const server_fp = self.media_plane.dtlsFingerprint(&fp_buf) orelse "";
-                const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive\r\n", .{
-                    protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, server_fp,
+                const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive", .{
+                    creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, server_fp,
                 }) catch return;
-                try appendToConn(conn, tline);
+                try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
             } else {
                 // Legacy SDES path (byte-identical to pre-Increment-3): ship the
                 // per-call SRTP group key, base64'd, over the TLS IRC link.
                 const gk = self.media_plane.groupKey(channel);
                 var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
                 const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
-                const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
-                    protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
+                const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} srtp={s}", .{
+                    creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
                 }) catch return;
-                try appendToConn(conn, tline);
+                try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
             }
         }
-        // Native transport (our own KaguraVox/KaguraVis codec leg): register this caller
-        // for the channel's native call and advertise the candidate + the
-        // stream_id the client must stamp into its kagura frames. Independent of
-        // the WebRTC plane above; best-effort (media is optional).
+
+        // Native transport (our own KaguraVox/KaguraVis codec leg): register this
+        // participant for the channel's native call and advertise the candidate +
+        // the stream_id the client must stamp into its kagura frames. Independent
+        // of the WebRTC plane above; best-effort (media is optional).
         const stream_id = self.nativeStreamId(channel, nick);
         if (self.native_media.port != 0) {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
@@ -25359,10 +25364,10 @@ pub const LinuxServer = struct {
             // remote native client would be told 127.0.0.1 and never reach the SFU.
             var native_host_buf: [16]u8 = undefined;
             const native_cand = self.media_plane.candidateIp(&native_host_buf) orelse self.config.media_host;
-            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=KaguraVox/KaguraVis{s}\r\n", .{
-                protocol_inventory.currentServerName(), channel, native_cand, self.native_media.port, stream_id, mac_token,
+            const detail = std.fmt.bufPrint(&nbuf, "candidate={s}:{d} stream={d} codec=KaguraVox/KaguraVis{s}", .{
+                native_cand, self.native_media.port, stream_id, mac_token,
             }) catch return;
-            try appendToConn(conn, nline);
+            try self.sendMediaEventReply(conn, "NATIVE", channel, detail);
         }
         // Record this participant's leg in the per-channel cross-leg bridge. The
         // client opts into the WebRTC leg with `transport=webrtc` (default native).
@@ -25508,7 +25513,8 @@ pub const LinuxServer = struct {
             return;
         };
 
-        try mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
+        try self.mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
+        try self.provisionMediaTransports(conn, channel, answer_digest != null, extra_args);
     }
 
     /// `MEDIA STATS <#chan>` — per-participant transport state: ICE status and
@@ -25518,24 +25524,24 @@ pub const LinuxServer = struct {
         const n = self.media_plane.statsForChannel(channel, &buf_stats);
         for (buf_stats[0..n]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=webrtc ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}\r\n", .{
-                protocol_inventory.currentServerName(), channel, s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
+            const detail = std.fmt.bufPrint(&buf, "{s} leg=webrtc ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}", .{
+                s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
             }) catch continue;
-            try appendToConn(conn, line);
+            try self.sendMediaEventReply(conn, "STATS", channel, detail);
         }
         // Native leg (our own KaguraVox/KaguraVis codec) stats.
         var native_stats: [native_media_mod.max_call_participants]native_media_mod.NativeMediaTransport.Stat = undefined;
         const nn = self.native_media.statsForChannel(channel, &native_stats);
         for (native_stats[0..nn]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=native stream={d} rx_pkts={d} rx_bytes={d}\r\n", .{
-                protocol_inventory.currentServerName(), channel, s.name(), s.stream_id, s.rx_packets, s.rx_bytes,
+            const detail = std.fmt.bufPrint(&buf, "{s} leg=native stream={d} rx_pkts={d} rx_bytes={d}", .{
+                s.name(), s.stream_id, s.rx_packets, s.rx_bytes,
             }) catch continue;
-            try appendToConn(conn, line);
+            try self.sendMediaEventReply(conn, "STATS", channel, detail);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ self.serverName(), channel, n + nn }) catch return;
-        try appendToConn(conn, end);
+        const end = std.fmt.bufPrint(&end_buf, "count={d}", .{n + nn}) catch return;
+        try self.sendMediaEventReply(conn, "STATS-END", channel, end);
     }
 
     fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
@@ -25566,12 +25572,12 @@ pub const LinuxServer = struct {
             const pos = self.media_rooms.positionOf(channel, p.id.slice());
             const hand: []const u8 = if (self.media_rooms.handRaised(channel, p.id.slice())) "hand" else "-";
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d} {s}\r\n", .{ self.serverName(), channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
-            try appendToConn(conn, line);
+            const detail = std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
+            try self.sendMediaEventReply(conn, "ROSTER", channel, detail);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of roster ({d})\r\n", .{ self.serverName(), channel, self.media_rooms.roster(channel).len }) catch return;
-        try appendToConn(conn, end);
+        const end = std.fmt.bufPrint(&end_buf, "count={d}", .{self.media_rooms.roster(channel).len}) catch return;
+        try self.sendMediaEventReply(conn, "ROSTER-END", channel, end);
     }
 
     /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
@@ -37973,11 +37979,11 @@ test "threaded server: media user modes block transmit and hide automatic presen
     try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
     try writeAllFd(fd_a, "PING :media-private\r\n");
     try recvUntil(&a, "PONG orochi.local :media-private", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "NOTE MEDIA #media JOIN B voice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "MEDIA JOIN #media B voice") == null);
 
     a.reset();
     try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
-    try recvUntil(&a, "NOTE MEDIA #media ROSTER B voice", 200);
+    try recvUntil(&a, "EVENT A MEDIA ROSTER #media B voice", 200);
     b.reset();
     try writeAllFd(fd_b, "MEDIA REACT #media abcde\r\n");
     try recvUntil(&b, "FAIL MEDIA INVALID_REACTION", 200);
@@ -38036,7 +38042,7 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     var offer_buf: [256]u8 = undefined;
     const offer = try std.fmt.bufPrint(&offer_buf, "MEDIA OFFER #media kaguravox transport=webrtc fingerprint=sha-256:{s} setup=active\r\n", .{peer_hex});
     try writeAllFd(fd_a, offer);
-    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
     // Drain a beat so the whole TRANSPORT line is buffered before we inspect it.
     try recvUntil(&a, "setup=passive", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=sha-256 ") != null);
@@ -38047,7 +38053,7 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     //     legacy srtp= group-key reply, no fingerprint/setup.
     a.reset();
     try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox transport=webrtc\r\n");
-    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
     try recvUntil(&a, "srtp=", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=") == null);
@@ -38089,7 +38095,7 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     // With the feature off, a plain OFFER still ships the legacy srtp= group key.
     a.reset();
     try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox transport=webrtc\r\n");
-    try recvUntil(&a, "NOTE MEDIA #media TRANSPORT", 200);
+    try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
     try recvUntil(&a, "srtp=", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=") == null);
@@ -38104,6 +38110,58 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     try writeAllFd(fd_a, offer);
     try recvUntil(&a, "FAIL MEDIA DTLS_UNAVAILABLE", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") == null);
+}
+
+test "threaded server: MEDIA ANSWER provisions transport and native leg" {
+    var cfg = multiOperTestConfig(0);
+    cfg.media_enabled = true;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    if (server.media_plane.port == 0 or server.native_media.port == 0) return error.SkipZigTest;
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #media\r\n");
+    try recvUntil(&a, " 366 A #media ", 200);
+    try writeAllFd(fd_b, "JOIN #media\r\n");
+    try recvUntil(&b, " 366 B #media ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox\r\n");
+    try recvUntil(&a, "EVENT A MEDIA OFFER-ACK #media", 200);
+    try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
+    try recvUntil(&a, "EVENT A MEDIA NATIVE #media", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA ANSWER #media kaguravox transport=webrtc\r\n");
+    try recvUntil(&b, "EVENT B MEDIA ANSWER-ACK #media", 200);
+    try recvUntil(&b, "EVENT B MEDIA TRANSPORT #media", 200);
+    try recvUntil(&b, "srtp=", 200);
+    try recvUntil(&b, "EVENT B MEDIA NATIVE #media", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "ANSWER-ACK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "TRANSPORT #media ufrag=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "NATIVE #media candidate=") != null);
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {

@@ -5,7 +5,7 @@
     "frame": "kagura_frame wire format, optionally followed by a 16-byte MAC tag (identical to the native UDP path)",
     "derive_key": "K32 = HMAC-SHA256(key = HMAC-SHA256(key='orochi native-media mac extract v1', msg=root16), msg = 'orochi native-media datagram mac v1' || 0x00 || channel || 0x00 || participant || 0x01)",
     "tag": "tag16 = HMAC-SHA256(K32, frame_bytes)[0..16]",
-    "key_issuance": "server derives K32 from its per-process root + (channel, participant) and hands it to the owning participant at MEDIA JOIN over the authenticated WS: ':server NOTE MEDIA <#chan> MACKEY <base64 K32>'. The browser HMACs with its issued K32; the server re-derives to verify (stateless)."
+    "key_issuance": "server derives K32 from its per-process root + (channel, participant) and hands it to the owning participant at MEDIA JOIN over the authenticated WS: ':server EVENT <nick> MEDIA MACKEY <#chan> <base64 K32>'. The browser HMACs with its issued K32; the server re-derives to verify (stateless)."
   },
   "labels": {
     "extract_key": "orochi native-media mac extract v1",

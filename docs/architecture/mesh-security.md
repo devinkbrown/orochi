@@ -197,7 +197,7 @@ lifetime (so re-JOIN is idempotent) but unpredictable to anyone without the
 secret, so an attacker who knows the public channel/nick can no longer
 precompute a victim's stream id and hijack or inject on the UDP port. No client
 change is required, because the server already delivers the id over the TLS IRC
-channel (`NOTE MEDIA ... NATIVE ... stream=<id>`).
+channel (`EVENT <nick> MEDIA NATIVE ... stream=<id>`).
 
 ## What this does not cover (future, cross-component)
 

@@ -686,7 +686,7 @@ native_media_require_mac = false
 # Relay browser media datagrams (binary WebSocket frames) between a channel's call
 # participants. Off by default; the WS media plane is opt-in. When on, MEDIA JOIN
 # hands each participant a per-stream MAC key over the authenticated WS
-# (NOTE MEDIA <#chan> MACKEY <base64>) and each browser datagram is verified
+# (EVENT <nick> MEDIA MACKEY <#chan> <base64>) and each browser datagram is verified
 # before fan-out. v1 fans out to same-node (same-shard) call members.
 ws_media_relay = false
 # Require a valid per-stream MAC tag on every browser media datagram. Default false

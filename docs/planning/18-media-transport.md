@@ -44,7 +44,7 @@ Everything is clean-room pure Zig on the existing
                                              • media_rooms.setProfile
                                              • media_plane.allocate  → ICE ufrag/pwd
                                              • media_plane.groupKey   → SRTP key (SDES)
-  ◀───────────────  NOTE MEDIA OFFER-ACK / PROFILE / TRANSPORT
+  ◀───────────────  EVENT <nick> MEDIA OFFER-ACK / PROFILE / TRANSPORT
                                                                   ▲ signaling plane (TCP/TLS)
   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
   STUN bind  ════════ UDP ═════════════▶    pump thread (media_plane):
@@ -117,7 +117,8 @@ The pump, for a non-STUN datagram:
 
 ## 6. Signaling wire protocol
 
-All server→client lines: `:<server> NOTE MEDIA <#chan> <verb> …`.
+All server→client media signaling lines ride Event Spine wire form:
+`:<server> EVENT <target> MEDIA <verb> <#chan> ...`.
 
 | Verb | Direction | Payload |
 |------|-----------|---------|

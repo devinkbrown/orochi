@@ -17,7 +17,8 @@ Server config `[media].native_media_require_mac` (default `false`):
 - `true` — untagged or bad-tag datagrams are dropped before address learning.
 
 When verification is on, the server advertises `mac=hmac-sha256-128` on the
-native-media `NOTE MEDIA … NATIVE` line. Clients should tag when they see this.
+targeted native-media `EVENT <nick> MEDIA NATIVE …` line. Clients should tag when
+they see this.
 
 ## Wire format
 

@@ -4,7 +4,8 @@
 
 This document records the planned media interop model and server-side non-goals.
 
-Status: **architecture decided + building blocks landed; live daemon wiring pending.**
+Status: **architecture decided + live offer/answer transport wiring landed; forward-path
+polish remains.**
 This supersedes the framing in [18-media-transport.md](18-media-transport.md). The earlier
 draft of this note framed WebRTC as a *forced mobile gateway with standard codecs*; that
 framing was incorrect. The corrected model below is recorded so it does not drift again.
@@ -68,21 +69,19 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Bridge | `kakehashi`, `kakehashi_session`, `ssrc_map`, `rtcp_translate` (control-plane NACK/PLI/FIR ↔ neutral feedback). |
 | Native resilience (Suimyaku plane) | `kagura_nack` (retransmit cache + gap tracker), `kagura_fec` (XOR FEC), `kagura_reassembly` (reorder/jitter), `simulcast_select` + `kagura_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate` (delay-based target bitrate), `media_pacer` (egress pacing), `native_feedback`. |
 | WebRTC stack (transport carrier + opt-in standard-codec fallback) | `srtp`/`srtcp`, `dtls_srtp`/`dtls_handshake`/`dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/`audio_level`/`mid_rid`/`playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/`twcc_feedback`/`rtx`, `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`, `sframe`, `flexfec`. `dcep`/`sctp_chunk` are what let a WebRTC DataChannel carry our opaque kagura frames (transport role); the RTP/codec pieces serve the opt-in standard fallback. |
-| Live WebRTC transport (already wired) | `media_transport`/`media_socket`/`media_plane` (UDP + ICE/STUN/SRTP-SDES relay + NACK). |
+| Live WebRTC transport (wired) | `media_transport`/`media_socket`/`media_plane` (UDP + ICE/STUN/SRTP-SDES or DTLS-SRTP relay + NACK). |
+| Live native transport (wired) | `native_media_transport` plus `MEDIA OFFER`/`MEDIA ANSWER` `NATIVE` signaling; participants receive a native UDP candidate and keyed stream id for KaguraVox/KaguraVis frames. |
+| Live cross-leg registration (wired) | `media_bridge` roster entries are created from both offerers and answerers, using `transport=webrtc`/DTLS requests to choose the WebRTC leg and native as the default. |
 
-## Remaining live wiring (serial; not yet done)
+## Remaining live wiring
 
-1. **Native media transport in the daemon.** Today `media_plane` is only the WebRTC/UDP
-   leg. The native leg (`kagura_frame` over `ryusen`/CoilPack + `secure_channel`) is
-   library-only — it must be brought into the daemon as a live transport so our codec runs
-   end-to-end on the default path. `native_media_link` is the forward-decision glue for it.
-   **This is the gating arc.**
-2. **Hook Kakehashi into the SFU forward path:** per-channel `kakehashi_session`; on each
+1. **Finish Kakehashi in the SFU forward path:** per-channel `kakehashi_session`; on each
    relayed frame, serialize to each target's leg (`toNative`/`toRtp`) via `ssrc_map`; drive
    `simulcast_select` from `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
-3. **Codec negotiation surface:** advertise per-participant codec sets in signaling so
-   `selectCommon` runs per call; reject/deny a media kind when no shared codec (never
-   transcode).
+2. **Broaden codec negotiation surface:** `MEDIA OFFER` establishes the active profile and
+   `MEDIA ANSWER` intersects each answerer against it while provisioning that participant's
+   transports. The remaining work is per-kind/per-participant codec-set fanout and explicit
+   media-kind denial when no shared codec exists (never transcode).
 
 ## Non-goals
 
