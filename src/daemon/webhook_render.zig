@@ -12,10 +12,15 @@
 //! or inject an IRC command.
 //!
 //! The Discord shape handled (all fields optional; a usable post needs `content`
-//! OR at least one non-empty embed):
+//! OR at least one non-empty embed/component):
 //!   { "content", "username", "avatar_url",
 //!     "embeds": [ { "title", "description", "url",
-//!                   "fields": [ { "name", "value" } ] } ] }
+//!                   "author": { "name" }, "footer": { "text" },
+//!                   "fields": [ { "name", "value" } ] } ],
+//!     "components": [ { "type": 1, "components": [
+//!                   { "type": 2, "label", "url", "custom_id" },
+//!                   { "type": 3, "placeholder",
+//!                     "options": [ { "label" } ] } ] } ] }
 
 const std = @import("std");
 
@@ -70,6 +75,10 @@ pub fn render(
         }
     }
 
+    if (obj.get("components")) |components_val| {
+        renderComponents(&writer, components_val);
+    }
+
     if (writer.lines == 0) return error.EmptyPayload;
     post.body_len = @intCast(writer.len);
 }
@@ -77,10 +86,14 @@ pub fn render(
 /// Render one embed object into compact IRC lines: title, description, then
 /// `name: value` per field. Empty pieces are skipped.
 fn renderEmbed(w: *LineWriter, embed: std.json.ObjectMap) void {
+    if (objectField(embed, "author")) |author| {
+        if (strField(author, "name")) |name| appendLabelled(w, "by ", name);
+    }
     if (strField(embed, "title")) |title| {
-        var tmp: [max_line]u8 = undefined;
-        const clean = sanitizeLine(title, &tmp);
-        if (clean.len != 0) w.addPrefixed("* ", clean);
+        if (strField(embed, "url")) |url|
+            appendTitleUrl(w, title, url)
+        else
+            appendLabelled(w, "* ", title);
     }
     if (strField(embed, "description")) |desc| {
         appendMultiline(w, desc);
@@ -95,6 +108,9 @@ fn renderEmbed(w: *LineWriter, embed: std.json.ObjectMap) void {
             }
         }
     }
+    if (objectField(embed, "footer")) |footer| {
+        if (strField(footer, "text")) |text| appendLabelled(w, "-- ", text);
+    }
 }
 
 /// Split `text` on newlines and append each sanitised, non-empty line.
@@ -106,6 +122,27 @@ fn appendMultiline(w: *LineWriter, text: []const u8) void {
         const clean = sanitizeLine(raw, &tmp);
         if (clean.len != 0) w.addLine(clean);
     }
+}
+
+fn appendLabelled(w: *LineWriter, prefix: []const u8, text: []const u8) void {
+    var tmp: [max_line]u8 = undefined;
+    const clean = sanitizeLine(text, &tmp);
+    if (clean.len != 0) w.addPrefixed(prefix, clean);
+}
+
+fn appendTitleUrl(w: *LineWriter, title: []const u8, url: []const u8) void {
+    var tbuf: [max_line]u8 = undefined;
+    const clean_title = sanitizeLine(title, &tbuf);
+    if (clean_title.len == 0) return;
+    var ubuf: [max_line]u8 = undefined;
+    const clean_url = sanitizeLine(url, &ubuf);
+    if (clean_url.len == 0) {
+        w.addPrefixed("* ", clean_title);
+        return;
+    }
+    var joined: [max_line]u8 = undefined;
+    const line = std.fmt.bufPrint(&joined, "{s} <{s}>", .{ clean_title, clean_url }) catch clean_title;
+    w.addPrefixed("* ", line);
 }
 
 /// Append a `name: value` field. `value` may itself be multi-line; only the
@@ -138,6 +175,85 @@ fn appendField(w: *LineWriter, name: []const u8, value: []const u8) void {
             w.addPrefixed("  ", clean_val);
         }
     }
+}
+
+fn renderComponents(w: *LineWriter, components_val: std.json.Value) void {
+    if (components_val != .array) return;
+    for (components_val.array.items) |item| {
+        if (w.lines >= max_lines) return;
+        if (item != .object) continue;
+        renderComponent(w, item.object);
+    }
+}
+
+fn renderComponent(w: *LineWriter, component: std.json.ObjectMap) void {
+    const kind = intField(component, "type") orelse 0;
+    switch (kind) {
+        1 => {
+            const children = component.get("components") orelse return;
+            if (children != .array) return;
+            for (children.array.items) |child| {
+                if (w.lines >= max_lines) return;
+                if (child == .object) renderComponent(w, child.object);
+            }
+        },
+        2 => renderButton(w, component),
+        3, 5, 6, 7, 8 => renderSelect(w, component),
+        else => {},
+    }
+}
+
+fn renderButton(w: *LineWriter, button: std.json.ObjectMap) void {
+    const label = strField(button, "label") orelse strField(button, "custom_id") orelse return;
+    var lbuf: [max_line]u8 = undefined;
+    const clean_label = sanitizeLine(label, &lbuf);
+    if (clean_label.len == 0) return;
+    if (strField(button, "url")) |url| {
+        var ubuf: [max_line]u8 = undefined;
+        const clean_url = sanitizeLine(url, &ubuf);
+        var joined: [max_line]u8 = undefined;
+        const line = if (clean_url.len == 0)
+            clean_label
+        else
+            std.fmt.bufPrint(&joined, "{s} <{s}>", .{ clean_label, clean_url }) catch clean_label;
+        w.addPrefixed("[button] ", line);
+    } else {
+        w.addPrefixed("[button] ", clean_label);
+    }
+}
+
+fn renderSelect(w: *LineWriter, select: std.json.ObjectMap) void {
+    const label = strField(select, "placeholder") orelse "select";
+    var lbuf: [max_line]u8 = undefined;
+    const clean_label = sanitizeLine(label, &lbuf);
+    if (clean_label.len == 0) return;
+
+    var options_buf: [max_line]u8 = undefined;
+    var options_len: usize = 0;
+    if (select.get("options")) |options| {
+        if (options == .array) {
+            for (options.array.items) |opt| {
+                if (opt != .object) continue;
+                const opt_label = strField(opt.object, "label") orelse continue;
+                var obuf: [max_line]u8 = undefined;
+                const clean_opt = sanitizeLine(opt_label, &obuf);
+                if (clean_opt.len == 0) continue;
+                const sep = if (options_len == 0) "" else ", ";
+                if (options_len + sep.len + clean_opt.len > options_buf.len) break;
+                @memcpy(options_buf[options_len .. options_len + sep.len], sep);
+                options_len += sep.len;
+                @memcpy(options_buf[options_len .. options_len + clean_opt.len], clean_opt);
+                options_len += clean_opt.len;
+            }
+        }
+    }
+
+    var joined: [max_line]u8 = undefined;
+    const line = if (options_len == 0)
+        clean_label
+    else
+        std.fmt.bufPrint(&joined, "{s}: {s}", .{ clean_label, options_buf[0..options_len] }) catch clean_label;
+    w.addPrefixed("[select] ", line);
 }
 
 /// Accumulator that joins lines with a single '\n' into a fixed buffer, capping
@@ -253,6 +369,22 @@ fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |n| n,
+        else => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -305,6 +437,48 @@ test "embeds render as compact title/description/field lines" {
     try testing.expectEqualStrings("succeeded", it.next().?);
     try testing.expectEqualStrings("env: prod", it.next().?);
     try testing.expectEqualStrings("rev: abc123", it.next().?);
+}
+
+test "embeds render author title URL and footer metadata" {
+    var post: webhook.PendingPost = .{};
+    const body =
+        "{\"embeds\":[{\"author\":{\"name\":\"GitHub\"}," ++
+        "\"title\":\"Build passed\",\"url\":\"https://ci.example/run/1\"," ++
+        "\"footer\":{\"text\":\"main abc123\"}}]}";
+    try renderBody(body, &post);
+    var it = std.mem.splitScalar(u8, post.body(), '\n');
+    try testing.expectEqualStrings("by GitHub", it.next().?);
+    try testing.expectEqualStrings("* Build passed <https://ci.example/run/1>", it.next().?);
+    try testing.expectEqualStrings("-- main abc123", it.next().?);
+    try testing.expect(it.next() == null);
+}
+
+test "components render button and select fallbacks" {
+    var post: webhook.PendingPost = .{};
+    const body =
+        "{\"content\":\"release gate\"," ++
+        "\"components\":[{\"type\":1,\"components\":[" ++
+        "{\"type\":2,\"label\":\"Open run\",\"url\":\"https://ci.example/run/2\"}," ++
+        "{\"type\":3,\"placeholder\":\"Promote to\",\"options\":[{\"label\":\"staging\"},{\"label\":\"prod\"}]}" ++
+        "]}]}";
+    try renderBody(body, &post);
+    var it = std.mem.splitScalar(u8, post.body(), '\n');
+    try testing.expectEqualStrings("release gate", it.next().?);
+    try testing.expectEqualStrings("[button] Open run <https://ci.example/run/2>", it.next().?);
+    try testing.expectEqualStrings("[select] Promote to: staging, prod", it.next().?);
+    try testing.expect(it.next() == null);
+}
+
+test "components are sanitized before text fallback rendering" {
+    var post: webhook.PendingPost = .{};
+    const body =
+        "{\"components\":[{\"type\":1,\"components\":[" ++
+        "{\"type\":2,\"label\":\"Open\\r\\nPRIVMSG #x :bad\",\"url\":\"https://ok.example\\u0007\"}" ++
+        "]}]}";
+    try renderBody(body, &post);
+    try testing.expectEqualStrings("[button] OpenPRIVMSG #x :bad <https://ok.example>", post.body());
+    try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\r') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\n') == null);
 }
 
 test "content plus embed both render" {
