@@ -11,6 +11,7 @@ const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn_creds = @import("webauthn_creds.zig");
 const key_transparency = @import("key_transparency.zig");
+const mmr = @import("../substrate/merkle_mountain_range.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
@@ -449,6 +450,25 @@ pub const Services = struct {
         root: key_transparency.Hash = @splat(0),
     };
 
+    pub const KeyTransparencyProofStep = struct {
+        side: mmr.Side,
+        hash: key_transparency.Hash,
+    };
+
+    pub const KeyTransparencyProofSnapshot = struct {
+        position: usize,
+        size: usize,
+        root: key_transparency.Hash,
+        path: []KeyTransparencyProofStep,
+        peaks: []key_transparency.Hash,
+
+        pub fn deinit(self: *KeyTransparencyProofSnapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+            allocator.free(self.peaks);
+            self.* = undefined;
+        }
+    };
+
     /// Return the current credential transparency root/size for status surfaces.
     pub fn keyTransparencyStatus(self: *Services) KeyTransparencyStatus {
         self.lock.lockShared();
@@ -459,6 +479,38 @@ pub const Services = struct {
             .enabled = true,
             .entries = log.len(),
             .root = log.root(),
+        };
+    }
+
+    /// Copy an inclusion proof for `position` into caller-owned memory. The
+    /// returned snapshot is stable after the services lock releases.
+    pub fn keyTransparencyProof(self: *Services, allocator: std.mem.Allocator, position: usize) (std.mem.Allocator.Error || error{ Disabled, IndexOutOfRange })!KeyTransparencyProofSnapshot {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const log = self.key_transparency orelse return error.Disabled;
+        var proof = log.proof(position) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.IndexOutOfRange => return error.IndexOutOfRange,
+        };
+        defer proof.deinit(log.tree.allocator);
+
+        const path = try allocator.alloc(KeyTransparencyProofStep, proof.path.len);
+        errdefer allocator.free(path);
+        for (proof.path, 0..) |step, i| {
+            path[i] = .{ .side = step.side, .hash = step.hash };
+        }
+
+        const peaks = try allocator.alloc(key_transparency.Hash, proof.peaks.len);
+        errdefer allocator.free(peaks);
+        @memcpy(peaks, proof.peaks);
+
+        return .{
+            .position = position,
+            .size = log.len(),
+            .root = log.root(),
+            .path = path,
+            .peaks = peaks,
         };
     }
 
@@ -3565,6 +3617,14 @@ test "key transparency log records certfp and passkey binding changes" {
     var proof = try kt.proof(1);
     defer proof.deinit(std.testing.allocator);
     try std.testing.expect(key_transparency.verifyInclusion(root, webauthn_bind, proof, 1, kt.len()));
+
+    var snapshot = try services.keyTransparencyProof(std.testing.allocator, 1);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.position);
+    try std.testing.expectEqual(@as(usize, 4), snapshot.size);
+    try std.testing.expectEqualSlices(u8, &root, &snapshot.root);
+    try std.testing.expect(snapshot.path.len != 0);
+    try std.testing.expectError(error.IndexOutOfRange, services.keyTransparencyProof(std.testing.allocator, 99));
 }
 
 test "webauthn bind/lookup/list/delete round-trip" {

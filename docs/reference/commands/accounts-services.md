@@ -214,6 +214,17 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `CERTDEL SHA256:...`
 - Sources: `src/daemon/modules/accounts.zig:87`, `src/daemon/server.zig:12183`
 
+## KEYTRANS
+
+- Syntax: `KEYTRANS [STATUS|ROOT|PROOF <position>]`
+- Description: Inspects the account credential transparency log. `STATUS` (default) reports whether the log is enabled plus the current append count and Merkle Mountain Range root. `ROOT` is an alias for status. `PROOF <position>` streams an inclusion-proof snapshot for a leaf index as `KEYTRANS PROOF`, `KEYTRANS PATH`, `KEYTRANS PEAK`, and `KEYTRANS PROOF-END` server notices.
+- Privileges: Registered client.
+- Parameters: Optional subcommand; `PROOF` additionally takes a decimal leaf index.
+- Replies: Server notices: `KEYTRANS STATUS disabled`, `KEYTRANS STATUS enabled entries=<n> root=<hex>`, or proof lines with root/path/peak hashes.
+- Errors: `FAIL KEYTRANS TEMPORARILY_UNAVAILABLE`, `NEED_MORE_PARAMS`, `BAD_POSITION`, `DISABLED`, `NO_SUCH_LEAF`, `INTERNAL_ERROR`, `INVALID_SUBCOMMAND`.
+- Example: `KEYTRANS PROOF 42`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleKeyTrans`, `src/daemon/services.zig` `keyTransparencyProof`
+
 ## TEGAMI
 
 - Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)

@@ -23230,6 +23230,80 @@ pub const LinuxServer = struct {
         try appendToConn(conn, m);
     }
 
+    fn keyTransReply(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "KEYTRANS {s}", .{body}) catch return;
+        try self.noticeTo(conn, text);
+    }
+
+    pub fn handleKeyTrans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "KEYTRANS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const p = parsed.paramSlice();
+        const sub = if (p.len == 0) "STATUS" else p[0];
+
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS") or std.ascii.eqlIgnoreCase(sub, "ROOT")) {
+            const status = svc.keyTransparencyStatus();
+            if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled");
+            const root_hex = std.fmt.bytesToHex(status.root, .lower);
+            var b: [160]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "STATUS enabled entries={d} root={s}", .{ status.entries, &root_hex }) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "PROOF")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS PROOF <position>");
+            const position = std.fmt.parseInt(usize, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_POSITION", "Proof position must be a decimal leaf index");
+            var proof = svc.keyTransparencyProof(self.allocator, position) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.IndexOutOfRange => "NO_SUCH_LEAF",
+                    error.OutOfMemory => "INTERNAL_ERROR",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.IndexOutOfRange => "No key transparency leaf exists at that position",
+                    error.OutOfMemory => "Could not allocate proof snapshot",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            defer proof.deinit(self.allocator);
+
+            const root_hex = std.fmt.bytesToHex(proof.root, .lower);
+            var hb: [192]u8 = undefined;
+            const header = std.fmt.bufPrint(
+                &hb,
+                "PROOF position={d} size={d} root={s} path={d} peaks={d}",
+                .{ proof.position, proof.size, &root_hex, proof.path.len, proof.peaks.len },
+            ) catch return;
+            try self.keyTransReply(conn, header);
+
+            for (proof.path, 0..) |step, i| {
+                const hash_hex = std.fmt.bytesToHex(step.hash, .lower);
+                const side: []const u8 = switch (step.side) {
+                    .left => "left",
+                    .right => "right",
+                };
+                var lb: [160]u8 = undefined;
+                const line = std.fmt.bufPrint(&lb, "PATH {d} {s} {s}", .{ i, side, &hash_hex }) catch continue;
+                try self.keyTransReply(conn, line);
+            }
+
+            for (proof.peaks, 0..) |peak, i| {
+                const hash_hex = std.fmt.bytesToHex(peak, .lower);
+                var lb: [160]u8 = undefined;
+                const line = std.fmt.bufPrint(&lb, "PEAK {d} {s}", .{ i, &hash_hex }) catch continue;
+                try self.keyTransReply(conn, line);
+            }
+
+            var eb: [80]u8 = undefined;
+            const end = std.fmt.bufPrint(&eb, "PROOF-END position={d}", .{proof.position}) catch return;
+            return self.keyTransReply(conn, end);
+        }
+
+        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>]");
+    }
+
     // ── WEBAUTHN: passkey (FIDO2) registration + passwordless login ──────────
     //
     // Ceremony state lives in `conn.webauthn_pending` (per-connection, single-
@@ -31730,6 +31804,68 @@ test "WEBAUTHN inert until [webauthn] configured" {
     lv.param_count = 1;
     try server.handleWebauthn(conn, &lv);
     try expectContains(conn.send_buf[0..conn.send_len], "NOT_CONFIGURED");
+}
+
+test "KEYTRANS exposes credential transparency root and inclusion proof" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+
+    _ = try kt.append(.{
+        .account = "alice",
+        .kind = .certfp,
+        .action = .bind,
+        .key_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .key_hash = key_transparency.materialHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .timestamp_ms = 1_700_000_000_000,
+    });
+    _ = try kt.append(.{
+        .account = "alice",
+        .kind = .webauthn,
+        .action = .bind,
+        .key_id = "credAAA",
+        .key_hash = key_transparency.materialHash("cose-key"),
+        .timestamp_ms = 1_700_000_001_000,
+    });
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var status = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &status);
+    const root_hex = std.fmt.bytesToHex(kt.root(), .lower);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS enabled entries=2 root=");
+    try expectContains(conn.send_buf[0..conn.send_len], &root_hex);
+
+    var proof = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    proof.params[0] = "PROOF";
+    proof.params[1] = "1";
+    proof.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &proof);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS PROOF position=1 size=2 root=");
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS PATH 0 left ");
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS PROOF-END position=1");
+
+    proof.params[1] = "9";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &proof);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
 }
 
 test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {

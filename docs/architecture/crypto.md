@@ -66,9 +66,12 @@ bind/delete and WebAuthn bind/delete append canonical events under the services
 mutation lock (`src/main.zig`, `src/daemon/services.zig`). WebAuthn events hash
 the raw COSE public key material, while CERTFP events hash the fingerprint
 string. The public `status.json` feed exposes whether key transparency is live,
-the current append count, and the current MMR root; the underlying module
-provides root and inclusion-proof verification primitives
-(`src/daemon/server.zig`, `src/daemon/key_transparency.zig`).
+the current append count, and the current MMR root. Clients and operators can
+also query the same log through the `KEYTRANS` server command: `STATUS`/`ROOT`
+returns the current root and size, while `PROOF <position>` streams the copied
+path and peak hashes needed to verify one inclusion proof
+(`src/daemon/server.zig`, `src/daemon/services.zig`,
+`src/daemon/key_transparency.zig`).
 
 ## ProofMark moderation proofs
 
