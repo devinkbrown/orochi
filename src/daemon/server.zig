@@ -5051,9 +5051,29 @@ pub const LinuxServer = struct {
         writeJsonEscaped(&w, self.config.network_name) catch return w.buffered();
         w.writeAll(",\"node\":") catch return w.buffered();
         writeJsonEscaped(&w, self.serverName()) catch return w.buffered();
+        w.writeAll(",\"description\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.config.server_description) catch return w.buffered();
+        w.writeAll(",\"icon_url\":") catch return w.buffered();
+        if (self.config.network_icon_url.len != 0) {
+            writeJsonEscaped(&w, self.config.network_icon_url) catch return w.buffered();
+        } else {
+            w.writeAll("null") catch return w.buffered();
+        }
         w.print(",\"discoverable\":{s}", .{if (self.config.network_discoverable) "true" else "false"}) catch return w.buffered();
         w.print(",\"uptime_seconds\":{d}", .{uptime}) catch return w.buffered();
         w.print(",\"users_online\":{d}", .{self.meshUserCount()}) catch return w.buffered();
+        const public_activity = self.chanstats.publicSummary(platform.realtimeMillis());
+        w.print(",\"activity\":{{\"channels\":{d},\"messages\":{d},\"active_channels_24h\":{d},\"last_active\":", .{
+            public_activity.channels,
+            public_activity.messages,
+            public_activity.active_channels_24h,
+        }) catch return w.buffered();
+        if (public_activity.last_active_ms) |last| {
+            w.print("{d}", .{@divFloor(last, 1000)}) catch return w.buffered();
+        } else {
+            w.writeAll("null") catch return w.buffered();
+        }
+        w.writeAll("}") catch return w.buffered();
         w.print(",\"mesh\":{{\"quorum\":{s},\"partitioned\":{s},\"components\":{d}}}", .{
             if (self.partition_quorum) "true" else "false",
             if (self.partition_split) "true" else "false",
@@ -32468,20 +32488,26 @@ test "status.json: emits node health + mesh peers for the public status page" {
         defer server.deinit();
 
         // Seed a live peer and a downed one, then build the JSON in memory.
+        server.config.server_description = "Alpha node";
+        server.config.network_icon_url = "https://example.test/orochi.png";
         server.markPeerHealth("ircx.us", .established);
         server.markPeerHealth("stale.node", .down);
         _ = try server.history.append("#hist", .{ .msgid = "h1", .sender = "a!u@h", .text = "one", .timestamp = 1 });
         _ = try server.history.append("#hist", .{ .msgid = "h2", .sender = "a!u@h", .text = "two", .timestamp = 2 });
         _ = try server.history.append("alice", .{ .msgid = "d1", .sender = "b!u@h", .text = "dm", .timestamp = 3 });
         try server.history.redact("#hist", "h1");
+        server.chanstats.recordMessage("#root", "alice", "public activity", platform.realtimeMillis());
 
         var buf: [8192]u8 = undefined;
         const text = server.buildStatusJson(&buf);
 
         // Node identity + health envelope.
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"description\":\"Alpha node\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"icon_url\":\"https://example.test/orochi.png\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"discoverable\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"activity\":{\"channels\":1,\"messages\":1,\"active_channels_24h\":1,\"last_active\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);

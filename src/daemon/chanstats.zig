@@ -134,6 +134,31 @@ pub const ChanStats = struct {
         return e.value_ptr.*.messages;
     }
 
+    pub const PublicSummary = struct {
+        channels: u64 = 0,
+        messages: u64 = 0,
+        active_channels_24h: u64 = 0,
+        last_active_ms: ?i64 = null,
+    };
+
+    /// Compact discovery/status summary. Counts only channels that meet the
+    /// public index threshold, mirroring `writeJson` instead of leaking one-off
+    /// transient probes into directory rankings.
+    pub fn publicSummary(self: *const ChanStats, now_ms: i64) PublicSummary {
+        const day_ms: i64 = 24 * 60 * 60 * 1000;
+        var out: PublicSummary = .{};
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            const agg = entry.value_ptr.*;
+            if (agg.messages < self.min_messages) continue;
+            out.channels += 1;
+            out.messages +|= agg.messages;
+            if (now_ms >= agg.last_active and now_ms - agg.last_active <= day_ms) out.active_channels_24h += 1;
+            if (out.last_active_ms == null or agg.last_active > out.last_active_ms.?) out.last_active_ms = agg.last_active;
+        }
+        return out;
+    }
+
     fn channel(self: *ChanStats, name: []const u8, now_ms: i64) ?*ChannelAgg {
         if (self.channels.getEntry(name)) |e| return e.value_ptr.*;
         const key = self.allocator.dupe(u8, name) catch return null;
@@ -1072,6 +1097,29 @@ test "writeJson without an exists_fn prunes nothing (backward compatible)" {
     s.recordMessage("#b", "y", "hi", 1_700_000_000_000);
     s.writeJson(std.testing.io, "/tmp", "IRCXNet", "n", 1_700_000_000_000, .{});
     try std.testing.expectEqual(@as(usize, 2), s.channels.count());
+}
+
+test "publicSummary mirrors public index threshold and recent activity" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const now: i64 = 1_700_000_000_000;
+    const old = now - (25 * 60 * 60 * 1000);
+
+    s.recordMessage("#live", "alice", "one", now);
+    s.recordMessage("#old", "bob", "older", old);
+    s.min_messages = 2;
+    const hidden = s.publicSummary(now);
+    try std.testing.expectEqual(@as(u64, 0), hidden.channels);
+    try std.testing.expectEqual(@as(u64, 0), hidden.messages);
+    try std.testing.expectEqual(@as(?i64, null), hidden.last_active_ms);
+
+    s.recordMessage("#live", "alice", "two", now);
+    s.recordMessage("#old", "bob", "older again", old);
+    const summary = s.publicSummary(now);
+    try std.testing.expectEqual(@as(u64, 2), summary.channels);
+    try std.testing.expectEqual(@as(u64, 4), summary.messages);
+    try std.testing.expectEqual(@as(u64, 1), summary.active_channels_24h);
+    try std.testing.expectEqual(@as(?i64, now), summary.last_active_ms);
 }
 
 test "slugify strips the channel prefix and neutralises unsafe / traversal bytes" {

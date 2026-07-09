@@ -90,8 +90,12 @@ The same flush also emits `status.json` beside the channel stats ([src/daemon/se
   "generated_at": 1700000000,
   "network": "IRCXNet",
   "node": "eshmaki.me",
+  "description": "Orochi flagship node",
+  "icon_url": "https://example.test/orochi.png",
+  "discoverable": true,
   "uptime_seconds": 86400,
   "users_online": 214,
+  "activity": {"channels": 12, "messages": 2048, "active_channels_24h": 5, "last_active": 1700000000},
   "mesh": {"quorum": true, "partitioned": false, "components": 1},
   "accounts": {"key_transparency": {"enabled": true, "entries": 42, "root": "..." }},
   "history": {"targets": 12, "entries": 2048, "tombstones": 17, "root": "..."},
@@ -102,7 +106,20 @@ The same flush also emits `status.json` beside the channel stats ([src/daemon/se
 }
 ```
 
-Node identity is `network` + `node` (`serverName`); `uptime_seconds` is derived from `boot_unix`; `users_online` is again `meshUserCount` ([src/daemon/server.zig:4054](../../src/daemon/server.zig#L4054)). The `mesh` envelope reflects the live partition detector — `quorum`, `partitioned`, and `components` come from `partition_quorum`/`partition_split`/`partition_components`, which `updatePartitionTransitions` maintains on every link up/down ([src/daemon/server.zig:4066](../../src/daemon/server.zig#L4066)). The `accounts.key_transparency` object exposes the live account credential transparency root/size when services are attached, and `history` reports retained Lotus CHATHISTORY target, entry, and tombstone counts plus a deterministic BLAKE3 root over sorted targets and retained entries.
+Node identity is `network` + `node` (`serverName`). `description`, `icon_url`,
+and `discoverable` are operator-controlled directory metadata from `[network]`;
+`discoverable` is explicit opt-in, so private meshes can publish local health
+without asking public crawlers to index them. `uptime_seconds` is derived from
+`boot_unix`; `users_online` is again `meshUserCount` ([src/daemon/server.zig:4054](../../src/daemon/server.zig#L4054)). The `activity` object is a compact liveness
+summary from the same bounded `ChanStats` aggregate used by `index.json`, counting
+only channels that meet the public index threshold and exposing last activity for
+directory ranking. The `mesh` envelope reflects the live partition detector —
+`quorum`, `partitioned`, and `components` come from `partition_quorum`/
+`partition_split`/`partition_components`, which `updatePartitionTransitions`
+maintains on every link up/down ([src/daemon/server.zig:4066](../../src/daemon/server.zig#L4066)). The `accounts.key_transparency` object exposes the live account
+credential transparency root/size when services are attached, and `history`
+reports retained Lotus CHATHISTORY target, entry, and tombstone counts plus a
+deterministic BLAKE3 root over sorted targets and retained entries.
 
 The `peers` array is built from the live `peer_health` registry ([src/daemon/server.zig:2657](../../src/daemon/server.zig#L2657), [src/daemon/link_health.zig:286](../../src/daemon/link_health.zig#L286)). For each used slot it emits the peer name, a `state` string mapped by `peerStatusString` (`established`→`up`, `connecting`/`handshaking`→`connecting`, `draining`, `down`), a boolean `up`, the smoothed `rtt_ms` (the EWMA `ewma_rtt_ms`, or `null` before the first sample), and `since_seconds` — the time in the current state from `LinkHealth.since` ([src/daemon/server.zig:4029](../../src/daemon/server.zig#L4029), [src/daemon/link_health.zig:54](../../src/daemon/link_health.zig#L54), [src/daemon/link_health.zig:99](../../src/daemon/link_health.zig#L99)). Two tests cover the shape and the state mapping ([src/daemon/server.zig:28783](../../src/daemon/server.zig#L28783), [src/daemon/server.zig:28824](../../src/daemon/server.zig#L28824)).
 
