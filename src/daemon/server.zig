@@ -1446,6 +1446,9 @@ pub const Config = struct {
     wasm_default_fuel: u64 = wasm_bridge.default_fuel,
     /// Hostcall capability classes plugins may receive. `[wasm] allowed_caps`.
     wasm_allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
+    /// Plugin names refused by the local trust policy / kill-switch.
+    /// `[wasm] disabled_plugins`.
+    wasm_disabled_plugins: []const []const u8 = &.{},
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -3481,6 +3484,7 @@ pub const LinuxServer = struct {
                 .max_memory_bytes = config.wasm_max_memory_bytes,
                 .default_fuel = config.wasm_default_fuel,
                 .allowed_caps = config.wasm_allowed_caps,
+                .disabled_plugins = config.wasm_disabled_plugins,
             }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
@@ -27800,12 +27804,14 @@ pub const LinuxServer = struct {
         self.config.wasm_max_memory_bytes = parsed.wasm.max_memory_bytes;
         self.config.wasm_default_fuel = parsed.wasm.default_fuel;
         self.config.wasm_allowed_caps = parsed.wasm.allowed_caps;
+        self.config.wasm_disabled_plugins = parsed.wasm.disabled_plugins;
         self.wasm.deinit();
         self.wasm = wasm_bridge.Bridge.initWithOptions(self.allocator, .{
             .max_plugin_bytes = self.config.wasm_max_plugin_bytes,
             .max_memory_bytes = self.config.wasm_max_memory_bytes,
             .default_fuel = self.config.wasm_default_fuel,
             .allowed_caps = self.config.wasm_allowed_caps,
+            .disabled_plugins = self.config.wasm_disabled_plugins,
         });
         self.loadWasmPlugins();
     }
@@ -35577,11 +35583,13 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     cfg.wasm_max_memory_bytes = 128 * 1024;
     cfg.wasm_default_fuel = 1234;
     cfg.wasm_allowed_caps = wasm_abi.CapabilitySet.initMany(&.{ .reply, .hooks });
+    cfg.wasm_disabled_plugins = &.{"bad"};
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
+    try std.testing.expectError(error.PluginDisabled, server.wasm.loadBytes("bad", wasm_bridge.testing.stop_hook_wasm));
     try server.wasm.loadBytes("guard", wasm_bridge.testing.stop_hook_wasm);
     const port = try server.boundPort();
 
@@ -35612,7 +35620,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
-    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks disabled_plugins=1 blocked_loads=1", 200);
     try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();

@@ -109,11 +109,13 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
 
     if (std.ascii.eqlIgnoreCase(view, "STATUS")) {
         try core.reply(.RPL_INFOSTART, &.{}, "OroWasm runtime status");
-        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} plugin_dir={s}", .{
+        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} disabled_plugins={d} blocked_loads={d} plugin_dir={s}", .{
             info.plugin_count,
             info.command_count,
             info.hook_count,
             if (caps.len == 0) "(none)" else caps,
+            info.disabled_plugin_count,
+            info.blocked_load_count,
             if (core.services.config.wasm_plugin_dir.len == 0) "(disabled)" else core.services.config.wasm_plugin_dir,
         }) catch return;
         try core.reply(.RPL_INFO, &.{}, status);

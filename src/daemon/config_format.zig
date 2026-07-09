@@ -222,6 +222,8 @@ pub const Config = struct {
         default_fuel: u64 = wasm_bridge.default_fuel,
         /// Hostcall capability classes plugins may receive after negotiation.
         allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
+        /// Plugin names refused by the local trust policy / kill-switch.
+        disabled_plugins: []const []const u8 = &.{},
     };
 
     pub const OperSection = struct {
@@ -854,6 +856,7 @@ pub const Config = struct {
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
+        freeStringList(allocator, self.wasm.disabled_plugins);
         allocator.free(self.listen.host);
         freeStringList(allocator, self.listen.trusted_proxies);
         allocator.free(self.listen.media_host);
@@ -997,6 +1000,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
     cfg.wasm.default_fuel = try uintField(doc, "wasm.default_fuel", cfg.wasm.default_fuel, 1, 10_000_000);
     if (doc.getArray("wasm.allowed_caps")) |arr| cfg.wasm.allowed_caps = try parseWasmCaps(arr);
+    if (doc.getArray("wasm.disabled_plugins")) |arr| {
+        freeStringList(allocator, cfg.wasm.disabled_plugins);
+        cfg.wasm.disabled_plugins = try ownStringArray(allocator, resolver, arr);
+    }
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);
@@ -1780,6 +1787,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "STORE", "hooks"]
+        \\disabled_plugins = ["bad", "bridge-discord.wasm"]
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
@@ -1788,6 +1796,9 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expect(cfg.wasm.allowed_caps.has(.store));
     try testing.expect(cfg.wasm.allowed_caps.has(.hooks));
     try testing.expect(!cfg.wasm.allowed_caps.has(.time));
+    try testing.expectEqual(@as(usize, 2), cfg.wasm.disabled_plugins.len);
+    try testing.expectEqualStrings("bad", cfg.wasm.disabled_plugins[0]);
+    try testing.expectEqualStrings("bridge-discord.wasm", cfg.wasm.disabled_plugins[1]);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]

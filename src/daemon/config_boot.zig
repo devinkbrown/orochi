@@ -60,6 +60,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;
     out.wasm_default_fuel = cfg.wasm.default_fuel;
     out.wasm_allowed_caps = cfg.wasm.allowed_caps;
+    out.wasm_disabled_plugins = cfg.wasm.disabled_plugins;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
@@ -887,6 +888,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
         \\allowed_caps = ["reply", "log", "hooks"]
+        \\disabled_plugins = ["bridge-discord", "bad.wasm"]
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
@@ -899,6 +901,9 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expect(loaded.config.wasm_allowed_caps.has(.log));
     try testing.expect(loaded.config.wasm_allowed_caps.has(.hooks));
     try testing.expect(!loaded.config.wasm_allowed_caps.has(.time));
+    try testing.expectEqual(@as(usize, 2), loaded.config.wasm_disabled_plugins.len);
+    try testing.expectEqualStrings("bridge-discord", loaded.config.wasm_disabled_plugins[0]);
+    try testing.expectEqualStrings("bad.wasm", loaded.config.wasm_disabled_plugins[1]);
 }
 
 test "limits overlay reputation knobs" {

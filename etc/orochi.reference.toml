@@ -587,6 +587,11 @@ allow_anonymous = false
 # hooks only for plugins you trust. Valid tokens: reply, log, time, rand, store,
 # lookup, hooks.
 # allowed_caps = ["reply", "log", "time"]
+# Local plugin kill-switch. Entries match a plugin stem (`bridge-discord`) or
+# file name (`bridge-discord.wasm`) case-insensitively and are refused before the
+# `.wasm` file is read. Use this for registry trust incidents or emergency
+# rollback without deleting plugin artifacts.
+# disabled_plugins = []
 
 
 # --- [oper] — operator subsystem settings ------------------------------------

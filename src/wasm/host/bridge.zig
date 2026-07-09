@@ -35,6 +35,8 @@ pub const RuntimeInfo = struct {
     manifest_schema: abi.SchemaVersion,
     host_function_count: usize,
     allowed_caps: abi.CapabilitySet,
+    disabled_plugin_count: usize,
+    blocked_load_count: usize,
     max_memory_bytes: usize,
     default_fuel: u64,
     max_plugin_bytes: usize,
@@ -48,6 +50,7 @@ pub const Options = struct {
     max_memory_bytes: usize = default_max_memory_bytes,
     default_fuel: u64 = default_fuel,
     allowed_caps: abi.CapabilitySet = default_allowed_caps,
+    disabled_plugins: []const []const u8 = &.{},
 };
 
 pub const PluginSummary = struct {
@@ -62,6 +65,7 @@ pub const Bridge = struct {
     allocator: std.mem.Allocator,
     store: plugin.PluginStore,
     options: Options,
+    blocked_loads: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Bridge {
         return initWithOptions(allocator, .{});
@@ -91,9 +95,13 @@ pub const Bridge = struct {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".wasm")) continue;
+            const plugin_name = entry.name[0 .. entry.name.len - ".wasm".len];
+            if (self.pluginDisabled(plugin_name)) {
+                self.blocked_loads += 1;
+                continue;
+            }
             const bytes = try dir.readFileAlloc(io, entry.name, self.allocator, .limited(self.options.max_plugin_bytes));
             defer self.allocator.free(bytes);
-            const plugin_name = entry.name[0 .. entry.name.len - ".wasm".len];
             try self.loadBytes(plugin_name, bytes);
             loaded += 1;
         }
@@ -102,6 +110,10 @@ pub const Bridge = struct {
 
     /// Register an already-parsed plugin module from bytes.
     pub fn loadBytes(self: *Bridge, name: []const u8, wasm: []const u8) anyerror!void {
+        if (self.pluginDisabled(name)) {
+            self.blocked_loads += 1;
+            return error.PluginDisabled;
+        }
         var meta = try Metadata.parse(self.allocator, name, wasm);
         defer meta.deinit(self.allocator);
 
@@ -179,6 +191,8 @@ pub const Bridge = struct {
             .manifest_schema = abi.manifest_schema,
             .host_function_count = abi.host_functions.len,
             .allowed_caps = self.store.policy.allowed_caps,
+            .disabled_plugin_count = self.options.disabled_plugins.len,
+            .blocked_load_count = self.blocked_loads,
             .max_memory_bytes = self.options.max_memory_bytes,
             .default_fuel = self.options.default_fuel,
             .max_plugin_bytes = self.options.max_plugin_bytes,
@@ -217,6 +231,14 @@ pub const Bridge = struct {
             if (std.ascii.eqlIgnoreCase(reg.hook, name)) return reg;
         }
         return null;
+    }
+
+    fn pluginDisabled(self: *const Bridge, name: []const u8) bool {
+        for (self.options.disabled_plugins) |blocked| {
+            if (std.ascii.eqlIgnoreCase(name, blocked)) return true;
+            if (std.mem.endsWith(u8, blocked, ".wasm") and std.ascii.eqlIgnoreCase(name, blocked[0 .. blocked.len - ".wasm".len])) return true;
+        }
+        return false;
     }
 };
 
@@ -601,9 +623,11 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
         .max_memory_bytes = 128 * 1024,
         .default_fuel = 1234,
         .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .hooks }),
+        .disabled_plugins = &.{"blocked"},
     });
     defer bridge.deinit();
     try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
+    try std.testing.expectError(error.PluginDisabled, bridge.loadBytes("blocked", &stop_hook_wasm_bytes));
 
     const info = bridge.runtimeInfo();
     try std.testing.expectEqual(@as(u16, 1), info.manifest_schema.major);
@@ -611,6 +635,8 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(info.allowed_caps.has(.reply));
     try std.testing.expect(info.allowed_caps.has(.hooks));
     try std.testing.expect(!info.allowed_caps.has(.time));
+    try std.testing.expectEqual(@as(usize, 1), info.disabled_plugin_count);
+    try std.testing.expectEqual(@as(usize, 1), info.blocked_load_count);
     try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
     try std.testing.expectEqual(@as(usize, 4096), info.max_plugin_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024), info.max_memory_bytes);
