@@ -17200,7 +17200,7 @@ pub const LinuxServer = struct {
         }
 
         if (std.ascii.eqlIgnoreCase(params[0], "STATS")) {
-            return self.handleEventStats(conn, is_oper);
+            return self.handleEventStats(conn, is_oper, params);
         }
 
         if (std.ascii.eqlIgnoreCase(params[0], "ADD")) {
@@ -17413,11 +17413,39 @@ pub const LinuxServer = struct {
         if (got != 0) try self.noticeTo(conn, "End of event replay.");
     }
 
-    /// `EVENT STATS` (oper-only): per-category + per-severity Event Spine event
-    /// counts since boot, plus the total and the live history-ring depth.
-    fn handleEventStats(self: *LinuxServer, conn: *ConnState, is_oper: bool) !void {
+    /// Render the machine-readable operator UI form of `EVENT STATS`.
+    fn writeEventStatsJson(self: *LinuxServer, w: *std.Io.Writer) !void {
+        try w.print("{{\"total\":{d},\"history_depth\":{d},\"categories\":{{", .{ self.event_stats.totalCount(), self.event_history.len() });
+        var first = true;
+        inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
+            const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.print("\"{s}\":{d}", .{ cat.token(), self.event_stats.categoryCount(@intFromEnum(cat)) });
+        }
+        try w.writeAll("},\"severities\":{");
+        first = true;
+        inline for (@typeInfo(event_spine.EventSeverity).@"enum".field_names) |field_name| {
+            const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field_name);
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.print("\"{s}\":{d}", .{ sev.token(), self.event_stats.severityCount(@intFromEnum(sev)) });
+        }
+        try w.writeAll("}}");
+    }
+
+    /// `EVENT STATS [JSON]` (oper-only): per-category + per-severity Event Spine
+    /// event counts since boot, plus the total and the live history-ring depth.
+    fn handleEventStats(self: *LinuxServer, conn: *ConnState, is_oper: bool, params: []const []const u8) !void {
         if (!is_oper) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT STATS is for operators");
+            return;
+        }
+        if (params.len >= 2 and std.ascii.eqlIgnoreCase(params[1], "JSON")) {
+            var buf: [1024]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            try self.writeEventStatsJson(&w);
+            try self.noticeTo(conn, w.buffered());
             return;
         }
         var hb: [96]u8 = undefined;
@@ -35320,6 +35348,18 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     // Oper A (subscribed) also sees the KILL as an Event Spine event
     // (`:<srv> EVENT A <killer> killed <target> (<reason>)`).
     try recvUntil(&a, "killed B ", 200);
+
+    // Operator UI form: EVENT STATS JSON returns a stable machine-readable
+    // object with all category/severity keys present.
+    a.reset();
+    try writeAllFd(fd_a, "EVENT STATS JSON\r\n");
+    try recvUntil(&a, "\"total\":", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"history_depth\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"categories\":{\"connect\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"announce\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"kill\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"severities\":{\"debug\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"critical\":") != null);
 }
 
 test "threaded server: SETNAME self echo requires setname cap" {

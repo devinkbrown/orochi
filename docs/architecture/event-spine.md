@@ -62,7 +62,17 @@ The ring **is** persisted to disk: `serializeInto`/`load` use an `OEH1`-magic li
 
 ## EVENT STATS and flood-collapse
 
-`EventStats` holds lock-free atomic (`std.atomic.Value(u64)`) per-category, per-severity, and total counters, incremented at the same two `record` sites as the history ring ([src/daemon/event_history.zig](../../src/daemon/event_history.zig)). `EVENT STATS` (oper-only, `handleEventStats`) reports the total since boot, the live ring depth, and the nonzero per-category/per-severity breakdown. Counters are **process-lifetime and deliberately not persisted** (the useful "since this boot" semantics), unlike the history ring which is.
+`EventStats` holds lock-free atomic (`std.atomic.Value(u64)`) per-category,
+per-severity, and total counters, incremented at the same two `record` sites as
+the history ring ([src/daemon/event_history.zig](../../src/daemon/event_history.zig)).
+`EVENT STATS` (oper-only, `handleEventStats`) reports the total since boot, the
+live ring depth, and the nonzero per-category/per-severity breakdown.
+`EVENT STATS JSON` returns the same counters as one NOTICE whose trailing
+parameter is a stable JSON object: `total`, `history_depth`, `categories`, and
+`severities`; all known category and severity keys are present, including zeros,
+so operator UIs can poll it without scraping prose. Counters are
+**process-lifetime and deliberately not persisted** (the useful "since this
+boot" semantics), unlike the history ring which is.
 
 `CollapseTable(64)` is RwLock-guarded and keyed on `(category, FNV-1a hash of message)` ([src/daemon/event_collapse.zig](../../src/daemon/event_collapse.zig)). `admit` delivers the first `default_threshold` (8) identical copies in a `default_window_ms` (10 s) window, then suppresses the rest; slots evict LRU when full. Two safety invariants: **severity `>= warn` is never collapsed** (a kill/ward/security/error storm always reaches opers in full), and **only exact repeats** (same category + identical message) collapse, so distinct events (different nick/channel) are unaffected. `flush` runs on the stats tick (reactor 0) and emits one summary per elapsed window that suppressed at least one event; that summary is published as `.flood`/`.warn` so it bypasses its own collapser (no self-collapse).
 
@@ -102,6 +112,6 @@ Both codecs are bounded per-field (so a hostile peer cannot pin large buffers), 
 | `EVENT CLEAR [type]` | Clear one IRCX type, or (no arg) all IRCX + category subscriptions, subject masks, and the severity floor. |
 | `EVENT SEVERITY [level]` | Oper-only. Set or report the per-session minimum severity for the category plane. |
 | `EVENT REPLAY [category\|ALL] [count]` | Oper-only. Re-send recent history-ring events (severity-floored, oldest→newest, age-prefixed). |
-| `EVENT STATS` | Oper-only. Per-category/severity counters since boot + live ring depth. |
+| `EVENT STATS [JSON]` | Oper-only. Per-category/severity counters since boot + live ring depth; `JSON` returns a stable object for operator UIs. |
 | `EVENT BROADCAST :<message>` | Oper-only. The former WALLOPS, folded into the spine as an `.announce` event. |
 | `EVENT OBSERVE <mask> [actions…] \| OFF \| LIST` | Oper-only. Manage the standing lifecycle-observation subscription (real hosts). |
