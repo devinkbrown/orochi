@@ -6,18 +6,18 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 
 ## MESH
 
-- Syntax: `MESH [LOG|GRANTS]`
-- Description: Without a subcommand, renders live mesh peer/link health and then a partition/quorum summary (`mesh intact`, `PARTITIONED (quorum held)`, or `PARTITIONED (NO QUORUM ...)`). `MESH LOG` prints recent mesh audit events. `MESH GRANTS` lists recognized cross-mesh operator grants.
+- Syntax: `MESH [LOG|GRANTS|ADMISSION]`
+- Description: Without a subcommand, renders live mesh peer/link health and then a partition/quorum summary (`mesh intact`, `PARTITIONED (quorum held)`, or `PARTITIONED (NO QUORUM ...)`). `MESH LOG` prints recent mesh audit events. `MESH GRANTS` lists recognized cross-mesh operator grants. `MESH ADMISSION` reports MeshPass admission posture (`open`, shared-secret fallback, or signed roots) without exposing shared secret or token bytes.
 - Privileges: Oper (`.access = .oper`).
-- Parameters: Optional `LOG` or `GRANTS`.
+- Parameters: Optional `LOG`, `GRANTS`, or `ADMISSION`.
 - Replies: Server notices containing report lines.
 - Errors: `ERR_NOPRIVILEGES 481`.
-- Example: `MESH GRANTS`
+- Example: `MESH ADMISSION`
 - Sources: `src/daemon/modules/oper_security.zig:132`, `src/daemon/server.zig:10308`, `src/daemon/server.zig:10412`
 
 ## NETSTAT
 
-- Syntax: `NETSTAT [LOG|GRANTS]`
+- Syntax: `NETSTAT [LOG|GRANTS|ADMISSION]`
 - Description: Alias of `MESH`; dispatches to the same handler and supports the same subcommands.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: Same as `MESH`.

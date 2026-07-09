@@ -5049,6 +5049,12 @@ pub const LinuxServer = struct {
         return public_activity.messages +| (public_activity.active_channels_24h *| 100) +| (public_activity.channels *| 10);
     }
 
+    fn meshAdmissionMode(self: *const LinuxServer) []const u8 {
+        if (self.meshpass_roots.len != 0) return "signed";
+        if (self.config.mesh_pass.len != 0) return "shared-secret";
+        return "open";
+    }
+
     /// Pure builder for `status.json` (see `writeStatusJson`). Returns the JSON
     /// slice backed by `buf`; on overflow returns whatever was written so far
     /// (best-effort, never fails). Separated so it is testable without file I/O.
@@ -5139,6 +5145,16 @@ pub const LinuxServer = struct {
             if (self.partition_quorum) "true" else "false",
             if (self.partition_split) "true" else "false",
             self.partition_components,
+        }) catch return w.buffered();
+        w.writeAll(",\"mesh_admission\":{\"mode\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.meshAdmissionMode()) catch return w.buffered();
+        w.print(",\"secured_s2s\":{s},\"require_secured\":{s},\"require_signed_frames\":{s},\"roots\":{d},\"token_present\":{s},\"min_revocation_epoch\":{d}}}", .{
+            if (self.s2sSecured()) "true" else "false",
+            if (self.config.require_secured) "true" else "false",
+            if (self.config.s2s_config.require_signed_frames) "true" else "false",
+            self.meshpass_roots.len,
+            if (self.mesh_admission_token.len != 0) "true" else "false",
+            self.config.mesh_admission_min_revocation_epoch,
         }) catch return w.buffered();
         const kt_status = if (self.account_services) |svc|
             svc.keyTransparencyStatus()
@@ -28261,6 +28277,25 @@ pub const LinuxServer = struct {
             }
             return;
         }
+        // `MESH ADMISSION` exposes the MeshPass security posture without leaking
+        // shared-secret or signed-token bytes.
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "ADMISSION")) {
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "admission mode={s} secured_s2s={s} require_secured={s} require_signed_frames={s} roots={d} token_present={s} min_revocation_epoch={d}", .{
+                self.meshAdmissionMode(),
+                if (self.s2sSecured()) "true" else "false",
+                if (self.config.require_secured) "true" else "false",
+                if (self.config.s2s_config.require_signed_frames) "true" else "false",
+                self.meshpass_roots.len,
+                if (self.mesh_admission_token.len != 0) "true" else "false",
+                self.config.mesh_admission_min_revocation_epoch,
+            }) catch "admission status unavailable";
+            try self.noticeTo(conn, line);
+            if (self.meshpass_roots.len != 0 and !self.s2sSecured()) {
+                try self.noticeTo(conn, "admission warning: signed MeshPass roots require secured S2S identity and crypto");
+            }
+            return;
+        }
         // `MESH GRANTS` lists the cross-mesh operator grants this node currently
         // recognizes (account, class, title, issuer, remaining TTL).
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "GRANTS")) {
@@ -33532,6 +33567,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"channels\":1,\"messages\":1,\"active_channels_24h\":1}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"proxy_protocol\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false,\"connection_throttle\":false,\"mesh_clone_limit\":false,\"reputation_gate\":false,\"dnsbl\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh_admission\":{\"mode\":\"open\",\"secured_s2s\":false,\"require_secured\":false,\"require_signed_frames\":true,\"roots\":0,\"token_present\":false,\"min_revocation_epoch\":0}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
@@ -36292,6 +36328,11 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     a.reset();
     try writeAllFd(fd_a, "REHASH\r\n");
     try recvUntil(&a, " 382 A ", 200);
+    // MESH ADMISSION exposes MeshPass posture without leaking admission bytes.
+    a.reset();
+    try writeAllFd(fd_a, "MESH ADMISSION\r\n");
+    try recvUntil(&a, "NOTICE A :admission mode=", 200);
+    try recvUntil(&a, "token_present=false", 200);
 
     // INFO (371), USERS (392), LINKS (364), MAP (015).
     a.reset();
