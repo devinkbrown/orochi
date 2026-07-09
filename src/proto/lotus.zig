@@ -8,6 +8,10 @@
 //! returns borrowed read views that remain valid until the next mutation.
 const std = @import("std");
 
+const Blake3 = std.crypto.hash.Blake3;
+
+pub const ContentHash = [Blake3.digest_length]u8;
+
 pub const Params = struct {
     max_targets: usize,
     max_per_target: usize,
@@ -30,6 +34,7 @@ pub const InputMessage = struct {
 };
 
 pub const Message = struct {
+    hash: ContentHash = @splat(0),
     msgid: []const u8,
     sender: []const u8,
     text: []const u8,
@@ -202,6 +207,7 @@ pub fn Lotus(comptime params: Params) type {
             const owned_text = try self.allocator.dupe(u8, new_text);
             self.allocator.free(entry.text);
             entry.text = owned_text;
+            entry.hash = hashText(new_text);
         }
 
         /// Resolve a message's server timestamp by its msgid within `target`, or
@@ -271,6 +277,7 @@ pub fn HistoryStore(comptime params: Params) type {
 }
 
 const StoredMessage = struct {
+    hash: ContentHash,
     msgid: []u8,
     sender: []u8,
     text: []u8,
@@ -283,6 +290,7 @@ const StoredMessage = struct {
 
     fn init(allocator: std.mem.Allocator, msg: InputMessage) std.mem.Allocator.Error!StoredMessage {
         var stored = StoredMessage{
+            .hash = hashText(msg.text),
             .msgid = &.{},
             .sender = &.{},
             .text = &.{},
@@ -306,6 +314,7 @@ const StoredMessage = struct {
         allocator.free(self.text);
         if (self.client_tags) |tags| allocator.free(tags);
         self.* = .{
+            .hash = @splat(0),
             .msgid = &.{},
             .sender = &.{},
             .text = &.{},
@@ -318,6 +327,7 @@ const StoredMessage = struct {
 
     fn view(self: *const StoredMessage) Message {
         return .{
+            .hash = self.hash,
             .msgid = self.msgid,
             .sender = self.sender,
             .text = self.text,
@@ -340,6 +350,12 @@ fn validateTarget(target: []const u8) Error!void {
 
 fn validateOutput(n: usize, out: []Message) Error!void {
     if (out.len < n) return error.OutputTooSmall;
+}
+
+fn hashText(text: []const u8) ContentHash {
+    var out: ContentHash = undefined;
+    Blake3.hash(text, &out, .{});
+    return out;
 }
 
 test "append evicts oldest and latest returns newest first" {
@@ -495,6 +511,10 @@ test "edit replaces message text" {
     const got = try store.latest("kain", 1, &out);
     try std.testing.expectEqual(@as(usize, 1), got.len);
     try expectMsg(got[0], "m1", 1, "after");
+    const after_hash = hashText("after");
+    const before_hash = hashText("before");
+    try std.testing.expectEqualSlices(u8, &after_hash, &got[0].hash);
+    try std.testing.expect(!std.mem.eql(u8, &before_hash, &got[0].hash));
 }
 
 test "client tags are retained for TAGMSG entries" {

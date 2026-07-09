@@ -57,7 +57,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 ## CHATHISTORY
 
 - Syntax: `CHATHISTORY <subcommand> <target> ...`
-- Description: Reassembles the original line and delegates to the chathistory parser/handler. Used for IRCv3 history playback.
+- Description: Reassembles the original line and delegates to the chathistory parser/handler. Used for IRCv3 history playback over the live Lotus ring; retained messages carry BLAKE3 content hashes, and edits update the stored content address before replay.
 - Privileges: Registered client.
 - Parameters: Parsed by the chathistory subsystem from the raw line.
 - Replies: History batches and standard batch framing.
