@@ -71,7 +71,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## AUDIT
 
 - Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id>`
-- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>`. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
+- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, and `UNSHUN`. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
 - Privileges: Oper holding the `audit_read` privilege.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
@@ -129,7 +129,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 - Description: Unified Warden network-ban registry. A Ward is `Match x Scope x Action`: match facets are `address`, `host`, `mask`, `account`, `realname`, `certfp`, `country`, and `asn`; scopes are `node` or `mesh`; actions are `refuse`, `expel`, `quarantine`, or `require_auth`. The registered surface has no K/D/G/Z-line commands.
 - Privileges: Oper plus `client_moderate` privilege.
 - Parameters: Subcommand-specific Warden axes and optional duration/reason.
-- Replies: Server notices and oper events. `WARD TEST` reports match/no-match by notice.
+- Replies: Server notices and oper events. `WARD ADD` and `WARD DEL` oper events include `proof=<id>` when the node has a signing identity. `WARD TEST` reports match/no-match by notice.
 - Errors: `ERR_NOPRIVILEGES 481`; usage and validation failures are server notices.
 - Example: `WARD ADD address 203.0.113.0/24 mesh refuse 3600 :abuse`
 - Sources: `src/daemon/modules/oper_security.zig:116`, `src/daemon/server.zig:5892`, `src/daemon/warden.zig:21`
@@ -151,7 +151,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 - Description: Adds a gag/shun restriction through the `handleShun` path.
 - Privileges: Oper.
 - Parameters: Target and optional reason.
-- Replies: Server notice/oper event.
+- Replies: Server notice/oper event with `proof=<id>` when the node has a signing identity.
 - Errors: `ERR_NOPRIVILEGES 481`; handler validation notices.
 - Example: `SHUN badnick :flood`
 - Sources: `src/daemon/modules/oper_security.zig:117`, `src/daemon/server.zig:5799`
@@ -162,7 +162,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 - Description: Clears a gag/shun restriction through the same handler with `adding = false`.
 - Privileges: Oper.
 - Parameters: Target.
-- Replies: Server notice/oper event.
+- Replies: Server notice/oper event with `proof=<id>` when the node has a signing identity.
 - Errors: `ERR_NOPRIVILEGES 481`; handler validation notices.
 - Example: `UNSHUN badnick`
 - Sources: `src/daemon/modules/oper_security.zig:118`, `src/daemon/server.zig:5799`

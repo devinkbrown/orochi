@@ -38,6 +38,9 @@ pub const Action = enum {
     rehash,
     die,
     restart,
+    ward_add,
+    unshun,
+    ward_del,
     other,
 
     /// Stable lowercase label used when rendering audit lines.
@@ -56,6 +59,9 @@ pub const Action = enum {
             .rehash => "rehash",
             .die => "die",
             .restart => "restart",
+            .ward_add => "ward_add",
+            .unshun => "unshun",
+            .ward_del => "ward_del",
             .other => "other",
         };
     }
@@ -76,6 +82,9 @@ pub const Action = enum {
             .rehash => 11,
             .die => 12,
             .restart => 13,
+            .ward_add => 14,
+            .unshun => 15,
+            .ward_del => 16,
             .other => 255,
         };
     }

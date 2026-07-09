@@ -15402,8 +15402,13 @@ pub const LinuxServer = struct {
         const mask = p[0];
         if (!adding) {
             const removed = self.shuns.remove(mask);
+            const status = if (removed) "removed" else "not found";
+            const proof_id = self.recordOperAudit(conn.session.displayName(), .unshun, mask, status);
             var b: [default_reply_bytes]u8 = undefined;
-            const note = std.fmt.bufPrint(&b, "UNSHUN {s}: {s}", .{ mask, if (removed) "removed" else "not found" }) catch return;
+            const note = if (proof_id) |pid|
+                std.fmt.bufPrint(&b, "UNSHUN {s}: {s} proof={s}", .{ mask, status, pid[0..] }) catch return
+            else
+                std.fmt.bufPrint(&b, "UNSHUN {s}: {s}", .{ mask, status }) catch return;
             try self.publishOperEvent(.oper_action, .notice, note);
             return;
         }
@@ -15429,8 +15434,12 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "SHUN: could not add (limit or invalid mask)");
             return;
         };
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .shun, mask, reason);
         var b: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&b, "SHUN {s}", .{mask}) catch return;
+        const note = if (proof_id) |pid|
+            std.fmt.bufPrint(&b, "SHUN {s} proof={s}", .{ mask, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&b, "SHUN {s}", .{mask}) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
     }
 
@@ -15526,6 +15535,7 @@ pub const LinuxServer = struct {
         action: warden.Action,
         secs: i64,
         reason: []const u8,
+        audit_action: svc_operaudit.Action,
     ) !void {
         const now = platform.realtimeMillis();
         const ward = warden.Ward{
@@ -15546,7 +15556,7 @@ pub const LinuxServer = struct {
         // A `mesh`-scope ward propagates to every secured peer so already-running
         // nodes enforce it live. A `node`-scope ward stays local.
         if (scope == .mesh) self.broadcastMeshWard(ward, .add);
-        const proof_id = self.recordOperAudit(conn.session.displayName(), .kline, pattern, if (reason.len != 0) reason else "WARD ADD");
+        const proof_id = self.recordOperAudit(conn.session.displayName(), audit_action, pattern, if (reason.len != 0) reason else "WARD ADD");
         var b: [default_reply_bytes]u8 = undefined;
         const note = if (proof_id) |pid|
             std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s} proof={s}", .{ match.token(), pattern, scope.token(), action.token(), pid[0..] }) catch return
@@ -15556,7 +15566,6 @@ pub const LinuxServer = struct {
     }
 
     fn deleteWardLive(self: *LinuxServer, conn: *ConnState, match: warden.Match, pattern: []const u8) !void {
-        _ = conn;
         // Capture the entry's scope BEFORE removal so a mesh-scope removal can be
         // propagated to peers (the `remove` itself only returns a bool). Resolve it
         // by a direct registry lookup so the scope read is correct regardless of how
@@ -15577,8 +15586,13 @@ pub const LinuxServer = struct {
                 }, .remove);
             }
         }
+        const status = if (removed) "removed" else "not found";
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .ward_del, pattern, status);
         var b: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, if (removed) "removed" else "not found" }) catch return;
+        const note = if (proof_id) |pid|
+            std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s} proof={s}", .{ match.token(), pattern, status, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, status }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
     }
 
@@ -15679,7 +15693,7 @@ pub const LinuxServer = struct {
                 break;
             }
         }
-        try self.addWardLive(conn, match, pattern, scope, action, secs, reason);
+        try self.addWardLive(conn, match, pattern, scope, action, secs, reason, .ward_add);
     }
 
     pub const WardAlias = enum { kline, dline, xline };
@@ -15733,7 +15747,7 @@ pub const LinuxServer = struct {
                 break;
             }
         }
-        try self.addWardLive(conn, match, pattern, .node, default_action, secs, reason);
+        try self.addWardLive(conn, match, pattern, .node, default_action, secs, reason, .kline);
     }
 
     /// ACCEPT [+nick|-nick|*|...] — caller-id (+g) allow list. Bare/`*` lists
@@ -39873,11 +39887,31 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try recvUntil(&o, "JUPE added: evil.example.net", 300);
     try recvUntil(&o, "JUPE ADD evil.example.net proof=", 300);
 
-    // AUDIT (newest first) shows both actions with actor/target/reason.
+    o.reset();
+    try writeAllFd(fd_o, "SHUN bad!*@host.example 0 :quiet\r\n");
+    try recvUntil(&o, "SHUN bad!*@host.example proof=", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "UNSHUN bad!*@host.example\r\n");
+    try recvUntil(&o, "UNSHUN bad!*@host.example: removed proof=", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "WARD ADD host bad.example mesh expel 0 :bad ward\r\n");
+    try recvUntil(&o, "WARD ADD host bad.example mesh/expel proof=", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "WARD DEL host bad.example\r\n");
+    try recvUntil(&o, "WARD DEL host bad.example: removed proof=", 300);
+
+    // AUDIT (newest first) shows the signed actions with actor/target/reason.
     o.reset();
     try writeAllFd(fd_o, "AUDIT\r\n");
-    try recvUntil(&o, "O jupe evil.example.net proof=", 300);
+    try recvUntil(&o, "O ward_del bad.example proof=", 300);
     try recvUntil(&o, "End of audit", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O ward_add bad.example proof=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O unshun bad!*@host.example proof=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O shun bad!*@host.example proof=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O jupe evil.example.net proof=") != null);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "O kill V proof=") != null);
 
     const marker = "proof=";
@@ -39897,12 +39931,16 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
 
     o.reset();
-    try writeAllFd(fd_o, "AUDIT JSON O 5\r\n");
+    try writeAllFd(fd_o, "AUDIT JSON O 8\r\n");
     try recvUntil(&o, "\"type\":\"audit\"", 300);
     try recvUntil(&o, "\"type\":\"audit-entry\"", 300);
     try recvUntil(&o, "\"type\":\"audit-end\"", 300);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"proof_id\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"ward_del\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"ward_add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"unshun\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"shun\"") != null);
 
     var proof_json_cmd_buf: [104]u8 = undefined;
     const proof_json_cmd = try std.fmt.bufPrint(&proof_json_cmd_buf, "AUDIT PROOF JSON {s}\r\n", .{proof_id});

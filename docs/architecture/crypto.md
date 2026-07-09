@@ -88,7 +88,8 @@ the stored proof material after the server re-verifies the signature and proof
 id. `AUDIT JSON` and `AUDIT PROOF JSON <id>` use the same Event Spine line shape
 with stable JSON payloads for operator UIs. Moderation Event Spine notices for
 signed actions also carry the same `proof=<id>` token, so an operator watching
-`EVENT` can jump directly to `AUDIT PROOF`. Nodes without a mesh key keep
+`EVENT` can jump directly to `AUDIT PROOF`. Current signed daemon actions include
+KILL, JUPE, native WARD ADD/DEL, SHUN, and UNSHUN. Nodes without a mesh key keep
 unsigned audit and event lines.
 
 ## Node identity
