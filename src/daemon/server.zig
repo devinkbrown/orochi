@@ -1765,13 +1765,16 @@ pub const Config = struct {
     /// inbound plaintext peers and never dial plaintext outbound links. Only the
     /// Tsumugi-secured path is permitted; if secured S2S is not configured/available
     /// (`!s2sSecured()`), all S2S is dropped rather than silently falling back to
-    /// clear. Default false preserves the backward-compatible plaintext fallback.
+    /// clear. Signed MeshPass admission roots also require this secured S2S path.
+    /// Default false preserves the plaintext fallback for unsigned deployments.
     require_secured: bool = false,
     /// `[mesh].trust_roots` as configured strings; decoded at init into
     /// Ed25519 node signing keys for secured-S2S peer allowlisting.
     mesh_trust_roots: []const []const u8 = &.{},
     /// `[mesh].admission_roots`: signer roots for MeshPass signed-capability
-    /// tokens. Distinct from peer node identity pins.
+    /// tokens. Distinct from peer node identity pins. Non-empty roots are invalid
+    /// unless Tsumugi secured S2S is configured; signed admission is never enforced
+    /// on the plaintext S2S path.
     mesh_admission_roots: []const []const u8 = &.{},
     mesh_admission_min_revocation_epoch: u64 = 0,
     /// `[mesh].connect` — peers ("host:port"; IPv6 hosts bracketed) this node
@@ -1852,6 +1855,37 @@ pub const Config = struct {
     /// binary is what actually boots. Null falls back to `/proc/self/exe`.
     exe_path: ?[]const u8 = null,
 };
+
+fn validateMeshAdmissionSecurity(config: Config) !void {
+    if (config.mesh_admission_roots.len == 0) return;
+    if (config.node_identity == null or config.crypto_io == null) {
+        return error.MeshAdmissionRequiresSecuredS2s;
+    }
+}
+
+test "mesh admission roots require secured S2S identity and crypto" {
+    try validateMeshAdmissionSecurity(.{ .port = 0 });
+
+    const roots = &[_][]const u8{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"};
+    try std.testing.expectError(
+        error.MeshAdmissionRequiresSecuredS2s,
+        validateMeshAdmissionSecurity(.{ .port = 0, .mesh_admission_roots = roots }),
+    );
+
+    const seed = @as([32]u8, @splat(0x44));
+    var ident = try node_identity.fromSeed(seed, "local");
+    defer ident.deinit();
+    try std.testing.expectError(
+        error.MeshAdmissionRequiresSecuredS2s,
+        validateMeshAdmissionSecurity(.{ .port = 0, .mesh_admission_roots = roots, .node_identity = &ident }),
+    );
+    try validateMeshAdmissionSecurity(.{
+        .port = 0,
+        .mesh_admission_roots = roots,
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+    });
+}
 
 pub fn mediaReassemblyConfig(config: Config) kagura_frame.ReassemblyConfig {
     return media_session.reassemblyConfig(.{ .reorder_window_frames = config.media_reorder_window_frames });
@@ -3256,6 +3290,7 @@ pub const LinuxServer = struct {
         const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         const config = runtime_features.config;
+        try validateMeshAdmissionSecurity(config);
         const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
         protocol_inventory.setBootUnix(boot_unix);
         protocol_inventory.setNodeId(config.node_id);

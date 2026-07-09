@@ -237,6 +237,8 @@ realm = "local"
 # `admission_roots` is non-empty, secured-S2S responders require peers to
 # present a token signed by one of these Ed25519 roots, bound to the peer node
 # key, carrying relay role and control/sync/irc_app/tsumugi frame families.
+# This requires secured S2S identity/crypto; if roots are configured but the
+# Tsumugi secured-S2S path is unavailable, server init fails closed.
 # admission_token = "env:OROCHI_MESHPASS_TOKEN"
 # admission_roots = ["env:OROCHI_MESHPASS_ROOT"]
 # admission_min_revocation_epoch = 0
