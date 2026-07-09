@@ -527,7 +527,7 @@ pub const min_stateless_reset_len: usize = 21;
 /// `min_stateless_reset_len`; the caller sizes it to mimic a plausible 1-RTT
 /// packet (and never larger than the triggering packet, to avoid amplification).
 ///
-/// NOTE (deferred send path): the listener does not yet invoke this on an
+/// Deferred send path: the listener does not yet invoke this on an
 /// unknown short-header DCID — see the module doc. This function + the token
 /// derivation are the complete, tested building blocks for that follow-up.
 pub fn encodeStatelessReset(

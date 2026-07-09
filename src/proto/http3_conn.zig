@@ -197,7 +197,7 @@ pub const Settings = struct {
 
     /// True if the peer advertised what WebTransport-over-HTTP/3 requires:
     /// `SETTINGS_ENABLE_WEBTRANSPORT` and `SETTINGS_H3_DATAGRAM` (RFC 9220 §3.1,
-    /// RFC 9297). NOTE: `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08, RFC 8441) is an
+    /// RFC 9297). `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08, RFC 8441) is an
     /// HTTP/2 setting and is NOT used in HTTP/3 — Extended CONNECT is enabled in
     /// H3 by the presence of `SETTINGS_ENABLE_WEBTRANSPORT` itself. Real browsers
     /// (Chrome) therefore omit 0x08 from their H3 SETTINGS, so it MUST NOT be

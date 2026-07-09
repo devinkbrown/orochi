@@ -773,7 +773,7 @@ pub const Config = struct {
         /// Require a verified attestation statement at registration: REGISTER-FINISH
         /// must carry an attestationObject and its `fmt` may not be "none". Opt-in
         /// (default false); when off, registration keeps trust-on-first-use and a
-        /// present attestation is still verified fail-closed. NOTE: the attestation
+        /// present attestation is still verified fail-closed. The attestation
         /// SIGNATURE is verified against the presented statement (self key, or the
         /// x5c leaf cert for packed-basic/fido-u2f), but the x5c leaf is NOT anchored
         /// to a trusted attestation root — there is no bundled FIDO metadata trust

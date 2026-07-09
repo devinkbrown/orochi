@@ -19,7 +19,7 @@
 
 const std = @import("std");
 
-// NOTE: `capsule.zig` defines `CapsuleKind`, whose ordinals populate
+// `capsule.zig` defines `CapsuleKind`, whose ordinals populate
 // `Entry.kind`. We intentionally do NOT `@import("capsule.zig")` here: under a
 // bare `zig test src/daemon/helix/upgrade_manifest.zig` invocation the test
 // module is rooted at this file's directory, and capsule.zig transitively

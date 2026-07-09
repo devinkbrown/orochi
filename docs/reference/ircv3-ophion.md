@@ -61,7 +61,7 @@ This table lists capability names found in current source. Where a cap is module
 | `sasl` | Module `m_sasl_core` | SASL negotiation entry point. See `m_sasl_core`. |
 | `server-time` | Core-registered and module-listed by `cap_server_time` | UTC message timestamps. See `cap_server_time`. |
 | `setname` | Core-registered and module-listed by `m_setname` | Realname changes. See `m_setname`. |
-| `standard-replies` | Core-registered | FAIL/WARN/NOTE replies. See `m_cap`. |
+| `standard-replies` | Core-registered | FAIL/WARN replies. See `m_cap`. |
 | `sts` | Module `cap_sts` | Strict Transport Security advertisement. See `cap_sts`. |
 | `tls` | Module `m_starttls` | STARTTLS negotiation. See `m_starttls`. |
 | `userhost-in-names` | Core-registered | Include userhost in NAMES output. See `m_namesx`. |
@@ -90,4 +90,3 @@ Capabilities are represented as bitmasks. `capability_put()` allocates one bit p
 | `SCRAM-SHA-256` | Module-dependent | SCRAM login. |
 | `SCRAM-SHA-512` | Module-dependent | SCRAM login. |
 | `SESSION-TOKEN` | `m_session_token` autoload singleton | Token resume; hashes persist in LMDB. See `Upgrade and Migration`. |
-

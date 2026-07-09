@@ -176,7 +176,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Description: Lists live sessions for the caller's account, reveals this session's local and optional mesh reclaim tokens, or resumes a detached session.
 - Privileges: Registered client logged in to an account.
 - Parameters: Optional subcommand; `LIST` is default.
-- Replies: `NOTE SESSION LIST`, `NOTE SESSION TOKEN`, optional `NOTE SESSION MTOKEN`, or end notices.
+- Replies: Server notices for `SESSION LIST`, `SESSION TOKEN`, optional `SESSION MTOKEN`, resume, redirect, and list end. Reclaim and migration state changes are also published on the Event Spine service plane.
 - Errors: `FAIL SESSION INVALID_TOKEN`, `FAIL SESSION NO_SESSION`; account-required notice.
 - Example: `SESSION TOKEN`
 - Sources: `src/daemon/modules/accounts.zig:71`, `src/daemon/server.zig:8880`, `src/daemon/server.zig:8930`
@@ -220,7 +220,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Description: Offline account messages (手紙 — "letter"); `MEMO` is an alias for the same command. `LIST` is the default and does not clear; login delivery clears pending messages.
 - Privileges: Registered client; account login required for list/clear/send.
 - Parameters: Optional subcommand; `SEND` target account and message.
-- Replies: `NOTE TEGAMI` lines, clear count, or delivery notice.
+- Replies: Server notices for message lists, clear count, forwarding, ignore lists, and delivery. Clear/forward mutations are also published on the Event Spine service plane.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL TEGAMI ACCOUNT_REQUIRED`, `ACCOUNT_UNKNOWN`, `MAILBOX_FULL`, `INVALID_MESSAGE`, `TEMPORARILY_UNAVAILABLE`, `INVALID_SUBCOMMAND`.
 - Example: `TEGAMI SEND alice :ping me later`
 - Sources: `src/daemon/modules/feature_misc.zig:53`, `src/daemon/server.zig:9030`
@@ -253,7 +253,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Description: Oper-only content filter control. Patterns are case-insensitive substring blocks applied to non-oper messages.
 - Privileges: Oper.
 - Parameters: `LIST`, or `ADD`/`DEL` plus pattern.
-- Replies: `NOTE FILTER` list/end notices or server notices.
+- Replies: Server notices for list/end output and mutation confirmations.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`, `FAIL FILTER TEMPORARILY_UNAVAILABLE`, `INVALID_PATTERN`, `NO_SUCH_PATTERN`, `INVALID_SUBCOMMAND`.
 - Example: `FILTER ADD badword`
 - Sources: `src/daemon/modules/feature_misc.zig:51`, `src/daemon/server.zig:9647`

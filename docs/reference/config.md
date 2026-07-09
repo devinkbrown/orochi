@@ -520,7 +520,7 @@ Source: struct at `src/daemon/config_format.zig:201`, parsing at `src/daemon/con
 
 Source: struct at `src/daemon/config_format.zig:495`, parsing at `src/daemon/config_format.zig:866`.
 
-Browser [Web Push](web-push.md) delivery for offline direct messages (triggered by the `tegami` away-delivery path). Off by default; enabling it needs an account store (subscriptions are account-scoped) and outbound HTTPS (it reuses the same trust anchors as ACME). The VAPID public key is advertised to clients through an ISUPPORT `VAPID=` token so nothing rides a NOTE data channel.
+Browser [Web Push](web-push.md) delivery for offline direct messages (triggered by the `tegami` away-delivery path). Off by default; enabling it needs an account store (subscriptions are account-scoped) and outbound HTTPS (it reuses the same trust anchors as ACME). The VAPID public key is advertised to clients through an ISUPPORT `VAPID=` token; lifecycle visibility is published on the Event Spine.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

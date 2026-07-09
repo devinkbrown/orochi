@@ -89,6 +89,7 @@ the in-house TLS stack, the media plane) predate this file; see
   reclaim, zero-drop `USR2` hot-upgrades that carry live TLS + mesh links across
   `execve` (Helix).
 - **Services as real commands:** `REGISTER`/`CHANNEL`/`TEGAMI`/`GHOST`/`SESSION`…
-  with structured `NOTE`/`FAIL` replies — no NickServ/ChanServ pseudo-clients.
+  with server notices for direct replies, `FAIL` for errors, and Event Spine
+  publication for service state — no NickServ/ChanServ pseudo-clients.
 - **IRCX + Event Spine:** `PROP`/`ACCESS`/`EVENT`, typed operator event plane,
   host cloaking, ephemeral rooms, channel stats.

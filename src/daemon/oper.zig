@@ -6,7 +6,7 @@
 //! This module is intentionally pure and allocation-free. The daemon's SASL
 //! layer verifies an account first, then asks this registry whether that
 //! canonical account maps to an operator class and privilege set. Command
-//! handlers render the typed outcomes as IRCv3 standard replies.
+//! handlers render the typed outcomes as server notices or failures.
 const std = @import("std");
 
 pub const default_params = Params{};
@@ -175,10 +175,10 @@ pub const OperGrant = struct {
 /// Structured reply concepts for the daemon command layer.
 pub const ReplyKind = enum {
     fail,
-    note,
+    ok,
 };
 
-/// Stable names callers can map to IRCv3 standard replies.
+/// Stable names callers can map to daemon replies.
 pub const ReplyCode = enum {
     account_required,
     account_not_oper,
@@ -307,7 +307,7 @@ pub fn replyForElevationError(err: ElevationError, account_name: ?[]const u8) Re
 /// Convert a successful grant into stable reply metadata.
 pub fn replyForGrant(grant: OperGrant) Reply {
     return .{
-        .kind = .note,
+        .kind = .ok,
         .code = .oper_granted,
         .account_name = grant.account_name,
         .class_name = grant.class_name,
@@ -399,7 +399,7 @@ test "known SASL account elevates to configured operator class" {
     try std.testing.expect(!grant.has(.server_shutdown));
 
     const reply = replyForGrant(grant);
-    try std.testing.expectEqual(ReplyKind.note, reply.kind);
+    try std.testing.expectEqual(ReplyKind.ok, reply.kind);
     try std.testing.expectEqual(ReplyCode.oper_granted, reply.code);
     try std.testing.expectEqualStrings("alice", reply.account_name.?);
 }

@@ -39,7 +39,7 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `account-notify` | none | ACCOUNT lines on common-user login/logout. | `src/daemon/dispatch.zig:349` |
 | `draft/account-registration` | `custom-account-name` (CAP LS 302) | REGISTER/VERIFY account registration discovery; the 302 value signals that custom (non-nick) account names are accepted. | `src/daemon/dispatch.zig` (`account_registration`, `value_302`) |
 | `draft/metadata-2` | none | METADATA GET/SET/LIST/CLEAR and 761/762/766 numerics. | `src/daemon/dispatch.zig:354` |
-| `standard-replies` | none | FAIL/WARN/NOTE support. | `src/daemon/dispatch.zig:356` |
+| `standard-replies` | none | FAIL/WARN support. | `src/daemon/dispatch.zig:356` |
 | `cap-notify` | none | Static cap set support; CAP NEW/DEL do not fire for the static set. | `src/daemon/dispatch.zig:357` |
 | `labeled-response` | none | Echoes `@label` on responses and frames multiline replies with labeled-response BATCH. | `src/daemon/dispatch.zig:362`, `src/daemon/dispatch.zig:1125` |
 | `draft/pre-away` | none | AWAY may be sent during registration. | `src/daemon/dispatch.zig:368` |

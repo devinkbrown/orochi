@@ -3,7 +3,7 @@
 
 //! Deterministic property and fuzz-style tests for IRCv3 standard replies.
 //!
-//! These tests exercise the public FAIL/WARN/NOTE builder API with bounded,
+//! These tests exercise the public FAIL/WARN builder API with bounded,
 //! fixed-seed attacker bytes. A generated input may fail validation, but it
 //! must fail with the builder's typed errors; successful output must remain a
 //! valid IRC line body with no raw line-control injection.
@@ -28,7 +28,7 @@ const ParsedReply = struct {
     }
 };
 
-test "FAIL WARN and NOTE builders return typed errors or valid bounded lines for arbitrary bytes" {
+test "FAIL and WARN builders return typed errors or valid bounded lines for arbitrary bytes" {
     var prng = std.Random.DefaultPrng.init(seed ^ 0xa771_6b1e);
     const random = prng.random();
 
@@ -256,7 +256,6 @@ fn parseRenderedLine(line: []const u8) !ParsedReply {
 fn parseReplyType(token: []const u8) !standard_replies.ReplyType {
     if (std.mem.eql(u8, token, "FAIL")) return .fail;
     if (std.mem.eql(u8, token, "WARN")) return .warn;
-    if (std.mem.eql(u8, token, "NOTE")) return .note;
     return error.InvalidReplyType;
 }
 
@@ -292,10 +291,9 @@ fn expectBuildError(err: standard_replies.BuildError) !void {
 }
 
 fn replyTypeForIteration(iteration: usize) standard_replies.ReplyType {
-    return switch (iteration % 3) {
+    return switch (iteration % 2) {
         0 => .fail,
-        1 => .warn,
-        else => .note,
+        else => .warn,
     };
 }
 

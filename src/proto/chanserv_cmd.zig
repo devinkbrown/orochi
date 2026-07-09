@@ -274,13 +274,11 @@ pub const ChanServNumeric = enum {
 /// Standard-reply verbs emitted by the formatter.
 pub const StandardReplyKind = enum {
     fail,
-    note,
 
     /// Returns the uppercase standard-reply verb.
     pub fn token(self: StandardReplyKind) []const u8 {
         return switch (self) {
             .fail => "FAIL",
-            .note => "NOTE",
         };
     }
 };
@@ -752,12 +750,10 @@ test "usage formatter returns every canonical usage string" {
     }
 }
 
-test "standard reply formatter writes fail and note lines" {
+test "standard reply formatter writes fail lines" {
     // Arrange
     var fail_out: [256]u8 = undefined;
-    var note_out: [256]u8 = undefined;
     const fail_params = [_][]const u8{"REGISTER"};
-    const note_params = [_][]const u8{"#chan"};
 
     // Act
     const fail_line = try formatStandardReply(
@@ -768,18 +764,9 @@ test "standard reply formatter writes fail and note lines" {
         &fail_params,
         fmtUsage(.register),
     );
-    const note_line = try formatStandardReply(
-        &note_out,
-        .note,
-        .cs,
-        .REGISTERED,
-        &note_params,
-        "Channel registered",
-    );
 
     // Assert
     try std.testing.expectEqualStrings("FAIL CHANNEL NEED_MORE_PARAMS REGISTER :CHANNEL REGISTER <#channel> [password]\r\n", fail_line);
-    try std.testing.expectEqualStrings("NOTE CS REGISTERED #chan :Channel registered\r\n", note_line);
 }
 
 test "standard reply formatter rejects empty params and short buffers" {
@@ -790,5 +777,5 @@ test "standard reply formatter rejects empty params and short buffers" {
 
     // Act and Assert
     try std.testing.expectError(error.EmptyToken, formatStandardReply(&out, .fail, .channel, .INVALID_PARAMS, &bad_params, "Bad input"));
-    try std.testing.expectError(error.OutputTooSmall, formatStandardReply(&short_out, .note, .channel, .INFO, &.{}, "Channel info"));
+    try std.testing.expectError(error.OutputTooSmall, formatStandardReply(&short_out, .fail, .channel, .INFO, &.{}, "Channel info"));
 }

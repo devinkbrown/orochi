@@ -135,7 +135,7 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | 913 | `ERR_NOACCESS` | IRCX PROP/DATA access denied. | `Insufficient access to set property`; `Cannot set that property`; DATA reserved-tag denials. | `src/daemon/server.zig:746`, `src/daemon/server.zig:7656`, `src/daemon/server.zig:7740` |
 | 923 | `ERR_NOWHISPER` | WHISPER blocked by IRCX NOWHISPER (`+w`). | `Channel does not allow whispers (+w)` | `src/daemon/server.zig:749`, `src/daemon/server.zig:7790`, `src/daemon/server.zig:7792` |
 
-## Standard replies: FAIL, WARN, NOTE
+## Standard replies: FAIL, WARN
 
 Standard replies are not numeric replies. They are line types carrying a severity token, a command token, a reply-code token, optional context params, and a trailing description.
 
@@ -143,7 +143,6 @@ Standard replies are not numeric replies. They are line types carrying a severit
 | --- | --- | --- | --- | --- |
 | `FAIL` | `standard_replies.fail`, `standard_replies_emit.fail`, and `LinuxServer.failReply`. | `FAIL <command> <code> [context...] :<description>` | CHATHISTORY parse failures, invalid UTF-8, Koshi content filter, multiline failures, media/service failures. | `src/proto/standard_replies.zig:15`, `src/proto/standard_replies.zig:200`, `src/proto/standard_replies_emit.zig:121`, `src/daemon/server.zig:10001`, `src/daemon/server.zig:5491`, `src/daemon/server.zig:10803` |
 | `WARN` | `standard_replies.warn` / `standard_replies_emit.warn`. | `WARN <command> <code> [context...] :<description>` | Cataloged builder support; no live `server.zig` emission found in current source. | `src/proto/standard_replies.zig:205`, `src/proto/standard_replies_emit.zig:131` |
-| `NOTE` | `standard_replies.note` / `standard_replies_emit.note`. | `NOTE <command> <code> [context...] :<description>` | Cataloged standard-reply builder support; Event Spine operator traffic uses raw `EVENT` lines. | `src/proto/standard_replies.zig:210`, `src/proto/standard_replies_emit.zig:136`, `src/daemon/event_spine.zig:292` |
 
 The shared standard-replies catalog currently contains these code tokens: `ACCOUNT_ALREADY_EXISTS`, `ACCOUNT_REQUIRED`, `ALREADY_AUTHENTICATED`, `ALREADY_REGISTERED`, `AUTHENTICATION_FAILED`, `BAD_ACCOUNT_NAME`, `BAD_CHANNEL_NAME`, `BAD_PASSWORD`, `BAD_TARGET`, `BANNED_FROM_CHANNEL`, `CANNOT_SEND_TO_CHANNEL`, `CHANNEL_DISABLED`, `CHANNEL_DOES_NOT_EXIST`, `CHANNEL_FULL`, `CHANNEL_RENAMED`, `CHANNEL_REQUIRED`, `COMMAND_DISABLED`, `COMMAND_RATE_LIMITED`, `EXPIRED_TOKEN`, `HOST_REQUIRED`, `INVALID_ACCOUNT_NAME`, `INVALID_CREDENTIALS`, `INVALID_KEY`, `INVALID_MODE`, `INVALID_PARAMS`, `INVALID_PROPERTY`, `INVALID_TARGET`, `INVALID_TOKEN`, `LIST_EMPTY`, `MESSAGE_RATE_LIMITED`, `MESSAGE_TOO_LONG`, `METADATA_LIMIT_REACHED`, `MONITOR_LIMIT_REACHED`, `NEED_MORE_PARAMS`, `NETWORK_ERROR`, `NICK_LOCKED`, `NO_MATCHING_KEY`, `NOT_AUTHENTICATED`, `NOT_CHANNEL_OPERATOR`, `NOT_ON_CHANNEL`, `NOT_REGISTERED`, `PERMISSION_DENIED`, `PRIVILEGES_REQUIRED`, `PROPERTY_REQUIRED`, `REGISTRATION_IS_DISABLED`, `SILENTLY_DROPPED`, `TARGET_REQUIRED`, `TOKEN_REQUIRED`, `TOO_MANY_CHANNELS`, `TOO_MANY_MATCHES`, `TOO_MANY_MONITOR_TARGETS`, `UNKNOWN_COMMAND`, `UNKNOWN_ERROR`, `UNKNOWN_PROPERTY`, and `UNSUPPORTED_MEDIA_TYPE` (`src/proto/standard_replies.zig:33`).
 

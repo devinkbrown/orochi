@@ -3,7 +3,7 @@
 
 //! IRCv3 standard-replies composer.
 //!
-//! Standard replies are Orochi's typed error/warning/note primitive for native
+//! Standard replies are Orochi's typed error/warning primitive for native
 //! services and command handlers. The hot path is allocation-free: callers pass
 //! command, code, context, description, and a destination buffer.
 const std = @import("std");
@@ -18,13 +18,11 @@ pub const MAX_LEGACY_BODY: usize = 510;
 pub const ReplyType = enum {
     fail,
     warn,
-    note,
 
     pub fn token(self: ReplyType) []const u8 {
         return switch (self) {
             .fail => "FAIL",
             .warn => "WARN",
-            .note => "NOTE",
         };
     }
 };
@@ -210,11 +208,6 @@ pub fn warn(command: []const u8, code: Code, description: []const u8) Builder {
     return build(.warn, command, .{ .catalog = code }, description);
 }
 
-/// Start a NOTE reply with a catalog code.
-pub fn note(command: []const u8, code: Code, description: []const u8) Builder {
-    return build(.note, command, .{ .catalog = code }, description);
-}
-
 /// Start a reply with an extension code token.
 pub fn custom(kind: ReplyType, command: []const u8, code: []const u8, description: []const u8) Builder {
     return build(kind, command, .{ .custom = code }, description);
@@ -347,7 +340,7 @@ const SliceWriter = struct {
     }
 };
 
-test "builds FAIL WARN and NOTE replies" {
+test "builds FAIL and WARN replies" {
     var buf: [256]u8 = undefined;
 
     const fail_line = try fail("REGISTER", .ACCOUNT_REQUIRED, "Authentication is required").write(&buf);
@@ -362,11 +355,6 @@ test "builds FAIL WARN and NOTE replies" {
         warn_line,
     );
 
-    const note_line = try note("ACCESS", .LIST_EMPTY, "No access entries matched").write(&buf);
-    try std.testing.expectEqualStrings(
-        "NOTE ACCESS LIST_EMPTY :No access entries matched",
-        note_line,
-    );
 }
 
 test "builds replies with context params" {
@@ -383,9 +371,9 @@ test "builds replies with context params" {
 
 test "escapes description controls and enforces length" {
     var buf: [128]u8 = undefined;
-    const line = try note("MEMO", .UNKNOWN_ERROR, "bad\r\n\x00\\tab\tbell\x07end").write(&buf);
+    const line = try warn("MEMO", .UNKNOWN_ERROR, "bad\r\n\x00\\tab\tbell\x07end").write(&buf);
     try std.testing.expectEqualStrings(
-        "NOTE MEMO UNKNOWN_ERROR :bad\\r\\n\\0\\\\tab\\tbell\\x07end",
+        "WARN MEMO UNKNOWN_ERROR :bad\\r\\n\\0\\\\tab\\tbell\\x07end",
         line,
     );
 

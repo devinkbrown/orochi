@@ -73,12 +73,9 @@ The server's VAPID public key is advertised as an **ISUPPORT (005) token**,
 carries the key and a client can call `pushManager.subscribe` with **zero extra
 round-trips** — it reads the key once at registration.
 
-This replaced an earlier NOTE-based channel (803fbe4, *"WEBPUSH sheds its NOTE data
-channel"*). The design rule: **NOTE is a standard reply, not a transport.** Using
-NOTE to ship the VAPID key, answer `LIST`, or broadcast subscription lifecycle
-overloaded a reply primitive as a bespoke data channel. Post-refactor: discovery is
-ISUPPORT, `LIST` answers as plain NOTICEs, and lifecycle publishes to the Event
-Spine — NOTE stays what it is everywhere else.
+This replaced an earlier reply-channel design. The design rule: service state
+does not ride ad-hoc reply lines. Discovery is ISUPPORT, `LIST` answers as plain
+server NOTICEs, and lifecycle publishes to the Event Spine.
 
 ## Delivery: trigger, worker, storage
 
@@ -116,7 +113,7 @@ per-node, not mesh-replicated.
 Subscribe/unsubscribe events publish to the Event Spine `.service` category via
 `publishOperEventSubject`, so opers can watch subscription lifecycle (`"WEBPUSH:
 <account> subscribed a push endpoint"` / `"… removed a push endpoint"`). This is the
-oper-observable surface — again, not a NOTE data channel.
+oper-observable surface.
 
 ## Configuration
 

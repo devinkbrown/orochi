@@ -11,7 +11,7 @@
 //! emits an immediate snapshot of the currently-matching population.
 //!
 //! The model inverts the legacy pull-based surveillance command into a stateful,
-//! filtered, push-based feed that rides the existing Event Spine NOTE delivery.
+//! filtered, push-based feed that rides the existing Event Spine delivery.
 //! This module is pure: it owns the per-observer filters and the matching/render
 //! logic; the live server supplies subject snapshots and performs delivery.
 
@@ -27,7 +27,7 @@ pub const Action = enum(u8) {
     host_change,
     oper_up,
 
-    /// Lowercase wire token for the action (used in NOTE rendering + parsing).
+    /// Lowercase wire token for the action (used in event rendering + parsing).
     pub fn token(self: Action) []const u8 {
         return switch (self) {
             .connect => "connect",
@@ -165,7 +165,7 @@ pub const Registry = struct {
     ///   `:<server> EVENT <target> OBSERVE <action> <nick>!<user>@<host> acct=<acct>[ <detail>]`
     /// `target` is the watching operator's nick (the recipient), matching the raw
     /// `:<srv> EVENT <target> <body>` form every other Event-Spine event now uses.
-    pub fn formatNote(out: []u8, server_name: []const u8, target: []const u8, action: Action, subject: Subject) ?[]const u8 {
+    pub fn formatEvent(out: []u8, server_name: []const u8, target: []const u8, action: Action, subject: Subject) ?[]const u8 {
         const acct = subject.account orelse "*";
         if (subject.detail.len == 0) {
             return std.fmt.bufPrint(out, ":{s} EVENT {s} OBSERVE {s} {s}!{s}@{s} acct={s}\r\n", .{ server_name, target, action.token(), subject.nick, subject.user, subject.host, acct }) catch null;
@@ -257,13 +257,13 @@ test "set enforces limits" {
     try std.testing.expectError(error.EmptyMask, reg.set(1, "", all_actions, 0));
 }
 
-test "formatNote renders the chatsvc EVENT line with and without detail" {
+test "formatEvent renders the chatsvc EVENT line with and without detail" {
     const subj = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .account = "bob" };
     var buf: [256]u8 = undefined;
-    const a = Registry.formatNote(&buf, "orochi.local", "kain", .connect, subj).?;
+    const a = Registry.formatEvent(&buf, "orochi.local", "kain", .connect, subj).?;
     try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE connect bob!~b@10.0.0.4 acct=bob\r\n", a);
     var buf2: [256]u8 = undefined;
     const subj2 = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .detail = "-> robert" };
-    const b = Registry.formatNote(&buf2, "orochi.local", "kain", .nick, subj2).?;
+    const b = Registry.formatEvent(&buf2, "orochi.local", "kain", .nick, subj2).?;
     try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE nick bob!~b@10.0.0.4 acct=* -> robert\r\n", b);
 }

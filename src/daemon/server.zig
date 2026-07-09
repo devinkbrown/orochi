@@ -1313,8 +1313,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     if (has_icon) {
         out[base.len + 3] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
     }
-    // Web Push server key — ISUPPORT is the discovery surface (no NOTE data
-    // channel): the client reads 005 once and can subscribe immediately.
+    // Web Push server key — ISUPPORT is the discovery surface: the client reads
+    // 005 once and can subscribe immediately.
     if (has_vapid) {
         out[base.len + 3 + @as(usize, @intFromBool(has_icon))] = try std.fmt.allocPrint(allocator, "VAPID={s}", .{cfg.webpush_vapid_pub});
     }
@@ -11303,7 +11303,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        // NOTE: +l (full) is handled separately in joinOne so it can fall back to
+        // +l (full) is handled separately in joinOne so it can fall back to
         // the IRCX +d auto-clone path; all the gates above are hard denials.
         return false;
     }
@@ -17857,7 +17857,7 @@ pub const LinuxServer = struct {
             const filter = self.observe.get(observeKey(entry.value)) orelse continue;
             if (!observe_mod.Registry.matches(filter, subject, action)) continue;
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = observe_mod.Registry.formatNote(&buf, origin_server, entry.value.session.displayName(), action, subject) orelse continue;
+            const line = observe_mod.Registry.formatEvent(&buf, origin_server, entry.value.session.displayName(), action, subject) orelse continue;
             self.deliver(entry.id, line) catch {};
         }
     }
@@ -22899,11 +22899,11 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(action, "SHOW")) {
             var sb: [160]u8 = undefined;
             var nb: [256]u8 = undefined;
-            const nl = if (svc.channelSuccessorGet(channel, &sb)) |acct|
-                std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} successor is {s}\r\n", .{ self.serverName(), channel, acct }) catch return
+            const msg = if (svc.channelSuccessorGet(channel, &sb)) |acct|
+                std.fmt.bufPrint(&nb, "SUCCESSOR: {s} successor is {s}", .{ channel, acct }) catch return
             else
-                std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} has no successor\r\n", .{ self.serverName(), channel }) catch return;
-            try appendToConn(conn, nl);
+                std.fmt.bufPrint(&nb, "SUCCESSOR: {s} has no successor", .{channel}) catch return;
+            try self.noticeTo(conn, msg);
             return;
         }
 
@@ -22938,8 +22938,9 @@ pub const LinuxServer = struct {
                 return;
             };
             var nb: [256]u8 = undefined;
-            const nl = std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} successor set to {s}\r\n", .{ self.serverName(), channel, account }) catch return;
-            try appendToConn(conn, nl);
+            const msg = std.fmt.bufPrint(&nb, "SUCCESSOR: {s} successor set to {s}", .{ channel, account }) catch return;
+            try self.noticeTo(conn, msg);
+            self.publishOperEvent(.service, .notice, msg) catch {};
             return;
         }
         try self.failReply(conn, "SUCCESSOR", "INVALID_SUBCOMMAND", "Use SHOW, SET <account>, or CLEAR");
@@ -23256,12 +23257,12 @@ pub const LinuxServer = struct {
         };
     }
 
-    /// Emit a structured `:server NOTE WEBAUTHN <body>` line (matches the SESSION
-    /// / SUCCESSOR reply idiom). `body` is a preformatted, CRLF-free payload.
-    fn webauthnNote(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
+    /// Emit a WEBAUTHN service reply as a server NOTICE. `body` is a
+    /// preformatted, CRLF-free payload.
+    fn webauthnReply(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTE WEBAUTHN {s}\r\n", .{ self.serverName(), body }) catch return;
-        try appendToConn(conn, line);
+        const text = std.fmt.bufPrint(&buf, "WEBAUTHN {s}", .{body}) catch return;
+        try self.noticeTo(conn, text);
     }
 
     pub fn handleWebauthn(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -23300,7 +23301,7 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "WEBAUTHN", "INTERNAL_ERROR", "Could not read passkeys");
         var b: [128]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "STATUS :{d} passkey(s) registered", .{listed.len}) catch return;
-        try self.webauthnNote(conn, body);
+        try self.webauthnReply(conn, body);
     }
 
     /// `WEBAUTHN REGISTER [label]` — issue a registration challenge to the
@@ -23320,7 +23321,7 @@ pub const LinuxServer = struct {
         const chal_b64 = base64url.encode(&cb, &challenge) catch return;
         var b: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "REGISTER-CHALLENGE {s} {s} :{s}", .{ chal_b64, rp.rp_id, account }) catch return;
-        try self.webauthnNote(conn, body);
+        try self.webauthnReply(conn, body);
     }
 
     /// `WEBAUTHN REGISTER-FINISH <cred_id_b64> <client_data_json_b64> <authdata_b64> [attestation_object_b64]`
@@ -23436,11 +23437,11 @@ pub const LinuxServer = struct {
 
         var b: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "REGISTERED {s} :{s}", .{ cred_id_b64, label }) catch return;
-        try self.webauthnNote(conn, body);
+        try self.webauthnReply(conn, body);
     }
 
-    /// Map a `webauthn.verifyAttestation` error to a stable FAIL code for the
-    /// `:server NOTE WEBAUTHN` reply. The `else` default covers the folded
+    /// Map a `webauthn.verifyAttestation` error to a stable FAIL code. The
+    /// `else` default covers the folded
     /// signature/encoding failure sets (all render as a generic verify failure).
     fn webauthnAttestationFailCode(err: webauthn.AttestationError) []const u8 {
         return switch (err) {
@@ -23486,7 +23487,7 @@ pub const LinuxServer = struct {
         const chal_b64 = base64url.encode(&cb, &challenge) catch return;
         var b: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "AUTH-CHALLENGE {s} {s} :{s}", .{ chal_b64, rp.rp_id, account }) catch return;
-        try self.webauthnNote(conn, body);
+        try self.webauthnReply(conn, body);
 
         // Advertise the account's allowed credential ids (for non-discoverable
         // authenticators). A malformed account or none registered simply yields
@@ -23496,7 +23497,7 @@ pub const LinuxServer = struct {
         for (listed) |*e| {
             var lb: [webauthn_creds_mod.max_cred_id_b64 + 32]u8 = undefined;
             const line = std.fmt.bufPrint(&lb, "ALLOW-CRED {s}", .{e.credId()}) catch continue;
-            try self.webauthnNote(conn, line);
+            try self.webauthnReply(conn, line);
         }
     }
 
@@ -23600,11 +23601,11 @@ pub const LinuxServer = struct {
         for (listed) |*e| {
             var b: [webauthn_creds_mod.max_cred_id_b64 + 128]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "CRED {s} {d} :{s}", .{ e.credId(), e.sign_count, e.label() }) catch continue;
-            try self.webauthnNote(conn, body);
+            try self.webauthnReply(conn, body);
         }
         var eb: [64]u8 = undefined;
         const end = std.fmt.bufPrint(&eb, "LIST :end ({d})", .{listed.len}) catch return;
-        try self.webauthnNote(conn, end);
+        try self.webauthnReply(conn, end);
     }
 
     fn webauthnRemove(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, p: []const []const u8) !void {
@@ -23623,7 +23624,7 @@ pub const LinuxServer = struct {
         };
         var b: [256]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "REMOVED :{s}", .{target}) catch return;
-        try self.webauthnNote(conn, body);
+        try self.webauthnReply(conn, body);
     }
 
     /// `ACCOUNTSET <account> <password> <field> <value>` — update an account
@@ -24229,15 +24230,15 @@ pub const LinuxServer = struct {
             for (account_sessions) |s| {
                 if (s.client != cid) continue;
                 const hex = std.fmt.bytesToHex(s.token, .lower);
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ self.serverName(), hex }) catch return;
-                try appendToConn(conn, line);
+                const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
+                try self.noticeTo(conn, line);
                 // Also offer a mesh-sealed token usable to reclaim/redirect from
                 // ANY node in the mesh (only when a mesh shared key is set).
                 var mbuf: [1024]u8 = undefined;
                 if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
                     var lb: [1152]u8 = undefined;
-                    const mline = std.fmt.bufPrint(&lb, ":{s} NOTE SESSION MTOKEN :{s}\r\n", .{ self.serverName(), mhex }) catch return;
-                    try appendToConn(conn, mline);
+                    const mline = std.fmt.bufPrint(&lb, "SESSION MTOKEN {s}", .{mhex}) catch return;
+                    try self.noticeTo(conn, mline);
                 }
                 return;
             }
@@ -24252,11 +24253,10 @@ pub const LinuxServer = struct {
             idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
             const state: []const u8 = if (s.attached) "attached" else "detached";
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION LIST :{s} #{d} signon={d} {s}\r\n", .{ self.serverName(), current, idx, s.signon_ms, state }) catch continue;
-            try appendToConn(conn, line);
+            const line = std.fmt.bufPrint(&buf, "SESSION LIST {s} #{d} signon={d} {s}", .{ current, idx, s.signon_ms, state }) catch continue;
+            try self.noticeTo(conn, line);
         }
-        const end = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION :End of session list\r\n", .{protocol_inventory.currentServerName()}) catch return;
-        try appendToConn(conn, end);
+        try self.noticeTo(conn, "SESSION: end of session list");
     }
 
     /// `SESSION RESUME <token>` — reclaim a previously-detached session of the
@@ -24294,9 +24294,10 @@ pub const LinuxServer = struct {
             return;
         }
         _ = self.sessions.remove(account, matched.client); // reclaim consumes the detached ghost
-        var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{protocol_inventory.currentServerName()}) catch return;
-        try appendToConn(conn, line);
+        try self.noticeTo(conn, "SESSION RESUME: session reclaimed");
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event = std.fmt.bufPrint(&event_buf, "SESSION reclaimed account={s}", .{account}) catch return;
+        self.publishOperEvent(.service, .notice, event) catch {};
     }
 
     /// Cross-server reclaim: `SESSION RESUME <mesh-token>` where the token is a
@@ -24363,8 +24364,9 @@ pub const LinuxServer = struct {
         if (have_capsule and !seen and now <= fields.expiry_ms) {
             if (self.consumeMigration(id, conn, account, migrate_token.?)) {
                 if (ghost) |g| _ = self.sessions.remove(account, g);
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session migrated + reclaimed (cross-server)\r\n", .{protocol_inventory.currentServerName()}) catch return;
-                try appendToConn(conn, line);
+                try self.noticeTo(conn, "SESSION RESUME: session migrated and reclaimed (cross-server)");
+                const event = std.fmt.bufPrint(&buf, "SESSION migrated+reclaimed account={s}", .{account}) catch return;
+                self.publishOperEvent(.service, .notice, event) catch {};
                 return;
             }
             // Restore failed mid-way: fall through to the legacy decision so the
@@ -24385,16 +24387,17 @@ pub const LinuxServer = struct {
                     }
                     _ = self.sessions.remove(account, g);
                 }
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed (cross-server)\r\n", .{protocol_inventory.currentServerName()}) catch return;
-                try appendToConn(conn, line);
+                try self.noticeTo(conn, "SESSION RESUME: session reclaimed (cross-server)");
+                const event = std.fmt.bufPrint(&buf, "SESSION reclaimed cross-server account={s}", .{account}) catch return;
+                self.publishOperEvent(.service, .notice, event) catch {};
             },
             .grant_redirect => |node| {
                 // The session lives on `node`; the client must reconnect there. The
                 // owning node ships the migration capsule from its own grant_local
                 // path (above) when it consumes the ghost, so the peer the client
                 // lands on already has the staged capsule to restore from.
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION REDIRECT :Session lives on {s}; reconnect there to reclaim\r\n", .{ self.serverName(), node }) catch return;
-                try appendToConn(conn, line);
+                const line = std.fmt.bufPrint(&buf, "SESSION REDIRECT: session lives on {s}; reconnect there to reclaim", .{node}) catch return;
+                try self.noticeTo(conn, line);
             },
             .deny_expired => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token expired"),
             .deny_replay => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token already used"),
@@ -24684,8 +24687,10 @@ pub const LinuxServer = struct {
             };
             const n = self.tegami.clear(acct);
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Cleared {d} message(s)\r\n", .{ self.serverName(), n }) catch return;
-            try appendToConn(conn, line);
+            const line = std.fmt.bufPrint(&buf, "TEGAMI: Cleared {d} message(s)", .{n}) catch return;
+            try self.noticeTo(conn, line);
+            const event = std.fmt.bufPrint(&buf, "TEGAMI cleared account={s} count={d}", .{ acct, n }) catch return;
+            self.publishOperEvent(.service, .notice, event) catch {};
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "FORWARD")) {
@@ -24697,10 +24702,10 @@ pub const LinuxServer = struct {
             if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
                 var buf: [192]u8 = undefined;
                 const line = if (self.memo_forward.forwardTarget(acct) catch null) |t|
-                    std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Forwarding your tegami to {s}\r\n", .{ self.serverName(), t }) catch return
+                    std.fmt.bufPrint(&buf, "TEGAMI: Forwarding your tegami to {s}", .{t}) catch return
                 else
-                    std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :No forward set\r\n", .{self.serverName()}) catch return;
-                try appendToConn(conn, line);
+                    std.fmt.bufPrint(&buf, "TEGAMI: No forward set", .{}) catch return;
+                try self.noticeTo(conn, line);
                 return;
             }
             const target = parsed.paramSlice()[1];
@@ -24726,8 +24731,10 @@ pub const LinuxServer = struct {
                 return;
             };
             var buf: [192]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Forwarding your tegami to {s}\r\n", .{ self.serverName(), target }) catch return;
-            try appendToConn(conn, line);
+            const line = std.fmt.bufPrint(&buf, "TEGAMI: Forwarding your tegami to {s}", .{target}) catch return;
+            try self.noticeTo(conn, line);
+            const event = std.fmt.bufPrint(&buf, "TEGAMI forward account={s} target={s}", .{ acct, target }) catch return;
+            self.publishOperEvent(.service, .notice, event) catch {};
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "IGNORE")) {
@@ -24741,12 +24748,12 @@ pub const LinuxServer = struct {
                 const entries = self.memo_ignore.list(acct, &out) catch out[0..0];
                 for (entries) |e| {
                     var lb: [192]u8 = undefined;
-                    const ln = std.fmt.bufPrint(&lb, ":{s} NOTE TEGAMI :ignoring {s}\r\n", .{ self.serverName(), e.sender }) catch continue;
-                    try appendToConn(conn, ln);
+                    const ln = std.fmt.bufPrint(&lb, "TEGAMI: ignoring {s}", .{e.sender}) catch continue;
+                    try self.noticeTo(conn, ln);
                 }
                 var eb: [128]u8 = undefined;
-                const end = std.fmt.bufPrint(&eb, ":{s} NOTE TEGAMI :End of ignore list ({d})\r\n", .{ self.serverName(), entries.len }) catch return;
-                try appendToConn(conn, end);
+                const end = std.fmt.bufPrint(&eb, "TEGAMI: End of ignore list ({d})", .{entries.len}) catch return;
+                try self.noticeTo(conn, end);
                 return;
             }
             const is_add = std.ascii.eqlIgnoreCase(action, "ADD");
@@ -24853,8 +24860,8 @@ pub const LinuxServer = struct {
     }
 
     /// WEBPUSH — browser push subscriptions (Onyx "reach you with the tab
-    /// closed"). The server VAPID key is discovered via ISUPPORT `VAPID=`
-    /// (never a NOTE data channel); lifecycle lands on the Event Spine.
+    /// closed"). The server VAPID key is discovered via ISUPPORT `VAPID=`;
+    /// lifecycle lands on the Event Spine.
     ///   SUBSCRIBE <endpoint> <p256dh> <auth>     → store (account-scoped, max 3)
     ///   UNSUBSCRIBE <endpoint>                   → remove one
     ///   LIST                                     → NOTICE per stored endpoint
@@ -24924,8 +24931,7 @@ pub const LinuxServer = struct {
                 self.allocator.free(ep_owned);
             }
             try self.noticeTo(conn, "WEBPUSH: subscription stored");
-            // Subscription lifecycle rides the Event Spine (oper-observable),
-            // never a NOTE data channel.
+            // Subscription lifecycle rides the Event Spine (oper-observable).
             var eb: [192]u8 = undefined;
             const ev = std.fmt.bufPrint(&eb, "WEBPUSH: {s} subscribed a push endpoint", .{acct}) catch "WEBPUSH: subscription stored";
             self.publishOperEventSubject(.service, .notice, ev, acct) catch {};
@@ -25068,16 +25074,16 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Emit the caller's pending tegami as NOTE lines (without clearing).
+    /// Emit the caller's pending tegami as server notices (without clearing).
     fn tegamiList(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
         for (self.tegami.pending(account)) |m| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ self.serverName(), m.from, m.text }) catch continue;
-            try appendToConn(conn, line);
+            const line = std.fmt.bufPrint(&buf, "TEGAMI from {s} :{s}", .{ m.from, m.text }) catch continue;
+            try self.noticeTo(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE TEGAMI :End of tegami ({d})\r\n", .{ self.serverName(), self.tegami.count(account) }) catch return;
-        try appendToConn(conn, end);
+        const end = std.fmt.bufPrint(&end_buf, "TEGAMI: End of tegami ({d})", .{self.tegami.count(account)}) catch return;
+        try self.noticeTo(conn, end);
     }
 
     /// Deliver and clear any pending tegami for the freshly-logged-in account.
@@ -25087,8 +25093,8 @@ pub const LinuxServer = struct {
         if (msgs.len == 0) return;
         for (msgs) |m| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ self.serverName(), m.from, m.text }) catch continue;
-            try appendToConn(conn, line);
+            const line = std.fmt.bufPrint(&buf, "TEGAMI from {s} :{s}", .{ m.from, m.text }) catch continue;
+            try self.noticeTo(conn, line);
         }
         _ = self.tegami.clear(account);
     }
@@ -26091,12 +26097,12 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
             var buf: [default_reply_bytes]u8 = undefined;
             for (self.content_filter.list(), 0..) |p, i| {
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE FILTER LIST :#{d} {s}\r\n", .{ self.serverName(), i + 1, p }) catch continue;
-                try appendToConn(conn, line);
+                const line = std.fmt.bufPrint(&buf, "FILTER LIST #{d} {s}", .{ i + 1, p }) catch continue;
+                try self.noticeTo(conn, line);
             }
             var end_buf: [default_reply_bytes]u8 = undefined;
-            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE FILTER :End of filter list ({d})\r\n", .{ self.serverName(), self.content_filter.list().len }) catch return;
-            try appendToConn(conn, end);
+            const end = std.fmt.bufPrint(&end_buf, "FILTER: End of filter list ({d})", .{self.content_filter.list().len}) catch return;
+            try self.noticeTo(conn, end);
             return;
         }
         if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
@@ -35390,7 +35396,7 @@ test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shard
         // auto-subscribed on elevation), one broadcasts, and EVERY oper must receive
         // it. publishOperEvent delivers locally AND fans the event to other shards'
         // inboxes; each reactor delivers to its own subscribers on its own thread.
-        // NOTE: this sandbox's SO_REUSEPORT routes all loopback accepts to one shard,
+        // This sandbox's SO_REUSEPORT routes all loopback accepts to one shard,
         // so the cross-shard RECEIVE side is mechanism-verified by instrumentation
         // rather than guaranteed exercised here; what this test does guarantee is that
         // the fan-out code path runs without breaking local delivery, and that an oper

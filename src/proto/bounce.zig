@@ -33,7 +33,7 @@ pub fn formatBounceNumeric(
 }
 
 /// Format a non-numeric migration hint:
-/// `:<server> NOTE MIGRATE <nick> reconnect token=<token_b64>\r\n`
+/// `:<server> NOTICE <nick> :MIGRATE reconnect token=<token_b64>\r\n`
 pub fn formatResumeHint(
     buf: []u8,
     server_name: []const u8,
@@ -42,7 +42,7 @@ pub fn formatResumeHint(
 ) Error![]const u8 {
     return printLine(
         buf,
-        ":{s} NOTE MIGRATE {s} reconnect token={s}\r\n",
+        ":{s} NOTICE {s} :MIGRATE reconnect token={s}\r\n",
         .{ server_name, nick, token_b64 },
     );
 }
@@ -96,7 +96,7 @@ test "formatBounceNumeric rejects undersized output buffer without truncation" {
     );
 }
 
-test "formatResumeHint formats exact migrate note line" {
+test "formatResumeHint formats exact migrate notice line" {
     var buf: [128]u8 = undefined;
 
     const line = try formatResumeHint(
@@ -107,13 +107,13 @@ test "formatResumeHint formats exact migrate note line" {
     );
 
     try std.testing.expectEqualStrings(
-        ":mesh-a.example NOTE MIGRATE nick reconnect token=AAECAwQFBgcICQoLDA0ODw==\r\n",
+        ":mesh-a.example NOTICE nick :MIGRATE reconnect token=AAECAwQFBgcICQoLDA0ODw==\r\n",
         line,
     );
 }
 
 test "formatResumeHint rejects undersized output buffer without truncation" {
-    const expected = ":s NOTE MIGRATE n reconnect token=t\r\n";
+    const expected = ":s NOTICE n :MIGRATE reconnect token=t\r\n";
     var buf: [expected.len - 1]u8 = undefined;
 
     try std.testing.expectError(

@@ -665,7 +665,7 @@ pub const World = struct {
     /// ASCII casemapping), without a ClientId in hand. Iterates the channel's
     /// member set and maps each member's ClientId back to its display nick via
     /// `client_nicks`. Returns null when the channel has no such member or no
-    /// such channel. NOTE: only LOCAL members are stored in the world member
+    /// such channel. Only LOCAL members are stored in the world member
     /// set — remote mesh members live in the per-link route roster — so a remote
     /// sender will not resolve here; callers that must enforce policy against a
     /// remote actor consult the link roster separately.

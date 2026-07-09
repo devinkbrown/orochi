@@ -136,11 +136,6 @@ pub fn warn(command: []const u8, code: []const u8, description: []const u8) Buil
     return build(.warn, command, code, description);
 }
 
-/// Start a NOTE reply with a caller-provided code token.
-pub fn note(command: []const u8, code: []const u8, description: []const u8) Builder {
-    return build(.note, command, code, description);
-}
-
 /// Start any standard reply with a caller-provided code token.
 pub fn custom(kind: ReplyType, command: []const u8, code: []const u8, description: []const u8) Builder {
     return build(kind, command, code, description);
@@ -168,18 +163,6 @@ pub fn emitWarn(
     description: []const u8,
 ) EmitError!void {
     try warn(command, code, description).withContext(context_params).emit(allocator, sink);
-}
-
-/// Emit a NOTE line directly into `sink`.
-pub fn emitNote(
-    allocator: std.mem.Allocator,
-    sink: *std.ArrayList(u8),
-    command: []const u8,
-    code: []const u8,
-    context_params: []const []const u8,
-    description: []const u8,
-) EmitError!void {
-    try note(command, code, description).withContext(context_params).emit(allocator, sink);
 }
 
 pub fn validCodeToken(token: []const u8) bool {
@@ -282,7 +265,7 @@ test "emit typed FAIL line with context params" {
     );
 }
 
-test "emit WARN and NOTE exact bytes" {
+test "emit WARN exact bytes" {
     const allocator = std.testing.allocator;
     var sink: std.ArrayList(u8) = .empty;
     defer sink.deinit(allocator);
@@ -290,12 +273,9 @@ test "emit WARN and NOTE exact bytes" {
     try warn("CHATHISTORY", "MESSAGE_RATE_LIMITED", "History query was throttled")
         .withContext(&.{"#orochi"})
         .appendLine(allocator, &sink);
-    try note("ACCESS", "LIST_EMPTY", "No access entries matched")
-        .appendLine(allocator, &sink);
 
     try std.testing.expectEqualStrings(
-        "WARN CHATHISTORY MESSAGE_RATE_LIMITED #orochi :History query was throttled\r\n" ++
-            "NOTE ACCESS LIST_EMPTY :No access entries matched\r\n",
+        "WARN CHATHISTORY MESSAGE_RATE_LIMITED #orochi :History query was throttled\r\n",
         sink.items,
     );
 }
@@ -365,7 +345,7 @@ test "validate command context and strict description" {
     );
     try std.testing.expectError(
         error.InvalidDescription,
-        note("MEMO", "UNKNOWN_ERROR", "bad\nline")
+        warn("MEMO", "UNKNOWN_ERROR", "bad\nline")
             .withMaxBodyLen(MAX_LEGACY_BODY)
             .withStrictDescription()
             .emit(allocator, &sink),
