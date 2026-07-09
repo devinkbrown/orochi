@@ -92,6 +92,10 @@ pub const MediaRooms = struct {
     /// keyed by an owned channel name. Established by `MEDIA OFFER`; consulted by
     /// `MEDIA ANSWER`. Cleared when the call ends.
     profiles: std.StringHashMap(CallProfile),
+    /// Per-(channel,participant) advertised codec/FEC capability set. This is
+    /// distinct from the channel profile: it records what each participant can
+    /// receive so Kakehashi can keep the call transcode-free.
+    participant_profiles: std.StringHashMap(CallProfile),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -106,6 +110,7 @@ pub const MediaRooms = struct {
             .positions = std.StringHashMap(Position).init(allocator),
             .hands = std.StringHashMap(void).init(allocator),
             .profiles = std.StringHashMap(CallProfile).init(allocator),
+            .participant_profiles = std.StringHashMap(CallProfile).init(allocator),
         };
     }
 
@@ -131,6 +136,9 @@ pub const MediaRooms = struct {
         var fit = self.profiles.keyIterator();
         while (fit.next()) |key| self.allocator.free(key.*);
         self.profiles.deinit();
+        var cit = self.participant_profiles.keyIterator();
+        while (cit.next()) |key| self.allocator.free(key.*);
+        self.participant_profiles.deinit();
         self.* = undefined;
     }
 
@@ -243,6 +251,7 @@ pub const MediaRooms = struct {
     /// Record the call's negotiated codec/FEC set for `channel` (overwrites any
     /// prior profile). `codecs` is copied inline (truncated to the cap).
     pub fn setProfile(self: *MediaRooms, channel: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) Error!void {
+        self.clearParticipantProfilesForChannel(channel);
         var prof = CallProfile{ .fec = fec };
         const n = @min(codecs.len, max_profile_codecs);
         @memcpy(prof.codecs[0..n], codecs[0..n]);
@@ -266,6 +275,56 @@ pub const MediaRooms = struct {
         if (self.profiles.fetchRemove(channel)) |kv| self.allocator.free(kv.key);
     }
 
+    /// Record one participant's advertised codec/FEC capabilities for `channel`.
+    /// `codecs` is copied inline (truncated to the cap).
+    pub fn setParticipantProfile(self: *MediaRooms, channel: []const u8, pid: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) Error!void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        var prof = CallProfile{ .fec = fec };
+        const n = @min(codecs.len, max_profile_codecs);
+        @memcpy(prof.codecs[0..n], codecs[0..n]);
+        prof.codec_count = @intCast(n);
+        const gop = try self.participant_profiles.getOrPut(k);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                _ = self.participant_profiles.remove(k);
+                return e;
+            };
+        }
+        gop.value_ptr.* = prof;
+    }
+
+    /// One participant's advertised codec/FEC capabilities, if known.
+    pub fn participantProfileOf(self: *const MediaRooms, channel: []const u8, pid: []const u8) ?CallProfile {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return null;
+        return self.participant_profiles.get(k);
+    }
+
+    pub fn clearParticipantProfile(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.participant_profiles.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
+    fn clearParticipantProfilesForChannel(self: *MediaRooms, channel: []const u8) void {
+        var victims: [max_participants][]const u8 = undefined;
+        var n: usize = 0;
+        var it = self.participant_profiles.keyIterator();
+        while (it.next()) |key| {
+            const k = key.*;
+            if (k.len <= channel.len or k[channel.len] != 0) continue;
+            if (!std.mem.eql(u8, k[0..channel.len], channel)) continue;
+            if (n >= victims.len) break;
+            victims[n] = k;
+            n += 1;
+        }
+        for (victims[0..n]) |key| {
+            _ = self.participant_profiles.remove(key);
+            self.allocator.free(key);
+        }
+    }
+
     /// Participant `pid` joins `channel`'s call publishing `kind` (creating the
     /// room on first join).
     pub fn join(self: *MediaRooms, channel: []const u8, pid: []const u8, kind: MediaKind) Error!void {
@@ -285,6 +344,7 @@ pub const MediaRooms = struct {
         self.clearBreakout(channel, pid);
         self.clearPosition(channel, pid);
         self.clearHand(channel, pid);
+        self.clearParticipantProfile(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -373,6 +433,23 @@ test "call profile persists then clears when the call ends" {
     try testing.expectEqual(@as(usize, 2), m.profileOf("#c").?.slice().len);
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expect(m.profileOf("#c") == null); // cleared with the room
+}
+
+test "participant codec profile stores and clears on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    const codecs = [_]sdp.Codec{
+        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 },
+    };
+    try m.setParticipantProfile("#c", "alice", &codecs, .{ .scheme = .rs_block, .redundancy = 1 });
+    const prof = m.participantProfileOf("#c", "alice").?;
+    try testing.expectEqual(@as(usize, 2), prof.slice().len);
+    try testing.expectEqual(sdp.CodecTag.kaguravox, prof.slice()[0].tag);
+    try testing.expectEqual(sdp.FecScheme.rs_block, prof.fec.scheme);
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.participantProfileOf("#c", "alice") == null);
 }
 
 test "mute and speaking state track per kind" {

@@ -72,16 +72,17 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live WebRTC transport (wired) | `media_transport`/`media_socket`/`media_plane` (UDP + ICE/STUN/SRTP-SDES or DTLS-SRTP relay + NACK). |
 | Live native transport (wired) | `native_media_transport` plus `MEDIA OFFER`/`MEDIA ANSWER` `NATIVE` signaling; participants receive a native UDP candidate and keyed stream id for KaguraVox/KaguraVis frames. |
 | Live cross-leg registration (wired) | `media_bridge` roster entries are created from both offerers and answerers, using `transport=webrtc`/DTLS requests to choose the WebRTC leg and native as the default. |
+| Live codec capability signaling (wired) | `MEDIA OFFER`/`MEDIA ANSWER` record each participant's advertised codec/FEC set, publish it as `MEDIA CAPS` on the Event Spine, and include it in targeted `MEDIA ROSTER` replies. |
 
 ## Remaining live wiring
 
 1. **Finish Kakehashi in the SFU forward path:** per-channel `kakehashi_session`; on each
    relayed frame, serialize to each target's leg (`toNative`/`toRtp`) via `ssrc_map`; drive
    `simulcast_select` from `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
-2. **Broaden codec negotiation surface:** `MEDIA OFFER` establishes the active profile and
-   `MEDIA ANSWER` intersects each answerer against it while provisioning that participant's
-   transports. The remaining work is per-kind/per-participant codec-set fanout and explicit
-   media-kind denial when no shared codec exists (never transcode).
+2. **Complete media-kind denial:** `MEDIA OFFER` establishes the active profile, `MEDIA ANSWER`
+   intersects each answerer against it while provisioning that participant's transports, and
+   `MEDIA CAPS` now fans out each participant's codec/FEC set. The remaining work is explicit
+   per-kind denial when no shared codec exists (never transcode).
 
 ## Non-goals
 

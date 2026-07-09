@@ -24942,6 +24942,7 @@ pub const LinuxServer = struct {
             self.media_plane.remove(channel, nick);
             self.native_media.unregister(channel, nick);
             self.bridgeUnregister(channel, nick);
+            self.media_rooms.clearParticipantProfile(channel, nick);
             if (self.media_rooms.leaveAll(channel, nick)) {
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
@@ -25113,6 +25114,7 @@ pub const LinuxServer = struct {
             self.media_plane.remove(entry.key_ptr.*, nick);
             self.native_media.unregister(entry.key_ptr.*, nick);
             self.bridgeUnregister(entry.key_ptr.*, nick);
+            self.media_rooms.clearParticipantProfile(entry.key_ptr.*, nick);
             if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
@@ -25179,6 +25181,12 @@ pub const LinuxServer = struct {
         var buf: [320]u8 = undefined;
         const detail = formatMediaCodecDetail(&buf, codecs, fec) orelse return;
         try self.sendMediaEventReply(conn, label, channel, detail);
+    }
+
+    fn publishMediaCaps(self: *LinuxServer, channel: []const u8, nick: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
+        var buf: [320]u8 = undefined;
+        const detail = formatMediaCodecDetail(&buf, codecs, fec) orelse return;
+        try self.publishMediaEvent("CAPS", channel, nick, detail);
     }
 
     /// The peer's RFC 8122 DTLS-SRTP request, parsed from a MEDIA OFFER/ANSWER's
@@ -25282,12 +25290,13 @@ pub const LinuxServer = struct {
             },
         }
 
-        const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
+        const offered_fec = sdp.Fec{ .scheme = .rs_block, .redundancy = 1 };
+        const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = offered_fec, .direction = .sendrecv };
         const server_codecs = [_]sdp.Codec{
             .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
             .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 },
         };
-        const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
+        const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = offered_fec, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, local, remote) catch {
             try self.failReply(conn, "MEDIA", "NEGOTIATE_FAILED", "No common codec");
             return;
@@ -25299,6 +25308,8 @@ pub const LinuxServer = struct {
         }
         // Persist the agreed set as the call profile a later ANSWER negotiates against.
         self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
+        self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
+        self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
         try self.mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
         // Converge the negotiated codec profile across the whole channel via the
         // MEDIA EVENT plane (typed, mesh-propagated, member-gated) — same path as
@@ -25494,7 +25505,8 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
-        const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
+        const answer_fec = sdp.Fec{ .scheme = .rs_block, .redundancy = 1 };
+        const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = answer_fec, .direction = .sendrecv };
         const offered = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = prof.slice(), .fec = prof.fec, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, offered, answerer) catch {
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
@@ -25513,6 +25525,8 @@ pub const LinuxServer = struct {
             return;
         };
 
+        self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
+        self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
         try self.mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
         try self.provisionMediaTransports(conn, channel, answer_digest != null, extra_args);
     }
@@ -25572,7 +25586,11 @@ pub const LinuxServer = struct {
             const pos = self.media_rooms.positionOf(channel, p.id.slice());
             const hand: []const u8 = if (self.media_rooms.handRaised(channel, p.id.slice())) "hand" else "-";
             var buf: [default_reply_bytes]u8 = undefined;
-            const detail = std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
+            const detail = if (self.media_rooms.participantProfileOf(channel, p.id.slice())) |prof| blk: {
+                var caps_buf: [256]u8 = undefined;
+                const caps = formatMediaCodecDetail(&caps_buf, prof.slice(), prof.fec) orelse break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
+                break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand, caps }) catch continue;
+            } else std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
             try self.sendMediaEventReply(conn, "ROSTER", channel, detail);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
@@ -38146,15 +38164,39 @@ test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     try recvUntil(&a, " 366 A #media ", 200);
     try writeAllFd(fd_b, "JOIN #media\r\n");
     try recvUntil(&b, " 366 B #media ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD MEDIA #media\r\n");
+    try recvUntil(&a, " 806 A MEDIA #media :Event added", 200);
+    b.reset();
+    try writeAllFd(fd_b, "EVENT ADD MEDIA #media\r\n");
+    try recvUntil(&b, " 806 B MEDIA #media :Event added", 200);
 
     a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "MEDIA JOIN #media voice\r\n");
+    try recvUntil(&a, "MEDIA JOIN #media A voice", 200);
+    try recvUntil(&b, "MEDIA JOIN #media A voice", 200);
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
+    try recvUntil(&a, "MEDIA JOIN #media B voice", 200);
+    try recvUntil(&b, "MEDIA JOIN #media B voice", 200);
+
+    a.reset();
+    b.reset();
     try writeAllFd(fd_a, "MEDIA OFFER #media kaguravox\r\n");
+    try recvUntil(&b, "EVENT B MEDIA CAPS #media A codecs=kaguravox", 200);
     try recvUntil(&a, "EVENT A MEDIA OFFER-ACK #media", 200);
     try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
     try recvUntil(&a, "EVENT A MEDIA NATIVE #media", 200);
 
     b.reset();
     try writeAllFd(fd_b, "MEDIA ANSWER #media kaguravox transport=webrtc\r\n");
+    try recvUntil(&a, "EVENT A MEDIA CAPS #media B codecs=kaguravox", 200);
     try recvUntil(&b, "EVENT B MEDIA ANSWER-ACK #media", 200);
     try recvUntil(&b, "EVENT B MEDIA TRANSPORT #media", 200);
     try recvUntil(&b, "srtp=", 200);
@@ -38162,6 +38204,11 @@ test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "ANSWER-ACK") != null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TRANSPORT #media ufrag=") != null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "NATIVE #media candidate=") != null);
+
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
+    try recvUntil(&a, "MEDIA ROSTER-END #media", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT A MEDIA ROSTER #media B voice main 0 0 - codecs=kaguravox fec=rs_block") != null);
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {
