@@ -105,10 +105,10 @@ Note: most `MAX_*_BYTES` values for nick/user/host/server/channel in per-feature
 |---|---|---|---|---|---|---|---|
 | cap.zig:8 | MAX_CAP_REPLY_BODY | 500 | CAP LS/LIST reply body byte budget | ircv3.cap_reply_body | uint | 500 | 100..510 |
 | cap_registry.zig:3 | default_line_limit | 510 | CAP line octet limit | borderline ircv3.cap_line_limit | uint | 510 | 256..512 |
-| multiline.zig:14 | default_max_bytes | 40000 | Max total bytes per multiline batch | ircv3.multiline_max_bytes | uint | 40000 | 4096..262144 |
-| multiline.zig:15 | default_max_lines | 64 | Max lines per multiline batch | ircv3.multiline_max_lines | uint | 64 | 2..1024 |
-| multiline.zig:16 | default_max_ref_len | 64 | multiline batch-ref cap | ircv3.multiline_ref_len | uint | 64 | 1..128 |
-| multiline.zig:17 | default_max_target_len | 128 | multiline target cap | ircv3.multiline_target_len | uint | 128 | 8..255 |
+| multiline.zig:14 | default_max_bytes | 40000 | Max total bytes per multiline batch | ircv3.multiline_max_bytes | uint | 40000 | 4096..262144; live in daemon config |
+| multiline.zig:15 | default_max_lines | 64 | Max lines per multiline batch | ircv3.multiline_max_lines | uint | 64 | 2..1024; live in daemon config |
+| multiline.zig:16 | default_max_ref_len | 64 | multiline batch-ref cap | ircv3.multiline_ref_len | uint | 64 | 1..128; live in daemon config |
+| multiline.zig:17 | default_max_target_len | 128 | multiline target cap | ircv3.multiline_target_len | uint | 128 | 8..255; live in daemon config |
 | labeled_response.zig:8 | MAX_LABEL_LEN | 64 | labeled-response label cap | ircv3.label_len | uint | 64 | 1..128 |
 | labeled_response.zig:9 | MAX_BATCH_REF_LEN | 64 | labeled batch-ref cap | ircv3.label_batch_ref_len | uint | 64 | 1..128 |
 | labeled_response.zig:10 | MAX_LINE_BODY | 8191 | labeled line body cap | borderline (wire) | uint | 8191 | – |

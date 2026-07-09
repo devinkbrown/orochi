@@ -44,7 +44,7 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `labeled-response` | none | Echoes `@label` on responses and frames multiline replies with labeled-response BATCH. | `src/daemon/dispatch.zig:362`, `src/daemon/dispatch.zig:1125` |
 | `draft/pre-away` | none | AWAY may be sent during registration. | `src/daemon/dispatch.zig:368` |
 | `draft/channel-context` | none | Relays client-only channel-context tags. | `src/daemon/dispatch.zig:371` |
-| `draft/multiline` | `max-bytes=4096,max-lines=24` | Accepts inbound multiline BATCH chunks and reassembles them within enforced limits. | `src/daemon/dispatch.zig:375` |
+| `draft/multiline` | `max-bytes=<ircv3.multiline_max_bytes>,max-lines=<ircv3.multiline_max_lines>` | Accepts inbound multiline BATCH chunks and reassembles them within enforced limits. Defaults are `40000` bytes and `64` lines. | `src/daemon/dispatch.zig`, `src/daemon/server.zig` |
 | `sts` | runtime policy value | Config-gated; omitted unless a live STS policy is enabled for the session. | `src/daemon/dispatch.zig:383`, `src/daemon/dispatch.zig:504` |
 
 ## Negotiation behavior

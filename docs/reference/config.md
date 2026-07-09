@@ -372,6 +372,19 @@ Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/con
 | `max_accounts` | integer | `65536` | `1..4294967295` | Multi-session/bouncer account registry size (`src/daemon/server.zig:1024`). |
 | `max_per_account` | integer | `64` | `1..1000000` | Max live sessions per account (`src/daemon/server.zig:1024`). |
 
+## `[ircv3]`
+
+Source: struct `Ircv3` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, CAP advertisement in `src/daemon/dispatch.zig`, and live enforcement in `src/daemon/server.zig`.
+
+Live IRCv3 protocol limits. The multiline byte/line values are advertised in CAP LS 302 as `draft/multiline=max-bytes=...,max-lines=...`; all four values are enforced by the inbound multiline reassembler.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `multiline_max_bytes` | integer | `40000` | `4096..262144` | Max reassembled draft/multiline body bytes accepted per batch. |
+| `multiline_max_lines` | integer | `64` | `2..1024` | Max PRIVMSG/NOTICE chunks accepted in one multiline batch. |
+| `multiline_ref_len` | integer | `64` | `1..128` | Max draft/multiline batch reference length. |
+| `multiline_target_len` | integer | `128` | `8..255` | Max target length accepted in a multiline batch open/chunk. |
+
 ## `[history.search]`
 
 Source: struct `History` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live `SearchIndex` construction in `src/daemon/server.zig`.
@@ -602,4 +615,3 @@ key is accepted before it changes live behavior, add it here in the same change.
 | Operator account name length | `128` bytes | `src/daemon/oper.zig:11` |
 | Operator class name length | `64` bytes | `src/daemon/oper.zig:11` |
 | Operator group inheritance depth | `32` links | `src/daemon/operator_groups.zig:11` |
-| IRCv3 multiline max bytes/lines/ref/target | `4096`, `24`, `64`, `128` | `src/daemon/server.zig:1096` |

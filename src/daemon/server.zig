@@ -1420,6 +1420,12 @@ pub const Config = struct {
     /// Max SILENCE masks per client (advertised as SILENCE, enforced by the
     /// silence Store). Configurable via `[limits] silencelimit`.
     silencelimit: u32 = 32,
+    /// draft/multiline inbound batch limits. Advertised through CAP LS 302 and
+    /// enforced by the per-connection reassembler. Configurable via `[ircv3]`.
+    multiline_max_bytes: usize = multiline.default_max_bytes,
+    multiline_max_lines: usize = multiline.default_max_lines,
+    multiline_ref_len: usize = multiline.default_max_ref_len,
+    multiline_target_len: usize = multiline.default_max_target_len,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -1844,14 +1850,13 @@ pub fn mediaReassemblyConfig(config: Config) kagura_frame.ReassemblyConfig {
 
 /// Per-connection daemon state used by both the pure command core and the
 /// socket loop. No slices in this struct borrow from transient recv buffers.
-/// draft/multiline reassembly limits. Advertised verbatim in the cap value
-/// (`max-bytes`/`max-lines`) and enforced by the per-conn assembler. Sized
-/// modestly so a single open batch costs ~4 KiB of heap, allocated lazily.
+/// draft/multiline reassembly compile-time ceilings. Runtime TOML limits are
+/// enforced per connection and decide the lazy accumulator allocation size.
 pub const multiline_cfg = multiline.Config{
-    .max_bytes = 4096,
-    .max_lines = 24,
-    .max_ref_len = 64,
-    .max_target_len = 128,
+    .max_bytes = 262144,
+    .max_lines = 1024,
+    .max_ref_len = 128,
+    .max_target_len = 255,
 };
 const MultilineAssembler = multiline.Assembler(multiline_cfg);
 
@@ -1860,7 +1865,7 @@ const MultilineAssembler = multiline.Assembler(multiline_cfg);
 /// only while a batch is open; freed on close/abort and connection teardown.
 const MultilineState = struct {
     assembler: MultilineAssembler = MultilineAssembler.init(),
-    out: [multiline_cfg.max_bytes]u8 = undefined,
+    out: []u8,
 };
 
 /// Per-connection WebSocket adapter for a `[listen] ws` browser client. Sits
@@ -7340,6 +7345,7 @@ pub const LinuxServer = struct {
     /// printable + comma-free per the SCRAM grammar) and the STS policy (so the
     /// `sts` cap is advertised on CAP LS when an operator enabled it).
     fn injectSessionState(self: *LinuxServer, conn: *ConnState) void {
+        conn.session.configureMultiline(self.config.multiline_max_bytes, self.config.multiline_max_lines) catch {};
         if (!self.config.sasl_enabled) {
             if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
             return;
@@ -27696,7 +27702,7 @@ pub const LinuxServer = struct {
             // A batch is open: a BATCH line is its close, anything tagged with
             // our reference is a chunk. Any assembler error aborts + FAILs.
             if (is_batch) {
-                const msg = ms.assembler.finish(line, &ms.out) catch {
+                const msg = ms.assembler.finish(line, ms.out) catch {
                     self.abortMultiline(conn);
                     try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
                     return true;
@@ -27707,7 +27713,12 @@ pub const LinuxServer = struct {
             }
             if (batchTagValue(parsed)) |ref| {
                 if (std.mem.eql(u8, ref, ms.assembler.reference())) {
-                    ms.assembler.append(line, &ms.out) catch {
+                    if (ms.assembler.line_count >= self.config.multiline_max_lines) {
+                        self.abortMultiline(conn);
+                        try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
+                        return true;
+                    }
+                    ms.assembler.append(line, ms.out) catch {
                         self.abortMultiline(conn);
                         try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
                         return true;
@@ -27721,12 +27732,25 @@ pub const LinuxServer = struct {
         // No open batch: only consume a `BATCH +ref draft/multiline target` open.
         if (is_batch and isMultilineOpen(parsed)) {
             const ms = self.allocator.create(MultilineState) catch return false;
-            ms.* = .{};
+            const out = self.allocator.alloc(u8, self.config.multiline_max_bytes) catch {
+                self.allocator.destroy(ms);
+                return false;
+            };
+            ms.* = .{ .out = out };
             ms.assembler.begin(line) catch {
+                self.allocator.free(ms.out);
                 self.allocator.destroy(ms);
                 try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
                 return true;
             };
+            if (ms.assembler.reference().len > self.config.multiline_ref_len or
+                ms.assembler.target().len > self.config.multiline_target_len)
+            {
+                self.allocator.free(ms.out);
+                self.allocator.destroy(ms);
+                try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
+                return true;
+            }
             conn.multiline = ms;
             return true;
         }
@@ -27758,6 +27782,7 @@ pub const LinuxServer = struct {
     /// Free and clear a connection's open multiline batch state, if any.
     fn abortMultiline(self: *LinuxServer, conn: *ConnState) void {
         if (conn.multiline) |ms| {
+            self.allocator.free(ms.out);
             self.allocator.destroy(ms);
             conn.multiline = null;
         }
@@ -36062,6 +36087,86 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
         "BATCH -z\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
+}
+
+test "threaded server: draft/multiline CAP value follows runtime config" {
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .multiline_max_bytes = 8192,
+        .multiline_max_lines = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+
+    try writeAllFd(fd, "CAP LS 302\r\n");
+    try recvUntil(&c, "draft/multiline=max-bytes=8192,max-lines=8", 200);
+}
+
+test "threaded server: draft/multiline enforces runtime line limit" {
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .multiline_max_bytes = 4096,
+        .multiline_max_lines = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :draft/multiline standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_b, "JOIN #m\r\n");
+    try recvUntil(&b, " 366 B #m ", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "BATCH +z draft/multiline #m\r\n" ++
+        "@batch=z PRIVMSG #m :one\r\n" ++
+        "@batch=z PRIVMSG #m :two\r\n" ++
+        "@batch=z PRIVMSG #m :three\r\n" ++
+        "BATCH -z\r\n");
+    try recvUntil(&a, "FAIL BATCH MULTILINE_INVALID", 200);
+    try b.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m :one") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m :two") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m :three") == null);
 }
 
 test "threaded server: external wakeReactor drives the running reactor loop" {

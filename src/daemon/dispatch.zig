@@ -420,7 +420,7 @@ const cap_specs = [_]CapSpec{
     // multiline: the server accepts an inbound `BATCH +ref draft/multiline`
     // (PRIVMSG/NOTICE chunks), reassembles it, and delivers the result. Limits
     // are advertised as the cap value and enforced by the per-conn assembler.
-    .{ .id = .multiline, .name = "draft/multiline", .value_302 = "max-bytes=4096,max-lines=24" },
+    .{ .id = .multiline, .name = "draft/multiline", .value_302 = "max-bytes=40000,max-lines=64" },
     // sts (Strict Transport Security): the modern, config-gated replacement for
     // STARTTLS (which this daemon deliberately never implements). The value is
     // NOT static: it is the wire policy ("duration=<s>,port=<p>[,preload]")
@@ -527,6 +527,14 @@ const CapSession = struct {
     cap_302: bool = false,
     /// STS advertisement policy. Default-constructed = disabled (see StsPolicy).
     sts: StsPolicy = .{},
+    /// Runtime multiline CAP value (`max-bytes=...,max-lines=...`) supplied by
+    /// the daemon config layer. Empty = use the static build default above.
+    multiline_value_buf: [64]u8 = undefined,
+    multiline_value_len: usize = 0,
+
+    fn multilineValue(self: *const CapSession) ?[]const u8 {
+        return if (self.multiline_value_len == 0) null else self.multiline_value_buf[0..self.multiline_value_len];
+    }
 
     fn registrationHeld(self: CapSession) bool {
         return self.state == .negotiating;
@@ -542,7 +550,7 @@ const CapSession = struct {
         if (std.ascii.eqlIgnoreCase(subcommand, "LS")) {
             self.state = .negotiating;
             self.cap_302 = self.cap_302 or (params.len != 0 and std.mem.eql(u8, params[0], "302"));
-            try emitCapLs(self.cap_302, self.sts.value(), sasl_value, sink);
+            try emitCapLs(self.cap_302, self.sts.value(), sasl_value, self.multilineValue(), sink);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(subcommand, "LIST")) {
@@ -552,7 +560,7 @@ const CapSession = struct {
         if (std.ascii.eqlIgnoreCase(subcommand, "REQ")) {
             if (params.len == 0) return .missing_parameter;
             self.state = .negotiating;
-            if (applyCapRequest(&self.negotiated, params[0], self.sts.value(), sasl_value)) {
+            if (applyCapRequest(&self.negotiated, params[0], self.sts.value(), sasl_value, self.multilineValue())) {
                 try sink.append(.ack, false, params[0]);
             } else {
                 try sink.append(.nak, false, params[0]);
@@ -582,7 +590,7 @@ fn capBit(id: CapId) u64 {
 /// flagged as a continuation (gets the trailing `*` parameter); the final chunk
 /// closes the list. A space is left for the `:<server> CAP <nick> LS * :` framing
 /// so each emitted line stays under the 512-byte wire limit.
-fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
+fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
     const seg_max: usize = 400;
     var seg: [seg_max]u8 = undefined;
     var len: usize = 0;
@@ -598,7 +606,8 @@ fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, sin
         // value is the policy itself, surfaced regardless of 302 since its
         // presence is already the operator's explicit, actionable signal.
         const static_value = if (cap_302) spec.value_302 else null;
-        const value = policy_value orelse if (spec.id == .sasl and cap_302) sasl_value else static_value;
+        const value = policy_value orelse
+            if (spec.id == .sasl and cap_302) sasl_value else if (spec.id == .multiline and cap_302) (multiline_value orelse static_value) else static_value;
         const value_len: usize = if (value) |v| 1 + v.len else 0;
         const space_len: usize = if (len == 0) 0 else 1;
         if (len + space_len + spec.name.len + value_len > seg.len) {
@@ -646,7 +655,7 @@ fn emitCapList(negotiated: CapSet, sink: *CapReplySink) DispatchError!void {
     try sink.append(.list, false, seg[0..len]);
 }
 
-fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]const u8, sasl_value: ?[]const u8) bool {
+fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8) bool {
     var raw_list = std.mem.trim(u8, raw_list_in, " ");
     if (raw_list.len != 0 and raw_list[0] == ':') raw_list = raw_list[1..];
     var cursor: usize = 0;
@@ -673,7 +682,7 @@ fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]c
         if (!remove and !capRequestable(spec, sts_value, sasl_value)) return false;
         if (requested_value) |value| {
             if (value.len == 0) return false;
-            const offered = capRequestValue(spec, sts_value, sasl_value) orelse return false;
+            const offered = capRequestValue(spec, sts_value, sasl_value, multiline_value) orelse return false;
             if (!capValueAllowed(offered, value)) return false;
         }
         if (remove) {
@@ -695,9 +704,10 @@ fn capRequestable(spec: CapSpec, sts_value: ?[]const u8, sasl_value: ?[]const u8
     return true;
 }
 
-fn capRequestValue(spec: CapSpec, sts_value: ?[]const u8, sasl_value: ?[]const u8) ?[]const u8 {
+fn capRequestValue(spec: CapSpec, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8) ?[]const u8 {
     if (spec.requires_policy) return sts_value;
     if (spec.id == .sasl) return sasl_value;
+    if (spec.id == .multiline) return multiline_value orelse spec.value_302;
     return spec.value_302;
 }
 
@@ -1383,6 +1393,13 @@ pub const ClientSession = struct {
     pub fn disableSts(self: *ClientSession) void {
         self.cap.sts.enabled = false;
         self.cap.sts.value_len = 0;
+    }
+
+    /// Configure the advertised draft/multiline limits for this session. The
+    /// server calls this from accepted-connection setup after TOML projection.
+    pub fn configureMultiline(self: *ClientSession, max_bytes: usize, max_lines: usize) error{OutputTooSmall}!void {
+        const wire = std.fmt.bufPrint(&self.cap.multiline_value_buf, "max-bytes={d},max-lines={d}", .{ max_bytes, max_lines }) catch return error.OutputTooSmall;
+        self.cap.multiline_value_len = wire.len;
     }
 };
 
@@ -2409,6 +2426,21 @@ test "CAP LS gates sasl on configured session mechanisms" {
     session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
     try dispatchText(&session, &replies, "CAP LS 302");
     try expectContains(replies.written(), "sasl=PLAIN");
+}
+
+test "CAP LS advertises configured draft/multiline limits" {
+    var session = ClientSession.init();
+    try session.configureMultiline(8192, 8);
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "draft/multiline=max-bytes=8192,max-lines=8");
+    replies.clear();
+
+    try dispatchText(&session, &replies, "CAP REQ :draft/multiline=max-lines=8");
+    try expectContains(replies.written(), " CAP * ACK :draft/multiline=max-lines=8\r\n");
+    try std.testing.expect(session.hasCap(.multiline));
 }
 
 test "CAP REQ accepts bare and value-bearing tokens" {

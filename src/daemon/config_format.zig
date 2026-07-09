@@ -26,6 +26,7 @@ const transcript_mod = @import("transcript.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
+const multiline_mod = @import("../proto/multiline.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
 
@@ -68,6 +69,7 @@ pub const Config = struct {
     io: Io = .{},
     reputation: Reputation = .{},
     sessions: Sessions = .{},
+    ircv3: Ircv3 = .{},
     history: History = .{},
     media: Media = .{},
     stats: Stats = .{},
@@ -387,6 +389,15 @@ pub const Config = struct {
     pub const Sessions = struct {
         max_accounts: u64 = 65536,
         max_per_account: u32 = 64,
+    };
+
+    /// `[ircv3]` — live IRCv3 protocol limits surfaced in CAP values and
+    /// enforced by the daemon.
+    pub const Ircv3 = struct {
+        multiline_max_bytes: u64 = multiline_mod.default_max_bytes,
+        multiline_max_lines: u64 = multiline_mod.default_max_lines,
+        multiline_ref_len: u64 = multiline_mod.default_max_ref_len,
+        multiline_target_len: u64 = multiline_mod.default_max_target_len,
     };
 
     /// `[history.search]` — live draft/search inverted-index sizing.
@@ -1073,6 +1084,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
     cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, 1_000_000));
+
+    // [ircv3]
+    cfg.ircv3.multiline_max_bytes = try uintField(doc, "ircv3.multiline_max_bytes", cfg.ircv3.multiline_max_bytes, 4096, 262144);
+    cfg.ircv3.multiline_max_lines = try uintField(doc, "ircv3.multiline_max_lines", cfg.ircv3.multiline_max_lines, 2, 1024);
+    cfg.ircv3.multiline_ref_len = try uintField(doc, "ircv3.multiline_ref_len", cfg.ircv3.multiline_ref_len, 1, 128);
+    cfg.ircv3.multiline_target_len = try uintField(doc, "ircv3.multiline_target_len", cfg.ircv3.multiline_target_len, 8, 255);
 
     // [history.search]
     cfg.history.search_max_words = try uintField(doc, "history.search.max_words", cfg.history.search_max_words, 256, 1_048_576);
@@ -2017,6 +2034,72 @@ test "parseToml: [history.search] limits project with bounded policy ranges" {
         \\irc = 6680
         \\[history.search]
         \\max_token_bytes = 257
+        \\
+    , .{}));
+}
+
+test "parseToml: [ircv3] multiline limits project with bounded policy ranges" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[ircv3]
+        \\multiline_max_bytes = 8192
+        \\multiline_max_lines = 8
+        \\multiline_ref_len = 32
+        \\multiline_target_len = 64
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 8192), cfg.ircv3.multiline_max_bytes);
+    try testing.expectEqual(@as(u64, 8), cfg.ircv3.multiline_max_lines);
+    try testing.expectEqual(@as(u64, 32), cfg.ircv3.multiline_ref_len);
+    try testing.expectEqual(@as(u64, 64), cfg.ircv3.multiline_target_len);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(@as(u64, multiline_mod.default_max_bytes), omitted.ircv3.multiline_max_bytes);
+    try testing.expectEqual(@as(u64, multiline_mod.default_max_lines), omitted.ircv3.multiline_max_lines);
+    try testing.expectEqual(@as(u64, multiline_mod.default_max_ref_len), omitted.ircv3.multiline_ref_len);
+    try testing.expectEqual(@as(u64, multiline_mod.default_max_target_len), omitted.ircv3.multiline_target_len);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[ircv3]
+        \\multiline_max_bytes = 4095
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[ircv3]
+        \\multiline_max_lines = 1
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[ircv3]
+        \\multiline_ref_len = 129
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[ircv3]
+        \\multiline_target_len = 7
         \\
     , .{}));
 }

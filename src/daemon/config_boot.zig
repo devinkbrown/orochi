@@ -154,6 +154,10 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
+    out.multiline_max_bytes = @intCast(cfg.ircv3.multiline_max_bytes);
+    out.multiline_max_lines = @intCast(cfg.ircv3.multiline_max_lines);
+    out.multiline_ref_len = @intCast(cfg.ircv3.multiline_ref_len);
+    out.multiline_target_len = @intCast(cfg.ircv3.multiline_target_len);
     out.search_index_config = .{
         .max_words = @intCast(cfg.history.search_max_words),
         .max_ids_per_word = @intCast(cfg.history.search_max_ids_per_word),
@@ -522,6 +526,11 @@ test "config text overlays the server config" {
         \\max_words = 4096
         \\max_ids_per_word = 128
         \\max_token_bytes = 32
+        \\[ircv3]
+        \\multiline_max_bytes = 8192
+        \\multiline_max_lines = 8
+        \\multiline_ref_len = 32
+        \\multiline_target_len = 64
         \\[media]
         \\enabled = true
         \\max_upload_bytes = 12345
@@ -613,6 +622,10 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 4096), loaded.config.search_index_config.max_words);
     try testing.expectEqual(@as(usize, 128), loaded.config.search_index_config.max_ids_per_word);
     try testing.expectEqual(@as(usize, 32), loaded.config.search_index_config.max_token_bytes);
+    try testing.expectEqual(@as(usize, 8192), loaded.config.multiline_max_bytes);
+    try testing.expectEqual(@as(usize, 8), loaded.config.multiline_max_lines);
+    try testing.expectEqual(@as(usize, 32), loaded.config.multiline_ref_len);
+    try testing.expectEqual(@as(usize, 64), loaded.config.multiline_target_len);
     try testing.expectEqual(@as(usize, 512), loaded.config.content_filter_config.max_patterns);
     try testing.expectEqual(@as(usize, 128), loaded.config.content_filter_config.max_pattern_len);
     try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);
