@@ -71,7 +71,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## AUDIT
 
 - Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id>`
-- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, `SQUIT`, `REDACT`, and IRCX `ACCESS` add/delete/clear mutations. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
+- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, `SQUIT`, `REDACT`, IRCX `ACCESS` add/delete/clear mutations, and FORCE* channel actions. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
 - Privileges: Oper holding the `audit_read` privilege.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
@@ -324,7 +324,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## FORCEOP
 
 - Syntax: `FORCEOP <#channel> <nick>`
-- Description: Forces channel operator mode on a target nick.
+- Description: Forces channel operator mode on a target nick. Successful actions publish an oper Event Spine notice with `proof=<id>` when the node has a signing identity.
 - Privileges: Oper.
 - Parameters: Channel and nick.
 - Replies: `MODE` broadcast or server notice for no-op.
@@ -335,7 +335,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## FORCEDEOP
 
 - Syntax: `FORCEDEOP <#channel> <nick>`
-- Description: Forces removal of channel operator mode from a target nick.
+- Description: Forces removal of channel operator mode from a target nick. Successful actions publish an oper Event Spine notice with `proof=<id>` when the node has a signing identity.
 - Privileges: Oper.
 - Parameters: Channel and nick.
 - Replies: `MODE` broadcast or server notice for no-op.
@@ -346,7 +346,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## FORCEJOIN
 
 - Syntax: `FORCEJOIN <#channel> <nick>`
-- Description: Applies `JOIN` to the target user's live connection.
+- Description: Applies `JOIN` to the target user's live connection. Successful actions publish an oper Event Spine notice with `proof=<id>` when the node has a signing identity.
 - Privileges: Oper.
 - Parameters: Channel and nick.
 - Replies: Normal join replies to target; `Force action applied` notice to oper.
@@ -357,7 +357,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## FORCEPART
 
 - Syntax: `FORCEPART <#channel> <nick> [:reason]`
-- Description: Parts a target user from a channel with an optional reason.
+- Description: Parts a target user from a channel with an optional reason. Successful actions publish an oper Event Spine notice with `proof=<id>` when the node has a signing identity.
 - Privileges: Oper.
 - Parameters: Channel, nick, optional reason.
 - Replies: `PART` broadcast; `Force action applied` notice.
@@ -368,7 +368,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## FORCETOPIC
 
 - Syntax: `FORCETOPIC <#channel> :<topic>`
-- Description: Sets a channel topic as the server and broadcasts it.
+- Description: Sets a channel topic as the server and broadcasts it. Successful actions publish an oper Event Spine notice with `proof=<id>` when the node has a signing identity.
 - Privileges: Oper.
 - Parameters: Channel and topic.
 - Replies: `TOPIC` broadcast.

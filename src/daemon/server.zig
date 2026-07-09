@@ -18419,6 +18419,7 @@ pub const LinuxServer = struct {
     fn forceJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8, nick: []const u8) !void {
         const t = self.resolveTargetConn(conn, nick) orelse return;
         try self.joinOne(t.id, t.conn, channel, null, 0);
+        self.auditForceAction(conn, .forcejoin, "FORCEJOIN", channel, nick);
         try self.noticeTo(conn, "Force action applied");
     }
 
@@ -18430,6 +18431,7 @@ pub const LinuxServer = struct {
         const t = self.resolveTargetConn(conn, nick) orelse return;
         const part_reason = if (reason.len > 0) reason else "Removed by operator";
         try self.partOne(t.id, t.conn, channel, part_reason);
+        self.auditForceAction(conn, .forcepart, "FORCEPART", channel, nick);
         try self.noticeTo(conn, "Force action applied");
     }
 
@@ -18447,12 +18449,14 @@ pub const LinuxServer = struct {
             return;
         };
         if (!changed) {
+            self.auditForceAction(conn, if (adding) .forceop else .forcedeop, if (adding) "FORCEOP" else "FORCEDEOP", channel, nick);
             try self.noticeTo(conn, "Force action applied (no change)");
             return;
         }
         var buf: [256]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}o {s}\r\n", .{ self.serverName(), channel, if (adding) "+" else "-", nick }) catch return;
         try self.broadcastChannel(channel, line, null);
+        self.auditForceAction(conn, if (adding) .forceop else .forcedeop, if (adding) "FORCEOP" else "FORCEDEOP", channel, nick);
     }
 
     fn forceTopic(self: *LinuxServer, conn: *ConnState, channel: []const u8, topic: []const u8) !void {
@@ -18464,6 +18468,19 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ self.serverName(), channel, topic }) catch return;
         try self.broadcastChannel(channel, line, null);
+        self.auditForceAction(conn, .forcetopic, "FORCETOPIC", channel, topic);
+    }
+
+    fn auditForceAction(self: *LinuxServer, conn: *ConnState, action: svc_operaudit.Action, command: []const u8, channel: []const u8, detail: []const u8) void {
+        var target_buf: [320]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buf, "{s} {s}", .{ channel, detail }) catch channel;
+        const proof_id = self.recordOperAudit(conn.session.displayName(), action, target, command);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event_note = if (proof_id) |pid|
+            std.fmt.bufPrint(&event_buf, "{s} {s} {s} proof={s}", .{ command, channel, detail, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&event_buf, "{s} {s} {s}", .{ command, channel, detail }) catch return;
+        self.publishOperEvent(.oper_action, .notice, event_note) catch {};
     }
 
     /// Map a member's channel-status modes to the mass-kick rank ladder.
@@ -40015,6 +40032,75 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try writeAllFd(fd_o, "AUDIT nobody\r\n");
     try recvUntil(&o, "End of audit (0)", 300);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
+}
+
+test "threaded server: FORCE actions produce ProofMark audit events" {
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd4)), "local");
+    defer ident.deinit();
+    var cfg = operTestConfig(0);
+    cfg.node_id = ident.shortId();
+    cfg.node_identity = &ident;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var o = LiveClient{ .fd = fd_o };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300);
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    o.reset();
+    try writeAllFd(fd_o, "FORCEJOIN #force B\r\n");
+    try recvUntil(&o, "FORCEJOIN #force B proof=", 300);
+    try recvUntil(&b, " 366 B #force ", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "FORCEOP #force B\r\n");
+    try recvUntil(&o, "FORCEOP #force B proof=", 300);
+    try recvUntil(&b, "MODE #force +o B", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "FORCEDEOP #force B\r\n");
+    try recvUntil(&o, "FORCEDEOP #force B proof=", 300);
+    try recvUntil(&b, "MODE #force -o B", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "FORCETOPIC #force :roadmap topic\r\n");
+    try recvUntil(&o, "FORCETOPIC #force roadmap topic proof=", 300);
+    try recvUntil(&b, "TOPIC #force :roadmap topic", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "FORCEPART #force B :audit done\r\n");
+    try recvUntil(&o, "FORCEPART #force B proof=", 300);
+    try recvUntil(&b, "PART #force", 300);
+
+    o.reset();
+    try writeAllFd(fd_o, "AUDIT JSON O 10\r\n");
+    try recvUntil(&o, "\"type\":\"audit-end\"", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"forcepart\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"forcetopic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"forcedeop\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"forceop\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"action\":\"forcejoin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"proof_id\":") != null);
 }
 
 test "threaded server: clone-limit admission refusals publish security events" {

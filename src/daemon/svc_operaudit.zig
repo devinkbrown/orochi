@@ -47,6 +47,11 @@ pub const Action = enum {
     access_add,
     access_delete,
     access_clear,
+    forcejoin,
+    forcepart,
+    forceop,
+    forcedeop,
+    forcetopic,
     other,
 
     /// Stable lowercase label used when rendering audit lines.
@@ -74,6 +79,11 @@ pub const Action = enum {
             .access_add => "access_add",
             .access_delete => "access_delete",
             .access_clear => "access_clear",
+            .forcejoin => "forcejoin",
+            .forcepart => "forcepart",
+            .forceop => "forceop",
+            .forcedeop => "forcedeop",
+            .forcetopic => "forcetopic",
             .other => "other",
         };
     }
@@ -103,6 +113,11 @@ pub const Action = enum {
             .access_add => 20,
             .access_delete => 21,
             .access_clear => 22,
+            .forcejoin => 23,
+            .forcepart => 24,
+            .forceop => 25,
+            .forcedeop => 26,
+            .forcetopic => 27,
             .other => 255,
         };
     }
