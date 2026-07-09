@@ -248,6 +248,34 @@ pub fn Lotus(comptime params: Params) type {
             return total;
         }
 
+        pub fn root(self: *const Self) ContentHash {
+            var keys: [params.max_targets][]const u8 = undefined;
+            var count: usize = 0;
+            var it = self.targets.iterator();
+            while (it.next()) |entry| {
+                keys[count] = entry.key_ptr.*;
+                count += 1;
+            }
+            std.mem.sort([]const u8, keys[0..count], {}, bytesLessThan);
+
+            var hasher = Blake3.init(.{});
+            hasher.update("orochi.lotus.root.v1");
+            updateLen(&hasher, count);
+            for (keys[0..count]) |target| {
+                const log = self.targets.get(target).?;
+                updateBytes(&hasher, target);
+                updateLen(&hasher, log.len);
+                var i: usize = 0;
+                while (i < log.len) : (i += 1) {
+                    updateStoredMessage(&hasher, log.entry(i));
+                }
+            }
+
+            var out: ContentHash = undefined;
+            hasher.final(&out);
+            return out;
+        }
+
         fn findNewest(self: *Self, target: []const u8, msgid: []const u8) Error!*StoredMessage {
             try validateTarget(target);
             const log = self.targets.getPtr(target) orelse return error.NotFound;
@@ -380,6 +408,38 @@ fn hashText(text: []const u8) ContentHash {
     var out: ContentHash = undefined;
     Blake3.hash(text, &out, .{});
     return out;
+}
+
+fn updateLen(hasher: anytype, len: usize) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, @intCast(len), .little);
+    hasher.update(&buf);
+}
+
+fn updateU64(hasher: anytype, value: u64) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    hasher.update(&buf);
+}
+
+fn updateBytes(hasher: anytype, bytes: []const u8) void {
+    updateLen(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn updateStoredMessage(hasher: anytype, entry: *const StoredMessage) void {
+    hasher.update("entry");
+    updateBytes(hasher, entry.msgid);
+    updateBytes(hasher, entry.sender);
+    updateBytes(hasher, entry.command);
+    updateBytes(hasher, entry.client_tags orelse "");
+    updateU64(hasher, entry.timestamp);
+    hasher.update(if (entry.tombstone) "t" else "l");
+    hasher.update(&entry.hash);
+}
+
+fn bytesLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
 test "append evicts oldest and latest returns newest first" {
@@ -536,6 +596,33 @@ test "aggregate counts expose targets entries and tombstones" {
     try std.testing.expectEqual(@as(usize, 2), store.targetCount());
     try std.testing.expectEqual(@as(usize, 3), store.totalStoredCount());
     try std.testing.expectEqual(@as(usize, 1), store.tombstoneCount());
+}
+
+test "root is deterministic and changes on edits and tombstones" {
+    const Store = Lotus(.{ .max_targets = 2, .max_per_target = 3, .max_text = 32 });
+    var first = Store.init(std.testing.allocator);
+    defer first.deinit();
+    var second = Store.init(std.testing.allocator);
+    defer second.deinit();
+
+    try appendForTest(&first, "#b", "b1", 3, "three");
+    try appendForTest(&first, "#a", "a1", 1, "one");
+    try appendForTest(&first, "#a", "a2", 2, "two");
+
+    try appendForTest(&second, "#a", "a1", 1, "one");
+    try appendForTest(&second, "#a", "a2", 2, "two");
+    try appendForTest(&second, "#b", "b1", 3, "three");
+
+    const before = first.root();
+    try std.testing.expectEqualSlices(u8, &before, &second.root());
+
+    try first.edit("#a", "a2", "two-edited");
+    const edited = first.root();
+    try std.testing.expect(!std.mem.eql(u8, &before, &edited));
+
+    try first.redact("#a", "a1");
+    const redacted = first.root();
+    try std.testing.expect(!std.mem.eql(u8, &edited, &redacted));
 }
 
 test "edit replaces message text" {

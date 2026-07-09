@@ -5025,10 +5025,12 @@ pub const LinuxServer = struct {
             w.writeAll("null") catch return w.buffered();
         }
         w.writeAll("}}") catch return w.buffered();
-        w.print(",\"history\":{{\"targets\":{d},\"entries\":{d},\"tombstones\":{d}}}", .{
+        const history_root_hex = std.fmt.bytesToHex(self.history.root(), .lower);
+        w.print(",\"history\":{{\"targets\":{d},\"entries\":{d},\"tombstones\":{d},\"root\":\"{s}\"}}", .{
             self.history.targetCount(),
             self.history.totalStoredCount(),
             self.history.tombstoneCount(),
+            &history_root_hex,
         }) catch return w.buffered();
 
         w.writeAll(",\"peers\":[") catch return w.buffered();
@@ -32194,7 +32196,9 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1,\"root\":\"") != null);
+        const history_root_hex = std.fmt.bytesToHex(server.history.root(), .lower);
+        try std.testing.expect(std.mem.indexOf(u8, text, &history_root_hex) != null);
         // Both peers present, with correct up/state.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
