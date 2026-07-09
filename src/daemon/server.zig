@@ -5080,10 +5080,11 @@ pub const LinuxServer = struct {
         }
         w.writeAll("]") catch return w.buffered();
         w.writeAll("}") catch return w.buffered();
-        w.print(",\"features\":{{\"s2s\":{s},\"websocket\":{s},\"webtransport\":{s},\"media\":{s},\"webpush\":{s},\"webauthn\":{s},\"webhook\":{s},\"metrics\":{s},\"sts\":{s},\"raw_public_key\":{s},\"ktls_tx\":{s},\"ktls_rx\":{s},\"orowasm\":{s},\"geo\":{s}}}", .{
+        w.print(",\"features\":{{\"s2s\":{s},\"websocket\":{s},\"webtransport\":{s},\"proxy_protocol\":{s},\"media\":{s},\"webpush\":{s},\"webauthn\":{s},\"webhook\":{s},\"metrics\":{s},\"sts\":{s},\"raw_public_key\":{s},\"ktls_tx\":{s},\"ktls_rx\":{s},\"orowasm\":{s},\"geo\":{s},\"connection_throttle\":{s},\"mesh_clone_limit\":{s},\"reputation_gate\":{s},\"dnsbl\":{s}}}", .{
             if (self.config.s2s_port != 0 or self.config.mesh_connect.len != 0) "true" else "false",
             if (self.config.ws_enabled) "true" else "false",
             if (self.config.webtransport_port != 0) "true" else "false",
+            if (self.config.proxy_protocol_enabled and self.config.trusted_proxies.len != 0) "true" else "false",
             if (self.config.media_enabled) "true" else "false",
             if (self.config.webpush_vapid_pub.len != 0) "true" else "false",
             if (self.config.webauthn_rp_id != null and self.config.webauthn_origins.len != 0) "true" else "false",
@@ -5095,6 +5096,10 @@ pub const LinuxServer = struct {
             if (self.config.tls_ktls_rx) "true" else "false",
             if (self.config.wasm_plugin_dir.len != 0) "true" else "false",
             if (self.config.geo_enabled) "true" else "false",
+            if (self.config.throttle_connects != 0) "true" else "false",
+            if (self.config.max_clones_per_ip_net != 0) "true" else "false",
+            if (self.config.reputation_refuse_threshold != 0) "true" else "false",
+            if (self.config.dnsbl != null) "true" else "false",
         }) catch return w.buffered();
         w.print(",\"mesh\":{{\"quorum\":{s},\"partitioned\":{s},\"components\":{d}}}", .{
             if (self.partition_quorum) "true" else "false",
@@ -32559,7 +32564,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"activity\":{\"channels\":1,\"messages\":1,\"active_channels_24h\":1,\"last_active\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"heatline\":[1]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"proxy_protocol\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false,\"connection_throttle\":false,\"mesh_clone_limit\":false,\"reputation_gate\":false,\"dnsbl\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
@@ -32577,6 +32582,9 @@ test "status.json: emits node health + mesh peers for the public status page" {
         server.config.s2s_port = 6697;
         server.config.ws_enabled = true;
         server.config.webtransport_port = 4433;
+        server.config.proxy_protocol_enabled = true;
+        const trusted_proxies = [_][]const u8{"127.0.0.1"};
+        server.config.trusted_proxies = &trusted_proxies;
         server.config.media_enabled = true;
         server.config.webpush_vapid_pub = "test-vapid";
         server.config.webauthn_rp_id = "chat.example";
@@ -32590,9 +32598,14 @@ test "status.json: emits node health + mesh peers for the public status page" {
         server.config.tls_ktls_rx = true;
         server.config.wasm_plugin_dir = "plugins";
         server.config.geo_enabled = true;
+        server.config.throttle_connects = 5;
+        server.config.max_clones_per_ip_net = 7;
+        server.config.reputation_refuse_threshold = 100;
+        var dnsbl: dnsbl_resolver.Resolver = undefined;
+        server.config.dnsbl = &dnsbl;
         const public_text = server.buildStatusJson(&buf);
         try std.testing.expect(std.mem.indexOf(u8, public_text, "\"discoverable\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, public_text, "\"features\":{\"s2s\":true,\"websocket\":true,\"webtransport\":true,\"media\":true,\"webpush\":true,\"webauthn\":true,\"webhook\":true,\"metrics\":true,\"sts\":true,\"raw_public_key\":true,\"ktls_tx\":true,\"ktls_rx\":true,\"orowasm\":true,\"geo\":true}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, public_text, "\"features\":{\"s2s\":true,\"websocket\":true,\"webtransport\":true,\"proxy_protocol\":true,\"media\":true,\"webpush\":true,\"webauthn\":true,\"webhook\":true,\"metrics\":true,\"sts\":true,\"raw_public_key\":true,\"ktls_tx\":true,\"ktls_rx\":true,\"orowasm\":true,\"geo\":true,\"connection_throttle\":true,\"mesh_clone_limit\":true,\"reputation_gate\":true,\"dnsbl\":true}") != null);
     } else return error.SkipZigTest;
 }
 

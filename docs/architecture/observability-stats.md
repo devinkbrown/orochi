@@ -106,6 +106,7 @@ The same flush also emits `status.json` beside the channel stats ([src/daemon/se
     "s2s": true,
     "websocket": true,
     "webtransport": true,
+    "proxy_protocol": true,
     "media": true,
     "webpush": true,
     "webauthn": true,
@@ -116,7 +117,11 @@ The same flush also emits `status.json` beside the channel stats ([src/daemon/se
     "ktls_tx": true,
     "ktls_rx": false,
     "orowasm": false,
-    "geo": true
+    "geo": true,
+    "connection_throttle": true,
+    "mesh_clone_limit": true,
+    "reputation_gate": true,
+    "dnsbl": true
   },
   "mesh": {"quorum": true, "partitioned": false, "components": 1},
   "accounts": {"key_transparency": {"enabled": true, "entries": 42, "root": "..." }},
@@ -141,8 +146,11 @@ ordered oldest-to-newest. Directory crawlers can rank a discoverable node by
 recent heat without fetching every per-channel JSON file. The `features` object
 is derived from live configuration gates and lets public directory crawlers
 classify a discoverable node without probing optional listeners or exposing
-secrets, addresses, peer lists, keys, or operator-only values. The `mesh`
-envelope reflects the live partition detector —
+secrets, thresholds, blocklist zones, trusted-proxy addresses, peer lists, keys,
+or operator-only values. Fronting and anti-abuse entries such as
+`proxy_protocol`, `connection_throttle`, `mesh_clone_limit`, `reputation_gate`,
+and `dnsbl` are coarse booleans only. The `mesh` envelope reflects the live
+partition detector —
 `quorum`, `partitioned`, and `components` come from `partition_quorum`/
 `partition_split`/`partition_components`, which `updatePartitionTransitions`
 maintains on every link up/down ([src/daemon/server.zig:4066](../../src/daemon/server.zig#L4066)). The `accounts.key_transparency` object exposes the live account
