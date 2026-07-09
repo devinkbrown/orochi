@@ -2,7 +2,7 @@
 
 *The numeric reply codes Orochi emits, where each originates, and the message text clients receive.*
 
-This reference documents current source only. Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C ophion, not a clone. Numeric values are drawn from the daemon-local enum in `src/daemon/server.zig:701` and the shared protocol enum in `src/proto/numeric.zig:9`; pre-registration numerics are also emitted by `src/daemon/dispatch.zig:141`.
+This reference documents current source only. Orochi is a pure-Zig 0.17-dev clean-room IRC daemon and a bespoke successor to C ophion, not a clone. Numeric values are drawn from the daemon-local enum in `src/daemon/server.zig:701` and the shared protocol enum in `src/proto/numeric.zig:9`; pre-registration numerics are also emitted by `src/daemon/dispatch.zig:141`.
 
 ## Source inventories
 

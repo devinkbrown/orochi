@@ -13,7 +13,7 @@ Orochi is a clean-slate Zig-native successor to ophion. The brief states that
 the daemon, substrate, and opssl crypto/TLS library are rewritten from scratch
 in Zig, and that ophion, libop, and opssl are reference material only
 (`docs/BRIEF.md:3`, `docs/BRIEF.md:4`, `docs/BRIEF.md:5`, `docs/BRIEF.md:6`).
-The pinned toolchain target is Zig 0.16.0 (`build.zig.zon:28`).
+The pinned toolchain target is Zig 0.17.0-dev.1282+c0f9b51d8 (`build.zig.zon:34`).
 
 The crypto and TLS paths covered here are Zig modules built from `std.crypto`
 and local code. For example, X-Wing builds on `std.crypto.kem.ml_kem.MLKem768`

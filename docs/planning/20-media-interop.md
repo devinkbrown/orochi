@@ -4,8 +4,8 @@
 
 This document records the planned media interop model and server-side non-goals.
 
-Status: **architecture decided + live offer/answer transport wiring landed; forward-path
-polish remains.**
+Status: **architecture decided + live offer/answer transport and cross-leg
+forward/control wiring landed.**
 This supersedes the framing in [18-media-transport.md](18-media-transport.md). The earlier
 draft of this note framed WebRTC as a *forced mobile gateway with standard codecs*; that
 framing was incorrect. The corrected model below is recorded so it does not drift again.
@@ -80,12 +80,11 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live ABR-driven simulcast selection (wired) | `MEDIA ABR` accepts receiver BWE/loss/RTT/NACK reports, runs the Suimyaku ABR hint through `simulcast_select`, and applies the result as the receiver's native layer ceiling without decoding or transcoding media. |
 | Live WebRTC-to-native feedback bridge (wired) | The WebRTC media plane now feeds decrypted RTCP PLI/FIR/NACK through `rtcp_translate`, maps media SSRCs through the bridge `ssrc_map`, encodes `native_feedback`, and sends it only to the native publisher. |
 | Live authenticated native-origin feedback ingress (wired) | The native UDP pump accepts `ONFB` feedback envelopes signed with the participant's native-media MAC key, verifies sender stream/address ownership, and translates native PLI/NACK into RTCP for the WebRTC publisher. |
+| Live pump-owned native-origin RTCP egress (wired) | Cross-thread native-origin RTCP is queued into the WebRTC media pump, where DTLS recipients are protected as SRTCP by the pump-owned crypto hub and group-key/plain peers receive canonical RTCP. |
 
 ## Remaining live wiring
 
-1. **Protected RTCP egress from non-pump threads:** queue native-origin RTCP
-   feedback through the media pump so DTLS-SRTP recipients receive SRTCP; the
-   current cross-thread helper fails closed when DTLS-SRTP is enabled.
+No open live-wiring gaps are tracked in this note.
 
 ## Non-goals
 

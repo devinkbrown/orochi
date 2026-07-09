@@ -31,6 +31,14 @@ pub const TransportAddress = media_transport.TransportAddress;
 pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
 pub const max_datagram = media_socket.max_datagram;
+const rtcp_egress_queue_cap: usize = 64;
+const rtcp_egress_max_bytes: usize = 2048;
+
+const QueuedRtcp = struct {
+    dest: TransportAddress = .{},
+    len: usize = 0,
+    bytes: [rtcp_egress_max_bytes]u8 = undefined,
+};
 
 /// Blocking acquire on the tryLock-only `std.atomic.Mutex`. Contention is
 /// near-zero (rare allocate/remove vs. low-rate STUN handshakes), so yielding.
@@ -138,6 +146,13 @@ pub const MediaPlane = struct {
     /// peer address) when that peer's DTLS records arrive.
     offered_fps: std.StringHashMapUnmanaged([peer_verify.digest_len]u8) = .empty,
     fp_mutex: std.atomic.Mutex = .unlocked,
+    /// Canonical RTCP packets produced off the media pump thread, usually by the
+    /// native-media bridge. The pump drains this queue so DTLS-SRTP recipients
+    /// receive SRTCP protected under the pump-owned crypto hub.
+    rtcp_out: [rtcp_egress_queue_cap]QueuedRtcp = undefined,
+    rtcp_out_head: usize = 0,
+    rtcp_out_len: usize = 0,
+    rtcp_out_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -189,6 +204,11 @@ pub const MediaPlane = struct {
             self.dtls_enabled = false;
             std.log.warn("orochi: DTLS-SRTP terminator disabled ({s})", .{@errorName(e)});
         };
+
+        lockSpin(&self.rtcp_out_mutex);
+        self.rtcp_out_head = 0;
+        self.rtcp_out_len = 0;
+        self.rtcp_out_mutex.unlock();
 
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch |e| {
@@ -297,7 +317,11 @@ pub const MediaPlane = struct {
         var buf: [media_socket.max_datagram]u8 = undefined;
         while (!self.stop_flag.load(.acquire)) {
             const sock = &(self.socket orelse return);
-            const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
+            self.drainQueuedRtcp(sock);
+            const got = sock.recvFrom(&buf) orelse {
+                self.drainQueuedRtcp(sock);
+                continue;
+            }; // timeout/idle
             if (got.data.len == 0) continue;
             if (got.data.len > self.max_frame_bytes) continue;
             // RFC 7983 demultiplexing: DTLS records carry a content-type byte in
@@ -336,6 +360,38 @@ pub const MediaPlane = struct {
                     self.relay(&sock.*, got.from, got.data, ssrc, seq);
                 }
             }
+        }
+    }
+
+    /// Drain off-thread RTCP egress on the pump thread. This is the only place
+    /// queued RTCP may touch the DTLS-SRTP crypto hub.
+    fn drainQueuedRtcp(self: *MediaPlane, sock: *MediaSocket) void {
+        while (true) {
+            var item: QueuedRtcp = undefined;
+            lockSpin(&self.rtcp_out_mutex);
+            if (self.rtcp_out_len == 0) {
+                self.rtcp_out_mutex.unlock();
+                return;
+            }
+            item = self.rtcp_out[self.rtcp_out_head];
+            self.rtcp_out_head = (self.rtcp_out_head + 1) % rtcp_egress_queue_cap;
+            self.rtcp_out_len -= 1;
+            self.rtcp_out_mutex.unlock();
+
+            self.sendCanonicalRtcpTo(sock, item.dest, item.bytes[0..item.len]);
+        }
+    }
+
+    /// Pump-thread-only send of canonical RTCP to one destination. DTLS peers are
+    /// protected as SRTCP; group-key/plain peers receive the canonical packet.
+    fn sendCanonicalRtcpTo(self: *MediaPlane, sock: *MediaSocket, dest: TransportAddress, canonical: []const u8) void {
+        var enc_buf: [media_socket.max_datagram + sfu_srtp.rtcp_overhead]u8 = undefined;
+        switch (self.dtlsState(dest)) {
+            .not_dtls => sock.sendTo(dest, canonical),
+            .unavailable => {},
+            .ready => if (self.srtp_hub.protectRtcp(dest, canonical, &enc_buf)) |wire| {
+                sock.sendTo(dest, wire);
+            },
         }
     }
 
@@ -605,15 +661,8 @@ pub const MediaPlane = struct {
         const n = self.transport.forwardFromSource(source, canonical, 0, null, &targets);
         self.mutex.unlock();
 
-        var enc_buf: [media_socket.max_datagram + sfu_srtp.rtcp_overhead]u8 = undefined;
         for (targets[0..n]) |dst| {
-            switch (self.dtlsState(dst)) {
-                .not_dtls => sock.sendTo(dst, canonical),
-                .unavailable => {}, // skip: never send a DTLS peer plaintext RTCP
-                .ready => if (self.srtp_hub.protectRtcp(dst, canonical, &enc_buf)) |wire| {
-                    sock.sendTo(dst, wire);
-                },
-            }
+            self.sendCanonicalRtcpTo(sock, dst, canonical);
         }
     }
 
@@ -708,12 +757,23 @@ pub const MediaPlane = struct {
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
 
-    /// Send canonical RTCP to a WebRTC peer from outside the media pump. The
-    /// DTLS/SRTCP crypto hub is pump-thread-owned, so cross-thread RTCP egress
-    /// fails closed when DTLS-SRTP is enabled rather than leaking plaintext.
+    /// Send canonical RTCP to a WebRTC peer from outside the media pump. When
+    /// DTLS-SRTP is enabled, this enqueues the packet for pump-thread egress so
+    /// the pump-owned SRTCP crypto hub can protect DTLS recipients.
     pub fn sendRtcpTo(self: *MediaPlane, dest: TransportAddress, bytes: []const u8) void {
-        if (self.dtls_enabled) return;
-        if (self.socket) |*s| s.sendTo(dest, bytes);
+        if (!self.dtls_enabled) {
+            if (self.socket) |*s| s.sendTo(dest, bytes);
+            return;
+        }
+        if (self.socket == null or bytes.len > rtcp_egress_max_bytes) return;
+        lockSpin(&self.rtcp_out_mutex);
+        defer self.rtcp_out_mutex.unlock();
+        if (self.rtcp_out_len >= rtcp_egress_queue_cap) return;
+        const idx = (self.rtcp_out_head + self.rtcp_out_len) % rtcp_egress_queue_cap;
+        self.rtcp_out[idx].dest = dest;
+        self.rtcp_out[idx].len = bytes.len;
+        @memcpy(self.rtcp_out[idx].bytes[0..bytes.len], bytes);
+        self.rtcp_out_len += 1;
     }
 
     /// The bound remote address of a WebRTC participant (learned via STUN), or
@@ -749,6 +809,7 @@ const dtls_srtp = @import("../proto/dtls_srtp.zig");
 const dtls13_messages = @import("../proto/dtls13_messages.zig");
 const dtls_kx = @import("../proto/dtls_keyexchange.zig");
 const srtp = @import("../proto/srtp.zig");
+const srtcp = @import("../proto/srtcp.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);
@@ -984,10 +1045,10 @@ test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound Web
     try testing.expectEqualSlices(u8, pli, got.data);
 }
 
-test "MediaPlane: cross-thread RTCP egress sends plaintext only when DTLS is off" {
+test "MediaPlane: cross-thread RTCP egress is direct when DTLS is off and queued when on" {
     var capture = try MediaSocket.bind(loopback_be, 0);
     defer capture.deinit();
-    capture.setRecvTimeoutMs(400);
+    capture.setRecvTimeoutMs(2000);
     const capture_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try capture.localPort());
     const rtcp = [_]u8{ 0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2 };
 
@@ -1008,7 +1069,8 @@ test "MediaPlane: cross-thread RTCP egress sends plaintext only when DTLS is off
         try plane.start(loopback_be, 0);
         plane.sendRtcpTo(capture_addr, &rtcp);
         var got_buf: [media_socket.max_datagram]u8 = undefined;
-        try testing.expect(capture.recvFrom(&got_buf) == null);
+        const got = capture.recvFrom(&got_buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, &rtcp, got.data);
     }
 }
 
@@ -1140,4 +1202,36 @@ test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted
     var plain: [rtp.len]u8 = undefined;
     const recovered = try srtp.unprotect(b_in, 0, got.data, &plain);
     try testing.expectEqualSlices(u8, &rtp, recovered);
+}
+
+test "MediaPlane e2e: queued RTCP egress is SRTCP protected for DTLS recipient" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true;
+    try plane.start(loopback_be, 0);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+
+    const creds = plane.allocate("#call", "bob") orelse return error.TestUnexpectedResult;
+    var b = try MediaSocket.bind(loopback_be, 0);
+    defer b.deinit();
+    b.setRecvTimeoutMs(3000);
+
+    var br: [32]u8 = undefined;
+    for (&br, 0..) |*x, i| x.* = @intCast((i *% 7) +% 3);
+
+    try stunBindPeer(&b, server_addr, creds);
+    const keys = try dtlsHandshakeClient(&b, server_addr, 0x6B, br);
+    const dest = plane.remoteFor("#call", "bob") orelse return error.TestUnexpectedResult;
+
+    var rtcp_buf: [64]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(0xABCD0001, 0xA1000001, &rtcp_buf);
+    plane.sendRtcpTo(dest, pli);
+
+    var got_buf: [media_socket.max_datagram]u8 = undefined;
+    const got = b.recvFrom(&got_buf) orelse return error.TestUnexpectedResult;
+    try testing.expect(!std.mem.eql(u8, got.data, pli));
+    const inbound = srtp.deriveSessionKeys(keys.serverMaster(), keys.serverSalt());
+    var recovered_buf: [64]u8 = undefined;
+    const recovered = try srtcp.unprotect(inbound, got.data, &recovered_buf);
+    try testing.expectEqualSlices(u8, pli, recovered);
 }

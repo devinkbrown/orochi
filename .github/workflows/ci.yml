@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0-dev.1282+c0f9b51d8"
 
 jobs:
   check:
@@ -23,13 +23,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
-      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
-      # so it can't find a release tag. Install straight from the official
-      # /download/ release tarball instead — deterministic, no mirror dependency.
+      # mlugg/setup-zig@v1 lags fresh tags and dev builds. Install straight from
+      # ziglang.org: release pins live under /download, dev pins under /builds.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
+            url="https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          else
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          fi
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
           tar -xf /tmp/zig.tar.xz -C /tmp
           echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
@@ -44,13 +47,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
-      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
-      # so it can't find a release tag. Install straight from the official
-      # /download/ release tarball instead — deterministic, no mirror dependency.
+      # mlugg/setup-zig@v1 lags fresh tags and dev builds. Install straight from
+      # ziglang.org: release pins live under /download, dev pins under /builds.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
+            url="https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          else
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          fi
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
           tar -xf /tmp/zig.tar.xz -C /tmp
           echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
@@ -73,13 +79,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # mlugg/setup-zig@v1 only tries community mirrors (all 404/503 for a
-      # just-released 0.16.0) and its official fallback hits /builds (dev-only),
-      # so it can't find a release tag. Install straight from the official
-      # /download/ release tarball instead — deterministic, no mirror dependency.
+      # mlugg/setup-zig@v1 lags fresh tags and dev builds. Install straight from
+      # ziglang.org: release pins live under /download, dev pins under /builds.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
+            url="https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          else
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          fi
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
           tar -xf /tmp/zig.tar.xz -C /tmp
           echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       # The static-musl ReleaseFast binary is the production artifact — verify it

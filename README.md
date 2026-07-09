@@ -4,7 +4,7 @@
 > browser WebSocket · voice/video — over a post-quantum cryptographic mesh, with no C interop.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Zig 0.16](https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig 0.17 dev](https://img.shields.io/badge/Zig-0.17--dev-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![C interop: none](https://img.shields.io/badge/C%20interop-none-success.svg)](#design-pillars)
 [![Status: in production](https://img.shields.io/badge/status-in%20production-success.svg)](#status)
 
@@ -77,7 +77,7 @@ flow, and a full source map.
 
 ## Build & run
 
-Orochi targets **Zig 0.16** on 64-bit Linux (the reactor uses `io_uring`).
+Orochi targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
 
 ```sh
 zig build              # build the daemon
@@ -109,7 +109,7 @@ The [`docs/`](docs/README.md) tree is grounded in, and cites, the live source:
 surface includes full IRCv3 + IRCX + SASL, in-process channel/nick services, class-based
 connection policy, a single runtime flood guard, `+j` network raid protection, and
 spam-trap honeypots. The tree is 900+ Zig source files (300+ daemon modules) with a
-deterministic-simulation test suite, all building under Zig 0.16.
+deterministic-simulation test suite, all building under Zig 0.17-dev.
 
 ## Contributing
 

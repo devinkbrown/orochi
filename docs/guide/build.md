@@ -6,7 +6,7 @@ Orochi builds with Zig's build system and has no package dependencies in `build.
 
 ## Requirements
 
-- Zig `0.16.0` or newer as declared by `build.zig.zon` (`build.zig.zon:28`).
+- Zig `0.17.0-dev.1282+c0f9b51d8` or newer as declared by `build.zig.zon` (`build.zig.zon:34`).
 - A 64-bit daemon target. `build.zig` rejects 32-bit daemon builds at configure time (`build.zig:20`, `build.zig:24`).
 
 ## Common targets

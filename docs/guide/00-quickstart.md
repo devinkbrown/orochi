@@ -2,7 +2,7 @@
 
 *Build Orochi, write a minimal config, and start the daemon.*
 
-Orochi is a pure-Zig 0.16 clean-room IRC daemon. The build package declares Zig `0.16.0` as the minimum supported compiler (`build.zig.zon:28`), and the daemon build rejects 32-bit targets (`build.zig:20`, `build.zig:24`).
+Orochi is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares Zig `0.17.0-dev.1282+c0f9b51d8` as the minimum supported compiler (`build.zig.zon:34`), and the daemon build rejects 32-bit targets (`build.zig:20`, `build.zig:24`).
 
 ## Build
 

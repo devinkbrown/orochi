@@ -2,7 +2,7 @@
 
 _System overview of the client-facing daemon, request flow, source map, and the architecture document index._
 
-Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.16.0"` and lists no dependencies under `.dependencies`, so the current tree builds entirely from checked-in Zig source. Evidence: `build.zig.zon:28`, `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
+Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.17.0-dev.1282+c0f9b51d8"` and lists no dependencies under `.dependencies`, so the current tree builds entirely from checked-in Zig source. Evidence: `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
 
 This overview covers the client-facing daemon, local world, module dispatch, reactor model, media, Helix upgrade, and OroWasm. Mesh/server-to-server (S2S) and cryptography are out of scope here; see [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md).
 
@@ -10,7 +10,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 
 | Area | Current source of truth | What it owns | Evidence |
 | --- | --- | --- | --- |
-| Build/package | `build.zig`, `build.zig.zon` | Zig package metadata, `orochi` executable, test/run steps, 64-bit daemon target guard | `build.zig:20`, `build.zig:87`, `build.zig.zon:28` |
+| Build/package | `build.zig`, `build.zig.zon` | Zig package metadata, `orochi` executable, test/run steps, 64-bit daemon target guard | `build.zig:20`, `build.zig:87`, `build.zig.zon:34` |
 | Daemon server | `src/daemon/server.zig` | Linux TCP server, Ringlane io_uring wrapper, connection table, registration integration, live stores, registry/WASM dispatch, media/upgrade wiring | `src/daemon/server.zig:1`, `src/daemon/server.zig:466`, `src/daemon/server.zig:1285` |
 | Connection classes | `src/daemon/conn_class.zig`, `src/daemon/server.zig` | Named per-connection policy (sendq/recvq ceilings, max_clients/per_ip/channels, timeouts, TLS/SASL requirements, flood control, nick-delay exemption); CIDR/TLS/account/oper/ident/host matching; per-class assignment at registration | `src/daemon/conn_class.zig:1`, `src/daemon/server.zig:7073`, `src/daemon/server.zig:3615` |
 | Nick delay | `src/daemon/nick_delay.zig`, `src/daemon/server.zig` | Held-nick registry; holds a released nick for a configured window to prevent nick camping; per-account reclaim and oper bypass; exempt class bypass | `src/daemon/nick_delay.zig:1`, `src/daemon/server.zig:2099`, `src/daemon/server.zig:5949` |
