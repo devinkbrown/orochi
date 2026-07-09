@@ -443,6 +443,25 @@ pub const Services = struct {
         self.key_transparency = log;
     }
 
+    pub const KeyTransparencyStatus = struct {
+        enabled: bool,
+        entries: usize = 0,
+        root: key_transparency.Hash = @splat(0),
+    };
+
+    /// Return the current credential transparency root/size for status surfaces.
+    pub fn keyTransparencyStatus(self: *Services) KeyTransparencyStatus {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const log = self.key_transparency orelse return .{ .enabled = false };
+        return .{
+            .enabled = true,
+            .entries = log.len(),
+            .root = log.root(),
+        };
+    }
+
     /// Force the backing OroStore into a compact snapshot for external backup.
     /// The caller may copy `store.snapshot_path` after this returns. Serialized with
     /// normal services mutations so the snapshot represents a whole store state.

@@ -39,6 +39,7 @@ const svc_tempmode = @import("svc_tempmode.zig");
 const svc_clonescan = @import("svc_clonescan.zig");
 const svc_lastseen = @import("svc_lastseen.zig");
 const proofmark = @import("proofmark.zig");
+const key_transparency = @import("key_transparency.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const svc_enforce = @import("svc_enforce.zig");
@@ -5010,6 +5011,20 @@ pub const LinuxServer = struct {
             if (self.partition_split) "true" else "false",
             self.partition_components,
         }) catch return w.buffered();
+        const kt_status = if (self.account_services) |svc|
+            svc.keyTransparencyStatus()
+        else
+            services_mod.Services.KeyTransparencyStatus{ .enabled = false };
+        w.writeAll(",\"accounts\":{\"key_transparency\":{\"enabled\":") catch return w.buffered();
+        w.writeAll(if (kt_status.enabled) "true" else "false") catch return w.buffered();
+        w.print(",\"entries\":{d},\"root\":", .{kt_status.entries}) catch return w.buffered();
+        if (kt_status.enabled) {
+            const root_hex = std.fmt.bytesToHex(kt_status.root, .lower);
+            w.print("\"{s}\"", .{&root_hex}) catch return w.buffered();
+        } else {
+            w.writeAll("null") catch return w.buffered();
+        }
+        w.writeAll("}}") catch return w.buffered();
 
         w.writeAll(",\"peers\":[") catch return w.buffered();
         var first = true;
@@ -32029,7 +32044,25 @@ test "threaded server: orochi/topics receives topic tags without generic message
 
 test "status.json: emits node health + mesh peers for the public status page" {
     if (comptime builtin.os.tag == .linux) {
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-status-kt.wal");
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+
+        _ = try kt.append(.{
+            .account = "alice",
+            .kind = .certfp,
+            .action = .bind,
+            .key_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .key_hash = key_transparency.materialHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            .timestamp_ms = 1_700_000_000_000,
+        });
+
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
@@ -32046,6 +32079,9 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
+        const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
+        try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
         // Both peers present, with correct up/state.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);

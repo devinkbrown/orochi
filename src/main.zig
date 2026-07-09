@@ -379,6 +379,9 @@ pub fn main(init: std.process.Init) !void {
     // Account ⇄ TLS certfp bindings for SASL EXTERNAL (CERTADD); outlives server.
     var certfp_binds = orochi.daemon.certfp_bind.CertfpBindStore.init(allocator);
     defer certfp_binds.deinit();
+    // Account credential transparency root; services append CERTFP/WebAuthn changes.
+    var key_transparency_log = orochi.daemon.key_transparency.KeyTransparencyLog.init(allocator);
+    defer key_transparency_log.deinit();
     if (held) |h| {
         if (!srv_cfg.sasl_enabled) {
             if (h.parsed.sasl.account_db != null) {
@@ -394,6 +397,7 @@ pub fn main(init: std.process.Init) !void {
                 });
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);
+                account_services.attachKeyTransparencyLog(&key_transparency_log);
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works
                 // certfp-only without a prior runtime CERTADD. Coexists with (never
                 // wipes) runtime CERTADD binds; malformed entries warn-and-skip.
