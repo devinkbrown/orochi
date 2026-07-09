@@ -5074,6 +5074,22 @@ pub const LinuxServer = struct {
             w.writeAll("null") catch return w.buffered();
         }
         w.writeAll("}") catch return w.buffered();
+        w.print(",\"features\":{{\"s2s\":{s},\"websocket\":{s},\"webtransport\":{s},\"media\":{s},\"webpush\":{s},\"webauthn\":{s},\"webhook\":{s},\"metrics\":{s},\"sts\":{s},\"raw_public_key\":{s},\"ktls_tx\":{s},\"ktls_rx\":{s},\"orowasm\":{s},\"geo\":{s}}}", .{
+            if (self.config.s2s_port != 0 or self.config.mesh_connect.len != 0) "true" else "false",
+            if (self.config.ws_enabled) "true" else "false",
+            if (self.config.webtransport_port != 0) "true" else "false",
+            if (self.config.media_enabled) "true" else "false",
+            if (self.config.webpush_vapid_pub.len != 0) "true" else "false",
+            if (self.config.webauthn_rp_id != null and self.config.webauthn_origins.len != 0) "true" else "false",
+            if (self.config.webhook_enabled) "true" else "false",
+            if (self.config.metrics_port != 0) "true" else "false",
+            if (self.config.sts_value != null) "true" else "false",
+            if (self.config.tls_raw_public_key) "true" else "false",
+            if (self.config.tls_ktls_tx) "true" else "false",
+            if (self.config.tls_ktls_rx) "true" else "false",
+            if (self.config.wasm_plugin_dir.len != 0) "true" else "false",
+            if (self.config.geo_enabled) "true" else "false",
+        }) catch return w.buffered();
         w.print(",\"mesh\":{{\"quorum\":{s},\"partitioned\":{s},\"components\":{d}}}", .{
             if (self.partition_quorum) "true" else "false",
             if (self.partition_split) "true" else "false",
@@ -32508,6 +32524,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"activity\":{\"channels\":1,\"messages\":1,\"active_channels_24h\":1,\"last_active\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
@@ -32522,8 +32539,25 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
 
         server.config.network_discoverable = true;
+        server.config.s2s_port = 6697;
+        server.config.ws_enabled = true;
+        server.config.webtransport_port = 4433;
+        server.config.media_enabled = true;
+        server.config.webpush_vapid_pub = "test-vapid";
+        server.config.webauthn_rp_id = "chat.example";
+        const origins = [_][]const u8{"https://chat.example"};
+        server.config.webauthn_origins = &origins;
+        server.config.webhook_enabled = true;
+        server.config.metrics_port = 9090;
+        server.config.sts_value = "duration=86400";
+        server.config.tls_raw_public_key = true;
+        server.config.tls_ktls_tx = true;
+        server.config.tls_ktls_rx = true;
+        server.config.wasm_plugin_dir = "plugins";
+        server.config.geo_enabled = true;
         const public_text = server.buildStatusJson(&buf);
         try std.testing.expect(std.mem.indexOf(u8, public_text, "\"discoverable\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, public_text, "\"features\":{\"s2s\":true,\"websocket\":true,\"webtransport\":true,\"media\":true,\"webpush\":true,\"webauthn\":true,\"webhook\":true,\"metrics\":true,\"sts\":true,\"raw_public_key\":true,\"ktls_tx\":true,\"ktls_rx\":true,\"orowasm\":true,\"geo\":true}") != null);
     } else return error.SkipZigTest;
 }
 
