@@ -14183,6 +14183,110 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    fn currentPinsValue(self: *LinuxServer, channel: []const u8) []const u8 {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "PINS") catch return "";
+        return ev.value;
+    }
+
+    fn emitPinsReply(self: *LinuxServer, conn: *ConnState, channel: []const u8, value: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} PINS {s} :{s}\r\n", .{ self.serverName(), channel, value }) catch return error.OutputTooSmall;
+        try appendToConn(conn, line);
+    }
+
+    fn persistPinsValue(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, value: []const u8) !bool {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const access = self.propAccess(id, conn, entity) orelse {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+            return false;
+        };
+        switch (self.channelBuiltinSet(entity, "PINS", value, false)) {
+            .bad_value => {
+                try queueNumeric(conn, .ERR_BADVALUE, &.{ channel, "PINS" }, "Invalid property value");
+                return false;
+            },
+            .applied => return false,
+            .not_handled => {},
+        }
+        if (overrideActive(conn) and self.propOverrideWouldBypass(id, entity)) {
+            self.auditOverrideUse(conn, "PINS", channel, "SET");
+        }
+        const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
+        const ev = self.props.setProp(entity, "PINS", value, setter) catch {
+            try queueNumeric(conn, .ERR_BADVALUE, &.{ channel, "PINS" }, "Invalid property value");
+            return false;
+        };
+        const hlc = self.nextChannelPropHlc();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const ps = self.signLocalChannelProp(true, ev.entity.id, ev.key, ev.value, ev.owner, hlc, &pk_buf, &sig_buf);
+        if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) {
+            self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
+        }
+        self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+        return true;
+    }
+
+    /// PINS <#channel> [LIST|ADD <msgid>|DEL <msgid>|CLEAR] — first-class
+    /// front-end for the mesh-propagated `PINS` channel PROP. The command does
+    /// not create a second store; clients using IRCX PROP see the same state.
+    pub fn handlePins(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PINS"}, "Usage: PINS <#channel> [LIST|ADD <msgid>|DEL <msgid>|CLEAR]");
+            return;
+        }
+        const channel = parsed.paramSlice()[0];
+        if (!world_model.isChannelName(channel) or !self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const wid = worldIdFromClient(id);
+        if (!conn.session.isOper() and !self.world.isMember(channel, wid)) {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        }
+
+        const current = self.currentPinsValue(channel);
+        if (parsed.param_count == 1 or std.ascii.eqlIgnoreCase(parsed.paramSlice()[1], "LIST")) {
+            try self.emitPinsReply(conn, channel, current);
+            return;
+        }
+
+        const sub = parsed.paramSlice()[1];
+        var next_buf: [ircx_prop_store.default_max_value]u8 = undefined;
+        var mutation: PinsMutation = undefined;
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            if (parsed.param_count < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PINS"}, "Usage: PINS <#channel> ADD <msgid>");
+                return;
+            }
+            mutation = pinsAddValue(current, parsed.paramSlice()[2], &next_buf, self.config.media_pins_max_per_channel, self.config.media_pins_max_msgid_bytes) orelse {
+                try queueNumeric(conn, .ERR_BADVALUE, &.{ channel, "PINS" }, "Invalid property value");
+                return;
+            };
+        } else if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "REMOVE")) {
+            if (parsed.param_count < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PINS"}, "Usage: PINS <#channel> DEL <msgid>");
+                return;
+            }
+            mutation = pinsDeleteValue(current, parsed.paramSlice()[2], &next_buf, self.config.media_pins_max_msgid_bytes) orelse {
+                try queueNumeric(conn, .ERR_BADVALUE, &.{ channel, "PINS" }, "Invalid property value");
+                return;
+            };
+        } else if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
+            mutation = .{ .value = "", .changed = current.len != 0 };
+        } else {
+            try self.failReply(conn, "PINS", "INVALID_SUBCOMMAND", "Use LIST, ADD, DEL, or CLEAR");
+            return;
+        }
+
+        if (mutation.changed) {
+            if (!try self.persistPinsValue(id, conn, channel, mutation.value)) return;
+        }
+        try self.emitPinsReply(conn, channel, mutation.value);
+    }
+
     fn pushMarkreadOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         if (!conn.session.hasCap(.read_marker)) return;
         const owner = conn.session.account() orelse conn.session.displayName();
@@ -20000,6 +20104,69 @@ pub const LinuxServer = struct {
             }
         }
         return true;
+    }
+
+    const PinsMutation = struct {
+        value: []const u8,
+        changed: bool,
+    };
+
+    fn validPinToken(msgid: []const u8, max_msgid_bytes: usize) bool {
+        return msgid.len != 0 and validPinsValueWithLimits(msgid, 1, max_msgid_bytes);
+    }
+
+    fn pinsContainsValue(value: []const u8, msgid: []const u8) bool {
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, msgid)) return true;
+        }
+        return false;
+    }
+
+    fn pinsAddValue(
+        current: []const u8,
+        msgid: []const u8,
+        out: []u8,
+        max_count: usize,
+        max_msgid_bytes: usize,
+    ) ?PinsMutation {
+        if (!validPinToken(msgid, max_msgid_bytes)) return null;
+        if (pinsContainsValue(current, msgid)) return .{ .value = current, .changed = false };
+
+        const next_len = current.len + msgid.len + @as(usize, if (current.len == 0) 0 else 1);
+        if (next_len > out.len) return null;
+        if (current.len != 0) {
+            std.mem.copyForwards(u8, out[0..current.len], current);
+            out[current.len] = ',';
+            @memcpy(out[current.len + 1 .. next_len], msgid);
+        } else {
+            @memcpy(out[0..msgid.len], msgid);
+        }
+        const next = out[0..next_len];
+        if (!validPinsValueWithLimits(next, max_count, max_msgid_bytes)) return null;
+        return .{ .value = next, .changed = true };
+    }
+
+    fn pinsDeleteValue(current: []const u8, msgid: []const u8, out: []u8, max_msgid_bytes: usize) ?PinsMutation {
+        if (!validPinToken(msgid, max_msgid_bytes)) return null;
+        var len: usize = 0;
+        var removed = false;
+        var it = std.mem.splitScalar(u8, current, ',');
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, msgid)) {
+                removed = true;
+                continue;
+            }
+            const need = tok.len + @as(usize, if (len == 0) 0 else 1);
+            if (len + need > out.len) return null;
+            if (len != 0) {
+                out[len] = ',';
+                len += 1;
+            }
+            std.mem.copyForwards(u8, out[len .. len + tok.len], tok);
+            len += tok.len;
+        }
+        return .{ .value = if (removed) out[0..len] else current, .changed = removed };
     }
 
     /// Record a conversation label into a channel's browsable topic registry (the
@@ -33034,6 +33201,33 @@ test "pinned messages: PINS prop value validation" {
     try std.testing.expect(!LinuxServer.validPinsValueWithLimits("abcd", 2, 3));
 }
 
+test "pinned messages: command mutators preserve bounded comma-list state" {
+    var out: [ircx_prop_store.default_max_value]u8 = undefined;
+
+    const add_first = LinuxServer.pinsAddValue("", "m1", &out, 2, 8).?;
+    try std.testing.expect(add_first.changed);
+    try std.testing.expectEqualStrings("m1", add_first.value);
+
+    const add_second = LinuxServer.pinsAddValue(add_first.value, "m2", &out, 2, 8).?;
+    try std.testing.expect(add_second.changed);
+    try std.testing.expectEqualStrings("m1,m2", add_second.value);
+
+    const add_dup = LinuxServer.pinsAddValue(add_second.value, "m2", &out, 2, 8).?;
+    try std.testing.expect(!add_dup.changed);
+    try std.testing.expectEqualStrings("m1,m2", add_dup.value);
+
+    try std.testing.expect(LinuxServer.pinsAddValue(add_second.value, "m3", &out, 2, 8) == null);
+    try std.testing.expect(LinuxServer.pinsAddValue(add_second.value, "bad token", &out, 2, 16) == null);
+
+    const del_first = LinuxServer.pinsDeleteValue(add_second.value, "m1", &out, 8).?;
+    try std.testing.expect(del_first.changed);
+    try std.testing.expectEqualStrings("m2", del_first.value);
+
+    const del_missing = LinuxServer.pinsDeleteValue(del_first.value, "missing", &out, 8).?;
+    try std.testing.expect(!del_missing.changed);
+    try std.testing.expectEqualStrings("m2", del_missing.value);
+}
+
 test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the generic prop" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{
@@ -33059,6 +33253,68 @@ test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the ge
         const ev = try server.props.getProp(chan, "PINS");
         try std.testing.expectEqualStrings("msg1,msg2", ev.value);
     } else return error.SkipZigTest;
+}
+
+test "threaded server: PINS command uses channel prop storage and op gate" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    try writeAllFd(fd_a, "JOIN #pins\r\n");
+    try recvUntil(&a, " 366 A #pins ", 200);
+    try writeAllFd(fd_b, "JOIN #pins\r\n");
+    try recvUntil(&b, " 366 B #pins ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PINS #pins\r\n");
+    try recvUntil(&b, " PINS #pins :\r\n", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PINS #pins ADD m1\r\n");
+    try recvUntil(&b, " 482 B #pins ", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PINS #pins ADD m1\r\n");
+    try recvUntil(&a, " PINS #pins :m1\r\n", 200);
+    try recvUntil(&b, " PROP #pins PINS :m1\r\n", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PINS #pins ADD m2\r\n");
+    try recvUntil(&a, " PINS #pins :m1,m2\r\n", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PINS #pins DEL m1\r\n");
+    try recvUntil(&a, " PINS #pins :m2\r\n", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PINS #pins CLEAR\r\n");
+    try recvUntil(&a, " PINS #pins :\r\n", 200);
 }
 
 test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {

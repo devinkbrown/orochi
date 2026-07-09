@@ -22,6 +22,7 @@ Registry commands default to registered-client access unless the command table s
 | `REDACT` | Redact a known message id. | [messaging.md](messaging.md#redact) |
 | `CHATHISTORY` | Query channel history batches. | [messaging.md](messaging.md#chathistory) |
 | `MARKREAD` | Set bouncer read markers. | [messaging.md](messaging.md#markread) |
+| `PINS` | List or edit pinned message ids through the channel PROP spine. | [messaging.md](messaging.md#pins) |
 | `METADATA` | IRCv3 metadata get/list/set/delete. | [messaging.md](messaging.md#metadata) |
 | `MONITOR` | Track online/offline nicks. | [messaging.md](messaging.md#monitor) |
 | `SILENCE` | Manage caller-side sender masks. | [messaging.md](messaging.md#silence) |

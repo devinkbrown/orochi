@@ -2,7 +2,7 @@
 
 *Text delivery, tag-only messages, redaction, history playback, metadata, and caller-side filtering.*
 
-The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHISTORY`, `MARKREAD`, `METADATA`, `MONITOR`, and `SILENCE` (`src/daemon/modules/messaging.zig:46`). `ACCEPT` is registered by the user query module (`src/daemon/modules/user_query.zig:82`).
+The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHISTORY`, `MARKREAD`, `PINS`, `METADATA`, `MONITOR`, and `SILENCE` (`src/daemon/modules/messaging.zig:59`). `ACCEPT` is registered by the user query module (`src/daemon/modules/user_query.zig:82`).
 
 ## PRIVMSG
 
@@ -74,7 +74,18 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 - Replies: No numeric success reply.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid parameters.
 - Example: `MARKREAD #chat 2026-06-10T12:00:00Z`
-- Sources: `src/daemon/modules/messaging.zig:52`, `src/daemon/server.zig:5354`
+- Sources: `src/daemon/modules/messaging.zig:69`, `src/daemon/server.zig:14155`
+
+## PINS
+
+- Syntax: `PINS <#channel> [LIST|ADD <msgid>|DEL <msgid>|CLEAR]`
+- Description: Lists or edits the channel's pinned message ids through the live `PINS` channel PROP. The command uses the same validation, signed channel-prop storage, local IRCX PROP notification, and mesh propagation path as `PROP <#channel> PINS :...`.
+- Privileges: Channel member or operator may list; channel operator or network operator may add, delete, or clear.
+- Parameters: Channel; optional subcommand and message id.
+- Replies: `:<server> PINS <#channel> :<comma-separated-msgids>` with an empty trailing value when no pins remain.
+- Errors: `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_BADVALUE 906`, `ERR_NEEDMOREPARAMS 461`, IRCv3 `FAIL PINS INVALID_SUBCOMMAND`.
+- Example: `PINS #chat ADD 01HMSGID`
+- Sources: `src/daemon/modules/messaging.zig:70`, `src/daemon/server.zig:14234`
 
 ## METADATA
 

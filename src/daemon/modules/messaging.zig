@@ -39,6 +39,10 @@ fn markread(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMarkread(x.conn, x.parsed);
 }
+fn pins(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handlePins(x.id, x.conn, x.parsed);
+}
 fn metadata(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMetadata(x.id, x.conn, x.parsed);
@@ -63,6 +67,7 @@ pub const module = registry.Module{
         .{ .name = "CHATHISTORY", .handler = chathistory },
         .{ .name = "SEARCH", .handler = search },
         .{ .name = "MARKREAD", .handler = markread },
+        .{ .name = "PINS", .handler = pins },
         .{ .name = "METADATA", .handler = metadata },
         .{ .name = "MONITOR", .handler = monitor },
         .{ .name = "SILENCE", .handler = silence },
