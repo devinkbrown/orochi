@@ -69,6 +69,7 @@ Registry commands default to registered-client access unless the command table s
 | `MODULES` | Oper registry module inventory. | [informational.md](informational.md#modules) |
 | `MODLIST` | Alias of `MODULES`. | [informational.md](informational.md#modlist) |
 | `COMMANDS` | Discover command registry entries. | [informational.md](informational.md#commands) |
+| `OROWASM` | Inspect OroWasm ABI, budgets, and loaded plugins. | [informational.md](informational.md#orowasm) |
 | `OPER` | Disabled password OPER; use SASL account elevation. | [oper-moderation.md](oper-moderation.md#oper) |
 | `REHASH` | Reload configuration. | [oper-moderation.md](oper-moderation.md#rehash) |
 | `GRANT` | Grant a registered account operator authority network-wide. | [oper-moderation.md](oper-moderation.md#grant) |

@@ -11,6 +11,7 @@ const std = @import("std");
 const registry = @import("../registry.zig");
 const module_core = @import("../module_core.zig");
 const module_manifest = @import("manifest.zig");
+const wasm_abi = @import("../../wasm/host/abi.zig");
 
 const Core = module_core.Core;
 
@@ -95,6 +96,82 @@ fn commands(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     try core.reply(.RPL_ENDOFINFO, &.{}, "End of COMMANDS");
 }
 
+/// OROWASM [STATUS|ABI|PLUGINS] — oper runtime view of the OroWasm host ABI,
+/// resource budgets, allowed host capabilities, and loaded plugin registrations.
+fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
+    const core = Core.from(ctx);
+    const view = if (inv.params.len >= 1 and inv.params[0].len != 0) inv.params[0] else "STATUS";
+    const info = core.server.wasm.runtimeInfo();
+
+    var caps_buf: [128]u8 = undefined;
+    const caps = info.allowed_caps.writeTokens(&caps_buf);
+    var line: [512]u8 = undefined;
+
+    if (std.ascii.eqlIgnoreCase(view, "STATUS")) {
+        try core.reply(.RPL_INFOSTART, &.{}, "OroWasm runtime status");
+        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} plugin_dir={s}", .{
+            info.plugin_count,
+            info.command_count,
+            info.hook_count,
+            if (caps.len == 0) "*" else caps,
+            if (core.services.config.wasm_plugin_dir.len == 0) "(disabled)" else core.services.config.wasm_plugin_dir,
+        }) catch return;
+        try core.reply(.RPL_INFO, &.{}, status);
+        const budgets = std.fmt.bufPrint(&line, "budgets max_plugin_bytes={d} max_memory_bytes={d} default_fuel={d}", .{
+            info.max_plugin_bytes,
+            info.max_memory_bytes,
+            info.default_fuel,
+        }) catch return;
+        try core.reply(.RPL_INFO, &.{}, budgets);
+        try core.reply(.RPL_ENDOFINFO, &.{}, "End of OROWASM");
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(view, "ABI")) {
+        try core.reply(.RPL_INFOSTART, &.{}, "OroWasm ABI");
+        const schema = std.fmt.bufPrint(&line, "manifest_schema={d}.{d} host_functions={d} allowed_caps={s}", .{
+            info.manifest_schema.major,
+            info.manifest_schema.minor,
+            info.host_function_count,
+            if (caps.len == 0) "*" else caps,
+        }) catch return;
+        try core.reply(.RPL_INFO, &.{}, schema);
+        for (wasm_abi.host_functions) |func| {
+            const row = std.fmt.bufPrint(&line, "hostcall {s} v{d}.{d} cap={s}", .{
+                func.name,
+                func.version.major,
+                func.version.minor,
+                func.capability.token(),
+            }) catch continue;
+            try core.reply(.RPL_INFO, &.{}, row);
+        }
+        try core.reply(.RPL_ENDOFINFO, &.{}, "End of OROWASM");
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(view, "PLUGINS")) {
+        try core.reply(.RPL_INFOSTART, &.{}, "OroWasm plugins");
+        var i: usize = 0;
+        while (core.server.wasm.pluginSummary(i)) |plugin| : (i += 1) {
+            var grant_buf: [128]u8 = undefined;
+            const grants = plugin.grants.writeTokens(&grant_buf);
+            const row = std.fmt.bufPrint(&line, "handle={d} name={s} commands={d} hooks={d} grants={s}", .{
+                plugin.handle,
+                plugin.name,
+                plugin.command_count,
+                plugin.hook_count,
+                if (grants.len == 0) "*" else grants,
+            }) catch continue;
+            try core.reply(.RPL_INFO, &.{}, row);
+        }
+        if (i == 0) try core.reply(.RPL_INFO, &.{}, "no plugins loaded");
+        try core.reply(.RPL_ENDOFINFO, &.{}, "End of OROWASM");
+        return;
+    }
+
+    try core.reply(.RPL_ENDOFINFO, &.{}, "Usage: OROWASM [STATUS|ABI|PLUGINS]");
+}
+
 pub const module = registry.Module{
     .id = "diag.introspect",
     .category = .diagnostic,
@@ -102,14 +179,18 @@ pub const module = registry.Module{
         .{ .name = "MODULES", .handler = modules, .summary = "list loaded registry modules" },
         .{ .name = "MODLIST", .handler = modules, .summary = "alias of MODULES" },
         .{ .name = "COMMANDS", .access = .any, .handler = commands, .summary = "discover commands you can run" },
+        .{ .name = "OROWASM", .access = .oper, .handler = orowasm, .summary = "inspect OroWasm ABI, budgets, and plugins" },
     },
 };
 
-test "introspect module declares MODULES and the registry is visible" {
+test "introspect module declares MODULES and OROWASM, and the registry is visible" {
     var saw_modules = false;
+    var saw_orowasm = false;
     for (module.commands) |c| {
         if (std.ascii.eqlIgnoreCase(c.name, "MODULES")) saw_modules = true;
+        if (std.ascii.eqlIgnoreCase(c.name, "OROWASM")) saw_orowasm = true;
     }
     try std.testing.expect(saw_modules);
+    try std.testing.expect(saw_orowasm);
     try std.testing.expect(module_manifest.enabled.len >= 1);
 }

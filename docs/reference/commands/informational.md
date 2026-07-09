@@ -127,7 +127,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `MODULES`
-- Sources: `src/daemon/modules/introspect.zig:14`, `src/daemon/modules/introspect.zig:99`
+- Sources: `src/daemon/modules/introspect.zig:18`, `src/daemon/modules/introspect.zig:179`
 
 ## MODLIST
 
@@ -138,7 +138,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: Same as `MODULES`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `MODLIST`
-- Sources: `src/daemon/modules/introspect.zig:14`, `src/daemon/modules/introspect.zig:100`
+- Sources: `src/daemon/modules/introspect.zig:18`, `src/daemon/modules/introspect.zig:180`
 
 ## COMMANDS
 
@@ -149,4 +149,15 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: None specific; unknown detail query ends with `No such command`.
 - Example: `COMMANDS MESH`
-- Sources: `src/daemon/modules/introspect.zig:39`, `src/daemon/modules/introspect.zig:101`
+- Sources: `src/daemon/modules/introspect.zig:46`, `src/daemon/modules/introspect.zig:181`
+
+## OROWASM
+
+- Syntax: `OROWASM [STATUS|ABI|PLUGINS]`
+- Description: Oper-only runtime introspection for the OroWasm app-platform host. `STATUS` reports loaded plugin counts, command/hook registrations, allowed host capabilities, plugin directory, and resource budgets. `ABI` reports the manifest schema and hostcall table. `PLUGINS` lists each loaded plugin handle with command/hook counts and granted capabilities.
+- Privileges: Oper (`.access = .oper`).
+- Parameters: Optional view name; defaults to `STATUS`.
+- Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
+- Errors: `ERR_NOPRIVILEGES 481` for non-opers.
+- Example: `OROWASM ABI`
+- Sources: `src/daemon/modules/introspect.zig:101`, `src/wasm/host/bridge.zig:32`

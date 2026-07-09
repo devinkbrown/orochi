@@ -14,8 +14,8 @@ const interp = @import("interp.zig");
 const plugin = @import("plugin.zig");
 const registry = @import("../../daemon/registry.zig");
 
-const default_fuel: u64 = 16 * 1024;
-const max_plugin_bytes: usize = 8 * 1024 * 1024;
+pub const default_fuel: u64 = 16 * 1024;
+pub const max_plugin_bytes: usize = 8 * 1024 * 1024;
 
 /// Host callbacks the daemon supplies so a plugin's granted hostcalls reach the
 /// live connection. Opaque ctx is the daemon's per-invocation context.
@@ -28,6 +28,26 @@ pub const HostBindings = struct {
 
 pub const Outcome = enum { handled, not_found, denied, trap };
 pub const HookOutcome = enum { continue_, stop, not_found, denied, trap };
+
+pub const RuntimeInfo = struct {
+    manifest_schema: abi.SchemaVersion,
+    host_function_count: usize,
+    allowed_caps: abi.CapabilitySet,
+    max_memory_bytes: usize,
+    default_fuel: u64,
+    max_plugin_bytes: usize,
+    plugin_count: usize,
+    command_count: usize,
+    hook_count: usize,
+};
+
+pub const PluginSummary = struct {
+    handle: plugin.PluginHandle,
+    name: []const u8,
+    grants: abi.CapabilitySet,
+    command_count: usize,
+    hook_count: usize,
+};
 
 pub const Bridge = struct {
     allocator: std.mem.Allocator,
@@ -136,6 +156,32 @@ pub const Bridge = struct {
 
     pub fn count(self: *const Bridge) usize {
         return self.store.plugins.items.len;
+    }
+
+    pub fn runtimeInfo(self: *const Bridge) RuntimeInfo {
+        return .{
+            .manifest_schema = abi.manifest_schema,
+            .host_function_count = abi.host_functions.len,
+            .allowed_caps = self.store.policy.allowed_caps,
+            .max_memory_bytes = self.store.policy.max_memory_bytes,
+            .default_fuel = default_fuel,
+            .max_plugin_bytes = max_plugin_bytes,
+            .plugin_count = self.store.plugins.items.len,
+            .command_count = self.store.commands.items.len,
+            .hook_count = self.store.hooks.items.len,
+        };
+    }
+
+    pub fn pluginSummary(self: *const Bridge, index: usize) ?PluginSummary {
+        if (index >= self.store.plugins.items.len) return null;
+        const item = self.store.plugins.items[index];
+        return .{
+            .handle = item.handle,
+            .name = item.name,
+            .grants = item.grants,
+            .command_count = self.store.commandCount(item.handle),
+            .hook_count = self.store.hookCount(item.handle),
+        };
     }
 
     pub fn deinit(self: *Bridge) void {
@@ -531,4 +577,26 @@ test "bridge dispatchHook routes hook exports and honors stop return" {
     });
 
     try std.testing.expectEqual(HookOutcome.stop, out);
+}
+
+test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
+    var bridge = Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
+
+    const info = bridge.runtimeInfo();
+    try std.testing.expectEqual(@as(u16, 1), info.manifest_schema.major);
+    try std.testing.expectEqual(@as(usize, abi.host_functions.len), info.host_function_count);
+    try std.testing.expect(info.allowed_caps.has(.reply));
+    try std.testing.expectEqual(default_fuel, info.default_fuel);
+    try std.testing.expectEqual(max_plugin_bytes, info.max_plugin_bytes);
+    try std.testing.expectEqual(@as(usize, 1), info.plugin_count);
+    try std.testing.expectEqual(@as(usize, 0), info.command_count);
+    try std.testing.expectEqual(@as(usize, 1), info.hook_count);
+
+    const summary = bridge.pluginSummary(0).?;
+    try std.testing.expectEqualStrings("mod", summary.name);
+    try std.testing.expectEqual(@as(usize, 0), summary.command_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.hook_count);
+    try std.testing.expect(bridge.pluginSummary(1) == null);
 }

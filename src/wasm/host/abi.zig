@@ -31,6 +31,18 @@ pub const Capability = enum {
     store,
     lookup,
     hooks,
+
+    pub fn token(self: Capability) []const u8 {
+        return switch (self) {
+            .reply => "reply",
+            .log => "log",
+            .time => "time",
+            .rand => "rand",
+            .store => "store",
+            .lookup => "lookup",
+            .hooks => "hooks",
+        };
+    }
 };
 
 /// Compact granted/requested capability set.
@@ -66,6 +78,23 @@ pub const CapabilitySet = struct {
         var it = self.set.iterator();
         while (it.next()) |_| n += 1;
         return n;
+    }
+
+    pub fn writeTokens(self: CapabilitySet, out: []u8) []const u8 {
+        var used: usize = 0;
+        var it = self.set.iterator();
+        while (it.next()) |cap| {
+            const token = cap.token();
+            const need = token.len + @as(usize, if (used == 0) 0 else 1);
+            if (used + need > out.len) break;
+            if (used != 0) {
+                out[used] = ',';
+                used += 1;
+            }
+            @memcpy(out[used .. used + token.len], token);
+            used += token.len;
+        }
+        return out[0..used];
     }
 };
 
@@ -182,4 +211,10 @@ test "host functions are independently named and capability gated" {
     try std.testing.expectEqual(Capability.time, now.capability);
     try std.testing.expect(now.version.compatible(.{ .major = 1 }));
     try std.testing.expect(findHostFunction("missing") == null);
+}
+
+test "capability set renders stable token list" {
+    const caps = CapabilitySet.initMany(&.{ .reply, .time, .log });
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("reply,log,time", caps.writeTokens(&out));
 }

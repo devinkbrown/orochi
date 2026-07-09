@@ -35546,6 +35546,55 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     try recvUntil(&admin, " 219 Oper i ", 200);
 }
 
+test "threaded server: OROWASM reports ABI budgets and plugin registrations to opers" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try server.wasm.loadBytes("guard", wasm_bridge.testing.stop_hook_wasm);
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_user = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_user);
+    var user = LiveClient{ .fd = fd_user };
+    try writeAllFd(fd_user, "NICK User\r\nUSER user 0 * :User\r\n");
+    try recvUntil(&user, " 001 User ", 200);
+    user.reset();
+    try writeAllFd(fd_user, "OROWASM STATUS\r\n");
+    try recvUntil(&user, " 481 User ", 200);
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    var admin = LiveClient{ .fd = fd_admin };
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
+    try recvUntil(&admin, "OroWasm runtime status", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,log,time", 200);
+    try recvUntil(&admin, "budgets max_plugin_bytes=8388608 max_memory_bytes=65536 default_fuel=16384", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "OROWASM ABI\r\n");
+    try recvUntil(&admin, "manifest_schema=1.0 host_functions=8 allowed_caps=reply,log,time", 200);
+    try recvUntil(&admin, "hostcall reply v1.0 cap=reply", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");
+    try recvUntil(&admin, "handle=1 name=guard commands=0 hooks=1 grants=*", 200);
+}
+
 test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
