@@ -666,7 +666,27 @@ pub const RouteTable = struct {
                 return .{ .outcome = .parted, .prev_status = prev };
             }
         }
-        if (!present) return .{ .outcome = .unchanged }; // part for an unknown member
+        if (!present) {
+            // If the JOIN side of this remote member lost a local/cross-node nick
+            // contest, it was stored under its deterministic loser UID. The peer's
+            // later PART still names the user's real nick, so remove the UID entry
+            // too; otherwise identified/duplicate-session cleanup leaves a phantom
+            // UID nick in NAMES until stale GC runs.
+            const uid = nick_collision.loserUid(node, nick);
+            if (list.find(uid[0..])) |idx| {
+                const cur = &list.entries.items[idx];
+                if (cur.node == node) {
+                    const prev = cur.status;
+                    if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev };
+                    cur.freeStrings(self.allocator);
+                    _ = list.entries.swapRemove(idx);
+                    self.pruneIfEmpty(chan);
+                    if (self.findMember(uid[0..]) == null) _ = self.removeNick(uid[0..]);
+                    return .{ .outcome = .parted, .prev_status = prev };
+                }
+            }
+            return .{ .outcome = .unchanged }; // part for an unknown member
+        }
         if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
         const owned = try self.allocator.dupe(u8, nick);
         errdefer self.allocator.free(owned);
@@ -1313,6 +1333,27 @@ test "applyMembership part removes a member and prunes an empty channel" {
     // Newer part removes; the now-empty channel is pruned.
     _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{}, 0);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
+}
+
+test "applyMembership part removes a collision-renamed UID member" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const uid = nick_collision.loserUid(10, "trev");
+    _ = try table.applyMembership("#root", uid[0..], 10, 0, 1, true, .{
+        .username = "trev",
+        .host = "trev.users.ircxnet",
+        .account = "trev",
+    }, 0);
+    try std.testing.expect(table.findMember(uid[0..]) != null);
+
+    // The PART wire event carries the user's real nick, not the fallback UID
+    // assigned by the receiver during collision resolution. It must still remove
+    // the UID roster entry so NAMES does not retain a phantom generated nick.
+    const res = try table.applyMembership("#root", "trev", 10, 0, 2, false, .{}, 0);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.parted, res.outcome);
+    try std.testing.expect(table.findMember(uid[0..]) == null);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#root").len);
 }
 
 test "channelNames enumerates channels with a live remote roster (LIST union input)" {
