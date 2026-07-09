@@ -5025,6 +5025,11 @@ pub const LinuxServer = struct {
             w.writeAll("null") catch return w.buffered();
         }
         w.writeAll("}}") catch return w.buffered();
+        w.print(",\"history\":{{\"targets\":{d},\"entries\":{d},\"tombstones\":{d}}}", .{
+            self.history.targetCount(),
+            self.history.totalStoredCount(),
+            self.history.tombstoneCount(),
+        }) catch return w.buffered();
 
         w.writeAll(",\"peers\":[") catch return w.buffered();
         var first = true;
@@ -32174,6 +32179,10 @@ test "status.json: emits node health + mesh peers for the public status page" {
         // Seed a live peer and a downed one, then build the JSON in memory.
         server.markPeerHealth("ircx.us", .established);
         server.markPeerHealth("stale.node", .down);
+        _ = try server.history.append("#hist", .{ .msgid = "h1", .sender = "a!u@h", .text = "one", .timestamp = 1 });
+        _ = try server.history.append("#hist", .{ .msgid = "h2", .sender = "a!u@h", .text = "two", .timestamp = 2 });
+        _ = try server.history.append("alice", .{ .msgid = "d1", .sender = "b!u@h", .text = "dm", .timestamp = 3 });
+        try server.history.redact("#hist", "h1");
 
         var buf: [8192]u8 = undefined;
         const text = server.buildStatusJson(&buf);
@@ -32185,6 +32194,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1}") != null);
         // Both peers present, with correct up/state.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);

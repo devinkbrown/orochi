@@ -224,6 +224,30 @@ pub fn Lotus(comptime params: Params) type {
             return log.len;
         }
 
+        pub fn targetCount(self: *const Self) usize {
+            return self.targets.count();
+        }
+
+        pub fn totalStoredCount(self: *const Self) usize {
+            var total: usize = 0;
+            var it = self.targets.iterator();
+            while (it.next()) |entry| total += entry.value_ptr.len;
+            return total;
+        }
+
+        pub fn tombstoneCount(self: *const Self) usize {
+            var total: usize = 0;
+            var it = self.targets.iterator();
+            while (it.next()) |entry| {
+                const log = entry.value_ptr;
+                var i: usize = 0;
+                while (i < log.len) : (i += 1) {
+                    if (log.entry(i).tombstone) total += 1;
+                }
+            }
+            return total;
+        }
+
         fn findNewest(self: *Self, target: []const u8, msgid: []const u8) Error!*StoredMessage {
             try validateTarget(target);
             const log = self.targets.getPtr(target) orelse return error.NotFound;
@@ -497,6 +521,21 @@ test "redact hides reads but keeps slot" {
     var out: [3]Message = undefined;
     const got = try store.latest("#lotus", 3, &out);
     try expectIds(got, &.{ "m3", "m1" });
+}
+
+test "aggregate counts expose targets entries and tombstones" {
+    const Store = Lotus(.{ .max_targets = 2, .max_per_target = 3, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try appendForTest(&store, "#a", "a1", 1, "one");
+    try appendForTest(&store, "#a", "a2", 2, "two");
+    try appendForTest(&store, "#b", "b1", 3, "three");
+    try store.redact("#a", "a1");
+
+    try std.testing.expectEqual(@as(usize, 2), store.targetCount());
+    try std.testing.expectEqual(@as(usize, 3), store.totalStoredCount());
+    try std.testing.expectEqual(@as(usize, 1), store.tombstoneCount());
 }
 
 test "edit replaces message text" {
