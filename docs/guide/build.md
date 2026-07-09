@@ -22,8 +22,15 @@ Orochi builds with Zig's build system and has no package dependencies in `build.
 | `zig build test-tls` | Runs focused Yoroi TLS/mTLS/ECH/RPK/DC tests. | `build.zig` |
 | `zig build test-server` | Runs focused daemon/server integration and auth tests. | `build.zig` |
 | `zig build test-config` | Runs focused TOML/config parsing and boot-projection tests. | `build.zig` |
+| `zig build test-ircx` | Runs focused IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests. | `build.zig` |
+| `zig build test-event-spine` | Runs focused event-spine, EVENT, observe, and playback tests. | `build.zig` |
+| `zig build test-mesh` | Runs focused Suimyaku mesh, S2S, repair, and secured-link tests. | `build.zig` |
+| `zig build test-media` | Runs focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests. | `build.zig` |
+| `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests. | `build.zig` |
+| `zig build test-helix` | Runs focused Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
 | `zig build test-smoke` | Runs `check` plus focused TLS/server/config suites. | `build.zig` |
-| `zig build all-checks` | Runs deterministic pre-push checks: `check`, full tests, bounded fuzz replay, and BoGo shim self-tests. | `build.zig` |
+| `zig build test-roadmap` | Runs `check` plus focused server roadmap suites. | `build.zig` |
+| `zig build all-checks` | Runs deterministic pre-push checks: `check`, WASM build, full tests, bounded fuzz replay, and BoGo shim self-tests. | `build.zig` |
 | `zig build test-verbose` | Runs full tests with per-test progress output. | `build.zig` |
 | `zig build all-checks-verbose` | Runs deterministic pre-push checks with per-test progress output for the full suite. | `build.zig` |
 | `zig build check` | Type-checks the daemon without emitting a binary. | `build.zig` |

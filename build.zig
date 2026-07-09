@@ -287,6 +287,168 @@ pub fn build(b: *std.Build) void {
     const test_config_verbose_step = b.step("test-config-verbose", "Run focused config tests with per-test progress output");
     test_config_verbose_step.dependOn(&run_config_tests_verbose.step);
 
+    const ircx_test_filters: []const []const u8 = &.{
+        "IRCX",
+        "ISIRCX",
+        "PROP",
+        "ACCESS",
+        "LISTX",
+        "DATA",
+        "MODEX",
+        "SACCESS",
+    };
+    const ircx_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = ircx_test_filters,
+    });
+    const run_ircx_tests = b.addRunArtifact(ircx_tests);
+    const test_ircx_step = b.step("test-ircx", "Run focused IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests");
+    test_ircx_step.dependOn(&run_ircx_tests.step);
+    const ircx_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = ircx_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_ircx_tests_verbose = b.addRunArtifact(ircx_tests_verbose);
+    const test_ircx_verbose_step = b.step("test-ircx-verbose", "Run focused IRCX tests with per-test progress output");
+    test_ircx_verbose_step.dependOn(&run_ircx_tests_verbose.step);
+
+    const event_test_filters: []const []const u8 = &.{
+        "event spine",
+        "event routing:",
+        "EventCategory",
+        "EVENT",
+        "event-playback",
+        "observe",
+        "POLICY event",
+    };
+    const event_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = event_test_filters,
+    });
+    const run_event_tests = b.addRunArtifact(event_tests);
+    const test_event_step = b.step("test-event-spine", "Run focused event-spine, EVENT, observe, and playback tests");
+    test_event_step.dependOn(&run_event_tests.step);
+    const event_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = event_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_event_tests_verbose = b.addRunArtifact(event_tests_verbose);
+    const test_event_verbose_step = b.step("test-event-spine-verbose", "Run focused event-spine tests with per-test progress output");
+    test_event_verbose_step.dependOn(&run_event_tests_verbose.step);
+
+    const mesh_test_filters: []const []const u8 = &.{
+        "S2S",
+        "s2s",
+        "mesh",
+        "Mesh",
+        "secured link",
+        "Suimyaku",
+        "REPAIR",
+        "repair",
+        "squit",
+        "CONNECT opens",
+    };
+    const mesh_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = mesh_test_filters,
+    });
+    const run_mesh_tests = b.addRunArtifact(mesh_tests);
+    const test_mesh_step = b.step("test-mesh", "Run focused Suimyaku mesh, S2S, repair, and secured-link tests");
+    test_mesh_step.dependOn(&run_mesh_tests.step);
+    const mesh_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = mesh_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_mesh_tests_verbose = b.addRunArtifact(mesh_tests_verbose);
+    const test_mesh_verbose_step = b.step("test-mesh-verbose", "Run focused mesh/S2S tests with per-test progress output");
+    test_mesh_verbose_step.dependOn(&run_mesh_tests_verbose.step);
+
+    const media_test_filters: []const []const u8 = &.{
+        "MEDIA",
+        "media",
+        "DTLS-SRTP",
+        "SFU",
+        "NativeMediaTransport",
+        "NativeMedia",
+        "WebTransport",
+        "webtransport",
+        "RTP",
+        "RTCP",
+    };
+    const media_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = media_test_filters,
+    });
+    const run_media_tests = b.addRunArtifact(media_tests);
+    const test_media_step = b.step("test-media", "Run focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests");
+    test_media_step.dependOn(&run_media_tests.step);
+    const media_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = media_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_media_tests_verbose = b.addRunArtifact(media_tests_verbose);
+    const test_media_verbose_step = b.step("test-media-verbose", "Run focused media tests with per-test progress output");
+    test_media_verbose_step.dependOn(&run_media_tests_verbose.step);
+
+    const services_test_filters: []const []const u8 = &.{
+        "services",
+        "Services",
+        "REGISTER",
+        "IDENTIFY",
+        "SASL",
+        "TOTP",
+        "WEBAUTHN",
+        "SESSION",
+        "TEGAMI",
+        "SUCCESSOR",
+        "account",
+    };
+    const services_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = services_test_filters,
+    });
+    const run_services_tests = b.addRunArtifact(services_tests);
+    const test_services_step = b.step("test-services", "Run focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests");
+    test_services_step.dependOn(&run_services_tests.step);
+    const services_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = services_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_services_tests_verbose = b.addRunArtifact(services_tests_verbose);
+    const test_services_verbose_step = b.step("test-services-verbose", "Run focused services/auth tests with per-test progress output");
+    test_services_verbose_step.dependOn(&run_services_tests_verbose.step);
+
+    const helix_test_filters: []const []const u8 = &.{
+        "Helix",
+        "helix",
+        "UPGRADE",
+        "upgrade",
+        "migration",
+        "resume",
+        "capsule",
+        "handoff",
+    };
+    const helix_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = helix_test_filters,
+    });
+    const run_helix_tests = b.addRunArtifact(helix_tests);
+    const test_helix_step = b.step("test-helix", "Run focused Helix upgrade, migration, resume, capsule, and handoff tests");
+    test_helix_step.dependOn(&run_helix_tests.step);
+    const helix_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = helix_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_helix_tests_verbose = b.addRunArtifact(helix_tests_verbose);
+    const test_helix_verbose_step = b.step("test-helix-verbose", "Run focused Helix/upgrade tests with per-test progress output");
+    test_helix_verbose_step.dependOn(&run_helix_tests_verbose.step);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -362,6 +524,25 @@ pub fn build(b: *std.Build) void {
     test_smoke_verbose_step.dependOn(&run_tls_tests_verbose.step);
     test_smoke_verbose_step.dependOn(&run_server_tests_verbose.step);
     test_smoke_verbose_step.dependOn(&run_config_tests_verbose.step);
+
+    const test_roadmap_step = b.step("test-roadmap", "Run semantic check plus focused server roadmap suites");
+    test_roadmap_step.dependOn(&check_exe.step);
+    test_roadmap_step.dependOn(&run_server_tests.step);
+    test_roadmap_step.dependOn(&run_config_tests.step);
+    test_roadmap_step.dependOn(&run_ircx_tests.step);
+    test_roadmap_step.dependOn(&run_event_tests.step);
+    test_roadmap_step.dependOn(&run_mesh_tests.step);
+    test_roadmap_step.dependOn(&run_services_tests.step);
+    test_roadmap_step.dependOn(&run_tls_tests.step);
+    const test_roadmap_verbose_step = b.step("test-roadmap-verbose", "Run focused server roadmap suites with per-test progress output");
+    test_roadmap_verbose_step.dependOn(&check_exe.step);
+    test_roadmap_verbose_step.dependOn(&run_server_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_config_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_ircx_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_event_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_mesh_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_services_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_tls_tests_verbose.step);
 
     // `zig build ct-check` — the opt-in, dudect-style constant-time verification
     // harness (roadmap 0.4). It measures execution-time independence from secret
@@ -515,14 +696,16 @@ pub fn build(b: *std.Build) void {
     const bogo_shim_test_step = b.step("bogo-shim-test", "Build + self-drive the BoGo shim (loopback exit-code smokes; no external harness)");
     bogo_shim_test_step.dependOn(&run_bogo_shim_tests.step);
 
-    const all_checks_step = b.step("all-checks", "Run deterministic pre-push checks: check, full tests, bounded fuzz replay, and BoGo shim self-tests");
+    const all_checks_step = b.step("all-checks", "Run deterministic pre-push checks: check, wasm, full tests, bounded fuzz replay, and BoGo shim self-tests");
     all_checks_step.dependOn(&check_exe.step);
+    all_checks_step.dependOn(wasm_step);
     all_checks_step.dependOn(&run_mod_tests.step);
     all_checks_step.dependOn(&run_exe_tests.step);
     all_checks_step.dependOn(&run_fuzz_tests.step);
     all_checks_step.dependOn(&run_bogo_shim_tests.step);
     const all_checks_verbose_step = b.step("all-checks-verbose", "Run deterministic pre-push checks with per-test progress output for the full suite");
     all_checks_verbose_step.dependOn(&check_exe.step);
+    all_checks_verbose_step.dependOn(wasm_step);
     all_checks_verbose_step.dependOn(&run_mod_tests_verbose.step);
     all_checks_verbose_step.dependOn(&run_exe_tests_verbose.step);
     all_checks_verbose_step.dependOn(&run_fuzz_tests.step);

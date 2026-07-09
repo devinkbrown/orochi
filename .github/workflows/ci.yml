@@ -67,6 +67,11 @@ jobs:
       # exact break shipped once) — keep it in CI.
       - name: Build browser WASM modules
         run: zig build wasm
+      # Debug catches safety checks and leak reports; ReleaseSafe catches codegen
+      # and optimization-only regressions without making CI depend on ReleaseFast
+      # runtime assertions.
+      - name: Run ReleaseSafe smoke suites
+        run: zig build test-smoke -Doptimize=ReleaseSafe --summary all
       # Threaded server tests need loopback sockets + io_uring; when a runner
       # lacks either the tests SkipZigTest rather than fail, so this stays green
       # on any hosted runner while exercising everything available.

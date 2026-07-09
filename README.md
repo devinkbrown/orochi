@@ -84,7 +84,8 @@ zig build              # build the daemon
 zig build check        # fast semantic analysis, no binary
 zig build test         # run the full test suite
 zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config suites
-zig build all-checks   # deterministic pre-push gate: check + tests + fuzz + BoGo smokes
+zig build test-roadmap # server roadmap gate: check + focused daemon/protocol suites
+zig build all-checks   # deterministic pre-push gate: check + wasm + tests + fuzz + BoGo smokes
 zig build all-checks-verbose # same gate with per-test progress for long runs
 zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/orochi
 zig build run          # run the daemon locally
