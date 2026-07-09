@@ -99,6 +99,7 @@ pub const dtls_srtp = @import("dtls_srtp.zig");
 pub const ech_config = @import("ech_config.zig");
 pub const ech = @import("ech.zig");
 pub const echo_message = @import("echo_message.zig");
+pub const e2ee_policy = @import("e2ee_policy.zig");
 pub const ec_pkcs = @import("ec_pkcs.zig");
 pub const ed25519_pkcs8 = @import("ed25519_pkcs8.zig");
 pub const elist = @import("elist.zig");
@@ -445,6 +446,7 @@ test {
     _ = ech_config;
     _ = ech;
     _ = echo_message;
+    _ = e2ee_policy;
     _ = ec_pkcs;
     _ = ed25519_pkcs8;
     _ = elist;

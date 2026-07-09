@@ -256,6 +256,7 @@ pub const CapId = enum(u6) {
     orochi_session_sync,
     orochi_bouncer,
     orochi_topics,
+    orochi_e2ee,
     chghost,
     no_implicit_names,
     chathistory,
@@ -345,6 +346,10 @@ const cap_specs = [_]CapSpec{
     // gets the `+orochi/topic=<label>` client-only tag without needing generic
     // message-tags, and clients can discover the topic-filtered CHATHISTORY path.
     .{ .id = .orochi_topics, .name = "orochi/topics" },
+    // orochi/e2ee: opt in to Orochi's E2EE control-plane tag. Clients with this
+    // cap may send/receive `+orochi/e2ee` on messages, letting required rooms
+    // reject plaintext without the daemon decrypting client payloads.
+    .{ .id = .orochi_e2ee, .name = "orochi/e2ee" },
     // chghost: receive a native CHGHOST line when a common user's host changes
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
@@ -2457,14 +2462,15 @@ test "CAP REQ accepts bare and value-bearing tokens" {
     try std.testing.expect(session.cap.negotiated.contains(.sasl));
 }
 
-test "CAP REQ accepts orochi/topics discovery cap" {
+test "CAP REQ accepts orochi discovery caps" {
     var session = ClientSession.init();
     var storage: [1024]u8 = undefined;
     var replies = ReplyCtx.init(&storage);
 
-    try dispatchText(&session, &replies, "CAP REQ :orochi/topics");
-    try expectContains(replies.written(), " CAP * ACK :orochi/topics\r\n");
+    try dispatchText(&session, &replies, "CAP REQ :orochi/topics orochi/e2ee");
+    try expectContains(replies.written(), " CAP * ACK :orochi/topics orochi/e2ee\r\n");
     try std.testing.expect(session.cap.negotiated.contains(.orochi_topics));
+    try std.testing.expect(session.cap.negotiated.contains(.orochi_e2ee));
 }
 
 test "CAP REQ accepts SASL EXTERNAL value when available" {

@@ -73,7 +73,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## PROP
 
 - Syntax: `PROP <entity> [<key[,key...]> [:<value>]]`
-- Description: IRCX property list/get/set/delete. One parameter lists all; two gets keys; three sets a value, and an empty trailing value deletes. Built-in channel properties such as `NAME`, `OID`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, and write-through `MEMBERKEY`/`MEMBERLIMIT` reflect live channel state.
+- Description: IRCX property list/get/set/delete. One parameter lists all; two gets keys; three sets a value, and an empty trailing value deletes. Built-in channel properties such as `NAME`, `OID`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, and write-through `MEMBERKEY`/`MEMBERLIMIT` reflect live channel state. Policy properties including `history-policy`, AI consent flags (`no-ai`, `local-only`, `server-ai-ok`), and `encryption-policy` persist through the ordinary signed PROP store; `encryption-policy=required` rejects plaintext channel messages unless they carry the negotiated `+orochi/e2ee` client tag.
 - Privileges: Registered client; writes require channel operator/owner, user self-ownership, or oper.
 - Parameters: Entity, optional key list, optional value.
 - Replies: `RPL_PROPLIST 818`, `RPL_PROPEND 819`; mode broadcasts for linked built-ins.

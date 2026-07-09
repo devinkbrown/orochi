@@ -225,6 +225,17 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `KEYTRANS PROOF 42`
 - Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleKeyTrans`, `src/daemon/services.zig` `keyTransparencyProof`
 
+## E2EEKEY
+
+- Syntax: `E2EEKEY [STATUS|LIST [account]|ADD <device-id> <algorithm> <public-key>|DEL <device-id>]`
+- Description: Manages public E2EE device-key advertisements for the caller's logged-in account. Device records are stored as account-scoped user PROP metadata under `e2ee.device.<device-id>` with value `<algorithm>:<public-key>`, so they replicate over the signed `ENTITY_PROP` path. `LIST [account]` reads public device keys for the caller or a named account; `ADD` and `DEL` require login to the owning account.
+- Privileges: Registered client; account login required for `STATUS`, `ADD`, `DEL`, and caller-default `LIST`.
+- Parameters: Optional subcommand; `ADD` takes a bounded device id, algorithm token, and public key token.
+- Replies: Server notices: `E2EEKEY STATUS account=<account> devices=<n>`, `E2EEKEY DEVICE account=<account> id=<device> alg=<algorithm> key=<public-key>`, `E2EEKEY END account=<account> devices=<n>`, `E2EEKEY ADDED ...`, or `E2EEKEY DELETED ...`.
+- Errors: `FAIL E2EEKEY NOT_LOGGED_IN`, `NEED_MORE_PARAMS`, `BAD_DEVICE`, `BAD_KEY`, `STORE_FAILED`, `INVALID_SUBCOMMAND`.
+- Example: `E2EEKEY ADD phone mls-x25519 abcd+/=`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleE2eeKey`, `src/proto/e2ee_policy.zig`
+
 ## TEGAMI
 
 - Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)

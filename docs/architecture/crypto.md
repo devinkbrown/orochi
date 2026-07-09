@@ -73,6 +73,22 @@ path and peak hashes needed to verify one inclusion proof
 (`src/daemon/server.zig`, `src/daemon/services.zig`,
 `src/daemon/key_transparency.zig`).
 
+## E2EE control plane
+
+Orochi's daemon does not decrypt client E2EE payloads. The implemented server
+surface is a control plane: the `orochi/e2ee` capability allows the client-only
+`+orochi/e2ee` message tag, and the channel PROP `encryption-policy` accepts
+`off`, `optional`, or `required`. Required rooms reject plaintext `PRIVMSG`
+delivery with `FAIL PRIVMSG E2EE_REQUIRED`; `NOTICE` is silently dropped per IRC
+NOTICE error rules. The policy value is an ordinary signed channel PROP, so it
+persists and converges through the existing channel PROP CRDT.
+
+Public account device keys are advertised with `E2EEKEY`, which stores bounded
+`e2ee.device.<device-id>` user PROP records as `<algorithm>:<public-key>` and
+fans changes through signed `ENTITY_PROP` replication. This gives clients a
+mesh-visible device-key directory without introducing a second key store or a
+server-side plaintext path.
+
 ## ProofMark moderation proofs
 
 `src/daemon/proofmark.zig` defines signed moderation proofs for privileged policy

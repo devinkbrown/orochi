@@ -134,6 +134,7 @@ pub const ChannelPropKey = enum {
     local_only,
     server_ai_ok,
     history_policy,
+    encryption_policy,
 
     pub fn token(self: ChannelPropKey) []const u8 {
         return switch (self) {
@@ -162,6 +163,7 @@ pub const ChannelPropKey = enum {
             .local_only => "local-only",
             .server_ai_ok => "server-ai-ok",
             .history_policy => "history-policy",
+            .encryption_policy => "encryption-policy",
         };
     }
 };
@@ -213,6 +215,7 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         // store. The daemon validates values as boolean tokens before storage.
         .no_ai, .local_only, .server_ai_ok => .{ .key = key, .max_value = 1, .min_setter = .host },
         .history_policy => .{ .key = key, .max_value = 16, .min_setter = .host },
+        .encryption_policy => .{ .key = key, .max_value = 16, .min_setter = .host },
     };
 }
 

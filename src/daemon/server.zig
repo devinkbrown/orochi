@@ -127,6 +127,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
+const e2ee_policy = @import("../proto/e2ee_policy.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
@@ -19825,6 +19826,13 @@ pub const LinuxServer = struct {
             if (!validAiPolicyValue(value)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, e2ee_policy.policy_prop)) {
+            // Room-level E2EE policy. Persist + mesh-propagate through the
+            // ordinary signed channel PROP CRDT; delivery reads it at send time.
+            if (deleting) return .not_handled;
+            if (!e2ee_policy.validPolicyValue(value)) return .bad_value;
+            return .not_handled;
+        }
         if (std.ascii.eqlIgnoreCase(key, "history-policy")) {
             // Aegis-lite room policy for history visibility. Persist as a normal
             // signed channel PROP; CHATHISTORY reads the value at request time.
@@ -19855,6 +19863,7 @@ pub const LinuxServer = struct {
     }
 
     pub const HistoryPolicy = enum { public, members, opers };
+    pub const ChannelEncryptionPolicy = e2ee_policy.Policy;
 
     fn validHistoryPolicyValue(value: []const u8) bool {
         return std.ascii.eqlIgnoreCase(value, "public") or
@@ -19870,6 +19879,17 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(ev.value, "members")) return .members;
         if (std.ascii.eqlIgnoreCase(ev.value, "opers")) return .opers;
         return .members;
+    }
+
+    pub fn channelEncryptionPolicy(self: *LinuxServer, channel: []const u8) ChannelEncryptionPolicy {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return .off;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, e2ee_policy.policy_prop) catch return .off;
+        return e2ee_policy.policyValue(ev.value) orelse .off;
+    }
+
+    fn messageSatisfiesEncryptionPolicy(self: *LinuxServer, channel: []const u8, raw_tags: ?[]const u8) bool {
+        return self.channelEncryptionPolicy(channel) != .required or e2ee_policy.encryptedTagPresent(raw_tags);
     }
 
     fn historyPolicyAllows(self: *LinuxServer, channel: []const u8, is_member: bool, is_oper: bool) bool {
@@ -23234,6 +23254,115 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "KEYTRANS {s}", .{body}) catch return;
         try self.noticeTo(conn, text);
+    }
+
+    fn e2eeKeyReply(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "E2EEKEY {s}", .{body}) catch return;
+        try self.noticeTo(conn, text);
+    }
+
+    const E2eeDeviceValue = struct {
+        algorithm: []const u8,
+        public_key: []const u8,
+    };
+
+    fn splitE2eeDeviceValue(value: []const u8) ?E2eeDeviceValue {
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return null;
+        if (colon == 0 or colon + 1 >= value.len) return null;
+        const algorithm = value[0..colon];
+        const public_key = value[colon + 1 ..];
+        if (!e2ee_policy.validAlgorithm(algorithm) or !e2ee_policy.validPublicKey(public_key)) return null;
+        return .{ .algorithm = algorithm, .public_key = public_key };
+    }
+
+    fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) usize {
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = self.props.listProps(entity, &views) catch return 0;
+        var count: usize = 0;
+        for (rows) |ev| {
+            if (e2ee_policy.isDevicePropKey(ev.key)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn handleE2eeKey(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        const sub = if (p.len == 0) "STATUS" else p[0];
+
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before managing E2EE device keys");
+            var b: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "STATUS account={s} devices={d}", .{ account, self.e2eeDeviceCount(account) }) catch return;
+            return self.e2eeKeyReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const account = if (p.len >= 2) p[1] else (conn.session.account() orelse
+                return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before listing your E2EE device keys"));
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+            const rows = self.props.listProps(entity, &views) catch rows: {
+                break :rows views[0..0];
+            };
+            var count: usize = 0;
+            for (rows) |ev| {
+                if (!e2ee_policy.isDevicePropKey(ev.key)) continue;
+                const device = ev.key[e2ee_policy.device_prop_prefix.len..];
+                const parsed_value = splitE2eeDeviceValue(ev.value) orelse continue;
+                var b: [default_reply_bytes]u8 = undefined;
+                const body = std.fmt.bufPrint(
+                    &b,
+                    "DEVICE account={s} id={s} alg={s} key={s}",
+                    .{ account, device, parsed_value.algorithm, parsed_value.public_key },
+                ) catch continue;
+                try self.e2eeKeyReply(conn, body);
+                count += 1;
+            }
+            var end_buf: [128]u8 = undefined;
+            const end = std.fmt.bufPrint(&end_buf, "END account={s} devices={d}", .{ account, count }) catch return;
+            return self.e2eeKeyReply(conn, end);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before adding E2EE device keys");
+            if (p.len < 4) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY ADD <device-id> <algorithm> <public-key>");
+            var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+            const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
+                return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            var value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
+            const value = e2ee_policy.deviceValue(p[2], p[3], &value_buf) orelse
+                return self.failReply(conn, "E2EEKEY", "BAD_KEY", "Algorithm or public key is invalid");
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
+                return self.failReply(conn, "E2EEKEY", "STORE_FAILED", "Could not store E2EE device key");
+            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+            self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+            var b: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "ADDED id={s} alg={s}", .{ p[1], p[2] }) catch return;
+            return self.e2eeKeyReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "DELETE")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before deleting E2EE device keys");
+            if (p.len < 2) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY DEL <device-id>");
+            var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+            const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
+                return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            self.props.deleteProp(entity, key) catch {};
+            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
+            self.notifyLocalPropChange(conn, entity, key, "");
+            var b: [96]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "DELETED id={s}", .{p[1]}) catch return;
+            return self.e2eeKeyReply(conn, body);
+        }
+
+        return self.failReply(conn, "E2EEKEY", "INVALID_SUBCOMMAND", "Usage: E2EEKEY [STATUS|LIST [account]|ADD <device-id> <algorithm> <public-key>|DEL <device-id>]");
     }
 
     pub fn handleKeyTrans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -28883,6 +29012,10 @@ pub const LinuxServer = struct {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
+            if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags)) {
+                if (!is_notice) try self.failReply(conn, command, "E2EE_REQUIRED", "Channel requires encrypted messages");
+                return;
+            }
             const speech = try self.channelSpeechGate(id, conn, target, chan, text, is_notice, min_rank, true);
             if (speech == .deny) return;
             const opmod_route = speech == .opmoderate;
@@ -29502,6 +29635,7 @@ fn findTagValue(tags_raw: []const u8, key: []const u8) ?[]const u8 {
 fn clientTagAllowedForSession(session: *const dispatch.ClientSession, key: []const u8) bool {
     if (session.hasCap(.message_tags)) return true;
     if (std.mem.eql(u8, key, topic_tag.tag_key)) return session.hasCap(.orochi_topics);
+    if (e2ee_policy.isEncryptedTagKey(key)) return session.hasCap(.orochi_e2ee);
     if (msgedit.isTypingTag(key)) return session.hasCap(.typing);
     if (std.mem.eql(u8, key, "+draft/react") or std.mem.eql(u8, key, "+draft/unreact")) return session.hasCap(.react);
     if (std.mem.eql(u8, key, "+draft/reply")) return session.hasCap(.reply);
@@ -31889,6 +32023,49 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
 }
 
+test "E2EEKEY advertises account device keys through user props" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+
+    var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    add.params[0] = "ADD";
+    add.params[1] = "phone";
+    add.params[2] = "mls-x25519";
+    add.params[3] = "abcd+/=";
+    add.param_count = 4;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=phone alg=mls-x25519");
+
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    const ev = try server.props.getProp(entity, "e2ee.device.phone");
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", ev.value);
+
+    var list_lv = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    list_lv.params[0] = "LIST";
+    list_lv.param_count = 1;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &list_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=kain id=phone alg=mls-x25519 key=abcd+/=");
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=kain devices=1");
+
+    var del = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    del.params[0] = "DEL";
+    del.params[1] = "phone";
+    del.param_count = 2;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &del);
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DELETED id=phone");
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
+}
+
 test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -32724,6 +32901,37 @@ test "history policy: channel PROP validates and tightens CHATHISTORY access" {
         try std.testing.expectEqual(LinuxServer.HistoryPolicy.opers, server.channelHistoryPolicy("#histpolicy"));
         try std.testing.expect(!server.historyPolicyAllows("#histpolicy", true, false));
         try std.testing.expect(server.historyPolicyAllows("#histpolicy", false, true));
+    } else return error.SkipZigTest;
+}
+
+test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#secure" };
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, e2ee_policy.policy_prop, "off", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, e2ee_policy.policy_prop, "optional", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, e2ee_policy.policy_prop, "required", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, e2ee_policy.policy_prop, "", true), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, e2ee_policy.policy_prop, "mandatory", false), .bad_value);
+
+        try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.off, server.channelEncryptionPolicy("#secure"));
+        _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.required, server.channelEncryptionPolicy("#secure"));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+orochi/e2ee=1"));
+
+        const id = try addTestLocalClient(&server, "alice", null);
+        const conn = server.connFor(id).?;
+        _ = try server.world.join("#secure", worldIdFromClient(id));
+
+        conn.send_len = 0;
+        try server.messageOne(id, conn, "PRIVMSG", "#secure", "plain", null);
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
     } else return error.SkipZigTest;
 }
 
