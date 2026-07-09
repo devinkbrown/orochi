@@ -1379,6 +1379,9 @@ pub const Config = struct {
     /// token when non-empty. Configurable via `[network] icon_url`; empty omits
     /// the token (Ophion `n_url`/NETWORKICON parity).
     network_icon_url: []const u8 = "",
+    /// Opt-in bit for public discovery directories. Exported in status.json so
+    /// crawlers can distinguish intentionally public nodes from private meshes.
+    network_discoverable: bool = false,
     /// MOTD text served by the MOTD command, split on newlines. Empty = the
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
@@ -5048,6 +5051,7 @@ pub const LinuxServer = struct {
         writeJsonEscaped(&w, self.config.network_name) catch return w.buffered();
         w.writeAll(",\"node\":") catch return w.buffered();
         writeJsonEscaped(&w, self.serverName()) catch return w.buffered();
+        w.print(",\"discoverable\":{s}", .{if (self.config.network_discoverable) "true" else "false"}) catch return w.buffered();
         w.print(",\"uptime_seconds\":{d}", .{uptime}) catch return w.buffered();
         w.print(",\"users_online\":{d}", .{self.meshUserCount()}) catch return w.buffered();
         w.print(",\"mesh\":{{\"quorum\":{s},\"partitioned\":{s},\"components\":{d}}}", .{
@@ -32475,6 +32479,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         const text = server.buildStatusJson(&buf);
 
         // Node identity + health envelope.
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"discoverable\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
@@ -32489,6 +32494,10 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+
+        server.config.network_discoverable = true;
+        const public_text = server.buildStatusJson(&buf);
+        try std.testing.expect(std.mem.indexOf(u8, public_text, "\"discoverable\":true") != null);
     } else return error.SkipZigTest;
 }
 

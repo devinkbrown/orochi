@@ -121,13 +121,14 @@ the Ophion CAP names:
   | `onpart` | channel | public (part timestamp) | `m_ircx_prop_onpart` |
   | `member_of` | user | public (membership list) | `m_ircx_prop_member_of` |
   | `account` | user | public | account binding |
-  | `user_profile` | user | public (`display/real/title/location/note`) | `m_ircx_prop_user_profile` (subset) |
+  | `user_profile` | user | public (`display/real/title/location/note/url/gender/picture/bio/email`) | `m_ircx_prop_user_profile` |
 
   GeoIP keys (implemented): `COUNTRY`, `REGION`, `CITY`, `ASN`, `ASORG` are now
   exposed as read-only user PROP providers (`ircx_prop_providers.zig`), gated
   self-or-oper to match the WHOIS geo policy so a cloaked user's IP-geolocation is
-  not world-readable. Remaining residual: Ophion's individual profile keys (`URL`,
-  `GENDER`, `PICTURE`, `BIO`, `EMAIL`) beyond `display/real/title/location/note`.
+  not world-readable. The individual profile keys (`URL`, `GENDER`, `PICTURE`,
+  `BIO`, `EMAIL`) are live as writable user PROP keys and included in the computed
+  `user_profile` value.
 - **IRCX oper extras — command-by-command mapping.** Orochi has native oper
   moderation commands and privilege gates under English names. Mapping Ophion's
   IRCX oper extras:

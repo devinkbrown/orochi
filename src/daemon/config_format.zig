@@ -147,6 +147,10 @@ pub const Config = struct {
         /// IRCv3 network icon: a URL to a network logo, advertised as the
         /// `NETWORKICON=<url>` ISUPPORT token when set (Ophion `n_url` parity).
         icon_url: ?[]const u8 = null,
+        /// Opt this node into public discovery-directory feeds. Off by default:
+        /// status.json still exists, but directories should not index it unless
+        /// this flag is explicitly true.
+        discoverable: bool = false,
     };
 
     /// Message of the Day. `text` is served by the MOTD command (split on
@@ -946,6 +950,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("network.server_name"), &cfg.network.server_name);
     try setOpt(allocator, resolver, doc.getString("network.description"), &cfg.network.description);
     try setOpt(allocator, resolver, doc.getString("network.icon_url"), &cfg.network.icon_url);
+    if (doc.getBool("network.discoverable")) |b| cfg.network.discoverable = b;
 
     // [motd] — `text` may use `@file:path` to load from disk.
     try setOpt(allocator, resolver, doc.getString("motd.text"), &cfg.motd.text);
@@ -1711,6 +1716,32 @@ test "parseToml: backup section projects directory and cadence" {
     defer cfg.deinit(allocator);
     try testing.expectEqualStrings("/var/backups/orochi", cfg.backup.dir);
     try testing.expectEqual(@as(i64, 12 * 60 * 60 * 1000), cfg.backup.interval_ms);
+}
+
+test "parseToml: network discoverable defaults private and parses opt-in" {
+    const allocator = testing.allocator;
+
+    var dflt = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{});
+    defer dflt.deinit(allocator);
+    try testing.expect(!dflt.network.discoverable);
+
+    var public = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[network]
+        \\discoverable = true
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{});
+    defer public.deinit(allocator);
+    try testing.expect(public.network.discoverable);
 }
 
 test "parseToml: [[opers]] array-of-tables + trust_roots list" {

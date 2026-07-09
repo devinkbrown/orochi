@@ -47,6 +47,9 @@ name = "Orochi"
 # advertises a NETWORKICON=<url> ISUPPORT (005) token so clients can show the
 # logo; omitted entirely when unset.
 # icon_url = "https://eshmaki.me/icon.png"
+# Opt this node into public discovery-directory crawls. When true, status.json
+# exports "discoverable":true; keep false for private meshes.
+# discoverable = false
 
 
 # --- [motd] — message of the day (personalized template) ---------------------

@@ -43,6 +43,7 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 | `server_name` | string or null | `"orochi.local"` | any hostname | This node's own server name — the source prefix of all server-originated lines (welcome numerics, the `!weather`/`!news` bot replies, ERROR/PING) and the identity presented to S2S peers. MUST be unique per node in a mesh so replies/identities don't collide (`src/proto/protocol_inventory.zig` `setServerName`). |
 | `description` | string or null | unset | any string | Per-node description shown in VERSION/WHOIS and gossiped to mesh peers (`src/daemon/config_format.zig:67`, `src/daemon/config_boot.zig:22`). |
 | `icon_url` | string or null | unset | URL string | IRCv3 network icon: when set, advertised as the `NETWORKICON=<url>` ISUPPORT token (clients may render the logo); omitted when unset. Ophion `n_url`/NETWORKICON parity (`src/daemon/server.zig` `buildIsupportTokens`, `src/daemon/config_boot.zig`). |
+| `discoverable` | boolean | `false` | `true`/`false` | Opt-in bit for public discovery directories. `status.json` exports `"discoverable":true` only when enabled, so private meshes are not indexed by accident (`src/daemon/server.zig` `buildStatusJson`). |
 
 ## `[motd]`
 

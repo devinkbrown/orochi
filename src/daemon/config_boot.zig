@@ -35,6 +35,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.network.icon_url) |v| {
         if (v.len != 0) out.network_icon_url = v;
     }
+    out.network_discoverable = cfg.network.discoverable;
     if (cfg.motd.text) |t| out.motd_text_raw = t;
     if (cfg.admin.location.len != 0) out.admin_location = cfg.admin.location;
     if (cfg.admin.email.len != 0) out.admin_email = cfg.admin.email;
@@ -512,6 +513,8 @@ test "config text overlays the server config" {
         \\webtransport = 4433
         \\proxy_protocol = true
         \\trusted_proxies = ["127.0.0.1"]
+        \\[network]
+        \\discoverable = true
         \\[limits]
         \\max_clients = 2048
         \\[mesh]
@@ -596,6 +599,7 @@ test "config text overlays the server config" {
     try testing.expect(loaded.config.proxy_protocol_enabled);
     try testing.expectEqual(@as(usize, 1), loaded.config.trusted_proxies.len);
     try testing.expectEqualStrings("127.0.0.1", loaded.config.trusted_proxies[0]);
+    try testing.expect(loaded.config.network_discoverable);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
     try testing.expectEqualStrings("ircxnet", loaded.config.mesh_realm);
