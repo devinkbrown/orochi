@@ -29,6 +29,7 @@ const media_room = @import("media_room.zig");
 const multiline_mod = @import("../proto/multiline.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
+const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 
 const default_search_index_config = search_index_mod.SearchIndex.Config{};
@@ -219,6 +220,8 @@ pub const Config = struct {
         max_memory_bytes: usize = wasm_bridge.default_max_memory_bytes,
         /// Instruction fuel budget for each plugin command or hook dispatch.
         default_fuel: u64 = wasm_bridge.default_fuel,
+        /// Hostcall capability classes plugins may receive after negotiation.
+        allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
     };
 
     pub const OperSection = struct {
@@ -993,6 +996,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.wasm.max_plugin_bytes = @intCast(try uintField(doc, "wasm.max_plugin_bytes", cfg.wasm.max_plugin_bytes, 1024, 64 * 1024 * 1024));
     cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
     cfg.wasm.default_fuel = try uintField(doc, "wasm.default_fuel", cfg.wasm.default_fuel, 1, 10_000_000);
+    if (doc.getArray("wasm.allowed_caps")) |arr| cfg.wasm.allowed_caps = try parseWasmCaps(arr);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);
@@ -1557,6 +1561,19 @@ fn ownStringArray(allocator: std.mem.Allocator, resolver: Resolver, arr: []const
     return list.toOwnedSlice(allocator);
 }
 
+fn parseWasmCaps(arr: []const toml.Value) TomlError!wasm_abi.CapabilitySet {
+    var caps = wasm_abi.CapabilitySet.empty;
+    for (arr) |*item| {
+        const raw = switch (item.*) {
+            .string => |s| s,
+            else => return error.ParseError,
+        };
+        const cap = wasm_abi.Capability.fromToken(raw) orelse return error.ParseError;
+        caps.insert(cap);
+    }
+    return caps;
+}
+
 /// Own a TOML field that may be either a single string OR an array of strings
 /// (e.g. `certfp = "abc…"` or `certfp = ["abc…", "def…"]`). Returns an owned,
 /// resolved string list; an absent field yields the empty slice.
@@ -1752,6 +1769,35 @@ test "parseToml: network discoverable defaults private and parses opt-in" {
     , .{});
     defer public.deinit(allocator);
     try testing.expect(public.network.discoverable);
+}
+
+test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown tokens" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\allowed_caps = ["reply", "STORE", "hooks"]
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.wasm.allowed_caps.has(.reply));
+    try testing.expect(cfg.wasm.allowed_caps.has(.store));
+    try testing.expect(cfg.wasm.allowed_caps.has(.hooks));
+    try testing.expect(!cfg.wasm.allowed_caps.has(.time));
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\allowed_caps = ["reply", "net:outbound"]
+        \\
+    , .{}));
 }
 
 test "parseToml: [[opers]] array-of-tables + trust_roots list" {

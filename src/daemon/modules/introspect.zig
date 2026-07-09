@@ -113,7 +113,7 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
             info.plugin_count,
             info.command_count,
             info.hook_count,
-            if (caps.len == 0) "*" else caps,
+            if (caps.len == 0) "(none)" else caps,
             if (core.services.config.wasm_plugin_dir.len == 0) "(disabled)" else core.services.config.wasm_plugin_dir,
         }) catch return;
         try core.reply(.RPL_INFO, &.{}, status);
@@ -133,7 +133,7 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
             info.manifest_schema.major,
             info.manifest_schema.minor,
             info.host_function_count,
-            if (caps.len == 0) "*" else caps,
+            if (caps.len == 0) "(none)" else caps,
         }) catch return;
         try core.reply(.RPL_INFO, &.{}, schema);
         for (wasm_abi.host_functions) |func| {
@@ -160,7 +160,7 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
                 plugin.name,
                 plugin.command_count,
                 plugin.hook_count,
-                if (grants.len == 0) "*" else grants,
+                if (grants.len == 0) "(none)" else grants,
             }) catch continue;
             try core.reply(.RPL_INFO, &.{}, row);
         }

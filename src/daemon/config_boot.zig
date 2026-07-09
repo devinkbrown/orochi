@@ -59,6 +59,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.wasm_max_plugin_bytes = cfg.wasm.max_plugin_bytes;
     out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;
     out.wasm_default_fuel = cfg.wasm.default_fuel;
+    out.wasm_allowed_caps = cfg.wasm.allowed_caps;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
@@ -885,6 +886,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_plugin_bytes = 4096
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
+        \\allowed_caps = ["reply", "log", "hooks"]
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
@@ -893,6 +895,10 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expectEqual(@as(usize, 4096), loaded.config.wasm_max_plugin_bytes);
     try testing.expectEqual(@as(usize, 131072), loaded.config.wasm_max_memory_bytes);
     try testing.expectEqual(@as(u64, 1234), loaded.config.wasm_default_fuel);
+    try testing.expect(loaded.config.wasm_allowed_caps.has(.reply));
+    try testing.expect(loaded.config.wasm_allowed_caps.has(.log));
+    try testing.expect(loaded.config.wasm_allowed_caps.has(.hooks));
+    try testing.expect(!loaded.config.wasm_allowed_caps.has(.time));
 }
 
 test "limits overlay reputation knobs" {

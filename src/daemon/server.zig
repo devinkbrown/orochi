@@ -16,6 +16,7 @@ const dispatch = @import("dispatch.zig");
 const module_core = @import("module_core.zig");
 const module_manifest = @import("modules/manifest.zig");
 const mod_registry = @import("registry.zig");
+const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
@@ -1443,6 +1444,8 @@ pub const Config = struct {
     wasm_max_memory_bytes: usize = wasm_bridge.default_max_memory_bytes,
     /// Instruction fuel per plugin command/hook dispatch. `[wasm] default_fuel`.
     wasm_default_fuel: u64 = wasm_bridge.default_fuel,
+    /// Hostcall capability classes plugins may receive. `[wasm] allowed_caps`.
+    wasm_allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -3477,6 +3480,7 @@ pub const LinuxServer = struct {
                 .max_plugin_bytes = config.wasm_max_plugin_bytes,
                 .max_memory_bytes = config.wasm_max_memory_bytes,
                 .default_fuel = config.wasm_default_fuel,
+                .allowed_caps = config.wasm_allowed_caps,
             }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
@@ -27795,11 +27799,13 @@ pub const LinuxServer = struct {
         self.config.wasm_max_plugin_bytes = parsed.wasm.max_plugin_bytes;
         self.config.wasm_max_memory_bytes = parsed.wasm.max_memory_bytes;
         self.config.wasm_default_fuel = parsed.wasm.default_fuel;
+        self.config.wasm_allowed_caps = parsed.wasm.allowed_caps;
         self.wasm.deinit();
         self.wasm = wasm_bridge.Bridge.initWithOptions(self.allocator, .{
             .max_plugin_bytes = self.config.wasm_max_plugin_bytes,
             .max_memory_bytes = self.config.wasm_max_memory_bytes,
             .default_fuel = self.config.wasm_default_fuel,
+            .allowed_caps = self.config.wasm_allowed_caps,
         });
         self.loadWasmPlugins();
     }
@@ -35570,6 +35576,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     cfg.wasm_max_plugin_bytes = 4096;
     cfg.wasm_max_memory_bytes = 128 * 1024;
     cfg.wasm_default_fuel = 1234;
+    cfg.wasm_allowed_caps = wasm_abi.CapabilitySet.initMany(&.{ .reply, .hooks });
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -35605,17 +35612,17 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
-    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,log,time", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks", 200);
     try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM ABI\r\n");
-    try recvUntil(&admin, "manifest_schema=1.0 host_functions=8 allowed_caps=reply,log,time", 200);
+    try recvUntil(&admin, "manifest_schema=1.0 host_functions=8 allowed_caps=reply,hooks", 200);
     try recvUntil(&admin, "hostcall reply v1.0 cap=reply", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");
-    try recvUntil(&admin, "handle=1 name=guard commands=0 hooks=1 grants=*", 200);
+    try recvUntil(&admin, "handle=1 name=guard commands=0 hooks=1 grants=(none)", 200);
 }
 
 test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {

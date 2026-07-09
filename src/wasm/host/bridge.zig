@@ -17,6 +17,7 @@ const registry = @import("../../daemon/registry.zig");
 pub const default_fuel: u64 = 16 * 1024;
 pub const max_plugin_bytes: usize = 8 * 1024 * 1024;
 pub const default_max_memory_bytes: usize = 64 * 1024;
+pub const default_allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .log, .time });
 
 /// Host callbacks the daemon supplies so a plugin's granted hostcalls reach the
 /// live connection. Opaque ctx is the daemon's per-invocation context.
@@ -46,6 +47,7 @@ pub const Options = struct {
     max_plugin_bytes: usize = max_plugin_bytes,
     max_memory_bytes: usize = default_max_memory_bytes,
     default_fuel: u64 = default_fuel,
+    allowed_caps: abi.CapabilitySet = default_allowed_caps,
 };
 
 pub const PluginSummary = struct {
@@ -70,7 +72,7 @@ pub const Bridge = struct {
             .allocator = allocator,
             .options = options,
             .store = plugin.PluginStore.init(allocator, .{
-                .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .log, .time }),
+                .allowed_caps = options.allowed_caps,
                 .max_memory_bytes = options.max_memory_bytes,
             }),
         };
@@ -598,6 +600,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
         .max_plugin_bytes = 4096,
         .max_memory_bytes = 128 * 1024,
         .default_fuel = 1234,
+        .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .hooks }),
     });
     defer bridge.deinit();
     try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
@@ -606,6 +609,8 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expectEqual(@as(u16, 1), info.manifest_schema.major);
     try std.testing.expectEqual(@as(usize, abi.host_functions.len), info.host_function_count);
     try std.testing.expect(info.allowed_caps.has(.reply));
+    try std.testing.expect(info.allowed_caps.has(.hooks));
+    try std.testing.expect(!info.allowed_caps.has(.time));
     try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
     try std.testing.expectEqual(@as(usize, 4096), info.max_plugin_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024), info.max_memory_bytes);

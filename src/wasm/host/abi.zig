@@ -43,6 +43,13 @@ pub const Capability = enum {
             .hooks => "hooks",
         };
     }
+
+    pub fn fromToken(token_text: []const u8) ?Capability {
+        inline for ([_]Capability{ .reply, .log, .time, .rand, .store, .lookup, .hooks }) |cap| {
+            if (std.ascii.eqlIgnoreCase(token_text, cap.token())) return cap;
+        }
+        return null;
+    }
 };
 
 /// Compact granted/requested capability set.
@@ -217,4 +224,10 @@ test "capability set renders stable token list" {
     const caps = CapabilitySet.initMany(&.{ .reply, .time, .log });
     var out: [64]u8 = undefined;
     try std.testing.expectEqualStrings("reply,log,time", caps.writeTokens(&out));
+}
+
+test "capability tokens parse case-insensitively and reject unknown names" {
+    try std.testing.expectEqual(Capability.reply, Capability.fromToken("reply").?);
+    try std.testing.expectEqual(Capability.store, Capability.fromToken("STORE").?);
+    try std.testing.expect(Capability.fromToken("net:outbound") == null);
 }
