@@ -25132,6 +25132,21 @@ pub const LinuxServer = struct {
         };
     }
 
+    fn codecMediaKind(tag: sdp.CodecTag) ?media_room.MediaKind {
+        return switch (tag) {
+            .kaguravox => .voice,
+            .kaguravis => .video,
+            .raw => null,
+        };
+    }
+
+    fn codecSetHasKind(codecs: []const sdp.Codec, kind: media_room.MediaKind) bool {
+        for (codecs) |codec| {
+            if (codecMediaKind(codec.tag) == kind) return true;
+        }
+        return false;
+    }
+
     fn fecSchemeName(scheme: sdp.FecScheme) []const u8 {
         return switch (scheme) {
             .none => "none",
@@ -25187,6 +25202,16 @@ pub const LinuxServer = struct {
         var buf: [320]u8 = undefined;
         const detail = formatMediaCodecDetail(&buf, codecs, fec) orelse return;
         try self.publishMediaEvent("CAPS", channel, nick, detail);
+    }
+
+    fn sendDeniedMediaKinds(self: *LinuxServer, conn: *ConnState, channel: []const u8, offered: []const sdp.Codec, accepted: []const sdp.Codec) !void {
+        const kinds = [_]media_room.MediaKind{ .voice, .video };
+        for (kinds) |kind| {
+            if (!codecSetHasKind(offered, kind) or codecSetHasKind(accepted, kind)) continue;
+            var buf: [96]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "kind={s} reason=no_common_codec", .{media_room.kindName(kind)}) catch return;
+            try self.sendMediaEventReply(conn, "KIND-DENIED", channel, detail);
+        }
     }
 
     /// The peer's RFC 8122 DTLS-SRTP request, parsed from a MEDIA OFFER/ANSWER's
@@ -25298,11 +25323,13 @@ pub const LinuxServer = struct {
         };
         const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = offered_fec, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, local, remote) catch {
+            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], &.{}) catch {};
             try self.failReply(conn, "MEDIA", "NEGOTIATE_FAILED", "No common codec");
             return;
         };
         defer negotiated.deinit(self.allocator);
         if (negotiated.codecs.len == 0) {
+            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], &.{}) catch {};
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the SFU");
             return;
         }
@@ -25310,6 +25337,7 @@ pub const LinuxServer = struct {
         self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
         self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
         self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
+        self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], negotiated.codecs) catch {};
         try self.mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
         // Converge the negotiated codec profile across the whole channel via the
         // MEDIA EVENT plane (typed, mesh-propagated, member-gated) — same path as
@@ -25509,11 +25537,13 @@ pub const LinuxServer = struct {
         const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = answer_fec, .direction = .sendrecv };
         const offered = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = prof.slice(), .fec = prof.fec, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, offered, answerer) catch {
+            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], prof.slice()) catch {};
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
             return;
         };
         defer negotiated.deinit(self.allocator);
         if (negotiated.codecs.len == 0) {
+            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], prof.slice()) catch {};
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
             return;
         }
@@ -25527,6 +25557,7 @@ pub const LinuxServer = struct {
 
         self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
         self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
+        self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], negotiated.codecs) catch {};
         try self.mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
         try self.provisionMediaTransports(conn, channel, answer_digest != null, extra_args);
     }
@@ -38195,8 +38226,9 @@ test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     try recvUntil(&a, "EVENT A MEDIA NATIVE #media", 200);
 
     b.reset();
-    try writeAllFd(fd_b, "MEDIA ANSWER #media kaguravox transport=webrtc\r\n");
+    try writeAllFd(fd_b, "MEDIA ANSWER #media kaguravox,kaguravis transport=webrtc\r\n");
     try recvUntil(&a, "EVENT A MEDIA CAPS #media B codecs=kaguravox", 200);
+    try recvUntil(&b, "EVENT B MEDIA KIND-DENIED #media kind=video reason=no_common_codec", 200);
     try recvUntil(&b, "EVENT B MEDIA ANSWER-ACK #media", 200);
     try recvUntil(&b, "EVENT B MEDIA TRANSPORT #media", 200);
     try recvUntil(&b, "srtp=", 200);
@@ -38208,7 +38240,7 @@ test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     a.reset();
     try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
     try recvUntil(&a, "MEDIA ROSTER-END #media", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT A MEDIA ROSTER #media B voice main 0 0 - codecs=kaguravox fec=rs_block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT A MEDIA ROSTER #media B voice main 0 0 - codecs=kaguravox,kaguravis fec=rs_block") != null);
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {
