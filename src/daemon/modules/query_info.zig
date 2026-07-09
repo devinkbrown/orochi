@@ -33,6 +33,11 @@ fn info(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
     try core.server.handleInfo(core.conn);
 }
 
+fn directory(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
+    const core = Core.from(ctx);
+    try core.server.handleDirectory(core.conn);
+}
+
 fn motd(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
     const core = Core.from(ctx);
     try core.server.handleMotd(core.conn);
@@ -65,6 +70,7 @@ pub const module = registry.Module{
         .{ .name = "TIME", .handler = time },
         .{ .name = "ADMIN", .handler = admin },
         .{ .name = "INFO", .handler = info },
+        .{ .name = "DIRECTORY", .handler = directory, .summary = "public discovery-directory summary for this node" },
         .{ .name = "MOTD", .handler = motd },
         .{ .name = "LUSERS", .handler = lusers },
         .{ .name = "USERS", .handler = users },

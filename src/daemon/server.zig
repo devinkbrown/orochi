@@ -5045,6 +5045,10 @@ pub const LinuxServer = struct {
         writeStatsFileAtomic(io, self.config.chanstats_dir, "status.json", json);
     }
 
+    fn directoryRankScore(public_activity: chanstats_mod.ChanStats.PublicSummary) u64 {
+        return public_activity.messages +| (public_activity.active_channels_24h *| 100) +| (public_activity.channels *| 10);
+    }
+
     /// Pure builder for `status.json` (see `writeStatusJson`). Returns the JSON
     /// slice backed by `buf`; on overflow returns whatever was written so far
     /// (best-effort, never fails). Separated so it is testable without file I/O.
@@ -5089,6 +5093,27 @@ pub const LinuxServer = struct {
         }
         w.writeAll("]") catch return w.buffered();
         w.writeAll("}") catch return w.buffered();
+        w.print(",\"directory\":{{\"listed\":{s},\"rank_score\":{d},\"last_active\":", .{
+            if (self.config.network_discoverable) "true" else "false",
+            directoryRankScore(public_activity),
+        }) catch return w.buffered();
+        if (public_activity.last_active_ms) |last| {
+            w.print("{d}", .{@divFloor(last, 1000)}) catch return w.buffered();
+        } else {
+            w.writeAll("null") catch return w.buffered();
+        }
+        w.writeAll(",\"entry\":{\"network\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.config.network_name) catch return w.buffered();
+        w.writeAll(",\"node\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.serverName()) catch return w.buffered();
+        w.writeAll(",\"description\":") catch return w.buffered();
+        writeJsonEscaped(&w, self.config.server_description) catch return w.buffered();
+        w.print(",\"users_online\":{d},\"channels\":{d},\"messages\":{d},\"active_channels_24h\":{d}}}}}", .{
+            self.meshUserCount(),
+            public_activity.channels,
+            public_activity.messages,
+            public_activity.active_channels_24h,
+        }) catch return w.buffered();
         w.print(",\"features\":{{\"s2s\":{s},\"websocket\":{s},\"webtransport\":{s},\"proxy_protocol\":{s},\"media\":{s},\"webpush\":{s},\"webauthn\":{s},\"webhook\":{s},\"metrics\":{s},\"sts\":{s},\"raw_public_key\":{s},\"ktls_tx\":{s},\"ktls_rx\":{s},\"orowasm\":{s},\"geo\":{s},\"connection_throttle\":{s},\"mesh_clone_limit\":{s},\"reputation_gate\":{s},\"dnsbl\":{s}}}", .{
             if (self.config.s2s_port != 0 or self.config.mesh_connect.len != 0) "true" else "false",
             if (self.config.ws_enabled) "true" else "false",
@@ -27820,6 +27845,50 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Yoroi TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (KaguraVox/KaguraVis)");
     }
 
+    /// DIRECTORY — registered-client view of the public discovery-directory
+    /// entry this node would publish. Mirrors the aggregate-only status.json
+    /// directory block: opt-in flag, liveness score, public activity, and mesh
+    /// peer health counts. It deliberately does not list channel names.
+    pub fn handleDirectory(self: *LinuxServer, conn: *ConnState) !void {
+        const public_activity = self.chanstats.publicSummary(platform.realtimeMillis());
+        var peers_total: u32 = 0;
+        var peers_up: u32 = 0;
+        for (&self.peer_health.slots) |*slot| {
+            if (!slot.used) continue;
+            peers_total += 1;
+            if (slot.health.state == .established) peers_up += 1;
+        }
+
+        try queueNumeric(conn, .RPL_INFOSTART, &.{}, "Orochi discovery directory");
+        var b: [640]u8 = undefined;
+        if (std.fmt.bufPrint(&b, "listed={s} network={s} node={s} description={s}", .{
+            if (self.config.network_discoverable) "true" else "false",
+            self.config.network_name,
+            self.serverName(),
+            self.config.server_description,
+        })) |line| try queueNumeric(conn, .RPL_INFO, &.{}, line) else |_| {}
+
+        if (std.fmt.bufPrint(&b, "rank_score={d} users_online={d} channels={d} messages={d} active_channels_24h={d}", .{
+            directoryRankScore(public_activity),
+            self.meshUserCount(),
+            public_activity.channels,
+            public_activity.messages,
+            public_activity.active_channels_24h,
+        })) |line| try queueNumeric(conn, .RPL_INFO, &.{}, line) else |_| {}
+
+        if (public_activity.last_active_ms) |last| {
+            if (std.fmt.bufPrint(&b, "last_active={d} heatline_days={d}", .{ @divFloor(last, 1000), public_activity.heatline_len })) |line| try queueNumeric(conn, .RPL_INFO, &.{}, line) else |_| {}
+        } else {
+            try queueNumeric(conn, .RPL_INFO, &.{}, "last_active=null heatline_days=0");
+        }
+
+        if (std.fmt.bufPrint(&b, "mesh_peers_up={d} mesh_peers_total={d}", .{ peers_up, peers_total })) |line| try queueNumeric(conn, .RPL_INFO, &.{}, line) else |_| {}
+        if (!self.config.network_discoverable) {
+            try queueNumeric(conn, .RPL_INFO, &.{}, "private: set [network] discoverable=true to opt into public directory crawlers");
+        }
+        try queueNumeric(conn, .RPL_ENDOFINFO, &.{}, "End of /DIRECTORY");
+    }
+
     /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).
     pub fn handleUsers(self: *LinuxServer, conn: *ConnState) !void {
         try queueNumeric(conn, .RPL_USERSSTART, &.{}, "UserID   Terminal  Host");
@@ -33445,6 +33514,9 @@ test "status.json: emits node health + mesh peers for the public status page" {
 
         var buf: [8192]u8 = undefined;
         const text = server.buildStatusJson(&buf);
+        var parsed_status = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer parsed_status.deinit();
+        try std.testing.expect(parsed_status.value.object.get("directory") != null);
 
         // Node identity + health envelope.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"description\":\"Alpha node\"") != null);
@@ -33454,6 +33526,10 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"activity\":{\"channels\":1,\"messages\":1,\"active_channels_24h\":1,\"last_active\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"heatline\":[1]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"directory\":{\"listed\":false,\"rank_score\":111,\"last_active\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"entry\":{\"network\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"description\":\"Alpha node\",\"users_online\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"channels\":1,\"messages\":1,\"active_channels_24h\":1}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"proxy_protocol\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false,\"connection_throttle\":false,\"mesh_clone_limit\":false,\"reputation_gate\":false,\"dnsbl\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
@@ -33495,6 +33571,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         server.config.dnsbl = &dnsbl;
         const public_text = server.buildStatusJson(&buf);
         try std.testing.expect(std.mem.indexOf(u8, public_text, "\"discoverable\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, public_text, "\"directory\":{\"listed\":true,\"rank_score\":111") != null);
         try std.testing.expect(std.mem.indexOf(u8, public_text, "\"features\":{\"s2s\":true,\"websocket\":true,\"webtransport\":true,\"proxy_protocol\":true,\"media\":true,\"webpush\":true,\"webauthn\":true,\"webhook\":true,\"metrics\":true,\"sts\":true,\"raw_public_key\":true,\"ktls_tx\":true,\"ktls_rx\":true,\"orowasm\":true,\"geo\":true,\"connection_throttle\":true,\"mesh_clone_limit\":true,\"reputation_gate\":true,\"dnsbl\":true}") != null);
     } else return error.SkipZigTest;
 }
@@ -36220,6 +36297,11 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     a.reset();
     try writeAllFd(fd_a, "INFO\r\n");
     try recvUntil(&a, " 371 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "DIRECTORY\r\n");
+    try recvUntil(&a, " 373 A :Orochi discovery directory\r\n", 200);
+    try recvUntil(&a, " 371 A :listed=", 200);
+    try recvUntil(&a, " 374 A :End of /DIRECTORY\r\n", 200);
     a.reset();
     try writeAllFd(fd_a, "USERS\r\n");
     try recvUntil(&a, " 392 A ", 200);
