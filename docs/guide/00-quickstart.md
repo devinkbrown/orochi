@@ -2,7 +2,10 @@
 
 *Build Orochi, write a minimal config, and start the daemon.*
 
-Orochi is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares Zig `0.17.0-dev.1282+c0f9b51d8` as the minimum supported compiler (`build.zig.zon:34`), and the daemon build rejects 32-bit targets (`build.zig:20`, `build.zig:24`).
+Orochi is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares
+Zig `0.17.0-dev.1282+c0f9b51d8` as the minimum supported compiler, and the
+daemon build rejects 32-bit targets. The browser WASM artifacts are the only
+deliberate 32-bit exception.
 
 ## Build
 
@@ -12,7 +15,7 @@ From the repository root:
 zig build
 ```
 
-The default build installs the `orochi` executable under `zig-out/bin` (`build.zig:87`, `build.zig:119`).
+The default build installs the `orochi` executable under `zig-out/bin`.
 
 For a fast semantic check:
 
@@ -20,11 +23,11 @@ For a fast semantic check:
 zig build check
 ```
 
-The `check` step analyzes `src/main.zig` without emitting a daemon binary (`build.zig:213`, `build.zig:227`).
+The `check` step analyzes `src/main.zig` without emitting a daemon binary.
 
 ## Minimal config
 
-The parser requires only `[node].id` and `[listen].irc` (`src/daemon/config_format.zig:478`):
+The parser requires only `[node].id` and `[listen].irc`:
 
 ```toml
 [node]
@@ -37,6 +40,12 @@ irc = 6680
 
 Save this as a local TOML file, or start from the runnable reference at `etc/orochi.reference.toml`. The current source still requires `[listen].irc` even for TLS-first deployments.
 
+Validate a config without binding ports or dialing mesh peers:
+
+```sh
+zig build run -- --check-config etc/orochi.reference.toml
+```
+
 ## First run
 
 Run the daemon with an explicit config path:
@@ -45,14 +54,40 @@ Run the daemon with an explicit config path:
 zig build run -- etc/orochi.reference.toml
 ```
 
-`src/main.zig` treats the first non-command argument as the config file path. It reads up to 1 MiB, parses the file, maps it onto `server.Config`, and stores the path for live `REHASH` (`src/main.zig:99`, `src/main.zig:104`, `src/main.zig:106`, `src/main.zig:112`). If the file is missing or invalid, boot logs the error and keeps defaults instead of aborting (`src/main.zig:116`, `src/main.zig:119`).
+`src/main.zig` treats the first non-command argument as the config file path. It
+reads up to 1 MiB, parses the file, maps it onto `server.Config`, and stores the
+path for live `REHASH`. If the file is missing or invalid, boot logs the error
+and keeps defaults instead of aborting.
 
-The default listener port is `6680` before config overlay (`src/main.zig:40`). The boot sequence then installs the configured network name, ISUPPORT limits, mesh identity, SASL account store, cloaking key, TLS listener, and optional STS policy before starting the server loop (`src/main.zig:129`, `src/main.zig:141`, `src/main.zig:160`, `src/main.zig:200`, `src/main.zig:216`, `src/main.zig:242`, `src/main.zig:266`).
+The default listener port is `6680` before config overlay. The boot sequence then
+installs the configured network name, ISUPPORT limits, mesh identity, SASL
+account store, cloaking key, TLS listener, and optional STS policy before
+starting the server loop.
+
+For an end-to-end local smoke after `zig build`:
+
+```sh
+python3 tools/runtime_smoke.py zig-out/bin/orochi
+```
+
+This boots a temporary loopback daemon, registers a client, verifies PING/PONG,
+and shuts the process down cleanly.
 
 ## Config indirection
 
-The parser supports `env:NAME` and `@file:path` string indirection (`src/daemon/config_format.zig:486`). The CLI boot resolver wires `env:` only (`src/main.zig:100`), so `@file:` requires a boot path that provides a file resolver.
+The parser supports `env:NAME` and `@file:path` string indirection for string
+values. The normal CLI boot path wires both resolvers, so configs can keep
+secrets in the process environment or in files relative to the daemon working
+directory.
 
 ## Connection classes
 
 After the basic setup, define connection classes under `[class.<name>]` to control per-client resource limits, flood policies, and admission rules by IP, TLS, account, or oper status. Every custom class inherits sensible fallbacks from the built-in `user` and `server` classes. See [operators.md](operators.md) for detailed coverage.
+
+## Production next steps
+
+- Use `zig build package --prefix /tmp/orochi-stage` to stage a ReleaseFast daemon,
+  reference config, and systemd unit.
+- Read the [runbook](../RUNBOOK.md) before deploying or hot-upgrading a live node.
+- Read [testing.md](testing.md) for the focused roadmap gates and long-run verbose
+  assurance lanes.

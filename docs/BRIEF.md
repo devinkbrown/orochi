@@ -2,12 +2,10 @@
 
 *Clean-slate, Zig-native successor to the ophion IRC daemon.*
 
-Orochi (大蛇 — the eight-forked great serpent) is a 100% clean-slate, Zig-native
-system: the daemon *and its entire substrate* (the libop systems library and the
-opssl crypto/TLS library) are rewritten from scratch in Zig. ophion, libop, and
-opssl are reference only — we mine them for the feature inventory, the hard-won
-lessons, and the Suimyaku/Tsumugi conceptual foundation, then design something
-better.
+Orochi is a 100% clean-slate, Zig-native system: the daemon, substrate, crypto,
+TLS, tooling, and browser WASM surfaces are all in this repository and written in
+Zig. ophion, libop, and opssl are historical reference material only — useful for
+feature inventory and hard-won operational lessons, never source to preserve.
 
 Orochi keeps ophion's full feature surface (IRCv3, IRCX, SASL, in-process
 services, WebSocket, CHATHISTORY, voice/video) and replaces the legacy TS6 S2S
@@ -56,12 +54,12 @@ something, name it and specify it well enough to build.
 
 ## Scope of the rewrite (everything is ours)
 
-1. **Substrate (libop successor, Zig-native).** Event loop (io_uring), lock-free
+1. **Substrate (`src/substrate`, Zig-native).** Event loop (io_uring), lock-free
    concurrency, allocators and arenas, the full data-structure kit, and the
    Suimyaku math substrate (CRDTs, vector and hybrid-logical clocks, Merkle delta
    sync, gossip). Reimagine these with comptime and Zig semantics; invent new
    primitives.
-2. **Crypto and TLS (opssl successor, Zig-native).** Modern: TLS 1.3 plus a
+2. **Crypto and TLS (`src/crypto`, Zig-native).** Modern: TLS 1.3 plus a
    hardened TLS 1.2 profile, post-quantum-hybrid by default, constant-time *by
    construction* (ideally comptime-verified), plus the Tsumugi transport crypto.
    Invent where the design allows.
@@ -99,7 +97,7 @@ historical inventory.
 - Tsumugi (was VEIL) reference spec: `ophion/docs/protocols/veil-security.md`
 - Suimyaku media (was LADON) reference: `ophion/docs/reference/modules/m_ladon_*.md`
 
-## Planning deliverables (this phase — Codex workers plus Claude synthesis)
+## Historical planning deliverables
 
 - `docs/planning/01-substrate.md` — Zig-native systems substrate (libop successor).
 - `docs/planning/02-crypto-tsumugi.md` — Zig-native crypto/TLS plus Tsumugi (opssl successor).
@@ -107,7 +105,16 @@ historical inventory.
 - `docs/planning/04-suimyaku-mesh.md` — client line protocol plus Suimyaku/Tsumugi mesh and CRDTs.
 - `docs/planning/05-innovation.md` — invented technologies plus build, test, and roadmap.
 
-Planning only; no production code until the design is settled and reviewed by Claude.
+These documents are design history. Current guides, reference docs, and source-backed
+tests are authoritative when behavior diverges from older planning text.
+
+## Current operator and contributor entry points
+
+- `README.md` — project overview and command shortlist.
+- `docs/README.md` — documentation index.
+- `docs/RUNBOOK.md` — deploy, validate, hot-upgrade, rollback, and health checks.
+- `CONTRIBUTING.md` — source-of-truth workflow and test/PR checklist.
+- `docs/guide/testing.md` — focused test lanes and deterministic assurance gates.
 
 ## Clean-room and no-legacy mandate
 

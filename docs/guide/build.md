@@ -2,12 +2,14 @@
 
 *Build, test, and cross-compile the Orochi daemon with Zig.*
 
-Orochi builds with Zig's build system and has no package dependencies in `build.zig.zon` (`build.zig.zon:34`). Linux builds do not link libc; macOS and BSD targets link libc only for the platform syscalls that require it (`build.zig:40`, `build.zig:43`).
+Orochi builds with Zig's build system and has no package dependencies in
+`build.zig.zon`. Linux builds do not link libc; macOS and BSD targets link libc
+only for the platform syscalls that require it.
 
 ## Requirements
 
-- Zig `0.17.0-dev.1282+c0f9b51d8` or newer as declared by `build.zig.zon` (`build.zig.zon:34`).
-- A 64-bit daemon target. `build.zig` rejects 32-bit daemon builds at configure time (`build.zig:20`, `build.zig:24`).
+- Zig `0.17.0-dev.1282+c0f9b51d8` or newer as declared by `build.zig.zon`.
+- A 64-bit daemon target. `build.zig` rejects 32-bit daemon builds at configure time.
 
 ## Common targets
 
@@ -36,6 +38,7 @@ Orochi builds with Zig's build system and has no package dependencies in `build.
 | `zig build check` | Type-checks the daemon without emitting a binary. | `build.zig` |
 | `zig build wasm` | Builds browser-facing KaguraVox/KaguraVis codec and transport WASM modules. | `build.zig` |
 | `zig build release` | Builds an optimized stripped daemon with `ReleaseFast`. | `build.zig` |
+| `zig build package` | Stages the ReleaseFast daemon, reference config, and systemd unit into the install prefix. | `build.zig` |
 
 `-Dtest-filter=<text>` is a build option. Do not pass `-- --test-filter`; that
 does not configure the build graph and can run far more than intended. See the
@@ -43,7 +46,8 @@ does not configure the build graph and can run far more than intended. See the
 
 ## Cross targets
 
-Pass `-Dtarget=<triple>` to choose a target; the build script uses standard target options (`build.zig:10`, `build.zig:14`).
+Pass `-Dtarget=<triple>` to choose a target; the build script uses Zig's
+standard target options.
 
 For example:
 
@@ -53,8 +57,31 @@ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
 zig build check -Dtarget=x86_64-linux
 ```
 
-The daemon target must be 64-bit. The `wasm` step is the deliberate `wasm32-freestanding` exception for browser codec and transport artifacts, not for the daemon (`build.zig:176`, `build.zig:179`).
+The daemon target must be 64-bit. The `wasm` step is the deliberate
+`wasm32-freestanding` exception for browser codec and transport artifacts, not
+for the daemon.
 
 ## Optimization
 
-Use Zig's standard `-Doptimize=` modes. Debug builds keep symbols; optimized daemon builds strip debug info (`build.zig:15`, `build.zig:31`).
+Use Zig's standard `-Doptimize=` modes. Debug builds keep symbols; optimized
+daemon builds strip debug info.
+
+## Packaging
+
+`zig build package` is the deployable bundle step. It is separate from the default
+install so `zig build` stays a fast debug binary install. By default it stages under
+`zig-out/`; use `--prefix <dir>` for a release staging directory:
+
+```sh
+zig build package --prefix /tmp/orochi-stage
+```
+
+The staged layout is:
+
+| Path | Contents |
+|---|---|
+| `bin/orochi` | ReleaseFast stripped daemon |
+| `etc/orochi/orochi.reference.toml` | Annotated reference config |
+| `lib/systemd/system/orochi.service` | systemd unit for production deployment |
+
+See the [runbook](../RUNBOOK.md) for install, reload, and rollback procedures.

@@ -10,7 +10,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 
 | Area | Current source of truth | What it owns | Evidence |
 | --- | --- | --- | --- |
-| Build/package | `build.zig`, `build.zig.zon` | Zig package metadata, `orochi` executable, test/run steps, 64-bit daemon target guard | `build.zig:20`, `build.zig:87`, `build.zig.zon:34` |
+| Build/package | `build.zig`, `build.zig.zon`, `etc/systemd/orochi.service` | Zig package metadata, `orochi` executable, focused test/run steps, ReleaseFast package staging, systemd unit, 64-bit daemon target guard | `build.zig`, `build.zig.zon`, `etc/systemd/orochi.service` |
 | Daemon server | `src/daemon/server.zig` | Linux TCP server, Ringlane io_uring wrapper, connection table, registration integration, live stores, registry/WASM dispatch, media/upgrade wiring | `src/daemon/server.zig:1`, `src/daemon/server.zig:466`, `src/daemon/server.zig:1285` |
 | Connection classes | `src/daemon/conn_class.zig`, `src/daemon/server.zig` | Named per-connection policy (sendq/recvq ceilings, max_clients/per_ip/channels, timeouts, TLS/SASL requirements, flood control, nick-delay exemption); CIDR/TLS/account/oper/ident/host matching; per-class assignment at registration | `src/daemon/conn_class.zig:1`, `src/daemon/server.zig:7073`, `src/daemon/server.zig:3615` |
 | Nick delay | `src/daemon/nick_delay.zig`, `src/daemon/server.zig` | Held-nick registry; holds a released nick for a configured window to prevent nick camping; per-account reclaim and oper bypass; exempt class bypass | `src/daemon/nick_delay.zig:1`, `src/daemon/server.zig:2099`, `src/daemon/server.zig:5949` |
@@ -26,6 +26,25 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Web Push | `src/crypto/webpush.zig`, `src/daemon/webpush.zig` | Browser push for offline DMs: RFC 8291 content encryption + RFC 8292 VAPID, background delivery worker, ISUPPORT `VAPID=` discovery, account-scoped subscriptions | `src/crypto/webpush.zig:1`, `src/daemon/webpush.zig:1`, `src/daemon/server.zig:1234` |
 | Host cloaking | `src/proto/cloak.zig`, `src/daemon/server.zig` | Keyed-HMAC v2 IP cloaks (hierarchical subnet-bannable or opaque), per-account cloak, rotatable key with ban continuity, GeoIP/ASN mixing, oper-only rDNS + cross-mesh real-IP/certfp in WHOIS | `src/proto/cloak.zig:1`, `src/daemon/config_format.zig:201` |
 | Observability / stats | `src/daemon/chanstats.zig`, `src/daemon/server.zig` | Per-channel statistics engine (JSON dashboard feed), USR2-durable binary snapshot, dead-channel prune, and the public `status.json` mesh-health feed | `src/daemon/chanstats.zig:1`, `src/daemon/server.zig` (`buildStatusJson`) |
+
+## Build, Test, And Package Surface
+
+The build graph is part of the architecture, not only developer tooling. It exposes
+the operational lanes used to keep the daemon deployable:
+
+| Step | Role |
+|---|---|
+| `check` | Type-checks the daemon without emitting a binary. |
+| `test-smoke` | Fast inner-loop gate for semantic, TLS, server, and config behavior. |
+| `test-roadmap` | Server-roadmap gate spanning server/config/IRCX/event/mesh/services/TLS. |
+| `test-media` / `test-helix` | Focused media and upgrade lanes kept independently runnable. |
+| `all-checks` | Deterministic pre-push gate: check, WASM build, full tests, fuzz corpus replay, and BoGo shim self-tests. |
+| `release` | ReleaseFast stripped production binary. |
+| `package` | ReleaseFast daemon plus reference config and systemd unit staged into the install prefix. |
+
+Verbose test variants use `tools/verbose_test_runner.zig` to print each test name,
+duration, summary counts, and the slowest tests, which makes long daemon suites
+observable in CI and tmux.
 
 ## End-to-end client request flow
 

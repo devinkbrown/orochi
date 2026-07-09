@@ -50,6 +50,18 @@ build graph and can accidentally run the broad suite.
 `zig build ct-check` is intentionally separate. It is a timing/statistical
 constant-time harness and should not be folded into deterministic CI gates.
 
+## Runtime smoke lanes
+
+These helpers run a real daemon binary, not only `test` blocks:
+
+| Command | Use it for |
+|---|---|
+| `python3 tools/runtime_smoke.py zig-out/bin/orochi` | Cold-boot a loopback daemon, register a client, verify PING/PONG, and shut down cleanly. |
+| `python3 tools/upgrade_smoke.py zig-out/bin/orochi` | Exercise Helix/SIGUSR2 hot-upgrade, inherited listener adoption, carried connection survival, WHOIS, NAMES, and post-upgrade registration. |
+
+Run them after `zig build` or against a staged release binary when validating an
+operator-facing change.
+
 ## Roadmap-change default
 
 For daemon/TLS/server roadmap work, run:
@@ -60,6 +72,14 @@ zig build test-roadmap-verbose --summary all
 zig build test -Dtest-filter="<feature keyword>" --summary all
 zig build test-smoke -Doptimize=ReleaseSafe --summary all
 zig build all-checks --summary all
+```
+
+For deploy or Helix work, add:
+
+```sh
+zig build
+python3 tools/runtime_smoke.py zig-out/bin/orochi
+python3 tools/upgrade_smoke.py zig-out/bin/orochi
 ```
 
 When config files changed, also run:

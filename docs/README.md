@@ -15,6 +15,12 @@ richer `INFO`.
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
 [architecture overview](architecture/00-overview.md).
 
+## Operations
+
+- [Runbook](RUNBOOK.md) — staging, systemd install, config validation, hot-upgrade, rollback, health checks
+- [Contributing](../CONTRIBUTING.md) — source-of-truth workflow, build/test lanes, PR checklist
+- [Security policy](../SECURITY.md) — private vulnerability reporting
+
 ## Guides
 
 - [Quickstart](guide/00-quickstart.md) — build, configure, and run in minutes
@@ -82,5 +88,6 @@ behavior, the guides and reference above — verified against the code — are a
 
 - [Project README](../README.md)
 - [Contributing](../CONTRIBUTING.md)
+- [Runbook](RUNBOOK.md)
 - [Security policy](../SECURITY.md)
 - [License (AGPL-3.0-or-later)](../LICENSE)

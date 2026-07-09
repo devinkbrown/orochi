@@ -20,7 +20,8 @@ native **Suimyaku + Tsumugi** cryptographic mesh.
 **Quick links:** [Quickstart](docs/guide/00-quickstart.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
-[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)
+[Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
+[Security](SECURITY.md) · [License](LICENSE)
 
 ## Highlights
 
@@ -88,13 +89,14 @@ zig build test-roadmap # server roadmap gate: check + focused daemon/protocol su
 zig build all-checks   # deterministic pre-push gate: check + wasm + tests + fuzz + BoGo smokes
 zig build all-checks-verbose # same gate with per-test progress for long runs
 zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/orochi
+zig build package      # stage release binary + reference config + systemd unit
 zig build run          # run the daemon locally
 ./tools/genroots.sh    # regenerate package-root imports from the files present
 ```
 
 Start from the [quickstart](docs/guide/00-quickstart.md), then see the
 [operator guide](docs/guide/operators.md), [testing guide](docs/guide/testing.md),
-[TLS guide](docs/guide/tls.md), and
+[runbook](docs/RUNBOOK.md), [TLS guide](docs/guide/tls.md), and
 [mesh guide](docs/guide/mesh.md). A complete, commented configuration reference lives in
 [`docs/reference/config.md`](docs/reference/config.md) and
 [`etc/orochi.reference.toml`](etc/orochi.reference.toml).
@@ -104,6 +106,7 @@ Start from the [quickstart](docs/guide/00-quickstart.md), then see the
 The [`docs/`](docs/README.md) tree is grounded in, and cites, the live source:
 
 - **[Guides](docs/guide/00-quickstart.md)** — quickstart, build, TLS, mesh, operators, persistence, upgrade.
+- **[Runbook](docs/RUNBOOK.md)** — staging, systemd install, config validation, health checks, hot-upgrade, rollback.
 - **[Architecture](docs/architecture/00-overview.md)** — reactor and threading, dispatch and modules, mesh, cryptography, media, upgrade.
 - **[Reference](docs/reference/commands/_index.md)** — every command, the config schema, IRCv3/IRCX, modes, numerics, and ISUPPORT.
 
