@@ -148,6 +148,176 @@ pub const FrameType = enum(u8) {
 
 pub const Type = FrameType;
 
+pub const Capability = enum(u3) {
+    frame_signing = 0,
+    member_account = 1,
+    member_oper_info = 2,
+    repair_frames = 3,
+
+    pub fn bit(self: Capability) u3 {
+        return @intFromEnum(self);
+    }
+
+    pub fn mask(self: Capability) u8 {
+        return @as(u8, 1) << self.bit();
+    }
+};
+
+pub const cap_frame_signing: u8 = Capability.frame_signing.mask();
+pub const cap_member_account: u8 = Capability.member_account.mask();
+pub const cap_member_oper_info: u8 = Capability.member_oper_info.mask();
+pub const cap_repair_frames: u8 = Capability.repair_frames.mask();
+
+pub const CapabilitySpec = struct {
+    cap: Capability,
+    token: []const u8,
+    summary: []const u8,
+
+    pub fn bit(self: CapabilitySpec) u3 {
+        return self.cap.bit();
+    }
+
+    pub fn mask(self: CapabilitySpec) u8 {
+        return self.cap.mask();
+    }
+};
+
+pub const capability_catalog = [_]CapabilitySpec{
+    .{
+        .cap = .frame_signing,
+        .token = "frame-signing",
+        .summary = "Signed-frame envelopes for direct-owned state, oper-trust facts, and repair frames.",
+    },
+    .{
+        .cap = .member_account,
+        .token = "member-account",
+        .summary = "Optional account fields on membership and nick-change propagation.",
+    },
+    .{
+        .cap = .member_oper_info,
+        .token = "member-oper-info",
+        .summary = "Secured-only real-host and certificate fingerprint propagation for oper-visible identity.",
+    },
+    .{
+        .cap = .repair_frames,
+        .token = "repair-frames",
+        .summary = "Merkle-guided anti-entropy repair summary, request, and response frames.",
+    },
+};
+
+pub fn capabilitySpec(cap: Capability) CapabilitySpec {
+    inline for (capability_catalog) |entry| {
+        if (entry.cap == cap) return entry;
+    }
+    unreachable;
+}
+
+pub fn capabilityByToken(token: []const u8) ?CapabilitySpec {
+    inline for (capability_catalog) |entry| {
+        if (std.mem.eql(u8, entry.token, token)) return entry;
+    }
+    return null;
+}
+
+pub const FrameFamily = enum {
+    handshake,
+    crdt,
+    membership,
+    relay,
+    oper,
+    control,
+    repair,
+    notification,
+
+    pub fn token(self: FrameFamily) []const u8 {
+        return switch (self) {
+            .handshake => "handshake",
+            .crdt => "crdt",
+            .membership => "membership",
+            .relay => "relay",
+            .oper => "oper",
+            .control => "control",
+            .repair => "repair",
+            .notification => "notification",
+        };
+    }
+};
+
+pub const FrameAuth = enum {
+    unsigned,
+    signable,
+    signed,
+    secured_signed,
+
+    pub fn token(self: FrameAuth) []const u8 {
+        return switch (self) {
+            .unsigned => "unsigned",
+            .signable => "signable",
+            .signed => "signed",
+            .secured_signed => "secured-signed",
+        };
+    }
+};
+
+pub const FrameSpec = struct {
+    frame_type: FrameType,
+    token: []const u8,
+    family: FrameFamily,
+    auth: FrameAuth,
+    capability_mask: u8 = 0,
+    summary: []const u8,
+};
+
+pub const frame_catalog = [_]FrameSpec{
+    .{ .frame_type = .HANDSHAKE, .token = "HANDSHAKE", .family = .handshake, .auth = .unsigned, .summary = "Exchanges node id, epoch, server name, description, and negotiated S2S capabilities." },
+    .{ .frame_type = .BURST, .token = "BURST", .family = .crdt, .auth = .unsigned, .summary = "Initial serialized channel CRDT state burst." },
+    .{ .frame_type = .DELTA, .token = "DELTA", .family = .crdt, .auth = .unsigned, .summary = "Incremental channel CRDT delta." },
+    .{ .frame_type = .GOSSIP, .token = "GOSSIP", .family = .membership, .auth = .unsigned, .summary = "Sazanami membership and suspicion gossip payload." },
+    .{ .frame_type = .PING, .token = "PING", .family = .control, .auth = .unsigned, .summary = "Liveness probe; answered with a matching PONG payload." },
+    .{ .frame_type = .PONG, .token = "PONG", .family = .control, .auth = .unsigned, .summary = "Liveness probe response." },
+    .{ .frame_type = .QUIT, .token = "QUIT", .family = .control, .auth = .unsigned, .summary = "Remote peer close notification." },
+    .{ .frame_type = .MEMBERSHIP, .token = "MEMBERSHIP", .family = .membership, .auth = .signable, .summary = "Channel-member route fact; optional account and oper-info extensions are capability-gated." },
+    .{ .frame_type = .MESSAGE, .token = "MESSAGE", .family = .relay, .auth = .signed, .summary = "Cross-node PRIVMSG, NOTICE, TAGMSG, DATA, and WHISPER relay with self-contained origin signature." },
+    .{ .frame_type = .OPER_GRANT, .token = "OPER_GRANT", .family = .oper, .auth = .secured_signed, .summary = "Cross-mesh operator authorization grant verified against the secured peer identity." },
+    .{ .frame_type = .CHANNEL_MODE_FLAGS, .token = "CHANNEL_MODE_FLAGS", .family = .membership, .auth = .signable, .summary = "Boolean channel-mode flag fact." },
+    .{ .frame_type = .CHANNEL_LIST, .token = "CHANNEL_LIST", .family = .membership, .auth = .signable, .summary = "Channel list-mode fact for ban, exception, and invite-exception lists." },
+    .{ .frame_type = .CHANNEL_PROP, .token = "CHANNEL_PROP", .family = .membership, .auth = .signed, .summary = "IRCX channel property LWW fact with multi-hop origin signature." },
+    .{ .frame_type = .TOPIC, .token = "TOPIC", .family = .membership, .auth = .signable, .summary = "Channel topic fact." },
+    .{ .frame_type = .NICKCHANGE, .token = "NICKCHANGE", .family = .membership, .auth = .signable, .summary = "Remote nick-change fact; optional account extension is capability-gated." },
+    .{ .frame_type = .CHANNEL_MODE_STATE, .token = "CHANNEL_MODE_STATE", .family = .membership, .auth = .signable, .summary = "Parameter and IRCX channel-mode state snapshot." },
+    .{ .frame_type = .SESSION_MIGRATE, .token = "SESSION_MIGRATE", .family = .relay, .auth = .signed, .summary = "Signed session-migration capsule for live reclaim on the owning node." },
+    .{ .frame_type = .ENTITY_PROP, .token = "ENTITY_PROP", .family = .membership, .auth = .signed, .summary = "IRCX user/member property LWW fact with kind-tagged multi-hop origin signature." },
+    .{ .frame_type = .CLONE_COUNT, .token = "CLONE_COUNT", .family = .notification, .auth = .unsigned, .summary = "Per-node clone-count gossip using salted IP hashes." },
+    .{ .frame_type = .OPER_EVENT, .token = "OPER_EVENT", .family = .oper, .auth = .signed, .summary = "Network-wide Event-Spine operator notification." },
+    .{ .frame_type = .OBSERVE_EVENT, .token = "OBSERVE_EVENT", .family = .oper, .auth = .signed, .summary = "Network-wide operator OBSERVE lifecycle record." },
+    .{ .frame_type = .KILL, .token = "KILL", .family = .oper, .auth = .signed, .summary = "Targeted cross-mesh operator KILL command." },
+    .{ .frame_type = .WARD, .token = "WARD", .family = .oper, .auth = .signed, .summary = "Network-wide Warden mesh-ban convergence record." },
+    .{ .frame_type = .RESYNC, .token = "RESYNC", .family = .control, .auth = .unsigned, .summary = "Full-state resync request after hot-upgrade link preservation." },
+    .{ .frame_type = .REPAIR_SUMMARY, .token = "REPAIR_SUMMARY", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Merkle/RBSR anti-entropy summary." },
+    .{ .frame_type = .REPAIR_REQUEST, .token = "REPAIR_REQUEST", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Request for CRDT records whose hashes differ from a repair summary." },
+    .{ .frame_type = .REPAIR_RESPONSE, .token = "REPAIR_RESPONSE", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Repair records that backfill requested CRDT entities." },
+    .{ .frame_type = .TEGAMI_PUSH, .token = "TEGAMI_PUSH", .family = .notification, .auth = .secured_signed, .summary = "Secured-only Web Push hint for offline Tegami delivery." },
+};
+
+pub fn frameSpec(frame_type: FrameType) FrameSpec {
+    inline for (frame_catalog) |entry| {
+        if (entry.frame_type == frame_type) return entry;
+    }
+    unreachable;
+}
+
+pub fn frameSpecByTag(tag_value: u8) ?FrameSpec {
+    const frame_type = FrameType.fromTag(tag_value) orelse return null;
+    return frameSpec(frame_type);
+}
+
+pub fn frameSpecByToken(token: []const u8) ?FrameSpec {
+    inline for (frame_catalog) |entry| {
+        if (std.mem.eql(u8, entry.token, token)) return entry;
+    }
+    return null;
+}
+
 pub const Frame = struct {
     frame_type: FrameType,
     payload: []const u8,
@@ -260,41 +430,11 @@ pub const Decoder = struct {
 
 const testing = std.testing;
 
-const all_frame_types = [_]FrameType{
-    .HANDSHAKE,
-    .BURST,
-    .DELTA,
-    .GOSSIP,
-    .PING,
-    .PONG,
-    .QUIT,
-    .MEMBERSHIP,
-    .MESSAGE,
-    .OPER_GRANT,
-    .CHANNEL_MODE_FLAGS,
-    .CHANNEL_LIST,
-    .CHANNEL_PROP,
-    .TOPIC,
-    .NICKCHANGE,
-    .CHANNEL_MODE_STATE,
-    .SESSION_MIGRATE,
-    .ENTITY_PROP,
-    .CLONE_COUNT,
-    .OPER_EVENT,
-    .OBSERVE_EVENT,
-    .KILL,
-    .WARD,
-    .RESYNC,
-    .REPAIR_SUMMARY,
-    .REPAIR_REQUEST,
-    .REPAIR_RESPONSE,
-    .TEGAMI_PUSH,
-};
-
 test "encode/decode round-trip each type" {
     const allocator = testing.allocator;
 
-    inline for (all_frame_types) |frame_type| {
+    inline for (frame_catalog) |spec| {
+        const frame_type = spec.frame_type;
         const payload = "suimyaku s2s payload";
         var encoded: [header_len + payload.len]u8 = undefined;
         const bytes = try encode(frame_type, payload, &encoded);
@@ -474,4 +614,44 @@ test "no leak when accumulator owns partial bytes" {
 
     try decoder.feed(bytes[0 .. bytes.len - 1]);
     try testing.expectEqual(@as(?Frame, null), try decoder.next());
+}
+
+test "capability catalog exposes stable wire bits" {
+    try testing.expectEqual(@as(u8, 0x01), cap_frame_signing);
+    try testing.expectEqual(@as(u8, 0x02), cap_member_account);
+    try testing.expectEqual(@as(u8, 0x04), cap_member_oper_info);
+    try testing.expectEqual(@as(u8, 0x08), cap_repair_frames);
+
+    try testing.expectEqual(@as(u3, 0), capabilitySpec(.frame_signing).bit());
+    try testing.expectEqual(@as(u3, 1), capabilityByToken("member-account").?.bit());
+    try testing.expect(capabilityByToken("does-not-exist") == null);
+}
+
+test "frame catalog covers every known tag exactly once" {
+    var seen = std.mem.zeroes([256]bool);
+    inline for (frame_catalog) |spec| {
+        const tag_value = spec.frame_type.tag();
+        try testing.expect(!seen[tag_value]);
+        seen[tag_value] = true;
+        try testing.expectEqual(spec.frame_type, FrameType.fromTag(tag_value).?);
+        try testing.expectEqual(spec.frame_type, frameSpec(spec.frame_type).frame_type);
+        try testing.expectEqual(spec.frame_type, frameSpecByTag(tag_value).?.frame_type);
+        try testing.expectEqual(spec.frame_type, frameSpecByToken(spec.token).?.frame_type);
+    }
+
+    var tag: usize = 0;
+    while (tag <= std.math.maxInt(u8)) : (tag += 1) {
+        if (FrameType.fromTag(@intCast(tag))) |frame_type| {
+            try testing.expect(seen[frame_type.tag()]);
+        }
+    }
+}
+
+test "repair frames are capability catalog gated" {
+    inline for (frame_catalog) |spec| {
+        if (spec.family == .repair) {
+            try testing.expectEqual(cap_repair_frames, spec.capability_mask);
+            try testing.expectEqual(FrameAuth.signed, spec.auth);
+        }
+    }
 }

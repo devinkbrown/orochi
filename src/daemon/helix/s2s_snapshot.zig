@@ -37,15 +37,16 @@
 const std = @import("std");
 
 const hs = @import("../../crypto/tsumugi_handshake.zig");
+const s2s_frame = @import("../../proto/s2s_frame.zig");
 
 pub const Error = error{ Truncated, TooLong };
 
 pub const est_len = hs.Established.serialized_len;
 
-pub const cap_signing: u8 = 1 << 0;
-pub const cap_account: u8 = 1 << 1;
-pub const cap_oper_info: u8 = 1 << 2;
-pub const cap_repair: u8 = 1 << 3;
+pub const cap_signing: u8 = s2s_frame.cap_frame_signing;
+pub const cap_account: u8 = s2s_frame.cap_member_account;
+pub const cap_oper_info: u8 = s2s_frame.cap_member_oper_info;
+pub const cap_repair: u8 = s2s_frame.cap_repair_frames;
 
 /// A plain view of one carried secured link. `remote_name`/`rec_inbuf`/`pending_out`
 /// borrow the source (encode input) or the decoded buffer (decode output); the

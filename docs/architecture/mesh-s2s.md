@@ -27,43 +27,60 @@ The daemon also keeps operational mesh state outside the substrate: peer health,
 
 `s2s_frame.zig` defines a simple length-prefixed frame. The header is exactly five bytes: one `u8` frame type tag and a little-endian `u32` payload length, followed by the payload bytes ([src/proto/s2s_frame.zig:1](../../src/proto/s2s_frame.zig#L1), [src/proto/s2s_frame.zig:3](../../src/proto/s2s_frame.zig#L3)). The default maximum frame size is 1 MiB ([src/proto/s2s_frame.zig:11](../../src/proto/s2s_frame.zig#L11)).
 
-| Frame type | Tag | Handled in current peer driver |
-| --- | ---: | --- |
-| `HANDSHAKE` | `0x01` | Exchanges node id, epoch, server name, and description. |
-| `BURST` | `0x02` | Applies a serialized channel CRDT state burst. |
-| `DELTA` | `0x03` | Merges a serialized CRDT delta. |
-| `GOSSIP` | `0x04` | Applies gossip membership payloads. |
-| `PING` / `PONG` | `0x05` / `0x06` | PING replies with matching PONG payload. |
-| `QUIT` | `0x07` | Closes the remote peer state. |
-| `MEMBERSHIP` | `0x08` | Applies remote channel-member route table facts (direct-origin, per-link signed). |
-| `MESSAGE` | `0x09` | Queues cross-node PRIVMSG/NOTICE/TAGMSG/DATA/WHISPER payloads; carries a self-contained origin signature verified at every hop. |
-| `OPER_GRANT` | `0x0A` | Queues signed oper-grant payloads for daemon verification. |
-| `CHANNEL_MODE_FLAGS` | `0x0B` | Boolean channel-mode flag facts (direct-origin, per-link signed). |
-| `CHANNEL_LIST` | `0x0C` | Channel list-mode (ban/except/invex) facts (direct-origin, per-link signed). |
-| `CHANNEL_PROP` | `0x0D` | IRCX channel property LWW facts; multi-hop origin signature stored in the prop clock and re-emitted verbatim. |
-| `TOPIC` | `0x0E` | Channel topic facts (direct-origin, per-link signed). |
-| `NICKCHANGE` | `0x0F` | Remote nick-change facts (direct-origin, per-link signed). |
-| `CHANNEL_MODE_STATE` | `0x10` | Parameter/extended channel-mode state (+k/+l/+j/+f, private/hidden, IRCX flags); direct-origin, per-link signed. |
-| `SESSION_MIGRATE` | `0x11` | Ships a signed session-migration capsule to the owning node for live reclaim. |
-| `ENTITY_PROP` | `0x12` | IRCX user/member property LWW facts; multi-hop origin signature (kind-tagged transcript), re-emitted verbatim. |
-| `CLONE_COUNT` | `0x13` | Per-node clone-count gossip folded into the network-wide per-IP-net aggregate; unsigned (a count, not an authority fact). |
-| `OPER_EVENT` | `0x14` | Network-wide Event-Spine notification (raid, flood, oper action, connect/disconnect, …) raised on one node and fanned to every node, rendered with the originating server name; signed. Carries `{category, severity, origin_server, message}` ([src/proto/oper_event.zig:1](../../src/proto/oper_event.zig#L1)). |
-| `OBSERVE_EVENT` | `0x15` | Network-wide operator OBSERVE feed: a lifecycle record (connect/quit/nick/oper-up) for a watched subject, so a standing `EVENT OBSERVE <mask>` matches subjects on every node; signed (the subject's real, uncloaked host is operator-trust). Carries `{action, origin_server, nick, user, host, account, detail}` ([src/proto/observe_event.zig:1](../../src/proto/observe_event.zig#L1)). |
+`src/proto/s2s_frame.zig` is now the source of truth for the public S2S frame catalog and the handshake capability catalog. `frame_catalog` records the tag, family, authentication mode, capability gate, and summary for every known frame; the codec tests assert that every `FrameType` is covered exactly once. `capability_catalog` records the stable handshake bits used by the peer driver and Helix resume snapshots.
 
-> A new frame tag is **not** backward-compatible: an older peer's decoder rejects
-> an unknown tag as `MalformedFrame` (see below) and the link re-dials, so the
-> mesh flaps until every node runs the binary that knows the tag. Upgrade all
-> mesh nodes together for any frame addition.
+| Capability | Bit | Mask | Meaning |
+| --- | ---: | ---: | --- |
+| `frame-signing` | `0` | `0x01` | Signed-frame envelopes for direct-owned state, oper-trust facts, and repair frames. |
+| `member-account` | `1` | `0x02` | Optional account fields on membership and nick-change propagation. |
+| `member-oper-info` | `2` | `0x04` | Secured-only real-host and certificate fingerprint propagation for oper-visible identity. |
+| `repair-frames` | `3` | `0x08` | Merkle-guided anti-entropy repair summary, request, and response frames. |
+
+| Frame type | Tag | Family | Auth | Capability | Current behavior |
+| --- | ---: | --- | --- | --- | --- |
+| `HANDSHAKE` | `0x01` | handshake | unsigned | - | Exchanges node id, epoch, server name, description, and capability bitfield. |
+| `BURST` | `0x02` | crdt | unsigned | - | Applies a serialized channel CRDT state burst. |
+| `DELTA` | `0x03` | crdt | unsigned | - | Merges a serialized CRDT delta. |
+| `GOSSIP` | `0x04` | membership | unsigned | - | Applies Sazanami membership and suspicion gossip payloads. |
+| `PING` | `0x05` | control | unsigned | - | Liveness probe; answered with a matching `PONG` payload. |
+| `PONG` | `0x06` | control | unsigned | - | Liveness probe response. |
+| `QUIT` | `0x07` | control | unsigned | - | Closes the remote peer state. |
+| `MEMBERSHIP` | `0x08` | membership | signable | `member-account`, `member-oper-info` extensions | Applies remote channel-member route table facts; optional account and oper-info trailing fields are capability-gated. |
+| `MESSAGE` | `0x09` | relay | signed | - | Queues cross-node PRIVMSG/NOTICE/TAGMSG/DATA/WHISPER payloads with self-contained origin signatures. |
+| `OPER_GRANT` | `0x0A` | oper | secured-signed | - | Queues cross-mesh operator grants for daemon verification against the secured peer identity. |
+| `CHANNEL_MODE_FLAGS` | `0x0B` | membership | signable | - | Boolean channel-mode flag facts. |
+| `CHANNEL_LIST` | `0x0C` | membership | signable | - | Channel list-mode facts for ban, exception, and invite-exception lists. |
+| `CHANNEL_PROP` | `0x0D` | membership | signed | - | IRCX channel property LWW facts with multi-hop origin signatures. |
+| `TOPIC` | `0x0E` | membership | signable | - | Channel topic facts. |
+| `NICKCHANGE` | `0x0F` | membership | signable | `member-account` extension | Remote nick-change facts with optional account propagation. |
+| `CHANNEL_MODE_STATE` | `0x10` | membership | signable | - | Parameter and IRCX channel-mode state snapshots. |
+| `SESSION_MIGRATE` | `0x11` | relay | signed | - | Ships a signed session-migration capsule to the owning node for live reclaim. |
+| `ENTITY_PROP` | `0x12` | membership | signed | - | IRCX user/member property LWW facts with kind-tagged multi-hop origin signatures. |
+| `CLONE_COUNT` | `0x13` | notification | unsigned | - | Per-node clone-count gossip using salted IP hashes. |
+| `OPER_EVENT` | `0x14` | oper | signed | - | Network-wide Event-Spine notification; carries `{category, severity, origin_server, message}` ([src/proto/oper_event.zig:1](../../src/proto/oper_event.zig#L1)). |
+| `OBSERVE_EVENT` | `0x15` | oper | signed | - | Network-wide operator OBSERVE lifecycle record; carries `{action, origin_server, nick, user, host, account, detail}` ([src/proto/observe_event.zig:1](../../src/proto/observe_event.zig#L1)). |
+| `KILL` | `0x16` | oper | signed | - | Targeted cross-mesh operator KILL command. |
+| `WARD` | `0x17` | oper | signed | - | Network-wide Warden mesh-ban add/remove convergence record. |
+| `RESYNC` | `0x18` | control | unsigned | - | Full-state resync request after Helix hot-upgrade link preservation. |
+| `REPAIR_SUMMARY` | `0x19` | repair | signed | `repair-frames` | Merkle/RBSR anti-entropy summary. |
+| `REPAIR_REQUEST` | `0x1A` | repair | signed | `repair-frames` | Request for CRDT records whose hashes differ from a repair summary. |
+| `REPAIR_RESPONSE` | `0x1B` | repair | signed | `repair-frames` | Repair records that backfill requested CRDT entities. |
+| `TEGAMI_PUSH` | `0x1C` | notification | secured-signed | - | Secured-only Web Push hint for offline Tegami delivery. |
+
+> Unknown frame tags are forward-tolerant as long as the length header is valid:
+> the decoder skips unknown length-delimited frames instead of tearing the link
+> down. Emitting a new frame still needs an upgrade or handshake-capability gate;
+> otherwise the receiver will discard behavior it does not understand.
 
 > Origin authentication, the per-link vs multi-hop signing modes, and the
 > handshake-negotiated signing capability are documented in
 > [mesh-security.md](mesh-security.md).
 
-The enum and tag mapping are in `FrameType` ([src/proto/s2s_frame.zig:26](../../src/proto/s2s_frame.zig#L26)), and the streaming decoder buffers partial input until a complete frame is available ([src/proto/s2s_frame.zig:116](../../src/proto/s2s_frame.zig#L116)). Unknown frame tags are rejected as malformed ([src/proto/s2s_frame.zig:123](../../src/proto/s2s_frame.zig#L123)).
+The enum and tag mapping are in `FrameType` ([src/proto/s2s_frame.zig:26](../../src/proto/s2s_frame.zig#L26)), and the streaming decoder buffers partial input until a complete frame is available ([src/proto/s2s_frame.zig:116](../../src/proto/s2s_frame.zig#L116)). Unknown frame tags are skipped after the bounded payload length is validated.
 
 ## Peer handshake and link adapters
 
-The pure peer driver has an internal Suimyaku handshake payload with magic `S2PH`, version `1`, node id, epoch, name, and description ([src/substrate/suimyaku/s2s_peer.zig:29](../../src/substrate/suimyaku/s2s_peer.zig#L29), [src/substrate/suimyaku/s2s_peer.zig:89](../../src/substrate/suimyaku/s2s_peer.zig#L89), [src/substrate/suimyaku/s2s_peer.zig:494](../../src/substrate/suimyaku/s2s_peer.zig#L494)). If the expected remote id is zero, the receiver adopts the id from the first handshake; otherwise it rejects an unexpected id ([src/substrate/suimyaku/s2s_peer.zig:386](../../src/substrate/suimyaku/s2s_peer.zig#L386), [src/substrate/suimyaku/s2s_peer.zig:391](../../src/substrate/suimyaku/s2s_peer.zig#L391)).
+The pure peer driver has an internal Suimyaku handshake payload with magic `S2PH`, version `2`, node id, epoch, name, description, and a single-byte capability bitfield. v1 peers omit the byte and decode as `caps == 0`; unknown future capability bits are ignored. If the expected remote id is zero, the receiver adopts the id from the first handshake; otherwise it rejects an unexpected id.
 
 Once established, the peer records the remote server in the registry, maps the remote server name to the remote node in the route table, establishes the link session, clears pending link-session outbound data, and emits a CRDT burst ([src/substrate/suimyaku/s2s_peer.zig:397](../../src/substrate/suimyaku/s2s_peer.zig#L397), [src/substrate/suimyaku/s2s_peer.zig:414](../../src/substrate/suimyaku/s2s_peer.zig#L414), [src/substrate/suimyaku/s2s_peer.zig:422](../../src/substrate/suimyaku/s2s_peer.zig#L422), [src/substrate/suimyaku/s2s_peer.zig:399](../../src/substrate/suimyaku/s2s_peer.zig#L399)).
 

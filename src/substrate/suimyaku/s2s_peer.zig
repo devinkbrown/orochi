@@ -49,22 +49,24 @@ const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 const handshake_version: u8 = 2;
 
 /// Handshake capability bits (forward-compatible bitfield). Unknown bits are
-/// ignored on decode, so future capabilities never break an older peer.
-const cap_frame_signing: u8 = 1 << 0;
+/// ignored on decode, so future capabilities never break an older peer. The
+/// public wire catalog lives in `proto/s2s_frame.zig`; keep the peer on that
+/// source of truth so handshake and snapshot resume cannot drift.
+const cap_frame_signing: u8 = s2s_frame.cap_frame_signing;
 /// The peer understands the optional `account` block on MEMBERSHIP/NICKCHANGE
 /// events (account-aware collision reconcile). Gated so we only ever append the
 /// extra wire bytes to a peer that advertised support — an older peer (which
 /// strictly rejects trailing bytes) never receives them.
-const cap_member_account: u8 = 1 << 1;
+const cap_member_account: u8 = s2s_frame.cap_member_account;
 /// The peer understands the optional `real_host` + `certfp` blocks on MEMBERSHIP
 /// events (oper-visible identity for remote-user WHOIS). Advertised ONLY by a
 /// SECURED link (one that holds a node signing key) — these fields are sensitive,
 /// so they must never traverse a plaintext S2S leg. Gated like `member_account`:
 /// the extra trailing bytes are appended only to a peer that advertised support.
-const cap_member_oper_info: u8 = 1 << 2;
+const cap_member_oper_info: u8 = s2s_frame.cap_member_oper_info;
 /// The peer understands Merkle-guided anti-entropy repair frames
 /// (REPAIR_SUMMARY/REQUEST/RESPONSE).
-const cap_repair_frames: u8 = 1 << 3;
+const cap_repair_frames: u8 = s2s_frame.cap_repair_frames;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
