@@ -578,6 +578,7 @@ test "config text overlays the server config" {
         \\realm = "ircxnet"
         \\[tls]
         \\enabled = true
+        \\request_client_cert = true
         \\raw_public_key = true
         \\[[tls.ech_keys]]
         \\config_path = "/etc/orochi/echconfig.bin"
@@ -649,6 +650,7 @@ test "config text overlays the server config" {
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
     try testing.expect(loaded.tls.enabled);
+    try testing.expect(loaded.tls.request_client_cert);
     try testing.expect(loaded.tls.raw_public_key);
     try testing.expectEqual(@as(usize, 1), loaded.tls.ech_keys.len);
     try testing.expectEqualStrings("/etc/orochi/echconfig.bin", loaded.tls.ech_keys[0].config_path);

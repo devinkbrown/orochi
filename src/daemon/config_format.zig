@@ -643,9 +643,11 @@ pub const Config = struct {
         /// Maximum accepted TLS 1.3 0-RTT early application bytes advertised in
         /// issued tickets. Zero disables early data while keeping PSK resumption.
         early_data_max_size: u32 = 0,
-        /// RFC 7250 server raw public keys. When true, a client that offers
+        /// RFC 7250 raw public keys. When true, a client that offers
         /// `server_certificate_type = RawPublicKey` may receive the leaf SPKI
-        /// instead of the X.509 chain. Default false keeps the classic path.
+        /// instead of the X.509 chain. With `request_client_cert`, a client that
+        /// offers `client_certificate_type = RawPublicKey` may present a raw
+        /// SPKI for SASL EXTERNAL CertFP. Default false keeps the classic path.
         raw_public_key: bool = false,
         /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
         ktls: KtlsMode = .off,
@@ -2597,6 +2599,7 @@ test "parseToml: [tls] section projects onto Config" {
         \\cert_path = "/etc/orochi/leaf.pem"
         \\key_path = "/etc/orochi/leaf.key"
         \\dns_name = "irc.example.test"
+        \\request_client_cert = true
         \\enable_tls12 = true
         \\enable_resumption = true
         \\early_data_max_size = 16384
@@ -2618,6 +2621,7 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expectEqualStrings("/etc/orochi/leaf.pem", cfg.tls.cert_path.?);
     try testing.expectEqualStrings("/etc/orochi/leaf.key", cfg.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", cfg.tls.dns_name);
+    try testing.expect(cfg.tls.request_client_cert);
     // These three keys were declared in the schema but never parsed — a TLS 1.2
     // opt-in (and resumption/0-RTT) was silently ignored. Guard the wiring.
     try testing.expect(cfg.tls.enable_tls12);

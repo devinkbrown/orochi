@@ -70,8 +70,10 @@ jobs:
       # Threaded server tests need loopback sockets + io_uring; when a runner
       # lacks either the tests SkipZigTest rather than fail, so this stays green
       # on any hosted runner while exercising everything available.
-      - name: Run test suite
-        run: zig build test
+      - name: Run focused smoke suites
+        run: zig build test-smoke-verbose --summary all
+      - name: Run deterministic assurance suite
+        run: zig build all-checks-verbose --summary all
 
   release:
     name: release build (x86_64-linux-musl)

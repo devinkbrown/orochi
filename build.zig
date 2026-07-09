@@ -165,6 +165,11 @@ pub fn build(b: *std.Build) void {
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     run_cmd.addPassthruArgs();
 
+    const verbose_test_runner = std.Build.Step.Compile.TestRunner{
+        .path = b.path("tools/verbose_test_runner.zig"),
+        .mode = .simple,
+    };
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
@@ -175,6 +180,16 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const test_mod_step = b.step("test-mod", "Run only the library/module test artifact; accepts -Dtest-filter=<text>");
+    test_mod_step.dependOn(&run_mod_tests.step);
+    const mod_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_mod_tests_verbose = b.addRunArtifact(mod_tests_verbose);
+    const test_mod_verbose_step = b.step("test-mod-verbose", "Run module tests with per-test progress output; accepts -Dtest-filter=<text>");
+    test_mod_verbose_step.dependOn(&run_mod_tests_verbose.step);
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -186,6 +201,91 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const test_exe_step = b.step("test-exe", "Run only the daemon executable-root test artifact; accepts -Dtest-filter=<text>");
+    test_exe_step.dependOn(&run_exe_tests.step);
+    const exe_tests_verbose = b.addTest(.{
+        .root_module = exe.root_module,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_exe_tests_verbose = b.addRunArtifact(exe_tests_verbose);
+    const test_exe_verbose_step = b.step("test-exe-verbose", "Run executable-root tests with per-test progress output; accepts -Dtest-filter=<text>");
+    test_exe_verbose_step.dependOn(&run_exe_tests_verbose.step);
+
+    const tls_test_filters: []const []const u8 = &.{
+        "TLS",
+        "tls",
+        "mTLS",
+        "RFC 7250",
+        "CertificateRequest",
+        "Encrypted Client Hello",
+        "delegated credential",
+        "record_size_limit",
+        "raw public key",
+    };
+    const tls_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = tls_test_filters,
+    });
+    const run_tls_tests = b.addRunArtifact(tls_tests);
+    const test_tls_step = b.step("test-tls", "Run focused Yoroi TLS, mTLS, ECH, RPK, DC, and record-size tests");
+    test_tls_step.dependOn(&run_tls_tests.step);
+    const tls_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = tls_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_tls_tests_verbose = b.addRunArtifact(tls_tests_verbose);
+    const test_tls_verbose_step = b.step("test-tls-verbose", "Run focused TLS tests with per-test progress output");
+    test_tls_verbose_step.dependOn(&run_tls_tests_verbose.step);
+
+    const server_test_filters: []const []const u8 = &.{
+        "threaded server:",
+        "tls13Config",
+        "banContextFor",
+        "SASL EXTERNAL",
+        "CertFP",
+        "raw-public-key",
+        "raw public key",
+    };
+    const server_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = server_test_filters,
+    });
+    const run_server_tests = b.addRunArtifact(server_tests);
+    const test_server_step = b.step("test-server", "Run focused daemon/server integration and auth tests");
+    test_server_step.dependOn(&run_server_tests.step);
+    const server_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = server_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_server_tests_verbose = b.addRunArtifact(server_tests_verbose);
+    const test_server_verbose_step = b.step("test-server-verbose", "Run focused server tests with per-test progress output");
+    test_server_verbose_step.dependOn(&run_server_tests_verbose.step);
+
+    const config_test_filters: []const []const u8 = &.{
+        "parseToml",
+        "config",
+        "Config",
+        "loadFromText",
+        "reference config",
+    };
+    const config_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = config_test_filters,
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+    const test_config_step = b.step("test-config", "Run focused TOML/config parsing, boot projection, and reference-config tests");
+    test_config_step.dependOn(&run_config_tests.step);
+    const config_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = config_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_config_tests_verbose = b.addRunArtifact(config_tests_verbose);
+    const test_config_verbose_step = b.step("test-config-verbose", "Run focused config tests with per-test progress output");
+    test_config_verbose_step.dependOn(&run_config_tests_verbose.step);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -193,6 +293,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    const test_verbose_step = b.step("test-verbose", "Run full tests with per-test progress output");
+    test_verbose_step.dependOn(&run_mod_tests_verbose.step);
+    test_verbose_step.dependOn(&run_exe_tests_verbose.step);
 
     // `zig build wasm` — compile the KaguraVox/KaguraVis codecs to a freestanding
     // WASM module for the in-browser client (#11/#32). Pure-integer +
@@ -248,6 +351,17 @@ pub fn build(b: *std.Build) void {
     });
     check_exe.generated_bin = .none; // analyze only; do not codegen/link an artifact
     check_step.dependOn(&check_exe.step);
+
+    const test_smoke_step = b.step("test-smoke", "Run fast semantic + TLS/server/config smoke tests for roadmap iteration");
+    test_smoke_step.dependOn(&check_exe.step);
+    test_smoke_step.dependOn(&run_tls_tests.step);
+    test_smoke_step.dependOn(&run_server_tests.step);
+    test_smoke_step.dependOn(&run_config_tests.step);
+    const test_smoke_verbose_step = b.step("test-smoke-verbose", "Run smoke tests with per-test progress output");
+    test_smoke_verbose_step.dependOn(&check_exe.step);
+    test_smoke_verbose_step.dependOn(&run_tls_tests_verbose.step);
+    test_smoke_verbose_step.dependOn(&run_server_tests_verbose.step);
+    test_smoke_verbose_step.dependOn(&run_config_tests_verbose.step);
 
     // `zig build ct-check` — the opt-in, dudect-style constant-time verification
     // harness (roadmap 0.4). It measures execution-time independence from secret
@@ -400,6 +514,19 @@ pub fn build(b: *std.Build) void {
     run_bogo_shim_tests.step.dependOn(&bogo_shim_install.step);
     const bogo_shim_test_step = b.step("bogo-shim-test", "Build + self-drive the BoGo shim (loopback exit-code smokes; no external harness)");
     bogo_shim_test_step.dependOn(&run_bogo_shim_tests.step);
+
+    const all_checks_step = b.step("all-checks", "Run deterministic pre-push checks: check, full tests, bounded fuzz replay, and BoGo shim self-tests");
+    all_checks_step.dependOn(&check_exe.step);
+    all_checks_step.dependOn(&run_mod_tests.step);
+    all_checks_step.dependOn(&run_exe_tests.step);
+    all_checks_step.dependOn(&run_fuzz_tests.step);
+    all_checks_step.dependOn(&run_bogo_shim_tests.step);
+    const all_checks_verbose_step = b.step("all-checks-verbose", "Run deterministic pre-push checks with per-test progress output for the full suite");
+    all_checks_verbose_step.dependOn(&check_exe.step);
+    all_checks_verbose_step.dependOn(&run_mod_tests_verbose.step);
+    all_checks_verbose_step.dependOn(&run_exe_tests_verbose.step);
+    all_checks_verbose_step.dependOn(&run_fuzz_tests.step);
+    all_checks_verbose_step.dependOn(&run_bogo_shim_tests.step);
 
     // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
     // installed to zig-out/bin, independent of the default step's optimize mode.

@@ -6112,6 +6112,54 @@ test "mTLS: RFC 7250 client raw public key completes and exposes SPKI identity" 
     try std.testing.expectEqualSlices(u8, client_spki, presented);
 }
 
+test "mTLS: RFC 7250 client raw public key rejects X.509 certificate bytes" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x35)));
+    const client_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x46)));
+
+    var server_cert_buf: [1024]u8 = undefined;
+    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x35, 0x01 },
+        .key_pair = server_kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var client_cert_buf: [1024]u8 = undefined;
+    const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x46, 0x01 },
+        .key_pair = client_kp,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{server_der},
+        .signing_key = server_kp,
+        .request_client_cert = true,
+        .enable_raw_public_key = true,
+    });
+    defer server.deinit();
+    server.client_cert_type_rpk = true;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try body.append(alloc, 0); // certificate_request_context
+    const entry_len = 3 + client_der.len + 2;
+    try appendU24(alloc, &body, entry_len);
+    try appendU24(alloc, &body, client_der.len);
+    try body.appendSlice(alloc, client_der);
+    try appendU16(alloc, &body, 0);
+
+    try std.testing.expectError(error.BadHandshake, server.parseClientCertificate(body.items));
+    try std.testing.expect(server.clientCertDer() == null);
+}
+
 test "mTLS: a declining client still completes with no client cert" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");

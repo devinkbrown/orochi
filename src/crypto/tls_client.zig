@@ -3643,6 +3643,38 @@ test "ClientHello offers server_certificate_type=[RawPublicKey, X509] when enabl
     try std.testing.expectEqual(tls_extension.CertificateType.x509, parsed[1]);
 }
 
+test "ClientHello offers client_certificate_type=[RawPublicKey, X509] when raw client key is configured" {
+    const allocator = std.testing.allocator;
+    const seed: [sign.seed_len]u8 = @splat(0x43);
+    var kp = try sign.KeyPair.fromSeed(seed);
+    defer kp.deinit();
+    const spki = ed25519Spki(kp.public_key);
+
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+    client.setClientRawPublicKeyForTest(&spki, kp);
+
+    const record = try client.start();
+    defer allocator.free(record);
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const ext_block = clientHelloExtensions(ch.body).?;
+
+    var saw_client: ?[]const u8 = null;
+    var it = tls_extension.Iterator.init(ext_block);
+    while (try it.next()) |ext| {
+        if (ext.typed() == .client_certificate_type) saw_client = ext.data;
+    }
+    try std.testing.expect(saw_client != null);
+    const data = saw_client.?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x02, 0x00 }, data);
+    var out: [4]tls_extension.CertificateType = undefined;
+    const parsed = try tls_extension.parseCertTypeList(data, &out);
+    try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, parsed[0]);
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, parsed[1]);
+}
+
 test "raw public key: bare SPKI Certificate sets the leaf key and validates the CertificateVerify signature" {
     const a = std.testing.allocator;
 

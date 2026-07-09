@@ -83,13 +83,17 @@ Orochi targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor us
 zig build              # build the daemon
 zig build check        # fast semantic analysis, no binary
 zig build test         # run the full test suite
+zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config suites
+zig build all-checks   # deterministic pre-push gate: check + tests + fuzz + BoGo smokes
+zig build all-checks-verbose # same gate with per-test progress for long runs
 zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/orochi
 zig build run          # run the daemon locally
 ./tools/genroots.sh    # regenerate package-root imports from the files present
 ```
 
 Start from the [quickstart](docs/guide/00-quickstart.md), then see the
-[operator guide](docs/guide/operators.md), [TLS guide](docs/guide/tls.md), and
+[operator guide](docs/guide/operators.md), [testing guide](docs/guide/testing.md),
+[TLS guide](docs/guide/tls.md), and
 [mesh guide](docs/guide/mesh.md). A complete, commented configuration reference lives in
 [`docs/reference/config.md`](docs/reference/config.md) and
 [`etc/orochi.reference.toml`](etc/orochi.reference.toml).

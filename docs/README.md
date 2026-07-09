@@ -19,6 +19,7 @@ richer `INFO`.
 
 - [Quickstart](guide/00-quickstart.md) — build, configure, and run in minutes
 - [Building](guide/build.md) — build targets and cross-compilation
+- [Testing](guide/testing.md) — focused test lanes, smoke gates, and deterministic assurance
 - [TLS](guide/tls.md) — the Yoroi stack, certificates, and mTLS
 - [Operators](guide/operators.md) — SASL-only operator setup and tooling
 - [Mesh / S2S linking](guide/mesh.md) — linking nodes into a Suimyaku mesh
