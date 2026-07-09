@@ -84,8 +84,10 @@ reason hash, policy version, issue time, and expiry for signed privileged
 actions. `LinuxServer.recordOperAudit` mints that evidence when the node has a
 mesh signing key, `AUDIT` renders `proof=<id>` on signed records, and
 `AUDIT PROOF <id>` lets an operator inspect the stored proof material after the
-server re-verifies the signature and proof id. Nodes without a mesh key keep the
-existing unsigned audit line.
+server re-verifies the signature and proof id. Moderation Event Spine notices
+for signed actions also carry the same `proof=<id>` token, so an operator
+watching `EVENT` can jump directly to `AUDIT PROOF`. Nodes without a mesh key
+keep the existing unsigned audit and event lines.
 
 ## Node identity
 

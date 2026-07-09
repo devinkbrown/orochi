@@ -71,7 +71,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## AUDIT
 
 - Syntax: `AUDIT [oper] [count] | AUDIT PROOF <proof-id>`
-- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records include `proof=<id>`. `AUDIT PROOF <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
+- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>`. `AUDIT PROOF <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
 - Privileges: Oper holding the `audit_read` privilege.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: `NOTE AUDIT` lines.

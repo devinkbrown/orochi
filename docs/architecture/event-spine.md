@@ -42,7 +42,7 @@ Both wire planes share the same daemon triad: a local cross-shard fan-out (`deli
 
 A subscriber matches when `sessionWantsEvent` is satisfied: the IRCX plane is tried first (token-routed, severity-agnostic, additive), else the category bit must be set **and** `severityWanted(severity)` passes **and** the per-category subject glob matches (default scope `*`). `MEDIA` events carry an extra gate — `mediaEventAllowed` requires a non-oper to be a member of the event's channel, preserving member-only media visibility.
 
-The publishers are thin renderers over this core: `raidAlert`/`spamtrapCheck` (`.flood`), `publishServerLink` (`.server_link`), `publishUserConnectEvent`/`publishUserDisconnectEvent` (`.connect`/`.disconnect`), `publishMemberEvent`/`publishUserNickEvent`/`publishUserEvent` (`.oper_action`), `publishChannelEvent` (`.announce`), `publishMediaEvent` (`.service`), `publishModerationHeld`/`publishHistoryPolicyDeny` (`.policy`), and `publishSecurityBlock` (`.security`).
+The publishers are thin renderers over this core: `raidAlert`/`spamtrapCheck` (`.flood`), `publishServerLink` (`.server_link`), `publishUserConnectEvent`/`publishUserDisconnectEvent` (`.connect`/`.disconnect`), `publishMemberEvent`/`publishUserNickEvent`/`publishUserEvent` (`.oper_action`), `publishChannelEvent` (`.announce`), `publishMediaEvent` (`.service`), `publishModerationHeld`/`publishHistoryPolicyDeny` (`.policy`), and `publishSecurityBlock` (`.security`). Signed privileged moderation events include the same `proof=<id>` token stored by `AUDIT`, letting subscribers correlate live Event Spine traffic with `AUDIT PROOF <id>` evidence.
 
 ## Live subscription
 

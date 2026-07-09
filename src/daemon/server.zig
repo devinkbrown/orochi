@@ -13440,12 +13440,17 @@ pub const LinuxServer = struct {
     /// network-wide so opers everywhere see it. Issued ONCE on the killing node.
     fn publishKillEvent(self: *LinuxServer, real_killer: []const u8, target_nick: []const u8, reason: []const u8, override: bool) !void {
         var kev_buf: [512]u8 = undefined;
-        const kev = if (override)
+        const proof_id = self.recordOperAudit(real_killer, .kill, target_nick, reason);
+        const kev = if (proof_id) |pid|
+            if (override)
+                (std.fmt.bufPrint(&kev_buf, "{s} killed {s} as SYSTEM ({s}) proof={s}", .{ real_killer, target_nick, reason, pid[0..] }) catch "anonymous kill")
+            else
+                (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s}) proof={s}", .{ real_killer, target_nick, reason, pid[0..] }) catch reason)
+        else if (override)
             (std.fmt.bufPrint(&kev_buf, "{s} killed {s} as SYSTEM ({s})", .{ real_killer, target_nick, reason }) catch "anonymous kill")
         else
             (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ real_killer, target_nick, reason }) catch reason);
         try self.publishOperEvent(.kill, .warn, kev);
-        self.recordOperAudit(real_killer, .kill, target_nick, reason);
     }
 
     /// Disconnect a LOCAL client as a KILL: deliver its KILL line + an ERROR close,
@@ -15480,10 +15485,13 @@ pub const LinuxServer = struct {
         // A `mesh`-scope ward propagates to every secured peer so already-running
         // nodes enforce it live. A `node`-scope ward stays local.
         if (scope == .mesh) self.broadcastMeshWard(ward, .add);
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .kline, pattern, if (reason.len != 0) reason else "WARD ADD");
         var b: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
+        const note = if (proof_id) |pid|
+            std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s} proof={s}", .{ match.token(), pattern, scope.token(), action.token(), pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
-        self.recordOperAudit(conn.session.displayName(), .kline, pattern, if (reason.len != 0) reason else note);
     }
 
     fn deleteWardLive(self: *LinuxServer, conn: *ConnState, match: warden.Match, pattern: []const u8) !void {
@@ -18194,7 +18202,13 @@ pub const LinuxServer = struct {
                 var nb: [384]u8 = undefined;
                 const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :JUPE added: {s} (takes effect on next peer activity)\r\n", .{ srv, nick, req.pattern }) catch return;
                 try appendToConn(conn, nl);
-                self.recordOperAudit(nick, .jupe, req.pattern, req.reason);
+                const proof_id = self.recordOperAudit(nick, .jupe, req.pattern, req.reason);
+                var event_buf: [default_reply_bytes]u8 = undefined;
+                const event_msg = if (proof_id) |pid|
+                    std.fmt.bufPrint(&event_buf, "JUPE ADD {s} proof={s}", .{ req.pattern, pid[0..] }) catch "JUPE ADD"
+                else
+                    std.fmt.bufPrint(&event_buf, "JUPE ADD {s}", .{req.pattern}) catch "JUPE ADD";
+                try self.publishOperEvent(.oper_action, .notice, event_msg);
             },
             .remove => |pattern| {
                 const removed = self.server_jupe.remove(pattern);
@@ -26304,9 +26318,14 @@ pub const LinuxServer = struct {
             target,
             detail,
         }) catch return;
-        self.publishOperEvent(.oper_action, .notice, msg) catch {};
-        self.publishOperEvent(.security, .notice, msg) catch {};
-        self.recordOperAudit(conn.session.displayName(), .other, target, msg);
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .other, target, msg);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event_msg = if (proof_id) |pid|
+            std.fmt.bufPrint(&event_buf, "{s} proof={s}", .{ msg, pid[0..] }) catch msg
+        else
+            msg;
+        self.publishOperEvent(.oper_action, .notice, event_msg) catch {};
+        self.publishOperEvent(.security, .notice, event_msg) catch {};
     }
 
     fn operProofEvidence(
@@ -26354,13 +26373,20 @@ pub const LinuxServer = struct {
     /// target, reason hash, policy version, and timestamp. Best-effort: an
     /// allocation/signing failure drops proof metadata or the record rather than
     /// faulting the action's hot path.
-    fn recordOperAudit(self: *LinuxServer, oper: []const u8, action: svc_operaudit.Action, target: []const u8, reason: []const u8) void {
+    fn recordOperAudit(self: *LinuxServer, oper: []const u8, action: svc_operaudit.Action, target: []const u8, reason: []const u8) ?[proofmark.proof_id_hex_len]u8 {
         const ts = self.nowMs();
         var proof_id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
         var proof_sig_buf: [@sizeOf(proofmark.Signature) * 2]u8 = undefined;
         var proof_pub_buf: [@sizeOf(proofmark.PublicKey) * 2]u8 = undefined;
         const proof = self.operProofEvidence(ts, oper, action, target, reason, &proof_id_buf, &proof_sig_buf, &proof_pub_buf);
-        _ = self.oper_audit.recordWithProofEvidence(ts, oper, action, target, reason, proof) catch {};
+        _ = self.oper_audit.recordWithProofEvidence(ts, oper, action, target, reason, proof) catch return null;
+        if (proof) |p| {
+            if (p.id.len != proofmark.proof_id_hex_len) return null;
+            var out: [proofmark.proof_id_hex_len]u8 = undefined;
+            @memcpy(out[0..], p.id);
+            return out;
+        }
+        return null;
     }
 
     fn proofHashHex(hash: proofmark.Digest, out: *[proofmark.proof_id_hex_len]u8) []const u8 {
@@ -39578,14 +39604,22 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try saslAdminPrelude(fd_o);
     try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
     try recvUntil(&o, " 381 O ", 300);
+    o.reset();
+    try writeAllFd(fd_o, "EVENT ADD KILL OPER_ACTION\r\n");
+    try recvUntil(&o, "Event categories:", 300);
     try writeAllFd(fd_v, "NICK V\r\nUSER v 0 * :V\r\n");
     try recvUntil(&v, " 001 V ", 200);
 
     // Two privileged actions: a KILL and a JUPE.
+    o.reset();
     try writeAllFd(fd_o, "KILL V :spam\r\n");
     try recvUntil(&v, "Killed", 300);
+    try recvUntil(&o, "killed V ", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "proof=") != null);
+    o.reset();
     try writeAllFd(fd_o, "JUPE evil.example.net 0 :rogue\r\n");
     try recvUntil(&o, "JUPE added: evil.example.net", 300);
+    try recvUntil(&o, "JUPE ADD evil.example.net proof=", 300);
 
     // AUDIT (newest first) shows both actions with actor/target/reason.
     o.reset();
