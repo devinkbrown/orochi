@@ -341,6 +341,12 @@ pub const NativeMediaTransport = struct {
         }
     }
 
+    /// Send a native control-plane feedback message to `dest`. This is not a
+    /// kagura media frame and must not pass through media-frame MAC tagging.
+    pub fn sendFeedbackTo(self: *NativeMediaTransport, dest: TransportAddress, bytes: []const u8) void {
+        if (self.socket) |*s| s.sendTo(dest, bytes);
+    }
+
     /// The learned transport address of a native participant in `channel`, or
     /// null if unknown / not yet learned (the peer hasn't published a datagram).
     pub fn remoteFor(self: *NativeMediaTransport, channel: []const u8, id: []const u8) ?TransportAddress {

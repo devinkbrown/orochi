@@ -78,11 +78,12 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live stream/SSRC identity map (wired) | `media_bridge` maintains `ssrc_map` bindings for each registered participant and translates native `stream_id` ↔ RTP `ssrc` during cross-leg rewrap. |
 | Live per-target bridge policy (wired) | Cross-leg fanout resolves the source participant through `ssrc_map` and asks `kakehashi_session.forwardTargets` for connected egress targets before rewrapping. |
 | Live ABR-driven simulcast selection (wired) | `MEDIA ABR` accepts receiver BWE/loss/RTT/NACK reports, runs the Suimyaku ABR hint through `simulcast_select`, and applies the result as the receiver's native layer ceiling without decoding or transcoding media. |
+| Live WebRTC-to-native feedback bridge (wired) | The WebRTC media plane now feeds decrypted RTCP PLI/FIR/NACK through `rtcp_translate`, maps media SSRCs through the bridge `ssrc_map`, encodes `native_feedback`, and sends it only to the native publisher. |
 
 ## Remaining live wiring
 
-1. **Finish Kakehashi feedback handling:** answer `rtcp_translate`/`native_feedback`
-   from the live SFU forward path.
+1. **Native-origin feedback ingress:** add an authenticated native control
+   envelope before accepting native feedback into the live WebRTC RTCP path.
 
 ## Non-goals
 

@@ -24,6 +24,8 @@ const kakehashi = @import("../substrate/kakehashi.zig");
 const kakehashi_session = @import("../substrate/kakehashi_session.zig");
 const ssrc_map_mod = @import("../substrate/ssrc_map.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
+const native_feedback = @import("../substrate/native_feedback.zig");
+const rtcp_translate = @import("../proto/rtcp_translate.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
 
@@ -37,6 +39,7 @@ pub const Error = kakehashi.Error || kagura_frame.DecodeError || kagura_frame.En
 const max_id_bytes = 64;
 pub const max_member_codecs = 8;
 const max_rewrap = 1600; // >= one MTU datagram after header rewrap
+const max_feedback_seqs = 64;
 
 /// Sends `bytes` to `target` on some leg's socket. The callback resolves the
 /// target's *live* transport address (learned post-OFFER via STUN / first
@@ -62,9 +65,15 @@ pub const CrossLegSink = struct {
 pub const RtpCrossSink = struct {
     ctx: *anyopaque,
     on_rtp_frame: *const fn (ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void,
+    on_rtcp_feedback: ?*const fn (ctx: *anyopaque, channel: []const u8, rtcp: []const u8) bool = null,
 
     pub fn onRtpFrame(self: RtpCrossSink, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
         self.on_rtp_frame(self.ctx, channel, rtp, keyframe_hint);
+    }
+
+    pub fn onRtcpFeedback(self: RtpCrossSink, channel: []const u8, rtcp: []const u8) bool {
+        const cb = self.on_rtcp_feedback orelse return false;
+        return cb(self.ctx, channel, rtcp);
     }
 };
 
@@ -271,6 +280,40 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             for (targets[0..n]) |*m| send(send_ctx, m, scratch[0..len]);
         }
 
+        /// Translate WebRTC RTCP feedback into native feedback and send it to
+        /// the native publisher named by the media SSRC. Returns true only when
+        /// the feedback was recognized and delivered cross-leg.
+        pub fn fanoutRtcpFeedbackToNative(self: *Self, rtcp: []const u8, send_ctx: *anyopaque, send: SendFn) bool {
+            var seqs16: [max_feedback_seqs]u16 = undefined;
+            const fb = rtcp_translate.parse(rtcp, &seqs16) catch return false;
+            switch (fb) {
+                .keyframe_request => |k| {
+                    const pid = self.ssrcs.participantForSsrc(k.media_ssrc) orelse return false;
+                    var target = self.memberByStableId(pid) orelse return false;
+                    if (target.leg != .native) return false;
+                    const stream_id = self.ssrcs.streamForSsrc(k.media_ssrc) orelse target.stream_id;
+                    var out: [64]u8 = undefined;
+                    const msg = native_feedback.encodeKeyframeRequest(stream_id, &out) catch return false;
+                    send(send_ctx, &target, msg);
+                    return true;
+                },
+                .nack => |nack| {
+                    const pid = self.ssrcs.participantForSsrc(nack.media_ssrc) orelse return false;
+                    var target = self.memberByStableId(pid) orelse return false;
+                    if (target.leg != .native) return false;
+                    if (nack.seqs.len > max_feedback_seqs) return false;
+                    const stream_id = self.ssrcs.streamForSsrc(nack.media_ssrc) orelse target.stream_id;
+                    var seqs32: [max_feedback_seqs]u32 = undefined;
+                    for (nack.seqs, 0..) |seq, i| seqs32[i] = seq;
+                    var out: [1 + 4 + 2 + max_feedback_seqs * 4]u8 = undefined;
+                    const msg = native_feedback.encodeNack(stream_id, seqs32[0..nack.seqs.len], &out) catch return false;
+                    send(send_ctx, &target, msg);
+                    return true;
+                },
+                .other => return false,
+            }
+        }
+
         /// Copy into `out` every member on the leg OPPOSITE to `from_leg`,
         /// excluding `from_id` (the publisher). These are the participants the
         /// caller must reach by rewrapping the frame onto the other transport.
@@ -380,6 +423,31 @@ const CaptureSendCtx = struct {
     }
 
     fn written(self: *const CaptureSendCtx) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const FeedbackCaptureCtx = struct {
+    count: usize = 0,
+    target_id: [max_id_bytes]u8 = undefined,
+    target_len: usize = 0,
+    bytes: [max_rewrap]u8 = undefined,
+    len: usize = 0,
+
+    fn send(ctx: *anyopaque, member: *const Member, bytes: []const u8) void {
+        const self: *FeedbackCaptureCtx = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.target_len = @min(member.id().len, self.target_id.len);
+        @memcpy(self.target_id[0..self.target_len], member.id()[0..self.target_len]);
+        self.len = @min(bytes.len, self.bytes.len);
+        @memcpy(self.bytes[0..self.len], bytes[0..self.len]);
+    }
+
+    fn target(self: *const FeedbackCaptureCtx) []const u8 {
+        return self.target_id[0..self.target_len];
+    }
+
+    fn written(self: *const FeedbackCaptureCtx) []const u8 {
         return self.bytes[0..self.len];
     }
 };
@@ -495,6 +563,55 @@ test "fanout honors kakehashi_session connected target policy" {
     var ctx = CountSendCtx{};
     br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
     try testing.expectEqual(@as(usize, 0), ctx.count);
+}
+
+test "feedback translates WebRTC PLI to native keyframe request" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var rtcp_buf: [64]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(0xB200, 0xA100, &rtcp_buf);
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(br.fanoutRtcpFeedbackToNative(pli, &ctx, FeedbackCaptureCtx.send));
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+    try testing.expectEqualStrings("alice", ctx.target());
+
+    var seq_out: [1]u32 = undefined;
+    const msg = try native_feedback.parse(ctx.written(), &seq_out);
+    switch (msg) {
+        .keyframe_request => |k| try testing.expectEqual(@as(u32, 100), k.stream_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "feedback translates WebRTC NACK to native NACK" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var rtcp_buf: [64]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(0xB200, 0xA100, &.{ 10, 12 }, &rtcp_buf);
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(br.fanoutRtcpFeedbackToNative(nack, &ctx, FeedbackCaptureCtx.send));
+
+    var seq_out: [4]u32 = undefined;
+    const msg = try native_feedback.parse(ctx.written(), &seq_out);
+    switch (msg) {
+        .nack => |n| {
+            try testing.expectEqual(@as(u32, 100), n.stream_id);
+            try testing.expectEqualSlices(u32, &.{ 10, 12 }, n.seqs);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {

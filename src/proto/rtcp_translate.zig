@@ -182,6 +182,29 @@ pub fn buildKeyframeRequest(sender_ssrc: u32, media_ssrc: u32, out: []u8) Error!
     };
 }
 
+/// Build an RTCP Generic NACK packet to send on the WebRTC leg. Each input
+/// sequence is encoded as its own PID-only FCI block; this is less compact than
+/// BLP packing but preserves the exact request set without allocation.
+pub fn buildNack(sender_ssrc: u32, media_ssrc: u32, seqs: []const u16, out: []u8) Error![]const u8 {
+    if (seqs.len == 0) return Error.BadFormat;
+    const total = header_len + seqs.len * nack_fci_len;
+    if (total > std.math.maxInt(u16) * 4 or out.len < total) return Error.BufferTooSmall;
+
+    out[0] = (@as(u8, rtcp_version) << 6) | @as(u8, fmt_nack);
+    out[1] = pt_rtpfb;
+    std.mem.writeInt(u16, out[2..4], @intCast(total / 4 - 1), .big);
+    std.mem.writeInt(u32, out[4..8], sender_ssrc, .big);
+    std.mem.writeInt(u32, out[8..12], media_ssrc, .big);
+
+    var off: usize = header_len;
+    for (seqs) |seq| {
+        std.mem.writeInt(u16, out[off..][0..2], seq, .big);
+        std.mem.writeInt(u16, out[off + 2 ..][0..2], 0, .big);
+        off += nack_fci_len;
+    }
+    return out[0..total];
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -308,6 +331,21 @@ test "buildKeyframeRequest round-trips through parse" {
 test "buildKeyframeRequest returns BufferTooSmall for a short buffer" {
     var small: [8]u8 = undefined;
     try std.testing.expectError(Error.BufferTooSmall, buildKeyframeRequest(1, 2, &small));
+}
+
+test "buildNack round-trips through parse" {
+    var buf: [64]u8 = undefined;
+    var seq_buf: [8]u16 = undefined;
+
+    const wire = try buildNack(0x11112222, 0x33334444, &.{ 77, 79 }, &buf);
+    const fb = try parse(wire, &seq_buf);
+    switch (fb) {
+        .nack => |n| {
+            try std.testing.expectEqual(@as(u32, 0x33334444), n.media_ssrc);
+            try std.testing.expectEqualSlices(u16, &.{ 77, 79 }, n.seqs);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "parse returns Truncated on a short packet" {

@@ -17,6 +17,7 @@ const media_transport = @import("../substrate/media_transport.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const rtp_nack = @import("../substrate/rtp_nack.zig");
+const rtcp_translate = @import("../proto/rtcp_translate.zig");
 const media_bridge = @import("media_bridge.zig");
 const dtls_server = @import("../proto/dtls12_server.zig");
 const dtls13_server = @import("../proto/dtls13_server.zig");
@@ -555,8 +556,9 @@ pub const MediaPlane = struct {
     /// Handle one inbound RTCP `packet` (from `source`): decrypt it if the source
     /// is a DTLS-SRTP peer (drop on auth failure), then either terminate a
     /// Generic NACK locally from the retransmit cache or relay it to the other
-    /// participants. Decrypting FIRST is what makes NACK work for DTLS peers (the
-    /// media SSRC + FCI are SRTCP-encrypted on the wire).
+    /// participants, or translate it to native feedback for a native publisher.
+    /// Decrypting FIRST is what makes feedback work for DTLS peers (the media
+    /// SSRC + FCI are SRTCP-encrypted on the wire).
     fn handleRtcp(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8) void {
         var plain_buf: [media_socket.max_datagram]u8 = undefined;
         var canonical: []const u8 = packet;
@@ -564,6 +566,22 @@ pub const MediaPlane = struct {
             .not_dtls => {},
             .unavailable => return, // DTLS source with no context ⇒ drop
             .ready => canonical = self.srtp_hub.unprotectRtcp(source, packet, &plain_buf) orelse return,
+        }
+
+        var chanbuf: [256]u8 = undefined;
+        var chanlen: usize = 0;
+        lockSpin(&self.mutex);
+        if (self.transport.channelForSource(source)) |chan| {
+            if (chan.len <= chanbuf.len) {
+                @memcpy(chanbuf[0..chan.len], chan);
+                chanlen = chan.len;
+            }
+        }
+        self.mutex.unlock();
+        if (chanlen != 0) {
+            if (self.cross) |sink| {
+                if (sink.onRtcpFeedback(chanbuf[0..chanlen], canonical)) return;
+            }
         }
 
         // Terminate a Generic NACK (RTPFB PT=205, FMT=1) from the retransmit
@@ -580,7 +598,7 @@ pub const MediaPlane = struct {
 
     /// Relay an already-decrypted (canonical) RTCP `packet` to the other call
     /// participants: re-encrypt per DTLS recipient (SRTCP), plain-forward to
-    /// group-key peers. Not cached for NACK nor bridged to native.
+    /// group-key peers. Not cached for NACK.
     fn forwardRtcp(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, canonical: []const u8) void {
         var targets: [media_transport.max_forward]TransportAddress = undefined;
         lockSpin(&self.mutex);
@@ -914,6 +932,48 @@ fn stunBindPeer(client: *MediaSocket, server_addr: TransportAddress, creds: Cred
     var decoded = try stun.decode(testing.allocator, got.data);
     defer decoded.deinit(testing.allocator);
     try testing.expectEqual(stun.MessageType.binding_success_response, decoded.typ);
+}
+
+const RtcpCaptureSink = struct {
+    sock: *MediaSocket,
+    dest: TransportAddress,
+
+    fn onRtp(_: *anyopaque, _: []const u8, _: []const u8, _: bool) void {}
+
+    fn onRtcp(ctx: *anyopaque, channel: []const u8, rtcp: []const u8) bool {
+        if (!std.mem.eql(u8, channel, "#call")) return false;
+        const self: *RtcpCaptureSink = @ptrCast(@alignCast(ctx));
+        self.sock.sendTo(self.dest, rtcp);
+        return true;
+    }
+};
+
+test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound WebRTC peer" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    try plane.start(loopback_be, 0);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+
+    const creds = plane.allocate("#call", "mob") orelse return error.TestUnexpectedResult;
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    client.setRecvTimeoutMs(2000);
+    try stunBindPeer(&client, server_addr, creds);
+
+    var capture = try MediaSocket.bind(loopback_be, 0);
+    defer capture.deinit();
+    capture.setRecvTimeoutMs(2000);
+    const capture_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try capture.localPort());
+    var sink = RtcpCaptureSink{ .sock = &client, .dest = capture_addr };
+    plane.setCrossLegSink(.{ .ctx = &sink, .on_rtp_frame = RtcpCaptureSink.onRtp, .on_rtcp_feedback = RtcpCaptureSink.onRtcp });
+
+    var rtcp_buf: [64]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(0xABCD, 0xA100, &rtcp_buf);
+    client.sendTo(server_addr, pli);
+
+    var got_buf: [media_socket.max_datagram]u8 = undefined;
+    const got = capture.recvFrom(&got_buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, pli, got.data);
 }
 
 /// Drive a DTLS 1.2 client handshake to completion against the live pump and

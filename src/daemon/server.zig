@@ -224,6 +224,15 @@ fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, b
         s.server.native_media.sendTo(s.channel, addr, bytes);
 }
 
+/// Resolve a native target's learned address and send control-plane feedback
+/// there. Feedback is not a kagura media frame, so it bypasses media-frame MAC
+/// tagging.
+fn bridgeSendFeedbackToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
+    const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
+    if (s.server.native_media.remoteFor(s.channel, target.id())) |addr|
+        s.server.native_media.sendFeedbackTo(addr, bytes);
+}
+
 /// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to kagura
 /// and fan it out to the channel's native members (live addresses per peer).
 fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
@@ -233,6 +242,18 @@ fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyfr
     const br = self.media_bridges.getPtr(channel) orelse return;
     var sctx = BridgeSendCtx{ .server = self, .channel = channel };
     br.fanoutWebrtcToNative(rtp, keyframe_hint, &sctx, bridgeSendToNative);
+}
+
+/// Cross-leg sink invoked by the WebRTC relay for RTCP feedback: translate
+/// PLI/FIR/NACK into native feedback and deliver it only to the native publisher
+/// named by the media SSRC.
+fn bridgeOnRtcpFeedback(ctx: *anyopaque, channel: []const u8, rtcp: []const u8) bool {
+    const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+    lockSpin(&self.media_bridges_mu);
+    defer self.media_bridges_mu.unlock();
+    const br = self.media_bridges.getPtr(channel) orelse return false;
+    var sctx = BridgeSendCtx{ .server = self, .channel = channel };
+    return br.fanoutRtcpFeedbackToNative(rtcp, &sctx, bridgeSendFeedbackToNative);
 }
 const tegami_mod = @import("tegami.zig");
 const webpush_mod = @import("webpush.zig");
@@ -3576,7 +3597,7 @@ pub const LinuxServer = struct {
             const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
             srvLog("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
             // Bridge WebRTC RTP frames to any native members of each channel.
-            self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
+            self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback });
         }
         self.startMetrics();
         self.startWebhook();
