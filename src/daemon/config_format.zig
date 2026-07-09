@@ -1834,7 +1834,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\[listen]
         \\irc = 6680
         \\[wasm]
-        \\allowed_caps = ["reply", "STORE", "hooks"]
+        \\allowed_caps = ["reply", "STORE", "hooks", "net:outbound"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\disabled_plugins = ["bad", "bridge-discord.wasm"]
         \\
@@ -1844,6 +1844,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expect(cfg.wasm.allowed_caps.has(.reply));
     try testing.expect(cfg.wasm.allowed_caps.has(.store));
     try testing.expect(cfg.wasm.allowed_caps.has(.hooks));
+    try testing.expect(cfg.wasm.allowed_caps.has(.net_outbound));
     try testing.expect(!cfg.wasm.allowed_caps.has(.time));
     try testing.expectEqual(@as(usize, 1), cfg.wasm.registry.len);
     try testing.expectEqualStrings("guard", cfg.wasm.registry[0].name);
@@ -1862,7 +1863,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\[listen]
         \\irc = 6680
         \\[wasm]
-        \\allowed_caps = ["reply", "net:outbound"]
+        \\allowed_caps = ["reply", "net:inbound"]
         \\
     , .{}));
 

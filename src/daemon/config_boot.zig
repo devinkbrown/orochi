@@ -889,7 +889,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_plugin_bytes = 4096
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
-        \\allowed_caps = ["reply", "log", "hooks"]
+        \\allowed_caps = ["reply", "log", "hooks", "net:outbound"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\disabled_plugins = ["bridge-discord", "bad.wasm"]
         \\
@@ -903,6 +903,7 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expect(loaded.config.wasm_allowed_caps.has(.reply));
     try testing.expect(loaded.config.wasm_allowed_caps.has(.log));
     try testing.expect(loaded.config.wasm_allowed_caps.has(.hooks));
+    try testing.expect(loaded.config.wasm_allowed_caps.has(.net_outbound));
     try testing.expect(!loaded.config.wasm_allowed_caps.has(.time));
     try testing.expectEqual(@as(usize, 1), loaded.config.wasm_registry.len);
     try testing.expectEqualStrings("guard", loaded.config.wasm_registry[0].name);

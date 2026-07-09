@@ -31,6 +31,7 @@ pub const Capability = enum {
     store,
     lookup,
     hooks,
+    net_outbound,
 
     pub fn token(self: Capability) []const u8 {
         return switch (self) {
@@ -41,16 +42,19 @@ pub const Capability = enum {
             .store => "store",
             .lookup => "lookup",
             .hooks => "hooks",
+            .net_outbound => "net:outbound",
         };
     }
 
     pub fn fromToken(token_text: []const u8) ?Capability {
-        inline for ([_]Capability{ .reply, .log, .time, .rand, .store, .lookup, .hooks }) |cap| {
+        inline for (all_capabilities) |cap| {
             if (std.ascii.eqlIgnoreCase(token_text, cap.token())) return cap;
         }
         return null;
     }
 };
+
+pub const all_capabilities = [_]Capability{ .reply, .log, .time, .rand, .store, .lookup, .hooks, .net_outbound };
 
 /// Compact granted/requested capability set.
 pub const CapabilitySet = struct {
@@ -166,6 +170,7 @@ pub const host_functions = [_]HostFunction{
     .{ .name = "store_put", .version = .{ .major = 1 }, .capability = .store },
     .{ .name = "lookup_client", .version = .{ .major = 1 }, .capability = .lookup },
     .{ .name = "subscribe_hook", .version = .{ .major = 1 }, .capability = .hooks },
+    .{ .name = "net_connect", .version = .{ .major = 1 }, .capability = .net_outbound },
 };
 
 pub fn findHostFunction(name: []const u8) ?HostFunction {
@@ -221,13 +226,14 @@ test "host functions are independently named and capability gated" {
 }
 
 test "capability set renders stable token list" {
-    const caps = CapabilitySet.initMany(&.{ .reply, .time, .log });
+    const caps = CapabilitySet.initMany(&.{ .reply, .time, .log, .net_outbound });
     var out: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("reply,log,time", caps.writeTokens(&out));
+    try std.testing.expectEqualStrings("reply,log,time,net:outbound", caps.writeTokens(&out));
 }
 
 test "capability tokens parse case-insensitively and reject unknown names" {
     try std.testing.expectEqual(Capability.reply, Capability.fromToken("reply").?);
     try std.testing.expectEqual(Capability.store, Capability.fromToken("STORE").?);
-    try std.testing.expect(Capability.fromToken("net:outbound") == null);
+    try std.testing.expectEqual(Capability.net_outbound, Capability.fromToken("net:outbound").?);
+    try std.testing.expect(Capability.fromToken("net:inbound") == null);
 }

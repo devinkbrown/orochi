@@ -242,6 +242,7 @@ pub const PluginStore = struct {
             return .{ .i64 = @bitCast(self.deterministic_rand) };
         }
         if (std.mem.eql(u8, func.name, "store_get")) return .{ .bytes_written = 0 };
+        if (std.mem.eql(u8, func.name, "net_connect")) return .{ .i64 = -1 };
         return .none;
     }
 };
@@ -280,17 +281,19 @@ test "load exposes host-owned command and hook registrations" {
 
 test "hostcall dispatch enforces granted capabilities" {
     var store = PluginStore.init(std.testing.allocator, .{
-        .allowed_caps = abi.CapabilitySet.initMany(&.{.reply}),
+        .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .net_outbound }),
     });
     defer store.deinit();
 
     const handle = try store.load(.{
         .name = "limited",
-        .requested_caps = &.{ .reply, .time },
+        .requested_caps = &.{ .reply, .time, .net_outbound },
     }, &empty_wasm);
 
     _ = try store.dispatchHostcall(handle, "reply", &.{});
     try std.testing.expectError(error.CapabilityDenied, store.dispatchHostcall(handle, "now_ms", &.{}));
+    const denied_connect = try store.dispatchHostcall(handle, "net_connect", &.{});
+    try std.testing.expectEqual(@as(i64, -1), denied_connect.i64);
 }
 
 test "unload tears down all registrations for a plugin handle" {

@@ -35642,8 +35642,9 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM ABI\r\n");
-    try recvUntil(&admin, "manifest_schema=1.0 host_functions=8 allowed_caps=reply,hooks", 200);
+    try recvUntil(&admin, "manifest_schema=1.0 host_functions=9 allowed_caps=reply,hooks", 200);
     try recvUntil(&admin, "hostcall reply v1.0 cap=reply", 200);
+    try recvUntil(&admin, "hostcall net_connect v1.0 cap=net:outbound min_tier=verified", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");

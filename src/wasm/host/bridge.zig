@@ -367,7 +367,7 @@ pub fn minTrustTierForCapability(cap: abi.Capability) TrustTier {
     return switch (cap) {
         .reply, .log, .time, .rand => .unlisted,
         .store, .lookup => .listed,
-        .hooks => .verified,
+        .hooks, .net_outbound => .verified,
     };
 }
 
@@ -377,7 +377,7 @@ pub fn trustTierAllows(tier: TrustTier, required: TrustTier) bool {
 
 fn trustScopedAllowedCaps(allowed: abi.CapabilitySet, tier: TrustTier) abi.CapabilitySet {
     var out = abi.CapabilitySet.empty;
-    inline for ([_]abi.Capability{ .reply, .log, .time, .rand, .store, .lookup, .hooks }) |cap| {
+    inline for (abi.all_capabilities) |cap| {
         if (allowed.has(cap) and trustTierAllows(tier, minTrustTierForCapability(cap))) out.insert(cap);
     }
     return out;
@@ -426,6 +426,9 @@ fn hostcall(ctx_ptr: *anyopaque, instance: *interp.Instance, module: []const u8,
     if (std.mem.eql(u8, name, "now_ms")) {
         if (args.len != 0) return error.TypeMismatch;
         return .{ .i32 = @bitCast(@as(i32, @truncate(ctx.host.now_ms(ctx.host.ctx)))) };
+    }
+    if (std.mem.eql(u8, name, "net_connect")) {
+        return .{ .i32 = @bitCast(@as(i32, -1)) };
     }
     return error.UnknownImport;
 }
@@ -874,6 +877,10 @@ test "registry pins require complete publisher signature metadata" {
 }
 
 test "trust tiers gate privileged host capabilities and hook intents" {
+    try std.testing.expectEqual(TrustTier.verified, minTrustTierForCapability(.net_outbound));
+    try std.testing.expect(!trustTierAllows(.listed, minTrustTierForCapability(.net_outbound)));
+    try std.testing.expect(trustTierAllows(.verified, minTrustTierForCapability(.net_outbound)));
+
     var deny_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
     std.crypto.hash.Blake3.hash(&denied_wasm, &deny_digest, .{});
     var unlisted = Bridge.initWithOptions(std.testing.allocator, .{
