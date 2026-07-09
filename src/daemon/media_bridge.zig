@@ -21,6 +21,8 @@
 //! agreed opaque payload between the two wire framings.
 const std = @import("std");
 const kakehashi = @import("../substrate/kakehashi.zig");
+const kakehashi_session = @import("../substrate/kakehashi_session.zig");
+const ssrc_map_mod = @import("../substrate/ssrc_map.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
@@ -75,6 +77,10 @@ pub fn defaultPtMap() PtMap {
     return m;
 }
 
+fn memberStableId(id: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, id);
+}
+
 /// One call participant and the transport identity needed to deliver to it.
 pub const Member = struct {
     id_buf: [max_id_bytes]u8 = undefined,
@@ -115,6 +121,8 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         members: [max_participants]Member = undefined,
         len: usize = 0,
         ptmap: PtMap = .{},
+        session: kakehashi_session.Session(max_participants) = .{},
+        ssrcs: ssrc_map_mod.SsrcMap(max_participants) = .{},
         codec_state: CodecState = .unknown,
         common_codec: ?Codec = null,
 
@@ -166,20 +174,28 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         }
 
         fn recomputeCodec(self: *Self) void {
+            self.session = .{};
+            self.ssrcs = .{};
             self.common_codec = null;
             if (self.len == 0) {
                 self.codec_state = .unknown;
                 return;
             }
-            var sets: [max_participants][]const Codec = undefined;
-            for (self.members[0..self.len], 0..) |*m, i| {
+            for (self.members[0..self.len]) |*m| {
                 if (m.codec_count == 0) {
                     self.codec_state = .unknown;
                     return;
                 }
-                sets[i] = m.codecSlice();
+                self.session.join(.{
+                    .id = memberStableId(m.id()),
+                    .leg = m.leg,
+                    .codecs = m.codecSlice(),
+                    .stream_id = m.stream_id,
+                    .ssrc = m.ssrc,
+                }) catch return;
+                self.ssrcs.bind(m.stream_id, m.ssrc, memberStableId(m.id())) catch return;
             }
-            self.common_codec = kakehashi.selectCommon(sets[0..self.len]);
+            self.common_codec = self.session.codec;
             self.codec_state = if (self.common_codec != null) .direct else .incompatible;
         }
 
@@ -207,8 +223,9 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             const view = kagura_frame.decode(datagram) catch return;
             const bf = kakehashi.fromNative(view);
             if (!self.codecAllowed(bf.codec)) return;
+            const ssrc = self.ssrcs.ssrcForStream(view.stream_id) orelse view.stream_id;
             var scratch: [max_rewrap]u8 = undefined;
-            const rtp = kakehashi.toRtp(bf, &self.ptmap, view.stream_id, &scratch) catch return;
+            const rtp = kakehashi.toRtp(bf, &self.ptmap, ssrc, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, rtp);
         }
 
@@ -222,7 +239,8 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             const dh = rtp_profile.decodeHeader(rtp) catch return;
             const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
             if (!self.codecAllowed(bf.codec)) return;
-            const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, dh.header.ssrc);
+            const stream_id = self.ssrcs.streamForSsrc(dh.header.ssrc) orelse dh.header.ssrc;
+            const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, stream_id);
             var scratch: [max_rewrap]u8 = undefined;
             const len = kagura_frame.encode(nf, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, scratch[0..len]);
@@ -324,6 +342,23 @@ const CountSendCtx = struct {
     }
 };
 
+const CaptureSendCtx = struct {
+    count: usize = 0,
+    bytes: [max_rewrap]u8 = undefined,
+    len: usize = 0,
+
+    fn send(ctx: *anyopaque, _: *const Member, bytes: []const u8) void {
+        const self: *CaptureSendCtx = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.len = @min(bytes.len, self.bytes.len);
+        @memcpy(self.bytes[0..self.len], bytes[0..self.len]);
+    }
+
+    fn written(self: *const CaptureSendCtx) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 test "fanout gates cross-leg frames on the shared Kakehashi codec" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 7 };
@@ -354,6 +389,60 @@ test "fanout gates cross-leg frames on the shared Kakehashi codec" {
     try testing.expect(br.transcodeFree());
     br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
     try testing.expectEqual(@as(usize, 1), ctx.count);
+}
+
+test "fanout translates native stream id to RTP ssrc through ssrc_map" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
+    native.setCodecs(&.{.kaguravox});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
+    webrtc.setCodecs(&.{.kaguravox});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    var src: [128]u8 = undefined;
+    const slen = try kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+        .stream_id = 7,
+        .sequence = 1,
+        .timestamp = 960,
+        .keyframe = false,
+        .codec = .kaguravox_audio,
+        .payload = "audio",
+    }, &src);
+
+    var ctx = CaptureSendCtx{};
+    br.fanoutNativeToWebrtc(src[0..slen], &ctx, CaptureSendCtx.send);
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+    const rtp = try rtp_profile.decodeHeader(ctx.written());
+    try testing.expectEqual(@as(u32, 0xA111_A111), rtp.header.ssrc);
+}
+
+test "fanout translates RTP ssrc to native stream id through ssrc_map" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
+    native.setCodecs(&.{.kaguravox});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
+    webrtc.setCodecs(&.{.kaguravox});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    const bf = kakehashi.BridgeFrame{
+        .codec = .kaguravox,
+        .timestamp = 960,
+        .sequence = 1,
+        .keyframe = false,
+        .payload = "audio",
+    };
+    var rtp_buf: [128]u8 = undefined;
+    const rtp = try kakehashi.toRtp(bf, &br.ptmap, 0xB222_B222, &rtp_buf);
+
+    var ctx = CaptureSendCtx{};
+    br.fanoutWebrtcToNative(rtp, false, &ctx, CaptureSendCtx.send);
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+    const native_frame = try kagura_frame.decode(ctx.written());
+    try testing.expectEqual(@as(u32, 80), native_frame.stream_id);
+    try testing.expectEqual(kagura_frame.CodecTag.kaguravox_audio, native_frame.codec);
 }
 
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {

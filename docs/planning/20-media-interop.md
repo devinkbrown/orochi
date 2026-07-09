@@ -74,14 +74,14 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live cross-leg registration (wired) | `media_bridge` roster entries are created from both offerers and answerers, using `transport=webrtc`/DTLS requests to choose the WebRTC leg and native as the default. |
 | Live codec capability signaling (wired) | `MEDIA OFFER`/`MEDIA ANSWER` record each participant's advertised codec/FEC set, publish it as `MEDIA CAPS` on the Event Spine, and include it in targeted `MEDIA ROSTER` replies. |
 | Live media-kind denial (wired) | `MEDIA OFFER`/`MEDIA ANSWER` emit targeted `MEDIA KIND-DENIED kind=<voice|video> reason=no_common_codec` replies for advertised kinds that cannot join the negotiated transcode-free codec set. |
-| Live shared-codec bridge gate (wired) | Cross-leg `media_bridge` registrations carry participant codec capabilities and only rewrap/fan out frames when `kakehashi.selectCommon` finds a shared codec; incompatible calls drop instead of transcoding. |
+| Live shared-codec bridge gate (wired) | Cross-leg `media_bridge` registrations carry participant codec capabilities, maintain a per-call `kakehashi_session`, and only rewrap/fan out frames when a shared codec exists; incompatible calls drop instead of transcoding. |
+| Live stream/SSRC identity map (wired) | `media_bridge` maintains `ssrc_map` bindings for each registered participant and translates native `stream_id` ↔ RTP `ssrc` during cross-leg rewrap. |
 
 ## Remaining live wiring
 
-1. **Finish Kakehashi in the SFU forward path:** replace the remaining coarse `ChannelBridge`
-   roster with full per-channel `kakehashi_session`; on each relayed frame, serialize to
-   each target's leg (`toNative`/`toRtp`) via `ssrc_map`; drive `simulcast_select` from
-   `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
+1. **Finish Kakehashi in the SFU forward path:** replace the remaining coarse target
+   selection with full per-target `kakehashi_session.forwardTargets` policy; drive
+   `simulcast_select` from `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
 
 ## Non-goals
 
