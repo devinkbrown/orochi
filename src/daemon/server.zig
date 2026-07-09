@@ -39125,7 +39125,12 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
 }
 
 test "OroWasm message_pre_deliver hook can stop delivery" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var cfg = Config{ .host = "127.0.0.1", .port = 0 };
+    var guard_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(wasm_bridge.testing.stop_hook_wasm, &guard_digest, .{});
+    const registry_pins = [_]wasm_bridge.RegistryPin{.{ .name = "guard", .blake3 = guard_digest, .tier = .verified }};
+    cfg.wasm_registry = &registry_pins;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };

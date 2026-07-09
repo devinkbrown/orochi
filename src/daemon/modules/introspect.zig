@@ -12,6 +12,7 @@ const registry = @import("../registry.zig");
 const module_core = @import("../module_core.zig");
 const module_manifest = @import("manifest.zig");
 const wasm_abi = @import("../../wasm/host/abi.zig");
+const wasm_bridge = @import("../../wasm/host/bridge.zig");
 
 const Core = module_core.Core;
 
@@ -141,11 +142,12 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         }) catch return;
         try core.reply(.RPL_INFO, &.{}, schema);
         for (wasm_abi.host_functions) |func| {
-            const row = std.fmt.bufPrint(&line, "hostcall {s} v{d}.{d} cap={s}", .{
+            const row = std.fmt.bufPrint(&line, "hostcall {s} v{d}.{d} cap={s} min_tier={s}", .{
                 func.name,
                 func.version.major,
                 func.version.minor,
                 func.capability.token(),
+                wasm_bridge.minTrustTierForCapability(func.capability).token(),
             }) catch continue;
             try core.reply(.RPL_INFO, &.{}, row);
         }

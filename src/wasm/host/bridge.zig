@@ -154,6 +154,11 @@ pub const Bridge = struct {
         try self.enforceRegistry(name, wasm);
         var meta = try Metadata.parse(self.allocator, name, wasm);
         defer meta.deinit(self.allocator);
+        const tier = self.pluginTier(name);
+        if (meta.hooks.items.len != 0 and tier != .verified) {
+            self.blocked_loads += 1;
+            return error.PluginTrustTierTooLow;
+        }
 
         const manifest = abi.PluginManifest{
             .name = name,
@@ -161,7 +166,7 @@ pub const Bridge = struct {
             .commands = try meta.commandDecls(self.allocator),
             .hooks = try meta.hookDecls(self.allocator),
         };
-        _ = try self.store.load(manifest, wasm);
+        _ = try self.store.loadWithAllowedCaps(manifest, wasm, trustScopedAllowedCaps(self.options.allowed_caps, tier));
     }
 
     pub fn hasCommand(self: *const Bridge, name: []const u8) bool {
@@ -356,6 +361,34 @@ pub fn registryPinTranscript(out: []u8, pin: RegistryPin) error{NoSpaceLeft}![]c
         digest_hex[0..],
         pin.tier.token(),
     });
+}
+
+pub fn minTrustTierForCapability(cap: abi.Capability) TrustTier {
+    return switch (cap) {
+        .reply, .log, .time, .rand => .unlisted,
+        .store, .lookup => .listed,
+        .hooks => .verified,
+    };
+}
+
+pub fn trustTierAllows(tier: TrustTier, required: TrustTier) bool {
+    return trustTierRank(tier) >= trustTierRank(required);
+}
+
+fn trustScopedAllowedCaps(allowed: abi.CapabilitySet, tier: TrustTier) abi.CapabilitySet {
+    var out = abi.CapabilitySet.empty;
+    inline for ([_]abi.Capability{ .reply, .log, .time, .rand, .store, .lookup, .hooks }) |cap| {
+        if (allowed.has(cap) and trustTierAllows(tier, minTrustTierForCapability(cap))) out.insert(cap);
+    }
+    return out;
+}
+
+fn trustTierRank(tier: TrustTier) u8 {
+    return switch (tier) {
+        .unlisted => 0,
+        .listed => 1,
+        .verified => 2,
+    };
 }
 
 fn hexLower(bytes: []const u8, out: []u8) void {
@@ -723,7 +756,11 @@ test "bridge dispatch reports missing command" {
 }
 
 test "bridge dispatchHook routes hook exports and honors stop return" {
-    var bridge = Bridge.init(std.testing.allocator);
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &digest, .{});
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{.{ .name = "mod", .blake3 = digest, .tier = .verified }},
+    });
     defer bridge.deinit();
     try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
 
@@ -834,6 +871,34 @@ test "registry pins require complete publisher signature metadata" {
     defer bridge.deinit();
     try std.testing.expectError(error.PluginSignatureIncomplete, bridge.loadBytes("guard", &stop_hook_wasm_bytes));
     try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().blocked_load_count);
+}
+
+test "trust tiers gate privileged host capabilities and hook intents" {
+    var deny_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&denied_wasm, &deny_digest, .{});
+    var unlisted = Bridge.initWithOptions(std.testing.allocator, .{
+        .allowed_caps = abi.CapabilitySet.initMany(&.{.store}),
+    });
+    defer unlisted.deinit();
+    try unlisted.loadBytes("STORE", &denied_wasm);
+    try std.testing.expect(!unlisted.pluginSummary(0).?.grants.has(.store));
+
+    var listed = Bridge.initWithOptions(std.testing.allocator, .{
+        .allowed_caps = abi.CapabilitySet.initMany(&.{.store}),
+        .registry = &.{.{ .name = "STORE", .blake3 = deny_digest, .tier = .listed }},
+    });
+    defer listed.deinit();
+    try listed.loadBytes("STORE", &denied_wasm);
+    try std.testing.expect(listed.pluginSummary(0).?.grants.has(.store));
+
+    var hook_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &hook_digest, .{});
+    var low_tier_hook = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{.{ .name = "guard", .blake3 = hook_digest, .tier = .listed }},
+    });
+    defer low_tier_hook.deinit();
+    try std.testing.expectError(error.PluginTrustTierTooLow, low_tier_hook.loadBytes("guard", &stop_hook_wasm_bytes));
+    try std.testing.expectEqual(@as(usize, 1), low_tier_hook.runtimeInfo().blocked_load_count);
 }
 
 fn signedRegistryPin(

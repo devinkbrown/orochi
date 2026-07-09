@@ -92,7 +92,11 @@ pub const PluginStore = struct {
     }
 
     pub fn load(self: *PluginStore, manifest: abi.PluginManifest, wasm: []const u8) Error!PluginHandle {
-        const grant = abi.negotiate(manifest, .{ .allowed_caps = self.policy.allowed_caps });
+        return self.loadWithAllowedCaps(manifest, wasm, self.policy.allowed_caps);
+    }
+
+    pub fn loadWithAllowedCaps(self: *PluginStore, manifest: abi.PluginManifest, wasm: []const u8, allowed_caps: abi.CapabilitySet) Error!PluginHandle {
+        const grant = abi.negotiate(manifest, .{ .allowed_caps = allowed_caps });
         if (!grant.manifest_ok) return error.IncompatibleManifest;
 
         const handle = self.next_handle;

@@ -583,9 +583,10 @@ allow_anonymous = false
 # 16384.
 # default_fuel = 16384
 # Hostcall capability classes a plugin may receive after manifest negotiation.
-# Default keeps the minimal control-plane surface open; add store/lookup/rand/
-# hooks only for plugins you trust. Valid tokens: reply, log, time, rand, store,
-# lookup, hooks.
+# Registry trust tiers still cap grants: unlisted may receive reply/log/time/rand,
+# listed may also receive store/lookup, and verified is required for hooks.
+# Default keeps the minimal control-plane surface open. Valid tokens: reply, log,
+# time, rand, store, lookup, hooks.
 # allowed_caps = ["reply", "log", "time"]
 # Optional content-addressed local registry. When non-empty, only listed plugins
 # whose BLAKE3-256 digest matches are loadable. `tier` is surfaced to opers via
