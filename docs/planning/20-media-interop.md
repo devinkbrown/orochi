@@ -77,11 +77,12 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 | Live shared-codec bridge gate (wired) | Cross-leg `media_bridge` registrations carry participant codec capabilities, maintain a per-call `kakehashi_session`, and only rewrap/fan out frames when a shared codec exists; incompatible calls drop instead of transcoding. |
 | Live stream/SSRC identity map (wired) | `media_bridge` maintains `ssrc_map` bindings for each registered participant and translates native `stream_id` ↔ RTP `ssrc` during cross-leg rewrap. |
 | Live per-target bridge policy (wired) | Cross-leg fanout resolves the source participant through `ssrc_map` and asks `kakehashi_session.forwardTargets` for connected egress targets before rewrapping. |
+| Live ABR-driven simulcast selection (wired) | `MEDIA ABR` accepts receiver BWE/loss/RTT/NACK reports, runs the Suimyaku ABR hint through `simulcast_select`, and applies the result as the receiver's native layer ceiling without decoding or transcoding media. |
 
 ## Remaining live wiring
 
-1. **Finish Kakehashi in the SFU forward path:** drive `simulcast_select` from
-   `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
+1. **Finish Kakehashi feedback handling:** answer `rtcp_translate`/`native_feedback`
+   from the live SFU forward path.
 
 ## Non-goals
 

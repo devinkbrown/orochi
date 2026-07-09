@@ -168,6 +168,8 @@ const dtls_fingerprint_mod = @import("../proto/dtls_fingerprint.zig");
 const dtls_peer_verify_mod = @import("../proto/dtls_peer_verify.zig");
 const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
+const suimyaku_media = @import("../substrate/suimyaku/media.zig");
+const simulcast_select = @import("../substrate/simulcast_select.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
@@ -24839,6 +24841,70 @@ pub const LinuxServer = struct {
             try self.sendMediaEventReply(conn, "LAYER", channel, detail);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "ABR")) {
+            // `MEDIA ABR <#chan> <current_kbps> <available_kbps> <loss_pct> <rtt_ms> [nack_per_sec]`
+            // applies the existing Suimyaku ABR hint and simulcast selector to this
+            // receiver's native layer ceiling. It is a control-plane hint only; the
+            // SFU still forwards opaque codec bytes and never transcodes.
+            if (parsed.param_count < 6) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA ABR <#chan> <current_kbps> <available_kbps> <loss_pct> <rtt_ms> [nack_per_sec]");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reporting ABR");
+                return;
+            }
+            const current_kbps = std.fmt.parseInt(u32, parsed.paramSlice()[2], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "current_kbps must be a positive integer");
+                return;
+            };
+            const available_kbps = std.fmt.parseInt(u32, parsed.paramSlice()[3], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "available_kbps must be an integer");
+                return;
+            };
+            const loss_pct = std.fmt.parseInt(u8, parsed.paramSlice()[4], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "loss_pct must be 0-100");
+                return;
+            };
+            const rtt_ms = std.fmt.parseInt(u16, parsed.paramSlice()[5], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "rtt_ms must be 0-65535");
+                return;
+            };
+            const nack_per_sec = if (parsed.param_count >= 7)
+                std.fmt.parseInt(u16, parsed.paramSlice()[6], 10) catch {
+                    try self.failReply(conn, "MEDIA", "BAD_ABR", "nack_per_sec must be 0-65535");
+                    return;
+                }
+            else
+                0;
+            const hint = suimyaku_media.abrHint(.{}, .{
+                .current_bitrate_kbps = current_kbps,
+                .available_bitrate_kbps = available_kbps,
+                .packet_loss_percent = loss_pct,
+                .rtt_ms = rtt_ms,
+                .nack_per_second = nack_per_sec,
+            }) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "Invalid ABR report");
+                return;
+            };
+            const selected = mediaAbrSelection(hint) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "No active simulcast layer");
+                return;
+            };
+            self.native_media.setSelection(channel, nick, .{ .max_spatial = selected.spatial, .max_temporal = @intCast(selected.temporal) });
+            var detail_buf: [160]u8 = undefined;
+            const keyframe = if (hint.request_keyframe) "true" else "false";
+            const detail = std.fmt.bufPrint(&detail_buf, "action={s} bitrate={d} fec={d} keyframe={s} spatial<={d} temporal<={d}", .{
+                mediaAbrActionName(hint.action),
+                hint.target_bitrate_kbps,
+                hint.fec_level,
+                keyframe,
+                selected.spatial,
+                selected.temporal,
+            }) catch return;
+            try self.sendMediaEventReply(conn, "ABR", channel, detail);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
             if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
@@ -25230,6 +25296,34 @@ pub const LinuxServer = struct {
             const detail = std.fmt.bufPrint(&buf, "kind={s} reason=no_common_codec", .{media_room.kindName(kind)}) catch return;
             try self.sendMediaEventReply(conn, "KIND-DENIED", channel, detail);
         }
+    }
+
+    fn mediaAbrActionName(action: suimyaku_media.AbrAction) []const u8 {
+        return switch (action) {
+            .hold => "hold",
+            .increase => "increase",
+            .decrease => "decrease",
+            .pause => "pause",
+        };
+    }
+
+    fn mediaAbrLayers() [3]simulcast_select.Layer {
+        return .{
+            .{ .spatial = 0, .temporal = 0, .bitrate_bps = 150_000 },
+            .{ .spatial = 1, .temporal = 0, .bitrate_bps = 500_000 },
+            .{ .spatial = 2, .temporal = 0, .bitrate_bps = 1_200_000 },
+        };
+    }
+
+    fn mediaAbrTargetBps(target_kbps: u32) u32 {
+        const bps = @as(u64, target_kbps) * 1000;
+        return if (bps > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(bps);
+    }
+
+    fn mediaAbrSelection(hint: suimyaku_media.AbrHint) !simulcast_select.Selection {
+        const layers = mediaAbrLayers();
+        const target_bps = if (hint.action == .pause) layers[0].bitrate_bps else mediaAbrTargetBps(hint.target_bitrate_kbps);
+        return simulcast_select.selectStable(&layers, target_bps, null, 50_000);
     }
 
     /// The peer's RFC 8122 DTLS-SRTP request, parsed from a MEDIA OFFER/ANSWER's
@@ -38257,6 +38351,15 @@ test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "ANSWER-ACK") != null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TRANSPORT #media ufrag=") != null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "NATIVE #media candidate=") != null);
+
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA ABR #media 1200 400 10 60 25\r\n");
+    try recvUntil(&b, "EVENT B MEDIA ABR #media action=decrease", 200);
+    try recvUntil(&b, "spatial<=0 temporal<=0", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA ABR #media 0 400 10 60\r\n");
+    try recvUntil(&b, "FAIL MEDIA BAD_ABR", 200);
 
     a.reset();
     try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
