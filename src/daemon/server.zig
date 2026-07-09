@@ -26418,16 +26418,99 @@ pub const LinuxServer = struct {
         return std.mem.eql(u8, id, entry.proof_id);
     }
 
-    fn handleAuditProof(self: *LinuxServer, conn: *ConnState, proof_id: []const u8) !void {
+    fn appendAuditEventPayload(self: *LinuxServer, conn: *ConnState, payload: []const u8) !void {
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} EVENT {s} AUDIT {s}\r\n", .{ self.serverName(), conn.session.displayName(), payload }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    fn writeAuditEntryJson(w: *std.Io.Writer, entry: *const svc_operaudit.Entry) !void {
+        try w.print("{{\"type\":\"audit-entry\",\"seq\":{d},\"ts\":{d},\"oper\":", .{ entry.seq, entry.ts });
+        try writeJsonEscaped(w, entry.oper);
+        try w.writeAll(",\"action\":");
+        try writeJsonEscaped(w, entry.action.label());
+        try w.writeAll(",\"target\":");
+        try writeJsonEscaped(w, entry.target);
+        try w.writeAll(",\"reason\":");
+        try writeJsonEscaped(w, entry.reason);
+        try w.writeAll(",\"proof_id\":");
+        if (entry.proof_id.len != 0) {
+            try writeJsonEscaped(w, entry.proof_id);
+        } else {
+            try w.writeAll("null");
+        }
+        try w.print(",\"proof_action\":{d}}}", .{entry.proof_action});
+    }
+
+    fn appendAuditEntryJson(self: *LinuxServer, conn: *ConnState, entry: *const svc_operaudit.Entry) !void {
+        var payload: [default_reply_bytes]u8 = undefined;
+        var w = std.Io.Writer.fixed(&payload);
+        try writeAuditEntryJson(&w, entry);
+        try self.appendAuditEventPayload(conn, w.buffered());
+    }
+
+    fn appendAuditProofJson(self: *LinuxServer, conn: *ConnState, proof_id: []const u8) !void {
+        const entry = self.oper_audit.findByProofId(proof_id) orelse {
+            var payload: [512]u8 = undefined;
+            var w = std.Io.Writer.fixed(&payload);
+            try w.writeAll("{\"type\":\"audit-proof\",\"found\":false,\"proof_id\":");
+            try writeJsonEscaped(&w, proof_id);
+            try w.writeByte('}');
+            try self.appendAuditEventPayload(conn, w.buffered());
+            return;
+        };
+
+        if (entry.proof_signature.len == 0 or entry.proof_public_key.len == 0) {
+            var payload: [default_reply_bytes]u8 = undefined;
+            var w = std.Io.Writer.fixed(&payload);
+            try w.writeAll("{\"type\":\"audit-proof\",\"found\":true,\"has_evidence\":false,\"proof_id\":");
+            try writeJsonEscaped(&w, proof_id);
+            try w.print(",\"seq\":{d}}}", .{entry.seq});
+            try self.appendAuditEventPayload(conn, w.buffered());
+            return;
+        }
+
+        const verified = auditProofVerified(entry);
+        var hash_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+        const reason_hash = proofHashHex(entry.proof_reason_hash, &hash_buf);
+        var payload: [default_reply_bytes]u8 = undefined;
+        var w = std.Io.Writer.fixed(&payload);
+        try w.print("{{\"type\":\"audit-proof\",\"found\":true,\"has_evidence\":true,\"valid\":{s},\"seq\":{d},\"proof_id\":", .{
+            if (verified) "true" else "false",
+            entry.seq,
+        });
+        try writeJsonEscaped(&w, entry.proof_id);
+        try w.writeAll(",\"actor\":");
+        try writeJsonEscaped(&w, entry.oper);
+        try w.writeAll(",\"action\":");
+        try writeJsonEscaped(&w, entry.action.label());
+        try w.print(",\"proof_action\":{d},\"target\":", .{entry.proof_action});
+        try writeJsonEscaped(&w, entry.target);
+        try w.print(",\"policy\":{d},\"issued_ms\":{d},\"expiry_ms\":{d},\"reason_hash\":", .{
+            entry.proof_policy_version,
+            entry.proof_issued_ms,
+            entry.proof_expiry_ms,
+        });
+        try writeJsonEscaped(&w, reason_hash);
+        try w.writeAll(",\"public_key\":");
+        try writeJsonEscaped(&w, entry.proof_public_key);
+        try w.writeAll(",\"signature\":");
+        try writeJsonEscaped(&w, entry.proof_signature);
+        try w.writeByte('}');
+        try self.appendAuditEventPayload(conn, w.buffered());
+    }
+
+    fn handleAuditProof(self: *LinuxServer, conn: *ConnState, proof_id: []const u8, json: bool) !void {
+        if (json) return self.appendAuditProofJson(conn, proof_id);
         const entry = self.oper_audit.findByProofId(proof_id) orelse {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE AUDIT :Proof {s} not found\r\n", .{ self.serverName(), proof_id }) catch return;
+            const line = std.fmt.bufPrint(&buf, ":{s} EVENT {s} AUDIT Proof {s} not found\r\n", .{ self.serverName(), conn.session.displayName(), proof_id }) catch return;
             try appendToConn(conn, line);
             return;
         };
         if (entry.proof_signature.len == 0 or entry.proof_public_key.len == 0) {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE AUDIT :Proof {s} has no stored evidence\r\n", .{ self.serverName(), proof_id }) catch return;
+            const line = std.fmt.bufPrint(&buf, ":{s} EVENT {s} AUDIT Proof {s} has no stored evidence\r\n", .{ self.serverName(), conn.session.displayName(), proof_id }) catch return;
             try appendToConn(conn, line);
             return;
         }
@@ -26436,8 +26519,9 @@ pub const LinuxServer = struct {
         var hash_buf: [proofmark.proof_id_hex_len]u8 = undefined;
         const reason_hash = proofHashHex(entry.proof_reason_hash, &hash_buf);
         var line1: [default_reply_bytes]u8 = undefined;
-        const out1 = std.fmt.bufPrint(&line1, ":{s} NOTE AUDIT :Proof {s} seq={d} valid={s} actor={s} action={s}/{d} target={s}\r\n", .{
+        const out1 = std.fmt.bufPrint(&line1, ":{s} EVENT {s} AUDIT Proof {s} seq={d} valid={s} actor={s} action={s}/{d} target={s}\r\n", .{
             self.serverName(),
+            conn.session.displayName(),
             entry.proof_id,
             entry.seq,
             if (verified) "true" else "false",
@@ -26448,8 +26532,9 @@ pub const LinuxServer = struct {
         }) catch return;
         try appendToConn(conn, out1);
         var line2: [default_reply_bytes]u8 = undefined;
-        const out2 = std.fmt.bufPrint(&line2, ":{s} NOTE AUDIT :Proof policy={d} issued_ms={d} expiry_ms={d} reason_hash={s}\r\n", .{
+        const out2 = std.fmt.bufPrint(&line2, ":{s} EVENT {s} AUDIT Proof policy={d} issued_ms={d} expiry_ms={d} reason_hash={s}\r\n", .{
             self.serverName(),
+            conn.session.displayName(),
             entry.proof_policy_version,
             entry.proof_issued_ms,
             entry.proof_expiry_ms,
@@ -26457,36 +26542,50 @@ pub const LinuxServer = struct {
         }) catch return;
         try appendToConn(conn, out2);
         var line3: [default_reply_bytes]u8 = undefined;
-        const out3 = std.fmt.bufPrint(&line3, ":{s} NOTE AUDIT :Proof public_key={s} signature={s}\r\n", .{
+        const out3 = std.fmt.bufPrint(&line3, ":{s} EVENT {s} AUDIT Proof public_key={s} signature={s}\r\n", .{
             self.serverName(),
+            conn.session.displayName(),
             entry.proof_public_key,
             entry.proof_signature,
         }) catch return;
         try appendToConn(conn, out3);
     }
 
-    /// `AUDIT [oper] [count]` — dump the oper-action audit ring, most recent first.
-    /// A leading non-numeric arg filters to one operator's actions. Gated on the
-    /// audit_read privilege (the same priv guarding the DEBUG flight recorder).
+    /// `AUDIT [JSON] [oper] [count]` — dump the oper-action audit ring, most
+    /// recent first. A leading non-numeric arg filters to one operator's actions.
+    /// Gated on the audit_read privilege (the same priv guarding the DEBUG flight
+    /// recorder). `AUDIT PROOF [JSON] <id>` inspects one ProofMark record.
     pub fn handleAudit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!self.requirePriv(conn, .audit_read)) return;
         const params = parsed.paramSlice();
         if (params.len >= 1 and std.ascii.eqlIgnoreCase(params[0], "PROOF")) {
-            if (params.len < 2) {
-                try self.noticeTo(conn, "AUDIT PROOF: usage AUDIT PROOF <proof-id>");
+            var proof_argi: usize = 1;
+            var json = false;
+            if (params.len > proof_argi and std.ascii.eqlIgnoreCase(params[proof_argi], "JSON")) {
+                json = true;
+                proof_argi += 1;
+            }
+            if (params.len <= proof_argi) {
+                try self.noticeTo(conn, "AUDIT PROOF: usage AUDIT PROOF [JSON] <proof-id>");
                 return;
             }
-            try self.handleAuditProof(conn, params[1]);
+            try self.handleAuditProof(conn, params[proof_argi], json);
             return;
         }
         var oper_filter: ?[]const u8 = null;
         var count: usize = 20;
-        if (params.len >= 1) {
-            if (std.fmt.parseInt(usize, params[0], 10)) |n| {
+        var json = false;
+        var argi: usize = 0;
+        if (params.len > argi and std.ascii.eqlIgnoreCase(params[argi], "JSON")) {
+            json = true;
+            argi += 1;
+        }
+        if (params.len > argi) {
+            if (std.fmt.parseInt(usize, params[argi], 10)) |n| {
                 count = std.math.clamp(n, 1, 200);
             } else |_| {
-                oper_filter = params[0];
-                if (params.len >= 2) count = std.math.clamp(std.fmt.parseInt(usize, params[1], 10) catch 20, 1, 200);
+                oper_filter = params[argi];
+                if (params.len > argi + 1) count = std.math.clamp(std.fmt.parseInt(usize, params[argi + 1], 10) catch 20, 1, 200);
             }
         }
         const entries = (if (oper_filter) |o|
@@ -26497,17 +26596,34 @@ pub const LinuxServer = struct {
             return;
         };
         defer self.allocator.free(entries);
+        if (json) {
+            var header: [512]u8 = undefined;
+            var hw = std.Io.Writer.fixed(&header);
+            try hw.print("{{\"type\":\"audit\",\"count\":{d},\"filter\":", .{entries.len});
+            if (oper_filter) |filter| {
+                try writeJsonEscaped(&hw, filter);
+            } else {
+                try hw.writeAll("null");
+            }
+            try hw.writeByte('}');
+            try self.appendAuditEventPayload(conn, hw.buffered());
+            for (entries) |*e| self.appendAuditEntryJson(conn, e) catch continue;
+            var end: [128]u8 = undefined;
+            const end_payload = std.fmt.bufPrint(&end, "{{\"type\":\"audit-end\",\"count\":{d}}}", .{entries.len}) catch "{\"type\":\"audit-end\"}";
+            try self.appendAuditEventPayload(conn, end_payload);
+            return;
+        }
         for (entries) |e| {
             var lb: [default_reply_bytes]u8 = undefined;
             const tgt = if (e.target.len != 0) e.target else "-";
             const ln = if (e.proof_id.len != 0)
-                std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} proof={s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.proof_id, e.reason }) catch continue
+                std.fmt.bufPrint(&lb, ":{s} EVENT {s} AUDIT #{d} {s} {s} {s} proof={s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), e.seq, e.oper, e.action.label(), tgt, e.proof_id, e.reason }) catch continue
             else
-                std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.reason }) catch continue;
+                std.fmt.bufPrint(&lb, ":{s} EVENT {s} AUDIT #{d} {s} {s} {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), e.seq, e.oper, e.action.label(), tgt, e.reason }) catch continue;
             try appendToConn(conn, ln);
         }
         var eb: [128]u8 = undefined;
-        const end = std.fmt.bufPrint(&eb, ":{s} NOTE AUDIT :End of audit ({d})\r\n", .{ self.serverName(), entries.len }) catch return;
+        const end = std.fmt.bufPrint(&eb, ":{s} EVENT {s} AUDIT End of audit ({d})\r\n", .{ self.serverName(), conn.session.displayName(), entries.len }) catch return;
         try appendToConn(conn, end);
     }
 
@@ -39632,7 +39748,9 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     const proof_start = (std.mem.indexOf(u8, o.written(), marker) orelse return error.TestExpectedEqual) + marker.len;
     const proof_end = proof_start + proofmark.proof_id_hex_len;
     try std.testing.expect(proof_end <= o.written().len);
-    const proof_id = o.written()[proof_start..proof_end];
+    var proof_id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+    @memcpy(&proof_id_buf, o.written()[proof_start..proof_end]);
+    const proof_id = proof_id_buf[0..];
     var proof_cmd_buf: [96]u8 = undefined;
     const proof_cmd = try std.fmt.bufPrint(&proof_cmd_buf, "AUDIT PROOF {s}\r\n", .{proof_id});
     o.reset();
@@ -39640,11 +39758,31 @@ test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
     try recvUntil(&o, "valid=true", 300);
     try recvUntil(&o, "public_key=", 300);
     try std.testing.expect(std.mem.indexOf(u8, o.written(), "signature=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
+
+    o.reset();
+    try writeAllFd(fd_o, "AUDIT JSON O 5\r\n");
+    try recvUntil(&o, "\"type\":\"audit\"", 300);
+    try recvUntil(&o, "\"type\":\"audit-entry\"", 300);
+    try recvUntil(&o, "\"type\":\"audit-end\"", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"proof_id\":") != null);
+
+    var proof_json_cmd_buf: [104]u8 = undefined;
+    const proof_json_cmd = try std.fmt.bufPrint(&proof_json_cmd_buf, "AUDIT PROOF JSON {s}\r\n", .{proof_id});
+    o.reset();
+    try writeAllFd(fd_o, proof_json_cmd);
+    try recvUntil(&o, "\"type\":\"audit-proof\"", 300);
+    try recvUntil(&o, "\"valid\":true", 300);
+    try recvUntil(&o, "\"public_key\":", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "\"signature\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
 
     // Filtering by a different oper yields no entries.
     o.reset();
     try writeAllFd(fd_o, "AUDIT nobody\r\n");
     try recvUntil(&o, "End of audit (0)", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "EVENT O AUDIT") != null);
 }
 
 test "threaded server: IDENTIFY brute-force throttle locks after repeated failures" {
