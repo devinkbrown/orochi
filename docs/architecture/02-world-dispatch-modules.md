@@ -89,7 +89,7 @@ STATS reporting includes per-class policy and live member count (numeric 218 RPL
 | `query.info` | VERSION, TIME, ADMIN, INFO, MOTD, LUSERS, USERS, LINKS, MAP | `src/daemon/modules/query_info.zig:58`, `src/daemon/modules/query_info.zig:61` |
 | `channel.ops` | JOIN, PART, NAMES, MODE, KICK, INVITE, TOPIC, KNOCK, CREATE, RENAME | `src/daemon/modules/channel_ops.zig:49`, `src/daemon/modules/channel_ops.zig:52` |
 | `messaging` | PRIVMSG, NOTICE, TAGMSG, REDACT, CHATHISTORY, MARKREAD, METADATA, MONITOR, SILENCE | `src/daemon/modules/messaging.zig:44`, `src/daemon/modules/messaging.zig:47` |
-| `accounts` | REGISTER, VERIFY, IDENTIFY, LOGOUT, DROP, ACCOUNTINFO, SASLINFO, ACCOUNTSET, GHOST, CHANNEL/CS, SESSION, CERTADD | `src/daemon/modules/accounts.zig:57`, `src/daemon/modules/accounts.zig:60` |
+| `accounts` | REGISTER, VERIFY, IDENTIFY, LOGOUT, DROP, ACCOUNTINFO, SASLINFO, ACCOUNTSET, GHOST, CHANNEL/CS, SESSION, CERTADD, WEBAUTHN, KEYTRANS, E2EEKEY, IDENTITY | `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` |
 | `ircx` | IRCX, ISIRCX, DATA, REQUEST, REPLY, WHISPER, PROP, ACCESS, EVENT, MODEX, LISTX | `src/daemon/modules/ircx.zig:45`, `src/daemon/modules/ircx.zig:48` |
 | `oper.security` | OPER, REHASH, KILL, CLOSE, DRAIN, UNREJECT, WARD, SHUN, UNSHUN, GLOBAL, OPERMOTD, DIE, RESTART, CONNECT, SQUIT, TRACE, ETRACE, STATS, TESTLINE, TESTMASK, USERIP, DEBUG, MESH/NETSTAT, ROUTE, NETHEALTH | `src/daemon/modules/oper_security.zig:104`, `src/daemon/modules/oper_security.zig:110` |
 | `user.query` | ISON, USERHOST, WHOIS, LIST, WHO, WHOWAS, AWAY, SETNAME, NICK, QUIT, ACCEPT, HELP, HELPOP, AUTOJOIN, GROUP, WELCOME | `src/daemon/modules/user_query.zig:69`, `src/daemon/modules/user_query.zig:72` |

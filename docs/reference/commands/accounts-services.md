@@ -236,6 +236,17 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `E2EEKEY ADD phone mls-x25519 abcd+/=`
 - Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleE2eeKey`, `src/proto/e2ee_policy.zig`
 
+## IDENTITY
+
+- Syntax: `IDENTITY [STATUS|LIST [account]|ADD <label> <ed25519-pubkey-hex> <signature-hex>|DEL <label>|VERIFY <account> <label> <ed25519-pubkey-hex> <signature-hex>]`
+- Description: Manages portable account identity keys. `ADD` requires the caller to be logged in and stores a public Ed25519 key only after verifying that the key signed Orochi's account-binding transcript for the logged-in account and label. Stored records are account-scoped user PROP metadata under `identity.key.<label>` with value `<pubkey-hex>:<signature-hex>`, so the assertion replicates over signed `ENTITY_PROP`. `VERIFY` checks a supplied assertion without mutating state.
+- Privileges: Registered client; account login required for `STATUS`, `ADD`, `DEL`, and caller-default `LIST`.
+- Parameters: Optional subcommand; `ADD` takes a bounded label, 64-hex Ed25519 public key, and 128-hex Ed25519 signature.
+- Replies: Server notices: `IDENTITY STATUS account=<account> keys=<n>`, `IDENTITY KEY account=<account> label=<label> pub=<hex> sig=<hex>`, `IDENTITY END account=<account> keys=<n>`, `IDENTITY VERIFY ... result=<valid|invalid>`, `IDENTITY ADDED ...`, or `IDENTITY DELETED ...`.
+- Errors: `FAIL IDENTITY NOT_LOGGED_IN`, `NEED_MORE_PARAMS`, `BAD_ASSERTION`, `BAD_LABEL`, `STORE_FAILED`, `INVALID_SUBCOMMAND`.
+- Example: `IDENTITY ADD primary <64-hex-pubkey> <128-hex-signature>`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleIdentity`, `src/proto/account_identity.zig`
+
 ## TEGAMI
 
 - Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)

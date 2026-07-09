@@ -89,6 +89,18 @@ fans changes through signed `ENTITY_PROP` replication. This gives clients a
 mesh-visible device-key directory without introducing a second key store or a
 server-side plaintext path.
 
+## Portable account identity
+
+Ryujin portable identity starts as account-owned Ed25519 assertions. `IDENTITY`
+does not generate keys; it verifies that a supplied public key signed Orochi's
+domain-separated account-binding transcript for `{account, label, public_key}`.
+Verified records are stored as account user PROP facts under
+`identity.key.<label>` with value `<pubkey-hex>:<signature-hex>`, then announced
+through the existing signed `ENTITY_PROP` replication path. The result is a
+mesh-visible public identity-key directory for clients and future cross-mesh
+admission flows without making server-local account rows the only source of
+identity truth.
+
 ## ProofMark moderation proofs
 
 `src/daemon/proofmark.zig` defines signed moderation proofs for privileged policy

@@ -9,6 +9,7 @@
 pub const accept_list = @import("accept_list.zig");
 pub const account_notify = @import("account_notify.zig");
 pub const account_notify_emit = @import("account_notify_emit.zig");
+pub const account_identity = @import("account_identity.zig");
 pub const account_register = @import("account_register.zig");
 pub const acme_account = @import("acme_account.zig");
 pub const acme_challenge = @import("acme_challenge.zig");
@@ -356,6 +357,7 @@ test {
     _ = accept_list;
     _ = account_notify;
     _ = account_notify_emit;
+    _ = account_identity;
     _ = account_register;
     _ = acme_account;
     _ = acme_challenge;

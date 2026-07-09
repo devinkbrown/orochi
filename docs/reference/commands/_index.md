@@ -124,6 +124,7 @@ Registry commands default to registered-client access unless the command table s
 | `CERTDEL` | Remove a bound TLS client certificate fingerprint. | [accounts-services.md](accounts-services.md#certdel) |
 | `KEYTRANS` | Inspect account credential transparency roots and proofs. | [accounts-services.md](accounts-services.md#keytrans) |
 | `E2EEKEY` | Manage public account E2EE device-key advertisements. | [accounts-services.md](accounts-services.md#e2eekey) |
+| `IDENTITY` | Manage portable self-signed account identity keys. | [accounts-services.md](accounts-services.md#identity) |
 | `TEGAMI` | Offline account messages. | [accounts-services.md](accounts-services.md#tegami) |
 | `VHOST` | Vhost wardrobe, requests, offers, and oper set. | [accounts-services.md](accounts-services.md#vhost) |
 | `PRIVS` | Show oper class and privileges. | [accounts-services.md](accounts-services.md#privs) |

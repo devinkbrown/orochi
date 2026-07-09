@@ -127,6 +127,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
+const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
@@ -23365,6 +23366,111 @@ pub const LinuxServer = struct {
         return self.failReply(conn, "E2EEKEY", "INVALID_SUBCOMMAND", "Usage: E2EEKEY [STATUS|LIST [account]|ADD <device-id> <algorithm> <public-key>|DEL <device-id>]");
     }
 
+    fn identityReply(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "IDENTITY {s}", .{body}) catch return;
+        try self.noticeTo(conn, text);
+    }
+
+    fn identityKeyCount(self: *LinuxServer, account: []const u8) usize {
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = self.props.listProps(entity, &views) catch return 0;
+        var count: usize = 0;
+        for (rows) |ev| {
+            if (account_identity.isPropKey(ev.key)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn handleIdentity(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        const sub = if (p.len == 0) "STATUS" else p[0];
+
+        if (std.ascii.eqlIgnoreCase(sub, "VERIFY")) {
+            if (p.len < 5) return self.failReply(conn, "IDENTITY", "NEED_MORE_PARAMS", "Usage: IDENTITY VERIFY <account> <label> <public-key-hex> <signature-hex>");
+            const ok = account_identity.verifyClaim(p[1], p[2], p[3], p[4]);
+            var b: [160]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "VERIFY account={s} label={s} result={s}", .{ p[1], p[2], if (ok) "valid" else "invalid" }) catch return;
+            return self.identityReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before managing portable identity keys");
+            var b: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "STATUS account={s} keys={d}", .{ account, self.identityKeyCount(account) }) catch return;
+            return self.identityReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const account = if (p.len >= 2) p[1] else (conn.session.account() orelse
+                return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before listing your portable identity keys"));
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+            const rows = self.props.listProps(entity, &views) catch rows: {
+                break :rows views[0..0];
+            };
+            var count: usize = 0;
+            for (rows) |ev| {
+                if (!account_identity.isPropKey(ev.key)) continue;
+                if (account_identity.parseClaimValue(ev.value) == null) continue;
+                const label = ev.key[account_identity.prop_prefix.len..];
+                var b: [default_reply_bytes]u8 = undefined;
+                const body = std.fmt.bufPrint(
+                    &b,
+                    "KEY account={s} label={s} pub={s} sig={s}",
+                    .{ account, label, ev.value[0..account_identity.public_key_hex_len], ev.value[account_identity.public_key_hex_len + 1 ..] },
+                ) catch continue;
+                try self.identityReply(conn, body);
+                count += 1;
+            }
+            var end_buf: [128]u8 = undefined;
+            const end = std.fmt.bufPrint(&end_buf, "END account={s} keys={d}", .{ account, count }) catch return;
+            return self.identityReply(conn, end);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before adding portable identity keys");
+            if (p.len < 4) return self.failReply(conn, "IDENTITY", "NEED_MORE_PARAMS", "Usage: IDENTITY ADD <label> <public-key-hex> <signature-hex>");
+            if (!account_identity.verifyClaim(account, p[1], p[2], p[3]))
+                return self.failReply(conn, "IDENTITY", "BAD_ASSERTION", "Identity key assertion did not verify for this account and label");
+            var key_buf: [account_identity.prop_prefix.len + account_identity.max_label_len]u8 = undefined;
+            const key = account_identity.propKey(p[1], &key_buf) orelse
+                return self.failReply(conn, "IDENTITY", "BAD_LABEL", "Identity label must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            var value_buf: [account_identity.max_value_len]u8 = undefined;
+            const value = account_identity.claimValue(p[2], p[3], &value_buf) orelse
+                return self.failReply(conn, "IDENTITY", "BAD_ASSERTION", "Identity public key or signature is invalid");
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
+                return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not store portable identity key");
+            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+            self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+            var b: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "ADDED label={s}", .{p[1]}) catch return;
+            return self.identityReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "DELETE")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before deleting portable identity keys");
+            if (p.len < 2) return self.failReply(conn, "IDENTITY", "NEED_MORE_PARAMS", "Usage: IDENTITY DEL <label>");
+            var key_buf: [account_identity.prop_prefix.len + account_identity.max_label_len]u8 = undefined;
+            const key = account_identity.propKey(p[1], &key_buf) orelse
+                return self.failReply(conn, "IDENTITY", "BAD_LABEL", "Identity label must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            self.props.deleteProp(entity, key) catch {};
+            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
+            self.notifyLocalPropChange(conn, entity, key, "");
+            var b: [96]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "DELETED label={s}", .{p[1]}) catch return;
+            return self.identityReply(conn, body);
+        }
+
+        return self.failReply(conn, "IDENTITY", "INVALID_SUBCOMMAND", "Usage: IDENTITY [STATUS|LIST [account]|ADD <label> <public-key-hex> <signature-hex>|DEL <label>|VERIFY <account> <label> <public-key-hex> <signature-hex>]");
+    }
+
     pub fn handleKeyTrans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "KEYTRANS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const p = parsed.paramSlice();
@@ -32064,6 +32170,75 @@ test "E2EEKEY advertises account device keys through user props" {
     try server.handleE2eeKey(conn, &del);
     try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DELETED id=phone");
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
+}
+
+test "IDENTITY advertises self-signed portable account keys through user props" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
+    const public_hex = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
+    var transcript_buf: [account_identity.max_transcript_len]u8 = undefined;
+    const msg = account_identity.transcript("kain", "primary", kp.public_key.toBytes(), &transcript_buf).?;
+    const sig = try kp.sign(msg, null);
+    const sig_hex = std.fmt.bytesToHex(sig.toBytes(), .lower);
+
+    var add = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    add.params[0] = "ADD";
+    add.params[1] = "primary";
+    add.params[2] = &public_hex;
+    add.params[3] = &sig_hex;
+    add.param_count = 4;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY ADDED label=primary");
+
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    const ev = try server.props.getProp(entity, "identity.key.primary");
+    try std.testing.expect(account_identity.parseClaimValue(ev.value) != null);
+
+    var list_lv = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    list_lv.params[0] = "LIST";
+    list_lv.param_count = 1;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &list_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY KEY account=kain label=primary pub=");
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY END account=kain keys=1");
+
+    var verify = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    verify.params[0] = "VERIFY";
+    verify.params[1] = "kain";
+    verify.params[2] = "primary";
+    verify.params[3] = &public_hex;
+    verify.params[4] = &sig_hex;
+    verify.param_count = 5;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &verify);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY VERIFY account=kain label=primary result=valid");
+
+    var status = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &status);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY STATUS account=kain keys=1");
+
+    var del = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    del.params[0] = "DEL";
+    del.params[1] = "primary";
+    del.param_count = 2;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &del);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY DELETED label=primary");
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
 }
 
 test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {
