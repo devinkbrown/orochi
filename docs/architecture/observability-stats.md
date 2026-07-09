@@ -95,7 +95,13 @@ The same flush also emits `status.json` beside the channel stats ([src/daemon/se
   "discoverable": true,
   "uptime_seconds": 86400,
   "users_online": 214,
-  "activity": {"channels": 12, "messages": 2048, "active_channels_24h": 5, "last_active": 1700000000},
+  "activity": {
+    "channels": 12,
+    "messages": 2048,
+    "active_channels_24h": 5,
+    "last_active": 1700000000,
+    "heatline": [12, 30, 41, 27, 98, 132, 119]
+  },
   "features": {
     "s2s": true,
     "websocket": true,
@@ -129,10 +135,14 @@ without asking public crawlers to index them. `uptime_seconds` is derived from
 `boot_unix`; `users_online` is again `meshUserCount` ([src/daemon/server.zig:4054](../../src/daemon/server.zig#L4054)). The `activity` object is a compact liveness
 summary from the same bounded `ChanStats` aggregate used by `index.json`, counting
 only channels that meet the public index threshold and exposing last activity for
-directory ranking. The `features` object is derived from live configuration
-gates and lets public directory crawlers classify a discoverable node without
-probing optional listeners or exposing secrets, addresses, peer lists, keys, or
-operator-only values. The `mesh` envelope reflects the live partition detector —
+directory ranking. `activity.heatline` is the same bounded 14-day sparkline shape
+used by the channel index, aggregated across public-indexed channels only and
+ordered oldest-to-newest. Directory crawlers can rank a discoverable node by
+recent heat without fetching every per-channel JSON file. The `features` object
+is derived from live configuration gates and lets public directory crawlers
+classify a discoverable node without probing optional listeners or exposing
+secrets, addresses, peer lists, keys, or operator-only values. The `mesh`
+envelope reflects the live partition detector —
 `quorum`, `partitioned`, and `components` come from `partition_quorum`/
 `partition_split`/`partition_components`, which `updatePartitionTransitions`
 maintains on every link up/down ([src/daemon/server.zig:4066](../../src/daemon/server.zig#L4066)). The `accounts.key_transparency` object exposes the live account

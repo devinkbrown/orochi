@@ -139,6 +139,9 @@ pub const ChanStats = struct {
         messages: u64 = 0,
         active_channels_24h: u64 = 0,
         last_active_ms: ?i64 = null,
+        heatline_days: [spark_days]i64 = @splat(0),
+        heatline: [spark_days]u64 = @splat(0),
+        heatline_len: usize = 0,
     };
 
     /// Compact discovery/status summary. Counts only channels that meet the
@@ -155,8 +158,36 @@ pub const ChanStats = struct {
             out.messages +|= agg.messages;
             if (now_ms >= agg.last_active and now_ms - agg.last_active <= day_ms) out.active_channels_24h += 1;
             if (out.last_active_ms == null or agg.last_active > out.last_active_ms.?) out.last_active_ms = agg.last_active;
+            for (agg.days.items) |d| mergePublicHeatlineDay(&out, d.day, d.messages);
         }
         return out;
+    }
+
+    fn mergePublicHeatlineDay(out: *PublicSummary, day: i64, messages: u64) void {
+        var lo: usize = 0;
+        while (lo < out.heatline_len and out.heatline_days[lo] < day) lo += 1;
+        if (lo < out.heatline_len and out.heatline_days[lo] == day) {
+            out.heatline[lo] +|= messages;
+            return;
+        }
+        if (out.heatline_len == spark_days) {
+            if (day <= out.heatline_days[0]) return;
+            var i: usize = 0;
+            while (i + 1 < out.heatline_len) : (i += 1) {
+                out.heatline_days[i] = out.heatline_days[i + 1];
+                out.heatline[i] = out.heatline[i + 1];
+            }
+            out.heatline_len -= 1;
+            if (lo > 0) lo -= 1;
+        }
+        var j = out.heatline_len;
+        while (j > lo) : (j -= 1) {
+            out.heatline_days[j] = out.heatline_days[j - 1];
+            out.heatline[j] = out.heatline[j - 1];
+        }
+        out.heatline_days[lo] = day;
+        out.heatline[lo] = messages;
+        out.heatline_len += 1;
     }
 
     fn channel(self: *ChanStats, name: []const u8, now_ms: i64) ?*ChannelAgg {
@@ -1112,6 +1143,7 @@ test "publicSummary mirrors public index threshold and recent activity" {
     try std.testing.expectEqual(@as(u64, 0), hidden.channels);
     try std.testing.expectEqual(@as(u64, 0), hidden.messages);
     try std.testing.expectEqual(@as(?i64, null), hidden.last_active_ms);
+    try std.testing.expectEqual(@as(usize, 0), hidden.heatline_len);
 
     s.recordMessage("#live", "alice", "two", now);
     s.recordMessage("#old", "bob", "older again", old);
@@ -1120,6 +1152,9 @@ test "publicSummary mirrors public index threshold and recent activity" {
     try std.testing.expectEqual(@as(u64, 4), summary.messages);
     try std.testing.expectEqual(@as(u64, 1), summary.active_channels_24h);
     try std.testing.expectEqual(@as(?i64, now), summary.last_active_ms);
+    try std.testing.expectEqual(@as(usize, 2), summary.heatline_len);
+    try std.testing.expectEqual(@as(u64, 2), summary.heatline[0]);
+    try std.testing.expectEqual(@as(u64, 2), summary.heatline[1]);
 }
 
 test "slugify strips the channel prefix and neutralises unsafe / traversal bytes" {

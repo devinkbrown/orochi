@@ -5073,6 +5073,12 @@ pub const LinuxServer = struct {
         } else {
             w.writeAll("null") catch return w.buffered();
         }
+        w.writeAll(",\"heatline\":[") catch return w.buffered();
+        for (public_activity.heatline[0..public_activity.heatline_len], 0..) |messages, i| {
+            if (i != 0) w.writeAll(",") catch return w.buffered();
+            w.print("{d}", .{messages}) catch return w.buffered();
+        }
+        w.writeAll("]") catch return w.buffered();
         w.writeAll("}") catch return w.buffered();
         w.print(",\"features\":{{\"s2s\":{s},\"websocket\":{s},\"webtransport\":{s},\"media\":{s},\"webpush\":{s},\"webauthn\":{s},\"webhook\":{s},\"metrics\":{s},\"sts\":{s},\"raw_public_key\":{s},\"ktls_tx\":{s},\"ktls_rx\":{s},\"orowasm\":{s},\"geo\":{s}}}", .{
             if (self.config.s2s_port != 0 or self.config.mesh_connect.len != 0) "true" else "false",
@@ -32524,6 +32530,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"activity\":{\"channels\":1,\"messages\":1,\"active_channels_24h\":1,\"last_active\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"heatline\":[1]") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
