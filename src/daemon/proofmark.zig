@@ -16,6 +16,7 @@ pub const PublicKey = [Ed25519.PublicKey.encoded_length]u8;
 pub const SecretKey = [Ed25519.SecretKey.encoded_length]u8;
 pub const Signature = [Ed25519.Signature.encoded_length]u8;
 pub const Digest = [Sha256.digest_length]u8;
+pub const proof_id_hex_len: usize = Sha256.digest_length * 2;
 
 pub const max_actor_len: usize = 256;
 pub const max_target_len: usize = 256;
@@ -119,6 +120,33 @@ pub fn reasonHash(reason_text: []const u8) Digest {
             break :blk out;
         },
     };
+}
+
+/// Stable public identifier for a signed proof. The id commits to both the
+/// canonical proof body and the detached signature, but does not reveal the
+/// reason text beyond the proof's existing reason hash.
+pub fn proofId(proof: Proof, sig: Signature) Error!Digest {
+    var encoded: [max_canonical_len]u8 = undefined;
+    const body = try canonicalBytes(proof, &encoded);
+    var h = Sha256.init(.{});
+    h.update(body);
+    h.update(&sig);
+    var out: Digest = undefined;
+    h.final(&out);
+    return out;
+}
+
+pub fn proofIdHex(proof: Proof, sig: Signature, out: *[proof_id_hex_len]u8) Error![]const u8 {
+    const id = try proofId(proof, sig);
+    for (id, 0..) |byte, i| {
+        out[i * 2] = hex(byte >> 4);
+        out[i * 2 + 1] = hex(byte & 0x0f);
+    }
+    return out[0..];
+}
+
+fn hex(n: u8) u8 {
+    return if (n < 10) '0' + n else 'a' + (n - 10);
 }
 
 fn validate(proof: Proof) Error!void {
@@ -233,6 +261,22 @@ test "reasonHash stable" {
 
     try std.testing.expectEqualSlices(u8, &a, &b);
     try std.testing.expect(!std.mem.eql(u8, &a, &c));
+}
+
+test "proof id commits to proof and signature" {
+    const kp = try testKey(0x45);
+    const proof = testProof();
+    const sig = try sign(proof, kp.secret_key.toBytes());
+
+    var id_buf: [proof_id_hex_len]u8 = undefined;
+    const id = try proofIdHex(proof, sig, &id_buf);
+    try std.testing.expectEqual(@as(usize, proof_id_hex_len), id.len);
+
+    var changed = proof;
+    changed.reason_hash[0] ^= 1;
+    var changed_buf: [proof_id_hex_len]u8 = undefined;
+    const changed_id = try proofIdHex(changed, sig, &changed_buf);
+    try std.testing.expect(!std.mem.eql(u8, id, changed_id));
 }
 
 test "canonical bytes can be backed by an unmanaged buffer" {

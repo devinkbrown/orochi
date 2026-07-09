@@ -72,6 +72,20 @@ audit API; current source provides the append log, root, and inclusion-proof
 verification primitives (`src/daemon/key_transparency.zig:65`,
 `src/daemon/key_transparency.zig:80`, `src/daemon/key_transparency.zig:105`).
 
+## ProofMark moderation proofs
+
+`src/daemon/proofmark.zig` defines signed moderation proofs for privileged policy
+decisions. The signed transcript is fixed-order and length-prefixed, committing
+to actor, target, action code, SHA-256 reason hash, policy version, issue time,
+and expiry. The module now also derives a public proof id from the canonical
+proof body plus detached Ed25519 signature, so audit output can cite a stable
+identifier without exposing the full reason text beyond its hash.
+
+The live oper audit ring can store that proof id alongside each privileged
+action. `LinuxServer.recordOperAudit` mints the proof id when the node has a mesh
+signing key, and `AUDIT` renders `proof=<id>` on signed records; nodes without a
+mesh key keep the existing unsigned audit line.
+
 ## Node identity
 
 `src/daemon/node_identity.zig` derives all live Tsumugi identity material from

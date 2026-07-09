@@ -38,6 +38,7 @@ const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
 const svc_clonescan = @import("svc_clonescan.zig");
 const svc_lastseen = @import("svc_lastseen.zig");
+const proofmark = @import("proofmark.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const svc_enforce = @import("svc_enforce.zig");
@@ -25921,11 +25922,39 @@ pub const LinuxServer = struct {
         self.recordOperAudit(conn.session.displayName(), .other, target, msg);
     }
 
-    /// Append one privileged action to the oper-action audit ring. Best-effort:
-    /// an allocation failure drops the record rather than faulting the action's
-    /// hot path. `ts` is the daemon clock.
+    fn operProofId(
+        self: *LinuxServer,
+        ts: i64,
+        oper: []const u8,
+        action: svc_operaudit.Action,
+        target: []const u8,
+        reason: []const u8,
+        out: *[proofmark.proof_id_hex_len]u8,
+    ) ?[]const u8 {
+        const kp = self.meshSignKey() orelse return null;
+        const proof = proofmark.Proof{
+            .actor = oper,
+            .target = target,
+            .action = action.proofCode(),
+            .reason_hash = proofmark.reasonHash(reason),
+            .policy_version = 1,
+            .issued_ms = ts,
+            .expiry_ms = std.math.maxInt(i64),
+        };
+        const sig = proofmark.sign(proof, kp.secret_key.toBytes()) catch return null;
+        return proofmark.proofIdHex(proof, sig, out) catch null;
+    }
+
+    /// Append one privileged action to the oper-action audit ring. When this node
+    /// has a mesh signing key, attach a ProofMark id committing to actor, action,
+    /// target, reason hash, policy version, and timestamp. Best-effort: an
+    /// allocation/signing failure drops proof metadata or the record rather than
+    /// faulting the action's hot path.
     fn recordOperAudit(self: *LinuxServer, oper: []const u8, action: svc_operaudit.Action, target: []const u8, reason: []const u8) void {
-        _ = self.oper_audit.record(self.nowMs(), oper, action, target, reason) catch {};
+        const ts = self.nowMs();
+        var proof_id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+        const proof_id = self.operProofId(ts, oper, action, target, reason, &proof_id_buf) orelse "";
+        _ = self.oper_audit.recordWithProof(ts, oper, action, target, reason, proof_id) catch {};
     }
 
     /// `AUDIT [oper] [count]` — dump the oper-action audit ring, most recent first.
@@ -25955,7 +25984,10 @@ pub const LinuxServer = struct {
         for (entries) |e| {
             var lb: [default_reply_bytes]u8 = undefined;
             const tgt = if (e.target.len != 0) e.target else "-";
-            const ln = std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.reason }) catch continue;
+            const ln = if (e.proof_id.len != 0)
+                std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} proof={s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.proof_id, e.reason }) catch continue
+            else
+                std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.reason }) catch continue;
             try appendToConn(conn, ln);
         }
         var eb: [128]u8 = undefined;

@@ -4,7 +4,8 @@
 //! Oper-action audit ring.
 //!
 //! A bounded, fixed-capacity ring that records structured oper actions —
-//! `{ts, oper, action, target, reason}` — so opers can review who did what.
+//! `{ts, oper, action, target, reason, proof_id}` — so opers can review who did
+//! what and correlate privileged actions with ProofMark evidence when available.
 //!
 //! This is intentionally distinct from the neighbouring subsystems:
 //!   * `audit_trail.zig` is a generic actor/event string ring.
@@ -13,8 +14,8 @@
 //!
 //! `OperAudit` is a plain, human-facing audit log of privileged actions.
 //! The oldest entry is evicted when the ring is full. Each record owns its
-//! `oper`, `target`, and `reason` strings (duped from the allocator), so the
-//! ring never aliases caller memory and frees everything on eviction/deinit.
+//! `oper`, `target`, `reason`, and `proof_id` strings (duped from the allocator),
+//! so the ring never aliases caller memory and frees everything on eviction/deinit.
 
 const std = @import("std");
 
@@ -57,6 +58,26 @@ pub const Action = enum {
             .other => "other",
         };
     }
+
+    /// Stable ProofMark action code. Do not reorder when the enum grows.
+    pub fn proofCode(self: Action) u8 {
+        return switch (self) {
+            .kill => 1,
+            .kline => 2,
+            .shun => 3,
+            .jupe => 4,
+            .mode => 5,
+            .akill => 6,
+            .unkline => 7,
+            .gline => 8,
+            .kick => 9,
+            .oper_up => 10,
+            .rehash => 11,
+            .die => 12,
+            .restart => 13,
+            .other => 255,
+        };
+    }
 };
 
 /// A single recorded oper action. Strings are owned by the ring.
@@ -73,6 +94,9 @@ pub const Entry = struct {
     target: []u8,
     /// Human-readable reason. May be empty.
     reason: []u8,
+    /// Optional ProofMark id. Empty means this record was not cryptographically
+    /// signed, usually because the node has no mesh signing key.
+    proof_id: []u8,
 };
 
 /// Fixed-capacity, oldest-evicted ring of oper actions.
@@ -116,6 +140,7 @@ pub const OperAudit = struct {
         self.allocator.free(entry.oper);
         self.allocator.free(entry.target);
         self.allocator.free(entry.reason);
+        self.allocator.free(entry.proof_id);
     }
 
     /// Record one oper action. Strings are duped into the ring. When the ring
@@ -129,6 +154,18 @@ pub const OperAudit = struct {
         target: []const u8,
         reason: []const u8,
     ) !u64 {
+        return self.recordWithProof(ts, oper, action, target, reason, "");
+    }
+
+    pub fn recordWithProof(
+        self: *OperAudit,
+        ts: i64,
+        oper: []const u8,
+        action: Action,
+        target: []const u8,
+        reason: []const u8,
+        proof_id: []const u8,
+    ) !u64 {
         const owned_oper = try self.allocator.dupe(u8, oper);
         errdefer self.allocator.free(owned_oper);
 
@@ -137,6 +174,9 @@ pub const OperAudit = struct {
 
         const owned_reason = try self.allocator.dupe(u8, reason);
         errdefer self.allocator.free(owned_reason);
+
+        const owned_proof = try self.allocator.dupe(u8, proof_id);
+        errdefer self.allocator.free(owned_proof);
 
         const seq = self.next_seq;
         // Saturate rather than overflow on an absurdly long-lived process.
@@ -160,6 +200,7 @@ pub const OperAudit = struct {
             .action = action,
             .target = owned_target,
             .reason = owned_reason,
+            .proof_id = owned_proof,
         };
         return seq;
     }
@@ -234,13 +275,25 @@ pub const OperAudit = struct {
             const e = self.slots[idx].?;
             const target = if (e.target.len == 0) "*" else e.target;
             if (e.reason.len == 0) {
-                try buf.print(allocator, "#{d} ts={d} {s} {s} {s}\n", .{
-                    e.seq, e.ts, e.oper, e.action.label(), target,
-                });
+                if (e.proof_id.len != 0) {
+                    try buf.print(allocator, "#{d} ts={d} {s} {s} {s} proof={s}\n", .{
+                        e.seq, e.ts, e.oper, e.action.label(), target, e.proof_id,
+                    });
+                } else {
+                    try buf.print(allocator, "#{d} ts={d} {s} {s} {s}\n", .{
+                        e.seq, e.ts, e.oper, e.action.label(), target,
+                    });
+                }
             } else {
-                try buf.print(allocator, "#{d} ts={d} {s} {s} {s} :{s}\n", .{
-                    e.seq, e.ts, e.oper, e.action.label(), target, e.reason,
-                });
+                if (e.proof_id.len != 0) {
+                    try buf.print(allocator, "#{d} ts={d} {s} {s} {s} proof={s} :{s}\n", .{
+                        e.seq, e.ts, e.oper, e.action.label(), target, e.proof_id, e.reason,
+                    });
+                } else {
+                    try buf.print(allocator, "#{d} ts={d} {s} {s} {s} :{s}\n", .{
+                        e.seq, e.ts, e.oper, e.action.label(), target, e.reason,
+                    });
+                }
             }
         }
         return buf.toOwnedSlice(allocator);
@@ -260,6 +313,20 @@ test "record assigns increasing seq and grows count" {
     try testing.expectEqual(@as(u64, 1), try audit.record(100, "alice", .kill, "bob", "spam"));
     try testing.expectEqual(@as(u64, 2), try audit.record(101, "alice", .kline, "1.2.3.4", "abuse"));
     try testing.expectEqual(@as(usize, 2), audit.len());
+}
+
+test "recordWithProof stores proof id" {
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+
+    const proof = "0123456789abcdef";
+    try testing.expectEqual(@as(u64, 1), try audit.recordWithProof(100, "alice", .kill, "bob", "spam", proof));
+    const entry = audit.at(0).?;
+    try testing.expectEqualStrings(proof, entry.proof_id);
+
+    const out = try audit.render(testing.allocator, 1);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, " proof=0123456789abcdef ") != null);
 }
 
 test "ring evicts oldest when over capacity" {
