@@ -154,7 +154,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 ## OROWASM
 
 - Syntax: `OROWASM [STATUS|ABI|PLUGINS]`
-- Description: Oper-only runtime introspection for the OroWasm app-platform host. `STATUS` reports loaded plugin counts, command/hook registrations, allowed host capabilities, configured disabled-plugin kill-switch entries, blocked load attempts, plugin directory, and resource budgets. `ABI` reports the manifest schema and hostcall table. `PLUGINS` lists each loaded plugin handle with command/hook counts and granted capabilities.
+- Description: Oper-only runtime introspection for the OroWasm app-platform host. `STATUS` reports loaded plugin counts, command/hook registrations, allowed host capabilities, configured registry pins, disabled-plugin kill-switch entries, blocked load attempts, plugin directory, and resource budgets. `ABI` reports the manifest schema and hostcall table. `PLUGINS` lists each loaded plugin handle with trust tier, command/hook counts, and granted capabilities.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: Optional view name; defaults to `STATUS`.
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.

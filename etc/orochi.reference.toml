@@ -587,6 +587,12 @@ allow_anonymous = false
 # hooks only for plugins you trust. Valid tokens: reply, log, time, rand, store,
 # lookup, hooks.
 # allowed_caps = ["reply", "log", "time"]
+# Optional content-addressed local registry. When non-empty, only listed plugins
+# whose BLAKE3-256 digest matches are loadable. `tier` is surfaced to opers via
+# OROWASM PLUGINS and must be one of unlisted/listed/verified.
+# registry = [
+#   { name = "rss", blake3 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tier = "verified" },
+# ]
 # Local plugin kill-switch. Entries match a plugin stem (`bridge-discord`) or
 # file name (`bridge-discord.wasm`) case-insensitively and are refused before the
 # `.wasm` file is read. Use this for registry trust incidents or emergency

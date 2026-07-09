@@ -35,6 +35,7 @@ pub const RuntimeInfo = struct {
     manifest_schema: abi.SchemaVersion,
     host_function_count: usize,
     allowed_caps: abi.CapabilitySet,
+    registry_pin_count: usize,
     disabled_plugin_count: usize,
     blocked_load_count: usize,
     max_memory_bytes: usize,
@@ -45,11 +46,39 @@ pub const RuntimeInfo = struct {
     hook_count: usize,
 };
 
+pub const TrustTier = enum {
+    unlisted,
+    listed,
+    verified,
+
+    pub fn token(self: TrustTier) []const u8 {
+        return switch (self) {
+            .unlisted => "unlisted",
+            .listed => "listed",
+            .verified => "verified",
+        };
+    }
+
+    pub fn fromToken(text: []const u8) ?TrustTier {
+        inline for ([_]TrustTier{ .unlisted, .listed, .verified }) |tier| {
+            if (std.ascii.eqlIgnoreCase(text, tier.token())) return tier;
+        }
+        return null;
+    }
+};
+
+pub const RegistryPin = struct {
+    name: []const u8,
+    blake3: [std.crypto.hash.Blake3.digest_length]u8,
+    tier: TrustTier = .listed,
+};
+
 pub const Options = struct {
     max_plugin_bytes: usize = max_plugin_bytes,
     max_memory_bytes: usize = default_max_memory_bytes,
     default_fuel: u64 = default_fuel,
     allowed_caps: abi.CapabilitySet = default_allowed_caps,
+    registry: []const RegistryPin = &.{},
     disabled_plugins: []const []const u8 = &.{},
 };
 
@@ -57,6 +86,7 @@ pub const PluginSummary = struct {
     handle: plugin.PluginHandle,
     name: []const u8,
     grants: abi.CapabilitySet,
+    trust_tier: TrustTier,
     command_count: usize,
     hook_count: usize,
 };
@@ -102,6 +132,7 @@ pub const Bridge = struct {
             }
             const bytes = try dir.readFileAlloc(io, entry.name, self.allocator, .limited(self.options.max_plugin_bytes));
             defer self.allocator.free(bytes);
+            try self.enforceRegistry(plugin_name, bytes);
             try self.loadBytes(plugin_name, bytes);
             loaded += 1;
         }
@@ -114,6 +145,7 @@ pub const Bridge = struct {
             self.blocked_loads += 1;
             return error.PluginDisabled;
         }
+        try self.enforceRegistry(name, wasm);
         var meta = try Metadata.parse(self.allocator, name, wasm);
         defer meta.deinit(self.allocator);
 
@@ -191,6 +223,7 @@ pub const Bridge = struct {
             .manifest_schema = abi.manifest_schema,
             .host_function_count = abi.host_functions.len,
             .allowed_caps = self.store.policy.allowed_caps,
+            .registry_pin_count = self.options.registry.len,
             .disabled_plugin_count = self.options.disabled_plugins.len,
             .blocked_load_count = self.blocked_loads,
             .max_memory_bytes = self.options.max_memory_bytes,
@@ -209,6 +242,7 @@ pub const Bridge = struct {
             .handle = item.handle,
             .name = item.name,
             .grants = item.grants,
+            .trust_tier = self.pluginTier(item.name),
             .command_count = self.store.commandCount(item.handle),
             .hook_count = self.store.hookCount(item.handle),
         };
@@ -235,12 +269,44 @@ pub const Bridge = struct {
 
     fn pluginDisabled(self: *const Bridge, name: []const u8) bool {
         for (self.options.disabled_plugins) |blocked| {
-            if (std.ascii.eqlIgnoreCase(name, blocked)) return true;
-            if (std.mem.endsWith(u8, blocked, ".wasm") and std.ascii.eqlIgnoreCase(name, blocked[0 .. blocked.len - ".wasm".len])) return true;
+            if (pluginNameMatches(name, blocked)) return true;
         }
         return false;
     }
+
+    fn enforceRegistry(self: *Bridge, name: []const u8, wasm: []const u8) !void {
+        if (self.options.registry.len == 0) return;
+        const pin = self.findRegistryPin(name) orelse {
+            self.blocked_loads += 1;
+            return error.PluginUnpinned;
+        };
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        std.crypto.hash.Blake3.hash(wasm, &digest, .{});
+        if (!std.mem.eql(u8, digest[0..], pin.blake3[0..])) {
+            self.blocked_loads += 1;
+            return error.PluginHashMismatch;
+        }
+    }
+
+    fn findRegistryPin(self: *const Bridge, name: []const u8) ?RegistryPin {
+        for (self.options.registry) |pin| {
+            if (pluginNameMatches(name, pin.name)) return pin;
+        }
+        return null;
+    }
+
+    fn pluginTier(self: *const Bridge, name: []const u8) TrustTier {
+        return if (self.findRegistryPin(name)) |pin| pin.tier else .unlisted;
+    }
 };
+
+fn pluginNameMatches(name: []const u8, candidate: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    if (candidate.len > ".wasm".len and std.ascii.eqlIgnoreCase(candidate[candidate.len - ".wasm".len ..], ".wasm")) {
+        return std.ascii.eqlIgnoreCase(name, candidate[0 .. candidate.len - ".wasm".len]);
+    }
+    return false;
+}
 
 const HostcallContext = struct {
     bridge: *Bridge,
@@ -618,16 +684,21 @@ test "bridge dispatchHook routes hook exports and honors stop return" {
 }
 
 test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
+    var mod_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&stop_hook_wasm_bytes, &mod_digest, .{});
+
     var bridge = Bridge.initWithOptions(std.testing.allocator, .{
         .max_plugin_bytes = 4096,
         .max_memory_bytes = 128 * 1024,
         .default_fuel = 1234,
         .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .hooks }),
+        .registry = &.{.{ .name = "mod.wasm", .blake3 = mod_digest, .tier = .verified }},
         .disabled_plugins = &.{"blocked"},
     });
     defer bridge.deinit();
     try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
     try std.testing.expectError(error.PluginDisabled, bridge.loadBytes("blocked", &stop_hook_wasm_bytes));
+    try std.testing.expectError(error.PluginUnpinned, bridge.loadBytes("other", &stop_hook_wasm_bytes));
 
     const info = bridge.runtimeInfo();
     try std.testing.expectEqual(@as(u16, 1), info.manifest_schema.major);
@@ -635,8 +706,9 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(info.allowed_caps.has(.reply));
     try std.testing.expect(info.allowed_caps.has(.hooks));
     try std.testing.expect(!info.allowed_caps.has(.time));
+    try std.testing.expectEqual(@as(usize, 1), info.registry_pin_count);
     try std.testing.expectEqual(@as(usize, 1), info.disabled_plugin_count);
-    try std.testing.expectEqual(@as(usize, 1), info.blocked_load_count);
+    try std.testing.expectEqual(@as(usize, 2), info.blocked_load_count);
     try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
     try std.testing.expectEqual(@as(usize, 4096), info.max_plugin_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024), info.max_memory_bytes);
@@ -646,7 +718,19 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
 
     const summary = bridge.pluginSummary(0).?;
     try std.testing.expectEqualStrings("mod", summary.name);
+    try std.testing.expectEqual(TrustTier.verified, summary.trust_tier);
     try std.testing.expectEqual(@as(usize, 0), summary.command_count);
     try std.testing.expectEqual(@as(usize, 1), summary.hook_count);
     try std.testing.expect(bridge.pluginSummary(1) == null);
+}
+
+test "registry pins reject hash mismatches" {
+    const wrong_digest: [std.crypto.hash.Blake3.digest_length]u8 = @splat(0xaa);
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .registry = &.{.{ .name = "guard", .blake3 = wrong_digest, .tier = .listed }},
+    });
+    defer bridge.deinit();
+
+    try std.testing.expectError(error.PluginHashMismatch, bridge.loadBytes("guard", &stop_hook_wasm_bytes));
+    try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().blocked_load_count);
 }

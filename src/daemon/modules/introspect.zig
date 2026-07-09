@@ -109,11 +109,12 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
 
     if (std.ascii.eqlIgnoreCase(view, "STATUS")) {
         try core.reply(.RPL_INFOSTART, &.{}, "OroWasm runtime status");
-        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} disabled_plugins={d} blocked_loads={d} plugin_dir={s}", .{
+        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} registry_pins={d} disabled_plugins={d} blocked_loads={d} plugin_dir={s}", .{
             info.plugin_count,
             info.command_count,
             info.hook_count,
             if (caps.len == 0) "(none)" else caps,
+            info.registry_pin_count,
             info.disabled_plugin_count,
             info.blocked_load_count,
             if (core.services.config.wasm_plugin_dir.len == 0) "(disabled)" else core.services.config.wasm_plugin_dir,
@@ -157,9 +158,10 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         while (core.server.wasm.pluginSummary(i)) |plugin| : (i += 1) {
             var grant_buf: [128]u8 = undefined;
             const grants = plugin.grants.writeTokens(&grant_buf);
-            const row = std.fmt.bufPrint(&line, "handle={d} name={s} commands={d} hooks={d} grants={s}", .{
+            const row = std.fmt.bufPrint(&line, "handle={d} name={s} tier={s} commands={d} hooks={d} grants={s}", .{
                 plugin.handle,
                 plugin.name,
+                plugin.trust_tier.token(),
                 plugin.command_count,
                 plugin.hook_count,
                 if (grants.len == 0) "(none)" else grants,

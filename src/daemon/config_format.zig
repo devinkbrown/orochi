@@ -222,6 +222,9 @@ pub const Config = struct {
         default_fuel: u64 = wasm_bridge.default_fuel,
         /// Hostcall capability classes plugins may receive after negotiation.
         allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
+        /// Content-addressed plugin registry pins. Non-empty means only pinned
+        /// plugins whose BLAKE3 digest matches are loadable.
+        registry: []const wasm_bridge.RegistryPin = &.{},
         /// Plugin names refused by the local trust policy / kill-switch.
         disabled_plugins: []const []const u8 = &.{},
     };
@@ -856,6 +859,7 @@ pub const Config = struct {
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
+        freeWasmRegistry(allocator, self.wasm.registry);
         freeStringList(allocator, self.wasm.disabled_plugins);
         allocator.free(self.listen.host);
         freeStringList(allocator, self.listen.trusted_proxies);
@@ -1000,6 +1004,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
     cfg.wasm.default_fuel = try uintField(doc, "wasm.default_fuel", cfg.wasm.default_fuel, 1, 10_000_000);
     if (doc.getArray("wasm.allowed_caps")) |arr| cfg.wasm.allowed_caps = try parseWasmCaps(arr);
+    if (doc.getArray("wasm.registry")) |arr| {
+        freeWasmRegistry(allocator, cfg.wasm.registry);
+        cfg.wasm.registry = try parseWasmRegistry(allocator, resolver, arr);
+    }
     if (doc.getArray("wasm.disabled_plugins")) |arr| {
         freeStringList(allocator, cfg.wasm.disabled_plugins);
         cfg.wasm.disabled_plugins = try ownStringArray(allocator, resolver, arr);
@@ -1581,6 +1589,33 @@ fn parseWasmCaps(arr: []const toml.Value) TomlError!wasm_abi.CapabilitySet {
     return caps;
 }
 
+fn parseWasmRegistry(allocator: std.mem.Allocator, resolver: Resolver, arr: []const toml.Value) TomlError![]const wasm_bridge.RegistryPin {
+    var list: std.ArrayList(wasm_bridge.RegistryPin) = .empty;
+    errdefer {
+        for (list.items) |pin| allocator.free(pin.name);
+        list.deinit(allocator);
+    }
+    for (arr) |*item| {
+        if (item.* != .table) return error.ParseError;
+        const raw_name = item.getString("name") orelse return error.ParseError;
+        const raw_hash = item.getString("blake3") orelse return error.ParseError;
+        const raw_tier = item.getString("tier") orelse "listed";
+        if (raw_hash.len != std.crypto.hash.Blake3.digest_length * 2) return error.ParseError;
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, raw_hash) catch return error.ParseError;
+        const tier = wasm_bridge.TrustTier.fromToken(raw_tier) orelse return error.ParseError;
+        const name = try resolveStr(allocator, resolver, raw_name);
+        errdefer allocator.free(name);
+        try list.append(allocator, .{ .name = name, .blake3 = digest, .tier = tier });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn freeWasmRegistry(allocator: std.mem.Allocator, pins: []const wasm_bridge.RegistryPin) void {
+    for (pins) |pin| allocator.free(pin.name);
+    allocator.free(pins);
+}
+
 /// Own a TOML field that may be either a single string OR an array of strings
 /// (e.g. `certfp = "abc…"` or `certfp = ["abc…", "def…"]`). Returns an owned,
 /// resolved string list; an absent field yields the empty slice.
@@ -1787,6 +1822,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "STORE", "hooks"]
+        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified" }]
         \\disabled_plugins = ["bad", "bridge-discord.wasm"]
         \\
     ;
@@ -1796,6 +1832,9 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expect(cfg.wasm.allowed_caps.has(.store));
     try testing.expect(cfg.wasm.allowed_caps.has(.hooks));
     try testing.expect(!cfg.wasm.allowed_caps.has(.time));
+    try testing.expectEqual(@as(usize, 1), cfg.wasm.registry.len);
+    try testing.expectEqualStrings("guard", cfg.wasm.registry[0].name);
+    try testing.expectEqual(wasm_bridge.TrustTier.verified, cfg.wasm.registry[0].tier);
     try testing.expectEqual(@as(usize, 2), cfg.wasm.disabled_plugins.len);
     try testing.expectEqualStrings("bad", cfg.wasm.disabled_plugins[0]);
     try testing.expectEqualStrings("bridge-discord.wasm", cfg.wasm.disabled_plugins[1]);

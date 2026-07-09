@@ -17,6 +17,7 @@ const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
 const og_mod = @import("operator_groups.zig");
 const event_spine = @import("event_spine.zig");
+const wasm_bridge = @import("../wasm/host/bridge.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
 const certfp_bind = @import("certfp_bind.zig");
@@ -60,6 +61,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;
     out.wasm_default_fuel = cfg.wasm.default_fuel;
     out.wasm_allowed_caps = cfg.wasm.allowed_caps;
+    out.wasm_registry = cfg.wasm.registry;
     out.wasm_disabled_plugins = cfg.wasm.disabled_plugins;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
@@ -888,6 +890,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
         \\allowed_caps = ["reply", "log", "hooks"]
+        \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified" }]
         \\disabled_plugins = ["bridge-discord", "bad.wasm"]
         \\
     ;
@@ -901,6 +904,9 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expect(loaded.config.wasm_allowed_caps.has(.log));
     try testing.expect(loaded.config.wasm_allowed_caps.has(.hooks));
     try testing.expect(!loaded.config.wasm_allowed_caps.has(.time));
+    try testing.expectEqual(@as(usize, 1), loaded.config.wasm_registry.len);
+    try testing.expectEqualStrings("guard", loaded.config.wasm_registry[0].name);
+    try testing.expectEqual(wasm_bridge.TrustTier.verified, loaded.config.wasm_registry[0].tier);
     try testing.expectEqual(@as(usize, 2), loaded.config.wasm_disabled_plugins.len);
     try testing.expectEqualStrings("bridge-discord", loaded.config.wasm_disabled_plugins[0]);
     try testing.expectEqualStrings("bad.wasm", loaded.config.wasm_disabled_plugins[1]);
