@@ -54,7 +54,7 @@ Registry commands default to registered-client access unless the command table s
 | `AUTOJOIN` | Manage account autojoin list. | [queries.md](queries.md#autojoin) |
 | `GROUP` | Account grouping query/management handler. | [queries.md](queries.md#group) |
 | `WELCOME` | Replay welcome text. | [queries.md](queries.md#welcome) |
-| `SUMMON` | Disabled command; returns 445. | [queries.md](queries.md#summon) |
+| `SUMMON` | Oper force-join for a target user and channel. | [queries.md](queries.md#summon) |
 | `VERSION` | Show server version. | [informational.md](informational.md#version) |
 | `TIME` | Show server time. | [informational.md](informational.md#time) |
 | `ADMIN` | Show configured admin contact. | [informational.md](informational.md#admin) |

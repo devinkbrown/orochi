@@ -17506,6 +17506,20 @@ pub const LinuxServer = struct {
             first = false;
             try w.print("\"{s}\":{d}", .{ sev.token(), self.event_stats.severityCount(@intFromEnum(sev)) });
         }
+        try w.writeAll(
+            "},\"operator_surfaces\":{" ++
+                "\"event_replay_json\":true," ++
+                "\"event_stats_json\":true," ++
+                "\"audit_event_spine\":true," ++
+                "\"audit_json\":true," ++
+                "\"audit_proof_json\":true," ++
+                "\"proofmark\":true," ++
+                "\"admission_security_events\":true," ++
+                "\"security_reputation_events\":true," ++
+                "\"security_throttle_events\":true," ++
+                "\"security_clone_events\":true" ++
+                "}",
+        );
         try w.writeAll("}}");
     }
 
@@ -29037,12 +29051,14 @@ pub const LinuxServer = struct {
     /// render with `*`. The grant path requires the secured Tsumugi mesh, over
     /// which signed grants travel.
     fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (!c.session.registered()) continue;
-            if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const c = entry.value;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (!c.session.registered()) continue;
+                if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
+            }
         }
         // Propagated cross-mesh grant (account == nick) carrying oper_override.
         if (self.oper_grants.lookup(nick, self.grantNowU64())) |g| {
@@ -29114,7 +29130,7 @@ pub const LinuxServer = struct {
         }
 
         const caps = names_reply.RequesterCaps{
-            .multi_prefix = conn.session.hasCap(.multi_prefix),
+            .multi_prefix = conn.session.hasCap(.multi_prefix) or conn.ircx,
             .userhost_in_names = conn.session.hasCap(.userhost_in_names),
         };
 
@@ -35577,6 +35593,17 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"kill\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"severities\":{\"debug\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"critical\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"operator_surfaces\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"event_replay_json\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"event_stats_json\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"audit_event_spine\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"audit_json\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"audit_proof_json\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"proofmark\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"admission_security_events\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"security_reputation_events\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"security_throttle_events\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"security_clone_events\":true") != null);
 
     // Operator UI form: EVENT REPLAY JSON streams bounded JSON notices for
     // history without scraping the prose replay format.
@@ -38154,6 +38181,39 @@ test "threaded server: NAMES honors multi-prefix cap" {
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
     try recvUntil(&a, "!+A", 200);
+}
+
+test "threaded server: IRCX NAMESX includes derived oper prefix in NAMES" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try saslAdminPrelude(fd);
+    try writeAllFd(fd, "NICK Kain\r\nUSER kain 0 * :Kain\r\n");
+    try recvUntil(&client, " 001 Kain ", 200);
+    try recvUntil(&client, " 381 Kain ", 200);
+
+    try writeAllFd(fd, "JOIN #root\r\n");
+    try recvUntil(&client, " 366 Kain #root ", 200);
+    try writeAllFd(fd, "MODE #root +v Kain\r\n");
+    try recvUntil(&client, "MODE #root +v Kain", 200);
+
+    client.reset();
+    try writeAllFd(fd, "NAMES #root\r\n");
+    try recvUntil(&client, "*!+Kain", 200);
 }
 
 test "threaded server: SUMMON force-joins the target (oper-gated)" {

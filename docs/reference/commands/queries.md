@@ -149,11 +149,13 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 
 ## SUMMON
 
-- Syntax: `SUMMON ...`
-- Description: Intentionally disabled.
-- Privileges: Any client (`.access = .any`).
-- Parameters: Ignored.
-- Replies: None on success because it always returns a disabled numeric.
-- Errors: `ERR_SUMMONDISABLED 445`.
-- Example: `SUMMON alice`
-- Sources: `src/daemon/modules/feature_misc.zig:36`, `src/daemon/modules/feature_misc.zig:56`
+- Syntax: `SUMMON <nick> <#channel>`
+- Description: Oper-only force-join. Orochi repurposes the obsolete host-paging
+  command as a direct operator command that resolves the target user, runs the
+  same join path as `FORCEJOIN`, and returns `RPL_SUMMONING 342`.
+- Privileges: Operator.
+- Parameters: Target nick and channel name.
+- Replies: `RPL_SUMMONING 342`.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`, join validation errors.
+- Example: `SUMMON alice #ops`
+- Sources: `src/daemon/modules/feature_misc.zig:36`, `src/daemon/server.zig` `handleSummon`

@@ -69,8 +69,22 @@ the history ring ([src/daemon/event_history.zig](../../src/daemon/event_history.
 live ring depth, and the nonzero per-category/per-severity breakdown.
 `EVENT STATS JSON` returns the same counters as one NOTICE whose trailing
 parameter is a stable JSON object: `total`, `history_depth`, `categories`, and
-`severities`; all known category and severity keys are present, including zeros,
-so operator UIs can poll it without scraping prose. Counters are
+`severities`; all known category and severity keys are present, including zeros.
+It also includes `operator_surfaces`, a stable boolean capability map for
+operator tooling:
+
+- `event_replay_json`
+- `event_stats_json`
+- `audit_event_spine`
+- `audit_json`
+- `audit_proof_json`
+- `proofmark`
+- `admission_security_events`
+- `security_reputation_events`
+- `security_throttle_events`
+- `security_clone_events`
+
+Operator UIs can poll it without scraping prose. Counters are
 **process-lifetime and deliberately not persisted** (the useful "since this
 boot" semantics), unlike the history ring which is.
 

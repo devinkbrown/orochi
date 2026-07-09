@@ -29,7 +29,9 @@ The channel command module registers the base membership and moderation commands
 ## NAMES
 
 - Syntax: `NAMES <#channel>`
-- Description: Emits the current channel names list.
+- Description: Emits the current channel names list. IRCv3 `multi-prefix` and
+  IRCX/NAMEX sessions receive every visible status prefix; network operators
+  carrying `oper_override` render with the derived leading `*` prefix.
 - Privileges: Registered client.
 - Parameters: Channel name.
 - Replies: `RPL_NAMREPLY 353`, `RPL_ENDOFNAMES 366`.

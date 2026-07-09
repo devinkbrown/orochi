@@ -52,7 +52,9 @@ defaults to `*`.
   an immediate snapshot of the currently-matching population on subscribe.
 - **`SEVERITY` / `REPLAY` / `STATS`** tune the per-session minimum severity,
   replay recorded events, and report counters. `EVENT REPLAY JSON` and
-  `EVENT STATS JSON` provide machine-readable NOTICE payloads; see
+  `EVENT STATS JSON` provide machine-readable NOTICE payloads, with
+  `EVENT STATS JSON` also advertising the stable `operator_surfaces` capability
+  map; see
   [event-spine.md](../../architecture/event-spine.md).
 
 ## Numerics

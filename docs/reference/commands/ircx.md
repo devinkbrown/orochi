@@ -104,8 +104,8 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
   rendered with the originating server name, so an operator sees matching
   subjects regardless of which node they are on. `EVENT REPLAY JSON` streams
   structured history records and `EVENT STATS JSON` returns a stable counters
-  object for operator UIs. WALLOPS functionality rides
-  `EVENT BROADCAST`; it is not a `+w` user-mode path.
+  object plus an `operator_surfaces` capability map for operator UIs. WALLOPS
+  functionality rides `EVENT BROADCAST`; it is not a `+w` user-mode path.
 - Privileges: Oper checked inside handler.
 - Parameters: Subcommand; categories or observe arguments as needed.
 - Replies: Raw `EVENT LIST` lines, `NOTE EVENT` observe/broadcast lines, and server notices.
