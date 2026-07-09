@@ -56,7 +56,7 @@ At SASL oper elevation a session's category mask is seeded **only** from its `[[
 
 `EventHistory(512)` is a bounded, RwLock-guarded ring of recent events, written from any reactor thread and from the mesh drain (`record` at both publish sites), so every push/collect takes the internal lock ([src/daemon/event_history.zig](../../src/daemon/event_history.zig)). Strings are copied into fixed in-slot buffers (origin ≤ 64, message ≤ 400 bytes) — no external ownership. `collect(filter_category, min_severity, out)` copies matching events newest-first under the lock into caller storage, so rendering happens lock-free.
 
-`EVENT REPLAY [category|ALL] [count]` (oper-only, `handleEventReplay`) collects up to `count` (clamped 1–200, default 30) events at or above the session's severity floor, then renders them oldest→newest as NOTICEs with a relative-age prefix (`[5m ago] KILL/warn <origin> …`) so they read as history, not live traffic.
+`EVENT REPLAY [JSON] [category|ALL] [count]` (oper-only, `handleEventReplay`) collects up to `count` (clamped 1-200, default 30) events at or above the session's severity floor, then renders them oldest->newest as NOTICEs. The default form uses a relative-age prefix (`[5m ago] KILL/warn <origin> ...`) so entries read as history, not live traffic. `EVENT REPLAY JSON ...` uses the same filters but emits machine-readable NOTICE payloads: a `type=event-replay` header, one bounded `type=event` object per retained event, and a `type=event-replay-end` trailer.
 
 The ring **is** persisted to disk: `serializeInto`/`load` use an `OEH1`-magic little-endian snapshot. `loadEventHistory` restores it at boot and `saveEventHistory` rewrites it on the stats cadence, gated to reactor 0 (the writer is `O_TRUNC`, not atomic, so a single writer avoids interleaved writes while the shared ring still captures every shard's events). This is wired to the `[oper] event_history_path` config; unset means in-memory only (per-process lifetime). REPLAY therefore survives a USR2 hot-upgrade and a cold restart.
 
@@ -111,7 +111,7 @@ Both codecs are bounded per-field (so a hostile peer cannot pin large buffers), 
 | `EVENT DEL\|DELETE <type\|category\|ALL>` | Unsubscribe from an IRCX type or categories. |
 | `EVENT CLEAR [type]` | Clear one IRCX type, or (no arg) all IRCX + category subscriptions, subject masks, and the severity floor. |
 | `EVENT SEVERITY [level]` | Oper-only. Set or report the per-session minimum severity for the category plane. |
-| `EVENT REPLAY [category\|ALL] [count]` | Oper-only. Re-send recent history-ring events (severity-floored, oldest→newest, age-prefixed). |
+| `EVENT REPLAY [JSON] [category\|ALL] [count]` | Oper-only. Re-send recent history-ring events (severity-floored, oldest->newest); `JSON` returns bounded event objects for operator UIs. |
 | `EVENT STATS [JSON]` | Oper-only. Per-category/severity counters since boot + live ring depth; `JSON` returns a stable object for operator UIs. |
 | `EVENT BROADCAST :<message>` | Oper-only. The former WALLOPS, folded into the spine as an `.announce` event. |
 | `EVENT OBSERVE <mask> [actions…] \| OFF \| LIST` | Oper-only. Manage the standing lifecycle-observation subscription (real hosts). |

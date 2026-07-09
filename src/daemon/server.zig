@@ -17367,11 +17367,11 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "Event minimum severity set to {s}", .{sev.token()}) catch "Event minimum severity set");
     }
 
-    /// `EVENT REPLAY [category|ALL] [count]` (oper-only): re-send recent Event
-    /// Spine events from the node-wide history ring — what happened before this
-    /// oper connected/subscribed. Filtered by the optional category and the
+    /// `EVENT REPLAY [JSON] [category|ALL] [count]` (oper-only): re-send recent
+    /// Event Spine events from the node-wide history ring — what happened before
+    /// this oper connected/subscribed. Filtered by the optional category and the
     /// session's minimum-severity floor; delivered oldest→newest as NOTICEs with
-    /// a relative-age prefix so they're unmistakably historical, not live.
+    /// either a relative-age prefix or bounded JSON records for operator UIs.
     fn handleEventReplay(self: *LinuxServer, conn: *ConnState, is_oper: bool, params: []const []const u8) !void {
         if (!is_oper) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT REPLAY is for operators");
@@ -17380,6 +17380,11 @@ pub const LinuxServer = struct {
         var filter_cat: ?u8 = null;
         var count: usize = 30;
         var argi: usize = 1;
+        var json = false;
+        if (params.len > argi and std.ascii.eqlIgnoreCase(params[argi], "JSON")) {
+            json = true;
+            argi += 1;
+        }
         // A leading non-numeric arg is a category (or ALL); then an optional count.
         if (params.len > argi and params[argi].len != 0 and !isAsciiDigits(params[argi])) {
             if (!std.ascii.eqlIgnoreCase(params[argi], "ALL")) {
@@ -17397,6 +17402,22 @@ pub const LinuxServer = struct {
 
         var buf: [200]event_history_mod.StoredEvent = undefined;
         const got = self.event_history.collect(filter_cat, @intFromEnum(conn.session.eventMinSeverity()), buf[0..count]);
+
+        if (json) {
+            var hb: [160]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&hb, "{{\"type\":\"event-replay\",\"count\":{d},\"severity_floor\":\"{s}\"}}", .{
+                got,
+                conn.session.eventMinSeverity().token(),
+            }) catch "{\"type\":\"event-replay\"}");
+            var i = got;
+            while (i > 0) {
+                i -= 1;
+                self.noticeEventReplayJson(conn, &buf[i]) catch continue;
+            }
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "{{\"type\":\"event-replay-end\",\"count\":{d}}}", .{got}) catch "{\"type\":\"event-replay-end\"}");
+            return;
+        }
 
         var hb: [96]u8 = undefined;
         try self.noticeTo(conn, std.fmt.bufPrint(&hb, "Event replay: {d} event(s){s}", .{ got, if (got == 0) " (history empty or nothing matched)" else "" }) catch "Event replay");
@@ -17416,6 +17437,25 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, text);
         }
         if (got != 0) try self.noticeTo(conn, "End of event replay.");
+    }
+
+    fn noticeEventReplayJson(self: *LinuxServer, conn: *ConnState, ev: *const event_history_mod.StoredEvent) !void {
+        const cat = ev.categoryEnum() orelse return;
+        const sev = ev.severityEnum();
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        var w = std.Io.Writer.fixed(&line_buf);
+        try w.print("{{\"type\":\"event\",\"ts\":{d},\"category\":", .{ev.ts_unix_ms});
+        try writeJsonEscaped(&w, cat.token());
+        try w.writeAll(",\"category_code\":");
+        try writeJsonEscaped(&w, cat.code());
+        try w.writeAll(",\"severity\":");
+        try writeJsonEscaped(&w, sev.token());
+        try w.writeAll(",\"origin\":");
+        try writeJsonEscaped(&w, ev.origin());
+        try w.writeAll(",\"message\":");
+        try writeJsonEscaped(&w, ev.message());
+        try w.writeByte('}');
+        try self.noticeTo(conn, w.buffered());
     }
 
     /// Render the machine-readable operator UI form of `EVENT STATS`.
@@ -35373,6 +35413,19 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"kill\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"severities\":{\"debug\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"critical\":") != null);
+
+    // Operator UI form: EVENT REPLAY JSON streams bounded JSON notices for
+    // history without scraping the prose replay format.
+    a.reset();
+    try writeAllFd(fd_a, "EVENT REPLAY JSON ALL 5\r\n");
+    try recvUntil(&a, "\"type\":\"event-replay\"", 200);
+    try recvUntil(&a, "\"type\":\"event\"", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"category\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"category_code\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"severity\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"origin\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"message\":") != null);
+    try recvUntil(&a, "\"type\":\"event-replay-end\"", 200);
 }
 
 test "threaded server: SETNAME self echo requires setname cap" {

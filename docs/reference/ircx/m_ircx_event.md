@@ -24,7 +24,7 @@ EVENT CLEAR  [<type>]
 EVENT BROADCAST :<message>
 EVENT OBSERVE <mask> [<actions>…] | OFF | LIST
 EVENT SEVERITY <level>
-EVENT REPLAY  [<args>…]
+EVENT REPLAY  [JSON] [<args>…]
 EVENT STATS
 ```
 
@@ -51,7 +51,8 @@ defaults to `*`.
   a nick/host mask and pushes a live lifecycle feed (with real hosts); it emits
   an immediate snapshot of the currently-matching population on subscribe.
 - **`SEVERITY` / `REPLAY` / `STATS`** tune the per-session minimum severity,
-  replay recorded events, and report counters — see
+  replay recorded events, and report counters. `EVENT REPLAY JSON` and
+  `EVENT STATS JSON` provide machine-readable NOTICE payloads; see
   [event-spine.md](../../architecture/event-spine.md).
 
 ## Numerics
