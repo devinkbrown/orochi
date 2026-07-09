@@ -46,10 +46,10 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 ## REDACT
 
 - Syntax: `REDACT <target> <msgid> [:reason]`
-- Description: Emits a message-redaction event for a known message id.
+- Description: Emits a message-redaction event for a known message id. When the daemon has a signing identity, the successful redaction is recorded in the ProofMark audit ring and the redaction reason carries `proof=<id>`.
 - Privileges: Registered client.
 - Parameters: Target, message id, optional reason.
-- Replies: Redaction line to target scope.
+- Replies: Redaction line to target scope; signed redactions include `proof=<id>` in the trailing reason.
 - Errors: `ERR_NEEDMOREPARAMS 461` for malformed invocation; target errors from handler.
 - Example: `REDACT #chat abc123 :cleanup`
 - Sources: `src/daemon/modules/messaging.zig:50`, `src/daemon/server.zig:7932`

@@ -43,6 +43,7 @@ pub const Action = enum {
     ward_del,
     connect,
     squit,
+    redact,
     other,
 
     /// Stable lowercase label used when rendering audit lines.
@@ -66,6 +67,7 @@ pub const Action = enum {
             .ward_del => "ward_del",
             .connect => "connect",
             .squit => "squit",
+            .redact => "redact",
             .other => "other",
         };
     }
@@ -91,6 +93,7 @@ pub const Action = enum {
             .ward_del => 16,
             .connect => 17,
             .squit => 18,
+            .redact => 19,
             .other => 255,
         };
     }

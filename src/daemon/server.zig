@@ -21085,9 +21085,27 @@ pub const LinuxServer = struct {
         // longer surfaces it (the history slot is kept as a tombstone, but the
         // inverted index has no tombstone concept — we evict the msgid outright).
         _ = self.search_index.remove(msgid);
+        var audit_target_buf: [320]u8 = undefined;
+        const audit_target = std.fmt.bufPrint(&audit_target_buf, "{s} {s}", .{ channel, msgid }) catch channel;
+        const audit_reason = reason orelse "REDACT";
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .redact, audit_target, audit_reason);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event_note = if (proof_id) |pid|
+            std.fmt.bufPrint(&event_buf, "REDACT {s} {s} proof={s}", .{ channel, msgid, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&event_buf, "REDACT {s} {s}", .{ channel, msgid }) catch return;
+        self.publishOperEvent(.oper_action, .notice, event_note) catch {};
+        var proof_reason_buf: [default_reply_bytes]u8 = undefined;
+        var redaction_reason: ?[]const u8 = reason;
+        if (proof_id) |pid| {
+            redaction_reason = if (reason) |r|
+                std.fmt.bufPrint(&proof_reason_buf, "{s} proof={s}", .{ r, pid[0..] }) catch r
+            else
+                std.fmt.bufPrint(&proof_reason_buf, "proof={s}", .{pid[0..]}) catch null;
+        }
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, reason);
+        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, redaction_reason);
         try self.broadcastChannelCap(channel, msg, .message_redaction, null);
     }
 
@@ -41777,7 +41795,11 @@ test "threaded server: EVENT requires event_subscribe privilege" {
 }
 
 test "threaded server: REDACT broadcast + WARD alias oper events" {
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xb7)), "local");
+    defer ident.deinit();
+    var cfg = operTestConfig(0);
+    cfg.node_identity = &ident;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -41816,6 +41838,13 @@ test "threaded server: REDACT broadcast + WARD alias oper events" {
     try writeAllFd(fd_a, real_redact);
     try recvUntil(&a, "REDACT #r ", 200);
     try recvUntil(&a, " :gone", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "proof=") != null);
+
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT JSON A 5\r\n");
+    try recvUntil(&a, "\"type\":\"audit-end\"", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"redact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"proof_id\":") != null);
 
     a.reset();
     try writeAllFd(fd_a, "REDACT #r bogus-msgid :gone\r\n");
