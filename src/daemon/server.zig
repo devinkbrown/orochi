@@ -25147,6 +25147,24 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    fn bridgeCodecTag(tag: sdp.CodecTag) media_bridge_mod.Codec {
+        return switch (tag) {
+            .kaguravox => .kaguravox,
+            .kaguravis => .kaguravis,
+            .raw => .raw,
+        };
+    }
+
+    fn bridgeCodecsFromSdp(out: []media_bridge_mod.Codec, codecs: []const sdp.Codec) []const media_bridge_mod.Codec {
+        var n: usize = 0;
+        for (codecs) |codec| {
+            if (n >= out.len) break;
+            out[n] = bridgeCodecTag(codec.tag);
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     fn fecSchemeName(scheme: sdp.FecScheme) []const u8 {
         return switch (scheme) {
             .none => "none",
@@ -25347,10 +25365,10 @@ pub const LinuxServer = struct {
         var pbuf: [256]u8 = undefined;
         if (formatMediaCodecDetail(&pbuf, negotiated.codecs, negotiated.fec)) |detail|
             self.publishMediaEvent("PROFILE", channel, conn.session.displayName(), detail) catch {};
-        try self.provisionMediaTransports(conn, channel, dtls_mode, extra_args);
+        try self.provisionMediaTransports(conn, channel, cbuf[0..cn], dtls_mode, extra_args);
     }
 
-    fn provisionMediaTransports(self: *LinuxServer, conn: *ConnState, channel: []const u8, dtls_mode: bool, extra_args: []const []const u8) !void {
+    fn provisionMediaTransports(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant_codecs: []const sdp.Codec, dtls_mode: bool, extra_args: []const []const u8) !void {
         const nick = conn.session.displayName();
 
         // Allocate this participant's ICE endpoint and advertise the server
@@ -25414,7 +25432,7 @@ pub const LinuxServer = struct {
         // the same call hear each other (rewrap only, never transcode).
         const want_webrtc = dtls_mode or isWebrtcTransport(extra_args);
         const leg: media_bridge_mod.Leg = if (want_webrtc) .webrtc else .native;
-        self.bridgeRegister(channel, nick, leg, stream_id);
+        self.bridgeRegister(channel, nick, leg, stream_id, participant_codecs);
     }
 
     /// True when the OFFER opts into the WebRTC leg via a `transport=webrtc`
@@ -25429,7 +25447,7 @@ pub const LinuxServer = struct {
     }
 
     /// Register (or update) a participant's leg in the channel's bridge roster.
-    fn bridgeRegister(self: *LinuxServer, channel: []const u8, id: []const u8, leg: media_bridge_mod.Leg, stream_id: u32) void {
+    fn bridgeRegister(self: *LinuxServer, channel: []const u8, id: []const u8, leg: media_bridge_mod.Leg, stream_id: u32, codecs: []const sdp.Codec) void {
         lockSpin(&self.media_bridges_mu);
         defer self.media_bridges_mu.unlock();
         const gop = self.media_bridges.getOrPut(self.allocator, channel) catch return;
@@ -25441,7 +25459,10 @@ pub const LinuxServer = struct {
             gop.key_ptr.* = key;
             gop.value_ptr.* = Bridge.init();
         }
-        gop.value_ptr.register(id, .{ .leg = leg, .stream_id = stream_id, .ssrc = stream_id }) catch {};
+        var member = media_bridge_mod.Member{ .leg = leg, .stream_id = stream_id, .ssrc = stream_id };
+        var codec_buf: [media_bridge_mod.max_member_codecs]media_bridge_mod.Codec = undefined;
+        member.setCodecs(bridgeCodecsFromSdp(&codec_buf, codecs));
+        gop.value_ptr.register(id, member) catch {};
     }
 
     /// Remove a participant from the channel's bridge; drop the channel once empty.
@@ -25559,7 +25580,7 @@ pub const LinuxServer = struct {
         self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
         self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], negotiated.codecs) catch {};
         try self.mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
-        try self.provisionMediaTransports(conn, channel, answer_digest != null, extra_args);
+        try self.provisionMediaTransports(conn, channel, cbuf[0..cn], answer_digest != null, extra_args);
     }
 
     /// `MEDIA STATS <#chan>` — per-participant transport state: ICE status and

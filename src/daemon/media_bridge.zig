@@ -26,12 +26,14 @@ const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
 
 pub const Leg = kakehashi.Leg; // .native | .webrtc
+pub const Codec = kakehashi.Codec;
 pub const TransportAddress = ice.TransportAddress;
 pub const PtMap = kakehashi.PtMap;
 
 pub const Error = kakehashi.Error || kagura_frame.DecodeError || kagura_frame.EncodeError;
 
 const max_id_bytes = 64;
+pub const max_member_codecs = 8;
 const max_rewrap = 1600; // >= one MTU datagram after header rewrap
 
 /// Sends `bytes` to `target` on some leg's socket. The callback resolves the
@@ -84,9 +86,23 @@ pub const Member = struct {
     band_id: u8 = kagura_frame.MEDIA_BAND_FLOOR,
     /// WebRTC identity (RTP SSRC stamped on the egress packet).
     ssrc: u32 = 0,
+    /// Participant-advertised codec capabilities. Empty means unknown; the bridge
+    /// remains permissive for tests/legacy callers until signaling supplies caps.
+    codecs: [max_member_codecs]Codec = undefined,
+    codec_count: u8 = 0,
 
     pub fn id(self: *const Member) []const u8 {
         return self.id_buf[0..self.id_len];
+    }
+
+    pub fn setCodecs(self: *Member, codecs: []const Codec) void {
+        const n = @min(codecs.len, self.codecs.len);
+        @memcpy(self.codecs[0..n], codecs[0..n]);
+        self.codec_count = @intCast(n);
+    }
+
+    pub fn codecSlice(self: *const Member) []const Codec {
+        return self.codecs[0..self.codec_count];
     }
 };
 
@@ -94,10 +110,13 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
     return struct {
         const Self = @This();
         pub const RegisterError = error{ Full, BadId };
+        const CodecState = enum { unknown, direct, incompatible };
 
         members: [max_participants]Member = undefined,
         len: usize = 0,
         ptmap: PtMap = .{},
+        codec_state: CodecState = .unknown,
+        common_codec: ?Codec = null,
 
         pub fn init() Self {
             return .{ .ptmap = defaultPtMap() };
@@ -118,6 +137,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
                 @memcpy(updated.id_buf[0..id.len], id);
                 updated.id_len = @intCast(id.len);
                 existing.* = updated;
+                self.recomputeCodec();
                 return;
             }
             if (self.len >= max_participants) return error.Full;
@@ -126,6 +146,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             nm.id_len = @intCast(id.len);
             self.members[self.len] = nm;
             self.len += 1;
+            self.recomputeCodec();
         }
 
         pub fn unregister(self: *Self, id: []const u8) bool {
@@ -133,6 +154,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
                 if (std.mem.eql(u8, mem.id(), id)) {
                     self.members[i] = self.members[self.len - 1];
                     self.len -= 1;
+                    self.recomputeCodec();
                     return true;
                 }
             }
@@ -141,6 +163,36 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
 
         pub fn count(self: *const Self) usize {
             return self.len;
+        }
+
+        fn recomputeCodec(self: *Self) void {
+            self.common_codec = null;
+            if (self.len == 0) {
+                self.codec_state = .unknown;
+                return;
+            }
+            var sets: [max_participants][]const Codec = undefined;
+            for (self.members[0..self.len], 0..) |*m, i| {
+                if (m.codec_count == 0) {
+                    self.codec_state = .unknown;
+                    return;
+                }
+                sets[i] = m.codecSlice();
+            }
+            self.common_codec = kakehashi.selectCommon(sets[0..self.len]);
+            self.codec_state = if (self.common_codec != null) .direct else .incompatible;
+        }
+
+        pub fn transcodeFree(self: *const Self) bool {
+            return self.codec_state == .direct;
+        }
+
+        fn codecAllowed(self: *const Self, codec: Codec) bool {
+            return switch (self.codec_state) {
+                .unknown => true,
+                .direct => self.common_codec == codec,
+                .incompatible => false,
+            };
         }
 
         /// Rewrap a native kagura `datagram` ONCE (keeping the source publisher's
@@ -154,6 +206,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             if (n == 0) return;
             const view = kagura_frame.decode(datagram) catch return;
             const bf = kakehashi.fromNative(view);
+            if (!self.codecAllowed(bf.codec)) return;
             var scratch: [max_rewrap]u8 = undefined;
             const rtp = kakehashi.toRtp(bf, &self.ptmap, view.stream_id, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, rtp);
@@ -168,6 +221,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             if (n == 0) return;
             const dh = rtp_profile.decodeHeader(rtp) catch return;
             const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
+            if (!self.codecAllowed(bf.codec)) return;
             const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, dh.header.ssrc);
             var scratch: [max_rewrap]u8 = undefined;
             const len = kagura_frame.encode(nf, &scratch) catch return;
@@ -259,6 +313,47 @@ test "unregister drops a member; register updates in place" {
     try testing.expect(br.unregister("a"));
     try testing.expectEqual(@as(usize, 0), br.count());
     try testing.expect(!br.unregister("a"));
+}
+
+const CountSendCtx = struct {
+    count: usize = 0,
+
+    fn send(ctx: *anyopaque, _: *const Member, _: []const u8) void {
+        const self: *CountSendCtx = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+    }
+};
+
+test "fanout gates cross-leg frames on the shared Kakehashi codec" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 7 };
+    native.setCodecs(&.{.kaguravox});
+    var webrtc = Member{ .leg = .webrtc, .ssrc = 0xCAFE };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+    try testing.expect(!br.transcodeFree());
+
+    var src: [128]u8 = undefined;
+    const slen = try kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+        .stream_id = 7,
+        .sequence = 1,
+        .timestamp = 1,
+        .keyframe = false,
+        .codec = .kaguravox_audio,
+        .payload = "audio",
+    }, &src);
+
+    var ctx = CountSendCtx{};
+    br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
+    try testing.expectEqual(@as(usize, 0), ctx.count);
+
+    webrtc.setCodecs(&.{ .kaguravox, .kaguravis });
+    try br.register("mob", webrtc);
+    try testing.expect(br.transcodeFree());
+    br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
+    try testing.expectEqual(@as(usize, 1), ctx.count);
 }
 
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {
