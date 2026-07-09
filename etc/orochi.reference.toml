@@ -573,6 +573,15 @@ allow_anonymous = false
 # dormant (no plugins loaded). A missing dir / malformed plugin is logged, never
 # fatal.
 # plugin_dir = "/var/lib/orochi/plugins"
+# Maximum bytes read for one `.wasm` plugin file. Large plugins are rejected
+# before interpretation. Default: 8388608 (8 MiB).
+# max_plugin_bytes = 8388608
+# Maximum linear memory bytes available to one plugin instance. Default: 65536
+# (one Wasm page).
+# max_memory_bytes = 65536
+# Instruction fuel budget for each plugin command or hook dispatch. Default:
+# 16384.
+# default_fuel = 16384
 
 
 # --- [oper] — operator subsystem settings ------------------------------------

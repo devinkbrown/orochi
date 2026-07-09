@@ -29,6 +29,7 @@ const media_room = @import("media_room.zig");
 const multiline_mod = @import("../proto/multiline.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
+const wasm_bridge = @import("../wasm/host/bridge.zig");
 
 const default_search_index_config = search_index_mod.SearchIndex.Config{};
 
@@ -212,6 +213,12 @@ pub const Config = struct {
         /// plugins; each registers IRC commands consulted AFTER the built-in
         /// registry (so a plugin can never shadow a core command). Unset = off.
         plugin_dir: ?[]const u8 = null,
+        /// Maximum bytes read for one `.wasm` plugin file.
+        max_plugin_bytes: usize = wasm_bridge.max_plugin_bytes,
+        /// Maximum linear memory bytes available to one plugin instance.
+        max_memory_bytes: usize = wasm_bridge.default_max_memory_bytes,
+        /// Instruction fuel budget for each plugin command or hook dispatch.
+        default_fuel: u64 = wasm_bridge.default_fuel,
     };
 
     pub const OperSection = struct {
@@ -983,6 +990,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("oper.event_history_path"), &cfg.oper.event_history_path);
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
     try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
+    cfg.wasm.max_plugin_bytes = @intCast(try uintField(doc, "wasm.max_plugin_bytes", cfg.wasm.max_plugin_bytes, 1024, 64 * 1024 * 1024));
+    cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
+    cfg.wasm.default_fuel = try uintField(doc, "wasm.default_fuel", cfg.wasm.default_fuel, 1, 10_000_000);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

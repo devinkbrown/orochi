@@ -581,6 +581,9 @@ OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `plugin_dir` | string or null | unset (dormant) | directory path | Directory scanned at boot and on REHASH for `*.wasm` control-plane plugins. Each registers IRC commands consulted **after** the built-in registry — a plugin can extend, never shadow, a core command. Plugins run sandboxed with only their negotiated host capabilities (reply/log/time). Missing dir / malformed plugin is logged, never fatal. |
+| `max_plugin_bytes` | integer | `8388608` | `1024..67108864` | Maximum bytes read for one `.wasm` plugin file before interpretation. |
+| `max_memory_bytes` | integer | `65536` | `65536..16777216` | Maximum linear memory bytes available to one plugin instance. |
+| `default_fuel` | integer | `16384` | `1..10000000` | Instruction fuel budget for each plugin command or hook dispatch. |
 
 ## `[[opers]]`
 

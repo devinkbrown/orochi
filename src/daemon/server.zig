@@ -1435,6 +1435,14 @@ pub const Config = struct {
     /// Directory scanned at boot/REHASH for `*.wasm` OroWasm control-plane
     /// plugins. Empty = the plugin system stays dormant. `[wasm] plugin_dir`.
     wasm_plugin_dir: []const u8 = "",
+    /// Maximum bytes accepted for one `.wasm` plugin file. `[wasm]
+    /// max_plugin_bytes`.
+    wasm_max_plugin_bytes: usize = wasm_bridge.max_plugin_bytes,
+    /// Maximum linear memory bytes per plugin instance. `[wasm]
+    /// max_memory_bytes`.
+    wasm_max_memory_bytes: usize = wasm_bridge.default_max_memory_bytes,
+    /// Instruction fuel per plugin command/hook dispatch. `[wasm] default_fuel`.
+    wasm_default_fuel: u64 = wasm_bridge.default_fuel,
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -3465,7 +3473,11 @@ pub const LinuxServer = struct {
             .allocator = allocator,
             .config = config,
             .owned_disabled_features = runtime_features.owned_disabled_features,
-            .wasm = wasm_bridge.Bridge.init(allocator),
+            .wasm = wasm_bridge.Bridge.initWithOptions(allocator, .{
+                .max_plugin_bytes = config.wasm_max_plugin_bytes,
+                .max_memory_bytes = config.wasm_max_memory_bytes,
+                .default_fuel = config.wasm_default_fuel,
+            }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
             .native_stream_key = blk: {
@@ -27780,8 +27792,15 @@ pub const LinuxServer = struct {
         // Rebuild the bridge so removed plugins disappear; the dir string lives in
         // the just-committed reload_parsed, so repoint the live config at it first.
         self.config.wasm_plugin_dir = if (parsed.wasm.plugin_dir) |v| v else "";
+        self.config.wasm_max_plugin_bytes = parsed.wasm.max_plugin_bytes;
+        self.config.wasm_max_memory_bytes = parsed.wasm.max_memory_bytes;
+        self.config.wasm_default_fuel = parsed.wasm.default_fuel;
         self.wasm.deinit();
-        self.wasm = wasm_bridge.Bridge.init(self.allocator);
+        self.wasm = wasm_bridge.Bridge.initWithOptions(self.allocator, .{
+            .max_plugin_bytes = self.config.wasm_max_plugin_bytes,
+            .max_memory_bytes = self.config.wasm_max_memory_bytes,
+            .default_fuel = self.config.wasm_default_fuel,
+        });
         self.loadWasmPlugins();
     }
 
@@ -35547,7 +35566,11 @@ test "threaded server: STATS m reports per-command usage to an oper" {
 }
 
 test "threaded server: OROWASM reports ABI budgets and plugin registrations to opers" {
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+    var cfg = operTestConfig(0);
+    cfg.wasm_max_plugin_bytes = 4096;
+    cfg.wasm_max_memory_bytes = 128 * 1024;
+    cfg.wasm_default_fuel = 1234;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -35583,7 +35606,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
     try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,log,time", 200);
-    try recvUntil(&admin, "budgets max_plugin_bytes=8388608 max_memory_bytes=65536 default_fuel=16384", 200);
+    try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM ABI\r\n");

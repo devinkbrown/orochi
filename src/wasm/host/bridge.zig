@@ -16,6 +16,7 @@ const registry = @import("../../daemon/registry.zig");
 
 pub const default_fuel: u64 = 16 * 1024;
 pub const max_plugin_bytes: usize = 8 * 1024 * 1024;
+pub const default_max_memory_bytes: usize = 64 * 1024;
 
 /// Host callbacks the daemon supplies so a plugin's granted hostcalls reach the
 /// live connection. Opaque ctx is the daemon's per-invocation context.
@@ -41,6 +42,12 @@ pub const RuntimeInfo = struct {
     hook_count: usize,
 };
 
+pub const Options = struct {
+    max_plugin_bytes: usize = max_plugin_bytes,
+    max_memory_bytes: usize = default_max_memory_bytes,
+    default_fuel: u64 = default_fuel,
+};
+
 pub const PluginSummary = struct {
     handle: plugin.PluginHandle,
     name: []const u8,
@@ -52,12 +59,19 @@ pub const PluginSummary = struct {
 pub const Bridge = struct {
     allocator: std.mem.Allocator,
     store: plugin.PluginStore,
+    options: Options,
 
     pub fn init(allocator: std.mem.Allocator) Bridge {
+        return initWithOptions(allocator, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, options: Options) Bridge {
         return .{
             .allocator = allocator,
+            .options = options,
             .store = plugin.PluginStore.init(allocator, .{
                 .allowed_caps = abi.CapabilitySet.initMany(&.{ .reply, .log, .time }),
+                .max_memory_bytes = options.max_memory_bytes,
             }),
         };
     }
@@ -75,7 +89,7 @@ pub const Bridge = struct {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".wasm")) continue;
-            const bytes = try dir.readFileAlloc(io, entry.name, self.allocator, .limited(max_plugin_bytes));
+            const bytes = try dir.readFileAlloc(io, entry.name, self.allocator, .limited(self.options.max_plugin_bytes));
             defer self.allocator.free(bytes);
             const plugin_name = entry.name[0 .. entry.name.len - ".wasm".len];
             try self.loadBytes(plugin_name, bytes);
@@ -112,7 +126,7 @@ pub const Bridge = struct {
         const reg = self.findCommand(name) orelse return .not_found;
         var ctx = HostcallContext{ .bridge = self, .handle = reg.plugin, .host = host };
         const callback = interp.HostCall{ .ctx = &ctx, .call = hostcall };
-        _ = self.store.callExportWithHostcalls(reg.plugin, reg.export_name, &.{}, default_fuel, callback) catch |err| switch (err) {
+        _ = self.store.callExportWithHostcalls(reg.plugin, reg.export_name, &.{}, self.options.default_fuel, callback) catch |err| switch (err) {
             error.HostCallDenied, error.CapabilityDenied => return .denied,
             else => return .trap,
         };
@@ -133,7 +147,7 @@ pub const Bridge = struct {
                 found = true;
                 var ctx = HostcallContext{ .bridge = self, .handle = reg.plugin, .host = host };
                 const callback = interp.HostCall{ .ctx = &ctx, .call = hostcall };
-                const result = self.store.callExportWithHostcalls(reg.plugin, reg.export_name, &.{}, default_fuel, callback) catch |err| switch (err) {
+                const result = self.store.callExportWithHostcalls(reg.plugin, reg.export_name, &.{}, self.options.default_fuel, callback) catch |err| switch (err) {
                     error.HostCallDenied, error.CapabilityDenied => {
                         denied = true;
                         continue;
@@ -163,9 +177,9 @@ pub const Bridge = struct {
             .manifest_schema = abi.manifest_schema,
             .host_function_count = abi.host_functions.len,
             .allowed_caps = self.store.policy.allowed_caps,
-            .max_memory_bytes = self.store.policy.max_memory_bytes,
-            .default_fuel = default_fuel,
-            .max_plugin_bytes = max_plugin_bytes,
+            .max_memory_bytes = self.options.max_memory_bytes,
+            .default_fuel = self.options.default_fuel,
+            .max_plugin_bytes = self.options.max_plugin_bytes,
             .plugin_count = self.store.plugins.items.len,
             .command_count = self.store.commands.items.len,
             .hook_count = self.store.hooks.items.len,
@@ -580,7 +594,11 @@ test "bridge dispatchHook routes hook exports and honors stop return" {
 }
 
 test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
-    var bridge = Bridge.init(std.testing.allocator);
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .max_plugin_bytes = 4096,
+        .max_memory_bytes = 128 * 1024,
+        .default_fuel = 1234,
+    });
     defer bridge.deinit();
     try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
 
@@ -588,8 +606,9 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expectEqual(@as(u16, 1), info.manifest_schema.major);
     try std.testing.expectEqual(@as(usize, abi.host_functions.len), info.host_function_count);
     try std.testing.expect(info.allowed_caps.has(.reply));
-    try std.testing.expectEqual(default_fuel, info.default_fuel);
-    try std.testing.expectEqual(max_plugin_bytes, info.max_plugin_bytes);
+    try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
+    try std.testing.expectEqual(@as(usize, 4096), info.max_plugin_bytes);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), info.max_memory_bytes);
     try std.testing.expectEqual(@as(usize, 1), info.plugin_count);
     try std.testing.expectEqual(@as(usize, 0), info.command_count);
     try std.testing.expectEqual(@as(usize, 1), info.hook_count);

@@ -56,6 +56,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.oper.event_history_path) |v| out.event_history_path = v;
     out.oper_auto_override = cfg.oper.auto_override;
     if (cfg.wasm.plugin_dir) |v| out.wasm_plugin_dir = v;
+    out.wasm_max_plugin_bytes = cfg.wasm.max_plugin_bytes;
+    out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;
+    out.wasm_default_fuel = cfg.wasm.default_fuel;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
@@ -879,11 +882,17 @@ test "wasm plugin_dir maps into the live config" {
         \\irc = 6680
         \\[wasm]
         \\plugin_dir = "/var/lib/orochi/plugins"
+        \\max_plugin_bytes = 4096
+        \\max_memory_bytes = 131072
+        \\default_fuel = 1234
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
     defer loaded.deinit(allocator);
     try testing.expectEqualStrings("/var/lib/orochi/plugins", loaded.config.wasm_plugin_dir);
+    try testing.expectEqual(@as(usize, 4096), loaded.config.wasm_max_plugin_bytes);
+    try testing.expectEqual(@as(usize, 131072), loaded.config.wasm_max_memory_bytes);
+    try testing.expectEqual(@as(u64, 1234), loaded.config.wasm_default_fuel);
 }
 
 test "limits overlay reputation knobs" {
