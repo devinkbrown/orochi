@@ -14163,7 +14163,7 @@ pub const LinuxServer = struct {
         return dmHistoryKey(conn.session.displayName(), conn.session.account(), target, peer_account, out) orelse target;
     }
 
-    fn chathistoryChannelVisibleTo(self: *LinuxServer, id: client_model.ClientId, target: []const u8) bool {
+    fn chathistoryChannelVisibleTo(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, target: []const u8) bool {
         const wid = worldIdFromClient(id);
         const channel_exists = self.world.channelExists(target);
         const is_member = self.world.isMember(target, wid);
@@ -14171,12 +14171,13 @@ pub const LinuxServer = struct {
             !self.world.channelHasFlag(target, .secret) and
             !self.world.isPrivate(target) and
             !self.world.isHidden(target);
-        return chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible);
+        if (!chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible)) return false;
+        return self.historyPolicyAllows(target, is_member, conn.session.isOper());
     }
 
     fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
         if (!world_model.isChannelName(target)) return true;
-        if (self.chathistoryChannelVisibleTo(id, target)) return true;
+        if (self.chathistoryChannelVisibleTo(id, conn, target)) return true;
         try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
         return false;
     }
@@ -19482,6 +19483,13 @@ pub const LinuxServer = struct {
             if (!validAiPolicyValue(value)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, "history-policy")) {
+            // Aegis-lite room policy for history visibility. Persist as a normal
+            // signed channel PROP; CHATHISTORY reads the value at request time.
+            if (deleting) return .not_handled;
+            if (!validHistoryPolicyValue(value)) return .bad_value;
+            return .not_handled;
+        }
         return .not_handled;
     }
 
@@ -19502,6 +19510,32 @@ pub const LinuxServer = struct {
 
     fn validAiPolicyValue(value: []const u8) bool {
         return std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "1");
+    }
+
+    pub const HistoryPolicy = enum { public, members, opers };
+
+    fn validHistoryPolicyValue(value: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(value, "public") or
+            std.ascii.eqlIgnoreCase(value, "members") or
+            std.ascii.eqlIgnoreCase(value, "opers");
+    }
+
+    pub fn channelHistoryPolicy(self: *LinuxServer, channel: []const u8) HistoryPolicy {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return .public;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "history-policy") catch return .public;
+        if (std.ascii.eqlIgnoreCase(ev.value, "public")) return .public;
+        if (std.ascii.eqlIgnoreCase(ev.value, "members")) return .members;
+        if (std.ascii.eqlIgnoreCase(ev.value, "opers")) return .opers;
+        return .members;
+    }
+
+    fn historyPolicyAllows(self: *LinuxServer, channel: []const u8, is_member: bool, is_oper: bool) bool {
+        return switch (self.channelHistoryPolicy(channel)) {
+            .public => true,
+            .members => is_member or is_oper,
+            .opers => is_oper,
+        };
     }
 
     pub fn channelAiPolicy(self: *LinuxServer, channel: []const u8) AiPolicy {
@@ -31856,6 +31890,35 @@ test "AI policy: channel PROP flags validate, persist, and resolve precedence" {
     } else return error.SkipZigTest;
 }
 
+test "history policy: channel PROP validates and tightens CHATHISTORY access" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#histpolicy" };
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "history-policy", "public", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "history-policy", "members", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "history-policy", "opers", false), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "history-policy", "", true), .not_handled);
+        try std.testing.expectEqual(server.channelBuiltinSet(chan, "history-policy", "friends", false), .bad_value);
+
+        try std.testing.expectEqual(LinuxServer.HistoryPolicy.public, server.channelHistoryPolicy("#histpolicy"));
+        _ = try server.props.setProp(chan, "history-policy", "members", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.HistoryPolicy.members, server.channelHistoryPolicy("#histpolicy"));
+        try std.testing.expect(!server.historyPolicyAllows("#histpolicy", false, false));
+        try std.testing.expect(server.historyPolicyAllows("#histpolicy", true, false));
+        try std.testing.expect(server.historyPolicyAllows("#histpolicy", false, true));
+
+        _ = try server.props.setProp(chan, "history-policy", "opers", .{ .id = "op", .access = .owner });
+        try std.testing.expectEqual(LinuxServer.HistoryPolicy.opers, server.channelHistoryPolicy("#histpolicy"));
+        try std.testing.expect(!server.historyPolicyAllows("#histpolicy", true, false));
+        try std.testing.expect(server.historyPolicyAllows("#histpolicy", false, true));
+    } else return error.SkipZigTest;
+}
+
 test "AI policy: public PROP visibility reaches non-op channel members" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -42177,6 +42240,68 @@ test "threaded server: CAP LS advertises draft/search" {
     var a = LiveClient{ .fd = fd_a };
     try writeAllFd(fd_a, "CAP LS 302\r\n");
     try recvUntil(&a, "draft/search", 200);
+}
+
+test "threaded server: history-policy prop gates CHATHISTORY for non-members" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory batch\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :draft/chathistory batch\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #histpolicy\r\n");
+    try recvUntil(&a, " 366 A #histpolicy ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG #histpolicy :visible-before-policy\r\nCHATHISTORY LATEST #histpolicy * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory #histpolicy", 200);
+    try recvUntil(&a, "PRIVMSG #histpolicy :visible-before-policy", 200);
+    try recvUntil(&a, "BATCH -1", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #histpolicy * 10\r\n");
+    try recvUntil(&b, "BATCH +1 chathistory #histpolicy", 200);
+    try recvUntil(&b, "PRIVMSG #histpolicy :visible-before-policy", 200);
+    try recvUntil(&b, "BATCH -1", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #histpolicy history-policy :members\r\n");
+    try recvUntil(&a, " 819 A #histpolicy ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #histpolicy * 10\r\n");
+    try recvUntil(&b, "FAIL CHATHISTORY ACCESS_DENIED", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #histpolicy\r\n");
+    try recvUntil(&b, " 366 B #histpolicy ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #histpolicy * 10\r\n");
+    try recvUntil(&b, "BATCH +1 chathistory #histpolicy", 200);
+    try recvUntil(&b, "PRIVMSG #histpolicy :visible-before-policy", 200);
+    try recvUntil(&b, "BATCH -1", 200);
 }
 
 test "threaded server: draft/event-playback replays TOPIC events only to capable clients" {

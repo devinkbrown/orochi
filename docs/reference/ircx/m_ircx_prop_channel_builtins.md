@@ -15,7 +15,7 @@ computed reads are `channelBuiltinGet`; validated writes are
 `OID`, `NAME`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, `LANGUAGE`,
 `FOUNDERKEY`, `OWNERKEY`, `HOSTKEY`, `VOICEKEY`, `MEMBERKEY`, `PICS`, `TOPIC`,
 `SUBJECT`, `CLIENT`, `ONJOIN`, `ONPART`, `LAG`, `ACCOUNT`, `CLIENTGUID`,
-`SERVICEPATH`, `no-ai`, `local-only`, `server-ai-ok`.
+`SERVICEPATH`, `no-ai`, `local-only`, `server-ai-ok`, `history-policy`.
 
 ### Computed / linked (answered ahead of the generic store)
 
@@ -89,7 +89,7 @@ These are public, channel-operator-managed policy flags for future server-side
 AI/plugin paths. `channelBuiltinSet` accepts only `0` or `1`; other values return
 `906 ERR_BADVALUE`. They are ordinary signed channel properties after
 validation, so they persist, mesh-propagate, and survive the same PROP replay
-path as `EPHEMERAL`, `PINS`, and `orochi.topics`.
+path as `EPHEMERAL`, `PINS`, `history-policy`, and `orochi.topics`.
 
 When multiple flags are present, daemon-side readers resolve precedence as:
 `no-ai` > `local-only` > `server-ai-ok` > unspecified. That makes the safest
@@ -102,13 +102,28 @@ than reading the flags directly. Local/client-side inference is allowed unless
 `server-ai-ok` wins; `unspecified` fails closed for server-side work. This is a
 policy hook only; it does not imply or create a separate MCP server.
 
+### `history-policy` — CHATHISTORY visibility
+
+```text
+PROP <#channel> history-policy :public    # default: ordinary visibility rules
+PROP <#channel> history-policy :members   # only members and opers may replay
+PROP <#channel> history-policy :opers     # only opers may replay
+PROP <#channel> history-policy :          # delete the policy
+```
+
+This is Orochi's live Aegis policy hook for history reads. `channelBuiltinSet`
+accepts only `public`, `members`, or `opers`; invalid values return
+`906 ERR_BADVALUE`. The value is stored as an ordinary signed channel property
+and enforced at the CHATHISTORY target-visibility gate after normal channel
+existence/secret/private/hidden checks pass. DMs do not use this channel policy.
+
 ## Mesh note
 
-Channel properties (built-in, `EPHEMERAL`, `PINS`, `orochi.topics`, and AI
-policy flags alike) are signed at the local origin and replicated as
-last-writer-wins CRDT facts. Commit `c2eee68` fixed cross-mesh PROP propagation
-so channel and entity properties now reach peers; the origin is stamped with the
-node's `shortId`.
+Channel properties (built-in, `EPHEMERAL`, `PINS`, `history-policy`,
+`orochi.topics`, and AI policy flags alike) are signed at the local origin and
+replicated as last-writer-wins CRDT facts. Commit `c2eee68` fixed cross-mesh
+PROP propagation so channel and entity properties now reach peers; the origin is
+stamped with the node's `shortId`.
 
 ## Examples
 
@@ -119,4 +134,5 @@ PROP #vault EPHEMERAL :0           ; turn expiry off again
 PROP #news PINS :01H…ABC,01H…XYZ   ; pin two messages by id
 PROP #news PINS :                  ; unpin everything
 PROP #private no-ai :1             ; opt the room out of AI processing
+PROP #vault history-policy :members ; require membership for history replay
 ```

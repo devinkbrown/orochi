@@ -133,6 +133,7 @@ pub const ChannelPropKey = enum {
     no_ai,
     local_only,
     server_ai_ok,
+    history_policy,
 
     pub fn token(self: ChannelPropKey) []const u8 {
         return switch (self) {
@@ -160,6 +161,7 @@ pub const ChannelPropKey = enum {
             .no_ai => "no-ai",
             .local_only => "local-only",
             .server_ai_ok => "server-ai-ok",
+            .history_policy => "history-policy",
         };
     }
 };
@@ -210,6 +212,7 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         // AI/plugin/MCP paths can enforce them without inventing a second policy
         // store. The daemon validates values as boolean tokens before storage.
         .no_ai, .local_only, .server_ai_ok => .{ .key = key, .max_value = 1, .min_setter = .host },
+        .history_policy => .{ .key = key, .max_value = 16, .min_setter = .host },
     };
 }
 
@@ -892,6 +895,7 @@ test "secret channel props stay hidden except raw internal lookup" {
     try std.testing.expect(channelPropKey("no-ai") == .no_ai);
     try std.testing.expect(channelPropKey("LOCAL-ONLY") == .local_only);
     try std.testing.expect(channelPropKey("server-ai-ok") == .server_ai_ok);
+    try std.testing.expect(channelPropKey("history-policy") == .history_policy);
     try std.testing.expectError(error.PropMissing, store.getProp(entity, "FOUNDERKEY"));
     try std.testing.expectEqualStrings("topkey", (try store.getPropRaw(entity, "FOUNDERKEY")).value);
 
