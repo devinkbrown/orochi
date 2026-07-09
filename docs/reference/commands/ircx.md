@@ -84,7 +84,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## ACCESS
 
 - Syntax: `ACCESS <#channel> <ADD|DELETE|LIST|CLEAR> [level [mask [timeout] [:reason]]]`
-- Description: IRCX per-channel access list for levels parsed by the access store. Management requires channel authority or oper.
+- Description: IRCX per-channel access list for levels parsed by the access store. Management requires channel authority or oper. Successful add/delete/clear mutations are recorded in the ProofMark audit ring and published on the operator Event Spine with `proof=<id>` when the daemon has a signing identity.
 - Privileges: Registered client with channel management access, or oper.
 - Parameters: Parsed by `ircx_access_store.parse`.
 - Replies: `RPL_ACCESSADD 801`, `RPL_ACCESSDELETE 802`, `RPL_ACCESSSTART 803`, `RPL_ACCESSENTRY 804`, `RPL_ACCESSEND 805`.

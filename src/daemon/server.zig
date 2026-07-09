@@ -19218,6 +19218,16 @@ pub const LinuxServer = struct {
         try self.handleServerAccessRequest(conn, req);
     }
 
+    fn auditAccessChange(self: *LinuxServer, conn: *ConnState, action: svc_operaudit.Action, channel: []const u8, detail: []const u8) void {
+        const proof_id = self.recordOperAudit(conn.session.displayName(), action, channel, detail);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event_note = if (proof_id) |pid|
+            std.fmt.bufPrint(&event_buf, "ACCESS {s} {s} proof={s}", .{ channel, detail, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&event_buf, "ACCESS {s} {s}", .{ channel, detail }) catch return;
+        self.publishOperEvent(.oper_action, .notice, event_note) catch {};
+    }
+
     pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count >= 1 and std.mem.eql(u8, parsed.paramSlice()[0], "*")) {
             const req = ircx_saccess.parseAccess(parsed.paramSlice()) catch {
@@ -19278,6 +19288,9 @@ pub const LinuxServer = struct {
                 if (ircx_access_store.buildAccessAdd(&buf, ctx, ev)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
+                var detail_buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&detail_buf, "ADD {s} {s}", .{ a.level.token(), a.mask }) catch "ADD";
+                self.auditAccessChange(conn, .access_add, a.channel, detail);
             },
             .delete => |d| {
                 if (!self.accessCanManage(id, conn, d.channel, d.level)) {
@@ -19293,6 +19306,9 @@ pub const LinuxServer = struct {
                 if (ircx_access_store.buildAccessDelete(&buf, ctx, d)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
+                var detail_buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&detail_buf, "DELETE {s} {s}", .{ d.level.token(), d.mask }) catch "DELETE";
+                self.auditAccessChange(conn, .access_delete, d.channel, detail);
             },
             .clear => |sel| {
                 if (!self.accessCanManage(id, conn, sel.channel, sel.level)) {
@@ -19311,6 +19327,12 @@ pub const LinuxServer = struct {
                 if (ircx_access_store.buildAccessEnd(&buf, ctx, sel.channel)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
+                var detail_buf: [64]u8 = undefined;
+                const detail = if (sel.level) |level|
+                    (std.fmt.bufPrint(&detail_buf, "CLEAR {s}", .{level.token()}) catch "CLEAR")
+                else
+                    "CLEAR *";
+                self.auditAccessChange(conn, .access_clear, sel.channel, detail);
             },
         }
     }
@@ -40923,7 +40945,11 @@ test "threaded server: HOSTKEY grants op on keyed join (not disclosed at join; o
 }
 
 test "threaded server: ACCESS add/list/delete gated by channel-op" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xc3)), "local");
+    defer ident.deinit();
+    var cfg = operTestConfig(0);
+    cfg.node_identity = &ident;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -40947,9 +40973,11 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     defer alloc.destroy(b);
     a.* = .{ .fd = fd_a };
     b.* = .{ .fd = fd_b };
+    try saslAdminPrelude(fd_a);
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(a, " 001 A ", 200);
+    try recvUntil(a, " 381 A ", 200);
     try recvUntil(b, " 001 B ", 200);
     try writeAllFd(fd_a, "IRCX\r\n");
     try writeAllFd(fd_b, "IRCX\r\n");
@@ -40961,6 +40989,7 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     a.reset();
     try writeAllFd(fd_a, "ACCESS #a ADD VOICE *!*@trusted.example\r\n");
     try recvUntil(a, " 801 A #a VOICE *!*@trusted.example", 200);
+    try recvUntil(a, "ACCESS #a ADD VOICE *!*@trusted.example proof=", 300);
     a.reset();
     try writeAllFd(fd_a, "ACCESS #a LIST\r\n");
     try recvUntil(a, " 803 A #a ", 200);
@@ -40969,10 +40998,28 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     a.reset();
     try writeAllFd(fd_a, "ACCESS #a DELETE VOICE *!*@trusted.example\r\n");
     try recvUntil(a, " 802 A #a VOICE *!*@trusted.example", 200);
+    try recvUntil(a, "ACCESS #a DELETE VOICE *!*@trusted.example proof=", 300);
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT JSON A 5\r\n");
+    try recvUntil(a, "\"type\":\"audit-end\"", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"access_delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"access_add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"proof_id\":") != null);
     // B (not a channel operator) cannot manage the access list (482).
     b.reset();
     try writeAllFd(fd_b, "ACCESS #a ADD VOICE *!*@x\r\n");
     try recvUntil(b, " 482 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a ADD DENY *!*@clear.example\r\n");
+    try recvUntil(a, "ACCESS #a ADD DENY *!*@clear.example proof=", 300);
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a CLEAR DENY\r\n");
+    try recvUntil(a, " 805 A #a ", 200);
+    try recvUntil(a, "ACCESS #a CLEAR DENY proof=", 300);
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT JSON A 5\r\n");
+    try recvUntil(a, "\"type\":\"audit-end\"", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"access_clear\"") != null);
     // Channel-recycle: A seeds a DENY entry, parts (channel destroyed as sole
     // member), then recreates #a — the stale DENY must NOT survive into the new
     // incarnation (only 803 start + 805 end, no 804 entry line).

@@ -44,6 +44,9 @@ pub const Action = enum {
     connect,
     squit,
     redact,
+    access_add,
+    access_delete,
+    access_clear,
     other,
 
     /// Stable lowercase label used when rendering audit lines.
@@ -68,6 +71,9 @@ pub const Action = enum {
             .connect => "connect",
             .squit => "squit",
             .redact => "redact",
+            .access_add => "access_add",
+            .access_delete => "access_delete",
+            .access_clear => "access_clear",
             .other => "other",
         };
     }
@@ -94,6 +100,9 @@ pub const Action = enum {
             .connect => 17,
             .squit => 18,
             .redact => 19,
+            .access_add => 20,
+            .access_delete => 21,
+            .access_clear => 22,
             .other => 255,
         };
     }

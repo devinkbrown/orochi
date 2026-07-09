@@ -71,7 +71,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## AUDIT
 
 - Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id>`
-- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, `SQUIT`, and `REDACT`. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
+- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, `SQUIT`, `REDACT`, and IRCX `ACCESS` add/delete/clear mutations. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
 - Privileges: Oper holding the `audit_read` privilege.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
