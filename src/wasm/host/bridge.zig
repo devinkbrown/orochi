@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Server-facing adapter for dispatching OroWasm plugins as IRC commands.
+//! Server-facing adapter for dispatching OroWasm plugins as IRC commands/hooks.
 //!
 //! The bridge keeps the daemon API small: load modules, find the plugin that
 //! owns a command, and run that exported handler with live host callbacks. The
@@ -12,6 +12,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const interp = @import("interp.zig");
 const plugin = @import("plugin.zig");
+const registry = @import("../../daemon/registry.zig");
 
 const default_fuel: u64 = 16 * 1024;
 const max_plugin_bytes: usize = 8 * 1024 * 1024;
@@ -26,6 +27,7 @@ pub const HostBindings = struct {
 };
 
 pub const Outcome = enum { handled, not_found, denied, trap };
+pub const HookOutcome = enum { continue_, stop, not_found, denied, trap };
 
 pub const Bridge = struct {
     allocator: std.mem.Allocator,
@@ -71,12 +73,17 @@ pub const Bridge = struct {
             .name = name,
             .requested_caps = meta.requested_caps.items,
             .commands = try meta.commandDecls(self.allocator),
+            .hooks = try meta.hookDecls(self.allocator),
         };
         _ = try self.store.load(manifest, wasm);
     }
 
     pub fn hasCommand(self: *const Bridge, name: []const u8) bool {
         return self.findCommand(name) != null;
+    }
+
+    pub fn hasHook(self: *const Bridge, name: []const u8) bool {
+        return self.findHook(name) != null;
     }
 
     /// Run the plugin that owns `name`, enforcing the plugin's granted hostcall set.
@@ -92,6 +99,41 @@ pub const Bridge = struct {
         return .handled;
     }
 
+    /// Run every plugin hook registered for `name`, in daemon hook-priority
+    /// order. A hook export that returns `i32 != 0` stops the chain; denied or
+    /// trapped hooks are isolated and later hooks still get a chance to run.
+    pub fn dispatchHook(self: *Bridge, name: []const u8, host: HostBindings) HookOutcome {
+        var found = false;
+        var denied = false;
+        var trapped = false;
+        const priorities = [_]registry.HookPriority{ .first, .early, .normal, .late, .last };
+        for (priorities) |priority| {
+            for (self.store.hooks.items) |reg| {
+                if (reg.priority != priority or !std.ascii.eqlIgnoreCase(reg.hook, name)) continue;
+                found = true;
+                var ctx = HostcallContext{ .bridge = self, .handle = reg.plugin, .host = host };
+                const callback = interp.HostCall{ .ctx = &ctx, .call = hostcall };
+                const result = self.store.callExportWithHostcalls(reg.plugin, reg.export_name, &.{}, default_fuel, callback) catch |err| switch (err) {
+                    error.HostCallDenied, error.CapabilityDenied => {
+                        denied = true;
+                        continue;
+                    },
+                    else => {
+                        trapped = true;
+                        continue;
+                    },
+                };
+                if (result) |value| {
+                    if (value.i32 != 0) return .stop;
+                }
+            }
+        }
+        if (!found) return .not_found;
+        if (denied) return .denied;
+        if (trapped) return .trap;
+        return .continue_;
+    }
+
     pub fn count(self: *const Bridge) usize {
         return self.store.plugins.items.len;
     }
@@ -104,6 +146,13 @@ pub const Bridge = struct {
     fn findCommand(self: *const Bridge, name: []const u8) ?plugin.HostCommandRegistration {
         for (self.store.commands.items) |reg| {
             if (std.ascii.eqlIgnoreCase(reg.name, name)) return reg;
+        }
+        return null;
+    }
+
+    fn findHook(self: *const Bridge, name: []const u8) ?plugin.HostHookRegistration {
+        for (self.store.hooks.items) |reg| {
+            if (std.ascii.eqlIgnoreCase(reg.hook, name)) return reg;
         }
         return null;
     }
@@ -158,10 +207,27 @@ const CommandMeta = struct {
     }
 };
 
+const HookMeta = struct {
+    hook: []u8,
+    export_name: []u8,
+    priority: abi.HookPriority = .normal,
+
+    fn decl(self: HookMeta) abi.HookDecl {
+        return .{ .hook = self.hook, .priority = self.priority, .export_name = self.export_name };
+    }
+
+    fn deinit(self: HookMeta, allocator: std.mem.Allocator) void {
+        allocator.free(self.hook);
+        allocator.free(self.export_name);
+    }
+};
+
 const Metadata = struct {
     requested_caps: std.ArrayList(abi.Capability) = .empty,
     commands: std.ArrayList(CommandMeta) = .empty,
+    hooks: std.ArrayList(HookMeta) = .empty,
     decls: std.ArrayList(abi.CommandDecl) = .empty,
+    hook_decls: std.ArrayList(abi.HookDecl) = .empty,
 
     fn parse(allocator: std.mem.Allocator, fallback_name: []const u8, wasm: []const u8) !Metadata {
         var meta = Metadata{};
@@ -171,7 +237,7 @@ const Metadata = struct {
         try parser.parse(allocator, fallback_name, &meta);
         if (meta.commands.items.len == 0) {
             if (parser.first_export) |export_name| {
-                try meta.addCommand(allocator, fallback_name, export_name);
+                if (!isHookExport(export_name)) try meta.addCommand(allocator, fallback_name, export_name);
             }
         }
         return meta;
@@ -192,6 +258,14 @@ const Metadata = struct {
         try self.commands.append(allocator, .{ .name = owned_name, .export_name = owned_export });
     }
 
+    fn addHook(self: *Metadata, allocator: std.mem.Allocator, hook: []const u8, export_name: []const u8) !void {
+        const owned_hook = try allocator.dupe(u8, hook);
+        errdefer allocator.free(owned_hook);
+        const owned_export = try allocator.dupe(u8, export_name);
+        errdefer allocator.free(owned_export);
+        try self.hooks.append(allocator, .{ .hook = owned_hook, .export_name = owned_export });
+    }
+
     fn commandDecls(self: *Metadata, allocator: std.mem.Allocator) ![]const abi.CommandDecl {
         self.decls.clearRetainingCapacity();
         try self.decls.ensureTotalCapacity(allocator, self.commands.items.len);
@@ -199,14 +273,28 @@ const Metadata = struct {
         return self.decls.items;
     }
 
+    fn hookDecls(self: *Metadata, allocator: std.mem.Allocator) ![]const abi.HookDecl {
+        self.hook_decls.clearRetainingCapacity();
+        try self.hook_decls.ensureTotalCapacity(allocator, self.hooks.items.len);
+        for (self.hooks.items) |hook| self.hook_decls.appendAssumeCapacity(hook.decl());
+        return self.hook_decls.items;
+    }
+
     fn deinit(self: *Metadata, allocator: std.mem.Allocator) void {
         for (self.commands.items) |cmd| cmd.deinit(allocator);
+        for (self.hooks.items) |hook| hook.deinit(allocator);
         self.commands.deinit(allocator);
+        self.hooks.deinit(allocator);
         self.requested_caps.deinit(allocator);
         self.decls.deinit(allocator);
+        self.hook_decls.deinit(allocator);
         self.* = undefined;
     }
 };
+
+fn isHookExport(export_name: []const u8) bool {
+    return std.mem.startsWith(u8, export_name, "hook_") and export_name.len > "hook_".len;
+}
 
 const MetaParser = struct {
     data: []const u8,
@@ -261,6 +349,8 @@ const MetaParser = struct {
             if (root.first_export == null) root.first_export = export_name;
             if (std.mem.startsWith(u8, export_name, "cmd_") and export_name.len > "cmd_".len) {
                 try meta.addCommand(allocator, export_name["cmd_".len..], export_name);
+            } else if (isHookExport(export_name)) {
+                try meta.addHook(allocator, export_name["hook_".len..], export_name);
             } else if (std.mem.eql(u8, export_name, "handle") or std.ascii.eqlIgnoreCase(export_name, fallback_name)) {
                 try meta.addCommand(allocator, fallback_name, export_name);
             }
@@ -340,6 +430,21 @@ const denied_wasm = [_]u8{
     0x0b,
 };
 
+const stop_hook_wasm_bytes = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, 0x03,
+    0x02, 0x01, 0x00, 0x07, 0x1c, 0x01, 0x18, 'h',
+    'o',  'o',  'k',  '_',  'm',  'e',  's',  's',
+    'a',  'g',  'e',  '_',  'p',  'r',  'e',  '_',
+    'd',  'e',  'l',  'i',  'v',  'e',  'r',  0x00,
+    0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01,
+    0x0b,
+};
+
+pub const testing = struct {
+    pub const stop_hook_wasm: []const u8 = &stop_hook_wasm_bytes;
+};
+
 const Capture = struct {
     text: std.ArrayList(u8) = .empty,
 
@@ -406,4 +511,24 @@ test "bridge dispatch reports missing command" {
         .log = Capture.log,
         .now_ms = Capture.now,
     }));
+}
+
+test "bridge dispatchHook routes hook exports and honors stop return" {
+    var bridge = Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    try bridge.loadBytes("mod", &stop_hook_wasm_bytes);
+
+    try std.testing.expect(!bridge.hasCommand("mod"));
+    try std.testing.expect(bridge.hasHook("message_pre_deliver"));
+
+    var capture = Capture{};
+    defer capture.text.deinit(std.testing.allocator);
+    const out = bridge.dispatchHook("message_pre_deliver", .{
+        .ctx = &capture,
+        .reply = Capture.reply,
+        .log = Capture.log,
+        .now_ms = Capture.now,
+    });
+
+    try std.testing.expectEqual(HookOutcome.stop, out);
 }

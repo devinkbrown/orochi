@@ -50,10 +50,11 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 
 | Stage | Behavior | Evidence |
 | --- | --- | --- |
-| Server consult | `dispatchRegistered` checks the bridge only after SerpentRegistry misses and only when plugin count is nonzero and the bridge has the command. | `src/daemon/server.zig:3471`, `src/daemon/server.zig:3473` |
+| Server consult | `dispatchRegistered` checks the bridge only after SerpentRegistry misses and only when plugin count is nonzero and the bridge has the command. | `src/daemon/server.zig`, `src/wasm/host/bridge.zig` |
 | Host bindings | The server supplies reply, log, and now_ms callbacks over an opaque per-command context. | `src/daemon/server.zig:3482`, `src/daemon/server.zig:3484`, `src/daemon/server.zig:3485`, `src/daemon/server.zig:3486` |
 | Bridge dispatch | `Bridge.dispatch` finds the owning plugin command, builds a hostcall callback, calls the exported function with default fuel, maps denied/trap outcomes, and returns handled. | `src/wasm/host/bridge.zig:79`, `src/wasm/host/bridge.zig:82`, `src/wasm/host/bridge.zig:84`, `src/wasm/host/bridge.zig:85`, `src/wasm/host/bridge.zig:86`, `src/wasm/host/bridge.zig:89` |
 | Server error mapping | Denied hostcalls and traps become numeric errors to the client. | `src/daemon/server.zig:3488`, `src/daemon/server.zig:3490`, `src/daemon/server.zig:3494` |
+| Hook dispatch | Exports named `hook_<id>` register plugin hooks. The server invokes `message_pre_deliver` through the same host bindings; a hook returning nonzero `i32` stops delivery, while denied/trapped hooks are isolated. | `src/wasm/host/bridge.zig`, `src/daemon/server.zig` |
 
 ## Plugin loading and capabilities
 
@@ -61,7 +62,7 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 | --- | --- | --- |
 | `Bridge.init` | Creates `PluginStore` with allowed caps reply, log, and time. | `src/wasm/host/bridge.zig:31`, `src/wasm/host/bridge.zig:34`, `src/wasm/host/bridge.zig:35` |
 | Directory load | `loadFromDir` opens a plugin directory, loads `*.wasm` files up to 8 MiB, and uses the file stem as fallback plugin name. | `src/wasm/host/bridge.zig:40`, `src/wasm/host/bridge.zig:43`, `src/wasm/host/bridge.zig:52`, `src/wasm/host/bridge.zig:53`, `src/wasm/host/bridge.zig:55` |
-| Metadata parse | Bridge parses imports/exports to infer requested capabilities and command exports; `cmd_*` exports become commands. | `src/wasm/host/bridge.zig:63`, `src/wasm/host/bridge.zig:67`, `src/wasm/host/bridge.zig:234`, `src/wasm/host/bridge.zig:249`, `src/wasm/host/bridge.zig:259` |
+| Metadata parse | Bridge parses imports/exports to infer requested capabilities plus command and hook exports; `cmd_*` exports become commands, and `hook_*` exports become hooks. | `src/wasm/host/bridge.zig` |
 | ABI schema | Host functions are independently versioned and capability-gated. | `src/wasm/host/abi.zig:1`, `src/wasm/host/abi.zig:8`, `src/wasm/host/abi.zig:22`, `src/wasm/host/abi.zig:69`, `src/wasm/host/abi.zig:121` |
 | Capability negotiation | Granted caps are the intersection of requested caps and host policy; manifest major version must be compatible. | `src/wasm/host/abi.zig:139`, `src/wasm/host/abi.zig:142`, `src/wasm/host/abi.zig:143` |
 | Store lifecycle | `PluginStore` owns loaded plugins, command registrations, hook registrations, and deinitializes them on unload/deinit. | `src/wasm/host/plugin.zig:68`, `src/wasm/host/plugin.zig:72`, `src/wasm/host/plugin.zig:73`, `src/wasm/host/plugin.zig:74`, `src/wasm/host/plugin.zig:81`, `src/wasm/host/plugin.zig:117` |
@@ -90,4 +91,4 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 | Helix client fd reattach | `handleUpgrade` now clears CLOEXEC on client fds and successor `adoptInheritedClient` reattaches them. Some comments still describe client fd reattach as a remaining increment. | stale comment: `src/daemon/server.zig:6074`; current code: `src/daemon/server.zig:6121`, `src/daemon/server.zig:6198`, `src/daemon/server.zig:6224` |
 | Channel membership carry-over | `session_snapshot.zig` header still says caps/umodes/channel membership are later, but the current format and server adoption restore channel memberships. | stale comment: `src/daemon/helix/session_snapshot.zig:8`; current code: `src/daemon/helix/session_snapshot.zig:15`, `src/daemon/server.zig:6219` |
 | Control-socket fd pass | The helper exists in `helix_live.handOff`, but the live `handleUpgrade` path uses env-passed arena/listener fds through `buildArenaListenerExecPlan`. | helper: `src/daemon/helix/live.zig:92`; live path: `src/daemon/server.zig:6148` |
-| Plugin hooks | `PluginStore` can register plugin hooks, but `Bridge.dispatch` only dispatches plugin commands in the current server path. | hook storage: `src/wasm/host/plugin.zig:74`; command dispatch: `src/wasm/host/bridge.zig:79`; server consult: `src/daemon/server.zig:3473` |
+| Plugin hooks | OroWasm hooks are active for `message_pre_deliver`; more typed daemon hook IDs can be wired as their guest payload ABI settles. | `src/wasm/host/bridge.zig`, `src/daemon/server.zig` |

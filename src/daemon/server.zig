@@ -28638,6 +28638,27 @@ pub const LinuxServer = struct {
             _ = verdict;
             if (!mpd.approved) return false;
         }
+        if (self.wasm.count() > 0 and self.wasm.hasHook("message_pre_deliver")) {
+            var parsed_stub = irc_line.LineView{ .raw = "", .command = command };
+            var wcore = module_core.Core{
+                .services = .{ .allocator = self.allocator, .config = &self.config },
+                .server = self,
+                .id = id,
+                .conn = conn,
+                .parsed = &parsed_stub,
+                .line = "",
+            };
+            const host = wasm_bridge.HostBindings{
+                .ctx = &wcore,
+                .reply = wasmReplyCb,
+                .log = wasmLogCb,
+                .now_ms = wasmNowCb,
+            };
+            switch (self.wasm.dispatchHook("message_pre_deliver", host)) {
+                .stop => return false,
+                .continue_, .not_found, .denied, .trap => {},
+            }
+        }
         // utf8only: reject malformed UTF-8 bodies with a standard-replies FAIL and
         // drop the message (ISUPPORT advertises UTF8ONLY). NOTICE stays silent.
         if (!utf8_guard.isValidMessageBody(text)) {
@@ -38235,6 +38256,21 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
     // Overlong-encoded slash (C0 AF) is invalid UTF-8 → FAIL ... INVALID_UTF8.
     try writeAllFd(fd_a, "PRIVMSG A :bad\xC0\xAF\r\n");
     try recvUntil(&a, "FAIL PRIVMSG INVALID_UTF8", 200);
+}
+
+test "OroWasm message_pre_deliver hook can stop delivery" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    try server.wasm.loadBytes("guard", wasm_bridge.testing.stop_hook_wasm);
+    try std.testing.expect(server.wasm.hasHook("message_pre_deliver"));
+
+    const id = try addTestLocalClient(&server, "alice", null);
+    const conn = server.connFor(id).?;
+    try std.testing.expect(!try server.messageContentGates(id, conn, "PRIVMSG", "#room", "hello", false));
 }
 
 test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
