@@ -71,7 +71,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 ## AUDIT
 
 - Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id>`
-- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, and `UNSHUN`. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
+- Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, and `SQUIT`. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
 - Privileges: Oper holding the `audit_read` privilege.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
@@ -217,7 +217,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 - Description: Opens an outbound server-to-server link, creating either a secured S2S initiator or plaintext S2S link and submitting an async connect.
 - Privileges: Oper plus `mesh_admin` privilege.
 - Parameters: Host and TCP port.
-- Replies: Server notice such as `CONNECT initiated` or `CONNECT initiated (secured)`.
+- Replies: Oper event with `proof=<id>` when the node has a signing identity, plus server notice such as `CONNECT initiated` or `CONNECT initiated (secured)`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`, notices for illegal port, invalid host, full table, or socket failure.
 - Example: `CONNECT 203.0.113.20 6667`
 - Sources: `src/daemon/modules/oper_security.zig:123`, `src/daemon/server.zig:6307`
@@ -228,7 +228,7 @@ The operator/security module registers the oper and moderation commands (`src/da
 - Description: Finds an established S2S peer by remote server name and closes it.
 - Privileges: Oper plus `mesh_admin` privilege.
 - Parameters: Server name; reason is currently not used by the handler.
-- Replies: `SQUIT complete` notice.
+- Replies: Oper event with `proof=<id>` when the node has a signing identity, plus `SQUIT complete` notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHSERVER 402`, `ERR_NOPRIVILEGES 481`.
 - Example: `SQUIT peer.example :maintenance`
 - Sources: `src/daemon/modules/oper_security.zig:124`, `src/daemon/server.zig:6373`

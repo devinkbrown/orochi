@@ -16866,6 +16866,16 @@ pub const LinuxServer = struct {
             });
             return;
         };
+        const mode = if (self.s2sSecured()) "secured" else "plain";
+        var target_buf: [320]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buf, "{s}:{d}", .{ host, port }) catch host;
+        const proof_id = self.recordOperAudit(conn.session.displayName(), .connect, target, mode);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event_note = if (proof_id) |pid|
+            std.fmt.bufPrint(&event_buf, "CONNECT {s} {s} proof={s}", .{ target, mode, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&event_buf, "CONNECT {s} {s}", .{ target, mode }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, event_note);
         try self.noticeTo(conn, if (self.s2sSecured()) "CONNECT initiated (secured)" else "CONNECT initiated");
     }
 
@@ -16993,6 +17003,14 @@ pub const LinuxServer = struct {
         const target = parsed.paramSlice()[0];
         if (self.findSquitVictim(target)) |victim| {
             try self.enqueueCloseOnOwner(victim.id, "SQUIT");
+            const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "SQUIT";
+            const proof_id = self.recordOperAudit(conn.session.displayName(), .squit, target, reason);
+            var event_buf: [default_reply_bytes]u8 = undefined;
+            const event_note = if (proof_id) |pid|
+                std.fmt.bufPrint(&event_buf, "SQUIT {s} proof={s}", .{ target, pid[0..] }) catch return
+            else
+                std.fmt.bufPrint(&event_buf, "SQUIT {s}", .{target}) catch return;
+            try self.publishOperEvent(.oper_action, .notice, event_note);
             try self.noticeTo(conn, "SQUIT complete");
         } else {
             try queueNumeric(conn, .ERR_NOSUCHSERVER, &.{target}, "No such server");
@@ -44038,7 +44056,11 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         defer closeFd(listen_fd);
         const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
 
-        var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xa4)), "local");
+        defer ident.deinit();
+        var cfg = operTestConfig(0);
+        cfg.node_identity = &ident;
+        var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
@@ -44063,6 +44085,9 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         var cmd_buf: [64]u8 = undefined;
         const cmd = try std.fmt.bufPrint(&cmd_buf, "CONNECT 127.0.0.1 {d}\r\n", .{remote_port});
         try writeAllFd(fd_a, cmd);
+        var connect_event_buf: [96]u8 = undefined;
+        const connect_event = try std.fmt.bufPrint(&connect_event_buf, "CONNECT 127.0.0.1:{d} plain proof=", .{remote_port});
+        try recvUntil(&a, connect_event, 400);
 
         // Accept the server's outbound connection on the test listener.
         var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
@@ -44167,8 +44192,15 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         try std.testing.expect(whois_seen);
 
         a.reset();
-        try writeAllFd(fd_a, "SQUIT remote.test\r\n");
+        try writeAllFd(fd_a, "SQUIT remote.test :maintenance\r\n");
+        try recvUntil(&a, "SQUIT remote.test proof=", 300);
         try recvUntil(&a, "SQUIT complete", 200);
+
+        a.reset();
+        try writeAllFd(fd_a, "AUDIT JSON A 8\r\n");
+        try recvUntil(&a, "\"type\":\"audit-end\"", 300);
+        try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"squit\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, a.written(), "\"action\":\"connect\"") != null);
     } else return error.SkipZigTest;
 }
 
