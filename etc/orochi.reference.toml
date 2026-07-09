@@ -198,8 +198,9 @@ enable_resumption = false
 # Maximum 0-RTT early data bytes advertised in tickets. 0 disables early data
 # while still allowing resumption when enable_resumption is true.
 early_data_max_size = 0
-# RFC 7250 server raw public keys. Off keeps the normal X.509 Certificate path;
-# on lets clients that explicitly offer RawPublicKey receive the leaf SPKI.
+# RFC 7250 raw public keys. Off keeps the normal X.509 Certificate path; on lets
+# clients that explicitly offer RawPublicKey receive the server leaf SPKI. When
+# request_client_cert is also on, clients may present a raw SPKI for CertFP mTLS.
 raw_public_key = false
 # Linux kTLS offload intent: "off", "tx", or "txrx". The daemon only enables it
 # when the running kernel advertises the TLS ULP; otherwise TLS stays userspace.

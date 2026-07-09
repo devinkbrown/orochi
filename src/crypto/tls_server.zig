@@ -137,11 +137,11 @@ pub const Config = struct {
     /// Empty disables ALPN negotiation.
     alpn_protocols: []const []const u8 = &.{},
     /// Mutual TLS: when true the server sends a CertificateRequest and verifies
-    /// the client's Certificate + CertificateVerify (Ed25519). CertFP pins by
-    /// fingerprint, so any presented leaf is accepted once its possession proof
-    /// verifies — there is no CA-chain requirement. A client that declines (empty
-    /// Certificate) still completes; `clientCertDer()` stays null. Default false
-    /// is fully backward-compatible (no CertificateRequest).
+    /// the client's Certificate + CertificateVerify. CertFP pins by fingerprint,
+    /// so any presented X.509 leaf or negotiated raw SPKI is accepted once its
+    /// possession proof verifies — there is no CA-chain requirement. A client
+    /// that declines (empty Certificate) still completes; `clientCertDer()` stays
+    /// null. Default false is fully backward-compatible (no CertificateRequest).
     request_client_cert: bool = false,
     /// Enable one post-handshake NewSessionTicket after the client Finished.
     /// The default is false so existing full handshakes remain byte-for-byte
@@ -197,9 +197,11 @@ pub const Config = struct {
     /// (no chain, no CA path). CertificateVerify is still signed with the same
     /// leaf key, so a client that has pinned/TOFU'd the key verifies possession.
     /// A client that does not offer the extension (or this flag off) gets the
-    /// classic X.509 chain, byte-identical to before. Only ever affects the server
-    /// certificate; `client_certificate_type` (raw-key client certs) is not
-    /// negotiated. Default false ⇒ the extension is never negotiated.
+    /// classic X.509 chain, byte-identical to before. When mutual TLS is enabled,
+    /// this also lets the server select RawPublicKey for the CLIENT certificate
+    /// via CertificateRequest's `client_certificate_type` extension, but only
+    /// when the client offered it. Default false ⇒ neither extension is
+    /// negotiated.
     enable_raw_public_key: bool = false,
     /// RFC 9345 delegated credential: a pre-minted DC the server presents to a
     /// client that offers the `delegated_credential` extension AND accepts the
@@ -486,8 +488,10 @@ pub const Server = struct {
     /// Decrypted client-flight handshake bytes accumulated across records, so a
     /// Certificate/CertificateVerify/Finished split over records reassembles.
     client_flight: std.ArrayList(u8) = .empty,
-    /// Verified client leaf DER (owned), or null when no cert was presented /
-    /// the possession proof failed. SHA-256 of this is the SASL EXTERNAL CertFP.
+    /// Verified client identity bytes (owned): X.509 leaf DER by default, or a
+    /// bare SPKI when RFC 7250 client RawPublicKey was negotiated. Null when no
+    /// cert was presented or the possession proof failed. SHA-256 of this is the
+    /// SASL EXTERNAL CertFP.
     client_cert_der: ?[]u8 = null,
     /// Public key parsed from the presented leaf (for CertificateVerify).
     client_leaf_key: ?ClientLeafKey = null,
@@ -544,6 +548,11 @@ pub const Server = struct {
     /// bare SubjectPublicKeyInfo instead of the X.509 chain. Re-derived per
     /// ClientHello (a HelloRetryRequest re-reads the offer). False ⇒ X.509.
     server_cert_type_rpk: bool = false,
+    /// RFC 7250: RawPublicKey was negotiated for the client certificate. Reached
+    /// only when mTLS is enabled, raw public keys are configured, and the
+    /// ClientHello offered `client_certificate_type` including RawPublicKey. The
+    /// client's Certificate then carries one bare SPKI instead of an X.509 leaf.
+    client_cert_type_rpk: bool = false,
     /// Index into `config.sni_certs` selected by the ClientHello's server_name,
     /// or null for the default top-level cert. Pinned on ClientHello1 and NOT
     /// re-derived on ClientHello2 (a HelloRetryRequest must not change the cert).
@@ -723,8 +732,9 @@ pub const Server = struct {
         try self.exportKeyingMaterial("EXPORTER-Channel-Binding", "", out[0..]);
     }
 
-    /// The verified client leaf DER (mTLS), or null. SHA-256 of this is the
-    /// SASL EXTERNAL CertFP.
+    /// The verified client identity bytes (mTLS), or null. This is X.509 leaf DER
+    /// unless RFC 7250 client RawPublicKey was negotiated, in which case it is the
+    /// bare SPKI. SHA-256 of this is the SASL EXTERNAL CertFP.
     pub fn clientCertDer(self: *const Server) ?[]const u8 {
         return self.client_cert_der;
     }
@@ -982,8 +992,10 @@ pub const Server = struct {
         return self.state != .connected;
     }
 
-    /// Capture the presented client leaf DER (CertFP pins by fingerprint, so only
-    /// the leaf matters; an empty list = a client that declined).
+    /// Capture the presented client leaf. In the classic mTLS path this is a DER
+    /// X.509 certificate; when RFC 7250 client RawPublicKey was negotiated it is
+    /// the bare SPKI bytes. The daemon's CertFP binding hashes whichever
+    /// possession-proven client identity was negotiated; an empty list = declined.
     fn parseClientCertificate(self: *Server, body: []const u8) Error!void {
         var c = Cursor.init(body);
         const request_context = try c.take(try c.readU8());
@@ -991,11 +1003,15 @@ pub const Server = struct {
         const list = try c.take(try c.readU24());
         var certs = Cursor.init(list);
         if (certs.remaining() == 0) return; // declined
-        const der = try certs.take(try certs.readU24());
+        const cert_data = try certs.take(try certs.readU24());
         _ = try certs.take(try certs.readU16()); // per-cert extensions (ignored)
-        const leaf = try self.allocator.dupe(u8, der);
+        if (certs.remaining() != 0) return error.BadHandshake;
+        const leaf = try self.allocator.dupe(u8, cert_data);
         errdefer self.allocator.free(leaf);
-        self.client_leaf_key = try clientKeyFromCert(leaf);
+        self.client_leaf_key = if (self.client_cert_type_rpk)
+            try clientKeyFromSpki(leaf)
+        else
+            try clientKeyFromCert(leaf);
         self.client_cert_der = leaf;
     }
 
@@ -1459,6 +1475,7 @@ pub const Server = struct {
         var offered_groups: ?[]const u8 = null; // supported_groups body (for HRR)
         var offered_cert_compression: ?cert_compression.Algorithm = null; // RFC 8879
         var offered_rpk = false; // RFC 7250: client will accept a RawPublicKey server cert
+        var offered_client_rpk = false; // RFC 7250: client can present a RawPublicKey cert
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
@@ -1503,6 +1520,17 @@ pub const Server = struct {
                         offered_rpk = true;
                     };
                 },
+                .client_certificate_type => if (self.request_client_cert and self.config.enable_raw_public_key) {
+                    // RFC 7250: the client offers the certificate types it can
+                    // present if we later send CertificateRequest. Select RPK
+                    // only for opt-in mTLS; default servers ignore the extension.
+                    var types_buf: [std.math.maxInt(u8)]tls_extension.CertificateType = undefined;
+                    const types = tls_extension.parseCertTypeList(ext.data, &types_buf) catch
+                        return error.BadHandshake;
+                    for (types) |t| if (t == .raw_public_key) {
+                        offered_client_rpk = true;
+                    };
+                },
                 .record_size_limit => {
                     // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
                     if (ext.data.len != 2) return error.BadHandshake;
@@ -1540,6 +1568,7 @@ pub const Server = struct {
         self.selected_suite = full_suite;
         self.cert_compression = offered_cert_compression;
         self.server_cert_type_rpk = offered_rpk;
+        self.client_cert_type_rpk = offered_client_rpk;
         // RFC 9345: re-derived fresh per ClientHello (so ClientHello2 re-reads it).
         self.client_accepts_dc = dc_accepted;
         // SNI (RFC 6066): pin the cert on ClientHello1. On ClientHello2 the SNI
@@ -1895,7 +1924,9 @@ pub const Server = struct {
 
     /// CertificateRequest (mTLS, RFC 8446 §4.3.2): empty request context + a
     /// signature_algorithms extension (the only mandatory one in TLS 1.3)
-    /// listing the schemes we verify client certs with.
+    /// listing the schemes we verify client certs with. When RFC 7250 client RPK
+    /// was negotiated from ClientHello, also selects `client_certificate_type =
+    /// RawPublicKey` so the client sends a bare SPKI in its Certificate.
     ///
     /// NOTE: `tls_extension.Builder.finish()` already returns the extensions
     /// vector *including* its leading 2-byte total-length prefix (it is appended
@@ -1909,9 +1940,15 @@ pub const Server = struct {
 
         var sigs_buf: [2 + 2 * client_cert_schemes.len]u8 = undefined;
         const sigs = try tls_signature_scheme.build(&sigs_buf, &client_cert_schemes);
-        var ext_storage: [32]u8 = undefined;
+        var ext_storage: [48]u8 = undefined;
         var ext_builder = try tls_extension.Builder.begin(&ext_storage);
         try ext_builder.addTyped(.signature_algorithms, sigs);
+        if (self.client_cert_type_rpk) {
+            try ext_builder.addTyped(
+                .client_certificate_type,
+                &[_]u8{tls_extension.CertificateType.raw_public_key.toInt()},
+            );
+        }
         try body.appendSlice(self.allocator, try ext_builder.finish());
         try self.emit(out, .certificate_request, body.items);
     }
@@ -2581,14 +2618,14 @@ const oid_ec_public_key_spki = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 }
 const oid_prime256v1_spki = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
 const oid_rsa_encryption_spki = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 }; // 1.2.840.113549.1.1.1
 
-/// Extract the public key from a leaf certificate's DER SPKI. CertFP/EXTERNAL
-/// target Ed25519 and ECDSA P-256 client certs; any other SPKI yields an error
-/// so the caller fails the possession proof rather than trusting an
-/// unverifiable cert.
-fn clientKeyFromCert(der: []const u8) Error!ClientLeafKey {
-    const cert = x509.parse(der) catch return error.BadHandshake;
+/// Extract a supported public key from DER SubjectPublicKeyInfo. Used for both
+/// X.509 client cert leaves and RFC 7250 raw-client-public-key certificates.
+fn clientKeyFromSpki(spki_der: []const u8) Error!ClientLeafKey {
+    var outer = x509.DerReader.init(spki_der);
+    const spki_seq = outer.readExpected(x509.Tag.sequence) catch return error.BadHandshake;
+    outer.expectEmpty() catch return error.BadHandshake;
     // SPKI value = SEQUENCE { AlgorithmIdentifier, BIT STRING { 0x00 ++ key } }.
-    var spki = x509.DerReader.init(cert.spki_value);
+    var spki = outer.child(spki_seq) catch return error.BadHandshake;
     const alg_seq = spki.readExpected(x509.Tag.sequence) catch return error.BadHandshake;
     const key_bits = spki.readExpected(x509.Tag.bit_string) catch return error.BadHandshake;
     spki.expectEmpty() catch return error.BadHandshake;
@@ -2625,6 +2662,15 @@ fn clientKeyFromCert(der: []const u8) Error!ClientLeafKey {
         return .{ .rsa = .{ .n = n, .e = e } };
     }
     return error.BadHandshake;
+}
+
+/// Extract the public key from a leaf certificate. CertFP/EXTERNAL target
+/// Ed25519, ECDSA P-256, and RSA client certs; any other SPKI yields an error
+/// so the caller fails the possession proof rather than trusting an
+/// unverifiable cert.
+fn clientKeyFromCert(der: []const u8) Error!ClientLeafKey {
+    const cert = x509.parse(der) catch return error.BadHandshake;
+    return clientKeyFromSpki(cert.spki_der);
 }
 
 /// A DER INTEGER's content as an unsigned big-endian magnitude: rejects a set
@@ -5999,6 +6045,71 @@ test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
     // The verified client leaf is exactly what was presented (CertFP source).
     const presented = server.clientCertDer() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, client_der, presented);
+}
+
+test "mTLS: RFC 7250 client raw public key completes and exposes SPKI identity" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const sign = @import("sign.zig");
+    const alloc = std.testing.allocator;
+
+    const s_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x34));
+    const c_seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(0x45));
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(s_seed);
+    const client_kp = try Ed25519.KeyPair.generateDeterministic(c_seed);
+    const client_sign = try sign.KeyPair.fromSeed(c_seed);
+
+    var server_cert_buf: [1024]u8 = undefined;
+    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x34, 0x01 },
+        .key_pair = server_kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var client_cert_buf: [1024]u8 = undefined;
+    const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x45, 0x01 },
+        .key_pair = client_kp,
+    });
+    const client_spki = (try x509.parse(client_der)).spki_der;
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{server_der},
+        .signing_key = server_kp,
+        .request_client_cert = true,
+        .enable_raw_public_key = true,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{server_der} });
+    defer client.deinit();
+    client.setClientRawPublicKeyForTest(client_spki, client_sign);
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cflight = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cflight);
+    try std.testing.expect(client.handshakeDone());
+
+    _ = try server.feed(cflight);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(server.client_cert_type_rpk);
+
+    const presented = server.clientCertDer() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, client_spki, presented);
 }
 
 test "mTLS: a declining client still completes with no client cert" {

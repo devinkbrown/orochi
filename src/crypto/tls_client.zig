@@ -467,11 +467,18 @@ pub const Client = struct {
     // the tls_server mTLS loopback tests, never by the production HTTPS path.
     /// Set true once the server's CertificateRequest is seen.
     cert_requested: bool = false,
+    /// RFC 7250: opt-in offer that this test client can present a raw public key
+    /// as its client certificate. Default false keeps ClientHello byte-identical.
+    offer_client_raw_public_key: bool = false,
+    /// Certificate type selected by the server's CertificateRequest. Defaults to
+    /// X.509 (absence of `client_certificate_type` means X.509).
+    client_cert_type: tls_extension.CertificateType = .x509,
     /// RFC 8879 diagnostic: set true when the server's certificate arrived as a
     /// CompressedCertificate that we inflated (rather than a plain Certificate).
     received_compressed_cert: bool = false,
-    /// Borrowed client leaf DER to present, or null to present an empty
-    /// Certificate (decline). Only meaningful when the server requested a cert.
+    /// Borrowed client certificate data to present, or null to present an empty
+    /// Certificate (decline). This is DER X.509 unless `client_cert_type` is
+    /// RawPublicKey, in which case it is DER SubjectPublicKeyInfo.
     client_cert_der: ?[]const u8 = null,
     /// Key pair matching `client_cert_der`'s SPKI, used to sign the client
     /// CertificateVerify (Ed25519 or ECDSA P-256).
@@ -846,6 +853,14 @@ pub const Client = struct {
     pub fn setClientCertForTest(self: *Client, der: []const u8, key_pair: sign.KeyPair) void {
         self.client_cert_der = der;
         self.client_key_pair = .{ .ed25519 = key_pair };
+    }
+
+    /// Test-only: present a bare DER SubjectPublicKeyInfo as the client
+    /// certificate when the server selects RFC 7250 RawPublicKey.
+    pub fn setClientRawPublicKeyForTest(self: *Client, spki_der: []const u8, key_pair: sign.KeyPair) void {
+        self.client_cert_der = spki_der;
+        self.client_key_pair = .{ .ed25519 = key_pair };
+        self.offer_client_raw_public_key = true;
     }
 
     /// Test-only: like `setClientCertForTest` but for an ECDSA P-256 client
@@ -1560,6 +1575,14 @@ pub const Client = struct {
             });
             try ext_builder.addTyped(.server_certificate_type, ct_body);
         }
+        if (self.offer_client_raw_public_key) {
+            var ct_buf: [8]u8 = undefined;
+            const ct_body = try tls_extension.buildCertTypeList(&ct_buf, &[_]tls_extension.CertificateType{
+                .raw_public_key,
+                .x509,
+            });
+            try ext_builder.addTyped(.client_certificate_type, ct_body);
+        }
 
         // RFC 9345 delegated_credential: a SignatureSchemeList naming the schemes
         // we accept for the DC's dc_cert_verify_algorithm (i.e. the schemes we can
@@ -1828,7 +1851,7 @@ pub const Client = struct {
                 // the server Certificate; the request itself stays in the
                 // transcript. Only the test-only mTLS path acts on it later.
                 if (msg.typ == .certificate_request) {
-                    try validateCertificateRequest(msg.body);
+                    self.client_cert_type = try validateCertificateRequest(msg.body, self.offer_client_raw_public_key);
                     self.cert_requested = true;
                     try self.appendTranscript(msg.raw);
                 } else if (msg.typ == .compressed_certificate) {
@@ -3044,7 +3067,7 @@ fn buildCertVerifyInput(out: *[cert_verify_input_max]u8, context: []const u8, tr
 /// signature_algorithms extension (the only mandatory one). Real clients
 /// (gnutls/openssl) enforce all of this, so the loopback client must too —
 /// otherwise server-side encoding bugs survive the round-trip tests.
-fn validateCertificateRequest(body: []const u8) Error!void {
+fn validateCertificateRequest(body: []const u8, offered_client_raw_public_key: bool) Error!tls_extension.CertificateType {
     if (body.len < 1) return error.BadHandshake;
     const ctx_len = body[0];
     if (ctx_len != 0) return error.BadHandshake; // MUST be empty outside post-handshake auth
@@ -3052,18 +3075,32 @@ fn validateCertificateRequest(body: []const u8) Error!void {
     const ext_body = tls_extension.unwrap(block) catch return error.BadHandshake;
     if (2 + ext_body.len != block.len) return error.BadHandshake; // trailing garbage
     var saw_signature_algorithms = false;
+    var cert_type: tls_extension.CertificateType = .x509;
     var it = tls_extension.Iterator.init(ext_body);
     while (it.next() catch return error.BadHandshake) |ext| {
-        if (ext.typed() != .signature_algorithms) continue;
-        // signature_algorithms data: 2-byte list length + even-sized,
-        // non-empty list of u16 schemes spanning the data exactly.
-        if (ext.data.len < 4) return error.BadHandshake;
-        const list_len = std.mem.readInt(u16, ext.data[0..2], .big);
-        if (list_len == 0 or list_len % 2 != 0) return error.BadHandshake;
-        if (2 + @as(usize, list_len) != ext.data.len) return error.BadHandshake;
-        saw_signature_algorithms = true;
+        switch (ext.typed()) {
+            .signature_algorithms => {
+                // signature_algorithms data: 2-byte list length + even-sized,
+                // non-empty list of u16 schemes spanning the data exactly.
+                if (ext.data.len < 4) return error.BadHandshake;
+                const list_len = std.mem.readInt(u16, ext.data[0..2], .big);
+                if (list_len == 0 or list_len % 2 != 0) return error.BadHandshake;
+                if (2 + @as(usize, list_len) != ext.data.len) return error.BadHandshake;
+                saw_signature_algorithms = true;
+            },
+            .client_certificate_type => {
+                const selected = try tls_extension.parseSelectedCertType(ext.data);
+                cert_type = switch (selected) {
+                    .x509 => .x509,
+                    .raw_public_key => if (offered_client_raw_public_key) .raw_public_key else return error.BadHandshake,
+                    else => return error.BadHandshake,
+                };
+            },
+            else => {},
+        }
     }
     if (!saw_signature_algorithms) return error.BadHandshake;
+    return cert_type;
 }
 
 fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.SignatureScheme, msg: []const u8, sig: []const u8) Error!void {
@@ -3982,7 +4019,15 @@ test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
         0x00, 0x0d, 0x00, 0x06, // signature_algorithms, data length 6
         0x00, 0x04, 0x08, 0x07, 0x04, 0x03, // list length 4: ed25519, ecdsa_p256
     };
-    try validateCertificateRequest(&good);
+    try std.testing.expectEqual(tls_extension.CertificateType.x509, try validateCertificateRequest(&good, false));
+
+    const raw_select = good ++ [_]u8{
+        0x00, 0x13, 0x00, 0x01, 0x02, // client_certificate_type = RawPublicKey
+    };
+    var raw = raw_select;
+    std.mem.writeInt(u16, raw[1..3], 15, .big);
+    try std.testing.expectEqual(tls_extension.CertificateType.raw_public_key, try validateCertificateRequest(&raw, true));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&raw, false));
 
     // The historical server bug: a second (doubled) extensions-length prefix.
     // Real clients reject this with "Invalid TLS extensions length field".
@@ -3996,19 +4041,19 @@ test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
         0x08, 0x07,
         0x04, 0x03,
     };
-    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&doubled));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&doubled, false));
 
     // A non-empty context is illegal in the main handshake.
     const nonempty_ctx = [_]u8{ 0x01, 0xaa, 0x00, 0x0a, 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x08, 0x07, 0x04, 0x03 };
-    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&nonempty_ctx));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&nonempty_ctx, false));
 
     // Missing the mandatory signature_algorithms extension.
     const no_sigalgs = [_]u8{ 0x00, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x00 };
-    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&no_sigalgs));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&no_sigalgs, false));
 
     // Extensions vector shorter than the remaining body (trailing garbage).
     const trailing = good ++ [_]u8{0x00};
-    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&trailing));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&trailing, false));
 
     // signature_algorithms list length disagreeing with the extension data.
     const bad_list = [_]u8{
@@ -4021,7 +4066,7 @@ test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
         0x06,
         0x00, 0x06, 0x08, 0x07, 0x04, 0x03, // claims 6 list bytes, has 4
     };
-    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&bad_list));
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&bad_list, false));
 }
 
 test "leaf RSA key survives the hs_plain consume (regression: copied, not borrowed)" {

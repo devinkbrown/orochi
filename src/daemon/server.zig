@@ -2171,8 +2171,9 @@ pub const ConnState = struct {
     /// parser, and outbound IRC lines are wrapped in text frames before the
     /// TLS seam. Heap-owned; freed in closeConn/deinit.
     ws: ?*WsState = null,
-    /// Stable backing for `session.tls_certfp` (the presented client cert's
-    /// lowercase-hex SHA-256), populated once the mTLS handshake completes.
+    /// Stable backing for `session.tls_certfp` (lowercase-hex SHA-256 of the
+    /// presented client cert, or raw SPKI when RFC 7250 mTLS RPK is negotiated),
+    /// populated once the mTLS handshake completes.
     certfp_buf: [certfp.fingerprint_len]u8 = undefined,
     /// Stable backing for `session.tls_exporter`, populated once the TLS 1.3
     /// handshake completes and the exporter is available.
