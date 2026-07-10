@@ -3825,6 +3825,7 @@ pub const LinuxServer = struct {
             const tags = MsgTags{
                 .time_value = serverTimeValue(&time_buf),
                 .account = null,
+                .client_tags = post.clientTags(),
                 .msgid = message_id,
                 .is_bot = true,
             };
@@ -3841,7 +3842,7 @@ pub const LinuxServer = struct {
                 .source_nick = nick,
                 .source_prefix = prefix,
                 .account = "",
-                .tags = "",
+                .tags = post.clientTags() orelse "",
                 .text = line,
                 .origin_node = self.config.node_id,
                 .hlc = hlc,
@@ -3851,7 +3852,7 @@ pub const LinuxServer = struct {
             self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
             _ = self.relayToPeers(relay_msg, .{ .channel = chan });
 
-            self.recordHistoryRelay(chan, prefix, message_id, "PRIVMSG", line, null);
+            self.recordHistoryRelay(chan, prefix, message_id, "PRIVMSG", line, post.clientTags());
         }
     }
 
@@ -31946,6 +31947,62 @@ test "webhook: a Discord POST is delivered to the bound channel as a bot integra
     // sanitised bot nick.
     try recvUntil(&c, "PRIVMSG #hooks :deploy ok", 400);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "CI-Bot!webhook@") != null);
+}
+
+test "webhook: Block-Kit-lite actions are delivered as IRCv3 client tags" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .webhook_enabled = true,
+        .webhook_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    server.start();
+    const wh = server.webhook_server orelse return error.SkipZigTest;
+    const webhook_port = wh.port;
+    const irc_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        server.wakeAllReactors();
+        if (connectLoopback(irc_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(irc_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "CAP REQ :message-tags\r\nNICK ann\r\nUSER a 0 * :A\r\nCAP END\r\n");
+    try recvUntil(&c, " 001 ann ", 200);
+    try writeAllFd(fd, "JOIN #hooks\r\n");
+    try recvUntil(&c, "JOIN #hooks", 200);
+
+    const idm: [webhook_mod.id_bytes]u8 = @splat(0x3a);
+    const tkm: [webhook_mod.token_bytes]u8 = @splat(0x4b);
+    const creds = try server.webhook_store.create("#hooks", "ci", "ann", 0, 0, server.webhookRate(), idm, tkm);
+
+    const body =
+        "{\"content\":\"deploy ok\",\"username\":\"CI Bot\",\"blocks\":[{\"type\":\"actions\",\"elements\":[" ++
+        "{\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"Open run\"},\"url\":\"https://ci.example/run/3\"}" ++
+        "]}]}";
+    var reqbuf: [1024]u8 = undefined;
+    const req = std.fmt.bufPrint(&reqbuf, "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n{s}", .{ creds.id, creds.token, body.len, body }) catch unreachable;
+    const hfd = connectLoopback(webhook_port) catch return error.SkipZigTest;
+    defer closeFd(hfd);
+    c.reset();
+    try writeAllFd(hfd, req);
+    var hc = LiveClient{ .fd = hfd };
+    try recvUntil(&hc, "204 No Content", 200);
+
+    try recvUntil(&c, "PRIVMSG #hooks :deploy ok", 400);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+orochi/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3") != null);
 }
 
 test "webhook: CREATE/LIST/DELETE gate on channel operator status" {

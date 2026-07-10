@@ -54,6 +54,8 @@ pub const max_creator: usize = 48;
 pub const max_nick: usize = 32;
 /// Max rendered body (all lines, joined by `\n`) carried inline in a post.
 pub const max_body_render: usize = 2048;
+/// Max IRCv3 client-only tag segment emitted for structured webhook metadata.
+pub const max_client_tags: usize = 192;
 
 /// Hard cap on total live bindings across the node.
 pub const max_bindings: usize = 512;
@@ -417,6 +419,9 @@ pub const PendingPost = struct {
     /// Sanitised body: one or more IRC message lines joined by a single `\n`.
     body_buf: [max_body_render]u8 = undefined,
     body_len: u16 = 0,
+    /// Sanitised client-only IRCv3 tags (no leading `@`), e.g. block actions.
+    client_tags_buf: [max_client_tags]u8 = undefined,
+    client_tags_len: u16 = 0,
 
     pub fn channel(self: *const PendingPost) []const u8 {
         return self.channel_buf[0..self.channel_len];
@@ -426,6 +431,10 @@ pub const PendingPost = struct {
     }
     pub fn body(self: *const PendingPost) []const u8 {
         return self.body_buf[0..self.body_len];
+    }
+    pub fn clientTags(self: *const PendingPost) ?[]const u8 {
+        if (self.client_tags_len == 0) return null;
+        return self.client_tags_buf[0..self.client_tags_len];
     }
 
     pub fn setChannel(self: *PendingPost, s: []const u8) void {

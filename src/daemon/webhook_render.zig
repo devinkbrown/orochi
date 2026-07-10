@@ -66,6 +66,7 @@ pub fn render(
     // --- Body lines -----------------------------------------------------
     // Accumulate sanitised lines joined by a single '\n' into the post body.
     var writer = LineWriter{ .buf = &post.body_buf };
+    var tag_writer = BlockTagWriter{ .buf = &post.client_tags_buf };
 
     if (strField(obj, "content")) |content| {
         appendMultiline(&writer, content);
@@ -82,7 +83,7 @@ pub fn render(
     }
 
     if (obj.get("blocks")) |blocks_val| {
-        renderBlocks(&writer, blocks_val);
+        renderBlocks(&writer, &tag_writer, blocks_val);
     }
 
     if (obj.get("components")) |components_val| {
@@ -91,6 +92,7 @@ pub fn render(
 
     if (writer.lines == 0) return error.EmptyPayload;
     post.body_len = @intCast(writer.len);
+    post.client_tags_len = @intCast(tag_writer.len);
 }
 
 /// Render one embed object into compact IRC lines: title, description, then
@@ -187,29 +189,29 @@ fn appendField(w: *LineWriter, name: []const u8, value: []const u8) void {
     }
 }
 
-fn renderBlocks(w: *LineWriter, blocks_val: std.json.Value) void {
+fn renderBlocks(w: *LineWriter, tags: *BlockTagWriter, blocks_val: std.json.Value) void {
     if (blocks_val != .array) return;
     for (blocks_val.array.items) |item| {
         if (w.lines >= max_lines) return;
         if (item != .object) continue;
-        renderBlock(w, item.object);
+        renderBlock(w, tags, item.object);
     }
 }
 
-fn renderBlock(w: *LineWriter, block: std.json.ObjectMap) void {
+fn renderBlock(w: *LineWriter, tags: *BlockTagWriter, block: std.json.ObjectMap) void {
     const kind = strField(block, "type") orelse return;
     if (std.mem.eql(u8, kind, "section")) {
-        renderBlockSection(w, block);
+        renderBlockSection(w, tags, block);
     } else if (std.mem.eql(u8, kind, "context")) {
         renderBlockContext(w, block);
     } else if (std.mem.eql(u8, kind, "actions")) {
-        renderBlockActions(w, block);
+        renderBlockActions(w, tags, block);
     } else if (std.mem.eql(u8, kind, "header")) {
         if (textField(block, "text")) |text| appendLabelled(w, "* ", text);
     }
 }
 
-fn renderBlockSection(w: *LineWriter, block: std.json.ObjectMap) void {
+fn renderBlockSection(w: *LineWriter, tags: *BlockTagWriter, block: std.json.ObjectMap) void {
     if (textField(block, "text")) |text| {
         appendMultiline(w, text);
     }
@@ -223,7 +225,7 @@ fn renderBlockSection(w: *LineWriter, block: std.json.ObjectMap) void {
         }
     }
     if (objectField(block, "accessory")) |accessory| {
-        renderBlockElement(w, accessory);
+        renderBlockElement(w, tags, accessory);
     }
 }
 
@@ -248,29 +250,29 @@ fn renderBlockContext(w: *LineWriter, block: std.json.ObjectMap) void {
     if (len != 0) w.addPrefixed("[context] ", joined[0..len]);
 }
 
-fn renderBlockActions(w: *LineWriter, block: std.json.ObjectMap) void {
+fn renderBlockActions(w: *LineWriter, tags: *BlockTagWriter, block: std.json.ObjectMap) void {
     const elements_val = block.get("elements") orelse return;
     if (elements_val != .array) return;
     for (elements_val.array.items) |element_val| {
         if (w.lines >= max_lines) return;
-        if (element_val == .object) renderBlockElement(w, element_val.object);
+        if (element_val == .object) renderBlockElement(w, tags, element_val.object);
     }
 }
 
-fn renderBlockElement(w: *LineWriter, element: std.json.ObjectMap) void {
+fn renderBlockElement(w: *LineWriter, tags: *BlockTagWriter, element: std.json.ObjectMap) void {
     const kind = strField(element, "type") orelse return;
     if (std.mem.eql(u8, kind, "button")) {
-        renderBlockButton(w, element);
+        renderBlockButton(w, tags, element);
     } else if (std.mem.eql(u8, kind, "static_select") or
         std.mem.eql(u8, kind, "multi_static_select") or
         std.mem.eql(u8, kind, "external_select") or
         std.mem.eql(u8, kind, "multi_external_select"))
     {
-        renderBlockSelect(w, element);
+        renderBlockSelect(w, tags, element);
     }
 }
 
-fn renderBlockButton(w: *LineWriter, button: std.json.ObjectMap) void {
+fn renderBlockButton(w: *LineWriter, tags: *BlockTagWriter, button: std.json.ObjectMap) void {
     const label = textField(button, "text") orelse strField(button, "action_id") orelse
         strField(button, "value") orelse return;
     var lbuf: [max_line]u8 = undefined;
@@ -286,12 +288,14 @@ fn renderBlockButton(w: *LineWriter, button: std.json.ObjectMap) void {
         else
             std.fmt.bufPrint(&joined, "{s} <{s}>", .{ clean_label, clean_url }) catch clean_label;
         w.addPrefixed("[button] ", line);
+        tags.addButton(clean_label, clean_url);
     } else {
         w.addPrefixed("[button] ", clean_label);
+        tags.addButton(clean_label, "");
     }
 }
 
-fn renderBlockSelect(w: *LineWriter, select: std.json.ObjectMap) void {
+fn renderBlockSelect(w: *LineWriter, tags: *BlockTagWriter, select: std.json.ObjectMap) void {
     const label = textField(select, "placeholder") orelse strField(select, "action_id") orelse "select";
     var lbuf: [max_line]u8 = undefined;
     const clean_label = sanitizeLine(label, &lbuf);
@@ -323,6 +327,7 @@ fn renderBlockSelect(w: *LineWriter, select: std.json.ObjectMap) void {
     else
         std.fmt.bufPrint(&joined, "{s}: {s}", .{ clean_label, options_buf[0..options_len] }) catch clean_label;
     w.addPrefixed("[select] ", line);
+    tags.addSelect(clean_label, options_buf[0..options_len]);
 }
 
 fn renderComponents(w: *LineWriter, components_val: std.json.Value) void {
@@ -430,6 +435,90 @@ const LineWriter = struct {
         self.lines += 1;
     }
 };
+
+const BlockTagWriter = struct {
+    buf: *[webhook.max_client_tags]u8,
+    len: usize = 0,
+    count: usize = 0,
+
+    fn addButton(self: *BlockTagWriter, label: []const u8, url: []const u8) void {
+        var tmp: [96]u8 = undefined;
+        var n: usize = 0;
+        appendSlice(&tmp, &n, "|b:") catch return;
+        appendEncoded(&tmp, &n, label) catch return;
+        if (url.len != 0) {
+            appendSlice(&tmp, &n, ",u:") catch return;
+            appendEncoded(&tmp, &n, url) catch return;
+        }
+        self.appendComponent(tmp[0..n]);
+    }
+
+    fn addSelect(self: *BlockTagWriter, label: []const u8, options: []const u8) void {
+        var tmp: [96]u8 = undefined;
+        var n: usize = 0;
+        appendSlice(&tmp, &n, "|s:") catch return;
+        appendEncoded(&tmp, &n, label) catch return;
+        if (options.len != 0) {
+            appendSlice(&tmp, &n, ",o:") catch return;
+            appendOptions(&tmp, &n, options) catch return;
+        }
+        self.appendComponent(tmp[0..n]);
+    }
+
+    fn appendComponent(self: *BlockTagWriter, component: []const u8) void {
+        if (self.count >= 8) return;
+        const prefix = "+orochi/block-kit=v1";
+        const prefix_len = if (self.len == 0) prefix.len else 0;
+        if (self.len + prefix_len + component.len > self.buf.len) return;
+        if (self.len == 0) {
+            @memcpy(self.buf[0..prefix.len], prefix);
+            self.len = prefix.len;
+        }
+        @memcpy(self.buf[self.len .. self.len + component.len], component);
+        self.len += component.len;
+        self.count += 1;
+    }
+};
+
+fn appendOptions(out: []u8, n: *usize, options: []const u8) error{NoSpaceLeft}!void {
+    var it = std.mem.splitSequence(u8, options, ", ");
+    var first = true;
+    while (it.next()) |opt| {
+        if (!first) try appendByte(out, n, '~');
+        try appendEncoded(out, n, opt);
+        first = false;
+    }
+}
+
+fn appendEncoded(out: []u8, n: *usize, raw: []const u8) error{NoSpaceLeft}!void {
+    const hex = "0123456789ABCDEF";
+    for (raw) |c| {
+        if (isTagSafe(c)) {
+            try appendByte(out, n, c);
+        } else {
+            try appendByte(out, n, '%');
+            try appendByte(out, n, hex[c >> 4]);
+            try appendByte(out, n, hex[c & 0x0f]);
+        }
+    }
+}
+
+fn isTagSafe(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '-' or c == '.' or c == '_' or c == '~';
+}
+
+fn appendSlice(out: []u8, n: *usize, bytes: []const u8) error{NoSpaceLeft}!void {
+    if (out.len - n.* < bytes.len) return error.NoSpaceLeft;
+    @memcpy(out[n.* .. n.* + bytes.len], bytes);
+    n.* += bytes.len;
+}
+
+fn appendByte(out: []u8, n: *usize, byte: u8) error{NoSpaceLeft}!void {
+    if (n.* == out.len) return error.NoSpaceLeft;
+    out[n.*] = byte;
+    n.* += 1;
+}
 
 // ---------------------------------------------------------------------------
 // Sanitisation
@@ -666,6 +755,10 @@ test "blocks render section context and action fallbacks" {
     try testing.expectEqualStrings("[button] Open run <https://ci.example/run/3>", it.next().?);
     try testing.expectEqualStrings("[select] Promote to: staging, prod", it.next().?);
     try testing.expect(it.next() == null);
+    try testing.expectEqualStrings(
+        "+orochi/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3|s:Promote%20to,o:staging~prod",
+        post.clientTags().?,
+    );
 }
 
 test "blocks sanitize interactive fallback text" {
@@ -677,8 +770,18 @@ test "blocks sanitize interactive fallback text" {
         "]}]}";
     try renderBody(body, &post);
     try testing.expectEqualStrings("[button] OpenPRIVMSG #x :bad <https://ok.example>", post.body());
+    try testing.expectEqualStrings(
+        "+orochi/block-kit=v1|b:OpenPRIVMSG%20%23x%20%3Abad,u:https%3A%2F%2Fok.example",
+        post.clientTags().?,
+    );
     try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\r') == null);
     try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\n') == null);
+}
+
+test "plain webhook payloads do not emit block-kit tags" {
+    var post: webhook.PendingPost = .{};
+    try renderBody("{\"content\":\"hi\"}", &post);
+    try testing.expect(post.clientTags() == null);
 }
 
 test "content plus embed both render" {
