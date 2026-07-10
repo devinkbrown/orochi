@@ -16566,8 +16566,14 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .s2s_link) continue;
             if (c.fields.len == 0) continue;
-            const snap = s2s_snapshot.decode(c.fields[0].bytes) catch |e| {
+            const snap = s2s_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 srvLog("orochi: UPGRADE resume — s2s link decode failed ({s})\n", .{@errorName(e)});
+                // The inherited socket fd lives ONLY inside the blob that failed to
+                // parse; recover it from the fixed leading field and close it so a
+                // decode failure drops the link cleanly instead of leaking the fd.
+                if (s2s_snapshot.peekFd(c.fields[0].bytes)) |leaked_fd| {
+                    if (leaked_fd >= 0) closeFd(leaked_fd);
+                }
                 continue;
             };
             if (snap.fd < 0) continue;

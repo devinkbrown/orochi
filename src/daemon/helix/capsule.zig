@@ -84,7 +84,10 @@ pub const registry = [_]Descriptor{
     .{ .kind = .veil_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .send_queue, .schema_id = 0x4853_4551, .current_version = 1, .min_supported = 1, .max_supported = 1 },
-    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07): `Established.serialize` gained a trailing `admitted_frame_families`
+    // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
+    // v1 capsules sealed by pre-bump binaries; `s2s_snapshot.decode` is version-aware.
+    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };

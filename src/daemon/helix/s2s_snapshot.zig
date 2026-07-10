@@ -22,6 +22,8 @@
 //!   [u8 role]            0 = initiator, 1 = responder (outer Tsumugi role)
 //!   [u8 s2s_initiator]   1 if THIS node dialed the link (collision resolution)
 //!   [N established]      Established.serialized_len bytes: record keys + peer id
+//!                        (schema v1 blobs are 4 bytes shorter here — they predate
+//!                         the trailing `admitted_frame_families`; see `decode`)
 //!   [u64 send_counter][u64 recv_counter][u64 feed_seq]
 //!   inner peer_link header:
 //!     [u64 local_epoch][u64 remote_epoch][u32 send_credit][u32 pending_credit]
@@ -39,9 +41,20 @@ const std = @import("std");
 const hs = @import("../../crypto/tsumugi_handshake.zig");
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 
-pub const Error = error{ Truncated, TooLong };
+pub const Error = error{ Truncated, TooLong, UnsupportedVersion };
 
 pub const est_len = hs.Established.serialized_len;
+
+/// Current `.s2s_link` capsule schema version whose blob layout `encode` writes.
+/// The blob carries no inline version — it rides the capsule header — so this
+/// MIRRORS the descriptor in `capsule.zig`; bump both together.
+pub const schema_version: u16 = 2;
+
+/// Length of the embedded `Established` blob in schema v1 capsules. v2 appended a
+/// trailing `admitted_frame_families` (u32) to `Established.serialize`, so a v1
+/// blob is exactly a v2 blob minus its last 4 bytes; legacy decode reconstructs
+/// `admitted_frame_families = 0` (the correct legacy/open default).
+pub const est_len_v1 = est_len - @sizeOf(u32);
 
 pub const cap_signing: u8 = s2s_frame.cap_frame_signing;
 pub const cap_account: u8 = s2s_frame.cap_member_account;
@@ -127,14 +140,34 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     return out.toOwnedSlice(allocator);
 }
 
-/// Decode a snapshot; byte-slice fields borrow `bytes`.
-pub fn decode(bytes: []const u8) Error!Snapshot {
+/// Decode a snapshot; byte-slice fields borrow `bytes`. `version` is the sealing
+/// capsule's schema version (`capsule.Header.version`). A v1 blob predates the
+/// trailing `admitted_frame_families` in the embedded `Established` region, so it
+/// is 4 bytes shorter there and decodes with `admitted_frame_families = 0`;
+/// because the field is appended at the END of `Established.serialize`, a v1 blob
+/// is byte-for-byte a v2 blob minus that trailing u32, so every FOLLOWING field
+/// still lands at its correct offset. Any version other than 1 or the current
+/// schema version is rejected fail-closed (a too-new blob may have grown the
+/// `Established` region again and cannot be parsed here).
+pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
     var r = Reader{ .buf = bytes };
     var snap = Snapshot{};
     snap.fd = try r.int(i32);
     snap.role = try r.byte();
     snap.s2s_initiator = (try r.byte()) != 0;
-    @memcpy(&snap.established, try r.take(est_len));
+    switch (version) {
+        1 => {
+            @memcpy(snap.established[0..est_len_v1], try r.take(est_len_v1));
+            @memset(snap.established[est_len_v1..], 0); // admitted_frame_families = 0
+        },
+        schema_version => @memcpy(&snap.established, try r.take(est_len)),
+        // Fail-closed: only v1 and the current schema are parseable here. MAINTENANCE
+        // TRAP — each future schema bump that keeps `min_supported = 1` in the capsule
+        // descriptor MUST add an explicit legacy arm above for EVERY still-accepted
+        // version (not just the newest), or that version's links silently drop across
+        // the upgrade (the exact field-shift bug this switch was introduced to fix).
+        else => return error.UnsupportedVersion,
+    }
     snap.send_counter = try r.int(u64);
     snap.recv_counter = try r.int(u64);
     snap.feed_seq = try r.int(u64);
@@ -156,6 +189,16 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     snap.rec_inbuf = try r.take(try r.int(u32));
     snap.pending_out = try r.take(try r.int(u32));
     return snap;
+}
+
+/// Best-effort recovery of the inherited socket fd from a snapshot blob whose
+/// full `decode` failed. The fd is always the fixed leading little-endian i32, so
+/// the adoption path can still `close()` it — a decode failure then drops the link
+/// cleanly instead of leaking the fd (the fd lives ONLY inside this blob). Returns
+/// null if the blob is too short to hold the fd.
+pub fn peekFd(bytes: []const u8) ?i32 {
+    if (bytes.len < @sizeOf(i32)) return null;
+    return std.mem.readInt(i32, bytes[0..@sizeOf(i32)], .little);
 }
 
 fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) std.mem.Allocator.Error!void {
@@ -220,7 +263,7 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
 
-    const got = try decode(bytes);
+    const got = try decode(bytes, schema_version);
     try testing.expectEqual(@as(i32, 41), got.fd);
     try testing.expectEqual(@as(u8, 1), got.role);
     try testing.expect(got.s2s_initiator);
@@ -242,5 +285,135 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
 }
 
 test "s2s link snapshot decode rejects truncation" {
-    try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }));
+    try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }, schema_version));
+}
+
+/// Byte offset of the embedded `Established` region: `fd`(i32) + `role`(u8) +
+/// `s2s_initiator`(u8). The trailing `admitted_frame_families`(u32) that v2 added
+/// lives at the END of that region.
+const est_field_off: usize = @sizeOf(i32) + 1 + 1;
+
+test "s2s link snapshot v2 round-trip preserves admitted_frame_families" {
+    const allocator = testing.allocator;
+    var snap = Snapshot{
+        .fd = 7,
+        .send_counter = 900,
+        .recv_counter = 800,
+        .caps = cap_signing,
+        .remote_name = "peer.example",
+        .rec_inbuf = "inbuf",
+        .pending_out = "pending",
+    };
+    // Fill the Established blob with a recognizable pattern and stamp a NON-ZERO
+    // admitted_frame_families into its trailing u32 (the v2-only field).
+    for (&snap.established, 0..) |*b, i| b.* = @truncate(i + 5);
+    std.mem.writeInt(u32, snap.established[est_len - 4 ..][0..4], 0x1122_3344, .little);
+
+    const bytes = try encode(allocator, snap);
+    defer allocator.free(bytes);
+
+    const got = try decode(bytes, schema_version);
+    try testing.expectEqualSlices(u8, &snap.established, &got.established);
+    try testing.expectEqual(
+        @as(u32, 0x1122_3344),
+        std.mem.readInt(u32, got.established[est_len - 4 ..][0..4], .little),
+    );
+    try testing.expectEqual(@as(u64, 900), got.send_counter);
+    try testing.expectEqual(@as(u64, 800), got.recv_counter);
+    try testing.expectEqualStrings("peer.example", got.remote_name);
+    try testing.expectEqualStrings("inbuf", got.rec_inbuf);
+    try testing.expectEqualStrings("pending", got.pending_out);
+}
+
+test "s2s link snapshot v1 blob decodes with admitted_frame_families=0 and all following fields intact" {
+    const allocator = testing.allocator;
+    var snap = Snapshot{
+        .fd = 33,
+        .role = 1,
+        .s2s_initiator = true,
+        .send_counter = 0xAABBCCDD_00112233,
+        .recv_counter = 0x0102030405060708,
+        .feed_seq = 4242,
+        .pl_local_epoch_ms = 111,
+        .pl_remote_epoch_ms = 222,
+        .pl_send_credit = 65000,
+        .pl_pending_credit = 4096,
+        .pl_next_out_seq = 91,
+        .pl_next_in_seq = 82,
+        .pl_last_acked = 73,
+        .remote_node_id = 0xFEEDFACECAFEBEEF,
+        .remote_epoch_ms = 3333,
+        .caps = cap_signing | cap_account | cap_repair,
+        .remote_name = "legacy.peer",
+        .connect_addr = &@as([28]u8, @splat('\x0b')),
+        .rec_inbuf = "half-record",
+        .pending_out = "queued-sealed",
+    };
+    // Give the Established region a distinct pattern and a non-zero trailing
+    // admitted_frame_families so we can prove v1 decode zeroes exactly it.
+    for (&snap.established, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    std.mem.writeInt(u32, snap.established[est_len - 4 ..][0..4], 0x7F00_00FF, .little);
+
+    // Encode at v2, then synthesize the v1 wire format by SPLICING OUT the trailing
+    // admitted_frame_families(u32) at the end of the Established region — exactly
+    // what a pre-bump binary would have produced.
+    const v2 = try encode(allocator, snap);
+    defer allocator.free(v2);
+    const cut_at = est_field_off + est_len - 4;
+    var v1: std.ArrayList(u8) = .empty;
+    defer v1.deinit(allocator);
+    try v1.appendSlice(allocator, v2[0..cut_at]);
+    try v1.appendSlice(allocator, v2[cut_at + 4 ..]);
+    try testing.expectEqual(v2.len - 4, v1.items.len);
+
+    const got = try decode(v1.items, 1);
+
+    // The Established prefix (everything before admitted_frame_families) survives
+    // verbatim; the trailing u32 is reconstructed as the legacy/open default 0.
+    try testing.expectEqualSlices(u8, snap.established[0..est_len_v1], got.established[0..est_len_v1]);
+    try testing.expectEqual(
+        @as(u32, 0),
+        std.mem.readInt(u32, got.established[est_len - 4 ..][0..4], .little),
+    );
+
+    // Every field FOLLOWING the Established region must land at its correct offset.
+    try testing.expectEqual(@as(i32, 33), got.fd);
+    try testing.expectEqual(@as(u8, 1), got.role);
+    try testing.expect(got.s2s_initiator);
+    try testing.expectEqual(@as(u64, 0xAABBCCDD_00112233), got.send_counter);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), got.recv_counter);
+    try testing.expectEqual(@as(u64, 4242), got.feed_seq);
+    try testing.expectEqual(@as(u64, 111), got.pl_local_epoch_ms);
+    try testing.expectEqual(@as(u64, 222), got.pl_remote_epoch_ms);
+    try testing.expectEqual(@as(u32, 65000), got.pl_send_credit);
+    try testing.expectEqual(@as(u32, 4096), got.pl_pending_credit);
+    try testing.expectEqual(@as(u64, 91), got.pl_next_out_seq);
+    try testing.expectEqual(@as(u64, 82), got.pl_next_in_seq);
+    try testing.expectEqual(@as(u64, 73), got.pl_last_acked);
+    try testing.expectEqual(@as(u64, 0xFEEDFACECAFEBEEF), got.remote_node_id);
+    try testing.expectEqual(@as(u64, 3333), got.remote_epoch_ms);
+    try testing.expectEqual(cap_signing | cap_account | cap_repair, got.caps);
+    try testing.expectEqualStrings("legacy.peer", got.remote_name);
+    try testing.expectEqualStrings(&@as([28]u8, @splat('\x0b')), got.connect_addr);
+    try testing.expectEqualStrings("half-record", got.rec_inbuf);
+    try testing.expectEqualStrings("queued-sealed", got.pending_out);
+}
+
+test "s2s link snapshot decode rejects an unknown too-new version fail-closed" {
+    const allocator = testing.allocator;
+    var snap = Snapshot{ .fd = 5 };
+    for (&snap.established, 0..) |*b, i| b.* = @truncate(i);
+    const bytes = try encode(allocator, snap);
+    defer allocator.free(bytes);
+    try testing.expectError(error.UnsupportedVersion, decode(bytes, schema_version + 1));
+}
+
+test "peekFd recovers the leading fd even from an otherwise-unparseable blob" {
+    // A blob far too short to decode still yields its fd for cleanup.
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &buf, 49, .little);
+    try testing.expectEqual(@as(?i32, 49), peekFd(&buf));
+    try testing.expectError(error.Truncated, decode(&buf, schema_version));
+    // Too short to even hold the fd → null (no bogus close).
+    try testing.expectEqual(@as(?i32, null), peekFd(&[_]u8{ 1, 2, 3 }));
 }
