@@ -21059,10 +21059,27 @@ pub const LinuxServer = struct {
         return self.relayToPeers(relay_msg, .{ .channel = channel }) > 0;
     }
 
+    fn clonePublicChannelProps(self: *LinuxServer, src: []const u8, dst: []const u8) void {
+        const src_entity = ircx_prop_store.Entity{ .kind = .channel, .id = src };
+        const dst_entity = ircx_prop_store.Entity{ .kind = .channel, .id = dst };
+        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = self.props.listProps(src_entity, &views) catch return;
+        for (rows) |entry| {
+            const ev = self.props.setProp(dst_entity, entry.key, entry.value, .{ .id = entry.owner, .access = entry.access }) catch continue;
+            const hlc = self.nextChannelPropHlc();
+            var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+            var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+            const ps = self.signLocalChannelProp(true, ev.entity.id, ev.key, ev.value, ev.owner, hlc, &pk_buf, &sig_buf);
+            if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) {
+                self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
+            }
+        }
+    }
+
     /// CREATE <channel> [modes] [clone-source] — IRCX channel creation
     /// (create-or-join as founder). Delegates to the JOIN path after parsing the
     /// IRCX form. With a clone source, the source channel's channel-level modes
-    /// are copied onto the new channel (Ophion CREATE template-clone) before the
+    /// and portable room metadata are copied onto the new channel before the
     /// requested `modes` are applied on top as an override.
     pub fn handleCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const req = ircx_create_cmd.parseParams(parsed.paramSlice()) catch {
@@ -21090,6 +21107,7 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_CHANNELEXIST, &.{req.channel}, "Channel already exists");
                 return;
             }
+            self.clonePublicChannelProps(source, req.channel);
             // Seat the creator as founder of the just-cloned (empty) channel before
             // joinOne so it skips the join gates — the channel now carries the
             // template's modes (which could be +i/+k) but the creator owns it.
@@ -44104,9 +44122,22 @@ test "threaded server: CREATE clones template modes and rejects bad sources" {
     a.reset();
     try writeAllFd(fd_a, "CREATE #tmpl +nt\r\n");
     try recvUntil(&a, " 366 A #tmpl ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TOPIC #tmpl :portable topic\r\n");
+    try recvUntil(&a, "TOPIC #tmpl :portable topic", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #tmpl +b Bad!*@*\r\n");
+    try recvUntil(&a, "MODE #tmpl +b Bad!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #tmpl SUBJECT :zig room\r\n");
+    try recvUntil(&a, " 818 A #tmpl SUBJECT :zig room", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #tmpl OWNERKEY :do-not-clone\r\n");
+    try recvUntil(&a, " 818 A #tmpl OWNERKEY :do-not-clone", 200);
 
     // Clone the template into #cl, overriding with +s on top of the inherited
-    // modes. The new channel must carry the template's +nt plus the +s override.
+    // modes. The new channel must carry the template's +nt, portable public
+    // channel metadata, plus the +s override.
     a.reset();
     try writeAllFd(fd_a, "CREATE #cl +s #tmpl\r\n");
     try recvUntil(&a, " 366 A #cl ", 200);
@@ -44115,6 +44146,20 @@ test "threaded server: CREATE clones template modes and rejects bad sources" {
     // Inherited +nt from the template, +s override on top, and +E (the IRCX
     // clone marker cloneChannel stamps on every clone target).
     try recvUntil(&a, " 324 A #cl +ntsE ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TOPIC #cl\r\n");
+    try recvUntil(&a, " 332 A #cl :portable topic", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #cl +b\r\n");
+    try recvUntil(&a, " 367 A #cl Bad!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #cl SUBJECT\r\n");
+    try recvUntil(&a, " 818 A #cl SUBJECT :zig room", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #cl OWNERKEY\r\n");
+    try recvUntil(&a, " 819 A #cl ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "do-not-clone") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 818 ") == null);
 
     // Cloning into an existing target is rejected with ERR_CHANNELEXIST (926).
     a.reset();

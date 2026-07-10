@@ -284,6 +284,12 @@ pub const ListEntry = struct {
     }
 };
 
+fn deinitListEntries(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(ListEntry)) void {
+    for (list.items) |*entry| entry.deinit(allocator);
+    list.deinit(allocator);
+    list.* = .empty;
+}
+
 pub const TopicInfo = struct {
     text: []const u8,
     setter: []const u8,
@@ -801,10 +807,24 @@ pub const World = struct {
         return channel.oid;
     }
 
-    /// IRCX CLONE: create `dst` as a clone of template channel `src`, copying the
-    /// channel-level modes, limit, key, and ext flags (template-copy scope) and
-    /// marking the new channel `+E` (clone) but not `+d` (a clone is not itself a
-    /// cloneable template, so clones never recurse). Membership/topic/bans are NOT
+    fn cloneListEntries(self: *World, src: []const ListEntry) WorldError!std.ArrayListUnmanaged(ListEntry) {
+        var out: std.ArrayListUnmanaged(ListEntry) = .empty;
+        errdefer deinitListEntries(self.allocator, &out);
+        for (src) |entry| {
+            var copy = try ListEntry.init(self.allocator, entry.mask, entry.setter, entry.set_at);
+            out.append(self.allocator, copy) catch |err| {
+                copy.deinit(self.allocator);
+                return err;
+            };
+        }
+        return out;
+    }
+
+    /// IRCX CLONE: create `dst` as a portable room/template clone of `src`,
+    /// copying channel-level modes, limit/key/forward/throttle configuration,
+    /// topic metadata, list-mode masks, and ext flags, while marking the new
+    /// channel `+E` (clone) but not `+d` (a clone is not itself a cloneable
+    /// template, so clones never recurse). Membership and pending invites are not
     /// copied — the clone starts empty with a fresh OID. Returns false if `dst`
     /// already exists; `error.NoSuchChannel` if `src` does not.
     pub fn cloneChannel(self: *World, src: []const u8, dst: []const u8) WorldError!bool {
@@ -818,19 +838,46 @@ pub const World = struct {
         const limit = tmpl.limit;
         const private = tmpl.private;
         const hidden = tmpl.hidden;
+        const throttle_joins = tmpl.throttle_joins;
+        const throttle_secs = tmpl.throttle_secs;
         var ext = tmpl.ext_modes;
         const key_copy: ?[]u8 = if (tmpl.key) |k| try self.allocator.dupe(u8, k) else null;
         errdefer if (key_copy) |k| self.allocator.free(k);
+        const forward_copy: ?[]u8 = if (tmpl.forward) |f| try self.allocator.dupe(u8, f) else null;
+        errdefer if (forward_copy) |f| self.allocator.free(f);
+        const topic_copy: ?[]u8 = if (tmpl.topic) |t| try self.allocator.dupe(u8, t) else null;
+        errdefer if (topic_copy) |t| self.allocator.free(t);
+        const topic_setter_copy: ?[]u8 = if (tmpl.topic_setter) |s| try self.allocator.dupe(u8, s) else null;
+        errdefer if (topic_setter_copy) |s| self.allocator.free(s);
+        const topic_time = tmpl.topic_time;
+        var bans_copy = try self.cloneListEntries(tmpl.bans.items);
+        errdefer deinitListEntries(self.allocator, &bans_copy);
+        var exempts_copy = try self.cloneListEntries(tmpl.exempts.items);
+        errdefer deinitListEntries(self.allocator, &exempts_copy);
+        var invex_copy = try self.cloneListEntries(tmpl.invex.items);
+        errdefer deinitListEntries(self.allocator, &invex_copy);
+        var mutes_copy = try self.cloneListEntries(tmpl.mutes.items);
+        errdefer deinitListEntries(self.allocator, &mutes_copy);
 
         const clone = try self.ensureChannel(dst);
         clone.modes = modes;
         clone.limit = limit;
         clone.private = private;
         clone.hidden = hidden;
+        clone.throttle_joins = throttle_joins;
+        clone.throttle_secs = throttle_secs;
         ext.set(.clone);
         ext.clear(.cloneable);
         clone.ext_modes = ext;
         clone.key = key_copy;
+        clone.forward = forward_copy;
+        clone.topic = topic_copy;
+        clone.topic_setter = topic_setter_copy;
+        clone.topic_time = topic_time;
+        clone.bans = bans_copy;
+        clone.exempts = exempts_copy;
+        clone.invex = invex_copy;
+        clone.mutes = mutes_copy;
         return true;
     }
 
@@ -1678,7 +1725,7 @@ test "channels receive monotonic, stable, unique IRCX object ids" {
     try std.testing.expect(world.channelOid("#nope") == null);
 }
 
-test "cloneChannel copies modes/limit/key and marks the clone +E with a fresh OID" {
+test "cloneChannel copies portable room template state and marks the clone +E with a fresh OID" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();
 
@@ -1687,14 +1734,36 @@ test "cloneChannel copies modes/limit/key and marks the clone +E with a fresh OI
     try std.testing.expect(try world.setChannelFlag("#tmpl", .moderated, true));
     try world.setChannelLimit("#tmpl", 42);
     try world.setChannelKey("#tmpl", "sekret");
+    try world.setForward("#tmpl", "#overflow");
+    try world.setThrottle("#tmpl", 3, 10);
+    try world.setTopic("#tmpl", "portable topic", "A!alice@localhost", 1234);
+    try std.testing.expect(try world.addBan("#tmpl", "bad!*@*", "setter", 1));
+    try std.testing.expect(try world.addExempt("#tmpl", "bad!vip@*", "setter", 2));
+    try std.testing.expect(try world.addInvex("#tmpl", "friend!*@*", "setter", 3));
+    try std.testing.expect(try world.addMute("#tmpl", "loud!*@*", "setter", 4));
     try std.testing.expect(try world.setChannelExtFlag("#tmpl", .cloneable, true));
     const tmpl_oid = world.channelOid("#tmpl").?;
 
     try std.testing.expect(try world.cloneChannel("#tmpl", "#tmpl1"));
 
-    // Modes/limit/key copied; clone is +E and not +d; OID is distinct; empty.
+    // Template state copied; clone is +E and not +d; OID is distinct; membership empty.
     try std.testing.expect(world.channelHasFlag("#tmpl1", .moderated));
     try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#tmpl1"));
+    try std.testing.expectEqualStrings("#overflow", world.forwardOf("#tmpl1").?);
+    try std.testing.expectEqual(@as(u16, 3), world.throttleOf("#tmpl1").?.joins);
+    try std.testing.expectEqual(@as(u32, 10), world.throttleOf("#tmpl1").?.secs);
+    const topic = world.topicInfo("#tmpl1").?;
+    try std.testing.expectEqualStrings("portable topic", topic.text);
+    try std.testing.expectEqualStrings("A!alice@localhost", topic.setter);
+    try std.testing.expectEqual(@as(i64, 1234), topic.set_at);
+    try std.testing.expectEqual(@as(usize, 1), world.bansOf("#tmpl1").?.len);
+    try std.testing.expectEqualStrings("bad!*@*", world.bansOf("#tmpl1").?[0].mask);
+    try std.testing.expectEqual(@as(usize, 1), world.exemptsOf("#tmpl1").?.len);
+    try std.testing.expectEqualStrings("bad!vip@*", world.exemptsOf("#tmpl1").?[0].mask);
+    try std.testing.expectEqual(@as(usize, 1), world.invexOf("#tmpl1").?.len);
+    try std.testing.expectEqualStrings("friend!*@*", world.invexOf("#tmpl1").?[0].mask);
+    try std.testing.expectEqual(@as(usize, 1), world.mutesOf("#tmpl1").?.len);
+    try std.testing.expectEqualStrings("loud!*@*", world.mutesOf("#tmpl1").?[0].mask);
     try std.testing.expect(world.channelHasExtFlag("#tmpl1", .clone));
     try std.testing.expect(!world.channelHasExtFlag("#tmpl1", .cloneable));
     try std.testing.expect(world.channelOid("#tmpl1").? != tmpl_oid);
