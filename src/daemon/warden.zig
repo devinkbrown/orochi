@@ -16,10 +16,12 @@
 //!              (refuse / expel / quarantine / require_auth)
 //!
 //! A subject presents its `Facets` at the checkpoint; `check` returns the first
-//! active Ward that matches. Address matching understands IPv4 CIDR; every other
-//! facet uses case-insensitive globbing. Pure: owns all strings, performs no I/O.
+//! active Ward that matches. Address matching understands IPv4 and IPv6 CIDR
+//! (family-distinct); every other facet — and a bare/wildcard address pattern —
+//! uses case-insensitive globbing. Pure: owns all strings, performs no I/O.
 
 const std = @import("std");
+const cidr = @import("../proto/cidr.zig");
 
 /// Which identity facet a Ward's pattern is tested against.
 pub const Match = enum {
@@ -424,13 +426,18 @@ pub fn decodeWire(bytes: []const u8) WireError!WireWard {
     };
 }
 
-/// Match a facet value against a Ward pattern. `.address` understands IPv4 CIDR
-/// (falling back to glob); all other facets use case-insensitive globbing.
+/// Match a facet value against a Ward pattern. An `.address` pattern that
+/// contains a `/` is an IPv4 **or** IPv6 CIDR network; every other facet — and a
+/// bare or wildcard address pattern such as `192.0.2.*` (no `/`) — uses
+/// case-insensitive globbing. CIDR matching is family-distinct: a v4 network
+/// never matches a v6 address and vice-versa, so a range ban cannot be dodged by
+/// address family. A malformed CIDR, or a value that is not an IP of the same
+/// family, fails closed on this axis (it is never literal-globbed against the
+/// CIDR text).
 pub fn matchValue(match: Match, pattern: []const u8, value: []const u8) bool {
-    if (match == .address) {
-        if (parseCidr(pattern)) |cidr| {
-            if (parseIpv4(value)) |addr| return cidr.contains(addr);
-        }
+    if (match == .address and std.mem.indexOfScalar(u8, pattern, '/') != null) {
+        const network = cidr.Cidr.parse(pattern) catch return false;
+        return network.containsText(value) catch false;
     }
     return globMatch(pattern, value);
 }
@@ -459,43 +466,6 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
     return p == pattern.len;
 }
 
-const Ipv4Cidr = struct {
-    addr: u32,
-    prefix_bits: u6,
-    fn contains(self: Ipv4Cidr, addr: u32) bool {
-        if (self.prefix_bits == 0) return true;
-        const shift: u5 = @intCast(32 - self.prefix_bits);
-        const mask: u32 = @as(u32, std.math.maxInt(u32)) << shift;
-        return (self.addr & mask) == (addr & mask);
-    }
-};
-
-fn parseCidr(bytes: []const u8) ?Ipv4Cidr {
-    const slash = std.mem.indexOfScalar(u8, bytes, '/') orelse return null;
-    if (std.mem.indexOfScalar(u8, bytes[slash + 1 ..], '/') != null) return null;
-    const addr = parseIpv4(bytes[0..slash]) orelse return null;
-    const prefix_int = std.fmt.parseInt(u8, bytes[slash + 1 ..], 10) catch return null;
-    if (prefix_int > 32) return null;
-    return .{ .addr = addr, .prefix_bits = @intCast(prefix_int) };
-}
-
-fn parseIpv4(bytes: []const u8) ?u32 {
-    var parts: [4]u8 = undefined;
-    var count: usize = 0;
-    var start: usize = 0;
-    while (start <= bytes.len) {
-        if (count == parts.len) return null;
-        const end = std.mem.indexOfScalarPos(u8, bytes, start, '.') orelse bytes.len;
-        if (end == start) return null;
-        parts[count] = std.fmt.parseInt(u8, bytes[start..end], 10) catch return null;
-        count += 1;
-        if (end == bytes.len) break;
-        start = end + 1;
-    }
-    if (count != parts.len) return null;
-    return (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | @as(u32, parts[3]);
-}
-
 // ── tests ────────────────────────────────────────────────────────────────
 
 fn mkWard(match: Match, pattern: []const u8, action: Action) Ward {
@@ -522,6 +492,61 @@ test "address ward matches ipv4 cidr; mask ward globs" {
     try std.testing.expect(reg.check(.{ .address = "192.0.3.50" }, 200) == null);
     const hit = reg.check(.{ .mask = "bob!~b@host.evil.example" }, 200).?;
     try std.testing.expectEqual(Action.expel, hit.action);
+}
+
+test "address ward matches ipv6 cidr; family-distinct from ipv4" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    // Insertion order matters: the v6 ward is checked first, then the v4 ward.
+    try reg.add(mkWard(.address, "2001:db8::/32", .refuse));
+    try reg.add(mkWard(.address, "10.0.0.0/8", .expel));
+
+    // An in-range IPv6 address (compressed + full) hits the v6 ward.
+    const hit = reg.check(.{ .address = "2001:db8:dead:beef::1" }, 0).?;
+    try std.testing.expectEqual(Action.refuse, hit.action);
+    // An out-of-range IPv6 address matches nothing.
+    try std.testing.expect(reg.check(.{ .address = "2001:dead::1" }, 0) == null);
+    // A v4 address falls through the v6 ward (family-distinct) to the v4 ward.
+    try std.testing.expectEqual(Action.expel, reg.check(.{ .address = "10.1.2.3" }, 0).?.action);
+    // A v6 loopback matches neither the v6 range nor the v4 range.
+    try std.testing.expect(reg.check(.{ .address = "::1" }, 0) == null);
+}
+
+test "matchValue: ipv6 cidr, family-distinctness, and glob fallthrough" {
+    // IPv6 CIDR, in and out of range.
+    try std.testing.expect(matchValue(.address, "2001:db8::/32", "2001:db8::1"));
+    try std.testing.expect(!matchValue(.address, "2001:db8::/32", "2001:db9::1"));
+    // A v4 CIDR never matches a v6 value, and a v6 CIDR never matches a v4 value.
+    try std.testing.expect(!matchValue(.address, "192.0.2.0/24", "2001:db8::1"));
+    try std.testing.expect(!matchValue(.address, "2001:db8::/32", "192.0.2.1"));
+    // A malformed CIDR fails closed (it is not literal-globbed against the value).
+    try std.testing.expect(!matchValue(.address, "192.0.2.0/99", "192.0.2.5"));
+    // A bare / wildcard address pattern has no '/', so it still globs unchanged.
+    try std.testing.expect(matchValue(.address, "192.0.2.*", "192.0.2.55"));
+    try std.testing.expect(matchValue(.address, "192.0.2.50", "192.0.2.50"));
+    try std.testing.expect(!matchValue(.address, "192.0.2.50", "192.0.2.51"));
+    // IPv4 CIDR still works exactly as before.
+    try std.testing.expect(matchValue(.address, "192.0.2.0/24", "192.0.2.99"));
+    try std.testing.expect(!matchValue(.address, "192.0.2.0/24", "192.0.3.1"));
+    // A non-address facet ignores CIDR entirely and globs.
+    try std.testing.expect(matchValue(.host, "*.bad", "x.bad"));
+}
+
+test "mesh ward wire round-trips an ipv6 cidr pattern" {
+    var buf: [max_wire_len]u8 = undefined;
+    const w = WireWard{
+        .op = .add,
+        .match = .address,
+        .pattern = "2001:db8::/32",
+        .action = .refuse,
+        .reason = "range ban",
+        .set_by = "oper",
+        .created_ms = 7,
+        .expires_ms = 0,
+    };
+    const back = try decodeWire(try encodeWire(w, &buf));
+    try std.testing.expectEqual(Match.address, back.match);
+    try std.testing.expectEqualStrings("2001:db8::/32", back.pattern);
 }
 
 test "country ward matches the GeoIP country facet case-insensitively" {
