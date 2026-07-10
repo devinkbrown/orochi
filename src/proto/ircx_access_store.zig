@@ -172,7 +172,12 @@ const Entry = struct {
     level: Level,
     mask: []u8,
     set_by: []u8,
+    /// Original requested timeout in seconds, echoed verbatim in ACCESS replies
+    /// (kept for wire-display stability). A value of 0 or null means permanent.
     duration: ?u64,
+    /// Absolute expiry as wall-clock unix seconds; null when the entry never
+    /// expires. Derived from `duration` and the store clock at add time.
+    expires_at: ?u64,
 
     fn view(self: *const Entry) EntryView {
         return .{
@@ -185,10 +190,22 @@ const Entry = struct {
     }
 };
 
+/// Absolute expiry for `duration` relative to `now` (wall-clock seconds). A
+/// null or zero duration is permanent (no expiry). Saturating add avoids wrap.
+fn computeExpiry(now: u64, duration: ?u64) ?u64 {
+    const d = duration orelse return null;
+    if (d == 0) return null;
+    return now +| d;
+}
+
 pub const AccessStore = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
     max_entries: usize = DEFAULT_MAX_ENTRIES,
+    /// Current wall-clock unix seconds, refreshed by the daemon before store
+    /// reads/writes (see `handleAccess`/`onTimerTick`). Defaults to 0 so
+    /// clock-agnostic callers/tests see timed entries as always-live.
+    now_seconds: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) AccessStore {
         return .{ .allocator = allocator };
@@ -196,6 +213,31 @@ pub const AccessStore = struct {
 
     pub fn initWith(allocator: std.mem.Allocator, max_entries: usize) AccessStore {
         return .{ .allocator = allocator, .max_entries = max_entries };
+    }
+
+    /// True when `entry` carries an expiry that the store clock has passed.
+    fn isExpired(self: *const AccessStore, entry: Entry) bool {
+        const at = entry.expires_at orelse return false;
+        return self.now_seconds >= at;
+    }
+
+    /// Drop every entry whose timeout has elapsed against the store clock,
+    /// returning how many were removed. Called by the daemon on its timer tick;
+    /// reads (`matchHostmask`/`list`) already skip expired entries, so this is a
+    /// bounded-memory reclaim, not a correctness dependency.
+    pub fn pruneExpired(self: *AccessStore) usize {
+        var removed_count: usize = 0;
+        var idx: usize = 0;
+        while (idx < self.entries.items.len) {
+            if (self.isExpired(self.entries.items[idx])) {
+                const removed = self.entries.swapRemove(idx);
+                freeEntry(self.allocator, removed);
+                removed_count += 1;
+            } else {
+                idx += 1;
+            }
+        }
+        return removed_count;
     }
 
     pub fn deinit(self: *AccessStore) void {
@@ -221,6 +263,7 @@ pub const AccessStore = struct {
             self.allocator.free(self.entries.items[idx].set_by);
             self.entries.items[idx].set_by = set_by_copy;
             self.entries.items[idx].duration = duration;
+            self.entries.items[idx].expires_at = computeExpiry(self.now_seconds, duration);
             return;
         }
 
@@ -239,6 +282,7 @@ pub const AccessStore = struct {
             .mask = mask_copy,
             .set_by = set_by_copy,
             .duration = duration,
+            .expires_at = computeExpiry(self.now_seconds, duration),
         });
     }
 
@@ -278,6 +322,7 @@ pub const AccessStore = struct {
 
         var count: usize = 0;
         for (self.entries.items) |*entry| {
+            if (self.isExpired(entry.*)) continue;
             if (!selector.matches(entry.*)) continue;
             if (count >= out.len) return error.OutputTooSmall;
             out[count] = entry.view();
@@ -292,6 +337,7 @@ pub const AccessStore = struct {
 
         var best: ?*const Entry = null;
         for (self.entries.items) |*entry| {
+            if (self.isExpired(entry.*)) continue;
             if (!std.ascii.eqlIgnoreCase(entry.channel, channel)) continue;
             if (!listx.globMatch(entry.mask, hostmask)) continue;
             if (best == null or entry.level.precedence() > best.?.level.precedence()) {
@@ -754,6 +800,81 @@ test "list remove clear and reply builders" {
         ":irc.example.test 802 dan #zig HOST b!*@host.test :ACCESS entry deleted\r\n",
         try buildAccessDelete(&buf, ctx, .{ .channel = "#zig", .level = .host, .mask = "b!*@host.test" }),
     );
+}
+
+test "ACCESS timed entry stops matching once its timeout elapses" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    store.now_seconds = 1000;
+    // 50s DENY added at t=1000 expires at t=1050.
+    try store.add("#zig", .deny, "bad!*@evil.test", "oper", 50);
+
+    // Still live at t=1049.
+    store.now_seconds = 1049;
+    try std.testing.expect((try store.matchHostmask("#zig", "bad!u@evil.test")) != null);
+    var views: [4]EntryView = undefined;
+    try std.testing.expectEqual(@as(usize, 1), (try store.list("#zig", &views)).len);
+
+    // Exactly at expiry (>=) it is gone from every read path.
+    store.now_seconds = 1050;
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#zig", "bad!u@evil.test"));
+    try std.testing.expectEqual(@as(usize, 0), (try store.list("#zig", &views)).len);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try store.listMatching(.{ .channel = "#zig", .level = .deny }, &views)).len,
+    );
+}
+
+test "ACCESS permanent entries never expire regardless of the clock" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    store.now_seconds = 500;
+    try store.add("#zig", .owner, "boss!*@corp.test", "oper", null); // null == permanent
+    try store.add("#zig", .voice, "reg!*@corp.test", "oper", 0); // 0 == permanent
+
+    store.now_seconds = std.math.maxInt(u64);
+    var views: [4]EntryView = undefined;
+    try std.testing.expectEqual(@as(usize, 2), (try store.list("#zig", &views)).len);
+    try std.testing.expect((try store.matchHostmask("#zig", "boss!u@corp.test")) != null);
+    try std.testing.expectEqual(@as(usize, 0), store.pruneExpired());
+}
+
+test "ACCESS pruneExpired reclaims only lapsed entries" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    store.now_seconds = 100;
+    try store.add("#zig", .deny, "a!*@h.test", "oper", 10); // expires 110
+    try store.add("#zig", .host, "b!*@h.test", "oper", null); // permanent
+    try store.add("#zig", .voice, "c!*@h.test", "oper", 1000); // expires 1100
+
+    store.now_seconds = 200; // only the 10s entry has lapsed
+    try std.testing.expectEqual(@as(usize, 1), store.pruneExpired());
+
+    var views: [4]EntryView = undefined;
+    const rows = try store.list("#zig", &views);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expect(!try store.remove("#zig", .deny, "a!*@h.test")); // already reclaimed
+    try std.testing.expect(try store.remove("#zig", .host, "b!*@h.test"));
+}
+
+test "ACCESS re-add refreshes an expired entry's timeout" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    store.now_seconds = 100;
+    try store.add("#zig", .deny, "x!*@h.test", "oper", 10); // expires 110
+
+    store.now_seconds = 200; // lapsed but not yet pruned
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#zig", "x!u@h.test"));
+
+    // Re-adding the same mask must revive it with a fresh window (no duplicate).
+    try store.add("#zig", .deny, "x!*@h.test", "oper", 50); // expires 250
+    var views: [4]EntryView = undefined;
+    try std.testing.expectEqual(@as(usize, 1), (try store.list("#zig", &views)).len);
+    try std.testing.expect((try store.matchHostmask("#zig", "x!u@h.test")) != null);
 }
 
 test "validation and bounded outputs" {

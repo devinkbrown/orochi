@@ -4554,6 +4554,11 @@ pub const LinuxServer = struct {
             _ = self.login_throttle.sweep(self.nowMs());
         }
         self.sweepTempModes();
+        // Keep the IRCX ACCESS store clock current on every reactor (a JOIN
+        // gate may match on any shard) so timed ACCESS entries expire; reclaim
+        // lapsed entries on reactor 0 under the same world lock as other sweeps.
+        self.access.now_seconds = self.accessNowSeconds();
+        if (self.rx() == &self.reactors[0]) _ = self.access.pruneExpired();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         self.sweepMeshAutoConnect(false);
@@ -5866,6 +5871,14 @@ pub const LinuxServer = struct {
     /// Monotonic ms as a non-negative u64 (the reputation table's clock type).
     fn nowU64(self: *const LinuxServer) u64 {
         return @intCast(@max(0, self.nowMs()));
+    }
+
+    /// Wall-clock unix SECONDS for the IRCX ACCESS timeout domain. ACCESS
+    /// timeouts are relative seconds, so the store compares against wall-clock
+    /// seconds (same domain as LISTX C/T age filters); sourced through the
+    /// reactor so deterministic simulation controls it.
+    fn accessNowSeconds(self: *const LinuxServer) u64 {
+        return self.meshWallMs() / 1000;
     }
 
     /// Wall-clock (Unix-epoch) ms — the physical base for the cross-mesh HLC.
@@ -19502,6 +19515,9 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCESS"}, "Invalid ACCESS");
             return;
         };
+        // Refresh the store clock so ADD stamps a correct absolute expiry and
+        // LIST/CLEAR see currently-lapsed timed entries as gone.
+        self.access.now_seconds = self.accessNowSeconds();
         const ctx = ircx_access_store.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var buf: [default_reply_bytes]u8 = undefined;
         switch (req) {
