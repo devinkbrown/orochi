@@ -11,7 +11,7 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `server-time` | none | Enables server-time tags. | `src/daemon/dispatch.zig:293` |
 | `message-tags` | none | Negotiable generic message tags. | `src/daemon/dispatch.zig:294` |
 | `echo-message` | none | Echo sent messages to sender. | `src/daemon/dispatch.zig:295` |
-| `sasl` | `PLAIN,EXTERNAL,SCRAM-SHA-256` | Live `AUTHENTICATE` routes PLAIN, EXTERNAL, and SCRAM-SHA-256 through the mech router; unconfigured checkers fail closed. | `src/daemon/dispatch.zig:298`, `src/daemon/dispatch.zig:1367` |
+| `sasl` | `PLAIN,EXTERNAL,SCRAM-SHA-256,SCRAM-SHA-512` | Live `AUTHENTICATE` routes PLAIN, EXTERNAL, SCRAM-SHA-256, and SCRAM-SHA-512 through the mech router; unconfigured checkers fail closed. | `src/daemon/dispatch.zig` (`sasl`, `writeSaslCapValue`) |
 | `multi-prefix` | none | Multi-prefix NAMES/WHOIS behavior. | `src/daemon/dispatch.zig:299` |
 | `userhost-in-names` | none | Adds userhost detail to NAMES for capable clients. | `src/daemon/dispatch.zig:300` |
 | `away-notify` | none | Away state notifications. | `src/daemon/dispatch.zig:301` |
@@ -22,9 +22,12 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `orochi/session-sync` | none | Orochi vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
 | `orochi/bouncer` | none | Orochi vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
 | `orochi/topics` | none | Orochi vendor cap for named conversations: clients can receive `+orochi/topic=<label>` without generic `message-tags`, and discover topic-filtered CHATHISTORY. | `src/daemon/dispatch.zig` (`orochi_topics`) |
+| `orochi/e2ee` | none | Orochi vendor cap for the `+orochi/e2ee` client tag used by encrypted-room policy. | `src/daemon/dispatch.zig` (`orochi_e2ee`) |
 | `chghost` | none | Receive CHGHOST lines for common-user host changes. | `src/daemon/dispatch.zig:316` |
 | `no-implicit-names` | none | Suppress automatic NAMES burst on JOIN for capable clients. | `src/daemon/dispatch.zig:319` |
+| `draft/no-implicit-names` | none | Draft spelling for the same negotiated capability as `no-implicit-names`; ACK echoes the requested token. | `src/daemon/dispatch.zig` (`no_implicit_names`) |
 | `draft/chathistory` | none | CHATHISTORY command and chathistory BATCH replies. | `src/daemon/dispatch.zig:331` |
+| `draft/search` | none | SEARCH command over the bounded CHATHISTORY inverted index. | `src/daemon/dispatch.zig` (`search`), `src/daemon/server.zig` (`handleSearch`) |
 | `draft/message-redaction` | none | REDACT command. | `src/daemon/dispatch.zig:332` |
 | `draft/message-editing` | none | EDIT command. | `src/daemon/dispatch.zig:333` |
 | `draft/read-marker` | none | MARKREAD command. | `src/daemon/dispatch.zig:334` |
@@ -46,6 +49,10 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `draft/channel-context` | none | Relays client-only channel-context tags. | `src/daemon/dispatch.zig:371` |
 | `draft/multiline` | `max-bytes=<ircv3.multiline_max_bytes>,max-lines=<ircv3.multiline_max_lines>` | Accepts inbound multiline BATCH chunks and reassembles them within enforced limits. Defaults are `40000` bytes and `64` lines. | `src/daemon/dispatch.zig`, `src/daemon/server.zig` |
 | `sts` | runtime policy value | Config-gated; omitted unless a live STS policy is enabled for the session. | `src/daemon/dispatch.zig:383`, `src/daemon/dispatch.zig:504` |
+| `account-extban` | `a` | Discovers account extban support; the same value is advertised in ISUPPORT `ACCOUNTEXTBAN`. | `src/daemon/dispatch.zig` (`account_extban`), `src/proto/isupport.zig` |
+| `utf8-only` | none | Discovers the server's strict UTF-8 enforcement and `UTF8ONLY` ISUPPORT token. | `src/daemon/dispatch.zig` (`utf8_only`), `src/proto/utf8_only.zig` |
+| `draft/netsplit` | none | Discovers IRCv3 netsplit BATCH support for mesh peer drops. | `src/daemon/dispatch.zig` (`netsplit`), `src/proto/netsplit_batch.zig` |
+| `draft/netjoin` | none | Discovers IRCv3 netjoin BATCH support for mesh peer roster bursts. | `src/daemon/dispatch.zig` (`netjoin`), `src/proto/netsplit_batch.zig` |
 
 ## Negotiation behavior
 
@@ -58,4 +65,4 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 
 ## Vendor caps
 
-The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync`, `orochi/bouncer`, and `orochi/topics`. No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.
+The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync`, `orochi/bouncer`, `orochi/topics`, and `orochi/e2ee`. No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.
