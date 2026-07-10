@@ -96,6 +96,10 @@ pub const Established = struct {
     peer_node_key: sign.PublicKey,
     accepted_bands: u128,
     accepted_features: u128,
+    /// MeshPass frame-family rights admitted for this peer. Zero means the peer
+    /// was not admitted by a signed MeshPass token and no token-scoped runtime
+    /// frame-family policy applies on this link.
+    admitted_frame_families: u32 = 0,
 
     pub fn deinit(self: *Established) void {
         self.root_key.wipe();
@@ -108,7 +112,7 @@ pub const Established = struct {
         32 + 32 + 32 + // root_key, send_key, recv_key
         @sizeOf(Nonce96) + @sizeOf(Nonce96) + // send_nonce, recv_nonce
         @sizeOf(NodeId) + 32 + // peer_node_id, peer_node_key
-        16 + 16; // accepted_bands, accepted_features (u128 each)
+        16 + 16 + 4; // accepted_bands, accepted_features (u128 each), admitted_frame_families
 
     /// Serialize the post-AKE directional secrets + peer identity into `out`
     /// (must be `serialized_len`). Used ONLY by the Helix s2s-link capsule to
@@ -133,6 +137,8 @@ pub const Established = struct {
         p += 16;
         std.mem.writeInt(u128, out[p..][0..16], self.accepted_features, .little);
         p += 16;
+        std.mem.writeInt(u32, out[p..][0..4], self.admitted_frame_families, .little);
+        p += 4;
         std.debug.assert(p == serialized_len);
     }
 
@@ -158,6 +164,8 @@ pub const Established = struct {
         p += 16;
         const features = std.mem.readInt(u128, in[p..][0..16], .little);
         p += 16;
+        const admitted_frame_families = std.mem.readInt(u32, in[p..][0..4], .little);
+        p += 4;
         return .{
             .root_key = RootKey.init(root),
             .send_key = ChainKey.init(send_k),
@@ -168,6 +176,7 @@ pub const Established = struct {
             .peer_node_key = peer_key,
             .accepted_bands = bands,
             .accepted_features = features,
+            .admitted_frame_families = admitted_frame_families,
         };
     }
 
@@ -353,7 +362,7 @@ pub const Initiator = struct {
         if (!try sign.verifyCtx(m2_sig_domain, &sig_digest, body.sig, body.node_key)) return error.BadSignature;
 
         self.state = .established;
-        return deriveEstablished(.initiator, &first, &second, self.m1_wire, bytes, body.node_id, body.node_key, body.accepted_bands, body.accepted_features);
+        return deriveEstablished(.initiator, &first, &second, self.m1_wire, bytes, body.node_id, body.node_key, body.accepted_bands, body.accepted_features, 0);
     }
 
     fn buildM1Payload(self: *Initiator, prefix: []const u8) Error![]u8 {
@@ -428,13 +437,14 @@ pub const Responder = struct {
         // mode: the encrypted M1 bytes must be a signed token for the peer's
         // authenticated node key, with enough frame-family authority to run S2S.
         // Without signer roots, keep the existing shared-secret gate.
-        if (self.cfg.meshpass_roots.len != 0) {
-            try verifyMeshPassToken(self.cfg.meshpass_roots, self.cfg.now_ms, body.mesh_pass, body.node_key);
+        const admitted_frame_families: u32 = if (self.cfg.meshpass_roots.len != 0) blk: {
+            const fields = try verifyMeshPassToken(self.cfg.meshpass_roots, self.cfg.now_ms, body.mesh_pass, body.node_key);
+            break :blk fields.allowed_frame_families;
         } else if (self.cfg.mesh_pass.len != 0 and
             !constantTimeEqlBytes(body.mesh_pass, self.cfg.mesh_pass))
         {
             return error.MeshPassMismatch;
-        }
+        } else 0;
 
         self.state = .m1_recv;
         var enc2 = try xwing.encapsulate(body.prekey.public_key, rng);
@@ -461,7 +471,7 @@ pub const Responder = struct {
         try out.appendSlice(self.allocator, sealed);
         const wire = try out.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(wire);
-        self.established = try deriveEstablished(.responder, &first, &enc2.shared, bytes, wire, body.node_id, body.node_key, expected_bands, expected_features);
+        self.established = try deriveEstablished(.responder, &first, &enc2.shared, bytes, wire, body.node_id, body.node_key, expected_bands, expected_features, admitted_frame_families);
         self.state = .m2_sent;
         return wire;
     }
@@ -539,7 +549,7 @@ fn updateInt(comptime T: type, h: *Blake3, value: T) void {
     h.update(&b);
 }
 
-fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *const xwing.SharedSecret, m1: []const u8, m2: []const u8, peer: NodeId, peer_key: sign.PublicKey, bands: u128, features: u128) Error!Established {
+fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *const xwing.SharedSecret, m1: []const u8, m2: []const u8, peer: NodeId, peer_key: sign.PublicKey, bands: u128, features: u128, admitted_frame_families: u32) Error!Established {
     var hs: [32]u8 = undefined;
     var h = Blake3.init(.{});
     h.update("MZ-TSUMUGI-XWING-IK-v1");
@@ -561,8 +571,8 @@ fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *cons
     try Hkdf.expand(&root, "s2c nonce gen0", &s2c_nonce);
 
     return switch (role) {
-        .initiator => .{ .root_key = root, .send_key = ChainKey.init(c2s_key), .recv_key = ChainKey.init(s2c_key), .send_nonce = c2s_nonce, .recv_nonce = s2c_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features },
-        .responder => .{ .root_key = root, .send_key = ChainKey.init(s2c_key), .recv_key = ChainKey.init(c2s_key), .send_nonce = s2c_nonce, .recv_nonce = c2s_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features },
+        .initiator => .{ .root_key = root, .send_key = ChainKey.init(c2s_key), .recv_key = ChainKey.init(s2c_key), .send_nonce = c2s_nonce, .recv_nonce = s2c_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features, .admitted_frame_families = admitted_frame_families },
+        .responder => .{ .root_key = root, .send_key = ChainKey.init(s2c_key), .recv_key = ChainKey.init(c2s_key), .send_nonce = s2c_nonce, .recv_nonce = c2s_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features, .admitted_frame_families = admitted_frame_families },
     };
 }
 
@@ -815,14 +825,14 @@ fn verifyMeshPassToken(
     now_ms: u64,
     token_bytes: []const u8,
     peer_node_key: sign.PublicKey,
-) Error!void {
+) Error!meshpass.Fields {
     if (token_bytes.len == 0) return error.MeshPassTokenMissing;
     const token = meshpass.decode(token_bytes) catch return error.MeshPassTokenInvalid;
-    const required = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi });
+    const required = meshpass.frameFamilies(&.{ .control, .sync, .tsumugi });
     for (roots) |root| {
         const fields = meshpass.bindDecodedToken(token, root, now_ms, peer_node_key, required) catch continue;
         if (!meshpass.hasRole(fields, .relay)) return error.MeshPassTokenInvalid;
-        return;
+        return fields;
     }
     return error.MeshPassTokenInvalid;
 }
@@ -1106,6 +1116,42 @@ test "signed MeshPass token admits a peer bound to the initiator node key" {
     const roots = [_]meshpass.TrustRoot{.{ .public_key = issuer.public_key.toBytes(), .realm = "local" }};
 
     try meshPassTokenHandshakeResult(std.testing.allocator, &fx, token_bytes, &roots, 0x4444);
+}
+
+test "signed MeshPass transport token establishes and carries runtime frame-family rights" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    const issuer = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x65)));
+    const admitted = meshpass.frameFamilies(&.{ .control, .sync, .tsumugi });
+    const token = try meshpass.issue(issuer, .{
+        .node_pubkey = fx.i_node.public_key,
+        .realm = "local",
+        .roles = meshpass.roles(&.{.relay}),
+        .issued_ms = 10,
+        .expiry_ms = 100,
+        .allowed_frame_families = admitted,
+        .max_fanout = 8,
+    });
+    var token_buf: [meshpass.max_token_len]u8 = undefined;
+    const token_bytes = token_buf[0..try meshpass.encode(&token_buf, token)];
+    const roots = [_]meshpass.TrustRoot{.{ .public_key = issuer.public_key.toBytes(), .realm = "local" }};
+
+    var rng = DeterministicIo{ .s = 0x4545 };
+    var cfg_i = fx.cfg_i;
+    cfg_i.mesh_pass = token_bytes;
+    var cfg_r = fx.cfg_r;
+    cfg_r.meshpass_roots = &roots;
+
+    var initr = Initiator.init(std.testing.allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, cfg_i);
+    defer initr.deinit();
+    var respr = Responder.init(std.testing.allocator, &fx.r_node, fx.r_pre, &fx.r_kem.secret_key, cfg_r);
+    defer respr.deinit();
+
+    const m1 = try initr.start(rng.io());
+    defer std.testing.allocator.free(m1);
+    const m2 = try respr.recv(m1, rng.io());
+    defer std.testing.allocator.free(m2);
+    try std.testing.expectEqual(admitted, respr.established.?.admitted_frame_families);
 }
 
 test "signed MeshPass admission requires a token when roots are configured" {

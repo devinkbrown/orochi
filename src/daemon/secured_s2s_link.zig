@@ -266,6 +266,7 @@ pub const SecuredLink = struct {
             .config = self.inner_config,
             .now_ms = rs.now_ms,
             .signing_key = self.identity.sign_kp,
+            .admitted_frame_families = rs.established.admitted_frame_families,
         }, rs.inner, rs.remote_name, rs.rng_seed);
         self.inner = link;
         return self;
@@ -861,6 +862,7 @@ pub const SecuredLink = struct {
             // holds. The inner peer takes an independent copy and wipes it on
             // deinit; `self.identity.sign_kp` is unaffected.
             .signing_key = self.identity.sign_kp,
+            .admitted_frame_families = self.establishedKeys().admitted_frame_families,
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         self.inner = link;

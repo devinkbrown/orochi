@@ -26,6 +26,7 @@ const s2s_frame = @import("../proto/s2s_frame.zig");
 const sign = @import("../crypto/sign.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
+const meshpass = @import("../proto/meshpass.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -60,6 +61,9 @@ pub const Options = struct {
     /// origin — the secured link guarantees this by deriving both from the same
     /// identity.
     signing_key: ?sign.KeyPair = null,
+    /// Signed MeshPass frame-family rights admitted for the remote peer. Zero
+    /// preserves open/shared-secret behavior.
+    admitted_frame_families: u32 = 0,
 };
 
 pub const S2sLink = struct {
@@ -116,6 +120,7 @@ pub const S2sLink = struct {
             .initial_send_credit = opts.config.link.peer_link_config.send_credit,
             .config = opts.config,
             .signing_key = opts.signing_key,
+            .admitted_frame_families = opts.admitted_frame_families,
         });
     }
 
@@ -211,6 +216,7 @@ pub const S2sLink = struct {
             .initial_send_credit = opts.config.link.peer_link_config.send_credit,
             .config = opts.config,
             .signing_key = opts.signing_key,
+            .admitted_frame_families = opts.admitted_frame_families,
         }, hdr, remote_name, opts.now_ms, rng_seed);
     }
 
@@ -1238,6 +1244,49 @@ test "OPER_GRANT payload round-trips across the link into takeOperGrants" {
     const empty = try b.takeOperGrants();
     defer allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "MeshPass admitted frame families drop app frames while sync still flows" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "b.orochi",
+        .admitted_frame_families = meshpass.frameFamilies(&.{ .control, .sync }),
+    });
+    defer b.deinit();
+
+    try a.start(10);
+    try pumpLinks(&a, &b, allocator, 11);
+    try std.testing.expect(a.established());
+    try std.testing.expect(b.established());
+
+    try a.sendMembership("#chat", "alice", 0, 100, true, .{ .username = "alice", .realname = "Alice", .host = "host.a" }, "");
+    try pumpLinks(&a, &b, allocator, 20);
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*d| d.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("alice", changes[0].nick);
+
+    try a.sendOperGrant("signed-oper-grant-bytes");
+    try pumpLinks(&a, &b, allocator, 30);
+    const grants = try b.takeOperGrants();
+    defer {
+        for (grants) |g| allocator.free(g);
+        allocator.free(grants);
+    }
+    try std.testing.expectEqual(@as(usize, 0), grants.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }
 
 test "consumeOutbound drops a partial-send prefix" {

@@ -69,6 +69,7 @@ const cap_member_oper_info: u8 = s2s_frame.cap_member_oper_info;
 const cap_repair_frames: u8 = s2s_frame.cap_repair_frames;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
+const meshpass = @import("../../proto/meshpass.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
 const observe_event = @import("../../proto/observe_event.zig");
@@ -152,6 +153,10 @@ pub const Options = struct {
     /// (i.e. `shortId(nodeIdFromPublicKey(pubkey))`). The secured link guarantees
     /// this by deriving `local_node_id` from the same identity it signs with.
     signing_key: ?sign.KeyPair = null,
+    /// Signed MeshPass frame-family rights admitted for the remote peer. Zero
+    /// means this link was not admitted by a signed MeshPass token, preserving
+    /// legacy/open/shared-secret behavior.
+    admitted_frame_families: u32 = 0,
 };
 
 const Handshake = struct {
@@ -197,6 +202,10 @@ pub const S2sPeer = struct {
     /// legacy unsigned (plaintext) path. When set, in-scope outbound frames are
     /// wrapped in a `signed_frame` envelope iff the peer advertised signing.
     signing_key: ?sign.KeyPair = null,
+    /// Signed MeshPass frame-family rights admitted for the remote peer. Zero
+    /// means this link was not admitted by a signed MeshPass token, preserving
+    /// legacy/open/shared-secret behavior.
+    admitted_frame_families: u32 = 0,
     /// Whether the remote peer advertised the `frame_signing` capability in its
     /// handshake. Learned on `recvHandshake`; gates both outbound wrapping (only
     /// wrap for a signing-capable peer) and inbound enforcement (a signing-capable
@@ -215,6 +224,9 @@ pub const S2sPeer = struct {
     /// Gated because these are newer S2S frame tags; older peers keep relying on
     /// the daemon's coarse full-state re-burst fallback.
     peer_supports_repair: bool = false,
+    /// Frames dropped because the peer's signed MeshPass token did not authorize
+    /// the frame catalog family at runtime.
+    rejected_admission_frames: u64 = 0,
     /// In-scope frames rejected because their signed-envelope verification failed
     /// or the self-certified origin did not match the claimed origin. Folded into
     /// the same audit drain as `rejected_origin_frames` (see `acceptsDirectOrigin`).
@@ -333,6 +345,7 @@ pub const S2sPeer = struct {
             .channel_name = channel_name,
             .config = options.config,
             .signing_key = options.signing_key,
+            .admitted_frame_families = options.admitted_frame_families,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
         };
     }
@@ -452,6 +465,7 @@ pub const S2sPeer = struct {
             .peer_supports_repair = hdr.peer_supports_repair,
             .config = options.config,
             .signing_key = options.signing_key,
+            .admitted_frame_families = options.admitted_frame_families,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
         };
     }
@@ -647,6 +661,10 @@ pub const S2sPeer = struct {
     }
 
     fn dispatch(self: *S2sPeer, frame: s2s_frame.Frame, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {
+        if (!self.meshPassAllowsFrame(frame.frame_type)) {
+            self.rejected_admission_frames +|= 1;
+            return;
+        }
         switch (frame.frame_type) {
             .HANDSHAKE => try self.recvHandshake(frame.payload, sink, now_ms, rng_seed),
             .BURST => try burst.apply(self.allocator, self.state, frame.payload, self.config.link.burst_limits),
@@ -1174,10 +1192,29 @@ pub const S2sPeer = struct {
     /// the daemon's existing audit drain surfaces every rejected direct-owned
     /// frame regardless of which gate dropped it.
     pub fn takeRejectedOriginFrames(self: *S2sPeer) u64 {
-        const n = self.rejected_origin_frames +| self.rejected_signature_frames;
+        const n = self.rejected_origin_frames +| self.rejected_signature_frames +| self.rejected_admission_frames;
         self.rejected_origin_frames = 0;
         self.rejected_signature_frames = 0;
+        self.rejected_admission_frames = 0;
         return n;
+    }
+
+    fn meshPassAllowsFrame(self: *const S2sPeer, frame_type: s2s_frame.FrameType) bool {
+        if (self.admitted_frame_families == 0) return true;
+        const family = meshPassFamilyForFrame(frame_type);
+        return (self.admitted_frame_families & meshpassFrameFamilyBit(family)) != 0;
+    }
+
+    fn meshPassFamilyForFrame(frame_type: s2s_frame.FrameType) meshpass.FrameFamily {
+        return switch (s2s_frame.frameSpec(frame_type).family) {
+            .handshake, .control => .control,
+            .crdt, .membership, .repair => .sync,
+            .relay, .oper, .notification => .irc_app,
+        };
+    }
+
+    fn meshpassFrameFamilyBit(family: meshpass.FrameFamily) u32 {
+        return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(family)));
     }
 
     fn acceptsDirectOrigin(self: *S2sPeer, origin_node: NodeId) bool {
