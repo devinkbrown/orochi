@@ -16320,9 +16320,18 @@ pub const LinuxServer = struct {
             // Use a separate write index: a channel whose member modes can't be
             // read is skipped entirely, never leaving an undefined slot inside the
             // serialized range (which would encode garbage into the snapshot).
-            var chan_names: [64][]const u8 = undefined;
-            const nch = self.world.channelsOf(worldIdFromClient(e.id), &chan_names);
-            var chans: [64]session_snapshot.ChannelMembership = undefined;
+            const chan_cap = self.world.channelCountOf(worldIdFromClient(e.id));
+            const chan_names = self.allocator.alloc([]const u8, chan_cap) catch {
+                if (tls_blob) |tb| self.allocator.free(tb);
+                continue;
+            };
+            defer self.allocator.free(chan_names);
+            const nch = self.world.channelsOf(worldIdFromClient(e.id), chan_names);
+            const chans = self.allocator.alloc(session_snapshot.ChannelMembership, nch) catch {
+                if (tls_blob) |tb| self.allocator.free(tb);
+                continue;
+            };
+            defer self.allocator.free(chans);
             var chan_n: usize = 0;
             for (chan_names[0..nch]) |cname| {
                 const m = self.world.memberModes(cname, worldIdFromClient(e.id)) orelse continue;
@@ -25069,10 +25078,13 @@ pub const LinuxServer = struct {
     }
 
     fn encodeMigrationSnapshot(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) ?[]u8 {
-        var chan_buf: [64][]const u8 = undefined;
-        var chan_mode_buf: [64]u8 = undefined;
+        const chan_cap = self.world.channelCountOf(worldIdFromClient(id));
+        const chan_buf = self.allocator.alloc([]const u8, chan_cap) catch return null;
+        defer self.allocator.free(chan_buf);
+        const chan_mode_buf = self.allocator.alloc(u8, chan_cap) catch return null;
+        defer self.allocator.free(chan_mode_buf);
         var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
-        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], chan_mode_buf[0..], umode_buf[0..]);
+        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf, chan_mode_buf, umode_buf[0..]);
         return snapshot.encode(self.allocator) catch null;
     }
 
@@ -25092,10 +25104,13 @@ pub const LinuxServer = struct {
     ) void {
         const kp = self.migrationKeypair() orelse return;
 
-        var chan_buf: [64][]const u8 = undefined;
-        var chan_mode_buf: [64]u8 = undefined;
+        const chan_cap = self.world.channelCountOf(worldIdFromClient(id));
+        const chan_buf = self.allocator.alloc([]const u8, chan_cap) catch return;
+        defer self.allocator.free(chan_buf);
+        const chan_mode_buf = self.allocator.alloc(u8, chan_cap) catch return;
+        defer self.allocator.free(chan_mode_buf);
         var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
-        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], chan_mode_buf[0..], umode_buf[0..]);
+        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf, chan_mode_buf, umode_buf[0..]);
 
         // Lend the persistent origin policy/journal to a transient MigrationOrigin
         // so replay/stale-epoch state survives across capsules without re-deriving
@@ -35443,7 +35458,9 @@ test "threaded server: login auto-restores detached nick and all channels before
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+    var cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services };
+    cfg.chanlimit = 96;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -35472,6 +35489,16 @@ test "threaded server: login auto-restores detached nick and all channels before
     try recvUntil(&a, " 366 trev #root ", 200);
     try recvUntil(&a, " 366 trev #ops ", 200);
     try recvUntil(&a, " 366 trev #dev ", 200);
+    a.reset();
+    var join_line: [64]u8 = undefined;
+    var join_reply: [64]u8 = undefined;
+    for (0..67) |i| {
+        const line = try std.fmt.bufPrint(&join_line, "JOIN #r{d:0>2}\r\n", .{i});
+        try writeAllFd(fd_a, line);
+        const reply = try std.fmt.bufPrint(&join_reply, " 366 trev #r{d:0>2} ", .{i});
+        try recvUntil(&a, reply, 200);
+        a.reset();
+    }
 
     closeFd(fd_a);
     fd_a_open = false;
@@ -35481,7 +35508,7 @@ test "threaded server: login auto-restores detached nick and all channels before
     defer closeFd(fd_b);
     var b = LiveClient{ .fd = fd_b };
 
-    try writeAllFd(fd_b, "NICK TempResume\r\nUSER webchat 0 * :Webchat\r\n");
+    try writeAllFd(fd_b, "CAP REQ :no-implicit-names\r\nNICK TempResume\r\nUSER webchat 0 * :Webchat\r\nCAP END\r\n");
     try recvUntil(&b, " 001 TempResume ", 200);
     b.reset();
     try writeAllFd(fd_b, "IDENTIFY trev correcthorse\r\n");
@@ -35490,6 +35517,7 @@ test "threaded server: login auto-restores detached nick and all channels before
     try recvUntil(&b, "JOIN #root", 200);
     try recvUntil(&b, "JOIN #ops", 200);
     try recvUntil(&b, "JOIN #dev", 200);
+    try recvUntil(&b, "JOIN #r66", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), ":TempResume!webchat@localhost JOIN") == null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "Guest") == null);
 
