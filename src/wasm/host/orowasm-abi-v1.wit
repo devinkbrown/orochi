@@ -27,8 +27,14 @@ interface host {
   net-connect: func(host: string, port: u16) -> result<u32, string>;
 }
 
+interface intents {
+  // intent import name: message_content
+  // gate: message-content
+}
+
 world plugin-v1 {
   import host;
+  import intents;
 
   // Exports named cmd_<command> register IRC commands.
   // Exports named hook_<hook> register daemon hooks.

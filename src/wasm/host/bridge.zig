@@ -37,6 +37,7 @@ pub const RuntimeInfo = struct {
     manifest_schema: abi.SchemaVersion,
     host_function_count: usize,
     allowed_caps: abi.CapabilitySet,
+    allowed_intents: abi.IntentSet,
     registry_pin_count: usize,
     signed_registry_pin_count: usize,
     revoked_hash_count: usize,
@@ -84,6 +85,7 @@ pub const Options = struct {
     max_memory_bytes: usize = default_max_memory_bytes,
     default_fuel: u64 = default_fuel,
     allowed_caps: abi.CapabilitySet = default_allowed_caps,
+    allowed_intents: abi.IntentSet = .empty,
     registry: []const RegistryPin = &.{},
     revoked_hashes: []const [std.crypto.hash.Blake3.digest_length]u8 = &.{},
     disabled_plugins: []const []const u8 = &.{},
@@ -93,6 +95,7 @@ pub const PluginSummary = struct {
     handle: plugin.PluginHandle,
     name: []const u8,
     grants: abi.CapabilitySet,
+    intents: abi.IntentSet,
     trust_tier: TrustTier,
     publisher_signed: bool,
     command_count: usize,
@@ -115,6 +118,7 @@ pub const Bridge = struct {
             .options = options,
             .store = plugin.PluginStore.init(allocator, .{
                 .allowed_caps = options.allowed_caps,
+                .allowed_intents = options.allowed_intents,
                 .max_memory_bytes = options.max_memory_bytes,
             }),
         };
@@ -165,10 +169,11 @@ pub const Bridge = struct {
         const manifest = abi.PluginManifest{
             .name = name,
             .requested_caps = meta.requested_caps.items,
+            .requested_intents = meta.requested_intents.items,
             .commands = try meta.commandDecls(self.allocator),
             .hooks = try meta.hookDecls(self.allocator),
         };
-        _ = try self.store.loadWithAllowedCaps(manifest, wasm, trustScopedAllowedCaps(self.options.allowed_caps, tier));
+        _ = try self.store.loadWithPolicy(manifest, wasm, trustScopedAllowedCaps(self.options.allowed_caps, tier), trustScopedAllowedIntents(self.options.allowed_intents, tier));
     }
 
     pub fn hasCommand(self: *const Bridge, name: []const u8) bool {
@@ -236,6 +241,7 @@ pub const Bridge = struct {
             .manifest_schema = abi.manifest_schema,
             .host_function_count = abi.host_functions.len,
             .allowed_caps = self.store.policy.allowed_caps,
+            .allowed_intents = self.store.policy.allowed_intents,
             .registry_pin_count = self.options.registry.len,
             .signed_registry_pin_count = self.signedRegistryPinCount(),
             .revoked_hash_count = self.options.revoked_hashes.len,
@@ -257,6 +263,7 @@ pub const Bridge = struct {
             .handle = item.handle,
             .name = item.name,
             .grants = item.grants,
+            .intents = item.intents,
             .trust_tier = self.pluginTier(item.name),
             .publisher_signed = self.pluginPublisherSigned(item.name),
             .command_count = self.store.commandCount(item.handle),
@@ -386,6 +393,12 @@ pub fn minTrustTierForCapability(cap: abi.Capability) TrustTier {
     };
 }
 
+pub fn minTrustTierForIntent(intent: abi.Intent) TrustTier {
+    return switch (intent) {
+        .message_content => .verified,
+    };
+}
+
 pub fn trustTierAllows(tier: TrustTier, required: TrustTier) bool {
     return trustTierRank(tier) >= trustTierRank(required);
 }
@@ -394,6 +407,14 @@ fn trustScopedAllowedCaps(allowed: abi.CapabilitySet, tier: TrustTier) abi.Capab
     var out = abi.CapabilitySet.empty;
     inline for (abi.all_capabilities) |cap| {
         if (allowed.has(cap) and trustTierAllows(tier, minTrustTierForCapability(cap))) out.insert(cap);
+    }
+    return out;
+}
+
+fn trustScopedAllowedIntents(allowed: abi.IntentSet, tier: TrustTier) abi.IntentSet {
+    var out = abi.IntentSet.empty;
+    inline for (abi.all_intents) |intent| {
+        if (allowed.has(intent) and trustTierAllows(tier, minTrustTierForIntent(intent))) out.insert(intent);
     }
     return out;
 }
@@ -484,6 +505,7 @@ const HookMeta = struct {
 
 const Metadata = struct {
     requested_caps: std.ArrayList(abi.Capability) = .empty,
+    requested_intents: std.ArrayList(abi.Intent) = .empty,
     commands: std.ArrayList(CommandMeta) = .empty,
     hooks: std.ArrayList(HookMeta) = .empty,
     decls: std.ArrayList(abi.CommandDecl) = .empty,
@@ -508,6 +530,13 @@ const Metadata = struct {
             if (existing == cap) return;
         }
         try self.requested_caps.append(allocator, cap);
+    }
+
+    fn addIntent(self: *Metadata, allocator: std.mem.Allocator, intent: abi.Intent) !void {
+        for (self.requested_intents.items) |existing| {
+            if (existing == intent) return;
+        }
+        try self.requested_intents.append(allocator, intent);
     }
 
     fn addCommand(self: *Metadata, allocator: std.mem.Allocator, name: []const u8, export_name: []const u8) !void {
@@ -546,6 +575,7 @@ const Metadata = struct {
         self.commands.deinit(allocator);
         self.hooks.deinit(allocator);
         self.requested_caps.deinit(allocator);
+        self.requested_intents.deinit(allocator);
         self.decls.deinit(allocator);
         self.hook_decls.deinit(allocator);
         self.* = undefined;
@@ -586,13 +616,16 @@ const MetaParser = struct {
         const count = try self.readU32();
         for (0..count) |_| {
             const module_len = try self.readU32();
-            _ = try self.bytes(module_len);
+            const module = try self.bytes(module_len);
             const name_len = try self.readU32();
             const name = try self.bytes(name_len);
             const kind = try self.byte();
             try self.skipImportDesc(kind);
             if (kind == 0) {
                 if (abi.findHostFunction(name)) |func| try meta.addCapability(allocator, func.capability);
+                if (std.mem.eql(u8, module, "orowasm.intent")) {
+                    if (abi.Intent.fromToken(name)) |intent| try meta.addIntent(allocator, intent);
+                }
             }
         }
     }
@@ -699,6 +732,16 @@ const stop_hook_wasm_bytes = [_]u8{
     'd',  'e',  'l',  'i',  'v',  'e',  'r',  0x00,
     0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01,
     0x0b,
+};
+
+const intent_wasm_bytes = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x02, 0x22,
+    0x01, 0x0e, 'o',  'r',  'o',  'w',  'a',  's',
+    'm',  '.',  'i',  'n',  't',  'e',  'n',  't',
+    0x0f, 'm',  'e',  's',  's',  'a',  'g',  'e',
+    '_',  'c',  'o',  'n',  't',  'e',  'n',  't',
+    0x00, 0x00,
 };
 
 pub const testing = struct {
@@ -823,6 +866,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(info.allowed_caps.has(.reply));
     try std.testing.expect(info.allowed_caps.has(.hooks));
     try std.testing.expect(!info.allowed_caps.has(.time));
+    try std.testing.expect(!info.allowed_intents.has(.message_content));
     try std.testing.expectEqual(@as(usize, 1), info.registry_pin_count);
     try std.testing.expectEqual(@as(usize, 1), info.signed_registry_pin_count);
     try std.testing.expectEqual(@as(usize, 0), info.revoked_hash_count);
@@ -841,6 +885,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(summary.publisher_signed);
     try std.testing.expectEqual(@as(usize, 0), summary.command_count);
     try std.testing.expectEqual(@as(usize, 1), summary.hook_count);
+    try std.testing.expect(!summary.intents.has(.message_content));
     try std.testing.expect(bridge.pluginSummary(1) == null);
 }
 
@@ -909,6 +954,7 @@ test "registry pins require complete publisher signature metadata" {
 
 test "trust tiers gate privileged host capabilities and hook intents" {
     try std.testing.expectEqual(TrustTier.verified, minTrustTierForCapability(.net_outbound));
+    try std.testing.expectEqual(TrustTier.verified, minTrustTierForIntent(.message_content));
     try std.testing.expect(!trustTierAllows(.listed, minTrustTierForCapability(.net_outbound)));
     try std.testing.expect(trustTierAllows(.verified, minTrustTierForCapability(.net_outbound)));
 
@@ -937,6 +983,28 @@ test "trust tiers gate privileged host capabilities and hook intents" {
     defer low_tier_hook.deinit();
     try std.testing.expectError(error.PluginTrustTierTooLow, low_tier_hook.loadBytes("guard", &stop_hook_wasm_bytes));
     try std.testing.expectEqual(@as(usize, 1), low_tier_hook.runtimeInfo().blocked_load_count);
+}
+
+test "privileged message-content intent is explicit and verified-tier gated" {
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&intent_wasm_bytes, &digest, .{});
+
+    var unlisted = Bridge.initWithOptions(std.testing.allocator, .{
+        .allowed_intents = abi.IntentSet.initMany(&.{.message_content}),
+    });
+    defer unlisted.deinit();
+    try unlisted.loadBytes("reader", &intent_wasm_bytes);
+    try std.testing.expect(!unlisted.pluginSummary(0).?.intents.has(.message_content));
+
+    var verified = Bridge.initWithOptions(std.testing.allocator, .{
+        .allowed_intents = abi.IntentSet.initMany(&.{.message_content}),
+        .registry = &.{.{ .name = "reader", .blake3 = digest, .tier = .verified }},
+    });
+    defer verified.deinit();
+    try verified.loadBytes("reader", &intent_wasm_bytes);
+    const info = verified.runtimeInfo();
+    try std.testing.expect(info.allowed_intents.has(.message_content));
+    try std.testing.expect(verified.pluginSummary(0).?.intents.has(.message_content));
 }
 
 fn signedRegistryPin(

@@ -1447,6 +1447,8 @@ pub const Config = struct {
     wasm_default_fuel: u64 = wasm_bridge.default_fuel,
     /// Hostcall capability classes plugins may receive. `[wasm] allowed_caps`.
     wasm_allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
+    /// Privileged plugin data-access intents. `[wasm] allowed_intents`.
+    wasm_allowed_intents: wasm_abi.IntentSet = .empty,
     /// Content-addressed plugin registry pins. Non-empty means only pinned
     /// plugins whose BLAKE3 digest matches are loadable. `[wasm] registry`.
     wasm_registry: []const wasm_bridge.RegistryPin = &.{},
@@ -3491,6 +3493,7 @@ pub const LinuxServer = struct {
                 .max_memory_bytes = config.wasm_max_memory_bytes,
                 .default_fuel = config.wasm_default_fuel,
                 .allowed_caps = config.wasm_allowed_caps,
+                .allowed_intents = config.wasm_allowed_intents,
                 .registry = config.wasm_registry,
                 .revoked_hashes = config.wasm_revoked_hashes,
                 .disabled_plugins = config.wasm_disabled_plugins,
@@ -27814,6 +27817,7 @@ pub const LinuxServer = struct {
         self.config.wasm_max_memory_bytes = parsed.wasm.max_memory_bytes;
         self.config.wasm_default_fuel = parsed.wasm.default_fuel;
         self.config.wasm_allowed_caps = parsed.wasm.allowed_caps;
+        self.config.wasm_allowed_intents = parsed.wasm.allowed_intents;
         self.config.wasm_registry = parsed.wasm.registry;
         self.config.wasm_revoked_hashes = parsed.wasm.revoked_blake3;
         self.config.wasm_disabled_plugins = parsed.wasm.disabled_plugins;
@@ -27823,6 +27827,7 @@ pub const LinuxServer = struct {
             .max_memory_bytes = self.config.wasm_max_memory_bytes,
             .default_fuel = self.config.wasm_default_fuel,
             .allowed_caps = self.config.wasm_allowed_caps,
+            .allowed_intents = self.config.wasm_allowed_intents,
             .registry = self.config.wasm_registry,
             .revoked_hashes = self.config.wasm_revoked_hashes,
             .disabled_plugins = self.config.wasm_disabled_plugins,
@@ -35702,14 +35707,15 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
-    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks registry_pins=1 signed_pins=1 revoked_hashes=1 disabled_plugins=1 blocked_loads=1", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks allowed_intents=(none) registry_pins=1 signed_pins=1 revoked_hashes=1 disabled_plugins=1 blocked_loads=1", 200);
     try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM ABI\r\n");
-    try recvUntil(&admin, "manifest_schema=1.0 host_functions=9 allowed_caps=reply,hooks", 200);
+    try recvUntil(&admin, "manifest_schema=1.0 host_functions=9 allowed_caps=reply,hooks allowed_intents=(none)", 200);
     try recvUntil(&admin, "hostcall reply v1.0 cap=reply", 200);
     try recvUntil(&admin, "hostcall net_connect v1.0 cap=net:outbound min_tier=verified", 200);
+    try recvUntil(&admin, "intent message-content min_tier=verified", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM WIT\r\n");
@@ -35719,7 +35725,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
 
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");
-    try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none)", 200);
+    try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none) intents=(none)", 200);
 }
 
 test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {

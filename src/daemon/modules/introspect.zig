@@ -106,15 +106,18 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
 
     var caps_buf: [128]u8 = undefined;
     const caps = info.allowed_caps.writeTokens(&caps_buf);
+    var intents_buf: [128]u8 = undefined;
+    const intents = info.allowed_intents.writeTokens(&intents_buf);
     var line: [512]u8 = undefined;
 
     if (std.ascii.eqlIgnoreCase(view, "STATUS")) {
         try core.reply(.RPL_INFOSTART, &.{}, "OroWasm runtime status");
-        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} registry_pins={d} signed_pins={d} revoked_hashes={d} disabled_plugins={d} blocked_loads={d} plugin_dir={s}", .{
+        const status = std.fmt.bufPrint(&line, "plugins={d} commands={d} hooks={d} allowed_caps={s} allowed_intents={s} registry_pins={d} signed_pins={d} revoked_hashes={d} disabled_plugins={d} blocked_loads={d} plugin_dir={s}", .{
             info.plugin_count,
             info.command_count,
             info.hook_count,
             if (caps.len == 0) "(none)" else caps,
+            if (intents.len == 0) "(none)" else intents,
             info.registry_pin_count,
             info.signed_registry_pin_count,
             info.revoked_hash_count,
@@ -135,11 +138,12 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
 
     if (std.ascii.eqlIgnoreCase(view, "ABI")) {
         try core.reply(.RPL_INFOSTART, &.{}, "OroWasm ABI");
-        const schema = std.fmt.bufPrint(&line, "manifest_schema={d}.{d} host_functions={d} allowed_caps={s}", .{
+        const schema = std.fmt.bufPrint(&line, "manifest_schema={d}.{d} host_functions={d} allowed_caps={s} allowed_intents={s}", .{
             info.manifest_schema.major,
             info.manifest_schema.minor,
             info.host_function_count,
             if (caps.len == 0) "(none)" else caps,
+            if (intents.len == 0) "(none)" else intents,
         }) catch return;
         try core.reply(.RPL_INFO, &.{}, schema);
         for (wasm_abi.host_functions) |func| {
@@ -149,6 +153,13 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
                 func.version.minor,
                 func.capability.token(),
                 wasm_bridge.minTrustTierForCapability(func.capability).token(),
+            }) catch continue;
+            try core.reply(.RPL_INFO, &.{}, row);
+        }
+        for (wasm_abi.all_intents) |intent| {
+            const row = std.fmt.bufPrint(&line, "intent {s} min_tier={s}", .{
+                intent.token(),
+                wasm_bridge.minTrustTierForIntent(intent).token(),
             }) catch continue;
             try core.reply(.RPL_INFO, &.{}, row);
         }
@@ -174,7 +185,9 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         while (core.server.wasm.pluginSummary(i)) |plugin| : (i += 1) {
             var grant_buf: [128]u8 = undefined;
             const grants = plugin.grants.writeTokens(&grant_buf);
-            const row = std.fmt.bufPrint(&line, "handle={d} name={s} tier={s} signed={s} commands={d} hooks={d} grants={s}", .{
+            var intent_buf: [128]u8 = undefined;
+            const granted_intents = plugin.intents.writeTokens(&intent_buf);
+            const row = std.fmt.bufPrint(&line, "handle={d} name={s} tier={s} signed={s} commands={d} hooks={d} grants={s} intents={s}", .{
                 plugin.handle,
                 plugin.name,
                 plugin.trust_tier.token(),
@@ -182,6 +195,7 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
                 plugin.command_count,
                 plugin.hook_count,
                 if (grants.len == 0) "(none)" else grants,
+                if (granted_intents.len == 0) "(none)" else granted_intents,
             }) catch continue;
             try core.reply(.RPL_INFO, &.{}, row);
         }

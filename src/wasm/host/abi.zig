@@ -113,6 +113,86 @@ pub const CapabilitySet = struct {
     }
 };
 
+/// Privileged data-access intents are separate from hostcall capabilities. They
+/// gate ambient data a plugin may observe through hooks or future event streams.
+pub const Intent = enum {
+    message_content,
+
+    pub fn token(self: Intent) []const u8 {
+        return switch (self) {
+            .message_content => "message-content",
+        };
+    }
+
+    pub fn importName(self: Intent) []const u8 {
+        return switch (self) {
+            .message_content => "message_content",
+        };
+    }
+
+    pub fn fromToken(text: []const u8) ?Intent {
+        inline for (all_intents) |intent| {
+            if (std.ascii.eqlIgnoreCase(text, intent.token())) return intent;
+            if (std.ascii.eqlIgnoreCase(text, intent.importName())) return intent;
+        }
+        return null;
+    }
+};
+
+pub const all_intents = [_]Intent{.message_content};
+
+pub const IntentSet = struct {
+    set: std.EnumSet(Intent) = .empty,
+
+    pub const empty: IntentSet = .{};
+    pub const all: IntentSet = .{ .set = std.EnumSet(Intent).full };
+
+    pub fn initMany(intents: []const Intent) IntentSet {
+        return .{ .set = std.EnumSet(Intent).initMany(intents) };
+    }
+
+    pub fn insert(self: *IntentSet, intent: Intent) void {
+        self.set.insert(intent);
+    }
+
+    pub fn has(self: IntentSet, intent: Intent) bool {
+        return self.set.contains(intent);
+    }
+
+    pub fn intersection(requested: IntentSet, allowed: IntentSet) IntentSet {
+        var out = IntentSet.empty;
+        var it = requested.set.iterator();
+        while (it.next()) |intent| {
+            if (allowed.has(intent)) out.insert(intent);
+        }
+        return out;
+    }
+
+    pub fn count(self: IntentSet) usize {
+        var n: usize = 0;
+        var it = self.set.iterator();
+        while (it.next()) |_| n += 1;
+        return n;
+    }
+
+    pub fn writeTokens(self: IntentSet, out: []u8) []const u8 {
+        var used: usize = 0;
+        var it = self.set.iterator();
+        while (it.next()) |intent| {
+            const token = intent.token();
+            const need = token.len + @as(usize, if (used == 0) 0 else 1);
+            if (used + need > out.len) break;
+            if (used != 0) {
+                out[used] = ',';
+                used += 1;
+            }
+            @memcpy(out[used .. used + token.len], token);
+            used += token.len;
+        }
+        return out[0..used];
+    }
+};
+
 /// A typed host function available to guests.
 pub const HostFunction = struct {
     name: []const u8,
@@ -150,6 +230,7 @@ pub const PluginManifest = struct {
     name: []const u8,
     abi_version: SchemaVersion = manifest_schema,
     requested_caps: []const Capability,
+    requested_intents: []const Intent = &.{},
     commands: []const CommandDecl = &.{},
     hooks: []const HookDecl = &.{},
 };
@@ -157,12 +238,14 @@ pub const PluginManifest = struct {
 /// Host policy used during negotiation.
 pub const HostPolicy = struct {
     allowed_caps: CapabilitySet = .{},
+    allowed_intents: IntentSet = .{},
 };
 
 /// Negotiated view of a plugin's authority.
 pub const Grant = struct {
     manifest_ok: bool,
     granted_caps: CapabilitySet,
+    granted_intents: IntentSet,
 };
 
 pub const host_functions = [_]HostFunction{
@@ -186,9 +269,11 @@ pub fn findHostFunction(name: []const u8) ?HostFunction {
 
 pub fn negotiate(manifest: PluginManifest, policy: HostPolicy) Grant {
     const requested = CapabilitySet.initMany(manifest.requested_caps);
+    const requested_intents = IntentSet.initMany(manifest.requested_intents);
     return .{
         .manifest_ok = manifest_schema.compatible(manifest.abi_version),
         .granted_caps = CapabilitySet.intersection(requested, policy.allowed_caps),
+        .granted_intents = IntentSet.intersection(requested_intents, policy.allowed_intents),
     };
 }
 
@@ -206,6 +291,7 @@ test "capability negotiation grants only policy intersection" {
     try std.testing.expect(grant.granted_caps.has(.log));
     try std.testing.expect(!grant.granted_caps.has(.store));
     try std.testing.expectEqual(@as(usize, 2), grant.granted_caps.count());
+    try std.testing.expectEqual(@as(usize, 0), grant.granted_intents.count());
 }
 
 test "capability negotiation denies incompatible manifest schema" {
@@ -220,6 +306,28 @@ test "capability negotiation denies incompatible manifest schema" {
 
     try std.testing.expect(!grant.manifest_ok);
     try std.testing.expect(grant.granted_caps.has(.reply));
+}
+
+test "intent negotiation grants only explicit policy intersection" {
+    const manifest = PluginManifest{
+        .name = "reader",
+        .requested_caps = &.{.reply},
+        .requested_intents = &.{.message_content},
+    };
+    const denied = negotiate(manifest, .{
+        .allowed_caps = CapabilitySet.initMany(&.{.reply}),
+    });
+    try std.testing.expect(denied.manifest_ok);
+    try std.testing.expect(!denied.granted_intents.has(.message_content));
+
+    const granted = negotiate(manifest, .{
+        .allowed_caps = CapabilitySet.initMany(&.{.reply}),
+        .allowed_intents = IntentSet.initMany(&.{.message_content}),
+    });
+    try std.testing.expect(granted.granted_intents.has(.message_content));
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("message-content", granted.granted_intents.writeTokens(&out));
+    try std.testing.expectEqual(Intent.message_content, Intent.fromToken("message_content").?);
 }
 
 test "host functions are independently named and capability gated" {

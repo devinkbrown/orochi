@@ -22,6 +22,7 @@ pub const Error = error{
 
 pub const Policy = struct {
     allowed_caps: abi.CapabilitySet = .{},
+    allowed_intents: abi.IntentSet = .{},
     max_memory_bytes: usize = 64 * 1024,
 };
 
@@ -53,6 +54,7 @@ const LoadedPlugin = struct {
     handle: PluginHandle,
     name: []u8,
     grants: abi.CapabilitySet,
+    intents: abi.IntentSet,
     instance: interp.Instance,
 
     fn deinit(self: *LoadedPlugin, allocator: std.mem.Allocator) void {
@@ -96,7 +98,11 @@ pub const PluginStore = struct {
     }
 
     pub fn loadWithAllowedCaps(self: *PluginStore, manifest: abi.PluginManifest, wasm: []const u8, allowed_caps: abi.CapabilitySet) Error!PluginHandle {
-        const grant = abi.negotiate(manifest, .{ .allowed_caps = allowed_caps });
+        return self.loadWithPolicy(manifest, wasm, allowed_caps, self.policy.allowed_intents);
+    }
+
+    pub fn loadWithPolicy(self: *PluginStore, manifest: abi.PluginManifest, wasm: []const u8, allowed_caps: abi.CapabilitySet, allowed_intents: abi.IntentSet) Error!PluginHandle {
+        const grant = abi.negotiate(manifest, .{ .allowed_caps = allowed_caps, .allowed_intents = allowed_intents });
         if (!grant.manifest_ok) return error.IncompatibleManifest;
 
         const handle = self.next_handle;
@@ -110,6 +116,7 @@ pub const PluginStore = struct {
             .handle = handle,
             .name = name,
             .grants = grant.granted_caps,
+            .intents = grant.granted_intents,
             .instance = instance,
         });
         errdefer _ = self.plugins.pop();
@@ -142,6 +149,11 @@ pub const PluginStore = struct {
     pub fn hasCapability(self: *const PluginStore, handle: PluginHandle, cap: abi.Capability) Error!bool {
         const plugin = self.findPluginConst(handle) orelse return error.UnknownPlugin;
         return plugin.grants.has(cap);
+    }
+
+    pub fn hasIntent(self: *const PluginStore, handle: PluginHandle, intent: abi.Intent) Error!bool {
+        const plugin = self.findPluginConst(handle) orelse return error.UnknownPlugin;
+        return plugin.intents.has(intent);
     }
 
     pub fn dispatchHostcall(self: *PluginStore, handle: PluginHandle, name: []const u8, args: []const u64) Error!HostcallResult {
@@ -294,6 +306,27 @@ test "hostcall dispatch enforces granted capabilities" {
     try std.testing.expectError(error.CapabilityDenied, store.dispatchHostcall(handle, "now_ms", &.{}));
     const denied_connect = try store.dispatchHostcall(handle, "net_connect", &.{});
     try std.testing.expectEqual(@as(i64, -1), denied_connect.i64);
+}
+
+test "intent grants are denied by default and require explicit policy" {
+    var store = PluginStore.init(std.testing.allocator, .{
+        .allowed_caps = abi.CapabilitySet.initMany(&.{.reply}),
+    });
+    defer store.deinit();
+
+    const denied = try store.load(.{
+        .name = "reader",
+        .requested_caps = &.{.reply},
+        .requested_intents = &.{.message_content},
+    }, &empty_wasm);
+    try std.testing.expect(!try store.hasIntent(denied, .message_content));
+
+    const granted = try store.loadWithPolicy(.{
+        .name = "trusted-reader",
+        .requested_caps = &.{.reply},
+        .requested_intents = &.{.message_content},
+    }, &empty_wasm, abi.CapabilitySet.initMany(&.{.reply}), abi.IntentSet.initMany(&.{.message_content}));
+    try std.testing.expect(try store.hasIntent(granted, .message_content));
 }
 
 test "unload tears down all registrations for a plugin handle" {

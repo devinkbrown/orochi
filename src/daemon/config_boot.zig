@@ -61,6 +61,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;
     out.wasm_default_fuel = cfg.wasm.default_fuel;
     out.wasm_allowed_caps = cfg.wasm.allowed_caps;
+    out.wasm_allowed_intents = cfg.wasm.allowed_intents;
     out.wasm_registry = cfg.wasm.registry;
     out.wasm_revoked_hashes = cfg.wasm.revoked_blake3;
     out.wasm_disabled_plugins = cfg.wasm.disabled_plugins;
@@ -891,6 +892,7 @@ test "wasm plugin_dir maps into the live config" {
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
         \\allowed_caps = ["reply", "log", "hooks", "net:outbound"]
+        \\allowed_intents = ["message-content"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\revoked_blake3 = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         \\disabled_plugins = ["bridge-discord", "bad.wasm"]
@@ -907,6 +909,7 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expect(loaded.config.wasm_allowed_caps.has(.hooks));
     try testing.expect(loaded.config.wasm_allowed_caps.has(.net_outbound));
     try testing.expect(!loaded.config.wasm_allowed_caps.has(.time));
+    try testing.expect(loaded.config.wasm_allowed_intents.has(.message_content));
     try testing.expectEqual(@as(usize, 1), loaded.config.wasm_registry.len);
     try testing.expectEqualStrings("guard", loaded.config.wasm_registry[0].name);
     try testing.expectEqual(wasm_bridge.TrustTier.verified, loaded.config.wasm_registry[0].tier);

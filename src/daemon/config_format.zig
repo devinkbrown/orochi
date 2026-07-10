@@ -223,6 +223,8 @@ pub const Config = struct {
         default_fuel: u64 = wasm_bridge.default_fuel,
         /// Hostcall capability classes plugins may receive after negotiation.
         allowed_caps: wasm_abi.CapabilitySet = wasm_bridge.default_allowed_caps,
+        /// Privileged data-access intents plugins may receive after negotiation.
+        allowed_intents: wasm_abi.IntentSet = .empty,
         /// Content-addressed plugin registry pins. Non-empty means only pinned
         /// plugins whose BLAKE3 digest matches are loadable.
         registry: []const wasm_bridge.RegistryPin = &.{},
@@ -1009,6 +1011,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
     cfg.wasm.default_fuel = try uintField(doc, "wasm.default_fuel", cfg.wasm.default_fuel, 1, 10_000_000);
     if (doc.getArray("wasm.allowed_caps")) |arr| cfg.wasm.allowed_caps = try parseWasmCaps(arr);
+    if (doc.getArray("wasm.allowed_intents")) |arr| cfg.wasm.allowed_intents = try parseWasmIntents(arr);
     if (doc.getArray("wasm.registry")) |arr| {
         freeWasmRegistry(allocator, cfg.wasm.registry);
         cfg.wasm.registry = try parseWasmRegistry(allocator, resolver, arr);
@@ -1598,6 +1601,19 @@ fn parseWasmCaps(arr: []const toml.Value) TomlError!wasm_abi.CapabilitySet {
     return caps;
 }
 
+fn parseWasmIntents(arr: []const toml.Value) TomlError!wasm_abi.IntentSet {
+    var intents = wasm_abi.IntentSet.empty;
+    for (arr) |*item| {
+        const raw = switch (item.*) {
+            .string => |s| s,
+            else => return error.ParseError,
+        };
+        const intent = wasm_abi.Intent.fromToken(raw) orelse return error.ParseError;
+        intents.insert(intent);
+    }
+    return intents;
+}
+
 fn parseWasmRegistry(allocator: std.mem.Allocator, resolver: Resolver, arr: []const toml.Value) TomlError![]const wasm_bridge.RegistryPin {
     var list: std.ArrayList(wasm_bridge.RegistryPin) = .empty;
     errdefer {
@@ -1856,6 +1872,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "STORE", "hooks", "net:outbound"]
+        \\allowed_intents = ["message-content"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
         \\revoked_blake3 = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         \\disabled_plugins = ["bad", "bridge-discord.wasm"]
@@ -1868,6 +1885,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expect(cfg.wasm.allowed_caps.has(.hooks));
     try testing.expect(cfg.wasm.allowed_caps.has(.net_outbound));
     try testing.expect(!cfg.wasm.allowed_caps.has(.time));
+    try testing.expect(cfg.wasm.allowed_intents.has(.message_content));
     try testing.expectEqual(@as(usize, 1), cfg.wasm.registry.len);
     try testing.expectEqualStrings("guard", cfg.wasm.registry[0].name);
     try testing.expectEqual(wasm_bridge.TrustTier.verified, cfg.wasm.registry[0].tier);
@@ -1888,6 +1906,16 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "net:inbound"]
+        \\
+    , .{}));
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\allowed_intents = ["plaintext"]
         \\
     , .{}));
 
