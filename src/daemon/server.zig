@@ -11841,9 +11841,22 @@ pub const LinuxServer = struct {
 
     pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
+            // Bare NAMES lists every visible channel. A non-oper must not see a
+            // secret(+s) or hidden(+h) channel, and — consistent with the
+            // single-channel ShowChannel gate below — must not see a private(+p)
+            // channel it is not a member of. Opers see everything; members see
+            // their own private channels. Fail-closed on an unknown viewer.
+            const viewer_is_oper = conn.session.isOper();
+            const viewer_wid = self.world.findNick(conn.session.displayName());
             var it = self.world.channelIterator();
             while (it.next()) |ch| {
-                if (ch.secret or ch.hidden) continue;
+                if (!viewer_is_oper) {
+                    if (ch.secret or ch.hidden) continue;
+                    if (self.world.isPrivate(ch.name)) {
+                        const is_member = if (viewer_wid) |vw| self.world.isMember(ch.name, vw) else false;
+                        if (!is_member) continue;
+                    }
+                }
                 try self.sendNames(conn, ch.name);
             }
             return;
@@ -12659,6 +12672,22 @@ pub const LinuxServer = struct {
     pub fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
         const requester = conn.session.displayName();
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            // Same ShowChannel gate as plain WHO: a secret(+s)/private(+p)
+            // channel's roster is visible only to members and opers, so a
+            // WHO <chan> %<fields> (WHOX) cannot enumerate a hidden channel
+            // either. Non-member non-oper gets a bare RPL_ENDOFWHO. Fail-closed.
+            if (!conn.session.isOper() and
+                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target)))
+            {
+                const viewer_wid = self.world.findNick(requester);
+                const is_member = if (viewer_wid) |vw| self.world.isMember(target, vw) else false;
+                if (!is_member) {
+                    var endbuf: [default_reply_bytes]u8 = undefined;
+                    const end = who.writeEndOfWho(&endbuf, self.serverName(), requester, target) catch return;
+                    try appendToConn(conn, end);
+                    return;
+                }
+            }
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
@@ -12793,6 +12822,23 @@ pub const LinuxServer = struct {
         }
 
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            // A secret (+s) or private (+p) channel's roster is visible only to
+            // its members (and opers) — mirror ophion's ShowChannel = PubChannel
+            // || IsMember (and the NAMES gate / channelHiddenFromWhois). A
+            // non-member non-oper gets a bare RPL_ENDOFWHO, never the member
+            // list, so WHO cannot enumerate a hidden channel. Fail-closed: an
+            // unknown viewer is treated as a non-member.
+            if (!conn.session.isOper() and
+                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target)))
+            {
+                const viewer_wid = self.world.findNick(requester);
+                const is_member = if (viewer_wid) |vw| self.world.isMember(target, vw) else false;
+                if (!is_member) {
+                    const end = who.writeEndOfWho(&buf, self.serverName(), requester, target) catch return;
+                    try appendToConn(conn, end);
+                    return;
+                }
+            }
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
@@ -37123,6 +37169,117 @@ test "threaded server IRCX: NAMES on a secret channel hides the roster from a no
     try writeAllFd(fd_a, "NAMES #sec\r\n");
     try recvUntil(&a, " 353 ", 200);
     try recvUntil(&a, " 366 A #sec ", 200);
+}
+
+test "threaded server IRCX: WHO on a secret channel hides the roster from a non-member" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds #sec and marks it secret (+s). B is NOT a member.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #sec\r\n");
+    try recvUntil(&a, " 366 A #sec ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #sec +s\r\n");
+    try recvUntil(&a, "MODE #sec +s", 200);
+
+    // Non-member B: WHO #sec must NOT leak the roster — only RPL_ENDOFWHO (315),
+    // never a 352 row naming A (ophion ShowChannel = PubChannel || IsMember).
+    b.reset();
+    try writeAllFd(fd_b, "WHO #sec\r\n");
+    try recvUntil(&b, " 315 B #sec ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 352 ") == null);
+
+    // WHOX form (WHO #sec %<fields>) must be gated identically — no 354 rows.
+    b.reset();
+    try writeAllFd(fd_b, "WHO #sec %na\r\n");
+    try recvUntil(&b, " 315 B #sec ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 354 ") == null);
+
+    // Sanity: a member (A) still sees the roster for its own secret channel.
+    a.reset();
+    try writeAllFd(fd_a, "WHO #sec\r\n");
+    try recvUntil(&a, " 352 A #sec ", 200);
+    try recvUntil(&a, " 315 A #sec ", 200);
+}
+
+test "threaded server IRCX: bare NAMES hides a private (+p) channel from a non-member" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds a private (+p, NOT secret) channel and a plain public channel.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #priv\r\n");
+    try recvUntil(&a, " 366 A #priv ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #priv +p\r\n");
+    try recvUntil(&a, "MODE #priv +p", 200);
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #pub\r\n");
+    try recvUntil(&a, " 366 A #pub ", 200);
+
+    // Non-member B: bare NAMES must list the public channel but NEVER the +p
+    // one it is not a member of. PING round-trips as a flush barrier so all
+    // NAMES output is on the wire before we assert.
+    b.reset();
+    try writeAllFd(fd_b, "NAMES\r\nPING :namesync\r\n");
+    try recvUntil(&b, "PONG orochi.local :namesync", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#pub") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#priv") == null);
+
+    // Sanity: the member (A) still sees its own +p channel in bare NAMES.
+    a.reset();
+    try writeAllFd(fd_a, "NAMES\r\nPING :namesync2\r\n");
+    try recvUntil(&a, "PONG orochi.local :namesync2", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#priv") != null);
 }
 
 test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-end" {
