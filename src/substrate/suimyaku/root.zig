@@ -38,6 +38,7 @@ pub const prolly = @import("prolly.zig");
 pub const riblt = @import("riblt.zig");
 pub const route_table = @import("route_table.zig");
 pub const s2s_peer = @import("s2s_peer.zig");
+pub const sazanami_dst = @import("sazanami_dst.zig");
 pub const server_registry = @import("server_registry.zig");
 pub const signed_frame = @import("signed_frame.zig");
 pub const state_props = @import("state_props.zig");
@@ -82,6 +83,7 @@ test {
     _ = riblt;
     _ = route_table;
     _ = s2s_peer;
+    _ = sazanami_dst;
     _ = server_registry;
     _ = signed_frame;
     _ = state_props;

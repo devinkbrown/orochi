@@ -1164,6 +1164,95 @@ test "anti-entropy repair uses full resync only when planned" {
     try std.testing.expect(NetworkState.eql(&mesh.nodes.items[0].state, &mesh.nodes.items[1].state));
 }
 
+test "Suimyaku mesh converges after partition heal across a seed campaign" {
+    // Deterministic Ocean deliverable: split the mesh, mutate CRDT state on both
+    // sides of the partition, heal, and require every replica to converge to a
+    // byte-identical state. `expectConverged` prints the failing seed so any red
+    // run replays verbatim.
+    var s: u64 = 0;
+    while (s < 64) : (s += 1) {
+        const seed = 0x0160_5a20 +% s;
+        var mesh = try Mesh.init(std.testing.allocator, seed, 4);
+        defer mesh.deinit();
+
+        try mesh.partitionFirstHalf();
+        try mesh.runRandomWorkload(60); // both sides mutate while split
+        mesh.heal();
+
+        try mesh.reconcile();
+        try mesh.expectConverged();
+    }
+}
+
+test "Suimyaku mesh merge is order-independent and idempotent across a seed campaign" {
+    // The convergence guarantee rests on the merge being commutative, associative
+    // and idempotent. Feed the exact same delta snapshots to two fresh replicas in
+    // opposite orders: a commutative/associative merge must land them on identical
+    // state regardless of ordering, and re-applying the whole set must be a no-op.
+    var s: u64 = 0;
+    while (s < 32) : (s += 1) {
+        const seed = 0x0160_9a70 +% s;
+        var mesh = try Mesh.init(std.testing.allocator, seed, 4);
+        defer mesh.deinit();
+        try mesh.runRandomWorkload(60);
+
+        const deltas = mesh.deltas.items;
+
+        var forward = NetworkState.init(std.testing.allocator, 7, 700);
+        defer forward.deinit();
+        var backward = NetworkState.init(std.testing.allocator, 7, 700);
+        defer backward.deinit();
+
+        for (deltas) |*d| try forward.merge(&d.state);
+        var i: usize = deltas.len;
+        while (i > 0) : (i -= 1) try backward.merge(&deltas[i - 1].state);
+
+        if (!NetworkState.eql(&forward, &backward)) {
+            std.debug.print("Suimyaku merge order-dependence seed=0x{x}\n", .{seed});
+            return error.MergeOrderDependent;
+        }
+
+        // Idempotence: re-merging the full delta set changes nothing.
+        var snapshot = try cloneNetworkState(&forward);
+        defer snapshot.deinit();
+        for (deltas) |*d| try forward.merge(&d.state);
+        if (!NetworkState.eql(&forward, &snapshot)) {
+            std.debug.print("Suimyaku merge non-idempotent seed=0x{x}\n", .{seed});
+            return error.MergeNonIdempotent;
+        }
+    }
+}
+
+test "Suimyaku mesh partition-heal convergence replays byte-for-byte from its seed" {
+    // A DST test must replay identically from its seed. Drive the same partition /
+    // mutate / heal / reconcile program twice under one seed and require the final
+    // converged state hashes to match.
+    const seed = 0x0160_5eed_d57;
+
+    var first = try Mesh.init(std.testing.allocator, seed, 4);
+    defer first.deinit();
+    try first.partitionFirstHalf();
+    try first.runRandomWorkload(60);
+    first.heal();
+    try first.reconcile();
+    try first.expectConverged();
+
+    var second = try Mesh.init(std.testing.allocator, seed, 4);
+    defer second.deinit();
+    try second.partitionFirstHalf();
+    try second.runRandomWorkload(60);
+    second.heal();
+    try second.reconcile();
+    try second.expectConverged();
+
+    const first_hash = stateHash(&first.nodes.items[0].state);
+    const second_hash = stateHash(&second.nodes.items[0].state);
+    if (!std.mem.eql(u8, &first_hash, &second_hash)) {
+        std.debug.print("Suimyaku replay divergence seed=0x{x}\n", .{seed});
+        return error.ReplayDiverged;
+    }
+}
+
 fn seedPlannerRepairPair(mesh: *Mesh, common_count: usize, unique_per_side: usize) !void {
     var i: usize = 0;
     while (i < common_count) : (i += 1) {
