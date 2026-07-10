@@ -24990,21 +24990,37 @@ pub const LinuxServer = struct {
         }
         switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, seen, now)) {
             .grant_local => {
-                // This node owns the detached session. Ship a migration capsule of
-                // the ghost's full state to the secured mesh BEFORE consuming it,
-                // so a future reconnect on any peer restores the complete session
-                // (nick/umodes/account/away/host/channels) rather than just a
-                // token grant. Best-effort; the local reclaim succeeds regardless.
+                // This node owns the detached session. Prefer the local detached
+                // snapshot first: the client may have followed a redirect back to
+                // the origin, and should get the same full-state restore as the
+                // ordinary local SESSION RESUME path.
+                const local_snapshot = if (migrate_token) |mt|
+                    self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, mt) catch null
+                else
+                    null;
+                defer if (local_snapshot) |bytes| self.allocator.free(bytes);
+                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
+
+                // If no local snapshot was available, best-effort ship a
+                // migration capsule of the ghost's live state to secured peers
+                // BEFORE consuming it, so a later reconnect elsewhere can still
+                // restore the complete session rather than just a token grant.
                 if (ghost) |g| {
-                    if (migrate_token) |mt| {
-                        if (self.connFor(clientIdFromMonitor(g))) |gconn| {
-                            self.shipSessionMigration(clientIdFromMonitor(g), gconn, account, mt);
+                    if (!restored) {
+                        if (migrate_token) |mt| {
+                            if (self.connFor(clientIdFromMonitor(g))) |gconn| {
+                                self.shipSessionMigration(clientIdFromMonitor(g), gconn, account, mt);
+                            }
                         }
                     }
                     _ = self.sessions.remove(account, g);
                 }
-                try self.noticeTo(conn, "SESSION RESUME: session reclaimed (cross-server)");
-                const event = std.fmt.bufPrint(&buf, "SESSION reclaimed cross-server account={s}", .{account}) catch return;
+                if (restored) {
+                    try self.noticeTo(conn, "SESSION RESUME: session restored (cross-server)");
+                } else {
+                    try self.noticeTo(conn, "SESSION RESUME: session reclaimed (cross-server)");
+                }
+                const event = std.fmt.bufPrint(&buf, "SESSION {s} cross-server account={s}", .{ if (restored) "restored" else "reclaimed", account }) catch return;
                 self.publishOperEvent(.service, .notice, event) catch {};
             },
             .grant_redirect => |node| {
@@ -35525,6 +35541,84 @@ test "threaded server: login auto-restores detached nick and all channels before
     try writeAllFd(fd_b, "WHOIS trev\r\n");
     try recvUntil(&b, " 318 trev trev ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TempResume") == null);
+}
+
+test "threaded server: mesh-token local resume restores detached snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-mesh-session-resume.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    const cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .mesh_pass = "mesh-reclaim-secret" };
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    var fd_a_open = true;
+    defer if (fd_a_open) closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK trev\r\nUSER trev 0 * :Trev\r\n");
+    try recvUntil(&a, " 001 trev ", 200);
+    try writeAllFd(fd_a, "REGISTER trev * correcthorse\r\n");
+    try recvUntil(&a, "REGISTER SUCCESS trev", 200);
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #root,#ops\r\n");
+    try recvUntil(&a, " 366 trev #root ", 200);
+    try recvUntil(&a, " 366 trev #ops ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(&a, "SESSION MTOKEN ", 200);
+    const marker = "SESSION MTOKEN ";
+    const mtok_start = (std.mem.indexOf(u8, a.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
+    const mtok_tail = a.written()[mtok_start..];
+    const mtok_len = std.mem.indexOfScalar(u8, mtok_tail, '\r') orelse return error.TestUnexpectedResult;
+    if (mtok_len > 1024) return error.TestUnexpectedResult;
+    var mtok_buf: [1024]u8 = undefined;
+    @memcpy(mtok_buf[0..mtok_len], mtok_tail[0..mtok_len]);
+    const mtok = mtok_buf[0..mtok_len];
+
+    try writeAllFd(fd_b, "NICK Helper\r\nUSER helper 0 * :Helper\r\n");
+    try recvUntil(&b, " 001 Helper ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "IDENTIFY trev correcthorse\r\n");
+    try recvUntil(&b, "You are now identified as trev", 200);
+
+    closeFd(fd_a);
+    fd_a_open = false;
+    testSleepMs(50);
+
+    b.reset();
+    var resume_line: [1200]u8 = undefined;
+    const line = try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{mtok});
+    try writeAllFd(fd_b, line);
+    try recvUntil(&b, "SESSION RESUME: session restored (cross-server)", 200);
+    try recvUntil(&b, "NICK :trev", 200);
+    try recvUntil(&b, "JOIN #root", 200);
+    try recvUntil(&b, "JOIN #ops", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "WHOIS trev\r\n");
+    try recvUntil(&b, " 318 trev trev ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "Helper") == null);
 }
 
 test "threaded server: OAUTHBEARER login does not auto-elevate oper" {
