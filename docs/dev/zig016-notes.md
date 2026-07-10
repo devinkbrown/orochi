@@ -46,9 +46,9 @@ Each file you create must be self-contained (import only `std`) so it can be tes
 
 ## Design references
 
-- `docs/planning/00-architecture.md` — canonical design + invention glossary (authority).
-- `docs/planning/01-substrate.md` .. `05-innovation.md` — detailed per-area design.
-- `docs/BRIEF.md` — mission + locked decisions.
+- `docs/architecture/00-overview.md` — subsystems, request flow, and source map (authoritative, source-cited).
+- `docs/reference/glossary.md` — codename key (Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, Ringlane, …).
+- `docs/reference/config.md` — full config schema, cited to `src/daemon/config_format.zig`.
 
 ## Clean-room and no-legacy mandate
 

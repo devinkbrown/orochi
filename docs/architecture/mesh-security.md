@@ -205,8 +205,7 @@ A per-datagram MAC on the kagura media **payload** itself would add
 defense-in-depth beyond the unguessable stream id, but the kagura frame is
 assembled in the Nexus/Ocean client JS (not this repo), so it requires a
 coordinated client + server change and is deliberately **not** stubbed
-server-only (it would be inert until the clients ship it). Tracked in
-[../audits/2026-06-15-orochi-vs-ophion-gap-audit.md](../audits/2026-06-15-orochi-vs-ophion-gap-audit.md).
+server-only (it would be inert until the clients ship it).
 
 ## Summary of guarantees
 

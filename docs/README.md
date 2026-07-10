@@ -13,7 +13,9 @@ holds against camping, and live operator introspection through `STATS Y`, `STATS
 richer `INFO`.
 
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
-[architecture overview](architecture/00-overview.md).
+[architecture overview](architecture/00-overview.md). The
+[codename glossary](reference/glossary.md) decodes the mythos vocabulary
+(Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, …).
 
 ## Operations
 
@@ -62,6 +64,7 @@ richer `INFO`.
 
 ## Protocol reference
 
+- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, Ringlane, Koshi, Tegami, MeshPass) mapped to source
 - [Numerics](reference/protocol/numerics.md)
 - [Modes](reference/protocol/modes.md) — user and channel modes, status prefixes
 - [ISUPPORT (005)](reference/protocol/isupport.md)
@@ -74,15 +77,8 @@ richer `INFO`.
 
 ## Configuration
 
-- [Config reference](reference/config.md) — every section and key, including `[limits].nick_delay` and `[class.*]`
+- [Config reference](reference/config.md) — every section and key, including `[limits].nick_delay` and `[class.*]`, cited to `src/daemon/config_format.zig`
 - [`etc/orochi.reference.toml`](../etc/orochi.reference.toml) — runnable, annotated example
-- [Config sweep](config-sweep/README.md) — per-subsystem audit of every config key against the source
-
-## Design notes
-
-`planning/` holds the original design intent (PRDs, architecture spikes) and `research/`
-holds the supporting research. Both are **historical**: where they disagree with current
-behavior, the guides and reference above — verified against the code — are authoritative.
 
 ## Project
 

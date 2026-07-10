@@ -87,7 +87,7 @@ observable in CI and tmux.
 
 ## Planning notes and divergences
 
-The planning docs remain useful design intent, especially `docs/planning/00-architecture.md`, `docs/planning/17-module-system.md`, `docs/planning/18-media-transport.md`, and `docs/planning/24-multithreading.md`. This architecture set treats current source as authoritative.
+This architecture set treats the current source as authoritative. The table below records places where the live code has moved ahead of, or diverged from, older design intent.
 
 | Topic | Current-code finding | Evidence |
 | --- | --- | --- |

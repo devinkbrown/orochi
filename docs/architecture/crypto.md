@@ -3,16 +3,13 @@
 *The cryptography implemented in the current Orochi source tree: primitives, TLS, the Tsumugi AKE, and the signed-object formats that protect mesh traffic.*
 
 This document describes the cryptography that exists in the current Orochi
-source tree. Intent notes from `docs/planning/02-crypto-tsumugi.md` and the
-opssl design inventory appear only where they match current code or clarify
-direction; current behavior is cited to `src/`.
+source tree. Every behavioral claim is cited to `src/`.
 
 ## Scope and stance
 
-Orochi is a clean-slate Zig-native successor to ophion. The brief states that
-the daemon, substrate, and opssl crypto/TLS library are rewritten from scratch
-in Zig, and that ophion, libop, and opssl are reference material only
-(`docs/BRIEF.md:3`, `docs/BRIEF.md:4`, `docs/BRIEF.md:5`, `docs/BRIEF.md:6`).
+Orochi is a clean-room, pure-Zig successor to the C ophion daemon: the daemon,
+substrate, and crypto/TLS library are all written from scratch in Zig, and
+ophion is not derived from as source (`README.md:3`, `README.md:133`).
 The pinned toolchain target is Zig 0.17.0-dev.1282+c0f9b51d8 (`build.zig.zon:34`).
 
 The crypto and TLS paths covered here are Zig modules built from `std.crypto`
@@ -31,10 +28,8 @@ the TLS listener wraps ordinary IRC clients in TLS 1.3 and is "no STARTTLS"
 state machine is scoped to TLS 1.3, X25519, Ed25519 leaf certificates, and
 AES-128-GCM / ChaCha20-Poly1305 (`src/crypto/tls_server.zig:1`,
 `src/crypto/tls_server.zig:6`, `src/crypto/tls_server.zig:7`,
-`src/crypto/tls_server.zig:8`). The planning note states the desired core TLS
-direction as TLS 1.3 only (`docs/planning/02-crypto-tsumugi.md:124`,
-`docs/planning/02-crypto-tsumugi.md:126`); the source above is the authority for
-what is implemented.
+`src/crypto/tls_server.zig:8`). The source above is the authority for what is
+implemented.
 
 ## Primitive inventory
 

@@ -123,6 +123,6 @@ ISUPPORT comes from `src/proto/protocol_inventory.zig`, not from module declarat
 
 ## Planning notes and divergences
 
-`docs/planning/17-module-system.md` is the design-intent document referenced by `module_core.zig`, `modules/manifest.zig`, and `introspect.zig`. Evidence: `src/daemon/module_core.zig:1`, `src/daemon/modules/manifest.zig:7`, `src/daemon/modules/introspect.zig:6`.
+The comptime module system is implemented across `module_core.zig`, `modules/manifest.zig`, and `introspect.zig`. Evidence: `src/daemon/module_core.zig:1`, `src/daemon/modules/manifest.zig:7`, `src/daemon/modules/introspect.zig:6`.
 
 The current source has moved daemon-owned post-registration commands into SerpentRegistry. Treat any planning or older request language that describes a live registered if/else command chain as historical, unless it points to the small non-command branches in `dispatchRegistered` for multiline, registry, WASM, and preregistration fallback. Evidence: `src/daemon/server.zig:3429`, `src/daemon/server.zig:3433`, `src/daemon/server.zig:3471`, `src/daemon/server.zig:3502`.

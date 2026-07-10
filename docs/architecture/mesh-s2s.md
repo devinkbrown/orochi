@@ -2,7 +2,7 @@
 
 *The Suimyaku mesh and server-to-server layer as implemented in the current source tree.*
 
-The planning documents define the direction: Suimyaku is the S2S CRDT mesh, Tsumugi is the secure handshake layer, Sazanami is gossip, and Goryu is the CRDT library ([docs/planning/04-suimyaku-mesh.md:5](../planning/04-suimyaku-mesh.md)). The S2S protocol plan explicitly rejects TS6/SID identity in favor of a sovereign node identity ([docs/planning/09-s2s-protocol.md:3](../planning/09-s2s-protocol.md), [docs/planning/09-s2s-protocol.md:6](../planning/09-s2s-protocol.md)). The code today implements a clean-room Orochi mesh, not a C Ophion clone.
+The mesh vocabulary (see the [glossary](../reference/glossary.md)): Suimyaku is the S2S CRDT mesh state model, Tsumugi is the secure handshake layer, Sazanami is the witnessed failure-detection gossip, and Goryu is the CRDT library. The design rejects TS6/SID identity in favor of a sovereign node identity. The code today implements a clean-room Orochi mesh, not a C ophion clone.
 
 ## Layer map
 
@@ -206,4 +206,4 @@ In the daemon, a `SESSION RESUME` token with non-local length is treated as a me
 
 ## Current implementation boundaries
 
-The source currently implements a frame-based peer driver and daemon relay path, not the full future banded protocol from the planning documents. `docs/planning/09-s2s-protocol.md` describes future bands, signed deltas, MeshPass, and Plumtree/RBSR work ([docs/planning/09-s2s-protocol.md:120](../planning/09-s2s-protocol.md), [docs/planning/09-s2s-protocol.md:214](../planning/09-s2s-protocol.md)). The source today has Tsumugi-secured link establishment, CRDT burst/delta/gossip frames, route-table-scoped message relay, membership frame projection, oper-grant sharing over secured links, and mesh-session reclaim. Where the code only provides pure helpers, this document calls that out: `writeNetjoin` exists, but the daemon does not call it; `LinkSession` contains repair message scheduling, but the live daemon peer path dispatches `s2s_frame` messages through `S2sPeer`.
+The source currently implements a frame-based peer driver and daemon relay path, not a full future banded protocol (bands, signed deltas, and Plumtree/RBSR-style optimizations remain design intent, not yet in the source). The source today has Tsumugi-secured link establishment, CRDT burst/delta/gossip frames, route-table-scoped message relay, membership frame projection, oper-grant sharing over secured links, and mesh-session reclaim. Where the code only provides pure helpers, this document calls that out: `writeNetjoin` exists, but the daemon does not call it; `LinkSession` contains repair message scheduling, but the live daemon peer path dispatches `s2s_frame` messages through `S2sPeer`.

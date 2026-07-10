@@ -87,4 +87,4 @@ The test suite contains an end-to-end threaded server test using `num_shards = 2
 
 ## Planning notes and divergences
 
-`docs/planning/06-threading.md`, `docs/planning/10-io-threading.md`, and `docs/planning/24-multithreading.md` describe the intended direction. Current code diverges in one important inline comment: `Config.num_shards` still says values greater than 1 are clamped to 1 at `runThreaded`, but the implementation starts the multi-reactor pool when `reactors.len > 1`. Evidence for the stale comment: `src/daemon/server.zig:987`; evidence for current behavior: `src/daemon/server.zig:2270`, `src/daemon/server.zig:2278`, `src/daemon/server.zig:2296`.
+Current code diverges from older design intent in one important inline comment: `Config.num_shards` still says values greater than 1 are clamped to 1 at `runThreaded`, but the implementation starts the multi-reactor pool when `reactors.len > 1`. Evidence for the stale comment: `src/daemon/server.zig:987`; evidence for current behavior: `src/daemon/server.zig:2270`, `src/daemon/server.zig:2278`, `src/daemon/server.zig:2296`.

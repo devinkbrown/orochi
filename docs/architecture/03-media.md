@@ -115,9 +115,9 @@ Browser and client WASM exports are separate from the daemon plugin host.
 
 ## Planning notes and divergences
 
-`docs/planning/18-media-transport.md`, `docs/planning/19-media-client-implementation.md`, and `docs/planning/20-media-interop.md` are design-intent references. The current code verifies these concrete pieces:
+Where older media-transport design intent has not fully landed in the source, the current code verifies these concrete pieces:
 
-| Planning topic | Current status | Evidence |
+| Topic | Current status | Evidence |
 | --- | --- | --- |
 | Runtime media SFU sizing | `max_participants` remains comptime-bound at 64; config-driven participant capacity is deferred. | `src/daemon/media_room.zig:14`, `src/daemon/media_room.zig:21`, `src/daemon/media_room.zig:24` |
 | Runtime kagura reassembly sizing | Runtime window defaults exist, but actual `ReassemblyBuffer` capacity remains comptime-bound. | `src/substrate/kagura_frame.zig:34`, `src/substrate/kagura_frame.zig:35`, `src/substrate/kagura_frame.zig:236` |
