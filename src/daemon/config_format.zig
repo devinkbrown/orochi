@@ -226,6 +226,9 @@ pub const Config = struct {
         /// Content-addressed plugin registry pins. Non-empty means only pinned
         /// plugins whose BLAKE3 digest matches are loadable.
         registry: []const wasm_bridge.RegistryPin = &.{},
+        /// Revoked plugin BLAKE3 digests. Matching bytes are refused regardless
+        /// of plugin name or registry pin.
+        revoked_blake3: []const [std.crypto.hash.Blake3.digest_length]u8 = &.{},
         /// Plugin names refused by the local trust policy / kill-switch.
         disabled_plugins: []const []const u8 = &.{},
     };
@@ -861,6 +864,7 @@ pub const Config = struct {
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
         freeWasmRegistry(allocator, self.wasm.registry);
+        allocator.free(self.wasm.revoked_blake3);
         freeStringList(allocator, self.wasm.disabled_plugins);
         allocator.free(self.listen.host);
         freeStringList(allocator, self.listen.trusted_proxies);
@@ -1008,6 +1012,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getArray("wasm.registry")) |arr| {
         freeWasmRegistry(allocator, cfg.wasm.registry);
         cfg.wasm.registry = try parseWasmRegistry(allocator, resolver, arr);
+    }
+    if (doc.getArray("wasm.revoked_blake3")) |arr| {
+        allocator.free(cfg.wasm.revoked_blake3);
+        cfg.wasm.revoked_blake3 = try parseHexArrayList(std.crypto.hash.Blake3.digest_length, allocator, arr);
     }
     if (doc.getArray("wasm.disabled_plugins")) |arr| {
         freeStringList(allocator, cfg.wasm.disabled_plugins);
@@ -1624,6 +1632,19 @@ fn parseHexArray(comptime len: usize, raw: []const u8) TomlError![len]u8 {
     return out;
 }
 
+fn parseHexArrayList(comptime len: usize, allocator: std.mem.Allocator, arr: []const toml.Value) TomlError![]const [len]u8 {
+    var list: std.ArrayList([len]u8) = .empty;
+    errdefer list.deinit(allocator);
+    for (arr) |*item| {
+        const raw = switch (item.*) {
+            .string => |s| s,
+            else => return error.ParseError,
+        };
+        try list.append(allocator, try parseHexArray(len, raw));
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 fn freeWasmRegistry(allocator: std.mem.Allocator, pins: []const wasm_bridge.RegistryPin) void {
     for (pins) |pin| allocator.free(pin.name);
     allocator.free(pins);
@@ -1836,6 +1857,7 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\[wasm]
         \\allowed_caps = ["reply", "STORE", "hooks", "net:outbound"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
+        \\revoked_blake3 = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         \\disabled_plugins = ["bad", "bridge-discord.wasm"]
         \\
     ;
@@ -1853,6 +1875,8 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
     try testing.expect(cfg.wasm.registry[0].signature != null);
     try testing.expectEqual(@as(u8, 0x11), cfg.wasm.registry[0].publisher.?[0]);
     try testing.expectEqual(@as(u8, 0x22), cfg.wasm.registry[0].signature.?[0]);
+    try testing.expectEqual(@as(usize, 1), cfg.wasm.revoked_blake3.len);
+    try testing.expectEqual(@as(u8, 0xaa), cfg.wasm.revoked_blake3[0][0]);
     try testing.expectEqual(@as(usize, 2), cfg.wasm.disabled_plugins.len);
     try testing.expectEqualStrings("bad", cfg.wasm.disabled_plugins[0]);
     try testing.expectEqualStrings("bridge-discord.wasm", cfg.wasm.disabled_plugins[1]);
@@ -1864,6 +1888,16 @@ test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown to
         \\irc = 6680
         \\[wasm]
         \\allowed_caps = ["reply", "net:inbound"]
+        \\
+    , .{}));
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\revoked_blake3 = ["aa"]
         \\
     , .{}));
 

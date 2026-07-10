@@ -62,6 +62,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.wasm_default_fuel = cfg.wasm.default_fuel;
     out.wasm_allowed_caps = cfg.wasm.allowed_caps;
     out.wasm_registry = cfg.wasm.registry;
+    out.wasm_revoked_hashes = cfg.wasm.revoked_blake3;
     out.wasm_disabled_plugins = cfg.wasm.disabled_plugins;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
@@ -891,6 +892,7 @@ test "wasm plugin_dir maps into the live config" {
         \\default_fuel = 1234
         \\allowed_caps = ["reply", "log", "hooks", "net:outbound"]
         \\registry = [{ name = "guard", blake3 = "0000000000000000000000000000000000000000000000000000000000000000", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" }]
+        \\revoked_blake3 = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         \\disabled_plugins = ["bridge-discord", "bad.wasm"]
         \\
     ;
@@ -910,6 +912,8 @@ test "wasm plugin_dir maps into the live config" {
     try testing.expectEqual(wasm_bridge.TrustTier.verified, loaded.config.wasm_registry[0].tier);
     try testing.expect(loaded.config.wasm_registry[0].publisher != null);
     try testing.expect(loaded.config.wasm_registry[0].signature != null);
+    try testing.expectEqual(@as(usize, 1), loaded.config.wasm_revoked_hashes.len);
+    try testing.expectEqual(@as(u8, 0xaa), loaded.config.wasm_revoked_hashes[0][0]);
     try testing.expectEqual(@as(usize, 2), loaded.config.wasm_disabled_plugins.len);
     try testing.expectEqualStrings("bridge-discord", loaded.config.wasm_disabled_plugins[0]);
     try testing.expectEqualStrings("bad.wasm", loaded.config.wasm_disabled_plugins[1]);

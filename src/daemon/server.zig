@@ -1450,6 +1450,9 @@ pub const Config = struct {
     /// Content-addressed plugin registry pins. Non-empty means only pinned
     /// plugins whose BLAKE3 digest matches are loadable. `[wasm] registry`.
     wasm_registry: []const wasm_bridge.RegistryPin = &.{},
+    /// Revoked plugin BLAKE3 digests refused regardless of name or registry pin.
+    /// `[wasm] revoked_blake3`.
+    wasm_revoked_hashes: []const [std.crypto.hash.Blake3.digest_length]u8 = &.{},
     /// Plugin names refused by the local trust policy / kill-switch.
     /// `[wasm] disabled_plugins`.
     wasm_disabled_plugins: []const []const u8 = &.{},
@@ -3489,6 +3492,7 @@ pub const LinuxServer = struct {
                 .default_fuel = config.wasm_default_fuel,
                 .allowed_caps = config.wasm_allowed_caps,
                 .registry = config.wasm_registry,
+                .revoked_hashes = config.wasm_revoked_hashes,
                 .disabled_plugins = config.wasm_disabled_plugins,
             }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
@@ -27810,6 +27814,7 @@ pub const LinuxServer = struct {
         self.config.wasm_default_fuel = parsed.wasm.default_fuel;
         self.config.wasm_allowed_caps = parsed.wasm.allowed_caps;
         self.config.wasm_registry = parsed.wasm.registry;
+        self.config.wasm_revoked_hashes = parsed.wasm.revoked_blake3;
         self.config.wasm_disabled_plugins = parsed.wasm.disabled_plugins;
         self.wasm.deinit();
         self.wasm = wasm_bridge.Bridge.initWithOptions(self.allocator, .{
@@ -27818,6 +27823,7 @@ pub const LinuxServer = struct {
             .default_fuel = self.config.wasm_default_fuel,
             .allowed_caps = self.config.wasm_allowed_caps,
             .registry = self.config.wasm_registry,
+            .revoked_hashes = self.config.wasm_revoked_hashes,
             .disabled_plugins = self.config.wasm_disabled_plugins,
         });
         self.loadWasmPlugins();
@@ -35600,6 +35606,8 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     registry_pin.signature = try publisher.signCtx(wasm_bridge.registry_signature_domain, transcript);
     const registry_pins = [_]wasm_bridge.RegistryPin{registry_pin};
     cfg.wasm_registry = &registry_pins;
+    const revoked_hashes = [_][std.crypto.hash.Blake3.digest_length]u8{@as([std.crypto.hash.Blake3.digest_length]u8, @splat(0xaa))};
+    cfg.wasm_revoked_hashes = &revoked_hashes;
     cfg.wasm_disabled_plugins = &.{"bad"};
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -35637,7 +35645,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM STATUS\r\n");
     try recvUntil(&admin, "OroWasm runtime status", 200);
-    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks registry_pins=1 signed_pins=1 disabled_plugins=1 blocked_loads=1", 200);
+    try recvUntil(&admin, "plugins=1 commands=0 hooks=1 allowed_caps=reply,hooks registry_pins=1 signed_pins=1 revoked_hashes=1 disabled_plugins=1 blocked_loads=1", 200);
     try recvUntil(&admin, "budgets max_plugin_bytes=4096 max_memory_bytes=131072 default_fuel=1234", 200);
 
     admin.reset();

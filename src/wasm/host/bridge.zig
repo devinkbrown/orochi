@@ -39,6 +39,7 @@ pub const RuntimeInfo = struct {
     allowed_caps: abi.CapabilitySet,
     registry_pin_count: usize,
     signed_registry_pin_count: usize,
+    revoked_hash_count: usize,
     disabled_plugin_count: usize,
     blocked_load_count: usize,
     max_memory_bytes: usize,
@@ -84,6 +85,7 @@ pub const Options = struct {
     default_fuel: u64 = default_fuel,
     allowed_caps: abi.CapabilitySet = default_allowed_caps,
     registry: []const RegistryPin = &.{},
+    revoked_hashes: []const [std.crypto.hash.Blake3.digest_length]u8 = &.{},
     disabled_plugins: []const []const u8 = &.{},
 };
 
@@ -236,6 +238,7 @@ pub const Bridge = struct {
             .allowed_caps = self.store.policy.allowed_caps,
             .registry_pin_count = self.options.registry.len,
             .signed_registry_pin_count = self.signedRegistryPinCount(),
+            .revoked_hash_count = self.options.revoked_hashes.len,
             .disabled_plugin_count = self.options.disabled_plugins.len,
             .blocked_load_count = self.blocked_loads,
             .max_memory_bytes = self.options.max_memory_bytes,
@@ -288,13 +291,18 @@ pub const Bridge = struct {
     }
 
     fn enforceRegistry(self: *Bridge, name: []const u8, wasm: []const u8) !void {
+        if (self.options.registry.len == 0 and self.options.revoked_hashes.len == 0) return;
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        std.crypto.hash.Blake3.hash(wasm, &digest, .{});
+        if (self.hashRevoked(digest)) {
+            self.blocked_loads += 1;
+            return error.PluginHashRevoked;
+        }
         if (self.options.registry.len == 0) return;
         const pin = self.findRegistryPin(name) orelse {
             self.blocked_loads += 1;
             return error.PluginUnpinned;
         };
-        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
-        std.crypto.hash.Blake3.hash(wasm, &digest, .{});
         if (!std.mem.eql(u8, digest[0..], pin.blake3[0..])) {
             self.blocked_loads += 1;
             return error.PluginHashMismatch;
@@ -326,6 +334,13 @@ pub const Bridge = struct {
             if (pluginNameMatches(name, pin.name)) return pin;
         }
         return null;
+    }
+
+    fn hashRevoked(self: *const Bridge, digest: [std.crypto.hash.Blake3.digest_length]u8) bool {
+        for (self.options.revoked_hashes) |revoked| {
+            if (std.mem.eql(u8, digest[0..], revoked[0..])) return true;
+        }
+        return false;
     }
 
     fn pluginTier(self: *const Bridge, name: []const u8) TrustTier {
@@ -810,6 +825,7 @@ test "runtimeInfo exposes OroWasm ABI budgets and loaded plugins" {
     try std.testing.expect(!info.allowed_caps.has(.time));
     try std.testing.expectEqual(@as(usize, 1), info.registry_pin_count);
     try std.testing.expectEqual(@as(usize, 1), info.signed_registry_pin_count);
+    try std.testing.expectEqual(@as(usize, 0), info.revoked_hash_count);
     try std.testing.expectEqual(@as(usize, 1), info.disabled_plugin_count);
     try std.testing.expectEqual(@as(usize, 2), info.blocked_load_count);
     try std.testing.expectEqual(@as(u64, 1234), info.default_fuel);
@@ -837,6 +853,21 @@ test "registry pins reject hash mismatches" {
 
     try std.testing.expectError(error.PluginHashMismatch, bridge.loadBytes("guard", &stop_hook_wasm_bytes));
     try std.testing.expectEqual(@as(usize, 1), bridge.runtimeInfo().blocked_load_count);
+}
+
+test "revoked hashes block plugins independent of registry pins" {
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&reply_wasm, &digest, .{});
+    var bridge = Bridge.initWithOptions(std.testing.allocator, .{
+        .revoked_hashes = &.{digest},
+    });
+    defer bridge.deinit();
+
+    try std.testing.expectError(error.PluginHashRevoked, bridge.loadBytes("renamed", &reply_wasm));
+    const info = bridge.runtimeInfo();
+    try std.testing.expectEqual(@as(usize, 1), info.revoked_hash_count);
+    try std.testing.expectEqual(@as(usize, 1), info.blocked_load_count);
+    try std.testing.expectEqual(@as(usize, 0), info.plugin_count);
 }
 
 test "registry pins verify publisher signatures" {

@@ -597,6 +597,10 @@ allow_anonymous = false
 # registry = [
 #   { name = "rss", blake3 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tier = "verified", publisher = "1111111111111111111111111111111111111111111111111111111111111111", signature = "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222" },
 # ]
+# Emergency content kill-switch. Entries are BLAKE3-256 hex digests of revoked
+# `.wasm` bytes and are refused regardless of plugin file name or registry pin.
+# Use this for per-version registry malware rescans or publisher compromise.
+# revoked_blake3 = []
 # Local plugin kill-switch. Entries match a plugin stem (`bridge-discord`) or
 # file name (`bridge-discord.wasm`) case-insensitively and are refused before the
 # `.wasm` file is read. Use this for registry trust incidents or emergency
