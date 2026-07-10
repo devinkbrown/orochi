@@ -141,6 +141,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.maxlist = cfg.limits.maxlist;
     out.chanlimit = cfg.limits.chanlimit;
     out.maxtargets = cfg.limits.maxtargets;
+    out.keylen = cfg.limits.keylen;
     out.modes_per_line = cfg.limits.modes_per_line;
     out.monitorlimit = cfg.limits.monitorlimit;
     out.silencelimit = cfg.limits.silencelimit;
@@ -526,6 +527,7 @@ test "config text overlays the server config" {
         \\discoverable = true
         \\[limits]
         \\max_clients = 2048
+        \\keylen = 24
         \\[mesh]
         \\realm = "ircxnet"
         \\mesh_pass = "shared-secret"
@@ -611,6 +613,7 @@ test "config text overlays the server config" {
     try testing.expect(loaded.config.network_discoverable);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+    try testing.expectEqual(@as(u32, 24), loaded.config.keylen);
     try testing.expectEqualStrings("ircxnet", loaded.config.mesh_realm);
     try testing.expectEqualStrings("shared-secret", loaded.config.mesh_pass);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_trust_roots.len);

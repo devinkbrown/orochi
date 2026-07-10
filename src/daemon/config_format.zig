@@ -360,6 +360,10 @@ pub const Config = struct {
         chanlimit: u32 = 50,
         /// Max comma-separated targets per PRIVMSG/NOTICE (advertised MAXTARGETS).
         maxtargets: u32 = 4,
+        /// Maximum channel-key (+k) length in bytes (advertised as KEYLEN and
+        /// enforced by the MODE +k handler). Capped at 64 — the chanmode
+        /// parser's hard key ceiling — so the two set-paths stay consistent.
+        keylen: u32 = 64,
         /// Channel-mode changes a client should combine per MODE command
         /// (advertised as MODES). Set to 1 for one mode/target per line.
         modes_per_line: u32 = 4,
@@ -1110,6 +1114,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.maxlist = @intCast(try uintField(doc, "limits.maxlist", cfg.limits.maxlist, 1, 10000));
     cfg.limits.chanlimit = @intCast(try uintField(doc, "limits.chanlimit", cfg.limits.chanlimit, 1, 10000));
     cfg.limits.maxtargets = @intCast(try uintField(doc, "limits.maxtargets", cfg.limits.maxtargets, 1, 64));
+    cfg.limits.keylen = @intCast(try uintField(doc, "limits.keylen", cfg.limits.keylen, 1, 64));
     cfg.limits.modes_per_line = @intCast(try uintField(doc, "limits.modes_per_line", cfg.limits.modes_per_line, 1, 20));
     cfg.limits.monitorlimit = @intCast(try uintField(doc, "limits.monitorlimit", cfg.limits.monitorlimit, 1, 100000));
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
@@ -1817,6 +1822,39 @@ test "parseToml: core sections project onto Config" {
     // Unspecified optional fields keep their defaults.
     try testing.expectEqual(@as(u64, 60_000), cfg.limits.ping_timeout_ms);
     try testing.expectEqualStrings("local", cfg.mesh.realm);
+}
+
+test "parseToml: [limits] keylen round-trips and rejects out-of-range" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\keylen = 40
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 40), cfg.limits.keylen);
+
+    // Absent key keeps the default.
+    var dflt = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqual(@as(u32, 64), dflt.limits.keylen);
+
+    // Parse boundaries accept: 1 (min) and 64 (the parser's key ceiling).
+    var lo = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=1\n", .{});
+    defer lo.deinit(allocator);
+    try testing.expectEqual(@as(u32, 1), lo.limits.keylen);
+    var hi = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=64\n", .{});
+    defer hi.deinit(allocator);
+    try testing.expectEqual(@as(u32, 64), hi.limits.keylen);
+
+    // 0 (below min) and 65 (above the parser's 64-byte ceiling) both fail closed.
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=0\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=65\n", .{}));
 }
 
 test "parseToml: backup section projects directory and cadence" {

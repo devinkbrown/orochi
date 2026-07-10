@@ -1296,6 +1296,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "CHANLIMIT=#&:{d}", .{cfg.chanlimit});
         } else if (std.mem.startsWith(u8, tok, "MAXTARGETS=")) {
             out[i] = try std.fmt.allocPrint(allocator, "MAXTARGETS={d}", .{cfg.maxtargets});
+        } else if (std.mem.startsWith(u8, tok, "KEYLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "KEYLEN={d}", .{cfg.keylen});
         } else if (std.mem.startsWith(u8, tok, "MONITOR=")) {
             out[i] = try std.fmt.allocPrint(allocator, "MONITOR={d}", .{cfg.monitorlimit});
         } else if (std.mem.startsWith(u8, tok, "SILENCE=")) {
@@ -1484,6 +1486,10 @@ pub const Config = struct {
     /// MAXTARGETS, enforced by handleMessage). Configurable via `[limits]
     /// maxtargets`.
     maxtargets: u32 = 4,
+    /// Maximum channel-key (+k) length in bytes (advertised as KEYLEN, enforced
+    /// by handleMode's +k branch). A value-typed field, so a live REHASH that
+    /// rebuilds Config never dangles. Configurable via `[limits] keylen`.
+    keylen: u32 = 64,
     /// How many channel-mode changes a client should combine per MODE command
     /// (advertised as MODES). Honored by mIRC/HexChat — set to 1 for one
     /// mode/target per line. Configurable via `[limits] modes_per_line`.
@@ -12194,6 +12200,10 @@ pub const LinuxServer = struct {
                         if (arg_index >= parsed.param_count) continue;
                         const key = parsed.paramSlice()[arg_index];
                         arg_index += 1;
+                        // KEYLEN: reject (do not truncate — a shortened key is a
+                        // different secret) an over-long +k key. Advertised in
+                        // ISUPPORT and enforced here, the primary key set-path.
+                        if (key.len > self.config.keylen) continue;
                         self.world.setChannelKey(channel, key) catch continue;
                         channel_state_changed = true;
                         appendParamMode(&applied, &targets, &emitted_sign, '+', 'k', key);
@@ -20003,7 +20013,12 @@ pub const LinuxServer = struct {
     fn channelBuiltinSet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8, deleting: bool) BuiltinSet {
         if (entity.kind != .channel) return .not_handled;
         if (std.ascii.eqlIgnoreCase(key, "MEMBERKEY")) {
-            if (!deleting and value.len > 31) return .bad_value; // draft cap
+            // MEMBERKEY is a live +k set-path, so it honors the advertised KEYLEN
+            // cap too — bounded by the stricter of the 31-byte draft cap and the
+            // configured keylen, keeping enforce-then-advertise honest when an
+            // operator lowers keylen below 31.
+            const member_key_cap: usize = @min(@as(usize, 31), self.config.keylen);
+            if (!deleting and value.len > member_key_cap) return .bad_value;
             self.world.setChannelKey(entity.id, if (deleting) null else value) catch return .bad_value;
             return .applied;
         }
@@ -37320,6 +37335,63 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try recvUntil(&a, " 369 A B ", 200);
 }
 
+test "threaded server: MODE +k enforces configured KEYLEN (reject over-long, accept at boundary)" {
+    // keylen = 8: a 10-byte key is rejected (channel stays unkeyed); an 8-byte
+    // key at the boundary is accepted. Enforce-then-advertise: the same cap that
+    // rides in ISUPPORT KEYLEN is what the +k handler refuses to exceed.
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .keylen = 8 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // Over-long key (10 > 8) is rejected: #k1 stays unkeyed, so B joins keyless.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #k1\r\n");
+    try recvUntil(&a, " 366 A #k1 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #k1 +k toolongkey\r\n");
+    a.reset();
+    try writeAllFd(fd_a, "MODE #k1\r\n");
+    try recvUntil(&a, " 324 A #k1 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "toolongkey") == null);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #k1\r\n");
+    try recvUntil(&b, " 366 B #k1 ", 200);
+
+    // Boundary key (exactly 8) is accepted and echoed; a keyless join is refused.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #k2\r\n");
+    try recvUntil(&a, " 366 A #k2 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #k2 +k pw8chars\r\n");
+    try recvUntil(&a, "MODE #k2 +k pw8chars", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #k2\r\n");
+    try recvUntil(&b, " 475 B #k2 ", 200);
+}
+
 test "threaded server: JOIN INVITE NAMES MODE and TOPIC RFC parity regressions" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -39625,7 +39697,7 @@ test "threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS" {
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12, .maxtargets = 3, .monitorlimit = 64, .silencelimit = 16 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12, .maxtargets = 3, .keylen = 40, .monitorlimit = 64, .silencelimit = 16 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var hits: usize = 0;
@@ -39638,13 +39710,14 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "MAXLIST=beIZ:25")) hits += 1;
         if (std.mem.eql(u8, tok, "CHANLIMIT=#&:12")) hits += 1;
         if (std.mem.eql(u8, tok, "MAXTARGETS=3")) hits += 1;
+        if (std.mem.eql(u8, tok, "KEYLEN=40")) hits += 1;
         if (std.mem.eql(u8, tok, "MONITOR=64")) hits += 1;
         if (std.mem.eql(u8, tok, "SILENCE=16")) hits += 1;
         if (std.mem.eql(u8, tok, "MODES=4")) hits += 1; // default modes_per_line
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 11), hits);
+    try std.testing.expectEqual(@as(usize, 12), hits);
     // base tokens + the three derived ones (PREFIX, STATUSMSG, MODES) appended.
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 3, tokens.len);
     // PREFIX/STATUSMSG come from the single source of truth, not a hardcoded copy.

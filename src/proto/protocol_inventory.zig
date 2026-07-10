@@ -80,6 +80,9 @@ pub const isupport_tokens = [_][]const u8{
     "MAXLIST=beIZ:100",
     "CHANLIMIT=#&:50",
     "MAXTARGETS=4",
+    // Max channel-key (+k) length. The boot override swaps this to the configured
+    // value; enforced by the daemon's MODE +k handler (server.zig).
+    "KEYLEN=64",
     "MONITOR=128",
     "SILENCE=32",
     "CASEMAPPING=ascii",
