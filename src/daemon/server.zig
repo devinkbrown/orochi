@@ -41007,6 +41007,49 @@ test "threaded server: LISTX filters on real channel SUBJECT from the PROP store
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "#beta") == null);
 }
 
+test "threaded server: LISTX inclusive >=N member-count threshold includes the boundary" {
+    // Proves the inclusive member-count filter over the real wire: a single
+    // client in #alpha makes it a 1-member channel, so `>=1` must include it
+    // where the strict `>1` (which the daemon already supported) excludes it.
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    a.* = .{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #alpha\r\n");
+    try recvUntil(a, " 366 A #alpha ", 200);
+
+    // `>=1` includes the 1-member channel (inclusive boundary).
+    a.reset();
+    try writeAllFd(fd_a, "LISTX >=1\r\n");
+    try recvUntil(a, " 817 ", 200); // RPL_LISTXEND
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 812 A #alpha ") != null);
+
+    // Strict `>1` excludes it: the 812 entry must be absent.
+    a.reset();
+    try writeAllFd(fd_a, "LISTX >1\r\n");
+    try recvUntil(a, " 817 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 812 A #alpha ") == null);
+}
+
 test "threaded server: LISTX emits PICS 813 after channel entries" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {

@@ -70,10 +70,15 @@ pub const Params = struct {
     }
 };
 
-/// Strict threshold comparison used by LISTX numeric filters.
+/// Threshold comparison used by LISTX numeric filters. Bare `>`/`<` are strict;
+/// the member-count filter also accepts inclusive `>=`/`<=` so "at least N"
+/// (a minimum member count) is expressible. The creation-age (`C`) and
+/// topic-age (`T`) filters keep the strict operators only.
 pub const Comparison = enum {
     greater_than,
     less_than,
+    greater_equal,
+    less_equal,
 
     fn fromByte(byte: u8) ?Comparison {
         return switch (byte) {
@@ -87,6 +92,8 @@ pub const Comparison = enum {
         return switch (self) {
             .greater_than => actual > threshold,
             .less_than => actual < threshold,
+            .greater_equal => actual >= threshold,
+            .less_equal => actual <= threshold,
         };
     }
 };
@@ -235,10 +242,20 @@ pub fn parseFilterWith(comptime params: Params, token: []const u8) ListxError!Fi
     try validateFilterBytes(token);
 
     if (token[0] == '>' or token[0] == '<') {
-        const comparison = Comparison.fromByte(token[0]).?;
+        // A trailing `=` makes the threshold inclusive: `>=N` / `<=N`. Detected
+        // here before the generic `X=<mask>` branch, which requires a leading
+        // letter, so there is no ambiguity. `parseDecimal` rejects an empty or
+        // non-numeric value (e.g. bare `>=`).
+        const is_greater = token[0] == '>';
+        const inclusive = token.len >= 2 and token[1] == '=';
+        const digits_start: usize = if (inclusive) 2 else 1;
+        const comparison: Comparison = if (is_greater)
+            (if (inclusive) .greater_equal else .greater_than)
+        else
+            (if (inclusive) .less_equal else .less_than);
         return .{ .criterion = .{ .member_count = .{
             .comparison = comparison,
-            .value = try parseDecimal(token[1..]),
+            .value = try parseDecimal(token[digits_start..]),
         } } };
     }
 
@@ -690,6 +707,53 @@ test "parse member count filters" {
     try std.testing.expectEqual(@as(u64, 10), request.filters[0].criterion.member_count.value);
     try std.testing.expectEqual(Comparison.less_than, request.filters[1].criterion.member_count.comparison);
     try std.testing.expectEqual(@as(u64, 50), request.filters[1].criterion.member_count.value);
+}
+
+test "LISTX inclusive member-count thresholds parse" {
+    const request = try parse(&.{">=10,<=50"});
+
+    try std.testing.expectEqual(@as(usize, 2), request.count);
+    try std.testing.expectEqual(Comparison.greater_equal, request.filters[0].criterion.member_count.comparison);
+    try std.testing.expectEqual(@as(u64, 10), request.filters[0].criterion.member_count.value);
+    try std.testing.expectEqual(Comparison.less_equal, request.filters[1].criterion.member_count.comparison);
+    try std.testing.expectEqual(@as(u64, 50), request.filters[1].criterion.member_count.value);
+}
+
+test "LISTX inclusive threshold includes the boundary value" {
+    const at_least_10 = try parse(&.{">=10"});
+    const at_most_10 = try parse(&.{"<=10"});
+    const boundary = ChannelInfo{ .name = "#edge", .members = 10, .created_ms = 0 };
+    const below = ChannelInfo{ .name = "#edge", .members = 9, .created_ms = 0 };
+    const above = ChannelInfo{ .name = "#edge", .members = 11, .created_ms = 0 };
+
+    // `>=10` admits exactly-10 where strict `>10` would reject it.
+    try std.testing.expect(at_least_10.matches(boundary, 0));
+    try std.testing.expect(at_least_10.matches(above, 0));
+    try std.testing.expect(!at_least_10.matches(below, 0));
+    try std.testing.expect(!(try parse(&.{">10"})).matches(boundary, 0));
+
+    // `<=10` admits exactly-10 where strict `<10` would reject it.
+    try std.testing.expect(at_most_10.matches(boundary, 0));
+    try std.testing.expect(at_most_10.matches(below, 0));
+    try std.testing.expect(!at_most_10.matches(above, 0));
+    try std.testing.expect(!(try parse(&.{"<10"})).matches(boundary, 0));
+}
+
+test "LISTX inclusive thresholds compose into a closed range" {
+    const request = try parse(&.{">=10,<=50"});
+    const in_range = ChannelInfo{ .name = "#a", .members = 10, .created_ms = 0 };
+    const top = ChannelInfo{ .name = "#b", .members = 50, .created_ms = 0 };
+    const too_big = ChannelInfo{ .name = "#c", .members = 51, .created_ms = 0 };
+
+    try std.testing.expect(request.matches(in_range, 0));
+    try std.testing.expect(request.matches(top, 0));
+    try std.testing.expect(!request.matches(too_big, 0));
+}
+
+test "LISTX inclusive threshold rejects a missing value" {
+    try std.testing.expectError(error.InvalidValue, parse(&.{">="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{"<="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{">=abc"}));
 }
 
 test "parse creation age filters" {
