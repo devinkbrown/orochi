@@ -153,12 +153,15 @@ Numerics are defined in [src/proto/numeric.zig](../../src/proto/numeric.zig).
 | Numeric | Meaning | Local user WHOIS | Remote (mesh) user WHOIS |
 | --- | --- | --- | --- |
 | `338` `RPL_WHOISACTUALLY` | real host / IP | Oper or self | Oper requester + field propagated (secured leg) |
-| `320` `RPL_WHOISSPECIAL` | GeoIP/ASN summary + rDNS name | Oper or self | Oper requester + real IP propagated (geo resolved locally) |
+| `320` `RPL_WHOISSPECIAL` | GeoIP/ASN summary + rDNS name; separate +R/+g message-restriction hints | Geo/rDNS: oper or self. +R/+g hints: any requester | Geo: oper requester + real IP propagated (geo resolved locally). +R/+g hints are local-user only |
 | `276` `RPL_WHOISCERTFP` | TLS client-cert fingerprint | Any requester (it is the value SASL EXTERNAL matches) | Oper requester + certfp propagated |
 
 Note the asymmetry: locally, `276` is not oper-gated (a client's certfp is not
 address-sensitive), but cross-mesh it rides the oper-info cap and is shown only
-to opers — a regular user never sees a remote user's certfp.
+to opers — a regular user never sees a remote user's certfp. `320` is also not
+only an identity line: the WHOIS builder emits additional public `320` lines for
+local targets in +R (registered senders only) and +g (caller-ID accept list)
+because those are message-delivery hints, not deanonymized host data.
 
 ## `[cloak]` configuration
 
