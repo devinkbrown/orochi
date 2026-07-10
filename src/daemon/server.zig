@@ -11404,6 +11404,7 @@ pub const LinuxServer = struct {
             const name = std.fmt.bufPrint(buf, "{s}{d}", .{ parent, n }) catch return null;
             if (!self.world.channelExists(name)) {
                 _ = self.world.cloneChannel(parent, name) catch return null;
+                self.clonePublicChannelProps(parent, name);
                 return name;
             }
             // An existing clone with room takes the join; a full one is skipped.
@@ -44174,6 +44175,75 @@ test "threaded server: CREATE clones template modes and rejects bad sources" {
     a.reset();
     try writeAllFd(fd_a, "MODE #nope\r\n");
     try recvUntil(&a, " 403 A #nope ", 200);
+}
+
+test "threaded server: cloneable full channel auto-clones portable public room state" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    try writeAllFd(fd_a, "JOIN #pool\r\n");
+    try recvUntil(&a, " 366 A #pool ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TOPIC #pool :portable pool\r\n");
+    try recvUntil(&a, "TOPIC #pool :portable pool", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #pool +b Bad!*@*\r\n");
+    try recvUntil(&a, "MODE #pool +b Bad!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #pool SUBJECT :overflow room\r\n");
+    try recvUntil(&a, " 818 A #pool SUBJECT :overflow room", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #pool OWNERKEY :template-secret\r\n");
+    try recvUntil(&a, " 818 A #pool OWNERKEY :template-secret", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #pool +d\r\n");
+    try recvUntil(&a, "MODE #pool +d", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #pool +l 1\r\n");
+    try recvUntil(&a, "MODE #pool +l 1", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #pool\r\n");
+    try recvUntil(&b, " 366 B #pool1 ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "TOPIC #pool1\r\n");
+    try recvUntil(&b, " 332 B #pool1 :portable pool", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #pool1 +b\r\n");
+    try recvUntil(&b, " 367 B #pool1 Bad!*@*", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PROP #pool1 SUBJECT\r\n");
+    try recvUntil(&b, " 818 B #pool1 SUBJECT :overflow room", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PROP #pool1 OWNERKEY\r\n");
+    try recvUntil(&b, " 819 B #pool1 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "template-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
 }
 
 test "threaded server: HELP topic + unknown" {
