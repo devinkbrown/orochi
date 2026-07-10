@@ -29,7 +29,13 @@ pub const Config = struct {
 
 /// Overlay media room keys from a parsed TOML document onto `cfg`.
 pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-    if (doc.getUint("media.max_participants")) |v| cfg.max_participants = @intCast(v);
+    if (doc.getUint("media.max_participants")) |v| {
+        // Clamp into [1, max_participants]. Zero would brick every call (join
+        // rejects when count() >= cap, and count() >= 0 is always true); a value
+        // above the inline Session(N) ceiling is meaningless and only masks the
+        // real limit that join enforces.
+        cfg.max_participants = std.math.clamp(@as(usize, @intCast(v)), 1, max_participants);
+    }
     if (doc.getUint("media.sfu.max_breakout_label_bytes")) |v| cfg.max_breakout_bytes = @intCast(v);
 }
 
@@ -544,6 +550,32 @@ test "applyToml overlays media participant and sfu breakout caps" {
     try m.join("#c", "alice", .voice);
     try m.setBreakout("#c", "alice", "engineering"); // truncated to 4 bytes
     try testing.expectEqualStrings("engi", m.breakoutOf("#c", "alice"));
+}
+
+test "applyToml clamps max_participants into the valid range" {
+    // Zero would brick every call: join compares count() >= min(cap, 256),
+    // and count() >= 0 is always true, so no participant could ever join.
+    // Clamp it up to at least 1.
+    {
+        var doc = try toml.parse(testing.allocator, "[media]\nmax_participants = 0\n");
+        defer doc.deinit(testing.allocator);
+        var cfg: Config = .{};
+        applyToml(&cfg, &doc);
+        try testing.expectEqual(@as(usize, 1), cfg.max_participants);
+
+        var m = MediaRooms.initConfig(testing.allocator, cfg);
+        defer m.deinit();
+        try m.join("#c", "alice", .voice); // still admits at least one
+        try testing.expectEqual(@as(usize, 1), m.roster("#c").len);
+    }
+    // A value above the inline Session ceiling is meaningless; clamp down to it.
+    {
+        var doc = try toml.parse(testing.allocator, "[media]\nmax_participants = 100000\n");
+        defer doc.deinit(testing.allocator);
+        var cfg: Config = .{};
+        applyToml(&cfg, &doc);
+        try testing.expectEqual(max_participants, cfg.max_participants);
+    }
 }
 
 test "join refuses new participants at runtime cap" {
