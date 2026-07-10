@@ -1064,9 +1064,10 @@ pub const ClientSession = struct {
         self.event_min_severity = sev;
     }
 
-    /// True when `sev` meets the session's minimum-severity threshold.
+    /// True when `sev` meets the session's minimum-severity threshold. Routed
+    /// through `EventSeverity.atLeast` so the ordinal ordering has one owner.
     pub fn severityWanted(self: *const ClientSession, sev: event_spine.EventSeverity) bool {
-        return @intFromEnum(sev) >= @intFromEnum(self.event_min_severity);
+        return sev.atLeast(self.event_min_severity);
     }
 
     /// The subject-glob scope for `category`, or `*` when none is set. Returns

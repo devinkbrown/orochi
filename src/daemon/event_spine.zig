@@ -82,7 +82,35 @@ pub const EventSeverity = enum {
         }
         return null;
     }
+
+    /// True when this severity ranks at or above `floor` in the fixed low→high
+    /// order (debug<info<notice<warn<error<critical) — the typed threshold
+    /// predicate for a min-severity filter, e.g. the per-session delivery floor
+    /// (`ClientSession.severityWanted`). Prefer this over open-coding an
+    /// `@intFromEnum` comparison; the declaration order it depends on is pinned
+    /// by the comptime guard below (which also protects `EVENT REPLAY`'s floor
+    /// and event-collapse's "never collapse ≥ warn" safety rule).
+    pub fn atLeast(self: EventSeverity, floor: EventSeverity) bool {
+        return @intFromEnum(self) >= @intFromEnum(floor);
+    }
 };
+
+comptime {
+    // `EventSeverity.atLeast`, the per-session delivery floor, `EVENT REPLAY`'s
+    // floor, and event-collapse's SAFETY rule ("severity ≥ warn is NEVER
+    // collapsed" — a kill/ward must always reach opers) all treat the enum's
+    // DECLARATION order as the severity order. Pin it so a reorder is a compile
+    // error HERE, rather than a silent mis-filter that could coalesce a kill or
+    // invert the collapse ceiling while the affected tests move in lockstep and
+    // stay green. Update this list — deliberately — when adding a level.
+    const ordered = [_]EventSeverity{ .debug, .info, .notice, .warn, .@"error", .critical };
+    if (ordered.len != @typeInfo(EventSeverity).@"enum".field_names.len)
+        @compileError("EventSeverity: add the new level to the ordered-severity guard");
+    for (ordered, 0..) |sev, i| {
+        if (@intFromEnum(sev) != i)
+            @compileError("EventSeverity ordinals must follow the low->high declaration order");
+    }
+}
 
 /// Bit mask over `EventCategory`.
 pub const CategoryMask = struct {
@@ -555,6 +583,27 @@ test "EventSeverity.parse and ordering supports a min-severity filter" {
     try std.testing.expect(@intFromEnum(EventSeverity.notice) < @intFromEnum(EventSeverity.warn));
     try std.testing.expect(@intFromEnum(EventSeverity.warn) < @intFromEnum(EventSeverity.@"error"));
     try std.testing.expect(@intFromEnum(EventSeverity.@"error") < @intFromEnum(EventSeverity.critical));
+}
+
+test "event spine severity threshold predicate atLeast follows the low->high order" {
+    const order = [_]EventSeverity{ .debug, .info, .notice, .warn, .@"error", .critical };
+    // atLeast(floor) is true exactly when self ranks at or above floor.
+    for (order, 0..) |sev, si| {
+        for (order, 0..) |floor, fi| {
+            try std.testing.expectEqual(si >= fi, sev.atLeast(floor));
+        }
+    }
+    // Reflexive at every level.
+    for (order) |sev| try std.testing.expect(sev.atLeast(sev));
+    // The event-collapse SAFETY boundary: warn and above clear a warn floor;
+    // notice and below do not (a kill/ward must never fall under it).
+    try std.testing.expect(EventSeverity.critical.atLeast(.warn));
+    try std.testing.expect(EventSeverity.@"error".atLeast(.warn));
+    try std.testing.expect(EventSeverity.warn.atLeast(.warn));
+    try std.testing.expect(!EventSeverity.notice.atLeast(.warn));
+    try std.testing.expect(!EventSeverity.debug.atLeast(.warn));
+    // A debug floor (the default session floor) admits everything.
+    for (order) |sev| try std.testing.expect(sev.atLeast(.debug));
 }
 
 test "IRCX event types parse from a bare token" {
