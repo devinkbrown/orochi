@@ -324,20 +324,18 @@ Evidence: `src/crypto/tsumugi_handshake.zig:418`,
 
 `src/daemon/secured_s2s_link.zig` frames only the TOFU prekey preamble, M1, and
 M2 with a u32 little-endian length. Once the AKE establishes, trailing and
-future bytes pass raw to the inner CRDT `S2sLink`; there is no double-framing
-(`src/daemon/secured_s2s_link.zig:3`, `src/daemon/secured_s2s_link.zig:5`,
-`src/daemon/secured_s2s_link.zig:6`, `src/daemon/secured_s2s_link.zig:7`,
-`src/daemon/secured_s2s_link.zig:8`, `src/daemon/secured_s2s_link.zig:222`,
-`src/daemon/secured_s2s_link.zig:223`, `src/daemon/secured_s2s_link.zig:227`,
-`src/daemon/secured_s2s_link.zig:285`, `src/daemon/secured_s2s_link.zig:288`).
-`beginCrdt` uses only the authenticated peer short id to initialize `S2sLink`;
-the `Established` AEAD keys are not passed into `S2sLink` there
-(`src/daemon/secured_s2s_link.zig:264`, `src/daemon/secured_s2s_link.zig:265`,
-`src/daemon/secured_s2s_link.zig:268`, `src/daemon/secured_s2s_link.zig:270`,
-`src/daemon/secured_s2s_link.zig:271`, `src/daemon/secured_s2s_link.zig:277`,
-`src/daemon/secured_s2s_link.zig:278`). Therefore, current live "secured S2S"
-authenticates the peer and derives keys, but the post-handshake CRDT stream is
-not shown in this adapter as encrypted with those `Established` keys.
+future bytes enter a Tsumugi record layer: complete records are AEAD-opened with
+the `Established` receive key and per-record counter AAD before plaintext reaches
+the inner CRDT `S2sLink`; outbound inner bytes are sealed with the send key,
+counter AAD, and a length-prefixed ciphertext+tag record
+(`src/daemon/secured_s2s_link.zig:4`, `src/daemon/secured_s2s_link.zig:13`,
+`src/daemon/secured_s2s_link.zig:43`, `src/daemon/secured_s2s_link.zig:66`,
+`src/daemon/secured_s2s_link.zig:760`, `src/daemon/secured_s2s_link.zig:884`,
+`src/daemon/secured_s2s_link.zig:911`, `src/daemon/secured_s2s_link.zig:916`,
+`src/daemon/secured_s2s_link.zig:930`, `src/daemon/secured_s2s_link.zig:953`,
+`src/daemon/secured_s2s_link.zig:954`). The inner link still owns semantic
+`s2s_frame` parsing, so there is no semantic double-framing: Tsumugi secures the
+byte stream, and `S2sLink` decodes the recovered frame stream.
 
 The server enables secured S2S only when `node_identity` and `crypto_io` are
 configured (`src/daemon/server.zig:2582`, `src/daemon/server.zig:2583`,
@@ -352,7 +350,18 @@ Inside the CRDT peer driver, secured links pass the node Ed25519 signing key int
 `mesh.require_signed_frames` defaults true: when this node has a signing key, a
 remote peer that does not advertise signing is rejected during handshake, and
 unsigned direct-owned state frames are dropped unless the operator explicitly
-sets that key false for a mixed rollout (`src/substrate/suimyaku/s2s_peer.zig`).
+sets that key false for a mixed rollout. The same peer path now also
+capability-gates signed Merkle repair frames (`REPAIR_SUMMARY`,
+`REPAIR_REQUEST`, `REPAIR_RESPONSE`) and applies valid repair responses through
+the CRDT repair substrate before requesting daemon resync
+(`src/proto/s2s_frame.zig:151`, `src/proto/s2s_frame.zig:166`,
+`src/proto/s2s_frame.zig:169`, `src/substrate/suimyaku/s2s_peer.zig:55`,
+`src/substrate/suimyaku/s2s_peer.zig:67`,
+`src/substrate/suimyaku/s2s_peer.zig:592`,
+`src/substrate/suimyaku/s2s_peer.zig:696`,
+`src/substrate/suimyaku/s2s_peer.zig:2118`,
+`src/substrate/suimyaku/s2s_peer.zig:2134`,
+`src/substrate/suimyaku/s2s_peer.zig:2146`).
 
 ## opssl TLS library and daemon use
 
