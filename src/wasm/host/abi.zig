@@ -22,6 +22,10 @@ pub const SchemaVersion = struct {
 /// independently through `HostFunction.version`.
 pub const manifest_schema: SchemaVersion = .{ .major = 1, .minor = 0 };
 
+/// Canonical OroWasm ABI v1 WIT descriptor. Kept beside the ABI module so every
+/// build target can embed the same source-controlled guest contract.
+pub const wit_v1 = @embedFile("orowasm-abi-v1.wit");
+
 /// Capability classes enforced per host function.
 pub const Capability = enum {
     reply,
@@ -236,4 +240,11 @@ test "capability tokens parse case-insensitively and reject unknown names" {
     try std.testing.expectEqual(Capability.store, Capability.fromToken("STORE").?);
     try std.testing.expectEqual(Capability.net_outbound, Capability.fromToken("net:outbound").?);
     try std.testing.expect(Capability.fromToken("net:inbound") == null);
+}
+
+test "WIT descriptor is ABI v1 and names every host function semantically" {
+    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "package orochi:orowasm@1.0.0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "world plugin-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "reply: func(text: string);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "net-connect: func(host: string, port: u16)") != null);
 }

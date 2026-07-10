@@ -35712,6 +35712,12 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     try recvUntil(&admin, "hostcall net_connect v1.0 cap=net:outbound min_tier=verified", 200);
 
     admin.reset();
+    try writeAllFd(fd_admin, "OROWASM WIT\r\n");
+    try recvUntil(&admin, "OroWasm ABI WIT v1", 200);
+    try recvUntil(&admin, "package orochi:orowasm@1.0.0;", 200);
+    try recvUntil(&admin, "net-connect: func(host: string, port: u16)", 200);
+
+    admin.reset();
     try writeAllFd(fd_admin, "OROWASM PLUGINS\r\n");
     try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none)", 200);
 }

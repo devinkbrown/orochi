@@ -97,7 +97,7 @@ fn commands(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     try core.reply(.RPL_ENDOFINFO, &.{}, "End of COMMANDS");
 }
 
-/// OROWASM [STATUS|ABI|PLUGINS] — oper runtime view of the OroWasm host ABI,
+/// OROWASM [STATUS|ABI|WIT|PLUGINS] — oper runtime view of the OroWasm host ABI,
 /// resource budgets, allowed host capabilities, and loaded plugin registrations.
 fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     const core = Core.from(ctx);
@@ -156,6 +156,18 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         return;
     }
 
+    if (std.ascii.eqlIgnoreCase(view, "WIT")) {
+        try core.reply(.RPL_INFOSTART, &.{}, "OroWasm ABI WIT v1");
+        var it = std.mem.splitScalar(u8, wasm_abi.wit_v1, '\n');
+        while (it.next()) |raw| {
+            const row = std.mem.trim(u8, raw, "\r");
+            if (row.len == 0) continue;
+            try core.reply(.RPL_INFO, &.{}, row);
+        }
+        try core.reply(.RPL_ENDOFINFO, &.{}, "End of OROWASM");
+        return;
+    }
+
     if (std.ascii.eqlIgnoreCase(view, "PLUGINS")) {
         try core.reply(.RPL_INFOSTART, &.{}, "OroWasm plugins");
         var i: usize = 0;
@@ -178,7 +190,7 @@ fn orowasm(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         return;
     }
 
-    try core.reply(.RPL_ENDOFINFO, &.{}, "Usage: OROWASM [STATUS|ABI|PLUGINS]");
+    try core.reply(.RPL_ENDOFINFO, &.{}, "Usage: OROWASM [STATUS|ABI|WIT|PLUGINS]");
 }
 
 pub const module = registry.Module{
@@ -188,7 +200,7 @@ pub const module = registry.Module{
         .{ .name = "MODULES", .handler = modules, .summary = "list loaded registry modules" },
         .{ .name = "MODLIST", .handler = modules, .summary = "alias of MODULES" },
         .{ .name = "COMMANDS", .access = .any, .handler = commands, .summary = "discover commands you can run" },
-        .{ .name = "OROWASM", .access = .oper, .handler = orowasm, .summary = "inspect OroWasm ABI, budgets, and plugins" },
+        .{ .name = "OROWASM", .access = .oper, .handler = orowasm, .summary = "inspect OroWasm ABI, WIT, budgets, and plugins" },
     },
 };
 

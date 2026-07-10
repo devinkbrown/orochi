@@ -1,0 +1,37 @@
+package orochi:orowasm@1.0.0;
+
+interface host {
+  // cap: reply
+  reply: func(text: string);
+
+  // cap: log
+  log: func(text: string);
+
+  // cap: time
+  now-ms: func() -> s64;
+
+  // cap: rand
+  rand: func(len: u32) -> list<u8>;
+
+  // cap: store
+  store-get: func(key: string) -> option<string>;
+  store-put: func(key: string, value: string);
+
+  // cap: lookup
+  lookup-client: func(nick: string) -> option<string>;
+
+  // cap: hooks
+  subscribe-hook: func(name: string);
+
+  // cap: net:outbound, min tier: verified
+  net-connect: func(host: string, port: u16) -> result<u32, string>;
+}
+
+world plugin-v1 {
+  import host;
+
+  // Exports named cmd_<command> register IRC commands.
+  // Exports named hook_<hook> register daemon hooks.
+  // A legacy handle export registers as the plugin filename stem.
+  export run: func(args: list<string>) -> s32;
+}

@@ -595,7 +595,7 @@ below. Source: struct `OperSection` at `src/daemon/config_format.zig`, mapping a
 
 ## `[wasm]`
 
-OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format.zig`, mapping at `src/daemon/config_boot.zig`, loaded by `src/daemon/server.zig` `loadWasmPlugins` (boot and REHASH), dispatched via `src/wasm/host/bridge.zig`.
+OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format.zig`, mapping at `src/daemon/config_boot.zig`, loaded by `src/daemon/server.zig` `loadWasmPlugins` (boot and REHASH), dispatched via `src/wasm/host/bridge.zig`. The canonical guest ABI v1 descriptor lives at `src/wasm/host/orowasm-abi-v1.wit`, is embedded by `src/wasm/host/abi.zig`, and is visible to opers through `OROWASM WIT`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|

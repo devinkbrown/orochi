@@ -153,11 +153,11 @@ The `query.info` module registers the stateless server-information commands (`sr
 
 ## OROWASM
 
-- Syntax: `OROWASM [STATUS|ABI|PLUGINS]`
-- Description: Oper-only runtime introspection for the OroWasm app-platform host. `STATUS` reports loaded plugin counts, command/hook registrations, allowed host capabilities, configured registry pins, signed registry pins, revoked plugin hashes, disabled-plugin kill-switch entries, blocked load attempts, plugin directory, and resource budgets. `ABI` reports the manifest schema, hostcall table, and minimum registry trust tier for each hostcall. `PLUGINS` lists each loaded plugin handle with trust tier, whether its registry pin was publisher-signed, command/hook counts, and granted capabilities.
+- Syntax: `OROWASM [STATUS|ABI|WIT|PLUGINS]`
+- Description: Oper-only runtime introspection for the OroWasm app-platform host. `STATUS` reports loaded plugin counts, command/hook registrations, allowed host capabilities, configured registry pins, signed registry pins, revoked plugin hashes, disabled-plugin kill-switch entries, blocked load attempts, plugin directory, and resource budgets. `ABI` reports the manifest schema, hostcall table, and minimum registry trust tier for each hostcall. `WIT` streams the canonical OroWasm ABI v1 WIT descriptor embedded from `src/wasm/host/orowasm-abi-v1.wit` through `src/wasm/host/abi.zig`, so opers can verify the live daemon's guest contract without reading local files. `PLUGINS` lists each loaded plugin handle with trust tier, whether its registry pin was publisher-signed, command/hook counts, and granted capabilities.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: Optional view name; defaults to `STATUS`.
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: `ERR_NOPRIVILEGES 481` for non-opers.
-- Example: `OROWASM ABI`
-- Sources: `src/daemon/modules/introspect.zig:101`, `src/wasm/host/bridge.zig:32`
+- Example: `OROWASM WIT`
+- Sources: `src/daemon/modules/introspect.zig:101`, `src/wasm/host/abi.zig:28`, `src/wasm/host/orowasm-abi-v1.wit:1`, `src/wasm/host/bridge.zig:32`
