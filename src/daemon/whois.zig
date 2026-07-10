@@ -122,6 +122,16 @@ pub const WhoisSubject = struct {
     /// Free-form GeoIP/ASN summary, surfaced as RPL_WHOISSPECIAL (320). Built by
     /// the daemon from the MaxMind database when one is loaded.
     geo: ?[]const u8 = null,
+    /// RPL_WHOISSPECIAL (320): the target is in +R (regonly-pm) mode and only
+    /// accepts private messages/notices from senders logged in to a registered
+    /// account. Surfaced to every requester — not oper-gated — so a sender learns
+    /// their message will be filtered before trying, mirroring the standard
+    /// message-restriction WHOIS line other networks emit. Off ⇒ no line.
+    regonly_msgs: bool = false,
+    /// RPL_WHOISSPECIAL (320): the target is in +g (caller-ID) mode and only
+    /// receives private messages from senders on its ACCEPT list. Like
+    /// `regonly_msgs`, a public messaging hint rather than a privacy field.
+    callerid: bool = false,
     channels: []const ChannelMembership = &.{},
 };
 
@@ -221,7 +231,17 @@ pub fn writeWhoisWith(
         try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick, subject.secure_cipher);
     }
     if (subject.geo) |geo_text| {
-        try writeWhoisGeoLine(params, sink, server_name, requester_nick, subject.nick, geo_text);
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, geo_text);
+    }
+    // Message-restriction hints (RPL_WHOISSPECIAL 320): tell any requester their
+    // PM will be filtered. Fixed, static trailings — no attacker input, so no
+    // per-field validation is required. +R is checked first to mirror the
+    // daemon's send-path ordering (regonly-pm gate before caller-ID).
+    if (subject.regonly_msgs) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is only accepting private messages from registered users");
+    }
+    if (subject.callerid) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is only accepting private messages from users on its accept list");
     }
     if (subject.away) |away_message| {
         try writeAwayLine(params, sink, server_name, requester_nick, subject.nick, away_message);
@@ -597,19 +617,22 @@ fn writeWhoisOperatorLine(
     try sink.commitLine(&b);
 }
 
-fn writeWhoisGeoLine(
+/// Emit one RPL_WHOISSPECIAL (320) line with a caller-supplied trailing. Shared
+/// by the GeoIP/ASN summary and the +R/+g message-restriction hints; 320 is a
+/// repeatable free-form line, so several may appear in a single WHOIS.
+fn writeWhoisSpecialLine(
     comptime params: Params,
     sink: *WhoisLineSink,
     server_name: []const u8,
     requester_nick: []const u8,
     subject_nick: []const u8,
-    geo_text: []const u8,
+    trailing: []const u8,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
     try b.numericPrefix(whois_special_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
-    try b.spaceTrailing(geo_text);
+    try b.spaceTrailing(trailing);
     try b.crlf();
     try sink.commitLine(&b);
 }
@@ -1039,6 +1062,107 @@ test "leading-colon actual_host is skipped but the WHOIS still completes" {
     }
     try std.testing.expect(!has_338); // skipped (no malformed param)
     try std.testing.expect(has_318); // but the reply still completes
+}
+
+test "regonly_msgs (+R) emits a RPL_WHOISSPECIAL 320 restriction line before end" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.regonly_msgs = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var idx_320: ?usize = null;
+    var idx_end: usize = 0;
+    for (lines, 0..) |line, i| {
+        if (std.mem.indexOf(u8, line.bytes, " 320 ") != null) {
+            idx_320 = i;
+            try std.testing.expectEqualStrings(
+                ":irc.example 320 dan alice :is only accepting private messages from registered users\r\n",
+                line.bytes,
+            );
+        }
+        if (std.mem.indexOf(u8, line.bytes, " 318 ") != null) idx_end = i;
+    }
+    try std.testing.expect(idx_320 != null);
+    try std.testing.expect(idx_320.? < idx_end); // before End of /WHOIS
+}
+
+test "callerid (+g) emits its own RPL_WHOISSPECIAL 320 line" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.callerid = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var found = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 320 ") != null) {
+            found = true;
+            try std.testing.expectEqualStrings(
+                ":irc.example 320 dan alice :is only accepting private messages from users on its accept list\r\n",
+                line.bytes,
+            );
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "both +R and +g emit two distinct 320 lines, +R first" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.regonly_msgs = true;
+    subject.callerid = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var idx_reg: ?usize = null;
+    var idx_cid: ?usize = null;
+    for (lines, 0..) |line, i| {
+        if (std.mem.indexOf(u8, line.bytes, "registered users") != null) idx_reg = i;
+        if (std.mem.indexOf(u8, line.bytes, "its accept list") != null) idx_cid = i;
+    }
+    try std.testing.expect(idx_reg != null);
+    try std.testing.expect(idx_cid != null);
+    try std.testing.expect(idx_reg.? < idx_cid.?); // +R checked before +g, mirroring the send path
+}
+
+test "no message-restriction umodes leaves the WHOIS byte-identical (no 320)" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    // sampleSubject sets neither regonly_msgs, callerid, nor geo.
+    try writeWhois(&sink, "irc.example", "dan", sampleSubject());
+
+    for (sink.slice()) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line.bytes, " 320 ") == null);
+    }
+}
+
+test "restriction 320s coexist with a geo 320 (multiple RPL_WHOISSPECIAL lines)" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.geo = "US · AS64500 ExampleNet";
+    subject.regonly_msgs = true;
+    subject.callerid = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var count_320: usize = 0;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 320 ") != null) count_320 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count_320); // geo + regonly + callerid
 }
 
 test "ERR_NOSUCHNICK builder emits 401" {

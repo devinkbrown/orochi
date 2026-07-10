@@ -13128,6 +13128,13 @@ pub const LinuxServer = struct {
                 break :blk @intCast(@max(@as(i64, 0), @divTrunc(signon_unix_ms, 1000)));
             },
             .geo = special,
+            // RPL_WHOISSPECIAL (320) message-restriction hints, shown to every
+            // requester so a sender learns their PM will be filtered before
+            // trying: +R (regonly-pm) only accepts messages from registered
+            // senders; +g (caller-ID) only from accept-listed senders. Both are
+            // enforced on the PRIVMSG/NOTICE path; here we only reflect the mode.
+            .regonly_msgs = tconn.session.umodes.contains(.regonly_pm),
+            .callerid = tconn.session.umodes.contains(.callerid),
             // RPL_WHOISSERVER (312) trailing: this node's configured description
             // (`[network] description`), mirroring the per-server description a
             // remote node gossips for its own users.
