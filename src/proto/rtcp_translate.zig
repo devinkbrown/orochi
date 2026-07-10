@@ -55,6 +55,10 @@ pub const pt_psfb: u8 = pli_fir.pt_psfb; // 206
 /// Transport-layer feedback message type: Generic NACK (RFC 4585 §6.2.1).
 pub const fmt_nack: u5 = 1;
 
+/// The fixed RTCP common header (V/P/count, PT, length) shared by every packet
+/// in a compound, in bytes. The length field it carries delimits each sub-packet.
+const rtcp_common_header_len: usize = 4;
+
 /// Common RTCP feedback header + the two SSRC fields, in bytes.
 const header_len: usize = 12;
 
@@ -169,6 +173,51 @@ pub fn parse(rtcp_packet: []const u8, seq_out: []u16) Error!Feedback {
         return Feedback{ .nack = .{ .media_ssrc = media_ssrc, .seqs = seq_out[0..written] } };
     }
 
+    return Feedback.other;
+}
+
+/// Parse a possibly-COMPOUND inbound RTCP datagram (RFC 3550 §6.1) and return the
+/// first feedback intent it carries. Unlike `parse` (which classifies a single
+/// packet at offset 0 and treats the whole tail as its FCI), this walks each
+/// sub-packet by its own length field. That matters because the mandatory
+/// compound shape a browser sends without `rtcp-rsize` leads with a Sender/
+/// Receiver Report (and often an SDES chunk) BEFORE the PLI/FIR/NACK — feeding
+/// such a datagram to `parse` sees the SR/RR at offset 0 and drops the feedback
+/// as `.other`, freezing video (a keyframe request never reaches the publisher).
+///
+/// The first PSFB (PLI/FIR) or RTPFB (Generic NACK) sub-packet wins; leading and
+/// interleaved non-feedback sub-packets (SR/RR/SDES/BYE/REMB/TWCC/…) are skipped.
+/// A NACK's FCI is delimited by that NACK packet's length, so trailing compound
+/// packets can never be mis-read as extra lost-sequence numbers.
+///
+/// Fail-closed: every sub-packet header is bounds- and version-checked before use;
+/// a truncated datagram or a bad RTCP version is rejected, and a malformed
+/// feedback sub-packet propagates its `parse` error rather than being accepted.
+pub fn parseCompound(datagram: []const u8, seq_out: []u16) Error!Feedback {
+    var pos: usize = 0;
+    while (pos < datagram.len) {
+        if (datagram.len - pos < rtcp_common_header_len) return Error.Truncated;
+
+        const version: u2 = @intCast(datagram[pos] >> 6);
+        if (version != rtcp_version) return Error.BadFormat;
+
+        const words_minus_one = std.mem.readInt(u16, datagram[pos + 2 ..][0..2], .big);
+        const sub_len = (@as(usize, words_minus_one) + 1) * 4;
+        if (sub_len < rtcp_common_header_len) return Error.BadFormat;
+        if (datagram.len - pos < sub_len) return Error.Truncated;
+
+        const sub = datagram[pos .. pos + sub_len];
+        const pt = sub[1];
+        if (pt == pt_psfb or pt == pt_rtpfb) {
+            // Classify the exact sub-slice: `parse` reads FCI as `sub[12..]`, which
+            // is precisely this packet's FCI now that `sub` is trimmed to sub_len.
+            switch (try parse(sub, seq_out)) {
+                .other => {}, // recognized RTCP type, just not a shape we translate
+                else => |fb| return fb,
+            }
+        }
+        pos += sub_len;
+    }
     return Feedback.other;
 }
 
@@ -385,6 +434,130 @@ test "parse returns TooMany when seq_out cannot hold all NACK seqs" {
     std.mem.writeInt(u16, pkt[14..16], 0b111, .big); // 3 follow-ups -> 4 total
 
     try std.testing.expectError(Error.TooMany, parse(&pkt, &seq_buf));
+}
+
+// A minimal Receiver Report (PT=201, RC=0): 8-byte header + reporter SSRC.
+fn writeMinimalRr(out: *[8]u8, ssrc: u32) []const u8 {
+    out[0] = @as(u8, rtcp_version) << 6; // V=2, P=0, RC=0
+    out[1] = 201;
+    std.mem.writeInt(u16, out[2..4], (8 / 4) - 1, .big);
+    std.mem.writeInt(u32, out[4..8], ssrc, .big);
+    return out[0..8];
+}
+
+// A minimal Sender Report (PT=200, RC=0): 28-byte header + sender info.
+fn writeMinimalSr(out: *[28]u8, ssrc: u32) []const u8 {
+    @memset(out, 0);
+    out[0] = @as(u8, rtcp_version) << 6;
+    out[1] = 200;
+    std.mem.writeInt(u16, out[2..4], (28 / 4) - 1, .big);
+    std.mem.writeInt(u32, out[4..8], ssrc, .big);
+    return out[0..28];
+}
+
+test "RTCP compound RR then PLI resolves keyframe_request" {
+    var seq_buf: [128]u16 = undefined;
+    var buf: [64]u8 = undefined;
+
+    var rr: [8]u8 = undefined;
+    _ = writeMinimalRr(&rr, 0x11111111);
+    const pli = try pli_fir.buildPli(0xDEADBEEF, 0x0BADF00D, buf[8..]);
+
+    var compound: [8 + 12]u8 = undefined;
+    @memcpy(compound[0..8], &rr);
+    @memcpy(compound[8..], pli);
+
+    // `parse` alone misclassifies (sees the RR at offset 0) — the bug this fixes.
+    try std.testing.expect((try parse(&compound, &seq_buf)) == .other);
+
+    const fb = try parseCompound(&compound, &seq_buf);
+    switch (fb) {
+        .keyframe_request => |k| try std.testing.expectEqual(@as(u32, 0x0BADF00D), k.media_ssrc),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "RTCP compound SR then NACK resolves nack with FCI delimited by length" {
+    var seq_buf: [128]u16 = undefined;
+
+    var sr: [28]u8 = undefined;
+    _ = writeMinimalSr(&sr, 0x22222222);
+
+    // NACK: PID=1000, BLP=0b101 -> {1000,1001,1003}, declared length = 16 bytes.
+    var nack: [16]u8 = undefined;
+    nack[0] = (@as(u8, rtcp_version) << 6) | fmt_nack;
+    nack[1] = pt_rtpfb;
+    std.mem.writeInt(u16, nack[2..4], (16 / 4) - 1, .big);
+    std.mem.writeInt(u32, nack[4..8], 0xAAAAAAAA, .big);
+    std.mem.writeInt(u32, nack[8..12], 0xBBBBBBBB, .big);
+    std.mem.writeInt(u16, nack[12..14], 1000, .big);
+    std.mem.writeInt(u16, nack[14..16], 0b101, .big);
+
+    // Append a trailing RR after the NACK: its bytes must NOT be read as FCI.
+    var rr: [8]u8 = undefined;
+    _ = writeMinimalRr(&rr, 0x33333333);
+
+    var compound: [28 + 16 + 8]u8 = undefined;
+    @memcpy(compound[0..28], &sr);
+    @memcpy(compound[28..44], &nack);
+    @memcpy(compound[44..], &rr);
+
+    const fb = try parseCompound(&compound, &seq_buf);
+    switch (fb) {
+        .nack => |n| {
+            try std.testing.expectEqual(@as(u32, 0xBBBBBBBB), n.media_ssrc);
+            try std.testing.expectEqualSlices(u16, &[_]u16{ 1000, 1001, 1003 }, n.seqs);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "RTCP compound with only reports yields other" {
+    var seq_buf: [8]u16 = undefined;
+    var sr: [28]u8 = undefined;
+    _ = writeMinimalSr(&sr, 0x1);
+    var rr: [8]u8 = undefined;
+    _ = writeMinimalRr(&rr, 0x2);
+
+    var compound: [28 + 8]u8 = undefined;
+    @memcpy(compound[0..28], &sr);
+    @memcpy(compound[28..], &rr);
+
+    try std.testing.expect((try parseCompound(&compound, &seq_buf)) == .other);
+}
+
+test "RTCP compound single reduced-size PLI resolves without a leading report" {
+    var seq_buf: [8]u16 = undefined;
+    var buf: [64]u8 = undefined;
+    const pli = try pli_fir.buildPli(0x1, 0x0FEEDBED, &buf);
+    const fb = try parseCompound(pli, &seq_buf);
+    switch (fb) {
+        .keyframe_request => |k| try std.testing.expectEqual(@as(u32, 0x0FEEDBED), k.media_ssrc),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "RTCP compound rejects a sub-packet whose declared length overruns the datagram" {
+    var seq_buf: [8]u16 = undefined;
+    var rr: [8]u8 = undefined;
+    _ = writeMinimalRr(&rr, 0x1);
+    // Claim 5 words (20 bytes) in an 8-byte packet.
+    std.mem.writeInt(u16, rr[2..4], 4, .big);
+    try std.testing.expectError(Error.Truncated, parseCompound(&rr, &seq_buf));
+}
+
+test "RTCP compound rejects a bad RTCP version in a sub-packet" {
+    var seq_buf: [8]u16 = undefined;
+    var sr: [28]u8 = undefined;
+    _ = writeMinimalSr(&sr, 0x1);
+    var pli_buf: [12]u8 = undefined;
+    const pli = try pli_fir.buildPli(0x1, 0x2, &pli_buf);
+    var compound: [28 + 12]u8 = undefined;
+    @memcpy(compound[0..28], &sr);
+    @memcpy(compound[28..], pli);
+    // Corrupt the version of the second (PLI) sub-packet.
+    compound[28] = (1 << 6) | (compound[28] & 0x3f);
+    try std.testing.expectError(Error.BadFormat, parseCompound(&compound, &seq_buf));
 }
 
 test "NACK PID near wraparound wraps in 16-bit sequence space" {

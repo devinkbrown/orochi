@@ -291,7 +291,10 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         /// the feedback was recognized and delivered cross-leg.
         pub fn fanoutRtcpFeedbackToNative(self: *Self, rtcp: []const u8, send_ctx: *anyopaque, send: SendFn) bool {
             var seqs16: [max_feedback_seqs]u16 = undefined;
-            const fb = rtcp_translate.parse(rtcp, &seqs16) catch return false;
+            // WebRTC RTCP arrives as a COMPOUND datagram (a leading SR/RR, often an
+            // SDES chunk, then the PLI/FIR/NACK) unless rtcp-rsize is negotiated, so
+            // walk sub-packets by length rather than reading only offset 0.
+            const fb = rtcp_translate.parseCompound(rtcp, &seqs16) catch return false;
             switch (fb) {
                 .keyframe_request => |k| {
                     const pid = self.ssrcs.participantForSsrc(k.media_ssrc) orelse return false;
@@ -626,6 +629,42 @@ test "feedback translates WebRTC PLI to native keyframe request" {
     var ctx = FeedbackCaptureCtx{};
     try testing.expect(br.fanoutRtcpFeedbackToNative(pli, &ctx, FeedbackCaptureCtx.send));
     try testing.expectEqual(@as(usize, 1), ctx.count);
+    try testing.expectEqualStrings("alice", ctx.target());
+
+    var seq_out: [1]u32 = undefined;
+    const msg = try native_feedback.parse(ctx.written(), &seq_out);
+    switch (msg) {
+        .keyframe_request => |k| try testing.expectEqual(@as(u32, 100), k.stream_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "RTCP compound feedback (RR then PLI) translates to a native keyframe request" {
+    var br = ChannelBridge(4).init();
+    var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
+    native.setCodecs(&.{.kaguravis});
+    var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
+    webrtc.setCodecs(&.{.kaguravis});
+    try br.register("alice", native);
+    try br.register("mob", webrtc);
+
+    // The RFC 3550 compound shape a browser sends without rtcp-rsize: a leading
+    // Receiver Report, then the PLI. The pre-fix bridge dropped this as `.other`.
+    var rr: [8]u8 = undefined;
+    rr[0] = 0x80; // V=2, RC=0
+    rr[1] = 201; // RR
+    std.mem.writeInt(u16, rr[2..4], 1, .big); // 8 bytes = 2 words
+    std.mem.writeInt(u32, rr[4..8], 0xB200, .big);
+
+    var pli_buf: [12]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(0xB200, 0xA100, &pli_buf);
+
+    var compound: [8 + 12]u8 = undefined;
+    @memcpy(compound[0..8], &rr);
+    @memcpy(compound[8..], pli);
+
+    var ctx = FeedbackCaptureCtx{};
+    try testing.expect(br.fanoutRtcpFeedbackToNative(&compound, &ctx, FeedbackCaptureCtx.send));
     try testing.expectEqualStrings("alice", ctx.target());
 
     var seq_out: [1]u32 = undefined;
