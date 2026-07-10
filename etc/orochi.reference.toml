@@ -779,6 +779,27 @@ listen = 0
 bind = "127.0.0.1"
 
 
+# --- [webhook] — incoming channel webhooks -----------------------------------
+# Discord-compatible and Block-Kit-lite JSON POST endpoint. Off by default; when
+# enabled, channel ops can create bindings with WEBHOOK CREATE <#channel> [name].
+# POST /api/webhooks/<id>/<token> to inject sanitized channel messages.
+[webhook]
+enabled = false
+# Plain HTTP listener port. Keep loopback and put TLS/rewrite auth at nginx/Caddy.
+listen = 0
+# bind = "127.0.0.1"
+# Persist id -> channel bindings across restart and USR2. Without this, runtime
+# bindings are intentionally in-memory only.
+# store_path = "webhooks.tsv"
+# Max JSON request-body bytes before 413.
+max_body_bytes = 8192
+# Per-binding token-bucket limits. rate_per_min = 0 disables rate limiting.
+rate_per_min = 60
+rate_burst = 10
+# Public reverse-proxy origin shown in WEBHOOK CREATE replies.
+# public_url_base = "https://irc.example.org"
+
+
 # --- [geoip] — GeoIP enrichment ----------------------------------------------
 [geoip]
 # Path to a MaxMind .mmdb database. Empty = GeoIP disabled.

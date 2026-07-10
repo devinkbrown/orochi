@@ -528,6 +528,25 @@ Browser [Web Push](web-push.md) delivery for offline direct messages (triggered 
 | `subject` | string | `mailto:ops@eshmaki.me` | VAPID JWT `sub` claim (RFC 8292) — an operator contact the push service may use to reach the node. |
 | `vapid_key_path` | string | `orochi-webpush-vapid.key` | Where the ES256 VAPID secret persists. **Rotating it invalidates every stored browser subscription** (the advertised public key changes). |
 
+## `[webhook]`
+
+Source: struct `Webhook` in `src/daemon/config_format.zig`, parsing in `parseToml`, boot projection in `src/daemon/config_boot.zig`, HTTP listener in `src/daemon/webhook_http.zig`, payload rendering in `src/daemon/webhook_render.zig`, and live channel injection in `src/daemon/server.zig` `handleWebhook` / `injectWebhookPost`.
+
+Incoming channel webhooks are off by default. When enabled, channel operators and network operators can run `WEBHOOK CREATE <#channel> [name]` to mint a one-time URL of the form `/api/webhooks/<id>/<token>`. The token is stored only as a hash; `LIST` never reveals it again, and `DELETE <id>` removes the binding.
+
+The listener accepts sanitized JSON payloads with `content`, `embeds`, Discord-style `components`, and Block-Kit-lite `blocks`. Supported block fallback types are `header`, `section`, `context`, and `actions`; buttons and select menus degrade to bounded text lines such as `[button] Open <https://...>` and `[select] Promote to: staging, prod` until a client renders richer IRCv3 tag payloads. CR/LF/NUL/control bytes are stripped before reactor handoff, and each post is capped by `max_body_bytes`, rendered line limits, and per-binding rate limits.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | `true` or `false` | Master switch. When false the listener never binds and `WEBHOOK` is not registered. |
+| `listen` | port integer | `0` | `0..65535` | Plain HTTP listener port. `0` binds an OS-ephemeral port when enabled; set a fixed loopback port behind a TLS reverse proxy in production. |
+| `bind` | string or null | unset (`127.0.0.1`) | IPv4 literal | Bind address for the webhook listener. Invalid/non-IPv4 values keep the loopback default. |
+| `store_path` | string or null | unset | path | TSV persistence for webhook bindings across restart and USR2. Unset keeps runtime bindings in memory only. |
+| `max_body_bytes` | integer | `8192` | `1..1048576` | Maximum accepted JSON body bytes; larger requests receive 413. |
+| `rate_per_min` | integer | `60` | `0..1000000` | Per-binding sustained request rate. `0` disables rate limiting. |
+| `rate_burst` | integer | `10` | `1..1000000` | Per-binding token-bucket burst capacity. |
+| `public_url_base` | string or null | unset | URL origin | Public reverse-proxy base used in `WEBHOOK CREATE` replies. When unset, replies derive `http://<bind>:<port>`. |
+
 ## `[tls]`
 
 Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/config_format.zig:408`, TLS boot projection at `src/daemon/config_boot.zig:97`, live listener at `src/main.zig:216`.

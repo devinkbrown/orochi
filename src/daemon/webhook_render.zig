@@ -11,12 +11,18 @@
 //! `content`/`username`/an embed can therefore never forge a second wire line
 //! or inject an IRC command.
 //!
-//! The Discord shape handled (all fields optional; a usable post needs `content`
-//! OR at least one non-empty embed/component):
+//! The inbound shape handled (all fields optional; a usable post needs `content`
+//! OR at least one non-empty embed/block/component):
 //!   { "content", "username", "avatar_url",
 //!     "embeds": [ { "title", "description", "url",
 //!                   "author": { "name" }, "footer": { "text" },
 //!                   "fields": [ { "name", "value" } ] } ],
+//!     "blocks": [ { "type": "section"|"context"|"actions"|"header",
+//!                   "text": { "text" }, "fields": [ { "text" } ],
+//!                   "elements": [ { "type": "button"|"static_select",
+//!                                   "text": { "text" }, "url",
+//!                                   "placeholder": { "text" },
+//!                                   "options": [ { "text": { "text" } } ] } ] } ],
 //!     "components": [ { "type": 1, "components": [
 //!                   { "type": 2, "label", "url", "custom_id" },
 //!                   { "type": 3, "placeholder",
@@ -73,6 +79,10 @@ pub fn render(
                 if (writer.lines >= max_lines) break;
             }
         }
+    }
+
+    if (obj.get("blocks")) |blocks_val| {
+        renderBlocks(&writer, blocks_val);
     }
 
     if (obj.get("components")) |components_val| {
@@ -175,6 +185,144 @@ fn appendField(w: *LineWriter, name: []const u8, value: []const u8) void {
             w.addPrefixed("  ", clean_val);
         }
     }
+}
+
+fn renderBlocks(w: *LineWriter, blocks_val: std.json.Value) void {
+    if (blocks_val != .array) return;
+    for (blocks_val.array.items) |item| {
+        if (w.lines >= max_lines) return;
+        if (item != .object) continue;
+        renderBlock(w, item.object);
+    }
+}
+
+fn renderBlock(w: *LineWriter, block: std.json.ObjectMap) void {
+    const kind = strField(block, "type") orelse return;
+    if (std.mem.eql(u8, kind, "section")) {
+        renderBlockSection(w, block);
+    } else if (std.mem.eql(u8, kind, "context")) {
+        renderBlockContext(w, block);
+    } else if (std.mem.eql(u8, kind, "actions")) {
+        renderBlockActions(w, block);
+    } else if (std.mem.eql(u8, kind, "header")) {
+        if (textField(block, "text")) |text| appendLabelled(w, "* ", text);
+    }
+}
+
+fn renderBlockSection(w: *LineWriter, block: std.json.ObjectMap) void {
+    if (textField(block, "text")) |text| {
+        appendMultiline(w, text);
+    }
+    if (block.get("fields")) |fields_val| {
+        if (fields_val == .array) {
+            for (fields_val.array.items) |field_val| {
+                if (w.lines >= max_lines) return;
+                const text = textValue(field_val) orelse continue;
+                appendLabelled(w, "- ", text);
+            }
+        }
+    }
+    if (objectField(block, "accessory")) |accessory| {
+        renderBlockElement(w, accessory);
+    }
+}
+
+fn renderBlockContext(w: *LineWriter, block: std.json.ObjectMap) void {
+    const elements_val = block.get("elements") orelse return;
+    if (elements_val != .array) return;
+
+    var joined: [max_line]u8 = undefined;
+    var len: usize = 0;
+    for (elements_val.array.items) |element_val| {
+        const text = textValue(element_val) orelse continue;
+        var tbuf: [max_line]u8 = undefined;
+        const clean = sanitizeLine(text, &tbuf);
+        if (clean.len == 0) continue;
+        const sep = if (len == 0) "" else " | ";
+        if (len + sep.len + clean.len > joined.len) break;
+        @memcpy(joined[len .. len + sep.len], sep);
+        len += sep.len;
+        @memcpy(joined[len .. len + clean.len], clean);
+        len += clean.len;
+    }
+    if (len != 0) w.addPrefixed("[context] ", joined[0..len]);
+}
+
+fn renderBlockActions(w: *LineWriter, block: std.json.ObjectMap) void {
+    const elements_val = block.get("elements") orelse return;
+    if (elements_val != .array) return;
+    for (elements_val.array.items) |element_val| {
+        if (w.lines >= max_lines) return;
+        if (element_val == .object) renderBlockElement(w, element_val.object);
+    }
+}
+
+fn renderBlockElement(w: *LineWriter, element: std.json.ObjectMap) void {
+    const kind = strField(element, "type") orelse return;
+    if (std.mem.eql(u8, kind, "button")) {
+        renderBlockButton(w, element);
+    } else if (std.mem.eql(u8, kind, "static_select") or
+        std.mem.eql(u8, kind, "multi_static_select") or
+        std.mem.eql(u8, kind, "external_select") or
+        std.mem.eql(u8, kind, "multi_external_select"))
+    {
+        renderBlockSelect(w, element);
+    }
+}
+
+fn renderBlockButton(w: *LineWriter, button: std.json.ObjectMap) void {
+    const label = textField(button, "text") orelse strField(button, "action_id") orelse
+        strField(button, "value") orelse return;
+    var lbuf: [max_line]u8 = undefined;
+    const clean_label = sanitizeLine(label, &lbuf);
+    if (clean_label.len == 0) return;
+
+    if (strField(button, "url")) |url| {
+        var ubuf: [max_line]u8 = undefined;
+        const clean_url = sanitizeLine(url, &ubuf);
+        var joined: [max_line]u8 = undefined;
+        const line = if (clean_url.len == 0)
+            clean_label
+        else
+            std.fmt.bufPrint(&joined, "{s} <{s}>", .{ clean_label, clean_url }) catch clean_label;
+        w.addPrefixed("[button] ", line);
+    } else {
+        w.addPrefixed("[button] ", clean_label);
+    }
+}
+
+fn renderBlockSelect(w: *LineWriter, select: std.json.ObjectMap) void {
+    const label = textField(select, "placeholder") orelse strField(select, "action_id") orelse "select";
+    var lbuf: [max_line]u8 = undefined;
+    const clean_label = sanitizeLine(label, &lbuf);
+    if (clean_label.len == 0) return;
+
+    var options_buf: [max_line]u8 = undefined;
+    var options_len: usize = 0;
+    if (select.get("options")) |options| {
+        if (options == .array) {
+            for (options.array.items) |opt_val| {
+                if (opt_val != .object) continue;
+                const opt_label = textField(opt_val.object, "text") orelse strField(opt_val.object, "value") orelse continue;
+                var obuf: [max_line]u8 = undefined;
+                const clean_opt = sanitizeLine(opt_label, &obuf);
+                if (clean_opt.len == 0) continue;
+                const sep = if (options_len == 0) "" else ", ";
+                if (options_len + sep.len + clean_opt.len > options_buf.len) break;
+                @memcpy(options_buf[options_len .. options_len + sep.len], sep);
+                options_len += sep.len;
+                @memcpy(options_buf[options_len .. options_len + clean_opt.len], clean_opt);
+                options_len += clean_opt.len;
+            }
+        }
+    }
+
+    var joined: [max_line]u8 = undefined;
+    const line = if (options_len == 0)
+        clean_label
+    else
+        std.fmt.bufPrint(&joined, "{s}: {s}", .{ clean_label, options_buf[0..options_len] }) catch clean_label;
+    w.addPrefixed("[select] ", line);
 }
 
 fn renderComponents(w: *LineWriter, components_val: std.json.Value) void {
@@ -377,6 +525,19 @@ fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     };
 }
 
+fn textField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return textValue(v);
+}
+
+fn textValue(v: std.json.Value) ?[]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        .object => |o| strField(o, "text"),
+        else => null,
+    };
+}
+
 fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const v = obj.get(key) orelse return null;
     return switch (v) {
@@ -474,6 +635,45 @@ test "components are sanitized before text fallback rendering" {
     const body =
         "{\"components\":[{\"type\":1,\"components\":[" ++
         "{\"type\":2,\"label\":\"Open\\r\\nPRIVMSG #x :bad\",\"url\":\"https://ok.example\\u0007\"}" ++
+        "]}]}";
+    try renderBody(body, &post);
+    try testing.expectEqualStrings("[button] OpenPRIVMSG #x :bad <https://ok.example>", post.body());
+    try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\r') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\n') == null);
+}
+
+test "blocks render section context and action fallbacks" {
+    var post: webhook.PendingPost = .{};
+    const body =
+        "{\"blocks\":[" ++
+        "{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"Deploy\"}}," ++
+        "{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"Build passed\"}," ++
+        "\"fields\":[{\"type\":\"mrkdwn\",\"text\":\"env: prod\"},{\"type\":\"plain_text\",\"text\":\"rev: abc123\"}]}," ++
+        "{\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"main\"},{\"type\":\"plain_text\",\"text\":\"2m ago\"}]}," ++
+        "{\"type\":\"actions\",\"elements\":[" ++
+        "{\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"Open run\"},\"url\":\"https://ci.example/run/3\"}," ++
+        "{\"type\":\"static_select\",\"placeholder\":{\"type\":\"plain_text\",\"text\":\"Promote to\"}," ++
+        "\"options\":[{\"text\":{\"type\":\"plain_text\",\"text\":\"staging\"}},{\"text\":{\"type\":\"plain_text\",\"text\":\"prod\"}}]}" ++
+        "]}" ++
+        "]}";
+    try renderBody(body, &post);
+    var it = std.mem.splitScalar(u8, post.body(), '\n');
+    try testing.expectEqualStrings("* Deploy", it.next().?);
+    try testing.expectEqualStrings("Build passed", it.next().?);
+    try testing.expectEqualStrings("- env: prod", it.next().?);
+    try testing.expectEqualStrings("- rev: abc123", it.next().?);
+    try testing.expectEqualStrings("[context] main | 2m ago", it.next().?);
+    try testing.expectEqualStrings("[button] Open run <https://ci.example/run/3>", it.next().?);
+    try testing.expectEqualStrings("[select] Promote to: staging, prod", it.next().?);
+    try testing.expect(it.next() == null);
+}
+
+test "blocks sanitize interactive fallback text" {
+    var post: webhook.PendingPost = .{};
+    const body =
+        "{\"blocks\":[{\"type\":\"actions\",\"elements\":[" ++
+        "{\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"Open\\r\\nPRIVMSG #x :bad\"}," ++
+        "\"url\":\"https://ok.example\\u0007\"}" ++
         "]}]}";
     try renderBody(body, &post);
     try testing.expectEqualStrings("[button] OpenPRIVMSG #x :bad <https://ok.example>", post.body());
