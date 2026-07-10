@@ -404,7 +404,7 @@ Live draft/search inverted-index sizing. These values construct the in-memory `S
 
 ## `[media]`
 
-Source: struct at `src/daemon/config_format.zig:245`, parsing at `src/daemon/config_format.zig:553`, mapping at `src/daemon/config_boot.zig:59`.
+Source: struct at `src/daemon/config_format.zig:446`, parsing at `src/daemon/config_format.zig:1174`, mapping at `src/daemon/config_boot.zig:85`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -421,11 +421,13 @@ Source: struct at `src/daemon/config_format.zig:245`, parsing at `src/daemon/con
 | `media.pins.max_per_channel` | integer | `50` | `1..1024` | Max msgids accepted in the live `PINS` channel prop. |
 | `media.pins.max_msgid_bytes` | integer | `64` | `8..256` | Max bytes per msgid token accepted in the live `PINS` channel prop. |
 | `media.reactions.max_token_bytes` | integer | `32` | `8..256` | Max `MEDIA REACT` token bytes; reactions are ephemeral event broadcasts. |
-| `native_media_require_mac` | bool | `false` | `true` or `false` | Require an authenticated per-datagram MAC on native (KaguraVox/KaguraVis) media. `false` accepts untagged datagrams (back-compat); `true` drops untagged/bad-tag datagrams before the SFU learns the sender. HMAC-SHA256-128 keyed from the per-stream PRF capability; needs matching client support (`src/daemon/config_format.zig:257`, `src/daemon/config_boot.zig:66`, `src/substrate/kagura_frame.zig`). |
-| `ws_media_relay` | bool | `false` | `true` or `false` | Relay browser media datagrams (binary WebSocket frames) between a channel's call participants (SFU). Off by default; opt-in. When on, `MEDIA JOIN` hands each participant a per-stream MAC key over the authenticated WS as `EVENT <nick> MEDIA MACKEY <#chan> <base64>`, and each datagram is lenient-verified before fan-out to same-node call members, including members homed on other reactor shards through the cross-shard fabric (`src/daemon/config_format.zig`, `src/daemon/server.zig` `handleWsMediaDatagram`, `src/substrate/kagura_frame.zig`). |
-| `ws_media_require_mac` | bool | `false` | `true` or `false` | Require a valid per-stream MAC tag on every browser media datagram. `false` relays untagged datagrams (a present tag must still verify); `true` drops untagged/bad-tag datagrams. Same `native_stream_key`-derived `(channel, participant)` key as the native leg. |
-| `stun_host` | string or null | unset | any string | Optional STUN host mapped to media discovery config (`src/daemon/config_boot.zig:30`, `src/daemon/server.zig:967`). |
-| `stun_port` | port integer | `0` | `0..65535` | STUN port mapped when non-zero (`src/daemon/config_boot.zig:31`). |
+| `native_media_require_mac` | bool | `false` | `true` or `false` | Require an authenticated per-datagram MAC on native (KaguraVox/KaguraVis) media. `false` accepts untagged datagrams (back-compat); `true` drops untagged/bad-tag datagrams before the SFU learns the sender. HMAC-SHA256-128 keyed from the per-stream PRF capability; needs matching client support (`src/daemon/config_format.zig:462`, `src/daemon/config_boot.zig:101`, `src/substrate/kagura_frame.zig`). |
+| `ws_media_relay` | bool | `false` | `true` or `false` | Relay browser media datagrams (binary WebSocket frames) between a channel's call participants (SFU). Off by default; opt-in. When on, `MEDIA JOIN` hands each participant a per-stream MAC key over the authenticated WS as `EVENT <nick> MEDIA MACKEY <#chan> <base64>`, and each datagram is lenient-verified before fan-out to same-node call members, including members homed on other reactor shards through the cross-shard fabric (`src/daemon/config_format.zig:466`, `src/daemon/config_boot.zig:102`, `src/daemon/server.zig` `handleWsMediaDatagram`, `src/substrate/kagura_frame.zig`). |
+| `ws_media_require_mac` | bool | `false` | `true` or `false` | Require a valid per-stream MAC tag on every browser media datagram. `false` relays untagged datagrams (a present tag must still verify); `true` drops untagged/bad-tag datagrams. Same `native_stream_key`-derived `(channel, participant)` key as the native leg (`src/daemon/config_format.zig:470`, `src/daemon/config_boot.zig:103`). |
+| `dtls_srtp` | bool | `false` | `true` or `false` | Enable DTLS-SRTP termination on the UDP media plane. Off by default; when enabled the media plane exposes a DTLS fingerprint for `MEDIA` negotiation and rejects malformed or unavailable fingerprint offers fail-closed (`src/daemon/config_format.zig:474`, `src/daemon/config_format.zig:1191`, `src/daemon/config_boot.zig:104`, `src/daemon/server.zig:26456`). |
+| `dtls13` | bool | `false` | `true` or `false` | Additionally enable the DTLS 1.3 engine on the media plane. This is parsed independently, but only has an effect with `dtls_srtp` enabled (`src/daemon/config_format.zig:480`, `src/daemon/config_format.zig:1192`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:3643`). |
+| `stun_host` | string or null | unset | any string | Optional STUN host mapped to media discovery config (`src/daemon/config_format.zig:483`, `src/daemon/config_boot.zig:106`, `src/daemon/server.zig:3623`). |
+| `stun_port` | port integer | `0` | `0..65535` | STUN port mapped when non-zero (`src/daemon/config_format.zig:484`, `src/daemon/config_format.zig:1219`, `src/daemon/config_boot.zig:107`). |
 
 ## `[stats]`
 
