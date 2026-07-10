@@ -71,22 +71,14 @@ pub const Params = struct {
 };
 
 /// Threshold comparison used by LISTX numeric filters. Bare `>`/`<` are strict;
-/// the member-count filter also accepts inclusive `>=`/`<=` so "at least N"
-/// (a minimum member count) is expressible. The creation-age (`C`) and
-/// topic-age (`T`) filters keep the strict operators only.
+/// a trailing `=` makes the comparison inclusive (`>=`/`<=`) so "at least N" is
+/// directly expressible. All three numeric filters — member-count, creation-age
+/// (`C`), and topic-age (`T`) — share this one operator grammar.
 pub const Comparison = enum {
     greater_than,
     less_than,
     greater_equal,
     less_equal,
-
-    fn fromByte(byte: u8) ?Comparison {
-        return switch (byte) {
-            '>' => .greater_than,
-            '<' => .less_than,
-            else => null,
-        };
-    }
 
     fn testValue(self: Comparison, actual: u64, threshold: u64) bool {
         return switch (self) {
@@ -242,29 +234,14 @@ pub fn parseFilterWith(comptime params: Params, token: []const u8) ListxError!Fi
     try validateFilterBytes(token);
 
     if (token[0] == '>' or token[0] == '<') {
-        // A trailing `=` makes the threshold inclusive: `>=N` / `<=N`. Detected
-        // here before the generic `X=<mask>` branch, which requires a leading
-        // letter, so there is no ambiguity. `parseDecimal` rejects an empty or
-        // non-numeric value (e.g. bare `>=`).
-        const is_greater = token[0] == '>';
-        const inclusive = token.len >= 2 and token[1] == '=';
-        const digits_start: usize = if (inclusive) 2 else 1;
-        const comparison: Comparison = if (is_greater)
-            (if (inclusive) .greater_equal else .greater_than)
-        else
-            (if (inclusive) .less_equal else .less_than);
-        return .{ .criterion = .{ .member_count = .{
-            .comparison = comparison,
-            .value = try parseDecimal(token[digits_start..]),
-        } } };
+        // Member-count threshold. Detected before the generic `X=<mask>` branch
+        // (which requires a leading letter), so there is no ambiguity.
+        return .{ .criterion = .{ .member_count = try parseThreshold(token) } };
     }
 
     if (token.len >= 3 and asciiEqual(token[0], 'C')) {
-        const comparison = Comparison.fromByte(token[1]) orelse return error.InvalidFilter;
-        return .{ .criterion = .{ .creation_age_ms = .{
-            .comparison = comparison,
-            .value = try parseDecimal(token[2..]),
-        } } };
+        // `C>N` / `C<N` and inclusive `C>=N` / `C<=N` creation-age thresholds.
+        return .{ .criterion = .{ .creation_age_ms = try parseThreshold(token[1..]) } };
     }
 
     if (asciiEql(token, "TOPICONLY")) {
@@ -272,11 +249,10 @@ pub fn parseFilterWith(comptime params: Params, token: []const u8) ListxError!Fi
     }
 
     if (token.len >= 3 and asciiEqual(token[0], 'T') and (token[1] == '<' or token[1] == '>')) {
-        const comparison = Comparison.fromByte(token[1]) orelse return error.InvalidFilter;
-        return .{ .criterion = .{ .topic_age_ms = .{
-            .comparison = comparison,
-            .value = try parseDecimal(token[2..]),
-        } } };
+        // `T>N` / `T<N` and inclusive `T>=N` / `T<=N` topic-age thresholds. The
+        // leading-operator guard keeps `T=<mask>` routed to the topic-text mask
+        // branch below.
+        return .{ .criterion = .{ .topic_age_ms = try parseThreshold(token[1..]) } };
     }
 
     // `R=0` / `R=1` registered filter.
@@ -568,6 +544,30 @@ fn validateTextMaskWith(comptime params: Params, mask: []const u8) ListxError!vo
     // the whole token; nothing further is required for a text-mask payload.
 }
 
+/// Parse a threshold expression whose first byte is `>` or `<`, optionally
+/// followed by `=` for an inclusive comparison, then a decimal value. Shared by
+/// the member-count, creation-age (`C`), and topic-age (`T`) filters so all
+/// three honor the same `>N` / `<N` / `>=N` / `<=N` grammar. A bare operator
+/// (e.g. `>=` with no digits) is rejected via `parseDecimal`.
+fn parseThreshold(expr: []const u8) ListxError!Filter.Threshold {
+    if (expr.len == 0) return error.InvalidFilter;
+    const is_greater = switch (expr[0]) {
+        '>' => true,
+        '<' => false,
+        else => return error.InvalidFilter,
+    };
+    const inclusive = expr.len >= 2 and expr[1] == '=';
+    const digits_start: usize = if (inclusive) 2 else 1;
+    const comparison: Comparison = if (is_greater)
+        (if (inclusive) .greater_equal else .greater_than)
+    else
+        (if (inclusive) .less_equal else .less_than);
+    return .{
+        .comparison = comparison,
+        .value = try parseDecimal(expr[digits_start..]),
+    };
+}
+
 fn parseDecimal(bytes: []const u8) ListxError!u64 {
     if (bytes.len == 0) return error.InvalidValue;
 
@@ -754,6 +754,65 @@ test "LISTX inclusive threshold rejects a missing value" {
     try std.testing.expectError(error.InvalidValue, parse(&.{">="}));
     try std.testing.expectError(error.InvalidValue, parse(&.{"<="}));
     try std.testing.expectError(error.InvalidValue, parse(&.{">=abc"}));
+}
+
+test "LISTX inclusive creation-age thresholds parse" {
+    const request = try parse(&.{"C>=60000,C<=3600000"});
+
+    try std.testing.expectEqual(@as(usize, 2), request.count);
+    try std.testing.expectEqual(Comparison.greater_equal, request.filters[0].criterion.creation_age_ms.comparison);
+    try std.testing.expectEqual(@as(u64, 60_000), request.filters[0].criterion.creation_age_ms.value);
+    try std.testing.expectEqual(Comparison.less_equal, request.filters[1].criterion.creation_age_ms.comparison);
+    try std.testing.expectEqual(@as(u64, 3_600_000), request.filters[1].criterion.creation_age_ms.value);
+}
+
+test "LISTX inclusive topic-age thresholds parse" {
+    const request = try parse(&.{"T>=1000,T<=9000"});
+
+    try std.testing.expectEqual(@as(usize, 2), request.count);
+    try std.testing.expectEqual(Comparison.greater_equal, request.filters[0].criterion.topic_age_ms.comparison);
+    try std.testing.expectEqual(@as(u64, 1000), request.filters[0].criterion.topic_age_ms.value);
+    try std.testing.expectEqual(Comparison.less_equal, request.filters[1].criterion.topic_age_ms.comparison);
+    try std.testing.expectEqual(@as(u64, 9000), request.filters[1].criterion.topic_age_ms.value);
+}
+
+test "LISTX inclusive age threshold includes the boundary and stays byte-identical for strict" {
+    // now_ms=100_000, channel created at 40_000 -> exactly 60_000ms old.
+    const now: u64 = 100_000;
+    const exactly_60k = ChannelInfo{ .name = "#c", .members = 1, .created_ms = 40_000 };
+
+    // `C>=60000` admits the boundary where strict `C>60000` rejects it.
+    try std.testing.expect((try parse(&.{"C>=60000"})).matches(exactly_60k, now));
+    try std.testing.expect(!(try parse(&.{"C>60000"})).matches(exactly_60k, now));
+    // `C<=60000` admits the boundary where strict `C<60000` rejects it.
+    try std.testing.expect((try parse(&.{"C<=60000"})).matches(exactly_60k, now));
+    try std.testing.expect(!(try parse(&.{"C<60000"})).matches(exactly_60k, now));
+
+    // Topic-age boundary: topic set at 40_000 -> exactly 60_000ms old.
+    const with_topic = ChannelInfo{
+        .name = "#t",
+        .members = 1,
+        .topic = "hi",
+        .created_ms = 0,
+        .topic_ms = 40_000,
+    };
+    try std.testing.expect((try parse(&.{"T>=60000"})).matches(with_topic, now));
+    try std.testing.expect(!(try parse(&.{"T>60000"})).matches(with_topic, now));
+    try std.testing.expect((try parse(&.{"T<=60000"})).matches(with_topic, now));
+    try std.testing.expect(!(try parse(&.{"T<60000"})).matches(with_topic, now));
+}
+
+test "LISTX inclusive age thresholds reject a missing value" {
+    try std.testing.expectError(error.InvalidValue, parse(&.{"C>="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{"C<="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{"T>="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{"T<=abc"}));
+}
+
+test "LISTX topic-age =mask disambiguation is preserved" {
+    // `T=<mask>` stays a topic-text mask; only `T>`/`T<` are age thresholds.
+    const request = try parse(&.{"T=*ship*"});
+    try std.testing.expectEqualStrings("*ship*", request.filters[0].criterion.topic_mask);
 }
 
 test "parse creation age filters" {
