@@ -2,7 +2,7 @@
 
 *IRCX discovery, typed messaging, properties, access lists, events, named modes, and extended listing.*
 
-The IRCX module registers the discovery, typed-messaging, property, access, event, mode, and list commands (`src/daemon/modules/ircx.zig:47`). `CREATE` lives in [channels.md](channels.md#create).
+The IRCX module registers the discovery, typed-messaging, property, access, event, mode, and list commands (`src/daemon/modules/ircx.zig:56`). `CREATE` lives in [channels.md](channels.md#create).
 
 ## IRCX
 
@@ -84,13 +84,13 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## ACCESS
 
 - Syntax: `ACCESS <#channel> <ADD|DELETE|LIST|CLEAR> [level [mask [timeout] [:reason]]]`
-- Description: IRCX per-channel access list for levels parsed by the access store. Management requires channel authority or oper. Successful add/delete/clear mutations are recorded in the ProofMark audit ring and published on the operator Event Spine with `proof=<id>` when the daemon has a signing identity.
+- Description: IRCX per-channel access list for `FOUNDER`, `OWNER`, `HOST`, `VOICE`, `DENY`, and `GRANT` levels. `ADD` accepts an optional numeric timeout before the optional reason; the timeout is stored and rendered in list entries. Management requires channel authority or oper. Successful add/delete/clear mutations are recorded in the ProofMark audit ring and published on the operator Event Spine with `proof=<id>` when the daemon has a signing identity.
 - Privileges: Registered client with channel management access, or oper.
-- Parameters: Parsed by `ircx_access_store.parse`.
+- Parameters: Channel, subcommand, optional level/mask selector, optional timeout, optional reason.
 - Replies: `RPL_ACCESSADD 801`, `RPL_ACCESSDELETE 802`, `RPL_ACCESSSTART 803`, `RPL_ACCESSENTRY 804`, `RPL_ACCESSEND 805`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOPRIVILEGES 481`.
 - Example: `ACCESS #zig ADD HOST *!*@trusted.example 0 :trusted`
-- Sources: `src/daemon/modules/ircx.zig:55`, `src/daemon/server.zig:7419`
+- Sources: `src/daemon/modules/ircx.zig:66`, `src/proto/ircx_access_store.zig:79`, `src/proto/ircx_access_store.zig:119`, `src/proto/ircx_access_store.zig:419`, `src/daemon/server.zig:19492`
 
 ## EVENT
 
@@ -127,10 +127,10 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## LISTX
 
 - Syntax: `LISTX [filter]`
-- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; oversized result sets are capped with `RPL_LISTXTRUNC 816`.
+- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; member-count filters and `C`/`T` age filters accept strict `>`/`<` and inclusive `>=`/`<=`. The handler lists the mesh-wide union of local and remote-only channels, caps oversized result sets with `RPL_LISTXTRUNC 816`, and emits `RPL_LISTXPICS 813` after an entry when the channel has a non-empty `PICS` property.
 - Privileges: Registered client.
 - Parameters: Optional LISTX filter.
-- Replies: IRCX list start/entry/end numerics `811`, `812`, `817`.
+- Replies: IRCX list start/entry/PICS/truncation/end numerics `811`, `812`, `813`, `816`, `817`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid filters.
-- Example: `LISTX >10`
-- Sources: `src/daemon/modules/ircx.zig:58`, `src/daemon/server.zig:4836`
+- Example: `LISTX >=10,C<=3600000`
+- Sources: `src/daemon/modules/ircx.zig:71`, `src/proto/listx.zig:73`, `src/proto/listx.zig:236`, `src/proto/listx.zig:242`, `src/proto/listx.zig:251`, `src/proto/listx.zig:420`, `src/daemon/server.zig:12920`
