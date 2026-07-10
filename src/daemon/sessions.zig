@@ -36,6 +36,12 @@ pub const Session = struct {
     snapshot: ?[]u8 = null,
 };
 
+pub const DetachedSnapshot = struct {
+    client: ClientId,
+    signon_ms: i64,
+    snapshot: []u8,
+};
+
 const SessionList = struct {
     items: std.ArrayListUnmanaged(Session) = .empty,
 
@@ -262,6 +268,40 @@ pub const SessionStore = struct {
         return null;
     }
 
+    /// Copy the newest detached restore snapshot for `account`, excluding the
+    /// caller's current live client id. Used by login-time auto-restore so a
+    /// reconnecting web client does not autojoin channels under a generated nick
+    /// while waiting for an explicit SESSION RESUME round trip.
+    pub fn copyNewestDetachedSnapshotInAccount(
+        self: *const SessionStore,
+        allocator: std.mem.Allocator,
+        account: []const u8,
+        exclude_client: ClientId,
+    ) std.mem.Allocator.Error!?DetachedSnapshot {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        var matched_client: ClientId = 0;
+        var matched_signon: i64 = std.math.minInt(i64);
+        var matched_snapshot: ?[]u8 = null;
+        for (list.items.items) |s| {
+            if (s.client == exclude_client or s.attached) continue;
+            const bytes = s.snapshot orelse continue;
+            if (matched_snapshot == null or s.signon_ms >= matched_signon) {
+                matched_client = s.client;
+                matched_signon = s.signon_ms;
+                matched_snapshot = bytes;
+            }
+        }
+        const bytes = matched_snapshot orelse return null;
+        return .{
+            .client = matched_client,
+            .signon_ms = matched_signon,
+            .snapshot = try allocator.dupe(u8, bytes),
+        };
+    }
+
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
         if (self.accounts.getPtr(account)) |list| return list;
         if (self.accounts.count() >= self.cfg.max_accounts) return error.TooManyAccounts;
@@ -335,6 +375,29 @@ test "detached session snapshots are copied and released across lifecycle paths"
     try testing.expect(s.markDetachedWithSnapshot("alice", 2, "second"));
     _ = try s.attach("alice", 2, tok(3), 30); // reattach same client frees old snapshot
     try testing.expect((try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(3))) == null);
+}
+
+test "copyNewestDetachedSnapshotInAccount ignores current client and returns newest ghost" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    _ = try s.attach("alice", 2, tok(2), 30);
+    _ = try s.attach("alice", 3, tok(3), 20);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "old"));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "new"));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 3, "current"));
+
+    const copied = (try s.copyNewestDetachedSnapshotInAccount(testing.allocator, "alice", 3)).?;
+    defer testing.allocator.free(copied.snapshot);
+    try testing.expectEqual(@as(ClientId, 2), copied.client);
+    try testing.expectEqual(@as(i64, 30), copied.signon_ms);
+    try testing.expectEqualStrings("new", copied.snapshot);
+
+    _ = try s.attach("alice", 4, tok(4), 40);
+    const copied_again = (try s.copyNewestDetachedSnapshotInAccount(testing.allocator, "alice", 4)).?;
+    defer testing.allocator.free(copied_again.snapshot);
+    try testing.expectEqual(@as(ClientId, 2), copied_again.client);
 }
 
 test "findByTokenInto locates a session for reclaim" {

@@ -144,7 +144,7 @@ pub const FsmState = enum(u8) {
 /// The field set mirrors `helix/session_snapshot.zig` (the local Helix-upgrade
 /// snapshot) so a cross-machine migration restores the same recognizable session
 /// a same-machine UPGRADE does: identity (nick/realname/account/host), away
-/// state, oper status, user modes, and channel membership.
+/// state, oper status, user modes, and channel membership with status bits.
 pub const Snapshot = struct {
     /// Client nickname at migration time.
     nick: []const u8,
@@ -152,6 +152,8 @@ pub const Snapshot = struct {
     umodes: []const u8,
     /// Channels the client occupies, by name.
     channels: []const []const u8,
+    /// Per-channel member mode bits, aligned with `channels`.
+    channel_modes: []const u8 = &.{},
     /// GECOS / realname.
     realname: []const u8 = "",
     /// Visible (cloaked) host the client presents.
@@ -171,13 +173,18 @@ pub const Snapshot = struct {
         // Build the channel array as CoilPack string values.
         var chan_values = try allocator.alloc(cpv.Value, self.channels.len);
         defer allocator.free(chan_values);
+        var mode_values = try allocator.alloc(cpv.Value, self.channels.len);
+        defer allocator.free(mode_values);
         for (self.channels, 0..) |chan, i| {
             chan_values[i] = .{ .string = chan };
+            const modes: u8 = if (i < self.channel_modes.len) self.channel_modes[i] else 0;
+            mode_values[i] = .{ .unsigned = modes };
         }
 
         var entries = [_]cpv.MapEntry{
             .{ .key = "account", .value = .{ .string = self.account } },
             .{ .key = "away", .value = .{ .string = self.away } },
+            .{ .key = "channel_modes", .value = .{ .array = mode_values } },
             .{ .key = "channels", .value = .{ .array = chan_values } },
             .{ .key = "host", .value = .{ .string = self.host } },
             .{ .key = "is_oper", .value = .{ .unsigned = @intFromBool(self.is_oper) } },
@@ -200,6 +207,7 @@ pub const Snapshot = struct {
         const nick_src = mapString(value.map, "nick") orelse return error.MalformedCapsule;
         const umodes_src = mapString(value.map, "umodes") orelse return error.MalformedCapsule;
         const chans_src = mapArray(value.map, "channels") orelse return error.MalformedCapsule;
+        const modes_src = mapArray(value.map, "channel_modes");
         // Identity/state fields default to empty/false so an older-format capsule
         // missing them still decodes (forward-compatible widening).
         const realname_src = mapString(value.map, "realname") orelse "";
@@ -230,16 +238,27 @@ pub const Snapshot = struct {
             for (channels[0..filled]) |chan| allocator.free(chan);
             allocator.free(channels);
         }
+        var channel_modes = try allocator.alloc(u8, chans_src.len);
+        errdefer allocator.free(channel_modes);
+        @memset(channel_modes, 0);
         for (chans_src) |chan_value| {
             if (chan_value != .string) return error.MalformedCapsule;
             channels[filled] = try allocator.dupe(u8, chan_value.string);
             filled += 1;
+        }
+        if (modes_src) |mode_values| {
+            if (mode_values.len != chans_src.len) return error.MalformedCapsule;
+            for (mode_values, 0..) |mode_value, i| {
+                if (mode_value != .unsigned or mode_value.unsigned > std.math.maxInt(u8)) return error.MalformedCapsule;
+                channel_modes[i] = @intCast(mode_value.unsigned);
+            }
         }
 
         return .{
             .nick = nick,
             .umodes = umodes,
             .channels = channels,
+            .channel_modes = channel_modes,
             .realname = realname,
             .host = host,
             .account = account,
@@ -261,6 +280,7 @@ pub const Snapshot = struct {
         allocator.free(self.username);
         for (self.channels) |chan| allocator.free(chan);
         allocator.free(self.channels);
+        allocator.free(self.channel_modes);
         self.* = undefined;
     }
 };
@@ -1203,6 +1223,7 @@ test "snapshot encode/decode round-trips an empty channel list" {
     try testing.expectEqualStrings("lone", decoded.nick);
     try testing.expectEqualStrings("+i", decoded.umodes);
     try testing.expectEqual(@as(usize, 0), decoded.channels.len);
+    try testing.expectEqual(@as(usize, 0), decoded.channel_modes.len);
     try testing.expectEqualStrings("", decoded.realname);
     try testing.expectEqualStrings("", decoded.host);
     try testing.expectEqualStrings("", decoded.account);
@@ -1214,10 +1235,12 @@ test "snapshot encode/decode round-trips the widened identity + state fields" {
     // Arrange
     const allocator = testing.allocator;
     const channels = [_][]const u8{ "#ops", "#lounge", "#dev" };
+    const channel_modes = [_]u8{ 0x01, 0x02, 0x04 };
     const snapshot = Snapshot{
         .nick = "alice",
         .umodes = "+iwxo",
         .channels = channels[0..],
+        .channel_modes = channel_modes[0..],
         .realname = "Alice Liddell",
         .host = "cloak-1a2b.users.orochi",
         .account = "alice",
@@ -1238,6 +1261,7 @@ test "snapshot encode/decode round-trips the widened identity + state fields" {
     try testing.expectEqualStrings("#ops", decoded.channels[0]);
     try testing.expectEqualStrings("#lounge", decoded.channels[1]);
     try testing.expectEqualStrings("#dev", decoded.channels[2]);
+    try testing.expectEqualSlices(u8, channel_modes[0..], decoded.channel_modes);
     try testing.expectEqualStrings("Alice Liddell", decoded.realname);
     try testing.expectEqualStrings("cloak-1a2b.users.orochi", decoded.host);
     try testing.expectEqualStrings("alice", decoded.account);

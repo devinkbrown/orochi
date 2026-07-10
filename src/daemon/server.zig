@@ -8251,8 +8251,7 @@ pub const LinuxServer = struct {
                 self.publishUserConnectEvent(conn) catch {};
                 // Apply any operator-approved vhost waiting for this account.
                 self.maybeApplyApprovedVhost(id, conn);
-                // Auto-join the account's configured channels.
-                self.applyAutojoin(id, conn);
+                self.applyLoginJoinState(id, conn);
                 // Set the client's `location`/`country` metadata from GeoIP (or
                 // the configured default) so `!weather` has a per-user location.
                 self.setGeoLocation(conn);
@@ -15564,6 +15563,33 @@ pub const LinuxServer = struct {
         for (chans) |c| self.joinOne(id, conn, c, null, 0) catch {};
     }
 
+    /// Prefer restoring a detached session snapshot over account autojoin during
+    /// login. Browser reconnects can authenticate before their explicit
+    /// SESSION RESUME command arrives; restoring here keeps generated temporary
+    /// nicks from joining the user's saved channels.
+    fn restoreDetachedBeforeAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) bool {
+        const cid = monitorIdFromClient(id);
+        const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch return false;
+        const detached = candidate orelse return false;
+        defer self.allocator.free(detached.snapshot);
+
+        const restored = self.restoreEncodedMigrationSnapshot(id, conn, account, detached.snapshot);
+        if (!restored) return true;
+
+        _ = self.sessions.remove(account, detached.client);
+        conn.nick_claimed_at_ms = 0;
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event = std.fmt.bufPrint(&event_buf, "SESSION auto-restored account={s}", .{account}) catch return true;
+        self.publishOperEvent(.service, .notice, event) catch {};
+        return true;
+    }
+
+    fn applyLoginJoinState(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        if (self.restoreDetachedBeforeAutojoin(id, conn, account)) return;
+        self.applyAutojoin(id, conn);
+    }
+
     /// `SHUN <mask> [secs] [:reason]` / `UNSHUN <mask>` — oper network mute.
     /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
     /// silently dropped. Bare `SHUN` lists active shuns.
@@ -20617,7 +20643,7 @@ pub const LinuxServer = struct {
         if (oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
         try self.deliverTegami(conn);
-        self.applyAutojoin(id, conn);
+        self.applyLoginJoinState(id, conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(id, conn);
         self.evaluateNickProtection(conn);
@@ -22824,7 +22850,7 @@ pub const LinuxServer = struct {
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
-        self.applyAutojoin(idFromToken(conn.token), conn);
+        self.applyLoginJoinState(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(idFromToken(conn.token), conn);
         self.evaluateNickProtection(conn);
@@ -22929,7 +22955,7 @@ pub const LinuxServer = struct {
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
-        self.applyAutojoin(idFromToken(conn.token), conn);
+        self.applyLoginJoinState(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(idFromToken(conn.token), conn);
         self.evaluateNickProtection(conn);
@@ -24996,14 +25022,24 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         conn: *ConnState,
         chan_buf: [][]const u8,
+        chan_mode_buf: []u8,
         umode_buf: []u8,
     ) migration_relay.Snapshot {
-        const nch = self.world.channelsOf(worldIdFromClient(id), chan_buf);
+        const wid = worldIdFromClient(id);
+        const nch = self.world.channelsOf(wid, chan_buf);
+        var chan_n: usize = 0;
+        for (chan_buf[0..nch]) |chan| {
+            const modes = self.world.memberModes(chan, wid) orelse continue;
+            chan_buf[chan_n] = chan;
+            chan_mode_buf[chan_n] = modes.bits;
+            chan_n += 1;
+        }
         const umodes = conn.session.umodeString(umode_buf);
         return .{
             .nick = conn.session.displayName(),
             .umodes = umodes,
-            .channels = chan_buf[0..nch],
+            .channels = chan_buf[0..chan_n],
+            .channel_modes = chan_mode_buf[0..chan_n],
             .realname = conn.session.realname(),
             .host = conn.session.host(),
             .account = conn.session.account() orelse "",
@@ -25015,8 +25051,9 @@ pub const LinuxServer = struct {
 
     fn encodeMigrationSnapshot(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) ?[]u8 {
         var chan_buf: [64][]const u8 = undefined;
+        var chan_mode_buf: [64]u8 = undefined;
         var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
-        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], umode_buf[0..]);
+        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], chan_mode_buf[0..], umode_buf[0..]);
         return snapshot.encode(self.allocator) catch null;
     }
 
@@ -25037,8 +25074,9 @@ pub const LinuxServer = struct {
         const kp = self.migrationKeypair() orelse return;
 
         var chan_buf: [64][]const u8 = undefined;
+        var chan_mode_buf: [64]u8 = undefined;
         var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
-        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], umode_buf[0..]);
+        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], chan_mode_buf[0..], umode_buf[0..]);
 
         // Lend the persistent origin policy/journal to a transient MigrationOrigin
         // so replay/stale-epoch state survives across capsules without re-deriving
@@ -25228,6 +25266,7 @@ pub const LinuxServer = struct {
             .is_oper = snap.is_oper,
         });
         self.injectSessionState(conn);
+        conn.nick_claimed_at_ms = 0;
 
         // Re-apply the migrated user modes (server source, so server-managed
         // letters carry too). +o/+r are derived from is_oper/logged_in already.
@@ -25245,19 +25284,18 @@ pub const LinuxServer = struct {
             self.announceNickChange(old_nick, snap.nick, membershipIdentityOf(conn));
             self.monitorTransition(old_nick, snap.nick) catch {};
         }
-        for (snap.channels) |chan| {
-            // The migration snapshot carries channel NAMES (member modes are not
-            // part of the relay snapshot); restore as a plain member, then any
-            // status modes converge via the normal mesh roster burst.
-            if (self.world.isMember(chan, wid)) continue;
-            self.joinOne(id, conn, chan, null, 0) catch {
-                self.world.restoreMember(chan, wid, .{ .bits = 0 }) catch continue;
+        for (snap.channels, 0..) |chan, i| {
+            const modes: u8 = if (i < snap.channel_modes.len) snap.channel_modes[i] else 0;
+            const was_member = self.world.isMember(chan, wid);
+            self.world.restoreMember(chan, wid, .{ .bits = modes }) catch continue;
+            if (!was_member) {
                 self.broadcastJoin(chan, conn) catch {};
+                self.publishMemberEvent("JOIN", chan, conn.session.displayName(), null) catch {};
+                self.notifyObservers(.join, observeSubject(conn, chan));
                 self.sendTopicReply(conn, chan) catch {};
                 if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, chan) catch {};
-                const jmodes = self.world.memberModes(chan, wid) orelse world_model.MemberModes.empty();
-                self.announceMembership(chan, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn), "");
-            };
+            }
+            self.announceMembership(chan, conn.session.displayName(), @truncate(modes), true, membershipIdentityOf(conn), "");
         }
         return true;
     }
@@ -35378,7 +35416,7 @@ test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
     try std.testing.expect(std.mem.indexOf(u8, client.written(), "sst_") == null);
 }
 
-test "threaded server: SESSION RESUME restores detached nick and channels" {
+test "threaded server: login auto-restores detached nick and all channels before autojoin" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -35411,15 +35449,10 @@ test "threaded server: SESSION RESUME restores detached nick and channels" {
     try writeAllFd(fd_a, "REGISTER trev * correcthorse\r\n");
     try recvUntil(&a, "REGISTER SUCCESS trev", 200);
     a.reset();
-    try writeAllFd(fd_a, "JOIN #root,#ops\r\n");
+    try writeAllFd(fd_a, "JOIN #root,#ops,#dev\r\n");
     try recvUntil(&a, " 366 trev #root ", 200);
     try recvUntil(&a, " 366 trev #ops ", 200);
-    a.reset();
-    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
-    try recvUntil(&a, "SESSION TOKEN ", 200);
-    const token = fixedHexAfter(a.written(), "SESSION TOKEN ", 2 * @sizeOf(sessions_mod.Token)) orelse return error.TestUnexpectedResult;
-    var resume_line_buf: [96]u8 = undefined;
-    const resume_line = try std.fmt.bufPrint(&resume_line_buf, "SESSION RESUME {s}\r\n", .{token});
+    try recvUntil(&a, " 366 trev #dev ", 200);
 
     closeFd(fd_a);
     fd_a_open = false;
@@ -35431,20 +35464,15 @@ test "threaded server: SESSION RESUME restores detached nick and channels" {
 
     try writeAllFd(fd_b, "NICK TempResume\r\nUSER webchat 0 * :Webchat\r\n");
     try recvUntil(&b, " 001 TempResume ", 200);
+    b.reset();
     try writeAllFd(fd_b, "IDENTIFY trev correcthorse\r\n");
     try recvUntil(&b, "You are now identified as trev", 200);
-    b.reset();
-
-    // Model the real webchat failure mode: the reconnecting temporary identity
-    // can already be visible in #root before the resume command arrives.
-    try writeAllFd(fd_b, "JOIN #root\r\n");
-    try recvUntil(&b, "JOIN #root", 200);
-    b.reset();
-
-    try writeAllFd(fd_b, resume_line);
-    try recvUntil(&b, "SESSION RESUME: session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
+    try recvUntil(&b, "JOIN #root", 200);
     try recvUntil(&b, "JOIN #ops", 200);
+    try recvUntil(&b, "JOIN #dev", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), ":TempResume!webchat@localhost JOIN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "Guest") == null);
 
     b.reset();
     try writeAllFd(fd_b, "WHOIS trev\r\n");
