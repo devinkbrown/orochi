@@ -11858,6 +11858,21 @@ pub const LinuxServer = struct {
             }
             return;
         }
+        // A secret (+s) or private (+p) channel's roster is visible only to its
+        // members (and opers) — mirror ophion's ShowChannel = PubChannel ||
+        // IsMember. A non-member gets a bare RPL_ENDOFNAMES, never the member
+        // list, so NAMES cannot enumerate a hidden channel (the WHOIS path
+        // already gates the same way via channelHiddenFromWhois).
+        if (!conn.session.isOper() and
+            (self.world.channelHasFlag(channel, .secret) or self.world.isPrivate(channel)))
+        {
+            const viewer_wid = self.world.findNick(conn.session.displayName());
+            const is_member = if (viewer_wid) |vw| self.world.isMember(channel, vw) else false;
+            if (!is_member) {
+                try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+                return;
+            }
+        }
         try self.sendNames(conn, channel);
     }
 
@@ -37058,6 +37073,56 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     a.reset();
     try writeAllFd(fd_a, "ADMIN\r\n");
     try recvUntil(&a, " 256 A ", 200);
+}
+
+test "threaded server IRCX: NAMES on a secret channel hides the roster from a non-member" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds #sec and marks it secret (+s). B is NOT a member.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #sec\r\n");
+    try recvUntil(&a, " 366 A #sec ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #sec +s\r\n");
+    try recvUntil(&a, "MODE #sec +s", 200);
+
+    // Non-member B: NAMES #sec must NOT leak the roster — only RPL_ENDOFNAMES,
+    // never a 353 naming A (ophion ShowChannel = PubChannel || IsMember).
+    b.reset();
+    try writeAllFd(fd_b, "NAMES #sec\r\n");
+    try recvUntil(&b, " 366 B #sec ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 353 ") == null);
+
+    // Sanity: a member (A) still sees the roster for its own secret channel.
+    a.reset();
+    try writeAllFd(fd_a, "NAMES #sec\r\n");
+    try recvUntil(&a, " 353 ", 200);
+    try recvUntil(&a, " 366 A #sec ", 200);
 }
 
 test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-end" {
