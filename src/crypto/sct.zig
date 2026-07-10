@@ -70,10 +70,11 @@
 //!     for chain validation; if the chain fails, never reach this code.
 //!   * SCT SOURCES: embedded X.509 extension (parsed via `x509.parseSctList` /
 //!     `x509.findSctListExtension`), the TLS `signed_certificate_timestamp`
-//!     extension (18), and OCSP. Only the X.509-extension source is wired here;
-//!     the TLS-extension and OCSP sources are follow-ups (they reuse the same
-//!     `parseList` + `verifySctAgainstLogs` path once their SCT bytes are in
-//!     hand).
+//!     extension (18), and OCSP (the stapled response's SingleResponse SCT
+//!     extension, OID 1.3.6.1.4.1.11129.2.4.5, mined via
+//!     `ocsp.sctListFromSingleExtensions`). All three reuse the same `parseList`
+//!     + `verifySctAgainstLogs` path once their SCT bytes are in hand, and the
+//!     tls_client pools them into ONE `DistinctValidLogs` union quorum.
 //!   * ENTRY TYPE: SCTs EMBEDDED in the certificate sign over the PRECERTIFICATE
 //!     (`precert_entry`): the leaf's TBSCertificate with the CT poison extension
 //!     and the SCT-list extension removed, prefixed by the issuer key hash (use
@@ -668,19 +669,21 @@ pub const ListSummary = struct {
 };
 
 /// Upper bound on the number of DISTINCT pinned logs a `DistinctValidLogs`
-/// accumulator can hold. A CT policy pools SCTs delivered by more than one method
-/// (the embedded X.509 extension AND the TLS `signed_certificate_timestamp`
-/// extension — RFC 6962 §3), and each list surfaces at most `max_scts` SCTs, so
-/// the union across the two sources is bounded by `2 * max_scts`.
-pub const max_distinct_logs: usize = 2 * max_scts;
+/// accumulator can hold. A CT policy pools SCTs delivered by all three RFC 6962 §3
+/// methods (the embedded X.509 extension, the TLS `signed_certificate_timestamp`
+/// extension, AND the OCSP `SingleResponse` SCT extension), and each list surfaces
+/// at most `max_scts` SCTs, so the union across the three sources is bounded by
+/// `3 * max_scts`.
+pub const max_distinct_logs: usize = 3 * max_scts;
 
 /// A bounded accumulator of DISTINCT CT `log_id`s that have contributed at least
 /// one `.valid` SCT, ACROSS one or more `verifyListAccumulating` calls.
 ///
 /// A single `ListSummary.distinct_valid_logs` counts distinct logs within ONE
 /// list. When a caller pools SCTs from multiple delivery methods (embedded cert
-/// extension + the TLS extension) it must count the distinct-log presence quorum
-/// over the UNION — a log that validly appears in BOTH sources counts once
+/// extension + the TLS extension + the OCSP SingleResponse extension) it must
+/// count the distinct-log presence quorum over the UNION — a log that validly
+/// appears in more than one source counts once
 /// (RFC 6962 §5.1-style). This accumulator carries that union across calls;
 /// `count()` is the quorum a fail-closed policy compares against `require_sct`.
 pub const DistinctValidLogs = struct {

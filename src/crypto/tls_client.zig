@@ -2141,13 +2141,15 @@ pub const Client = struct {
             try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
         // Opt-in SCT (Certificate Transparency) verification, pooling SCTs from
-        // BOTH the embedded X.509 extension (precert entry) and any TLS
-        // `signed_certificate_timestamp` extension the server returned (final-cert
-        // entry) into ONE cross-source distinct-log quorum. Byte-identical when
-        // `ct_logs` is empty (the default): the path is skipped and no ext-18 was
-        // ever advertised. `enforce_sct` adds tamper detection; `require_sct` adds
-        // the presence + distinct-log quorum.
-        try verifyScts(chain, leaf_tls_ext_scts, self.ct_logs, self.enforce_sct, self.require_sct);
+        // ALL THREE RFC 6962 §3 sources — the embedded X.509 extension (precert
+        // entry), any TLS `signed_certificate_timestamp` extension (final-cert
+        // entry), and the stapled OCSP response's SingleResponse SCT extension
+        // (final-cert entry) — into ONE cross-source distinct-log quorum. Byte-
+        // identical when `ct_logs` is empty (the default): the path is skipped, no
+        // ext-18 was ever advertised, and OCSP stapling is requested regardless
+        // (so the OCSP source adds no wire change). `enforce_sct` adds tamper
+        // detection; `require_sct` adds the presence + distinct-log quorum.
+        try verifyScts(chain, leaf_tls_ext_scts, leaf_ocsp_staple, self.ct_logs, self.enforce_sct, self.require_sct);
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         try self.ownLeafRsaKey();
 
@@ -2890,20 +2892,23 @@ fn freeCtLogs(allocator: Allocator, logs: []sct.CtLog) void {
 }
 
 /// OPT-IN Certificate Transparency (RFC 6962) verification for the leaf, pooling
-/// SCTs from BOTH delivery methods a TLS-1.3 client can receive:
+/// SCTs from ALL THREE delivery methods a TLS-1.3 client can receive:
 ///
 ///   * the EMBEDDED X.509 SCT-list extension — SCTs signing the PRECERTIFICATE
 ///     (`precert_entry`: the leaf TBS with the SCT-list + poison extensions
-///     stripped, prefixed by the issuer key hash); and
+///     stripped, prefixed by the issuer key hash);
 ///   * the leaf CertificateEntry's `signed_certificate_timestamp` extension
 ///     (`tls_ext_scts`, RFC 6962 §3.3) — SCTs signing the FINAL certificate
-///     (`x509_entry`: the leaf DER).
+///     (`x509_entry`: the leaf DER); and
+///   * the stapled OCSP response's SingleResponse SCT extension (`ocsp_staple`,
+///     OID 1.3.6.1.4.1.11129.2.4.5) — SCTs also signing the FINAL certificate
+///     (`x509_entry`), mined from the response matching the leaf serial.
 ///
-/// Both sources are verified against `ct_logs` and pooled into ONE cross-source
-/// distinct-log presence quorum (a log valid in both sources counts once), which
-/// two independent, composable policies act on:
+/// All three sources are verified against `ct_logs` and pooled into ONE cross-
+/// source distinct-log presence quorum (a log valid in more than one source counts
+/// once), which two independent, composable policies act on:
 ///
-///   * `enforce` (tamper detection): ANY pinned-log-matched SCT from EITHER source
+///   * `enforce` (tamper detection): ANY pinned-log-matched SCT from ANY source
 ///     whose signature is INVALID rejects with `error.BadSct`.
 ///   * `require` (presence + distinct-log quorum): when `>= 1`, the pooled set
 ///     must reach `require` DISTINCT pinned logs with a valid SCT, else
@@ -2913,10 +2918,11 @@ fn freeCtLogs(allocator: Allocator, logs: []sct.CtLog) void {
 /// FAIL-OPEN: absent SCTs, an unpinned log, or any parse/reconstruction failure
 /// contributes a zero summary that no enabled policy rejects. When `require >= 1`
 /// those same "no valid SCTs proven" outcomes are a hard reject — an attacker
-/// omitting SCTs from both sources cannot reach the quorum.
+/// omitting SCTs from all three sources cannot reach the quorum.
 ///
 /// `ct_logs` empty ⇒ the entire path is skipped AND no ext-18 was ever advertised
-/// in the ClientHello ⇒ the wire is byte-identical to the pre-feature client
+/// in the ClientHello (OCSP stapling is requested regardless, so the OCSP source
+/// adds no wire change) ⇒ the wire is byte-identical to the pre-feature client
 /// regardless of `enforce`/`require`.
 ///
 /// The temporal (future-dated) check is deliberately NOT enforced here: passing
@@ -2926,16 +2932,18 @@ fn freeCtLogs(allocator: Allocator, logs: []sct.CtLog) void {
 fn verifyScts(
     chain: []const []const u8,
     tls_ext_scts: ?[]const u8,
+    ocsp_staple: ?[]const u8,
     ct_logs: []const sct.CtLog,
     enforce: bool,
     require: u8,
 ) Error!void {
     if (ct_logs.len == 0) return; // feature off ⇒ nothing runs, wire byte-identical
 
-    // Pool distinct valid logs across both sources; track any invalid SCT for the
+    // Pool distinct valid logs across all sources; track any invalid SCT for the
     // tamper-detection policy. Every fail-open path (missing chain, absent SCTs,
-    // precert reconstruction failure, malformed list) yields a zero summary, so a
-    // mis-issued cert that simply omits SCTs cannot bypass a `require >= 1` policy.
+    // precert reconstruction failure, unparseable staple, malformed list) yields a
+    // zero summary, so a mis-issued cert that simply omits SCTs cannot bypass a
+    // `require >= 1` policy.
     var pooled: sct.DistinctValidLogs = .{};
     var any_invalid = false;
 
@@ -2947,6 +2955,11 @@ fn verifyScts(
         if (ext.invalid > 0) any_invalid = true;
     }
 
+    if (ocsp_staple) |staple| {
+        const oc = ocspSctSummary(chain, staple, ct_logs, &pooled);
+        if (oc.invalid > 0) any_invalid = true;
+    }
+
     // Tamper detection: an authenticated-but-invalid SCT rejects under `enforce`.
     if (enforce and any_invalid) return error.BadSct;
     // Presence + distinct-log quorum over the pooled set. Skipped entirely when
@@ -2956,15 +2969,16 @@ fn verifyScts(
 }
 
 /// OPT-IN embedded-SCT verification for the leaf certificate. Thin wrapper over
-/// `verifyScts` with no TLS-extension source (the embedded X.509 SCT extension
-/// only). Retained as a standalone entrypoint for direct embedded-only checks.
+/// `verifyScts` with no TLS-extension or OCSP source (the embedded X.509 SCT
+/// extension only). Retained as a standalone entrypoint for direct embedded-only
+/// checks.
 fn verifyEmbeddedScts(
     chain: []const []const u8,
     ct_logs: []const sct.CtLog,
     enforce: bool,
     require: u8,
 ) Error!void {
-    return verifyScts(chain, null, ct_logs, enforce, require);
+    return verifyScts(chain, null, null, ct_logs, enforce, require);
 }
 
 /// Verify the leaf's EMBEDDED SCT-list extension against `ct_logs`, recording
@@ -3023,6 +3037,59 @@ fn tlsExtSctSummary(
     if (chain.len == 0) return .{}; // defensive: no leaf to check
     const ctx = sct.CertContext{ .entry_type = .x509_entry, .signed_entry = chain[0] };
     return sct.verifyListAccumulating(list_bytes, ctx, ct_logs, null, pooled) catch return .{};
+}
+
+/// Verify the leaf's OCSP-DELIVERED SCT list against `ct_logs`, recording distinct
+/// valid logs into `pooled`. Mines the SCT-list extension (OID
+/// 1.3.6.1.4.1.11129.2.4.5) from the SingleResponse whose CertID serial matches
+/// the leaf, in the stapled OCSP response `ocsp_staple`. OCSP-delivered SCTs sign
+/// the FINAL leaf DER (`x509_entry`) — the same entry type as the TLS extension.
+///
+/// The SCT's authenticity is established by its OWN log signature (verified against
+/// `ct_logs`), NOT by the OCSP response signature — so the staple need not be
+/// separately validated here; the leaf-serial scoping is only to find the right
+/// SingleResponse. The leaf serial is read STRUCTURALLY (`leafSerialDer`) rather
+/// than via a full `x509.parse`: the chain was already verified at the call site,
+/// and this keeps the OCSP source symmetric with `embeddedSctSummary` /
+/// `tlsExtSctSummary` (all navigate structurally). Returns a zero `sct.ListSummary`
+/// on every fail-open path (no leaf, unreadable serial, unparseable staple, no
+/// matching SingleResponse, no SCT extension, malformed list) so the caller's
+/// `require` gate decides open vs closed. Should a server uncommonly deliver a
+/// PRECERT SCT over OCSP, it reconstructs under the wrong entry type and tallies
+/// `.invalid` — a false-reject under `enforce` and a non-credit under `require`,
+/// both fail-CLOSED, never a bypass — mirroring the TLS-extension path.
+fn ocspSctSummary(
+    chain: []const []const u8,
+    ocsp_staple: []const u8,
+    ct_logs: []const sct.CtLog,
+    pooled: *sct.DistinctValidLogs,
+) sct.ListSummary {
+    if (chain.len == 0) return .{}; // defensive: no leaf to check
+    const serial = leafSerialDer(chain[0]) orelse return .{};
+    const parsed = ocsp.parse(ocsp_staple) catch return .{};
+    const single = ocsp.singleForSerial(parsed, serial) orelse return .{};
+    const list_bytes = (ocsp.sctListFromSingleExtensions(single.single_extensions_der) catch return .{}) orelse
+        return .{}; // no OCSP-delivered SCTs
+    const ctx = sct.CertContext{ .entry_type = .x509_entry, .signed_entry = chain[0] };
+    return sct.verifyListAccumulating(list_bytes, ctx, ct_logs, null, pooled) catch return .{};
+}
+
+/// Structurally extract the leaf's `serialNumber` INTEGER value — the exact bytes
+/// `x509.parse` exposes as `serial_der` — by navigating Certificate → TBS →
+/// serialNumber without a full parse or validation (the chain is verified
+/// elsewhere). Fail-open: any malformed DER yields `null`, so a caller treats an
+/// unreadable serial as "no OCSP SCTs to mine".
+fn leafSerialDer(cert_der: []const u8) ?[]const u8 {
+    var top = x509.DerReader.init(cert_der);
+    const cert_seq = top.readExpected(x509.Tag.sequence) catch return null;
+    var body = top.child(cert_seq) catch return null;
+    const tbs = body.readExpected(x509.Tag.sequence) catch return null;
+    var tbs_reader = body.child(tbs) catch return null;
+    if (tbs_reader.hasRemaining() and (tbs_reader.peekTag() catch return null) == x509.Tag.context_0_constructed) {
+        _ = tbs_reader.readTlv() catch return null; // [0] EXPLICIT version
+    }
+    const serial = tbs_reader.readExpected(x509.Tag.integer) catch return null;
+    return serial.value;
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
@@ -5323,9 +5390,16 @@ fn sctTestEcdsaSpki(a: Allocator, sec1: [65]u8) []u8 {
 
 /// A structurally-walkable leaf TBS prefix (version[0]…spki) — copied verbatim.
 fn sctTestPrefix(a: Allocator) []u8 {
+    return sctTestPrefixSerial(a, &[_]u8{ 0xAB, 0xCD });
+}
+
+/// `sctTestPrefix` with a caller-chosen `serialNumber` value. OCSP-source tests
+/// need a DER-POSITIVE serial (high bit clear) so `ocsp.parse`'s CertID validation
+/// accepts it, whereas the embedded/ext-18 paths never inspect the serial.
+fn sctTestPrefixSerial(a: Allocator, serial: []const u8) []u8 {
     var out: std.ArrayList(u8) = .empty;
     out.appendSlice(a, sctTlv(a, x509.Tag.context_0_constructed, sctTlv(a, x509.Tag.integer, &[_]u8{0x02}))) catch unreachable;
-    out.appendSlice(a, sctTlv(a, x509.Tag.integer, &[_]u8{ 0xAB, 0xCD })) catch unreachable;
+    out.appendSlice(a, sctTlv(a, x509.Tag.integer, serial)) catch unreachable;
     for (0..5) |_| out.appendSlice(a, sctTlv(a, x509.Tag.sequence, "")) catch unreachable;
     return out.toOwnedSlice(a) catch unreachable;
 }
@@ -5411,6 +5485,12 @@ const SctFixture = struct {
 };
 
 fn buildSctFixture(a: Allocator) !SctFixture {
+    return buildSctFixtureSerial(a, &[_]u8{ 0xAB, 0xCD });
+}
+
+/// `buildSctFixture` with a caller-chosen leaf `serial` — the OCSP-source tests
+/// need a DER-positive one so the stapled response's CertID parses.
+fn buildSctFixtureSerial(a: Allocator, serial: []const u8) !SctFixture {
     // A real Ed25519 self-signed issuer so `extractCertParts` succeeds.
     const Ed25519 = std.crypto.sign.Ed25519;
     const issuer_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x33)));
@@ -5433,7 +5513,7 @@ fn buildSctFixture(a: Allocator) !SctFixture {
     const log = sct.CtLog{ .log_id = sct.logIdFromSpki(log_spki), .key_spki_der = log_spki };
 
     // The precertificate TBS the SCT signs over (leaf minus the SCT extension).
-    const prefix = sctTestPrefix(a);
+    const prefix = sctTestPrefixSerial(a, serial);
     const other_ext = sctTestExt(a, &[_]u8{ 0x55, 0x1D, 0x13 }, sctTlv(a, x509.Tag.sequence, "")); // basicConstraints
     const precert_tbs = sctTestTbs(a, prefix, &.{other_ext});
 
@@ -5745,12 +5825,12 @@ test "verifyScts: a TLS-extension SCT satisfies the quorum with no embedded SCT"
     const pins = [_]sct.CtLog{x.log};
 
     // The valid ext-18 SCT meets a 1-log presence quorum (and passes under enforce).
-    try verifyScts(&chain, x.list, &pins, false, 1);
-    try verifyScts(&chain, x.list, &pins, true, 1);
+    try verifyScts(&chain, x.list, null, &pins, false, 1);
+    try verifyScts(&chain, x.list, null, &pins, true, 1);
     // Without the ext-18 source, the same leaf has no SCTs at all ⇒ below quorum.
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, &pins, false, 1));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, null, &pins, false, 1));
     // A 2-log quorum is not met by a single ext-18 log.
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, &pins, false, 2));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, null, &pins, false, 2));
 }
 
 test "verifyScts: embedded and TLS-extension SCTs pool into one distinct-log quorum" {
@@ -5768,16 +5848,16 @@ test "verifyScts: embedded and TLS-extension SCTs pool into one distinct-log quo
     const pins = [_]sct.CtLog{ f.log, x.log };
 
     // Pooled union {embedded f.log, ext-18 x.log} = 2 distinct logs.
-    try verifyScts(&chain, x.list, &pins, false, 2);
-    try verifyScts(&chain, x.list, &pins, true, 2);
+    try verifyScts(&chain, x.list, null, &pins, false, 2);
+    try verifyScts(&chain, x.list, null, &pins, true, 2);
     // 3 distinct logs are not available ⇒ reject.
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, &pins, false, 3));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, null, &pins, false, 3));
     // Neither source ALONE reaches 2 distinct logs — proving the pooling matters.
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, &pins, false, 2));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, null, &pins, false, 2));
     const no_embed = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
     const no_embed_chain = [_][]const u8{ no_embed, f.issuer_der };
     const x2 = sctFixtureSignX509(a, no_embed, f.ts);
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&no_embed_chain, x2.list, &[_]sct.CtLog{x2.log}, false, 2));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&no_embed_chain, x2.list, null, &[_]sct.CtLog{x2.log}, false, 2));
 }
 
 test "verifyScts: a tampered TLS-extension SCT rejects ONLY under enforcement" {
@@ -5795,10 +5875,10 @@ test "verifyScts: a tampered TLS-extension SCT rejects ONLY under enforcement" {
     // pinned log still matches, but the signature is invalid.
     x.list[x.list.len - 1] ^= 0x01;
     // enforce on → the invalid pinned ext-18 SCT is a hard reject.
-    try std.testing.expectError(error.BadSct, verifyScts(&chain, x.list, &pins, true, 0));
+    try std.testing.expectError(error.BadSct, verifyScts(&chain, x.list, null, &pins, true, 0));
     // enforce off → tolerated (fail-open); and it never counts toward a quorum.
-    try verifyScts(&chain, x.list, &pins, false, 0);
-    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, &pins, false, 1));
+    try verifyScts(&chain, x.list, null, &pins, false, 0);
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, null, &pins, false, 1));
 }
 
 test "verifyScts: TLS-extension SCTs are ignored when the feature is off" {
@@ -5812,9 +5892,179 @@ test "verifyScts: TLS-extension SCTs are ignored when the feature is off" {
 
     // ct_logs empty ⇒ the whole path is skipped (no ext-18 was ever advertised),
     // even under enforce AND a presence requirement: byte-identical-when-off.
-    try verifyScts(&chain, x.list, &.{}, true, 2);
+    try verifyScts(&chain, x.list, null, &.{}, true, 2);
     // A structurally broken ext-18 list is likewise a no-op when the feature is off.
-    try verifyScts(&chain, &[_]u8{ 0xDE, 0xAD }, &.{}, true, 2);
+    try verifyScts(&chain, &[_]u8{ 0xDE, 0xAD }, null, &.{}, true, 2);
+}
+
+/// Assemble a minimal RFC 6960 OCSP response DER that `ocsp.parse` accepts, with
+/// one `good` SingleResponse for `leaf_serial`. When `sct_list` is non-null it is
+/// carried in that SingleResponse's `singleExtensions` under the OCSP SCT-list OID
+/// (1.3.6.1.4.1.11129.2.4.5); null omits the extension. The BasicOCSPResponse
+/// signature is a placeholder — `ocspSctSummary` authenticates each SCT by its own
+/// log signature, never the OCSP response signature.
+fn sctTestOcspStaple(a: Allocator, leaf_serial: []const u8, sct_list: ?[]const u8) []u8 {
+    const enumerated: u8 = 0x0A;
+    const context_0_primitive: u8 = 0x80; // certStatus good [0] IMPLICIT NULL
+    const context_2_primitive: u8 = 0x82; // responderID byKey [2] KeyHash
+
+    // CertID ::= SEQUENCE { hashAlgorithm SEQUENCE{OID sha1, NULL}, issuerNameHash
+    // OCTET STRING, issuerKeyHash OCTET STRING, serialNumber INTEGER }.
+    const oid_sha1 = [_]u8{ 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+    var hash_alg_body: std.ArrayList(u8) = .empty;
+    hash_alg_body.appendSlice(a, sctTlv(a, x509.Tag.oid, &oid_sha1)) catch unreachable;
+    hash_alg_body.appendSlice(a, sctTlv(a, x509.Tag.null_value, "")) catch unreachable;
+    var cert_id_body: std.ArrayList(u8) = .empty;
+    cert_id_body.appendSlice(a, sctTlv(a, x509.Tag.sequence, hash_alg_body.items)) catch unreachable;
+    cert_id_body.appendSlice(a, sctTlv(a, x509.Tag.octet_string, &@as([20]u8, @splat(0x11)))) catch unreachable;
+    cert_id_body.appendSlice(a, sctTlv(a, x509.Tag.octet_string, &@as([20]u8, @splat(0x22)))) catch unreachable;
+    cert_id_body.appendSlice(a, sctTlv(a, x509.Tag.integer, leaf_serial)) catch unreachable;
+    const cert_id = sctTlv(a, x509.Tag.sequence, cert_id_body.items);
+
+    // SingleResponse: CertID, certStatus good, thisUpdate, [singleExtensions].
+    var single_body: std.ArrayList(u8) = .empty;
+    single_body.appendSlice(a, cert_id) catch unreachable;
+    single_body.appendSlice(a, sctTlv(a, context_0_primitive, "")) catch unreachable; // good
+    single_body.appendSlice(a, sctTlv(a, x509.Tag.generalized_time, "20260102030405Z")) catch unreachable;
+    if (sct_list) |list| {
+        // Extension: SEQUENCE { OID sct-ocsp, OCTET STRING( OCTET STRING(list) ) };
+        // wrapped in singleExtensions [1] EXPLICIT SEQUENCE OF Extension.
+        const ext = sctTestExt(a, &ocsp.sct_ocsp_extension_oid, sctTlv(a, x509.Tag.octet_string, list));
+        const ext_seq = sctTlv(a, x509.Tag.sequence, ext);
+        single_body.appendSlice(a, sctTlv(a, x509.Tag.context_1_constructed, ext_seq)) catch unreachable;
+    }
+    const single = sctTlv(a, x509.Tag.sequence, single_body.items);
+
+    // ResponseData: responderID byKey [2], producedAt, responses SEQUENCE OF.
+    var tbs_body: std.ArrayList(u8) = .empty;
+    tbs_body.appendSlice(a, sctTlv(a, context_2_primitive, &@as([20]u8, @splat(0x33)))) catch unreachable;
+    tbs_body.appendSlice(a, sctTlv(a, x509.Tag.generalized_time, "20260102030405Z")) catch unreachable;
+    tbs_body.appendSlice(a, sctTlv(a, x509.Tag.sequence, single)) catch unreachable;
+    const tbs = sctTlv(a, x509.Tag.sequence, tbs_body.items);
+
+    // BasicOCSPResponse: tbsResponseData, signatureAlgorithm, signature (dummy).
+    const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+    var basic_body: std.ArrayList(u8) = .empty;
+    basic_body.appendSlice(a, tbs) catch unreachable;
+    basic_body.appendSlice(a, sctTlv(a, x509.Tag.sequence, sctTlv(a, x509.Tag.oid, &oid_ecdsa_sha256))) catch unreachable;
+    basic_body.appendSlice(a, sctTlv(a, x509.Tag.bit_string, &[_]u8{ 0x00, 0xAB, 0xCD })) catch unreachable;
+    const basic = sctTlv(a, x509.Tag.sequence, basic_body.items);
+
+    // responseBytes [0] EXPLICIT SEQUENCE { responseType OID, response OCTET STRING }.
+    const oid_ocsp_basic = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01 };
+    var rb_body: std.ArrayList(u8) = .empty;
+    rb_body.appendSlice(a, sctTlv(a, x509.Tag.oid, &oid_ocsp_basic)) catch unreachable;
+    rb_body.appendSlice(a, sctTlv(a, x509.Tag.octet_string, basic)) catch unreachable;
+    const response_bytes = sctTlv(a, x509.Tag.context_0_constructed, sctTlv(a, x509.Tag.sequence, rb_body.items));
+
+    // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED successful, responseBytes }.
+    var ocsp_body: std.ArrayList(u8) = .empty;
+    ocsp_body.appendSlice(a, sctTlv(a, enumerated, &[_]u8{0x00})) catch unreachable;
+    ocsp_body.appendSlice(a, response_bytes) catch unreachable;
+    return sctTlv(a, x509.Tag.sequence, ocsp_body.items);
+}
+
+test "verifyScts: an OCSP-delivered SCT satisfies the quorum with no embedded/ext-18 SCT" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const serial = [_]u8{ 0x02, 0x9A }; // DER-positive so the CertID parses
+    const f = try buildSctFixtureSerial(a, &serial);
+    // A leaf carrying NO embedded SCT extension; SCTs arrive only over OCSP.
+    const leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
+    try std.testing.expectEqualSlices(u8, &serial, leafSerialDer(leaf).?);
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    const o = sctFixtureSignX509(a, leaf, f.ts); // OCSP SCT signs the final leaf (x509_entry)
+    const staple = sctTestOcspStaple(a, &serial, o.list);
+    const pins = [_]sct.CtLog{o.log};
+
+    // The valid OCSP SCT meets a 1-log presence quorum (and passes under enforce).
+    try verifyScts(&chain, null, staple, &pins, false, 1);
+    try verifyScts(&chain, null, staple, &pins, true, 1);
+    // Without the OCSP staple, the same leaf has no SCTs at all ⇒ below quorum.
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, null, &pins, false, 1));
+    // A 2-log quorum is not met by a single OCSP log.
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, staple, &pins, false, 2));
+}
+
+test "verifyScts: embedded, TLS-extension, and OCSP SCTs pool into one distinct-log quorum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const serial = [_]u8{ 0x03, 0x11 };
+    const f = try buildSctFixtureSerial(a, &serial);
+    // Leaf carrying the embedded precert SCT from f.log.
+    const leaf = sctFixtureLeaf(a, f, f.der_sig);
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    // ext-18 SCT from a DISTINCT log, OCSP SCT from a THIRD distinct log — both
+    // over the FINAL leaf DER (x509_entry).
+    const x = sctFixtureSignX509(a, leaf, f.ts);
+    const o = sctFixtureSignX509(a, leaf, f.ts);
+    try std.testing.expect(!std.mem.eql(u8, &f.log.log_id, &x.log.log_id));
+    try std.testing.expect(!std.mem.eql(u8, &f.log.log_id, &o.log.log_id));
+    try std.testing.expect(!std.mem.eql(u8, &x.log.log_id, &o.log.log_id));
+    const staple = sctTestOcspStaple(a, &serial, o.list);
+    const pins = [_]sct.CtLog{ f.log, x.log, o.log };
+
+    // Pooled union {embedded f.log, ext-18 x.log, OCSP o.log} = 3 distinct logs.
+    try verifyScts(&chain, x.list, staple, &pins, false, 3);
+    try verifyScts(&chain, x.list, staple, &pins, true, 3);
+    // 4 distinct logs are not available ⇒ reject.
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, staple, &pins, false, 4));
+    // NONE of the three sources dropped leaves 3 reachable — proving the pooling
+    // matters (embedded is always present on this leaf; each pair reaches only 2).
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, null, &pins, false, 3));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, x.list, null, &pins, false, 3));
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, staple, &pins, false, 3));
+}
+
+test "verifyScts: a tampered OCSP-delivered SCT rejects ONLY under enforcement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const serial = [_]u8{ 0x02, 0x9A };
+    const f = try buildSctFixtureSerial(a, &serial);
+    const leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    const o = sctFixtureSignX509(a, leaf, f.ts);
+    // Flip the LAST byte of the SCT list (the trailing signature byte): the pinned
+    // log still matches, but the signature is invalid. Tamper BEFORE embedding.
+    o.list[o.list.len - 1] ^= 0x01;
+    const staple = sctTestOcspStaple(a, &serial, o.list);
+    const pins = [_]sct.CtLog{o.log};
+
+    // enforce on → the invalid pinned OCSP SCT is a hard reject.
+    try std.testing.expectError(error.BadSct, verifyScts(&chain, null, staple, &pins, true, 0));
+    // enforce off → tolerated (fail-open); and it never counts toward a quorum.
+    try verifyScts(&chain, null, staple, &pins, false, 0);
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, staple, &pins, false, 1));
+}
+
+test "verifyScts: OCSP-delivered SCTs are ignored when the feature is off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const serial = [_]u8{ 0x02, 0x9A };
+    const f = try buildSctFixtureSerial(a, &serial);
+    const leaf = sctTestCert(a, sctTestTbs(a, f.prefix, &.{f.other_ext}));
+    const chain = [_][]const u8{ leaf, f.issuer_der };
+    const o = sctFixtureSignX509(a, leaf, f.ts);
+    const staple = sctTestOcspStaple(a, &serial, o.list);
+
+    // ct_logs empty ⇒ the whole path is skipped. OCSP stapling is requested
+    // regardless, so mining adds no wire change: byte-identical-when-off — even
+    // under enforce AND a presence requirement.
+    try verifyScts(&chain, null, staple, &.{}, true, 2);
+    // A structurally broken staple is likewise a no-op when the feature is off.
+    try verifyScts(&chain, null, &[_]u8{ 0xDE, 0xAD }, &.{}, true, 2);
+    // Feature ON but the staple carries NO SCT extension ⇒ contributes nothing
+    // (fail-open); require 1 with only the OCSP source ⇒ below quorum.
+    const no_sct_staple = sctTestOcspStaple(a, &serial, null);
+    try std.testing.expectError(error.InsufficientScts, verifyScts(&chain, null, no_sct_staple, &[_]sct.CtLog{o.log}, false, 1));
 }
 
 test "Client advertises the SCT extension only when CT logs are pinned" {

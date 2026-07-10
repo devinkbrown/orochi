@@ -84,6 +84,12 @@ pub const SingleResponse = struct {
     this_update: []const u8,
     /// Optional validated nextUpdate GeneralizedTime bytes.
     next_update: ?[]const u8,
+    /// Content bytes of the SingleResponse `singleExtensions` — the inner
+    /// `SEQUENCE OF Extension` (RFC 6960 §4.2.1), a view into the OCSP DER input,
+    /// or empty when absent. Scan it with `sctListFromSingleExtensions` to mine an
+    /// RFC 6962 OCSP-delivered SCT list. Defaulted so hand-built literals need not
+    /// set it.
+    single_extensions_der: []const u8 = &.{},
 };
 
 pub fn ParsedResponse(comptime max_responses: usize) type {
@@ -179,6 +185,40 @@ pub fn statusForSerial(parsed: anytype, serial: []const u8) ?CertStatus {
 pub fn singleForSerial(parsed: anytype, serial: []const u8) ?SingleResponse {
     for (parsed.responses[0..parsed.response_count]) |single| {
         if (serialsEqual(single.serial, serial)) return single;
+    }
+    return null;
+}
+
+/// OID 1.3.6.1.4.1.11129.2.4.5 — the OCSP-delivered `SignedCertificateTimestampList`
+/// extension (RFC 6962 §3.3), carried in a `SingleResponse`'s `singleExtensions`.
+/// One digit past the X.509 embedded-SCT extension (`...2.4.2`).
+pub const sct_ocsp_extension_oid = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x05 };
+
+/// Scan a `SingleResponse.single_extensions_der` (the raw `SEQUENCE OF Extension`
+/// content) for the OCSP SCT-list extension and return the raw TLS
+/// `SignedCertificateTimestampList` bytes — ready for `sct.parseList`, signing the
+/// FINAL leaf DER (`x509_entry`) like the TLS extension — or `null` when the
+/// extension is absent. The exact-OID compare is the identity boundary; any
+/// malformed extension DER fails closed with a typed error. The SCT extension's
+/// `extnValue` wraps a `SignedCertificateTimestampList ::= OCTET STRING` (the same
+/// shape as the X.509 extension), so `x509.parseSctList` peels the inner OCTET
+/// STRING to the TLS list bytes.
+pub fn sctListFromSingleExtensions(single_extensions_der: []const u8) Error!?[]const u8 {
+    if (single_extensions_der.len == 0) return null;
+    var extensions = x509.DerReader.init(single_extensions_der);
+    while (extensions.hasRemaining()) {
+        const one_tlv = try extensions.readExpected(x509.Tag.sequence);
+        var one = try extensions.child(one_tlv);
+        const oid_tlv = try one.readExpected(x509.Tag.oid);
+        try validateOid(oid_tlv.value);
+        if (one.hasRemaining() and try one.peekTag() == x509.Tag.boolean) {
+            _ = try one.readTlv(); // optional `critical` flag (ignored)
+        }
+        const value = try one.readExpected(x509.Tag.octet_string);
+        try one.expectEmpty();
+        if (std.mem.eql(u8, oid_tlv.value, &sct_ocsp_extension_oid)) {
+            return try x509.parseSctList(value.value);
+        }
     }
     return null;
 }
@@ -477,8 +517,13 @@ fn parseSingleResponse(parent: x509.DerReader, single_tlv: x509.Tlv) Error!Singl
         try explicit.expectEmpty();
     }
 
+    var single_extensions_der: []const u8 = &.{};
     if (single.hasRemaining()) {
-        _ = try single.readExpected(x509.Tag.context_1_constructed); // singleExtensions
+        // singleExtensions [1] EXPLICIT Extensions (SEQUENCE OF Extension).
+        var explicit = try single.child(try single.readExpected(x509.Tag.context_1_constructed));
+        const seq = try explicit.readExpected(x509.Tag.sequence);
+        try explicit.expectEmpty();
+        single_extensions_der = seq.value;
     }
     try single.expectEmpty();
 
@@ -490,6 +535,7 @@ fn parseSingleResponse(parent: x509.DerReader, single_tlv: x509.Tlv) Error!Singl
         .cert_status = status,
         .this_update = this_update,
         .next_update = next_update,
+        .single_extensions_der = single_extensions_der,
     };
 }
 
@@ -847,6 +893,30 @@ test "ocsp parses successful basic response with one good single response" {
     try std.testing.expectEqualSlices(u8, "20260202030405Z", single.next_update.?);
     try std.testing.expectEqual(CertStatus.good, statusForSerial(parsed, &[_]u8{0x01}).?);
     try std.testing.expect(statusForSerial(parsed, &[_]u8{0x02}) == null);
+    // No singleExtensions present ⇒ empty, and thus no OCSP-delivered SCTs.
+    try std.testing.expectEqual(@as(usize, 0), single.single_extensions_der.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), try sctListFromSingleExtensions(single.single_extensions_der));
+}
+
+test "sctListFromSingleExtensions mines the OCSP SCT extension and fails closed" {
+    // Empty singleExtensions ⇒ no SCTs.
+    try std.testing.expectEqual(@as(?[]const u8, null), try sctListFromSingleExtensions(""));
+
+    // One Extension: SEQUENCE { OID sct-ocsp (…2.4.5), OCTET STRING( OCTET
+    // STRING( 0xAA 0xBB ) ) }. `parseSctList` peels the inner OCTET STRING.
+    const ext = [_]u8{
+        0x30, 0x12,
+        0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x05,
+        0x04, 0x04, 0x04, 0x02, 0xAA, 0xBB,
+    };
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, (try sctListFromSingleExtensions(&ext)).?);
+
+    // A non-matching extension OID (basicConstraints) ⇒ null: not this source.
+    const other = [_]u8{ 0x30, 0x08, 0x06, 0x03, 0x55, 0x1D, 0x13, 0x04, 0x01, 0x00 };
+    try std.testing.expectEqual(@as(?[]const u8, null), try sctListFromSingleExtensions(&other));
+
+    // Truncated extension DER ⇒ fail closed with a typed error, never a read past.
+    try std.testing.expectError(error.Truncated, sctListFromSingleExtensions(&[_]u8{ 0x30, 0x12, 0x06 }));
 }
 
 test "ocsp rejects malformed outer responses" {
