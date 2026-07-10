@@ -32,12 +32,15 @@ pub const Session = struct {
     /// True while the underlying connection is attached; false when the client
     /// dropped but the session is retained for reclaim/bouncer buffering.
     attached: bool = true,
+    /// Optional server-owned encoded restore snapshot for detached sessions.
+    snapshot: ?[]u8 = null,
 };
 
 const SessionList = struct {
     items: std.ArrayListUnmanaged(Session) = .empty,
 
     fn deinit(self: *SessionList, allocator: std.mem.Allocator) void {
+        for (self.items.items) |*session| freeSnapshot(allocator, session);
         self.items.deinit(allocator);
     }
 
@@ -86,6 +89,7 @@ pub const SessionStore = struct {
 
         const list = try self.ensureAccount(account);
         if (list.indexOfClient(client)) |idx| {
+            freeSnapshot(self.allocator, &list.items.items[idx]);
             list.items.items[idx] = .{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
             return list.items.items[idx];
         }
@@ -93,6 +97,7 @@ pub const SessionStore = struct {
             // At cap: evict the oldest *detached* ghost to make room for the live
             // session. Never evict an attached session (that would drop a peer).
             if (oldestDetached(list)) |evict| {
+                freeSnapshot(self.allocator, &list.items.items[evict]);
                 _ = list.items.swapRemove(evict);
             } else return error.TooManySessions;
         }
@@ -116,12 +121,26 @@ pub const SessionStore = struct {
     /// Mark a session detached (connection dropped) but retain it for reclaim/
     /// bouncer. Returns true if it was present. The session is NOT removed.
     pub fn markDetached(self: *SessionStore, account: []const u8, client: ClientId) bool {
+        return self.markDetachedWithSnapshot(account, client, null);
+    }
+
+    /// Mark a session detached and persist an optional encoded restore snapshot.
+    /// The snapshot is copied into the store and freed when the session is
+    /// reattached, removed, evicted, or the account is dropped.
+    pub fn markDetachedWithSnapshot(self: *SessionStore, account: []const u8, client: ClientId, snapshot: ?[]const u8) bool {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
-        list.items.items[idx].attached = false;
+        const session = &list.items.items[idx];
+        const copied = if (snapshot) |bytes|
+            if (bytes.len != 0) self.allocator.dupe(u8, bytes) catch null else null
+        else
+            null;
+        freeSnapshot(self.allocator, session);
+        session.snapshot = copied;
+        session.attached = false;
         return true;
     }
 
@@ -133,6 +152,7 @@ pub const SessionStore = struct {
 
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
+        freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
         _ = entry.value_ptr.items.swapRemove(idx);
         if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
         return true;
@@ -147,6 +167,7 @@ pub const SessionStore = struct {
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
+                freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
                 _ = entry.value_ptr.items.swapRemove(idx);
                 if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
                 return 1;
@@ -164,6 +185,7 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return out[0..0];
         const n = @min(list.items.items.len, out.len);
         @memcpy(out[0..n], list.items.items[0..n]);
+        for (out[0..n]) |*session| session.snapshot = null;
         return out[0..n];
     }
 
@@ -203,7 +225,11 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return null;
         for (list.items.items) |s| {
-            if (std.crypto.timing_safe.eql(Token, s.token, token)) return s;
+            if (std.crypto.timing_safe.eql(Token, s.token, token)) {
+                var copied = s;
+                copied.snapshot = null;
+                return copied;
+            }
         }
         return null;
     }
@@ -213,6 +239,27 @@ pub const SessionStore = struct {
     pub fn findDetachedTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
         const s = self.findTokenSessionInAccount(account, token) orelse return null;
         return if (s.attached) null else s.client;
+    }
+
+    /// Copy the encoded restore snapshot for a detached token in `account`.
+    /// Returns null when the token is unknown, still attached, or has no snapshot.
+    pub fn copyDetachedSnapshotInAccount(
+        self: *const SessionStore,
+        allocator: std.mem.Allocator,
+        account: []const u8,
+        token: Token,
+    ) std.mem.Allocator.Error!?[]u8 {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        for (list.items.items) |s| {
+            if (!std.crypto.timing_safe.eql(Token, s.token, token)) continue;
+            if (s.attached) return null;
+            const bytes = s.snapshot orelse return null;
+            return try allocator.dupe(u8, bytes);
+        }
+        return null;
     }
 
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
@@ -231,6 +278,11 @@ pub const SessionStore = struct {
         self.allocator.free(owned_key);
     }
 };
+
+fn freeSnapshot(allocator: std.mem.Allocator, session: *Session) void {
+    if (session.snapshot) |bytes| allocator.free(bytes);
+    session.snapshot = null;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -265,6 +317,24 @@ test "markDetached retains the session; remove prunes; empty account drops" {
     try testing.expect(!retained[0].attached);
     try testing.expect(s.remove("bob", 7));
     try testing.expectEqual(@as(usize, 0), s.sessionsInto("bob", &out).len); // account pruned
+}
+
+test "detached session snapshots are copied and released across lifecycle paths" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "nick=alice;channels=#root,#ops"));
+
+    const copied = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(1))).?;
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("nick=alice;channels=#root,#ops", copied);
+
+    _ = try s.attach("alice", 2, tok(2), 20); // evicts detached client 1 and its snapshot
+    try testing.expect((try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(1))) == null);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "second"));
+    _ = try s.attach("alice", 2, tok(3), 30); // reattach same client frees old snapshot
+    try testing.expect((try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(3))) == null);
 }
 
 test "findByTokenInto locates a session for reclaim" {
