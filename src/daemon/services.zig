@@ -1016,6 +1016,9 @@ pub const Services = struct {
     fn accountForCertfpUnlocked(self: *Services, fingerprint: []const u8) ServiceError![]const u8 {
         const acct = try self.certfpOwnerUnlocked(fingerprint);
         if (try self.accountSuspendedUnlocked(acct)) return error.AuthFailed;
+        // SASL EXTERNAL must honor an admin FORBID too — otherwise a certfp bound
+        // before the forbid keeps logging the account in.
+        if (self.accountForbiddenUnlocked(acct)) return error.AuthFailed;
         return acct;
     }
 
@@ -1145,7 +1148,10 @@ pub const Services = struct {
         };
         const record = try decodeAccount(value);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
-        if ((record.flags & account_flag_suspended) != 0) return error.AuthFailed;
+        // A suspended OR admin-forbidden account cannot authenticate: FORBID must
+        // lock the owner out of every credential path, matching issueSessionToken
+        // and validateSessionToken which already reject both flags.
+        if ((record.flags & (account_flag_suspended | account_flag_forbidden)) != 0) return error.AuthFailed;
         return .{ .identified = .{ .name = record.name } };
     }
 
@@ -3781,6 +3787,44 @@ test "account lifecycle flags round-trip and persist" {
         try std.testing.expect(!reserved.registered);
         try std.testing.expect(reserved.forbidden());
     }
+}
+
+test "forbidden account is locked out of every login path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-forbidden-login.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    // Bind a certfp to alice through the durable props mirror; certfpOwnerUnlocked
+    // falls back to it when the in-memory cache is cold, so this exercises the
+    // SASL EXTERNAL lookup without a live CertfpBindStore.
+    const fp = "aa:bb:cc:dd";
+    var kb: [certfp_key_max]u8 = undefined;
+    const k = certfpKey(&kb, fp).?;
+    try store.family(.props).put(k, "alice");
+    try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
+
+    // An admin FORBID on a registered account must lock it out of EVERY login
+    // path, exactly as the session-token paths (issue/validate) already do.
+    const info = try services.setAccountForbidden("alice", true, &scratch);
+    try std.testing.expect(info.forbidden());
+
+    // Password / SASL PLAIN both route through identifyAccount.
+    try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", "correct horse battery staple"));
+    // A minted session token must also refuse to issue for a forbidden account.
+    try std.testing.expectError(error.AuthFailed, services.issueSessionToken("alice", 1000));
+    // Client-cert (SASL EXTERNAL).
+    try std.testing.expect(services.accountForCertfp(fp) == null);
+
+    // UNFORBID restores authentication on both credential paths.
+    _ = try services.setAccountForbidden("alice", false, &scratch);
+    _ = try services.identifyAccount("alice", "correct horse battery staple");
+    try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
 }
 
 test "setAccount refuses password-holder lifecycle flag changes" {
