@@ -667,6 +667,46 @@ pub const ListSummary = struct {
     distinct_valid_logs: usize = 0,
 };
 
+/// Upper bound on the number of DISTINCT pinned logs a `DistinctValidLogs`
+/// accumulator can hold. A CT policy pools SCTs delivered by more than one method
+/// (the embedded X.509 extension AND the TLS `signed_certificate_timestamp`
+/// extension — RFC 6962 §3), and each list surfaces at most `max_scts` SCTs, so
+/// the union across the two sources is bounded by `2 * max_scts`.
+pub const max_distinct_logs: usize = 2 * max_scts;
+
+/// A bounded accumulator of DISTINCT CT `log_id`s that have contributed at least
+/// one `.valid` SCT, ACROSS one or more `verifyListAccumulating` calls.
+///
+/// A single `ListSummary.distinct_valid_logs` counts distinct logs within ONE
+/// list. When a caller pools SCTs from multiple delivery methods (embedded cert
+/// extension + the TLS extension) it must count the distinct-log presence quorum
+/// over the UNION — a log that validly appears in BOTH sources counts once
+/// (RFC 6962 §5.1-style). This accumulator carries that union across calls;
+/// `count()` is the quorum a fail-closed policy compares against `require_sct`.
+pub const DistinctValidLogs = struct {
+    ids: [max_distinct_logs][log_id_len]u8 = undefined,
+    len: usize = 0,
+
+    /// Number of distinct valid logs recorded so far (`<= max_distinct_logs`).
+    pub fn count(self: *const DistinctValidLogs) usize {
+        return self.len;
+    }
+
+    /// Record `id` if not already present. Silently ignores an `id` past
+    /// `max_distinct_logs` — the union of two `max_scts`-bounded lists never
+    /// exceeds that bound, so this saturates only on impossible input and, if it
+    /// ever did, would UNDER-count (a fail-CLOSED direction for a quorum check).
+    fn add(self: *DistinctValidLogs, id: [log_id_len]u8) void {
+        for (self.ids[0..self.len]) |seen| {
+            if (std.mem.eql(u8, &seen, &id)) return;
+        }
+        if (self.len < self.ids.len) {
+            self.ids[self.len] = id;
+            self.len += 1;
+        }
+    }
+};
+
 /// Parse a `SignedCertificateTimestampList` and verify every SCT it carries
 /// against the pinned log set, returning a `ListSummary`. Propagates a parse
 /// error (malformed list framing / too many SCTs) so the caller treats a
@@ -677,6 +717,32 @@ pub fn verifyList(
     ctx: CertContext,
     logs: []const CtLog,
     now_ms: ?u64,
+) Error!ListSummary {
+    return verifyListImpl(list_bytes, ctx, logs, now_ms, null);
+}
+
+/// Like `verifyList`, but ALSO records every DISTINCT pinned log that
+/// contributed a `.valid` SCT into `acc`. A caller verifying SCTs from more than
+/// one delivery method calls this once per source with the SAME `acc`, then
+/// checks `acc.count()` against its distinct-log presence quorum — so a log valid
+/// in two sources counts once (RFC 6962 §5.1). The returned `ListSummary` still
+/// reports this call's own tallies (e.g. `.invalid` for tamper detection).
+pub fn verifyListAccumulating(
+    list_bytes: []const u8,
+    ctx: CertContext,
+    logs: []const CtLog,
+    now_ms: ?u64,
+    acc: *DistinctValidLogs,
+) Error!ListSummary {
+    return verifyListImpl(list_bytes, ctx, logs, now_ms, acc);
+}
+
+fn verifyListImpl(
+    list_bytes: []const u8,
+    ctx: CertContext,
+    logs: []const CtLog,
+    now_ms: ?u64,
+    acc: ?*DistinctValidLogs,
 ) Error!ListSummary {
     const list = try parseList(list_bytes);
     var buf: [internal_signed_data_buf_len]u8 = undefined;
@@ -710,6 +776,9 @@ pub fn verifyList(
                     seen_len += 1;
                     summary.distinct_valid_logs += 1;
                 }
+                // The cross-source accumulator dedups globally (a log valid here
+                // and in another source counts once), so feed it every `.valid`.
+                if (acc) |a| a.add(sct.log_id);
             },
             .no_applicable_log => summary.no_applicable_log += 1,
             .invalid => summary.invalid += 1,
@@ -1591,6 +1660,82 @@ test "verifyList counts distinct valid logs for a presence quorum" {
         try testing.expectEqual(@as(usize, 1), summary.no_applicable_log);
         try testing.expectEqual(@as(usize, 0), summary.distinct_valid_logs);
     }
+}
+
+test "verifyListAccumulating unions distinct valid logs across two sources" {
+    // Two lists over the SAME x509 entry: list 1 has valid SCTs from logs A and
+    // B; list 2 has valid SCTs from logs B and C. The per-list distinct counts are
+    // 2 and 2, but the UNION (a cross-source presence quorum) is {A,B,C} = 3, with
+    // B counted once. This models embedded + TLS-extension SCT pooling.
+    const allocator = testing.allocator;
+
+    const kp_a = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki_a = try testEcdsaSpki(allocator, kp_a.public_key.toUncompressedSec1());
+    defer allocator.free(spki_a);
+    const log_a = CtLog{ .log_id = logIdFromSpki(spki_a), .key_spki_der = spki_a };
+    const kp_b = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki_b = try testEcdsaSpki(allocator, kp_b.public_key.toUncompressedSec1());
+    defer allocator.free(spki_b);
+    const log_b = CtLog{ .log_id = logIdFromSpki(spki_b), .key_spki_der = spki_b };
+    const kp_c = ecdsa_p256.KeyPair.generate(testing.io);
+    const spki_c = try testEcdsaSpki(allocator, kp_c.public_key.toUncompressedSec1());
+    defer allocator.free(spki_c);
+    const log_c = CtLog{ .log_id = logIdFromSpki(spki_c), .key_spki_der = spki_c };
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x21 };
+    const ctx = CertContext{ .entry_type = .x509_entry, .signed_entry = &cert_der };
+    const ts: u64 = 555;
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = ts,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+
+    const SignFn = struct {
+        fn go(kp: ecdsa_p256.KeyPair, s: []const u8, out: []u8) []const u8 {
+            const sig = ecdsa_p256.sign(s, kp) catch unreachable;
+            var db: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+            const d = ecdsa_p256.signatureToDer(sig, &db) catch unreachable;
+            @memcpy(out[0..d.len], d);
+            return out[0..d.len];
+        }
+    };
+    var da: [128]u8 = undefined;
+    var db: [128]u8 = undefined;
+    var dc: [128]u8 = undefined;
+    const dsig_a = SignFn.go(kp_a, signed, &da);
+    const dsig_b = SignFn.go(kp_b, signed, &db);
+    const dsig_c = SignFn.go(kp_c, signed, &dc);
+
+    var ba: [256]u8 = undefined;
+    var bb1: [256]u8 = undefined;
+    var bb2: [256]u8 = undefined;
+    var bc: [256]u8 = undefined;
+    const body_a = buildOneSctBody(&ba, log_a.log_id, ts, &.{}, dsig_a);
+    const body_b1 = buildOneSctBody(&bb1, log_b.log_id, ts, &.{}, dsig_b);
+    const body_b2 = buildOneSctBody(&bb2, log_b.log_id, ts, &.{}, dsig_b);
+    const body_c = buildOneSctBody(&bc, log_c.log_id, ts, &.{}, dsig_c);
+
+    var lb1: [768]u8 = undefined;
+    var lb2: [768]u8 = undefined;
+    const list1 = buildList(&lb1, &.{ body_a, body_b1 });
+    const list2 = buildList(&lb2, &.{ body_b2, body_c });
+    const pins = [_]CtLog{ log_a, log_b, log_c };
+
+    var acc: DistinctValidLogs = .{};
+    const s1 = try verifyListAccumulating(list1, ctx, &pins, null, &acc);
+    try testing.expectEqual(@as(usize, 2), s1.distinct_valid_logs);
+    try testing.expectEqual(@as(usize, 2), acc.count());
+    const s2 = try verifyListAccumulating(list2, ctx, &pins, null, &acc);
+    try testing.expectEqual(@as(usize, 2), s2.distinct_valid_logs);
+    // Union {A,B,C} = 3, NOT 2+2 = 4 (log B contributed to both lists).
+    try testing.expectEqual(@as(usize, 3), acc.count());
+
+    // verifyList (no accumulator) still behaves identically for a single list.
+    const plain = try verifyList(list1, ctx, &pins, null);
+    try testing.expectEqual(@as(usize, 2), plain.distinct_valid_logs);
 }
 
 test "verifyOneSct fails closed when the certified entry exceeds the internal buffer" {
