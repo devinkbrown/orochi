@@ -978,7 +978,15 @@ pub const RouteTable = struct {
             };
             errdefer self.allocator.free(owned);
             // If new_nick already maps (collision), overwrite the owned key it has.
-            if (self.nick_to_node.fetchRemove(new_nick)) |old_new| self.allocator.free(old_new.key);
+            // That displaces a distinct pre-existing entry, so the map net-loses one
+            // slot (old removed, new displaced, new re-added); decrement `nick_count`
+            // to match or it leaks upward on every rename-into-an-existing-nick and
+            // eventually wedges `setNickLocation` against `max_nicks` with a false
+            // RouteTableFull.
+            if (self.nick_to_node.fetchRemove(new_nick)) |old_new| {
+                self.allocator.free(old_new.key);
+                self.nick_count -= 1;
+            }
             try self.nick_to_node.putNoClobber(owned, node);
             existed = true;
         }
@@ -1151,6 +1159,36 @@ test "nick routing" {
     try std.testing.expect(table.removeNick("alice"));
     try std.testing.expect(!table.removeNick("alice"));
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
+}
+
+test "mesh route_table renameNick keeps nick_count consistent across the collision path" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // Non-collision rename: the target nick is free, so the count is unchanged
+    // (one nick keeps existing, just re-keyed).
+    try table.setNickLocation("alice", 10);
+    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+    try std.testing.expect(try table.renameNick("alice", "carol", 10, .{}));
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("carol"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
+    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+
+    // Collision rename: "carol" renames onto "bob", which ALREADY routes to
+    // another node. The old "carol" mapping is removed and the pre-existing
+    // "bob" mapping is displaced, so exactly one nick_to_node entry disappears —
+    // nick_count MUST drop from 2 to 1, not stay at 2.
+    try table.setNickLocation("bob", 20);
+    try std.testing.expectEqual(@as(usize, 2), table.nickCount());
+    try std.testing.expect(try table.renameNick("carol", "bob", 10, .{}));
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("bob"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("carol"));
+    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+
+    // The leaked counter must not wedge future inserts against max_nicks: with a
+    // consistent count of 1 there is room for more nicks up to the cap.
+    try table.setNickLocation("dave", 30);
+    try std.testing.expectEqual(@as(usize, 2), table.nickCount());
 }
 
 test "channel fan-out node set" {
