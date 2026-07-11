@@ -2436,17 +2436,21 @@ const Reader = struct {
     }
 
     fn readVarint(self: *Reader) !usize {
-        var shift: u6 = 0;
         var value: u64 = 0;
         var i: usize = 0;
         while (i < 10) : (i += 1) {
             const byte = try self.readByte();
+            // Derive the shift from the bounded loop index (i < 10 ⇒ i*7 ≤ 63)
+            // rather than accumulating `shift += 7`, which overflows the u6 shift
+            // amount on a 10th continuation byte: a trap under ReleaseSafe and a
+            // silent wrap under ReleaseFast. This form fails closed with
+            // VarintTooLong in every build mode.
+            const shift = @as(u6, @intCast(i * 7));
             value |= @as(u64, byte & 0x7f) << shift;
             if ((byte & 0x80) == 0) {
                 if (value > std.math.maxInt(usize)) return error.Oversize;
                 return @intCast(value);
             }
-            shift += 7;
         }
         return error.VarintTooLong;
     }
@@ -2482,7 +2486,11 @@ const Reader = struct {
     }
 
     fn readFixed(self: *Reader, len: usize) ![]const u8 {
-        if (self.pos + len > self.buf.len) return error.Truncated;
+        // Overflow-free bounds check: `len` can be a varint approaching usize-max,
+        // so `self.pos + len` would wrap and pass a naive check, yielding an OOB
+        // slice. `self.pos <= self.buf.len` always holds, so the subtraction is
+        // safe.
+        if (len > self.buf.len - self.pos) return error.Truncated;
         const out = self.buf[self.pos .. self.pos + len];
         self.pos += len;
         return out;
@@ -3579,4 +3587,112 @@ test "a signing peer's UNSIGNED in-scope frame is rejected" {
     defer allocator.free(props);
     try std.testing.expectEqual(@as(usize, 0), props.len);
     try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial exploit/attack corpus: the S2S frame-dispatch parse surface.
+//
+// A Byzantine (or, for unsigned frames, unauthenticated) mesh peer controls the
+// bytes inside every well-framed S2S frame. `S2sPeer.feed` streaming-decodes the
+// frame header and dispatches the attacker-controlled payload straight into the
+// per-type parsers (burst/delta/gossip/membership/channel-mode/… decode). This
+// corpus drives that surface with hostile payloads and asserts the ONLY
+// observable outcome is a returned value or a returned error — never a panic,
+// OOB slice, integer overflow, or unbounded growth. It mirrors the doctrine in
+// `crypto/tls_fuzz.zig`: feed hostile bytes to the attacker-facing parsers and
+// prove they fail closed. Deterministic + fixed-seed, so it runs in the full
+// suite AND under `zig build test-exploit`, and any trap replays byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// Frame the payload for `frame_type` and feed it through a fresh-ish peer. The
+/// peer carries no MeshPass admission set, so `meshPassAllowsFrame` permits every
+/// family and the payload reaches the real parser. Errors are the fail-closed
+/// outcome and are swallowed; a panic/OOB is what this asserts cannot happen.
+fn feedHostileFrame(
+    peer: *S2sPeer,
+    sink: *BufferSink,
+    frame_type: s2s_frame.FrameType,
+    payload: []const u8,
+    now_ms: u64,
+    seed: u64,
+) void {
+    sink.clear();
+    var hdr: [s2s_frame.header_len]u8 = undefined;
+    hdr[0] = frame_type.tag();
+    std.mem.writeInt(u32, hdr[1..][0..4], @intCast(payload.len), .little);
+    // Feed header then body so the streaming decoder reassembles a complete frame.
+    peer.feed(&hdr, sink.sink(), now_ms, seed) catch return;
+    peer.feed(payload, sink.sink(), now_ms, seed) catch return;
+}
+
+test "exploit: s2s frame dispatch survives hostile payloads for every frame type (fail-closed)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1_000 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "atk.test");
+    defer peer.deinit();
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+
+    // Every wire frame type, including unknown/unmapped tags (skipped, not fatal).
+    const frame_types = [_]s2s_frame.FrameType{
+        .HANDSHAKE,          .BURST,           .DELTA,        .GOSSIP,      .PING,
+        .PONG,               .QUIT,            .MEMBERSHIP,   .MESSAGE,     .OPER_GRANT,
+        .CHANNEL_MODE_FLAGS, .CHANNEL_LIST,    .CHANNEL_PROP, .TOPIC,       .NICKCHANGE,
+        .CHANNEL_MODE_STATE, .SESSION_MIGRATE, .ENTITY_PROP,  .CLONE_COUNT, .OPER_EVENT,
+        .OBSERVE_EVENT,      .KILL,            .WARD,         .RESYNC,      .REPAIR_SUMMARY,
+        .REPAIR_REQUEST,     .REPAIR_RESPONSE, .TEGAMI_PUSH,
+    };
+
+    // Boundary payloads that target the integer-overflow / length-confusion bug
+    // class directly: a leading varint (or magic + varint) claiming a length at
+    // or near usize-max, which a naive `pos + len` bounds check wraps past.
+    const usize_max_varint = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
+    const burst_header_overflow = [_]u8{ 'S', 'B', 'S', 'T', 1, 1 } ++ usize_max_varint;
+    const burst_member_overflow = [_]u8{ 'S', 'B', 'S', 'T', 1, 4 } ++ usize_max_varint;
+    const structured = [_][]const u8{
+        &usize_max_varint, //                                        lone giant varint
+        &burst_header_overflow, //                                   burst record len = 2^64-1
+        &burst_member_overflow, //                                   member_compact record len
+        &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }, //                         all-ones prefix
+        &[_]u8{ 0, 0, 0, 0 }, //                                     all-zero prefix
+        &[_]u8{ 'S', 'B', 'S', 'T', 1 }, //                          valid magic, truncated
+        "", //                                                       empty payload
+        &[_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 }, // never-terminating varint
+    };
+
+    // 1) Every structured boundary payload against every frame type.
+    for (structured) |payload| {
+        for (frame_types) |ft| {
+            feedHostileFrame(&peer, &sink, ft, payload, tc.now_ms, 0xB17E);
+        }
+    }
+
+    // 2) A seeded pseudorandom corpus: pure-random and near-structured bodies.
+    //    Fixed seed ⇒ any trap replays deterministically on re-run.
+    var prng = std.Random.DefaultPrng.init(0x5EED_A77ACC);
+    const rng = prng.random();
+    var buf: [512]u8 = undefined;
+    var iter: usize = 0;
+    while (iter < 3000) : (iter += 1) {
+        const len = rng.intRangeAtMost(usize, 0, buf.len);
+        rng.bytes(buf[0..len]);
+        // Bias a slice toward a plausible burst/coilpack magic so the parser gets
+        // past the header guard and reaches the length-driven inner reads.
+        if (len >= 6 and (iter & 3) == 0) {
+            buf[0] = 'S';
+            buf[1] = 'B';
+            buf[2] = 'S';
+            buf[3] = 'T';
+            buf[4] = 1;
+            buf[5] = @as(u8, @intCast(1 + (iter % 4)));
+        }
+        const ft = frame_types[iter % frame_types.len];
+        feedHostileFrame(&peer, &sink, ft, buf[0..len], tc.now_ms, 0x5EED +% iter);
+    }
+
+    // Surviving to here with the testing allocator (leak-checked on deinit) is the
+    // proof: no parser trapped, over-read, or leaked on any hostile input.
+    try std.testing.expect(true);
 }

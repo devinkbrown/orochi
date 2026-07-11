@@ -572,7 +572,10 @@ const Reader = struct {
     }
 
     fn readFixed(self: *Reader, len: usize) ![]const u8 {
-        if (self.pos + len > self.buf.len) return error.Truncated;
+        // Overflow-free bounds check: `len` is varint-sourced (up to usize-max),
+        // so `self.pos + len` would wrap. `self.pos <= self.buf.len` always holds,
+        // so the subtraction never underflows.
+        if (len > self.buf.len - self.pos) return error.Truncated;
         const out = self.buf[self.pos .. self.pos + len];
         self.pos += len;
         return out;

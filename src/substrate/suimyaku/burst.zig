@@ -478,7 +478,11 @@ const Reader = struct {
     }
 
     fn readFixed(self: *Reader, len: usize) ![]const u8 {
-        if (self.pos + len > self.buf.len) return error.Truncated;
+        // Overflow-free bounds check: `len` is varint-sourced and can approach
+        // usize-max, so `self.pos + len` would wrap. `self.pos <= self.buf.len`
+        // always holds (every cursor advance is guarded by a prior bounds check),
+        // so the subtraction never underflows.
+        if (len > self.buf.len - self.pos) return error.Truncated;
         const bytes = self.buf[self.pos .. self.pos + len];
         self.pos += len;
         return bytes;
@@ -760,4 +764,29 @@ test "Limits.applyToml overlays mesh.link burst keys" {
     cfg.applyToml(&doc);
     try std.testing.expectEqual(@as(usize, 262144), cfg.max_burst_bytes);
     try std.testing.expectEqual(@as(usize, 512), cfg.max_records); // default
+}
+
+test "exploit: burst record length near usize-max is rejected fail-closed (no OOB slice)" {
+    const allocator = std.testing.allocator;
+
+    // A well-framed BURST payload whose FIRST record claims a varint length of
+    // 2^64-1. Reached PRE-SIGNATURE: an unsigned BURST frame dispatches straight
+    // to `apply`, so a Byzantine (or even unauthenticated) peer controls these
+    // bytes. The classic `pos + len > buf.len` bounds check overflows when `len`
+    // approaches usize-max, wrapping to a small value that passes the check and
+    // yields an out-of-bounds `buf[pos..wrapped]` slice — a remote crash / OOB
+    // read in the ReleaseFast ship binary (where the slice safety trap is off).
+    // The only acceptable outcome is a returned error: reject, never OOB.
+    const payload = [_]u8{
+        'S', 'B', 'S', 'T', // magic
+        1, //                  version
+        1, //                  RecordKind.header
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // varint 2^64-1
+    };
+
+    var target = ChannelCrdt.init(allocator, 2);
+    defer target.deinit();
+
+    // Must return an error (Truncated), never trap or read out of bounds.
+    try std.testing.expectError(error.Truncated, apply(allocator, &target, &payload, default_limits));
 }
