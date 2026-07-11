@@ -956,6 +956,9 @@ pub const Server = struct {
             defer self.allocator.free(opened.content);
             consumePrefix(&self.recv_buf, rec.wire_len);
             if (opened.content_type != .handshake) return error.BadRecord;
+            // RFC 8446 §5.1: zero-length handshake fragments MUST NOT be sent;
+            // receiving one is fatal rather than an ignorable no-op.
+            if (opened.content.len == 0) return error.BadHandshake;
             try self.client_flight.appendSlice(self.allocator, opened.content);
             while (try self.processClientFlightMessage()) {}
         }
@@ -1183,27 +1186,33 @@ pub const Server = struct {
     /// Process a decrypted post-handshake handshake fragment. A KeyUpdate rotates
     /// the client→server application keys and, when update_requested, queues our
     /// own KeyUpdate(update_not_requested) reply and rotates the server→client
-    /// keys (RFC 8446 §4.6.3). Other messages are ignored.
+    /// keys (RFC 8446 §4.6.3). FAIL-CLOSED: a zero-length fragment (prohibited,
+    /// RFC 8446 §5.1), any handshake type other than KeyUpdate (a client has no
+    /// other legal post-handshake message toward us — we never send a
+    /// post-handshake CertificateRequest), or trailing partial bytes (no
+    /// cross-record post-handshake reassembly exists, so they would otherwise be
+    /// silently lost) all abort the connection.
     fn handlePostHandshake(self: *Server, fragment: []const u8) Error!void {
+        if (fragment.len == 0) return error.BadHandshake;
         var off: usize = 0;
         while (parseHandshakeMaybe(fragment, &off)) |msg| {
-            if (msg.typ == .key_update) {
-                if (msg.body.len != 1) return error.BadHandshake;
-                const request = msg.body[0];
-                if (request != @intFromEnum(KeyUpdateRequest.not_requested) and
-                    request != @intFromEnum(KeyUpdateRequest.requested))
-                {
-                    return error.BadHandshake;
-                }
-                try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
-                self.app_read_seq = 0;
-                if (request == @intFromEnum(KeyUpdateRequest.requested)) {
-                    const reply = try self.buildKeyUpdateRecord(.not_requested);
-                    defer self.allocator.free(reply);
-                    try self.post_handshake_send.appendSlice(self.allocator, reply);
-                }
+            if (msg.typ != .key_update) return error.BadHandshake;
+            if (msg.body.len != 1) return error.BadHandshake;
+            const request = msg.body[0];
+            if (request != @intFromEnum(KeyUpdateRequest.not_requested) and
+                request != @intFromEnum(KeyUpdateRequest.requested))
+            {
+                return error.BadHandshake;
+            }
+            try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
+            self.app_read_seq = 0;
+            if (request == @intFromEnum(KeyUpdateRequest.requested)) {
+                const reply = try self.buildKeyUpdateRecord(.not_requested);
+                defer self.allocator.free(reply);
+                try self.post_handshake_send.appendSlice(self.allocator, reply);
             }
         }
+        if (off != fragment.len) return error.BadHandshake;
     }
 
     /// Build one KeyUpdate record sealed under the *current* server send keys,
@@ -3057,9 +3066,10 @@ const Cursor = struct {
 /// Like parseHandshake but returns null (instead of erroring) when fewer than a
 /// full handshake message is buffered yet — used to drain the client flight.
 fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
-    if (input.len < 4) return null;
-    const len = (@as(usize, input[1]) << 16) | (@as(usize, input[2]) << 8) | input[3];
-    if (input.len < 4 + len) return null;
+    if (input.len - offset.* < 4) return null;
+    const hdr = input[offset.*..];
+    const len = (@as(usize, hdr[1]) << 16) | (@as(usize, hdr[2]) << 8) | hdr[3];
+    if (input.len - offset.* < 4 + len) return null;
     return parseHandshake(input, offset) catch null;
 }
 
@@ -5403,6 +5413,65 @@ test "takeAlert seals an ENCRYPTED fatal alert for post-ServerHello handshake er
             @intFromEnum(AlertDescription.decode_error),
         }, opened.content);
     }
+}
+
+test "TLS 1.3 post-handshake: server rejects non-KeyUpdate messages, empty and truncated fragments (fail-closed)" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x71)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "ph.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x02},
+        .key_pair = kp,
+        .dns_names = &.{"ph.test"},
+    });
+    var server = try Server.init(allocator, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    server.state = .connected;
+    server.selected_suite = .tls_aes_128_gcm_sha256;
+    server.client_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+    server.client_app_keys.iv = @as([12]u8, @splat(0xA5));
+
+    // 1. A client may only send KeyUpdate post-handshake; a NewSessionTicket
+    //    from the client is unexpected_message (RFC 8446 §4.6.1/§5.1) — fatal.
+    var nst_body_buf: [32]u8 = undefined;
+    const nst_body = try tls_session_ticket.encode(&nst_body_buf, .{
+        .ticket_lifetime = 1,
+        .ticket_age_add = 0,
+        .ticket_nonce = "",
+        .ticket = &.{0xaa},
+        .extensions = "",
+    });
+    var nst: std.ArrayList(u8) = .empty;
+    defer nst.deinit(allocator);
+    try writeHandshake(allocator, &nst, .new_session_ticket, nst_body);
+    const nst_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, nst.items);
+    defer allocator.free(nst_rec);
+    try std.testing.expectError(error.BadHandshake, server.decrypt(nst_rec));
+
+    // 2. A zero-length handshake fragment MUST NOT be sent (RFC 8446 §5.1).
+    const empty_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 1, .handshake, "");
+    defer allocator.free(empty_rec);
+    try std.testing.expectError(error.BadHandshake, server.decrypt(empty_rec));
+
+    // 3. Truncated trailing handshake bytes are fatal, never silently dropped.
+    const truncated = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0 };
+    const trunc_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 2, .handshake, &truncated);
+    defer allocator.free(trunc_rec);
+    try std.testing.expectError(error.BadHandshake, server.decrypt(trunc_rec));
+
+    // 4. A well-formed KeyUpdate still rotates cleanly after the rejects above.
+    var ku: std.ArrayList(u8) = .empty;
+    defer ku.deinit(allocator);
+    try writeHandshake(allocator, &ku, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.not_requested)});
+    const ku_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 3, .handshake, ku.items);
+    defer allocator.free(ku_rec);
+    const out = try server.decrypt(ku_rec);
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {

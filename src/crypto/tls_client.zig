@@ -450,6 +450,11 @@ pub const Client = struct {
     hrr_seen: bool = false,
     cookie: ?[]const u8 = null,
     cookie_buf: [512]u8 = undefined,
+    /// Cipher suite the HelloRetryRequest committed to. RFC 8446 §4.1.4: the
+    /// subsequent ServerHello MUST carry the same suite — enforced in
+    /// parseServerHello (the transcript hash alone would not catch a swap
+    /// between two suites that share a hash, e.g. 0x1301 ↔ 0x1303).
+    hrr_suite: ?CipherSuite = null,
     retry_hello: ?[]u8 = null,
     /// Group a HelloRetryRequest asked us to retry with. When set, the second
     /// ClientHello offers exactly one key_share — for this group (RFC 8446
@@ -1052,12 +1057,18 @@ pub const Client = struct {
     }
 
     /// Process a decrypted post-handshake handshake fragment. NewSessionTicket
-    /// and other informational messages are ignored; a KeyUpdate rotates the
-    /// server→client application keys and, when the peer requested an update,
-    /// queues our own KeyUpdate(update_not_requested) reply and rotates the
-    /// client→server keys (RFC 8446 §4.6.3). The fragment may carry more than one
-    /// handshake message.
+    /// is captured for resumption; a KeyUpdate rotates the server→client
+    /// application keys and, when the peer requested an update, queues our own
+    /// KeyUpdate(update_not_requested) reply and rotates the client→server keys
+    /// (RFC 8446 §4.6.3). The fragment may carry more than one handshake
+    /// message. FAIL-CLOSED: a zero-length fragment (prohibited, RFC 8446 §5.1),
+    /// any other handshake type (unexpected_message — we never advertise
+    /// post_handshake_auth, so even CertificateRequest is illegal here), or
+    /// trailing partial bytes (this engine performs no cross-record
+    /// post-handshake reassembly, so they would otherwise be silently lost) all
+    /// abort the connection.
     fn handlePostHandshake(self: *Client, fragment: []const u8) Error!void {
+        if (fragment.len == 0) return error.BadHandshake;
         var off: usize = 0;
         while (parseHandshakeMaybe(fragment, &off)) |msg| {
             if (msg.typ == .key_update) {
@@ -1076,9 +1087,13 @@ pub const Client = struct {
                 }
             } else if (msg.typ == .new_session_ticket) {
                 try self.captureNewSessionTicket(msg.body);
+            } else {
+                // RFC 8446 §5.1: any other handshake type after the handshake
+                // is unexpected_message — fatal, never silently skipped.
+                return error.BadHandshake;
             }
-            // Other post-handshake messages are ignored.
         }
+        if (off != fragment.len) return error.BadHandshake;
     }
 
     fn captureNewSessionTicket(self: *Client, body: []const u8) Error!void {
@@ -1779,6 +1794,7 @@ pub const Client = struct {
         }
         if (!selected_version) return error.MissingExtension;
         self.selected_suite = suite; // selects the transcript hash below
+        self.hrr_suite = suite; // §4.1.4: the ServerHello MUST keep this suite
 
         // RFC 8446 §4.1.4: the requested group must be one we support AND did not
         // already offer a key_share for (a change-nothing HRR is illegal). By
@@ -1841,6 +1857,9 @@ pub const Client = struct {
                 return error.TlsAlert;
             }
             if (opened.content_type != .handshake) return error.BadRecord;
+            // RFC 8446 §5.1: zero-length handshake fragments MUST NOT be sent;
+            // receiving one is fatal rather than an ignorable no-op.
+            if (opened.content.len == 0) return error.BadHandshake;
             try self.hs_plain.appendSlice(self.allocator, opened.content);
         }
         return null;
@@ -1919,6 +1938,13 @@ pub const Client = struct {
         const sid = try c.take(try c.readU8());
         if (!std.mem.eql(u8, sid, &self.legacy_session_id)) return error.BadHandshake;
         const suite = try CipherSuite.fromWire(try c.readU16());
+        // RFC 8446 §4.1.4: after a HelloRetryRequest the ServerHello MUST carry
+        // the same cipher suite the HRR committed to. Enforced explicitly — two
+        // suites sharing a transcript hash (0x1301 ↔ 0x1303) would otherwise
+        // slide through until (at best) a Finished mismatch.
+        if (self.hrr_suite) |committed| {
+            if (committed != suite) return error.BadHandshake;
+        }
         if (try c.readU8() != 0) return error.BadHandshake;
         const extensions_block = try c.take(try c.readU16());
         try c.expectEmpty();
@@ -1950,6 +1976,14 @@ pub const Client = struct {
             self.psk_accepted = true;
         }
         const share = selected_share.?;
+        // RFC 8446 §4.2.8: the server's key_share MUST name a group we actually
+        // sent a KeyShareEntry for — after a HelloRetryRequest, exactly the
+        // retry group ClientHello2 carried.
+        if (self.retry_key_share_group) |g| {
+            if (share.group.toInt() != g.toInt()) return error.BadHandshake;
+        } else if (!self.offeredShareFor(supported_groups.NamedGroup.fromInt(share.group.toInt()))) {
+            return error.BadHandshake;
+        }
         var out = ServerKexSecret{};
         switch (share.group) {
             .x25519 => {
@@ -3112,9 +3146,9 @@ fn parseHandshake(input: []const u8, offset: *usize) Error!HandshakeMsg {
 }
 
 fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
-    if (input.len < 4) return null;
-    const len = readU24Bytes(input[1..4]);
-    if (input.len < 4 + len) return null;
+    if (input.len - offset.* < 4) return null;
+    const len = readU24Bytes(input[offset.* + 1 ..][0..3]);
+    if (input.len - offset.* < 4 + len) return null;
     return parseHandshake(input, offset) catch null;
 }
 
@@ -4056,6 +4090,157 @@ test "decryptApp skips post-handshake handshake records (NewSessionTicket)" {
     const got = try client.decryptApp(app);
     defer allocator.free(got.application_data);
     try std.testing.expectEqualSlices(u8, "HTTP/1.1 200 OK", got.application_data);
+}
+
+test "TLS 1.3 post-handshake: unknown types, empty and truncated fragments are fatal (fail-closed)" {
+    // Arrange: a connected client with known server app keys (same shape as the
+    // NewSessionTicket skip test above).
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+    client.state = .connected;
+    client.selected_suite = .tls_aes_128_gcm_sha256;
+    client.server_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+    client.server_app_keys.iv = @as([12]u8, @splat(0xA5));
+
+    // 1. A post-handshake handshake message that is neither KeyUpdate nor
+    //    NewSessionTicket (here an out-of-place Finished) is unexpected_message
+    //    (RFC 8446 §5.1) — fatal, never silently skipped.
+    var bogus: std.ArrayList(u8) = .empty;
+    defer bogus.deinit(allocator);
+    try writeHandshake(allocator, &bogus, .finished, &(@as([32]u8, @splat(0x11))));
+    const bogus_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, bogus.items);
+    defer allocator.free(bogus_rec);
+    try std.testing.expectError(error.BadHandshake, client.decryptApp(bogus_rec));
+
+    // 2. A zero-length handshake fragment MUST NOT be sent (RFC 8446 §5.1) —
+    //    receiving one is fatal, not a no-op.
+    const empty_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 1, .handshake, "");
+    defer allocator.free(empty_rec);
+    try std.testing.expectError(error.BadHandshake, client.decryptApp(empty_rec));
+
+    // 3. Truncated trailing handshake bytes must not be silently dropped: this
+    //    engine performs no cross-record post-handshake reassembly, so a partial
+    //    message would otherwise vanish (silent data corruption).
+    const truncated = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0 }; // 3 of 4 header bytes
+    const trunc_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 2, .handshake, &truncated);
+    defer allocator.free(trunc_rec);
+    try std.testing.expectError(error.BadHandshake, client.decryptApp(trunc_rec));
+
+    // 4. A well-formed KeyUpdate on the next record still rotates cleanly.
+    var ku: std.ArrayList(u8) = .empty;
+    defer ku.deinit(allocator);
+    try writeHandshake(allocator, &ku, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.not_requested)});
+    const ku_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 3, .handshake, ku.items);
+    defer allocator.free(ku_rec);
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ku_rec));
+}
+
+/// Build a minimal TLS 1.3 ServerHello body (legacy_version, random, echoed
+/// session id, suite, null compression, then supported_versions=0x0304 and one
+/// key_share entry) for driving parseServerHello directly in tests.
+fn buildTestServerHelloBody(
+    allocator: Allocator,
+    session_id: []const u8,
+    suite: u16,
+    group: u16,
+    key_exchange: []const u8,
+) ![]u8 {
+    var exts: std.ArrayList(u8) = .empty;
+    defer exts.deinit(allocator);
+    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &exts, 2);
+    try appendU16(allocator, &exts, tls_supported_versions.tls13);
+    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.key_share));
+    try appendU16(allocator, &exts, @intCast(4 + key_exchange.len));
+    try appendU16(allocator, &exts, group);
+    try appendU16(allocator, &exts, @intCast(key_exchange.len));
+    try exts.appendSlice(allocator, key_exchange);
+
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try appendU16(allocator, &body, tls_record.legacy_record_version);
+    try body.appendSlice(allocator, &(@as([32]u8, @splat(0x42)))); // non-HRR random
+    try body.append(allocator, @intCast(session_id.len));
+    try body.appendSlice(allocator, session_id);
+    try appendU16(allocator, &body, suite);
+    try body.append(allocator, 0); // legacy_compression_method
+    try appendU16(allocator, &body, @intCast(exts.items.len));
+    try body.appendSlice(allocator, exts.items);
+    return body.toOwnedSlice(allocator);
+}
+
+test "TLS 1.3 ServerHello after HRR must keep the HRR cipher suite (RFC 8446 §4.1.4)" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+    client.hrr_seen = true;
+    client.hrr_suite = .tls_aes_128_gcm_sha256;
+
+    // A ServerHello that switches suite after the HelloRetryRequest committed
+    // (0x1303 chacha shares SHA-256 with 0x1301, so the transcript hash alone
+    // would not catch the swap) is fatal.
+    const swapped = try buildTestServerHelloBody(
+        allocator,
+        &client.legacy_session_id,
+        @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256),
+        supported_groups.NamedGroup.x25519.toInt(),
+        &client.x25519_pair.public_key,
+    );
+    defer allocator.free(swapped);
+    try std.testing.expectError(error.BadHandshake, client.parseServerHello(swapped));
+
+    // The HRR-committed suite is accepted.
+    const kept = try buildTestServerHelloBody(
+        allocator,
+        &client.legacy_session_id,
+        @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+        supported_groups.NamedGroup.x25519.toInt(),
+        &client.x25519_pair.public_key,
+    );
+    defer allocator.free(kept);
+    const shared = try client.parseServerHello(kept);
+    try std.testing.expectEqual(@as(usize, 32), shared.len);
+}
+
+test "TLS 1.3 ServerHello key_share group must be one the ClientHello offered (RFC 8446 §4.2.8)" {
+    const allocator = std.testing.allocator;
+
+    // After an HRR that pinned the retry group, the ServerHello MUST answer with
+    // exactly that group — an x25519 answer to a hybrid retry is fatal.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+        defer client.deinit();
+        client.hrr_seen = true;
+        client.hrr_suite = .tls_aes_128_gcm_sha256;
+        client.retry_key_share_group = .x25519mlkem768;
+        const body = try buildTestServerHelloBody(
+            allocator,
+            &client.legacy_session_id,
+            @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+            supported_groups.NamedGroup.x25519.toInt(),
+            &client.x25519_pair.public_key,
+        );
+        defer allocator.free(body);
+        try std.testing.expectError(error.BadHandshake, client.parseServerHello(body));
+    }
+
+    // Without an HRR the selected group must still be one we sent a share for:
+    // a client that offered only P-256 rejects an x25519 selection.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+        defer client.deinit();
+        client.offerOnlyP256ForTest();
+        const body = try buildTestServerHelloBody(
+            allocator,
+            &client.legacy_session_id,
+            @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+            supported_groups.NamedGroup.x25519.toInt(),
+            &client.x25519_pair.public_key,
+        );
+        defer allocator.free(body);
+        try std.testing.expectError(error.BadHandshake, client.parseServerHello(body));
+    }
 }
 
 fn clientHelloExtensions(body: []const u8) ?[]const u8 {
