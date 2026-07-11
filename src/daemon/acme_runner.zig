@@ -426,11 +426,11 @@ pub fn issue(
         for (progress.effects) |effect| switch (effect) {
             .serve_http01 => |c| try token_store.put(c.token, c.key_authorization),
             .write_cert => |c| {
-                try writeCertAtomic(io, cfg.cert_out_path, c.pem);
+                try writeCertAtomic(io, std.Io.Dir.cwd(), cfg.cert_out_path, c.pem);
                 if (cfg.key_out_path) |kp| {
                     var pem_buf: [512]u8 = undefined;
                     const key_pem = try ecPrivateKeyPem(cert_key, &pem_buf);
-                    try writeCertAtomic(io, kp, key_pem);
+                    try writeKeyAtomic(io, std.Io.Dir.cwd(), kp, key_pem);
                 }
                 cert_written = true;
             },
@@ -681,11 +681,49 @@ fn ecPrivateKeyPem(kp: ecdsa_p256.KeyPair, out: []u8) ![]const u8 {
     return pem.encode(out, "EC PRIVATE KEY", &der) catch return error.NoSpaceLeft;
 }
 
+/// Owner-only (0o600) file mode for the TLS private key. This is umask-monotonic:
+/// a umask can only *clear* bits, never add group/other permission, so the key is
+/// never written group/world-readable regardless of the process umask. On targets
+/// without a POSIX permission model fall back to the default — the daemon deploys
+/// on Linux/musl where the model applies. The discriminant is a `u0` `mode_t`
+/// (Windows and any `mode_t`-less target, e.g. wasm freestanding), not the OS tag,
+/// so the posix-only `.fromMode` is only referenced where it exists.
+const key_file_perms: std.Io.File.Permissions = if (std.posix.mode_t == u0 or builtin.os.tag == .windows)
+    .default_file
+else
+    .fromMode(0o600);
+
 /// Write the issued PEM chain to `path` atomically (temp file + rename via the
 /// Io layer), so an nginx reload never reads a partial cert. The chain is public;
 /// default permissions are fine. The containing dir should be kain-owned.
-fn writeCertAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
-    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+fn writeCertAtomic(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    try writeAtomic(io, dir, path, data, .default_file);
+}
+
+/// Write the TLS PRIVATE KEY to `path` atomically with owner-only (0o600) perms.
+/// The atomic temp file is created with the key mode and renamed over the target,
+/// which carries the mode with it — so on a shared host no other local user can
+/// read the daemon's private key (impersonation/MITM), and a renewal never leaves
+/// a world-readable key behind. Same durability as the chain writer (fsync+rename).
+fn writeKeyAtomic(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    try writeAtomic(io, dir, path, data, key_file_perms);
+}
+
+/// Atomic write with an explicit file mode: create an unnamed/temp file with
+/// `perms`, stream + fsync the data, then atomically rename it over `path`. A
+/// reader never sees a partial file, and the final file has exactly `perms`
+/// (subject to umask). `.replace = true` intentionally makes a fresh inode, so
+/// callers MUST pass the intended perms every time — the previous file's mode is
+/// NOT inherited (this is why the key path must pass `key_file_perms`, not rely
+/// on a pre-existing 0o600 that a rename would otherwise destroy).
+fn writeAtomic(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    data: []const u8,
+    perms: std.Io.File.Permissions,
+) !void {
+    var atomic = try dir.createFileAtomic(io, path, .{ .replace = true, .permissions = perms });
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, data);
     try atomic.file.sync(io);
@@ -733,6 +771,49 @@ test "consumePrefix shifts remaining bytes down" {
     try list.appendSlice(allocator, "ABCDEFG");
     consumePrefix(&list, 3);
     try std.testing.expectEqualStrings("DEFG", list.items);
+}
+
+test "acme writeKeyAtomic writes the TLS private key owner-only (0o600)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Pin umask so the resulting mode is deterministic, then restore it. Zig's
+    // test runner executes test blocks sequentially on one thread, so mutating
+    // the process-global umask here is race-free.
+    const old_umask = std.os.linux.syscall1(.umask, 0o022);
+    defer _ = std.os.linux.syscall1(.umask, old_umask);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeKeyAtomic(io, tmp.dir, "tls.key", "-----BEGIN EC PRIVATE KEY-----\ns\n-----END EC PRIVATE KEY-----\n");
+
+    const st = try tmp.dir.statFile(io, "tls.key", .{});
+    const mode = st.permissions.toMode() & 0o777;
+    // The fix: owner rw only. A world/group-readable key on a shared host lets
+    // any local user impersonate the daemon (MITM), which is the bug this guards.
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
+    // Umask-independent security invariant: never any group/other permission.
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o077);
+}
+
+test "acme writeCertAtomic leaves the public cert chain default-readable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    const old_umask = std.os.linux.syscall1(.umask, 0o022);
+    defer _ = std.os.linux.syscall1(.umask, old_umask);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCertAtomic(io, tmp.dir, "fullchain.pem", "-----BEGIN CERTIFICATE-----\np\n-----END CERTIFICATE-----\n");
+
+    const st = try tmp.dir.statFile(io, "fullchain.pem", .{});
+    const mode = st.permissions.toMode() & 0o777;
+    // The public chain keeps default_file (0o666) & ~umask(0o022) = 0o644 — the
+    // private-key hardening must NOT lock down the chain nginx/peers must read.
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), mode);
 }
 
 test "applyToml overlays runner acme tunables" {
