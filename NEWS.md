@@ -10,10 +10,69 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
-## Unreleased
+## 0.4.0 (committed; pending deploy)
 
 Committed on `main` and pushed; not yet deployed to the live IRCXNet nodes. A
-security + mesh-hardening pass on top of 0.3.0.
+security-, TLS-, and anti-abuse-hardening pass on top of 0.3.0, plus the new
+standalone `yoroi` crypto CLI.
+
+### TLS
+- **Extended Master Secret (RFC 7627) is now REQUIRED by default** on the
+  hardened TLS 1.2 profile, both server and client. A ClientHello that does not
+  offer the `extended_master_secret` extension is aborted (`EmsRequired`); there
+  is no silent downgrade. `require_extended_master_secret` can be set false only
+  for legacy interop, and even then EMS is negotiated and used whenever offered,
+  and TLS 1.2 tickets are only resumed for EMS-negotiated sessions.
+  (`src/crypto/tls12_server.zig:96`, `src/crypto/tls12_server.zig:581`,
+  `src/crypto/tls12_client.zig:89`)
+- **TLS 1.3 handshake hardening.** A HelloRetryRequest now pins the cipher suite
+  it commits to — the second ClientHello may not change it — and its `key_share`
+  must supply exactly the group the server asked for (`src/crypto/tls_server.zig:484`,
+  `src/crypto/tls_server.zig:594`). A 0-RTT attempt is bound to a freshness
+  window: the server un-obfuscates the client's `obfuscated_ticket_age` against
+  the ticket's sealed `ticket_age_add` and refuses `early_data` if it falls
+  outside `early_data_age_skew_ms` (default 10 s) in either direction — the
+  multi-node age-window replay defense the single-process binder ring cannot
+  provide; the handshake still resumes at 1-RTT (`src/crypto/tls_server.zig:186`).
+  ECH now emits `retry_configs` in EncryptedExtensions in response to an ECH
+  handshake so a client with a stale config can recover (`src/crypto/tls_server.zig:240`).
+
+### Cloaking & privacy
+- **Argon2id cloak-key derivation.** The `[cloak] secret` passphrase is now
+  stretched through Argon2id (memory-hard, ~64 MiB + iterations per guess) with a
+  fixed domain-separation salt, replacing the previous bare `SHA256(secret)`. The
+  whole cloak model rests on key secrecy — the IPv4 input space is fully
+  enumerable — so a low-entropy operator passphrase must not be offline
+  brute-forceable. Derivation stays deterministic, so cloaked hosts remain stable
+  across restarts and identical mesh-wide. **Migration:** the first boot after
+  upgrade reshuffles every client's cloak ONCE, and pre-upgrade host/subnet
+  `WARD` bans on the old SHA256-derived cloaks do NOT carry over
+  (`previous_secret` grace covers only future rotations under the new KDF, not the
+  SHA256→Argon2id transition). (`src/main.zig:472`)
+- **Auth-split epoch anonymous cloaks.** New `[cloak] anon_epoch_secs` knob
+  (default `86400` = 24 h). An UNAUTHENTICATED client now gets an OPAQUE cloak
+  salted by the current wall-clock epoch (`floor(now/anon_epoch_secs)`), so a
+  static-IP anonymous user is neither linkable across epochs nor leaks subnet
+  co-membership. Logged-in clients are unaffected — they keep their stable,
+  moderatable account/hierarchical cloak. `0` disables rotation (pre-2026-07
+  behavior). (`src/daemon/config_format.zig:646`, `src/proto/cloak.zig:187`)
+
+### Anti-abuse
+- **Live-ward enforcement.** A newly-added or mesh-propagated `WARD` now acts on
+  already-connected clients immediately instead of only refusing their next
+  reconnect — a network ban bites during a live raid, not one reconnect later.
+  The sweep reuses the same matcher as the registration checkpoint (facets +
+  previous-cloak-key fallback); oper sessions and S2S links are exempt.
+  (`src/daemon/server.zig:18713`)
+
+### Tooling
+- **`yoroi` — a standalone, openssl-parity crypto CLI.** `zig build` now also
+  produces `zig-out/bin/yoroi`, a pure-Zig toolkit over the same crypto substrate
+  the daemon uses. Verbs: `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`,
+  `rand`, `ciphers`, `asn1parse` (with `s_client`/`s_server`/`enc`/`ocsp`/`crl`
+  reserved, exit 3). Scriptable exit codes: `0` ok, `1` failed, `2` usage, `3`
+  not implemented. Focused tests: `zig build test-cli`.
+  (`src/cli/yoroi_main.zig:15`, `build.zig:458`)
 
 ### Security
 - **Hidden-channel roster leak closed.** `NAMES <channel>`, bare `NAMES`, `WHO
@@ -69,6 +128,9 @@ security + mesh-hardening pass on top of 0.3.0.
   informational, IRCX), the numerics table, the IRCv3 capability reference, and
   the mesh / crypto / event-spine architecture docs. Stale prior-project naming
   removed throughout.
+- Groundwork for a dedicated adversarial **exploit/attack test harness** —
+  protocol fuzzing and abuse-path regression tests aimed at the parser, auth, TLS,
+  and admission surfaces (`docs/research/exploit-suite-blueprint.md`).
 
 ## 0.3.0 — "Sumi-e onboarding" (2026-07-08)
 

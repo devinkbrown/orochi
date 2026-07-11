@@ -26,13 +26,29 @@ before any public disclosure, and coordinate timing with us.
 
 High-interest areas include:
 
-- The TLS 1.3 / hardened TLS 1.2 stack and certificate handling.
+- The TLS 1.3 / hardened TLS 1.2 stack and certificate handling. The TLS 1.2
+  profile requires Extended Master Secret (RFC 7627) by default, and the TLS 1.3
+  server pins the HelloRetryRequest cipher suite, validates the retried
+  `key_share` group, enforces a 0-RTT ticket-age freshness window, and is
+  fail-closed across the handshake state machine.
 - The Tsumugi handshake and Suimyaku mesh record layer (server-to-server crypto).
 - Authentication: SASL (PLAIN / SCRAM / EXTERNAL), session tokens, CERTFP.
-- Connection admission, flood/raid controls, and resource bounds.
+- Host cloaking: the Argon2id-derived cloak key and the epoch-rotated anonymous
+  cloaks (`[cloak] anon_epoch_secs`).
+- Connection admission, flood/raid controls, `WARD` enforcement, and resource bounds.
 - The in-place upgrade (Helix) state handoff and the WASM plugin host.
+
+## Adversarial testing
+
+Beyond the deterministic-simulation suite, Orochi is building a dedicated
+adversarial **exploit/attack test harness** — protocol fuzzing and abuse-path
+regression tests aimed at the parser, authentication, TLS, and admission
+surfaces. The direction and coverage plan live in
+[`docs/research/exploit-suite-blueprint.md`](docs/research/exploit-suite-blueprint.md)
+(a research/planning document, not a statement of current coverage).
 
 ## Supported versions
 
-Orochi is developed on a rolling basis; fixes land on `main`. Operators should track
-`main` and apply security fixes via the session-preserving `USR2` hot-upgrade.
+Orochi is developed on a rolling basis; fixes land on `main` (current release
+line: **0.4.0**). Operators should track `main` and apply security fixes via the
+session-preserving `USR2` hot-upgrade.

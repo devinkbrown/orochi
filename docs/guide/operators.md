@@ -176,6 +176,37 @@ raid_window = "10s"
 
 Operators can also plant **spam-trap honeypots** with `SPAMTRAP ADD NICK <nick>` / `SPAMTRAP ADD CHAN <#channel>`: a non-oper that contacts a trap trips a `FLOOD` alert and is flagged for `WARD` follow-up. See [commands/oper-moderation.md](../reference/commands/oper-moderation.md).
 
+### Live-ward enforcement
+
+A `WARD` (network ban) now bites **already-connected** clients, not just the next reconnect. When a ward is added locally by the `WARD` command or arrives propagated from another mesh node, the daemon sweeps every live, registered, non-oper session and applies the first matching ward's action immediately (`src/daemon/server.zig:18713`, `src/daemon/server.zig:18730`):
+
+- `refuse` / `expel` → the client is closed with `Closing Link: <name> (Banned: <reason>)`.
+- `quarantine` → the session is restricted in place (no `JOIN`, no `PRIVMSG`/`NOTICE`), no teardown.
+- `require_auth` → authenticated subjects pass; everyone else is expelled.
+
+Operator sessions and S2S links are exempt. The sweep reuses the registration checkpoint's matcher exactly — the same facets and the same previous-cloak-key fallback — so a live raid is cut off the moment the ban lands rather than one reconnect later.
+
+## Host cloaking
+
+By default every client's real IP is hidden behind an HMAC [cloak](../reference/host-cloaking.md), configured under `[cloak]`. Two 0.4.0 changes affect operators.
+
+### Argon2id key derivation (migration note)
+
+The `[cloak] secret` passphrase is stretched through **Argon2id** (memory-hard) with a fixed domain-separation salt to derive the cloak key, replacing the previous bare `SHA256(secret)` (`src/main.zig:472`). Because the IPv4 input space is fully enumerable, the model rests on key secrecy, and a low-entropy operator passphrase must not be offline brute-forceable. Derivation is deterministic, so cloaked hosts stay stable across restarts and identical mesh-wide.
+
+**One-time migration on upgrade:** the derived key changes, so the first boot after this upgrade **reshuffles every client's cloak once**. Pre-upgrade host/subnet `WARD` bans written against the old SHA256-derived cloaks **do not carry over** — the daemon can no longer reproduce that key. The `[cloak] previous_secret` grace window covers only future rotations under the new Argon2id KDF, not the SHA256→Argon2id transition itself. Expect to re-establish any long-lived cloak/subnet bans after upgrade.
+
+### Anonymous-cloak rotation (`anon_epoch_secs`)
+
+```toml
+[cloak]
+anon_epoch_secs = 86400   # default 24 h; 0 disables rotation
+```
+
+When non-zero, an **unauthenticated** (not-logged-in) client is given an OPAQUE cloak salted by the current wall-clock epoch, `floor(now/anon_epoch_secs)` (`src/daemon/config_format.zig:646`, `src/proto/cloak.zig:187`). A static-IP anonymous user is therefore neither linkable across epochs nor able to leak subnet co-membership. It is wall-clock based so every mesh node agrees on the epoch. Valid range is `0`–`31536000` s.
+
+**Operator impact:** because anonymous cloaks rotate and are opaque, host/subnet `WARD` bans on anonymous abusers are short-lived and not subnet-bannable — moderation of anonymous abuse shifts to **account bans plus registration friction** (which the opaque cloaks are designed to require). **Logged-in clients are unaffected**: they keep a stable, moderatable account/hierarchical cloak. Set `anon_epoch_secs = 0` to restore the pre-2026-07 stable-cloak behavior for anonymous clients (at the cost of forever-linkability and subnet co-membership exposure).
+
 ## Server links and peer inspection
 
 ### Per-link statistics

@@ -19,6 +19,8 @@ enable_tls12 = false
 
 Set `enable_tls12 = true` to also accept hardened TLS 1.2 (ECDHE-AEAD) clients on the same listener via version dispatch. It is **off by default** to preserve the TLS 1.3-only posture. When enabled, the 1.2 leg presents a freshly bootstrapped ECDSA-P256 leaf (the 1.2 engine signs ServerKeyExchange with `ecdsa_secp256r1_sha256`), independent of the 1.3 leaf.
 
+The TLS 1.2 profile **requires the Extended Master Secret (RFC 7627) by default**. A ClientHello that does not offer the `extended_master_secret` extension is aborted with `EmsRequired` — there is no silent downgrade to the weaker randoms-based master secret, which closes the RFC 7627 §5.3 triple-handshake / synchronized-session class of attacks (`src/crypto/tls12_server.zig:96`, `src/crypto/tls12_server.zig:581`). The requirement is a fixed engine default (`require_extended_master_secret = true`), not a config knob; it can only be loosened in-code for legacy interop, and even then EMS is still negotiated and used whenever a client offers it, and a TLS 1.2 ticket is only resumed for an EMS-negotiated session (the ticket carries an `EM12` tag) (`src/crypto/tls12_server.zig:45`, `src/crypto/tls12_server.zig:103`). The client engine offers EMS on every ClientHello and, with the same default, aborts if a server fails to echo it (`src/crypto/tls12_client.zig:89`).
+
 When `[tls].enabled` is true, `main.zig` loads the configured cert/key or bootstraps a self-signed Ed25519 leaf using `dns_name`, then sets `server.Config.tls_port`, the certificate chain, the signing key, and the client-cert request flag (`src/main.zig:222`, `src/main.zig:224`, `src/main.zig:231`, `src/main.zig:234`). The server binds the TLS listener only when both certificate material and a signing key are present (`src/daemon/server.zig:1499`).
 
 Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine requests a client certificate (`src/daemon/server.zig:2433`, `src/daemon/server.zig:2439`), and the SASL bridge maps the presented certificate fingerprint to an account binding (`src/daemon/sasl_bridge.zig:70`).
@@ -38,6 +40,12 @@ A hardened TLS 1.2 client and server engine also exists as standalone modules (`
 | Post-handshake KeyUpdate | Honored in both directions: the receiving side rotates its traffic keys and replies with its own KeyUpdate when requested. |
 | Mutual TLS | The server can request an Ed25519 client certificate; its fingerprint (CertFP) backs SASL EXTERNAL (see below). |
 | Delegated credentials | TLS client/server consume RFC 9345 delegated credentials when explicitly configured/offered. The out-of-band helper `orochi delegated-credential inspect|validate` parses ready-made DC wire bytes and can validate the leaf signature, DelegationUsage, KeyUsage, and lifetime window against a leaf certificate. Minting/rotation is still not shipped because it needs production private-key loading and safe DC key-output policy. |
+
+**TLS 1.3 handshake hardening (server):** the server side is fail-closed across the handshake state machine (`src/crypto/tls_server.zig`):
+
+- **HelloRetryRequest is single-shot and pinned.** When a ClientHello offers no usable `key_share` but does advertise a supported group, the server sends exactly one HRR requesting that group. The cipher suite committed in the HRR may not change in the second ClientHello, and that ClientHello's `key_share` must supply exactly the requested group (`src/crypto/tls_server.zig:484`, `src/crypto/tls_server.zig:594`).
+- **0-RTT freshness window.** On a 0-RTT resumption the server un-obfuscates the client's `obfuscated_ticket_age` with the ticket's sealed `ticket_age_add` and compares it against its own measured elapsed time; if they differ by more than `early_data_age_skew_ms` (default 10 s) in either direction, `early_data` is refused and the handshake resumes at 1-RTT. This is the multi-node age-window replay defense a single-process binder ring cannot provide, and it runs only for v3 tickets when a clock is configured (`src/crypto/tls_server.zig:186`).
+- **ECH `retry_configs`.** A server with ECH keys emits `retry_configs` in EncryptedExtensions only in response to an ECH handshake, so a client offering a stale ECH config can recover without leaking a signal on non-ECH handshakes (`src/crypto/tls_server.zig:240`).
 
 **Certificate validation (client):** chain-to-trust-anchor signature checks (RSA-PSS/PKCS#1, ECDSA P-256/P-384, Ed25519), SAN dNSName matching, validity-window enforcement when a wall clock is supplied (the live HTTPS and ACME paths pass one), ExtendedKeyUsage `serverAuth` on the leaf, `keyCertSign` plus basicConstraints on path CAs, and X.509 Name Constraints (permitted/excluded dNSName subtrees).
 
@@ -63,6 +71,23 @@ expiry (`leaf.notBefore + valid_time`) must be live, within the seven-day
 remaining-lifetime cap, and before the leaf `notAfter`, and the DC signature must
 verify under the leaf SPKI. The supported leaf-signature schemes are Ed25519,
 ECDSA P-256/SHA-256, and RSA-PSS-RSAE-SHA256.
+
+## `yoroi` — the crypto CLI
+
+`zig build` produces a second binary alongside the daemon: `zig-out/bin/yoroi`, a standalone openssl-parity crypto toolkit backed by the same pure-Zig substrate the daemon uses (`build.zig:458`, `src/cli/yoroi_main.zig:15`). It is convenient for generating and inspecting the certificate material the `[tls]` block consumes without pulling in OpenSSL.
+
+```sh
+yoroi genpkey -algorithm ec -out key.pem            # ECDSA P-256 private key (file mode 0600)
+yoroi req -key key.pem -cn irc.example.net -out csr.pem   # PKCS#10 CSR from the key
+yoroi x509 -in cert.pem -text                       # decode/print a certificate
+yoroi x509 -in cert.pem -fingerprint                # SHA-256 fingerprint + SPKI pin
+yoroi verify -CAfile ca.pem cert.pem                # verify a chain against a CA bundle
+yoroi ciphers                                       # list supported suites, groups, sig schemes
+yoroi dgst -sha256 file                             # digest (HMAC key is read from a file, never argv)
+yoroi asn1parse -in cert.der                        # dump a DER structure
+```
+
+The full verb set is `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`, `rand`, `ciphers`, and `asn1parse`; `s_client`, `s_server`, `enc`, `ocsp`, and `crl` are reserved and exit `3` (not implemented). Run `yoroi <cmd> --help` for per-command options. Exit codes are scriptable: `0` ok, `1` operation failed, `2` usage error, `3` not implemented (`src/cli/yoroi_main.zig:33`). Its focused tests run under `zig build test-cli`.
 
 ## STS
 

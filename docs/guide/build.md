@@ -15,7 +15,7 @@ only for the platform syscalls that require it.
 
 | Command | What it does | Source |
 |---|---|---|
-| `zig build` | Builds and installs `zig-out/bin/orochi`. | `build.zig` |
+| `zig build` | Builds and installs `zig-out/bin/orochi` and the `yoroi` crypto CLI (`zig-out/bin/yoroi`). | `build.zig` |
 | `zig build run -- <config.toml>` | Builds, installs, then runs the daemon with forwarded args. | `build.zig` |
 | `zig build test` | Runs module tests and executable-root tests. | `build.zig` |
 | `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig` |
@@ -30,6 +30,7 @@ only for the platform syscalls that require it.
 | `zig build test-media` | Runs focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests. | `build.zig` |
 | `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests. | `build.zig` |
 | `zig build test-helix` | Runs focused Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
+| `zig build test-cli` | Runs the `yoroi` crypto CLI toolkit tests. | `build.zig` |
 | `zig build test-smoke` | Runs `check` plus focused TLS/server/config suites. | `build.zig` |
 | `zig build test-roadmap` | Runs `check` plus focused server roadmap suites. | `build.zig` |
 | `zig build all-checks` | Runs deterministic pre-push checks: `check`, WASM build, full tests, bounded fuzz replay, and BoGo shim self-tests. | `build.zig` |

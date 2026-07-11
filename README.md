@@ -45,7 +45,9 @@ native **Suimyaku + Tsumugi** cryptographic mesh.
   nick, not the server.
 - **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
   compile error; TLS is **1.3 plus a hardened 1.2 profile** (AEAD/ECDHE-only; no RSA key
-  exchange, CBC, compression, or renegotiation).
+  exchange, CBC, compression, or renegotiation) with **Extended Master Secret (RFC 7627)
+  required by default**, a single-shot suite-pinned HelloRetryRequest, and a 0-RTT
+  ticket-age freshness window.
 - **Trust through simulation.** Deterministic-simulation testing (the *Deterministic
   Ocean* harness) drives the CRDT mesh and crypto via injected clock/net/RNG, so any
   failure replays from a 64-bit seed.
@@ -81,7 +83,7 @@ flow, and a full source map.
 Orochi targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
 
 ```sh
-zig build              # build the daemon
+zig build              # build the daemon (and the `yoroi` crypto CLI) into zig-out/bin
 zig build check        # fast semantic analysis, no binary
 zig build test         # run the full test suite
 zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config suites

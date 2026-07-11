@@ -19,6 +19,7 @@ smallest lane that proves the change, then run a broader gate before pushing.
 | `zig build test-media --summary all` | Media, DTLS-SRTP, SFU, native media, WebTransport, RTP, and RTCP paths. |
 | `zig build test-services --summary all` | Services, account auth, SASL, TOTP, WebAuthn, sessions, Tegami, and successor paths. |
 | `zig build test-helix --summary all` | Helix upgrade, migration, resume, capsule, and handoff paths. |
+| `zig build test-cli --summary all` | The `yoroi` crypto CLI toolkit (x509/genpkey/pkey/req/dgst/verify/rand/ciphers/asn1parse). |
 | `zig build test-smoke --summary all` | Inner-loop roadmap gate: `check` plus TLS/server/config focused suites. |
 | `zig build test-roadmap --summary all` | Server-roadmap gate: `check` plus server/config/IRCX/event/mesh/services/TLS focused suites. |
 | `zig build test-smoke -Doptimize=ReleaseSafe --summary all` | Optimized smoke gate for safety-checked release codegen paths. |
