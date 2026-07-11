@@ -675,7 +675,7 @@ test "IRCX enable parse" {
     try std.testing.expectError(error.UnknownIrcxCommand, parseIrcxCommand("PING token"));
 }
 
-test "IRCX numeric metadata includes Ophion EVENT numerics" {
+test "IRCX numeric metadata includes EVENT numerics" {
     try std.testing.expectEqualStrings("RPL_EVENTADD", numericByCode(808).?.name);
     try std.testing.expectEqualStrings("RPL_EVENTLIST", numericByCode(809).?.name);
     try std.testing.expectEqualStrings("RPL_EVENTEND", numericByCode(810).?.name);

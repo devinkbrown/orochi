@@ -979,7 +979,7 @@ test "user profile properties use the profile value limit" {
     var too_long = @as([(user_profile_max_value + 1)]u8, @splat('x'));
     try std.testing.expectError(error.InvalidValue, store.setProp(entity, "URL", too_long[0..], setter));
 
-    // The tighter cap applies only to the newly added Ophion-profile fields.
+    // The tighter cap applies only to the newly added user-profile fields.
     // Existing Orochi profile keys and generic user props retain the store-wide
     // value budget.
     _ = try store.setProp(entity, "display", too_long[0..], setter);

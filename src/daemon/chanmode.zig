@@ -446,8 +446,7 @@ pub fn rankOfMode(mode: MemberMode) u8 {
 pub const TierOp = struct { mode: MemberMode, on: bool };
 
 /// Expand a single named status MODE change into the ordered set of concrete
-/// tier ops realizing Ophion's cumulative-authority hierarchy (modelled on
-/// `ophion/ircd/chmode.c` chm_owner/chm_op): the chain
+/// tier ops realizing a cumulative-authority tier hierarchy: the chain
 /// founder > owner > op means a tier carries every authority below it, so a
 /// member occupies exactly ONE chain level (Orochi stores the single highest
 /// tier — the creator holds founder alone, `world.zig`). Voice is independent.
@@ -993,7 +992,7 @@ test "oper-only and admin-only channel modes round-trip" {
     try std.testing.expectEqualStrings("+OA", serialized.mode_string);
 }
 
-// --- cascadeStatusOps: Ophion-faithful cumulative hierarchy --------------------
+// --- cascadeStatusOps: cumulative-authority tier hierarchy ---------------------
 
 /// Render the ops `cascadeStatusOps` produces as a wire-style mode string
 /// (e.g. "-q+o") so the cumulative cascade is easy to assert in tests.

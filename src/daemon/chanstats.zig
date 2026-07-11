@@ -1,5 +1,5 @@
-//! chanstats.zig — per-channel statistics engine (the ophion `m_chanstats`
-//! replacement, native + in-process). Aggregates live channel activity into
+//! chanstats.zig — per-channel statistics engine (native + in-process).
+//! Aggregates live channel activity into
 //! per-channel counters and emits self-describing JSON (an index plus one file
 //! per channel) into a directory that nginx serves; a SolidJS dashboard renders
 //! it. Pure data + JSON; no sockets, no SQLite — the daemon feeds it via

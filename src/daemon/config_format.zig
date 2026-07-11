@@ -148,7 +148,7 @@ pub const Config = struct {
         /// gossiped to mesh peers (per-server description). Null = generic tagline.
         description: ?[]const u8 = null,
         /// IRCv3 network icon: a URL to a network logo, advertised as the
-        /// `NETWORKICON=<url>` ISUPPORT token when set (Ophion `n_url` parity).
+        /// `NETWORKICON=<url>` ISUPPORT token when set.
         icon_url: ?[]const u8 = null,
         /// Opt this node into public discovery-directory feeds. Off by default:
         /// status.json still exists, but directories should not index it unless

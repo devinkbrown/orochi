@@ -130,7 +130,7 @@ pub fn originShortId(pubkey: sign.PublicKey) u64 {
 // either fail the receiver's `originShortId` check or erase the true author.
 // Closing multi-hop requires storing the ORIGINAL signer's `(pubkey, sig)`
 // alongside each CRDT fact / relayed message and re-emitting THAT, not the
-// relay's. Tracked in docs/audits/2026-06-15-orochi-vs-ophion-gap-audit.md.
+// relay's. Tracked in the multi-hop signing gap audit.
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -64,7 +64,7 @@ pub const Prefix = struct {
 pub const CreateArgs = struct {
     channel: []const u8,
     modes: ?[]const u8 = null,
-    /// Ophion CREATE clone/template source channel: its channel-level modes are
+    /// CREATE clone/template source channel: its channel-level modes are
     /// copied onto the new channel before `modes` is applied as an override.
     clone_from: ?[]const u8 = null,
 };

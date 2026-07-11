@@ -1103,7 +1103,7 @@ const Numeric = enum(u16) {
     ERR_KEYINVALID = 767,
     ERR_KEYNOPERMISSION = 769,
     // IRCX draft: 913 IRCERR_NOACCESS ("insufficient privileges for operation").
-    // EVENT duplicate handling uses Ophion's ERR_EVENTDUP 821; keep 918 for PROP.
+    // EVENT duplicate handling uses the IRCX ERR_EVENTDUP 821; keep 918 for PROP.
     ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
     ERR_BADVALUE = 906,
@@ -1314,7 +1314,7 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // (`[limits] modes_per_line`, default 4). Clients that honor it (mIRC,
     // HexChat) send one mode/target per line when set to 1.
     out[base.len + 2] = try std.fmt.allocPrint(allocator, "MODES={d}", .{cfg.modes_per_line});
-    // Optional IRCv3 network icon — Ophion NETWORKICON / n_url parity. Advertised
+    // Optional IRCv3 network icon — NETWORKICON support. Advertised
     // only when [network] icon_url is set, so existing 005 bursts are unchanged.
     if (has_icon) {
         out[base.len + 3] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
@@ -1383,7 +1383,7 @@ pub const Config = struct {
     server_description: []const u8 = "Orochi - pure-Zig mesh IRC daemon",
     /// IRCv3 network icon URL, advertised as the `NETWORKICON=<url>` ISUPPORT
     /// token when non-empty. Configurable via `[network] icon_url`; empty omits
-    /// the token (Ophion `n_url`/NETWORKICON parity).
+    /// the token (NETWORKICON support).
     network_icon_url: []const u8 = "",
     /// Opt-in bit for public discovery directories. Exported in status.json so
     /// crawlers can distinguish intentionally public nodes from private meshes.
@@ -2910,7 +2910,7 @@ pub const LinuxServer = struct {
     /// PRIVMSG/NOTICE messages are recorded into `history`. Bounded by its Config;
     /// queried by `handleSearch`, which scopes hits back to a target's history.
     search_index: search_index_mod.SearchIndex,
-    /// Per-channel statistics aggregator (the ophion m_chanstats replacement).
+    /// Per-channel statistics aggregator (native per-channel statistics engine).
     /// Fed from the recordHistory* chokepoints; flushed to `chanstats_dir` as JSON
     /// on the stats interval. Only active when `config.chanstats_dir` is set.
     chanstats: chanstats_mod.ChanStats,
@@ -11203,7 +11203,7 @@ pub const LinuxServer = struct {
         // IRCX processing order: GRANT, then DENY/GAG (GRANT overrides DENY).
         // A server-level GRANT is a whitelist exemption: a connecting client
         // whose mask matches a GRANT entry bypasses the SACCESS deny/gag
-        // firewall entirely. Mirrors ophion m_ircx_access_server.c.
+        // firewall entirely. Matches the IRCX ACCESS server-side firewall semantics.
         if (self.saccess.matchHostmask(.grant, mask) != null) return false;
         if (self.saccess.matchHostmask(.deny, mask)) |entry| {
             var buf: [default_reply_bytes]u8 = undefined;
@@ -11876,8 +11876,8 @@ pub const LinuxServer = struct {
             return;
         }
         // A secret (+s) or private (+p) channel's roster is visible only to its
-        // members (and opers) — mirror ophion's ShowChannel = PubChannel ||
-        // IsMember. A non-member gets a bare RPL_ENDOFNAMES, never the member
+        // members (and opers) — ShowChannel = public-channel ||
+        // is-member. A non-member gets a bare RPL_ENDOFNAMES, never the member
         // list, so NAMES cannot enumerate a hidden channel (the WHOIS path
         // already gates the same way via channelHiddenFromWhois).
         if (!conn.session.isOper() and
@@ -12134,7 +12134,7 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
                         continue;
                     };
-                    // Ophion-faithful cumulative hierarchy (founder > owner > op):
+                    // Cumulative-authority tier hierarchy (founder > owner > op):
                     // expand the named change into the concrete tier ops it implies.
                     // A deop strips the higher tiers it carries; a higher-tier
                     // removal demotes one rank. Voice is independent. See
@@ -12827,8 +12827,8 @@ pub const LinuxServer = struct {
 
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
             // A secret (+s) or private (+p) channel's roster is visible only to
-            // its members (and opers) — mirror ophion's ShowChannel = PubChannel
-            // || IsMember (and the NAMES gate / channelHiddenFromWhois). A
+            // its members (and opers) — ShowChannel = public-channel
+            // || is-member (and the NAMES gate / channelHiddenFromWhois). A
             // non-member non-oper gets a bare RPL_ENDOFWHO, never the member
             // list, so WHO cannot enumerate a hidden channel. Fail-closed: an
             // unknown viewer is treated as a non-member.
@@ -14726,7 +14726,7 @@ pub const LinuxServer = struct {
         self.chanstatsEvent(store_target, sender, command, text);
     }
 
-    // ── channel-stats feed (the ophion m_chanstats replacement) ──────────────
+    // ── channel-stats feed (native per-channel statistics engine) ────────────
 
     /// Bare nick from a `[:]nick!user@host` prefix; "" for a server source.
     fn nickFromPrefix(prefix: []const u8) []const u8 {
@@ -15152,10 +15152,10 @@ pub const LinuxServer = struct {
     }
 
     /// draft/search anti-abuse: the minimum gap (monotonic ms) between two SEARCH
-    /// commands from one client. Matches Ophion's 5s/client floor.
+    /// commands from one client. A 5s/client floor.
     const search_rate_limit_ms: i64 = 5_000;
     /// draft/search result cap: at most this many messages per query, newest
-    /// first. Matches Ophion's SEARCH_MAX_RESULTS.
+    /// first. A fixed per-query result ceiling.
     const search_max_results: usize = 50;
     /// draft/search query bound: at most this many distinct words are intersected
     /// (AND). Excess words are ignored, keeping the per-query cost bounded.
@@ -15183,8 +15183,8 @@ pub const LinuxServer = struct {
     /// target searches the requester's DM history with that peer. Rate-limited
     /// per client and capped at `search_max_results` (newest-first).
     ///
-    /// Simplification vs Ophion: Ophion backs SEARCH with SQLite FTS5 (ranked
-    /// full-text). Orochi uses a bounded in-memory inverted index with exact,
+    /// Design note: rather than a ranked full-text backend (e.g. SQLite FTS5),
+    /// Orochi uses a bounded in-memory inverted index with exact,
     /// case-folded word AND-matching (no stemming, no substring, no relevance
     /// ranking) — results are ordered newest-first like CHATHISTORY LATEST.
     pub fn handleSearch(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
@@ -17561,7 +17561,7 @@ pub const LinuxServer = struct {
     }
 
     /// EVENT ADD|CHANGE|DELETE|CLEAR|LIST — IRCX EVENT subscription control.
-    /// Opers manage Ophion-compatible CHANNEL/MEMBER/USER subscriptions with
+    /// Opers manage IRCX CHANNEL/MEMBER/USER subscriptions with
     /// per-type subject masks; delivery maps those IRCX types onto Event Spine
     /// categories while replies stay on the IRCX numeric surface.
     pub fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -29901,7 +29901,7 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .RPL_TARGNOTIFY, &.{target}, "has been informed that you messaged them");
                     }
                     // 718 carries the sender's nick and user@host as distinct
-                    // tokens (ophion/charybdis RPL_UMODEGMSG layout) so the
+                    // tokens (the RPL_UMODEGMSG numeric layout) so the
                     // recipient's client can populate an accept-prompt. A client
                     // parsing by position would otherwise read a literal "G".
                     var umask_buf: [256]u8 = undefined;
@@ -37189,7 +37189,7 @@ test "threaded server IRCX: NAMES on a secret channel hides the roster from a no
     try recvUntil(&a, "MODE #sec +s", 200);
 
     // Non-member B: NAMES #sec must NOT leak the roster — only RPL_ENDOFNAMES,
-    // never a 353 naming A (ophion ShowChannel = PubChannel || IsMember).
+    // never a 353 naming A (ShowChannel = public-channel || is-member).
     b.reset();
     try writeAllFd(fd_b, "NAMES #sec\r\n");
     try recvUntil(&b, " 366 B #sec ", 200);
@@ -37239,7 +37239,7 @@ test "threaded server IRCX: WHO on a secret channel hides the roster from a non-
     try recvUntil(&a, "MODE #sec +s", 200);
 
     // Non-member B: WHO #sec must NOT leak the roster — only RPL_ENDOFWHO (315),
-    // never a 352 row naming A (ophion ShowChannel = PubChannel || IsMember).
+    // never a 352 row naming A (ShowChannel = public-channel || is-member).
     b.reset();
     try writeAllFd(fd_b, "WHO #sec\r\n");
     try recvUntil(&b, " 315 B #sec ", 200);
@@ -43319,7 +43319,7 @@ test "threaded server: narrowing live GRANT clears armed override" {
     try recvUntil(&t, " 481 T ", 200);
 }
 
-test "threaded server: IRCX EVENT subscription numerics match Ophion" {
+test "threaded server: IRCX EVENT subscription numerics" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,

@@ -191,7 +191,7 @@ pub fn categoryMaskFromTokens(tokens: []const []const u8) CategoryMask {
 
 pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".field_names.len;
 
-/// IRCX EVENT subscription types supported by Ophion's client-facing command.
+/// IRCX EVENT subscription types supported by the client-facing command.
 /// These are intentionally distinct from Orochi's EventCategory taxonomy:
 /// command replies/listing use the IRCX names, while delivery maps each type to
 /// the closest existing Event Spine categories.

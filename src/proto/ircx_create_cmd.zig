@@ -52,7 +52,7 @@ pub const InitialModes = struct {
 pub const Request = struct {
     channel: []const u8,
     initial_modes: ?InitialModes = null,
-    /// Ophion CREATE clone/template source: when set, the source channel's
+    /// CREATE clone/template source: when set, the source channel's
     /// channel-level modes are copied onto the new channel before `initial_modes`
     /// is applied on top as an override.
     clone_from: ?[]const u8 = null,

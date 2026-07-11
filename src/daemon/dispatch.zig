@@ -922,13 +922,14 @@ pub const ClientSession = struct {
     /// pure category-only subscriptions (the historic behavior) unchanged. A
     /// non-empty mask narrows delivery: an event of category C reaches this session
     /// only when its subject glob-matches `event_subject_masks[@intFromEnum(C)]`
-    /// (mirrors Ophion's per-event-type `masks[EVENT_MAX_TYPES][256]`). Owned
+    /// (per-event-type subject masks, one entry per category). Owned
     /// in-struct (FixedString), so there is nothing to free on clear/deinit.
     event_subject_masks: [EVENT_CATEGORY_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = @splat(.{}),
-    /// IRCX EVENT subscriptions in Ophion wire terms. This state is separate from
+    /// IRCX EVENT subscriptions in IRCX wire terms. This state is separate from
     /// the daemon-native Event Spine category mask so `EVENT ADD CHANNEL`, `LIST`,
-    /// duplicate checks, and missing-subscription errors behave like Ophion even
-    /// when an operator is already subscribed to daemon oper notices.
+    /// duplicate checks, and missing-subscription errors follow the established
+    /// IRCX EVENT semantics even when an operator is already subscribed to daemon
+    /// oper notices.
     ircx_event_mask: event_spine.IrcxEventMask = .{},
     ircx_event_subject_masks: [event_spine.IRCX_EVENT_TYPE_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = @splat(.{}),
 
