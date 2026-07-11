@@ -6,6 +6,7 @@ const std = @import("std");
 const channel_crdt = @import("channel_crdt.zig");
 const clock = @import("clock.zig");
 const delta_codec = @import("delta_codec.zig");
+const member_compact = @import("member_compact.zig");
 const toml = @import("../../proto/toml.zig");
 
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
@@ -42,7 +43,7 @@ const DeltaView = delta_codec.DeltaView(codec_limits);
 const magic = [_]u8{ 'S', 'B', 'S', 'T' };
 const version: u8 = 1;
 
-const RecordKind = enum(u8) { header = 1, member_delta = 2, mode = 3 };
+const RecordKind = enum(u8) { header = 1, member_delta = 2, mode = 3, member_compact = 4 };
 const ModeKind = enum(u8) { invite_only = 1, moderated = 2, no_external = 3, topic_protected = 4, secret = 5, key = 6, limit = 7 };
 
 pub fn serialize(allocator: Allocator, source: *const ChannelCrdt, limits: Limits) ![]u8 {
@@ -90,6 +91,7 @@ pub fn deserializeApply(
                 saw_header = true;
             },
             .member_delta => try readMember(allocator, &incoming, payload),
+            .member_compact => try readMemberCompact(allocator, &incoming, payload),
             .mode => try readMode(&incoming, payload),
         }
     }
@@ -137,6 +139,27 @@ fn writeMember(
     entry: anytype,
     limits: Limits,
 ) !void {
+    // Prefer the canonical dense DeltaView form: it is byte-identical to what a
+    // legacy peer emits, so its Merkle/burst bytes still match cross-version. Fall
+    // back to the compact frontier form ONLY when the dense causal-context
+    // expansion overflows (a member whose context counter exceeds
+    // `max_context_dots` on a busy channel) — the exact members a legacy peer
+    // could neither encode nor consume, so this is a strict improvement, not a
+    // cross-version regression.
+    var encoded: [codec_limits.max_wire_bytes]u8 = undefined;
+    if (encodeMemberDense(&encoded, hlc, entry)) |delta_bytes| {
+        try appendRecord(out, allocator, .member_delta, delta_bytes, limits);
+    } else |err| switch (err) {
+        error.Oversize => {
+            var compact_buf: [member_compact.max_bytes]u8 = undefined;
+            const compact_bytes = try encodeMemberCompact(&compact_buf, hlc, entry);
+            try appendRecord(out, allocator, .member_compact, compact_bytes, limits);
+        },
+        else => return err,
+    }
+}
+
+fn encodeMemberDense(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
     var view = DeltaView{
         .family = .memberships,
         .entity_id = undefined,
@@ -151,9 +174,31 @@ fn writeMember(
     try fillAdds(&view, entry.adds.items);
     try fillRemoves(&view);
 
-    var encoded: [codec_limits.max_wire_bytes]u8 = undefined;
-    const delta_bytes = try view.encode(&encoded);
-    try appendRecord(out, allocator, .member_delta, delta_bytes, limits);
+    return view.encode(out);
+}
+
+fn encodeMemberCompact(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
+    if (entry.context.len > member_compact.max_context) return error.Oversize;
+    if (entry.adds.items.len > member_compact.max_adds) return error.Oversize;
+
+    var ctx: [member_compact.max_context]member_compact.Entry = undefined;
+    for (entry.context.entries[0..entry.context.len], 0..) |e, i| {
+        ctx[i] = .{ .replica = e.replica, .counter = e.counter };
+    }
+
+    var adds: [member_compact.max_adds][member_compact.add_value_len]u8 = undefined;
+    for (entry.adds.items, 0..) |add, i| {
+        const dot = Dot{ .replica = add.dot.replica_id, .counter = add.dot.counter };
+        encodeAddValue(adds[i][0..], dot, add.hlc, add.status);
+    }
+
+    return member_compact.encode(
+        out,
+        entry.member_id,
+        hlc.toU64(),
+        ctx[0..entry.context.len],
+        adds[0..entry.adds.items.len],
+    );
 }
 
 fn readMember(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
@@ -182,6 +227,40 @@ fn readMember(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !vo
 
     try target.members.append(allocator, .{
         .member_id = readU64Le(view.entity_id),
+        .adds = adds,
+        .context = context,
+    });
+}
+
+fn readMemberCompact(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
+    const view = try member_compact.decode(bytes);
+
+    var context = clock.VersionVector.init();
+    for (view.context[0..view.context_len]) |e| {
+        var single = clock.VersionVector.init();
+        single.entries[0] = .{ .replica = e.replica, .counter = e.counter };
+        single.len = 1;
+        try context.merge(&single);
+    }
+
+    var adds = std.ArrayList(@TypeOf(target.members.items[0].adds.items[0])).empty;
+    errdefer adds.deinit(allocator);
+
+    for (view.adds[0..view.adds_len]) |raw| {
+        const decoded = try decodeAddValue(&raw);
+        // The live dot must lie within the transmitted causal-context frontier,
+        // matching the dense codec's `DotOutsideCausalContext` guarantee.
+        if (decoded.dot.counter == 0) return error.InvalidMemberRecord;
+        if (context.counter(decoded.dot.replica) < decoded.dot.counter) return error.InvalidMemberRecord;
+        try adds.append(allocator, .{
+            .dot = .{ .replica_id = @intCast(decoded.dot.replica), .counter = decoded.dot.counter },
+            .hlc = decoded.hlc,
+            .status = decoded.status,
+        });
+    }
+
+    try target.members.append(allocator, .{
+        .member_id = view.member_id,
         .adds = adds,
         .context = context,
     });
@@ -454,6 +533,7 @@ fn readRecordKind(r: *Reader) !RecordKind {
         1 => .header,
         2 => .member_delta,
         3 => .mode,
+        4 => .member_compact,
         else => error.UnknownRecord,
     };
 }
@@ -608,6 +688,64 @@ test "two nodes bursting to each other converge" {
     try apply(allocator, &a, burst_b, default_limits);
     try apply(allocator, &b, burst_a, default_limits);
     try std.testing.expect(ChannelCrdt.eql(&a, &b));
+}
+
+fn countRecordKind(bytes: []const u8, want: u8) !usize {
+    var r = Reader{ .buf = bytes };
+    for (magic) |_| _ = try r.readByte();
+    _ = try r.readByte(); // version
+    var n: usize = 0;
+    while (!r.done()) {
+        const kind = try r.readByte();
+        _ = try r.readBytes();
+        if (kind == want) n += 1;
+    }
+    return n;
+}
+
+test "Suimyaku mesh burst: small members stay dense so legacy peers still parse" {
+    const allocator = std.testing.allocator;
+    var source = ChannelCrdt.init(allocator, 1);
+    defer source.deinit();
+    discard(try source.localJoin(10, .{ .op = true }, 10));
+    discard(try source.localJoin(20, .{ .voice = true }, 11));
+
+    const bytes = try serialize(allocator, &source, default_limits);
+    defer allocator.free(bytes);
+
+    // No wire change while the dense form fits: only member_delta (kind 2)
+    // records, never member_compact (kind 4). A legacy peer parses this byte for
+    // byte.
+    try std.testing.expectEqual(@as(usize, 2), try countRecordKind(bytes, @intFromEnum(RecordKind.member_delta)));
+    try std.testing.expectEqual(@as(usize, 0), try countRecordKind(bytes, @intFromEnum(RecordKind.member_compact)));
+}
+
+test "Suimyaku mesh burst: member past dense context cap round-trips via compact fallback" {
+    const allocator = std.testing.allocator;
+    var source = ChannelCrdt.init(allocator, 1);
+    defer source.deinit();
+
+    // Drive one replica's channel-global dot counter past max_context_dots (512)
+    // for a single member via join/part churn, then leave it live. The dense
+    // causal-context expansion would return error.Oversize here.
+    var i: u64 = 0;
+    while (i < 600) : (i += 1) {
+        discard(try source.localJoin(77, .{ .voice = true }, 10 + i));
+        discard(try source.localPart(77));
+    }
+    discard(try source.localJoin(77, .{ .op = true }, 700));
+    try std.testing.expect(source.members.items[0].context.counter(1) > codec_limits.max_context_dots);
+
+    const bytes = try serialize(allocator, &source, default_limits);
+    defer allocator.free(bytes);
+
+    try std.testing.expect((try countRecordKind(bytes, @intFromEnum(RecordKind.member_compact))) >= 1);
+
+    var target = ChannelCrdt.init(allocator, 2);
+    defer target.deinit();
+    try deserializeApply(allocator, &target, bytes, default_limits);
+    try std.testing.expect(ChannelCrdt.eql(&source, &target));
+    try std.testing.expect(target.containsMember(77));
 }
 
 test "Limits.applyToml overlays mesh.link burst keys" {

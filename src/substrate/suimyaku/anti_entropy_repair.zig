@@ -7,6 +7,7 @@ const burst = @import("burst.zig");
 const channel_crdt = @import("channel_crdt.zig");
 const clock = @import("clock.zig");
 const delta_codec = @import("delta_codec.zig");
+const member_compact = @import("member_compact.zig");
 const merkle = @import("merkle.zig");
 const Allocator = std.mem.Allocator;
 const ChannelCrdt = channel_crdt.ChannelCrdt;
@@ -16,6 +17,10 @@ pub const Hash = merkle.Hash;
 pub const codec_limits = burst.codec_limits;
 const DeltaView = delta_codec.DeltaView(codec_limits);
 const Dot = delta_codec.Dot;
+/// A member payload is either the canonical dense DeltaView form or, when the
+/// dense causal-context expansion overflows, the compact frontier form. Size the
+/// scratch buffer for whichever is larger.
+const max_member_payload = @max(codec_limits.max_wire_bytes, member_compact.max_bytes);
 const member_prefix = "member:";
 const key_invite_only = "mode:invite_only";
 const key_moderated = "mode:moderated";
@@ -93,7 +98,7 @@ pub fn summarize(allocator: Allocator, state: *const ChannelCrdt) !Summary {
     for (state.members.items) |entry| {
         var key_buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, member_prefix ++ "{d}", .{entry.member_id});
-        var payload: [codec_limits.max_wire_bytes]u8 = undefined;
+        var payload: [max_member_payload]u8 = undefined;
         const encoded = try encodeMemberPayload(&payload, .{}, entry);
         try putDigest(&out, key, entityHash(key, encoded));
         out.entity_count += 1;
@@ -210,7 +215,7 @@ fn makeEntityRecord(allocator: Allocator, source: *const ChannelCrdt, key: []con
         const member_id = try std.fmt.parseInt(channel_crdt.MemberId, key[member_prefix.len..], 10);
         for (source.members.items) |entry| {
             if (entry.member_id == member_id) {
-                var payload: [codec_limits.max_wire_bytes]u8 = undefined;
+                var payload: [max_member_payload]u8 = undefined;
                 const encoded = try encodeMemberPayload(&payload, .{}, entry);
                 return try ownedRecord(allocator, .member, key, encoded);
             }
@@ -247,6 +252,20 @@ fn ownedRecord(allocator: Allocator, kind: RecordKind, key: []const u8, payload:
 }
 
 fn encodeMemberPayload(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
+    // Prefer the canonical dense DeltaView form (byte-identical to a legacy peer,
+    // so Merkle entity hashes still match cross-version). Fall back to the compact
+    // frontier form ONLY when the dense causal-context expansion overflows — the
+    // exact members a legacy peer could neither summarize nor repair, so no
+    // cross-version regression.
+    if (encodeMemberDense(out, hlc, entry)) |dense| {
+        return dense;
+    } else |err| switch (err) {
+        error.Oversize => return encodeMemberCompact(out, hlc, entry),
+        else => return err,
+    }
+}
+
+fn encodeMemberDense(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
     var entity: [8]u8 = undefined;
     writeU64Le(&entity, entry.member_id);
 
@@ -261,7 +280,32 @@ fn encodeMemberPayload(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
     return view.encode(out);
 }
 
+fn encodeMemberCompact(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
+    if (entry.context.len > member_compact.max_context) return error.Oversize;
+    if (entry.adds.items.len > member_compact.max_adds) return error.Oversize;
+
+    var ctx: [member_compact.max_context]member_compact.Entry = undefined;
+    for (entry.context.entries[0..entry.context.len], 0..) |e, i| {
+        ctx[i] = .{ .replica = e.replica, .counter = e.counter };
+    }
+
+    var adds: [member_compact.max_adds][member_compact.add_value_len]u8 = undefined;
+    for (entry.adds.items, 0..) |add, i| {
+        const dot = Dot{ .replica = add.dot.replica_id, .counter = add.dot.counter };
+        encodeAddValue(adds[i][0..], dot, add.hlc, add.status);
+    }
+
+    return member_compact.encode(
+        out,
+        entry.member_id,
+        hlc.toU64(),
+        ctx[0..entry.context.len],
+        adds[0..entry.adds.items.len],
+    );
+}
+
 fn readMemberPayload(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
+    if (member_compact.matches(bytes)) return readMemberPayloadCompact(allocator, target, bytes);
     const view = try DeltaView.decode(bytes);
     if (view.family != .memberships or view.entity_id.len != 8) return error.InvalidRepairRecord;
     if (Hlc.compare(view.hlc, target.hlc) == .gt) target.hlc = view.hlc;
@@ -286,6 +330,42 @@ fn readMemberPayload(allocator: Allocator, target: *ChannelCrdt, bytes: []const 
 
     try target.members.append(allocator, .{
         .member_id = readU64Le(view.entity_id),
+        .adds = adds,
+        .context = context,
+    });
+}
+
+fn readMemberPayloadCompact(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
+    const view = try member_compact.decode(bytes);
+    const hlc = hlcFromKey(view.hlc_key);
+    if (Hlc.compare(hlc, target.hlc) == .gt) target.hlc = hlc;
+
+    var context = clock.VersionVector.init();
+    for (view.context[0..view.context_len]) |e| {
+        var single = clock.VersionVector.init();
+        single.entries[0] = .{ .replica = e.replica, .counter = e.counter };
+        single.len = 1;
+        try context.merge(&single);
+    }
+
+    var adds = std.ArrayList(@TypeOf(target.members.items[0].adds.items[0])).empty;
+    errdefer adds.deinit(allocator);
+
+    for (view.adds[0..view.adds_len]) |raw| {
+        const decoded = try decodeAddValue(&raw);
+        // The live dot must lie within the transmitted causal-context frontier,
+        // matching the dense codec's `DotOutsideCausalContext` guarantee.
+        if (decoded.dot.counter == 0) return error.InvalidRepairRecord;
+        if (context.counter(decoded.dot.replica) < decoded.dot.counter) return error.InvalidRepairRecord;
+        try adds.append(allocator, .{
+            .dot = .{ .replica_id = @intCast(decoded.dot.replica), .counter = decoded.dot.counter },
+            .hlc = decoded.hlc,
+            .status = decoded.status,
+        });
+    }
+
+    try target.members.append(allocator, .{
+        .member_id = view.member_id,
         .adds = adds,
         .context = context,
     });
@@ -699,4 +779,30 @@ test "multi-round convergence" {
     try std.testing.expect(!ChannelCrdt.eql(&a, &b));
     _ = try repairOneWay(allocator, &b, &a);
     try std.testing.expect(ChannelCrdt.eql(&a, &b));
+}
+test "summarize and repair a member whose context exceeds the dense cap" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+
+    // Push one replica's channel-global dot counter past max_context_dots (512)
+    // for a single member. Before the compact fallback, summarize() → error.Oversize
+    // here and the Merkle anti-entropy backstop silently no-oped.
+    var i: u64 = 0;
+    while (i < 600) : (i += 1) {
+        discard(try src.localJoin(77, .{ .voice = true }, 10 + i));
+        discard(try src.localPart(77));
+    }
+    discard(try src.localJoin(77, .{ .op = true }, 700));
+    try std.testing.expect(src.members.items[0].context.counter(1) > codec_limits.max_context_dots);
+
+    // summarize must succeed (was error.Oversize) and round-trip through repair.
+    var s = try summarize(allocator, &src);
+    s.deinit();
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    _ = try repairOneWay(allocator, &dst, &src);
+    try std.testing.expect(ChannelCrdt.eql(&src, &dst));
+    try std.testing.expect(dst.containsMember(77));
 }

@@ -22,6 +22,7 @@ pub const gossip_round = @import("gossip_round.zig");
 pub const gossip_views = @import("gossip_views.zig");
 pub const link_session = @import("link_session.zig");
 pub const media = @import("media.zig");
+pub const member_compact = @import("member_compact.zig");
 pub const membership_burst = @import("membership_burst.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
