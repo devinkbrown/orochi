@@ -2,7 +2,7 @@
 
 *The per-channel statistics engine and the public status feed as implemented in the current source tree.*
 
-Orochi replaces ophion's `m_chanstats` with a native, in-process engine that aggregates live channel activity into per-channel counters and emits self-describing JSON for a static dashboard, plus a separate `status.json` public health feed. Both are pure data producers: no sockets, no SQLite. The daemon feeds the aggregate from its history chokepoints and flushes on a throttled cadence into a directory nginx serves at `/stats/`. The engine lives in [src/daemon/chanstats.zig](../../src/daemon/chanstats.zig); the daemon wiring and the status feed live in [src/daemon/server.zig](../../src/daemon/server.zig).
+Orochi ships a native, in-process chanstats engine (replacing the traditional `m_chanstats` approach) that aggregates live channel activity into per-channel counters and emits self-describing JSON for a static dashboard, plus a separate `status.json` public health feed. Both are pure data producers: no sockets, no SQLite. The daemon feeds the aggregate from its history chokepoints and flushes on a throttled cadence into a directory nginx serves at `/stats/`. The engine lives in [src/daemon/chanstats.zig](../../src/daemon/chanstats.zig); the daemon wiring and the status feed live in [src/daemon/server.zig](../../src/daemon/server.zig).
 
 ## Per-channel statistics engine
 

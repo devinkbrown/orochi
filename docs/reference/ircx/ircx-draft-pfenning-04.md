@@ -5,8 +5,8 @@ _Normative extraction of the canonical IRCX IETF draft — the source of truth f
 > Source: IETF Internet-Draft "Extensions to the Internet Relay Chat Protocol
 > (IRCX)", Pfenning/Abraham (Microsoft), July 1998.
 > https://www.ietf.org/archive/id/draft-pfenning-irc-extensions-04.txt
-> Captured 2026-06-05 as Orochi's authoritative IRCX reference. The ophion
-> implementation notes live in the sibling `ircx-protocol-ophion.md` and
+> Captured 2026-06-05 as Orochi's authoritative IRCX reference. Legacy C
+> implementation notes live in the sibling `ircx-protocol.md` and
 > `m_ircx_*.md` files.
 
 ## Protocol discovery

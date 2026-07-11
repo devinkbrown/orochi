@@ -54,7 +54,7 @@ Each file you create must be self-contained (import only `std`) so it can be tes
 
 This mandate applies to every module and has highest priority.
 
-Orochi is a **clean-room, modern, inventive** IRC daemon. Do not port legacy IRC behavior or copy ophion/charybdis/ratbox code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT mesh world.
+Orochi is a **clean-room, modern, inventive** IRC daemon. Do not port or copy legacy IRC daemon code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT mesh world.
 
 **Banned legacy behavior — never implement, and remove if found:**
 
@@ -77,7 +77,7 @@ crypto. When a legacy feature has no modern equivalent, invent a principled one 
 **Services = internalized native commands (no bots):** accounts/channels/memos are exposed as real
 server commands (REGISTER, IDENTIFY, GROUP, DROP, LOGOUT, CREGISTER, ACCESS, AKICK, MEMO, VHOST, ...)
 with IRCv3 standard-replies (FAIL/WARN/NOTE) + structured numerics, not pseudo-client bots
-(no NickServ/ChanServ PRIVMSG targets). Like ophion's in-process services, but with cleaner messaging.
+(no NickServ/ChanServ PRIVMSG targets). In-process services — real server commands, no pseudo-clients — with cleaner messaging.
 The services.zig backend stays I/O-free (typed results); the daemon command layer wraps it natively.
 
 ## Cross-platform mandate

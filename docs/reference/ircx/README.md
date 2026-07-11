@@ -39,7 +39,7 @@ module.
 | Document | Role |
 | --- | --- |
 | [`ircx-draft-pfenning-04.md`](ircx-draft-pfenning-04.md) | Canonical IETF draft — source of truth for numerics, commands, modes, and properties. |
-| [`ircx-protocol-ophion.md`](ircx-protocol-ophion.md) | Legacy behavioral blueprint (ophion). Historical only — not authoritative on identity/SID; Orochi is SID-free. |
+| [`ircx-protocol.md`](ircx-protocol.md) | Legacy behavioral blueprint (prior C IRCX daemon). Historical only — not authoritative on identity/SID; Orochi is SID-free. |
 | [../../architecture/event-spine.md](../../architecture/event-spine.md) | Full architecture behind `EVENT`, OBSERVE, BROADCAST, categories, and severity. |
 
 ## Numeric map (live)

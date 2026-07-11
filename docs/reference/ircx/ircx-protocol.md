@@ -2,14 +2,14 @@
 
 _Opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration._
 
-> Historical reference only: this page describes the legacy Ophion C implementation
+> Historical reference only: this page describes a legacy C IRCX implementation
 > (`modules/m_ircx_*.c`). It is not the Orochi Zig implementation source of truth.
 > For Orochi, verify current behavior in `src/daemon/modules/ircx.zig`,
 > `src/daemon/server.zig`, and the relevant `src/proto/ircx_*.zig` files.
 
 ## Overview
 
-Ophion's IRCX support is implemented by `modules/m_ircx_*.c`. The base module registers the `IRCX` server capability, the `IRCX` and `ISIRCX` client commands, and the ISUPPORT tokens `IRCX`, `MAXCODEPAGE`, and `MAXLANGUAGE`.
+In this legacy C implementation, IRCX support is implemented by `modules/m_ircx_*.c`. The base module registers the `IRCX` server capability, the `IRCX` and `ISIRCX` client commands, and the ISUPPORT tokens `IRCX`, `MAXCODEPAGE`, and `MAXLANGUAGE`.
 
 IRCX is explicit opt-in for clients. A client enters IRCX mode by sending `IRCX` or `ISIRCX`; the server sets IRCX/NAMESX state and replies with `RPL_IRCX`. Current source does not force IRCX mode merely because a client becomes an IRC operator.
 
@@ -98,7 +98,7 @@ PROP #team LADON.MEDIA.VOICE :members
 PROP #team LADON.MEDIA.VOICE :
 PROP #team CLEAR
 PROP #team GET TOPIC
-PROP #team SET CLIENT :ophion-web
+PROP #team SET CLIENT :example-web
 ```
 
 | Property Family | Default | Description |

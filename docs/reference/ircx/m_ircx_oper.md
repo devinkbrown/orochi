@@ -2,7 +2,7 @@
 
 _The operator-gated corner of Orochi's IRCX family — server access lists (`SACCESS`), the `+z` GAG umode, and the operator `EVENT` plane._
 
-Orochi is not the old ophion C daemon: there is no `modules/m_ircx_oper.c`, no
+Orochi is not a legacy C IRC daemon: there is no `modules/m_ircx_oper.c`, no
 MAPI, and no `OPFORCE`/`SVSJOIN` pseudo-commands. The operator surface is plain
 English and rides real server commands in
 [`src/daemon/server.zig`](../../../src/daemon/server.zig), registered through
@@ -43,7 +43,7 @@ Both require operator status and the `event_subscribe` privilege. See
 
 ## Notes
 
-- The legacy ophion `OPFORCE`/`SVSJOIN` commands are intentionally absent.
+- The legacy `OPFORCE`/`SVSJOIN` commands are intentionally absent.
   Forced joins and moderation are expressed through the modern surface (SACCESS,
   channel `ACCESS`, WARD ban policy) rather than services pseudo-commands.
 - All of these are IRCX-family commands except `MODE`; the IRCX ones require the

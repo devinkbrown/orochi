@@ -2,8 +2,8 @@
 
 *The complete guide, architecture, and reference for the Orochi IRC daemon — grounded in, and cited against, the live source.*
 
-Orochi is a pure-Zig (0.17-dev) clean-room IRC daemon — a bespoke successor to the C `ophion`
-daemon, not a clone. It speaks IRCv3 + IRCX, runs a custom Suimyaku CRDT mesh with
+Orochi is a pure-Zig (0.17-dev) clean-room IRC daemon, built from first principles — not a
+clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Suimyaku CRDT mesh with
 forward-secret Tsumugi server links, and ships its own pure-Zig TLS (Yoroi), media codecs
 (KaguraVox/KaguraVis), and in-place upgrade (Helix).
 

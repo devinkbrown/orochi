@@ -2,7 +2,7 @@
 
 *The Suimyaku mesh and server-to-server layer as implemented in the current source tree.*
 
-The mesh vocabulary (see the [glossary](../reference/glossary.md)): Suimyaku is the S2S CRDT mesh state model, Tsumugi is the secure handshake layer, Sazanami is the witnessed failure-detection gossip, and Goryu is the CRDT library. The design rejects TS6/SID identity in favor of a sovereign node identity. The code today implements a clean-room Orochi mesh, not a C ophion clone.
+The mesh vocabulary (see the [glossary](../reference/glossary.md)): Suimyaku is the S2S CRDT mesh state model, Tsumugi is the secure handshake layer, Sazanami is the witnessed failure-detection gossip, and Goryu is the CRDT library. The design rejects TS6/SID identity in favor of a sovereign node identity. The code today implements a clean-room Orochi mesh, not a clone of any prior daemon.
 
 ## Layer map
 

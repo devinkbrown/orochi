@@ -9,10 +9,10 @@
 [![Status: in production](https://img.shields.io/badge/status-in%20production-success.svg)](#status)
 
 **Orochi** (水蛟 — the coiling water-dragon) is a **100% clean-slate, fully Zig-native**
-IRC daemon and the successor to the C [ophion](https://github.com/devinkbrown/ophion)
-server. The daemon *and its entire substrate* — the systems library and the crypto/TLS
-stack — are written from scratch in Zig with **no C interop**. It keeps ophion's full
-feature surface (IRCv3, IRCX, SASL, in-process services, WebSocket, CHATHISTORY,
+IRC daemon built from first principles. The daemon *and its entire substrate* — the
+systems library and the crypto/TLS stack — are written from scratch in Zig with **no C
+interop**. It covers a full modern feature surface (IRCv3, IRCX, SASL, in-process
+services, WebSocket, CHATHISTORY,
 voice/video), adds class-based connection policy with bounded growable SendQ/RecvQ and
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Suimyaku + Tsumugi** cryptographic mesh.
@@ -35,7 +35,7 @@ native **Suimyaku + Tsumugi** cryptographic mesh.
 ## Design pillars
 
 - **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are all
-  Zig; `comptime` replaces ophion's MAPI module machinery and generates wire codecs and
+  Zig; `comptime` powers the module machinery and generates wire codecs and
   dispatch tables.
 - **Mesh, not tree.** **Suimyaku** (水脈) — a CRDT state mesh with Sazanami gossip and
   Merkle anti-entropy — over **Tsumugi** (紬) — a post-quantum-hybrid (X25519 + ML-KEM-768)
@@ -130,7 +130,7 @@ Orochi is licensed under the **GNU Affero General Public License v3.0 or later
 (AGPL-3.0-or-later)**. See [`LICENSE`](LICENSE) for the full text; every source file
 carries an SPDX header.
 
-Orochi is clean-room — it does **not** derive from ophion's code, so this license is
+Orochi is clean-room — it does **not** derive from any prior daemon's code, so this license is
 chosen freely rather than inherited. AGPL is deliberate: Orochi is a network server, and
 §13 ("Remote Network Interaction") means **anyone who runs a modified Orochi as a network
 service — for example, operating an IRC network — must offer that service's users the
