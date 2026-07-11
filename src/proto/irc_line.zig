@@ -315,3 +315,145 @@ test "rejects oversize line bodies" {
     const big = &@as([(MAX_LINE_BODY + 1)]u8, @splat('A'));
     try std.testing.expectError(error.OversizeLine, parseLine(big));
 }
+
+// ---------------------------------------------------------------------------
+// Exploit corpus (P2 / CWE-20,190,400,770): the wire parser is the first thing
+// a hostile client touches. Every case feeds an adversarial line and asserts
+// the parser FAILS CLOSED — a returned typed error OR a BOUNDED LineView (never
+// a panic, an OOB slice, an over-count array write, or an unbounded scan). Each
+// case runs in the full `zig build test` AND under `zig build test-exploit`.
+// These lock in the confirmed length/count/control-byte defenses as permanent
+// regressions so a later refactor cannot silently remove a load-bearing bound.
+
+/// A parsed view must never exceed its fixed-array bounds regardless of input:
+/// a breach here is a real out-of-bounds write in ReleaseFast (safety off).
+fn assertBounded(view: LineView) !void {
+    try std.testing.expect(view.param_count <= MAXPARA);
+    try std.testing.expect(view.tag_count <= MAXTAGS);
+}
+
+test "exploit: parseLine rejects hostile lines fail-closed (reject corpus)" {
+    // Each input MUST return a typed error — never a partial/forged parse.
+    const Case = struct { in: []const u8, want: ParseError };
+    const cases = [_]Case{
+        // Embedded framing bytes: the CRLF/NUL smuggling primitive. An interior
+        // NUL or CR/LF must be rejected so it can never split a second wire line.
+        .{ .in = "PING abc\x00def", .want = error.EmbeddedNul },
+        .{ .in = "PRIVMSG #c :a\rb", .want = error.EmbeddedLineBreak },
+        .{ .in = "PRIVMSG #c :a\nb", .want = error.EmbeddedLineBreak },
+        .{ .in = "PRIVMSG #c :a\r\nOPER x y", .want = error.EmbeddedLineBreak },
+        // Empty / whitespace-only / structural-only: no command to dispatch.
+        .{ .in = "", .want = error.EmptyLine },
+        .{ .in = "\r\n", .want = error.EmptyLine },
+        .{ .in = "   ", .want = error.MissingCommand },
+        .{ .in = "@only=tags", .want = error.MissingCommand },
+        .{ .in = ":prefix.only", .want = error.MissingCommand },
+        .{ .in = "@t; CMD", .want = error.MalformedTags }, // trailing empty tag segment
+        .{ .in = "@ CMD", .want = error.MalformedTags }, // empty tag block
+        .{ .in = "@=noKey CMD", .want = error.MalformedTags }, // key must be non-empty
+        .{ .in = "@k\x01ey=v CMD", .want = error.MalformedTags }, // control byte caught as invalid key
+        .{ .in = ": CMD", .want = error.MalformedPrefix }, // empty prefix
+        // Param-count overflow: the 16th positional arg must be refused, never
+        // written past params[MAXPARA-1] (an OOB store under ReleaseFast).
+        .{ .in = "CMD p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15", .want = error.TooManyParams },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectError(c.want, parseLine(c.in));
+    }
+}
+
+test "exploit: parseLine bounds pathological tag/param counts (algorithmic-complexity guard)" {
+    // A ';'-storm tag blob is the classic unbounded-scan DoS. The parser caps
+    // the tag count at MAXTAGS: exactly MAXTAGS parses, and the FIRST tag past
+    // the cap short-circuits with TooManyTags — the scan cannot run unbounded.
+    var buf: [MAX_LINE_BODY]u8 = undefined;
+
+    // Exactly MAXTAGS keys → accepted, tag_count == MAXTAGS (bounded, no overflow).
+    {
+        var w: usize = 0;
+        buf[w] = '@';
+        w += 1;
+        for (0..MAXTAGS) |i| {
+            if (i != 0) {
+                buf[w] = ';';
+                w += 1;
+            }
+            const seg = std.fmt.bufPrint(buf[w..], "k{d}", .{i}) catch unreachable;
+            w += seg.len;
+        }
+        const tail = " PING x";
+        @memcpy(buf[w..][0..tail.len], tail);
+        w += tail.len;
+        const view = try parseLine(buf[0..w]);
+        try assertBounded(view);
+        try std.testing.expectEqual(@as(usize, MAXTAGS), view.tag_count);
+    }
+
+    // MAXTAGS + many extra keys → rejected fail-closed with a bounded scan.
+    {
+        var w: usize = 0;
+        buf[w] = '@';
+        w += 1;
+        for (0..MAXTAGS + 500) |i| {
+            if (i != 0) {
+                buf[w] = ';';
+                w += 1;
+            }
+            const seg = std.fmt.bufPrint(buf[w..], "k{d}", .{i}) catch unreachable;
+            w += seg.len;
+        }
+        const tail = " PING x";
+        @memcpy(buf[w..][0..tail.len], tail);
+        w += tail.len;
+        try std.testing.expectError(error.TooManyTags, parseLine(buf[0..w]));
+    }
+
+    // A raw ';'-only storm (no valid keys) followed by a command rejects on the
+    // FIRST empty segment inside parseTags — the scan cannot run the whole blob.
+    {
+        var storm: [4096]u8 = undefined;
+        storm[0] = '@';
+        @memset(storm[1 .. storm.len - 4], ';');
+        const tail = " CMD";
+        @memcpy(storm[storm.len - 4 ..], tail);
+        try std.testing.expectError(error.MalformedTags, parseLine(&storm));
+    }
+}
+
+test "exploit: parseLine parses max-boundary lines fail-closed (bounded, not corrupt)" {
+    // Boundary inputs that MUST parse cleanly (no off-by-one): a line body at
+    // exactly MAX_LINE_BODY, a trailing ':' producing an empty final param, and
+    // exactly MAXPARA params. Each must stay within the fixed-array bounds.
+    var buf: [MAX_LINE_BODY]u8 = undefined;
+    @memset(&buf, 'A');
+    const prefix = "PRIVMSG #c :";
+    @memcpy(buf[0..prefix.len], prefix);
+    const view = try parseLine(&buf); // len == MAX_LINE_BODY exactly
+    try assertBounded(view);
+
+    const empty_trailing = try parseLine("PRIVMSG #c :");
+    try assertBounded(empty_trailing);
+    try std.testing.expect(empty_trailing.trailing != null);
+    try std.testing.expectEqual(@as(usize, 0), empty_trailing.trailing.?.len);
+
+    // MAXPARA-1 (14) positional params: one below the cap, still cleanly bounded.
+    const maxpar = try parseLine("CMD p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13");
+    try assertBounded(maxpar);
+    try std.testing.expectEqual(@as(usize, MAXPARA - 1), maxpar.param_count);
+}
+
+test "exploit: unescapeTagValue is bounded and cannot overflow its output buffer" {
+    // A hostile tag value packed with escapes must never write past out_buf: the
+    // decoder returns OutputTooSmall rather than smashing the stack. It also must
+    // not run away on a trailing lone backslash.
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, unescapeTagValue("aaaaaaaa", &tiny));
+
+    var out: [16]u8 = undefined;
+    // Lone trailing backslash is preserved, not read out of bounds.
+    const lone = try unescapeTagValue("ab\\", &out);
+    try std.testing.expectEqualStrings("ab\\", lone);
+    // Every known escape decodes without exceeding the input-derived length.
+    const decoded = try unescapeTagValue("\\s\\:\\r\\n\\\\", &out);
+    try std.testing.expect(decoded.len <= 5);
+}

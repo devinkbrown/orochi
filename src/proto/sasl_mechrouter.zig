@@ -703,6 +703,122 @@ test "mechanism list string advertises supported mechanisms" {
     try std.testing.expectEqualStrings(SUPPORTED_MECHANISMS, Router.mechanismList());
 }
 
+// ---------------------------------------------------------------------------
+// Exploit corpus (P3 / CWE-287,294,306,384): the SASL router is the auth state
+// machine a hostile client drives via AUTHENTICATE. Every case asserts it FAILS
+// CLOSED — no account is ever granted on malformed / out-of-order / oversized /
+// replayed input, the exchange resets on failure, and no path panics. Runs in
+// the full `zig build test` AND under `zig build test-exploit`.
+
+/// A PLAIN checker that accepts ONLY kain/correct — any other credential (empty,
+/// garbage, wrong password) returns null so the router must fail closed.
+const ExploitPlainDb = struct {
+    fn verify(_: *anyopaque, creds: sasl.PlainCredentials) ?[]const u8 {
+        if (!std.mem.eql(u8, creds.authcid, "kain")) return null;
+        if (!std.mem.eql(u8, creds.password, "correct")) return null;
+        return "kain";
+    }
+};
+
+fn exploitPlainRouter(token: *u8) Router {
+    return Router.init(.{ .plain = .{ .ptr = token, .verifyFn = ExploitPlainDb.verify } }, "serverNonce");
+}
+
+test "exploit: SASL router grants nothing on out-of-order / malformed / oversized input" {
+    var token: u8 = 0;
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+
+    // AUTHENTICATE payload BEFORE any mechanism start: idle state must refuse,
+    // never fall through into a mechanism step.
+    {
+        var router = exploitPlainRouter(&token);
+        const r = router.receive(&b64("authz\x00kain\x00correct"), &out);
+        try std.testing.expectEqual(Failure.invalid_state, r.fail);
+    }
+
+    // Oversized chunk (> MAX_AUTHENTICATE_CHUNK): refused as too_long, no decode.
+    {
+        var router = exploitPlainRouter(&token);
+        _ = router.start("PLAIN");
+        var big: [MAX_AUTHENTICATE_CHUNK + 1]u8 = undefined;
+        @memset(&big, 'A');
+        const r = router.receive(&big, &out);
+        try std.testing.expectEqual(Failure.too_long, r.fail);
+    }
+
+    // Non-base64 garbage: invalid_message (decode fails fail-closed).
+    {
+        var router = exploitPlainRouter(&token);
+        _ = router.start("PLAIN");
+        const r = router.receive("!!!!not base64!!!!", &out);
+        try std.testing.expectEqual(Failure.invalid_message, r.fail);
+    }
+
+    // Empty and structurally-wrong PLAIN blobs: never a grant.
+    {
+        const bad = [_][]const u8{
+            "", // empty message
+            "garbage-no-nul", // no NUL separators
+            "authz\x00kainonly", // missing password field
+            "authz\x00wrong\x00correct", // wrong authcid
+            "authz\x00kain\x00wrong", // wrong password
+        };
+        for (bad) |raw| {
+            var router = exploitPlainRouter(&token);
+            _ = router.start("PLAIN");
+            const enc = std.base64.standard.Encoder;
+            var eb: [512]u8 = undefined;
+            const encoded = enc.encode(eb[0..enc.calcSize(raw.len)], raw);
+            const r = router.receive(encoded, &out);
+            // Either invalid_message (parse) or invalid_credentials (verify) — but
+            // NEVER a success. Assert the outcome is a fail, not a grant.
+            try std.testing.expect(r == .fail);
+        }
+    }
+}
+
+test "exploit: SASL abort resets the exchange (no lingering authenticated state)" {
+    var token: u8 = 0;
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    var router = exploitPlainRouter(&token);
+
+    try std.testing.expectEqualStrings("+", router.start("PLAIN").continue_);
+    // Client aborts mid-exchange.
+    try std.testing.expectEqual(Failure.aborted, router.receive("*", &out).fail);
+    // A follow-up payload after abort hits idle: refused, never resumed.
+    try std.testing.expectEqual(Failure.invalid_state, router.receive(&b64("authz\x00kain\x00correct"), &out).fail);
+}
+
+test "exploit: SASL success cannot be replayed for a second grant" {
+    var token: u8 = 0;
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    var router = exploitPlainRouter(&token);
+
+    _ = router.start("PLAIN");
+    const good = b64("authz\x00kain\x00correct");
+    try std.testing.expectEqualStrings("kain", router.receive(&good, &out).success.account);
+    // Replaying the exact accepted chunk WITHOUT a fresh start must not re-grant:
+    // the router returned to idle, so the replay is refused fail-closed.
+    try std.testing.expectEqual(Failure.invalid_state, router.receive(&good, &out).fail);
+}
+
+test "exploit: SASL EXTERNAL is unavailable without a bound certfp (no spoof)" {
+    // EXTERNAL binds to the TLS-presented certfp only. With no certfp bound (a
+    // plaintext or unverified conn), the mechanism must not even start — a client
+    // cannot assert an identity by naming an authzid.
+    var ext_token: u8 = 0;
+    var router = Router.init(.{ .external = .{
+        .ptr = &ext_token,
+        .verifyFn = struct {
+            fn verify(_: *anyopaque, _: []const u8, _: []const u8) ?[]const u8 {
+                return "should-never-be-called";
+            }
+        }.verify,
+    } }, "serverNonce");
+    // tls_certfp is null → enabled(external) is false → start fails unavailable.
+    try std.testing.expectEqual(Failure.unavailable, router.start("EXTERNAL").fail);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

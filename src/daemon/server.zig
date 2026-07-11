@@ -19408,6 +19408,15 @@ pub const LinuxServer = struct {
     /// relayed to peers (so members on other nodes see the one reply, sourced
     /// from this node's name). No peer regenerates it — no cross-server collision.
     fn fantasyReply(self: *LinuxServer, chan: []const u8, text: []const u8) void {
+        // Fail-closed CRLF/control-byte guard (CWE-93). `text` is external-feed
+        // content (weather/news bodies), NOT an IRC-line-parsed client field, so
+        // it never passed through the inbound `requireNoControlBytes` gate — and
+        // this sink is `broadcastChannel` + mesh relay, which bypass the
+        // `emitReplyLine` choke point. A control byte in the reflected feed value
+        // could inject a second wire line into the channel broadcast AND the S2S
+        // relay, so a hostile/compromised feed is dropped whole here (clean feed
+        // content is byte-identical). This single guard covers both sinks below.
+        if (dispatch.hasControlByte(text)) return;
         const origin = self.serverName();
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ origin, chan, text }) catch return;
@@ -40811,6 +40820,164 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
     // The handler still ran: the clean entry + end-of-list are delivered.
     try expectContains(out, "*!*@clean");
     try expectContains(out, "SHUN: end of list");
+}
+
+// --- Exploit corpus (Part A / §1B, CWE-93): the fantasy-bot reply sink. Unlike
+// the per-conn reply builders (guarded by emitReplyLine), fantasyReply delivers
+// via `broadcastChannel` + mesh relay and reflects EXTERNAL-FEED content
+// (!weather/!news bodies). Client args are IRC-line-parsed so cannot carry raw
+// CR/LF, but a compromised/hostile feed value is NOT line-parsed — a control
+// byte there could inject a second wire line into the channel broadcast AND the
+// S2S relay. The guard drops such a reply whole; clean feed content is
+// byte-identical. This drives the real sink end-to-end and asserts fail-closed.
+
+test "exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast + relay sink)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "victim", null);
+    const conn = server.connFor(id).?;
+    _ = try server.world.join("#room", worldIdFromClient(id));
+
+    // Hostile feed values: a full CRLF forging an OPER/KILL line, a lone CR, a
+    // lone LF, and an embedded NUL. Every one must be dropped — nothing delivered.
+    const hostile = [_][]const u8{
+        "sunny 25C\r\n:orochi 001 victim :forged welcome",
+        "cloudy\rKILL victim :forged",
+        "rain\nPRIVMSG #room :forged spoof",
+        "wind \x00 gust",
+    };
+    for (hostile) |feed| {
+        conn.send_len = 0;
+        server.fantasyReply("#room", feed);
+        // Fail-closed: the whole reply is dropped, so no bytes (and thus no forged
+        // wire line the feed smuggled) reach the channel member.
+        try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+        try assertNoInjectedWireLine(conn.send_buf[0..conn.send_len]);
+    }
+
+    // A clean feed body is delivered byte-for-byte (guard is transparent).
+    conn.send_len = 0;
+    server.fantasyReply("#room", "sunny 25C, light breeze");
+    const out = conn.send_buf[0..conn.send_len];
+    try expectContains(out, " NOTICE #room :sunny 25C, light breeze\r\n");
+    try assertNoInjectedWireLine(out);
+}
+
+// --- Exploit corpus (Part B / P2, §1A, CWE-20,190,770): the client wire parser
+// + dispatch seam driven through the real `processLine`. Locks in the confirmed
+// parser defenses as regressions AND exercises downstream dispatch on hostile
+// input. Invariant: a returned value OR a typed error, NEVER a panic; a parse
+// rejection writes ZERO bytes (no partial/forged reply).
+
+test "exploit: processLine rejects hostile lines with zero writes (fail-closed)" {
+    const reject = [_]struct { in: []const u8, want: anyerror }{
+        .{ .in = "PING :abc\nWHOIS kain", .want = error.EmbeddedLineBreak },
+        .{ .in = "PRIVMSG #c :a\x00b", .want = error.EmbeddedNul },
+        .{ .in = "PRIVMSG #c :a\r\nOPER x y", .want = error.EmbeddedLineBreak },
+        .{ .in = "CMD p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15", .want = error.TooManyParams },
+        .{ .in = "@t; PING x", .want = error.MalformedTags },
+        .{ .in = "", .want = error.EmptyLine },
+    };
+    for (reject) |c| {
+        var conn = ConnState.init(-1);
+        var storage: [8192]u8 = undefined;
+        var sink = TestSink{ .storage = &storage };
+        try std.testing.expectError(c.want, processLine(&conn, c.in, &sink));
+        // Fail-closed: a rejected line emits nothing at all.
+        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+    }
+}
+
+test "exploit: processLine survives adversarial-but-wellformed lines without panic" {
+    // Well-formed lines that stress the parser/dispatch bounds: a tag load at the
+    // cap, an unknown command, missing-param commands, IRCX PROP/METADATA/ACCESS
+    // parameter abuse, deep escapes. On a bare (unregistered) conn most reply with
+    // a numeric reject; the point is that NONE panic, OOB, or hang. (Under
+    // ReleaseSafe a real trap would fail this test.)
+    var tag_line: [4096]u8 = undefined;
+    {
+        var w: usize = 0;
+        tag_line[w] = '@';
+        w += 1;
+        for (0..64) |i| { // exactly MAXTAGS — the cap, not over it
+            if (i != 0) {
+                tag_line[w] = ';';
+                w += 1;
+            }
+            const seg = std.fmt.bufPrint(tag_line[w..], "k{d}=v", .{i}) catch unreachable;
+            w += seg.len;
+        }
+        const tail = " PING tok";
+        @memcpy(tag_line[w..][0..tail.len], tail);
+        w += tail.len;
+        var conn = ConnState.init(-1);
+        var storage: [8192]u8 = undefined;
+        var sink = TestSink{ .storage = &storage };
+        processLine(&conn, tag_line[0..w], &sink) catch {};
+    }
+    const survive = [_][]const u8{
+        "FOOBAR alpha beta", // unknown command
+        "NICK", // missing param
+        "USER", // missing params
+        "PROP", // IRCX PROP, no args
+        "PROP #chan", // PROP with target only
+        "PROP #chan OWNERKEY", // PROP get with no value
+        "METADATA", // no args
+        "METADATA * SET key", // metadata abuse: no value
+        "ACCESS", // IRCX ACCESS, no args
+        "ACCESS #chan ADD", // ACCESS with missing mask
+        "WHO", // no mask
+        "WHOIS", // no target
+        "JOIN", // no channel
+        "MODE #chan +ooooooooooo a b c d e f g h i j k", // param-heavy MODE
+        "PRIVMSG #c :\\s\\:\\r\\n\\\\ escaped-looking-but-literal",
+        ":spoofed!user@host PRIVMSG #c :prefix-spoof attempt",
+    };
+    for (survive) |line| {
+        var conn = ConnState.init(-1);
+        var storage: [8192]u8 = undefined;
+        var sink = TestSink{ .storage = &storage };
+        // A returned value or a typed error, never a panic/OOB (fail-closed).
+        processLine(&conn, line, &sink) catch {};
+    }
+}
+
+// --- Exploit corpus (Part B / P3, §1C, CWE-287,306): server-level auth bypass.
+// OPER is disabled (operator status is SASL-only, granted from an account's
+// [oper] binding), so the OPER command must NEVER elevate — no password, no
+// class, nothing a client sends can grant it. Asserts fail-closed non-elevation.
+
+test "exploit: OPER command grants no operator status (SASL-only elevation, fail-closed)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "attacker", null);
+    const conn = server.connFor(id).?;
+    try std.testing.expect(!conn.session.isOper());
+
+    // Every hostile OPER form: guessed creds, empty creds, extra params. None
+    // may flip is_oper — the handler refuses with ERR_NOOPERHOST.
+    const attempts = [_][]const u8{
+        "OPER admin hunter2",
+        "OPER root toor",
+        "OPER",
+        "OPER a b c d e",
+    };
+    for (attempts) |line| {
+        conn.send_len = 0;
+        var parsed = try irc_line.parseLine(line);
+        try server.handleOper(conn, &parsed);
+        try std.testing.expect(!conn.session.isOper());
+        try expectContains(conn.send_buf[0..conn.send_len], "OPER is disabled");
+    }
+    try std.testing.expect(!conn.session.isOper());
 }
 
 test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
