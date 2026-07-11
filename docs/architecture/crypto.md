@@ -20,15 +20,29 @@ and `std.crypto.dh.X25519` (`src/crypto/xwing.zig:15`, `src/crypto/xwing.zig:17`
 `src/crypto/tls_server.zig:31`), and MeshPass uses `std.crypto.sign.Ed25519`
 (`src/proto/meshpass.zig:9`).
 
-The deployed client TLS stance is modern-only for the daemon listener.
+The deployed client TLS stance is implicit TLS, with no STARTTLS.
 `main.zig` configures an implicit TLS port and states "No STARTTLS" explicitly
 (`src/main.zig:213`, `src/main.zig:216`). `server.Config` repeats the policy:
-the TLS listener wraps ordinary IRC clients in TLS 1.3 and is "no STARTTLS"
-(`src/daemon/server.zig:1037`, `src/daemon/server.zig:1038`). The TLS server
-state machine is scoped to TLS 1.3, X25519, Ed25519 leaf certificates, and
-AES-128-GCM / ChaCha20-Poly1305 (`src/crypto/tls_server.zig:1`,
-`src/crypto/tls_server.zig:6`, `src/crypto/tls_server.zig:7`,
-`src/crypto/tls_server.zig:8`). The source above is the authority for what is
+the TLS listener wraps ordinary IRC clients and is "no STARTTLS"
+(`src/daemon/server.zig:1037`, `src/daemon/server.zig:1038`). The preferred
+listener path is TLS 1.3; when a TLS 1.2 config is present, `TlsConn.initDual`
+routes non-1.3 ClientHello traffic into the hardened TLS 1.2 server
+(`src/daemon/tls_conn.zig:64`, `src/daemon/tls_conn.zig:69`,
+`src/daemon/tls_conn.zig:93`, `src/daemon/tls_conn.zig:96`). The TLS 1.3
+server supports X25519, secp256r1, and X25519MLKEM768 key shares,
+Ed25519/ECDSA-P256/RSA CertificateVerify keys, and
+AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305 suites
+(`src/crypto/tls_server.zig:119`, `src/crypto/tls_server.zig:127`,
+`src/crypto/tls_server.zig:131`, `src/crypto/tls_server.zig:135`,
+`src/crypto/tls_server.zig:361`, `src/crypto/tls_server.zig:363`,
+`src/crypto/tls_server.zig:1471`, `src/crypto/tls_server.zig:1499`).
+The TLS 1.2 fallback is intentionally fail-closed: TLS 1.2 only, null
+compression, secp256r1 ECDHE, ECDSA-P256/RSA authentication, and AEAD suites
+only; policy rejects RSA key exchange, CBC, RC4, export, NULL, TLS 1.0/1.1,
+compression, and renegotiation (`src/crypto/tls12_server.zig:4`,
+`src/crypto/tls12_server.zig:10`, `src/crypto/tls.zig:173`,
+`src/crypto/tls.zig:207`, `src/crypto/tls.zig:724`,
+`src/crypto/tls.zig:749`). The source above is the authority for what is
 implemented.
 
 ## Primitive inventory
@@ -38,7 +52,8 @@ implemented.
 | X-Wing KEM | ML-KEM-768 + X25519 hybrid KEM; public key is ML-KEM-768 public key plus X25519 public key; ciphertext is ML-KEM-768 ciphertext plus X25519 ephemeral public key; shared secret is SHA3-256 over `ss_M || ss_X || ct_X || pk_X || XWingLabel`. | `src/crypto/xwing.zig:1`, `src/crypto/xwing.zig:5`, `src/crypto/xwing.zig:6`, `src/crypto/xwing.zig:7`, `src/crypto/xwing.zig:129`, `src/crypto/xwing.zig:135` |
 | Ed25519 identity and signatures | Tsumugi node identity and signed prekeys use the local Ed25519 signing key; `SignedPrekey` embeds the node key and Ed25519 signature. | `src/crypto/tsumugi_handshake.zig:99`, `src/crypto/tsumugi_handshake.zig:101`, `src/crypto/tsumugi_handshake.zig:110`, `src/crypto/tsumugi_handshake.zig:136`, `src/crypto/tsumugi_handshake.zig:137` |
 | Tsumugi handshake payload AEAD | Handshake payloads are sealed/opened with ChaCha20-Poly1305. Keys are derived with HKDF-SHA256 over the X-Wing secret and a BLAKE3 salt over label/AAD. | `src/crypto/tsumugi_handshake.zig:17`, `src/crypto/tsumugi_handshake.zig:18`, `src/crypto/tsumugi_handshake.zig:467`, `src/crypto/tsumugi_handshake.zig:473`, `src/crypto/tsumugi_handshake.zig:474`, `src/crypto/tsumugi_handshake.zig:489`, `src/crypto/tsumugi_handshake.zig:495` |
-| TLS listener AEADs | TLS server supports `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`. | `src/crypto/tls_server.zig:71`, `src/crypto/tls_server.zig:72`, `src/crypto/tls_server.zig:73` |
+| TLS listener AEADs | TLS 1.3 server supports `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, and `TLS_CHACHA20_POLY1305_SHA256`; TLS 1.2 policy allows only ECDHE AEAD suites. | `src/crypto/tls_server.zig:361`, `src/crypto/tls_server.zig:363`, `src/crypto/tls_server.zig:407`, `src/crypto/tls_server.zig:411`, `src/crypto/tls.zig:173`, `src/crypto/tls.zig:207` |
+| Secret(T) | Fixed-size and runtime-length byte-secret wrappers require explicit `expose`/`declassify`, compare without data-dependent early exit, format as redacted, and wipe wrapped bytes. Compile-time checks reject non-byte wrappers or non-mutable storage for wipe. | `src/crypto/secret.zig:4`, `src/crypto/secret.zig:9`, `src/crypto/secret.zig:27`, `src/crypto/secret.zig:42`, `src/crypto/secret.zig:44`, `src/crypto/secret.zig:63`, `src/crypto/secret.zig:67`, `src/crypto/secret.zig:89`, `src/crypto/secret.zig:100`, `src/crypto/secret.zig:129` |
 | HPKE | Base mode DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305. | `src/crypto/hpke.zig:1`, `src/crypto/hpke.zig:9`, `src/crypto/hpke.zig:10`, `src/crypto/hpke.zig:11`, `src/crypto/hpke.zig:14`, `src/crypto/hpke.zig:15`, `src/crypto/hpke.zig:16` |
 | TreeKEM-style group root | MLS-like left-balanced tree; leaves are X25519 member keys and parent/path secrets use HKDF-SHA256. | `src/crypto/treekem.zig:1`, `src/crypto/treekem.zig:4`, `src/crypto/treekem.zig:5`, `src/crypto/treekem.zig:11`, `src/crypto/treekem.zig:12` |
 | Session reclaim | Canonical length-prefixed fields with trailing HMAC-SHA256 tag. | `src/proto/session_reclaim_mesh.zig:1`, `src/proto/session_reclaim_mesh.zig:8`, `src/proto/session_reclaim_mesh.zig:9`, `src/proto/session_reclaim_mesh.zig:19` |
@@ -312,6 +327,18 @@ Evidence: `src/crypto/tsumugi_handshake.zig:418`,
 `src/crypto/tsumugi_handshake.zig:439`, `src/crypto/tsumugi_handshake.zig:440`,
 `src/crypto/tsumugi_handshake.zig:441`.
 
+Tsumugi's established key hygiene is source-backed: `Established.deinit` wipes
+the root, send, and receive keys; `deriveEstablished` copies the derived raw
+directional keys into `Secret(T)` wrappers and secure-zeroes the raw stack
+arrays afterward; post-handshake record seal/open declassify directional keys
+into local stack arrays with `defer secureZero(&key)` before using
+ChaCha20-Poly1305. Nonces are directional bases plus per-record counters, so
+each sealed/opened record uses a unique nonce for that direction
+(`src/crypto/tsumugi_handshake.zig:104`, `src/crypto/tsumugi_handshake.zig:108`,
+`src/crypto/tsumugi_handshake.zig:190`, `src/crypto/tsumugi_handshake.zig:207`,
+`src/crypto/tsumugi_handshake.zig:566`, `src/crypto/tsumugi_handshake.zig:581`,
+`src/crypto/tsumugi_session.zig:77`, `src/crypto/tsumugi_session.zig:83`).
+
 `tsumugi_session.Session` stores the established state and bridges
 `peer_node_id` to `node_short_id.shortId(peer)` for S2S routing
 (`src/crypto/tsumugi_session.zig:1`, `src/crypto/tsumugi_session.zig:10`,
@@ -363,59 +390,128 @@ the CRDT repair substrate before requesting daemon resync
 `src/substrate/suimyaku/s2s_peer.zig:2134`,
 `src/substrate/suimyaku/s2s_peer.zig:2146`).
 
-## opssl TLS library and daemon use
+## Yoroi TLS library and daemon use
 
-In Orochi naming, "opssl" refers to the pure-Zig successor library in
-`src/crypto` and `src/proto/tls_*`; it is not the old C library. The user-facing
-ABOUT text names "opssl" as "a from-scratch pure-Zig TLS and primitive library"
-(`src/proto/server_about.zig:62`).
+Yoroi is the pure-Zig crypto and TLS surface in `src/crypto` and
+`src/proto/tls_*`; the daemon wires it directly for client TLS, ACME HTTPS, and
+secured S2S.
 
 ### TLS server
 
 | Topic | Current behavior | Source |
 | --- | --- | --- |
 | Listener type | Separate implicit-TLS client listener; no STARTTLS. | `src/main.zig:213`, `src/main.zig:216`, `src/daemon/server.zig:1037`, `src/daemon/server.zig:1038` |
-| Certificate material | Loads PEM/DER cert + PKCS#8 Ed25519 key when both paths are set; otherwise, if enabled, bootstraps a self-signed Ed25519 leaf for `dns_name`. | `src/daemon/tls_certs.zig:3`, `src/daemon/tls_certs.zig:5`, `src/daemon/tls_certs.zig:9`, `src/daemon/tls_certs.zig:71`, `src/daemon/tls_certs.zig:73`, `src/daemon/tls_certs.zig:93`, `src/daemon/tls_certs.zig:98`, `src/daemon/tls_certs.zig:101`, `src/daemon/tls_certs.zig:144`, `src/daemon/tls_certs.zig:148`, `src/daemon/tls_certs.zig:149` |
-| Server state machine | Socketless TLS 1.3 server state machine; caller feeds raw bytes and uses encrypt/decrypt after handshake. | `src/crypto/tls_server.zig:1`, `src/crypto/tls_server.zig:2`, `src/crypto/tls_server.zig:3`, `src/crypto/tls_server.zig:4` |
-| Key exchange | Server accepts TLS 1.3 and an X25519 key share; unsupported groups fail. | `src/crypto/tls_server.zig:404`, `src/crypto/tls_server.zig:410`, `src/crypto/tls_server.zig:415`, `src/crypto/tls_server.zig:426`, `src/crypto/tls_server.zig:427`, `src/crypto/tls_server.zig:430` |
-| CertificateVerify | Server signs `CertificateVerify` with Ed25519. | `src/crypto/tls_server.zig:533`, `src/crypto/tls_server.zig:534`, `src/crypto/tls_server.zig:536`, `src/crypto/tls_server.zig:540`, `src/crypto/tls_server.zig:542` |
-| mTLS | Optional `CertificateRequest`; advertises Ed25519 client cert signatures. Client cert possession is verified, but CertFP pinning does not require CA chain. | `src/crypto/tls_server.zig:57`, `src/crypto/tls_server.zig:58`, `src/crypto/tls_server.zig:59`, `src/crypto/tls_server.zig:60`, `src/crypto/tls_server.zig:61`, `src/crypto/tls_server.zig:488`, `src/crypto/tls_server.zig:489`, `src/crypto/tls_server.zig:497`, `src/crypto/tls_server.zig:302`, `src/crypto/tls_server.zig:307`, `src/crypto/tls_server.zig:315` |
-| CertFP | After TLS handshake, the daemon computes SHA-256 CertFP from the verified client leaf DER for SASL EXTERNAL. | `src/daemon/tls_conn.zig:93`, `src/daemon/tls_conn.zig:95`, `src/daemon/server.zig:3273`, `src/daemon/server.zig:3276`, `src/daemon/server.zig:3277`, `src/daemon/server.zig:3278` |
+| Certificate material | Loads PEM/DER leaf-first chains and Ed25519, ECDSA-P256, or RSA private keys when cert/key paths are set. If enabled without paths, bootstraps a self-signed Ed25519 leaf for TLS 1.3; the hardened TLS 1.2 bootstrap mints an ECDSA-P256 leaf. | `src/daemon/tls_certs.zig:4`, `src/daemon/tls_certs.zig:20`, `src/daemon/tls_certs.zig:85`, `src/daemon/tls_certs.zig:119`, `src/daemon/tls_certs.zig:121`, `src/daemon/tls_certs.zig:157`, `src/daemon/tls_certs.zig:160`, `src/daemon/tls_certs.zig:209`, `src/daemon/tls_certs.zig:240`, `src/daemon/tls_certs.zig:283`, `src/daemon/tls_certs.zig:286`, `src/daemon/tls_certs.zig:320`, `src/daemon/tls_certs.zig:323`, `src/daemon/tls_certs.zig:357` |
+| Server state machine | Socketless TLS 1.3 server state machine; `TlsConn` can route a first ClientHello to either TLS 1.3 or the optional hardened TLS 1.2 server. | `src/crypto/tls_server.zig:1`, `src/crypto/tls_server.zig:4`, `src/daemon/tls_conn.zig:82`, `src/daemon/tls_conn.zig:97` |
+| Key exchange | TLS 1.3 accepts X25519, secp256r1, and X25519MLKEM768 shares; if no usable share exists but a supported group was advertised, it sends HelloRetryRequest before failing. Selection prefers X25519, then secp256r1, then X25519MLKEM768. | `src/crypto/tls_server.zig:1471`, `src/crypto/tls_server.zig:1499`, `src/crypto/tls_server.zig:1594`, `src/crypto/tls_server.zig:1605`, `src/crypto/tls_server.zig:1662`, `src/crypto/tls_server.zig:1711` |
+| TLS 1.3 PQ hybrid | X25519MLKEM768 client share is `ml-kem_ek || x25519_pk`; the server encapsulates ML-KEM-768, does X25519 ECDH, emits `ml-kem_ct || x25519_pk`, and feeds the raw concatenation `mlkem_ss || x25519_ss` to the TLS key schedule. | `src/crypto/tls_server.zig:1662`, `src/crypto/tls_server.zig:1663`, `src/crypto/tls_server.zig:1682`, `src/crypto/tls_server.zig:1711` |
+| CertificateVerify | Server signs `CertificateVerify` with the active Ed25519, ECDSA-P256, RSA-PSS, or delegated-credential key. | `src/crypto/tls_server.zig:119`, `src/crypto/tls_server.zig:135`, `src/crypto/tls_server.zig:2127`, `src/crypto/tls_server.zig:2173` |
+| Hardened TLS 1.2 | Optional fallback is TLS 1.2 only, secp256r1 ECDHE, ECDSA-P256/RSA authentication, null compression, and AEAD suites; RSA key exchange, CBC/RC4/export/NULL suites, TLS 1.0/1.1, compression, and renegotiation are outside policy. | `src/crypto/tls12_server.zig:4`, `src/crypto/tls12_server.zig:10`, `src/crypto/tls12_server.zig:508`, `src/crypto/tls12_server.zig:528`, `src/crypto/tls12_server.zig:538`, `src/crypto/tls12_server.zig:646`, `src/crypto/tls.zig:173`, `src/crypto/tls.zig:207`, `src/crypto/tls.zig:724`, `src/crypto/tls.zig:749` |
+| mTLS | Optional `CertificateRequest` advertises Ed25519, ECDSA-P256, and RSA-PSS client cert signatures. Possession proof failure clears the captured client cert, but CertFP pinning does not require CA chain validation. | `src/crypto/tls_server.zig:486`, `src/crypto/tls_server.zig:497`, `src/crypto/tls_server.zig:1018`, `src/crypto/tls_server.zig:1052`, `src/crypto/tls_server.zig:1915`, `src/crypto/tls_server.zig:1945`, `src/crypto/tls_server.zig:2668`, `src/crypto/tls_server.zig:2674` |
+| CertFP | After TLS handshake, the daemon computes SHA-256 CertFP from the verified client leaf DER for SASL EXTERNAL. | `src/daemon/tls_conn.zig:246`, `src/daemon/tls_conn.zig:255`, `src/daemon/server.zig:7937`, `src/daemon/server.zig:7942` |
 | STS | Advertised only when `[sts]` is enabled and a TLS listener is live. | `src/main.zig:239`, `src/main.zig:241`, `src/main.zig:244`, `src/main.zig:245`, `src/main.zig:251`, `src/main.zig:258` |
 
 `src/daemon/tls_conn.zig` is the per-connection adapter that frames records
 before feeding the socketless TLS server. It buffers partial records, returns
 handshake flight ciphertext, exposes decrypted plaintext after handshake, and
-encrypts outbound application bytes (`src/daemon/tls_conn.zig:1`,
-`src/daemon/tls_conn.zig:7`, `src/daemon/tls_conn.zig:9`,
-`src/daemon/tls_conn.zig:15`, `src/daemon/tls_conn.zig:99`,
-`src/daemon/tls_conn.zig:101`, `src/daemon/tls_conn.zig:114`,
-`src/daemon/tls_conn.zig:115`, `src/daemon/tls_conn.zig:118`,
-`src/daemon/tls_conn.zig:123`, `src/daemon/tls_conn.zig:129`,
-`src/daemon/tls_conn.zig:134`, `src/daemon/tls_conn.zig:144`).
+encrypts outbound application bytes (`src/daemon/tls_conn.zig:267`,
+`src/daemon/tls_conn.zig:313`, `src/daemon/tls_conn.zig:382`,
+`src/daemon/tls_conn.zig:398`, `src/daemon/tls_conn.zig:408`,
+`src/daemon/tls_conn.zig:445`).
 `LinuxServer` creates the TLS listener only when it has a cert chain and signing
 key, instantiates `TlsConn` per accepted TLS connection, and routes decrypted
-bytes into the normal IRC parser (`src/daemon/server.zig:1487`,
-`src/daemon/server.zig:1490`, `src/daemon/server.zig:1494`,
-`src/daemon/server.zig:2421`, `src/daemon/server.zig:2423`,
-`src/daemon/server.zig:2424`, `src/daemon/server.zig:2427`,
-`src/daemon/server.zig:3263`, `src/daemon/server.zig:3268`,
-`src/daemon/server.zig:3287`, `src/daemon/server.zig:3288`).
+bytes into the normal IRC parser (`src/daemon/server.zig:3252`,
+`src/daemon/server.zig:3257`, `src/daemon/server.zig:3304`,
+`src/daemon/server.zig:3314`, `src/daemon/server.zig:6030`,
+`src/daemon/server.zig:6058`, `src/daemon/server.zig:7918`,
+`src/daemon/server.zig:7944`).
+
+TLS record handling keeps nonce and sequence uniqueness explicit. TLS 1.3
+derives each record nonce as `write_iv XOR (0^4 || seq)` and rejects malformed
+record headers, wrong outer content types, overflow, bad inner content types,
+and surplus/truncated ciphertext before returning plaintext. TLS 1.2 refuses
+sequence exhaustion, binds the sequence number into AEAD AAD, takes AES-GCM
+explicit nonces from the wire while keeping sequence-bound AAD, and uses
+sequence-derived ChaCha20-Poly1305 nonces (`src/crypto/tls_record.zig:176`,
+`src/crypto/tls_record.zig:185`, `src/crypto/tls_record.zig:196`,
+`src/crypto/tls_record.zig:207`, `src/crypto/tls_record.zig:233`,
+`src/crypto/tls_record.zig:313`, `src/crypto/tls12.zig:376`,
+`src/crypto/tls12.zig:486`).
+
+TLS 1.3 HKDF helpers implement RFC 8446 HKDF-Expand-Label, derive early,
+handshake, master, traffic, exporter, and Finished secrets over typed
+`Secret(T)` material. The generic AEAD layer exposes fixed-size key/nonce/tag
+types, maps auth failure to an explicit error, and provides counter nonces that
+refuse to wrap before reuse (`src/crypto/hkdf_tls13.zig:4`,
+`src/crypto/hkdf_tls13.zig:9`, `src/crypto/hkdf_tls13.zig:67`,
+`src/crypto/hkdf_tls13.zig:208`, `src/crypto/aead.zig:4`,
+`src/crypto/aead.zig:19`, `src/crypto/aead.zig:24`,
+`src/crypto/aead.zig:42`, `src/crypto/aead.zig:66`,
+`src/crypto/aead.zig:119`, `src/crypto/aead.zig:130`,
+`src/crypto/aead.zig:213`).
+
+Linux kTLS support is TLS 1.3-only in the daemon adapter. `ktls.zig` encodes
+kernel `crypto_info` for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305,
+probes the TLS ULP, and attaches TX/RX via `setsockopt`. `TlsConn` only exports
+kTLS state for completed TLS 1.3 sessions; TLS 1.2 returns
+`KtlsUnsupportedEngine`, and RX KeyUpdate re-installs the kernel RX key or
+closes fail-safe on error (`src/daemon/ktls.zig:37`,
+`src/daemon/ktls.zig:59`, `src/daemon/ktls.zig:71`,
+`src/daemon/ktls.zig:112`, `src/daemon/ktls.zig:144`,
+`src/daemon/ktls.zig:198`, `src/daemon/ktls.zig:220`,
+`src/daemon/ktls.zig:247`, `src/daemon/ktls.zig:261`,
+`src/daemon/ktls.zig:295`, `src/daemon/tls_conn.zig:122`,
+`src/daemon/tls_conn.zig:158`, `src/daemon/tls_conn.zig:161`,
+`src/daemon/tls_conn.zig:209`).
+
+### X.509, OCSP, SCT, and CRL parsing
+
+Yoroi's X.509/DER reader is deliberately minimal and fail-closed: it refuses
+empty, oversized, over-depth, truncated, trailing, non-canonical, indefinite,
+unsupported, or structurally invalid DER before higher layers consume
+certificate fields. Extension parsing requires each extension to be a DER
+sequence with OID, optional boolean, OCTET STRING value, and no trailing bytes;
+AIA OCSP and TLS Feature must-staple are parsed from those strict extension
+values (`src/crypto/x509.zig:4`, `src/crypto/x509.zig:8`,
+`src/crypto/x509.zig:20`, `src/crypto/x509.zig:49`,
+`src/crypto/x509.zig:123`, `src/crypto/x509.zig:201`,
+`src/crypto/x509.zig:947`, `src/crypto/x509.zig:1019`).
+
+OCSP staples parse and verify fail-closed at the security boundary: a servable
+staple must parse as successful, verify directly or through an authorized
+delegated responder, match the requested serial with status `good`, carry
+`nextUpdate`, and be within freshness bounds. OCSP-delivered SCTs are accepted
+as the third CT source by mining the SCT extension from `SingleResponse`
+extensions; malformed SCT extension DER returns a typed error rather than
+falling through (`src/crypto/ocsp.zig:132`, `src/crypto/ocsp.zig:172`,
+`src/crypto/ocsp.zig:197`, `src/crypto/ocsp.zig:224`,
+`src/crypto/ocsp.zig:232`, `src/crypto/ocsp.zig:267`,
+`src/crypto/ocsp.zig:901`, `src/crypto/ocsp.zig:927`,
+`src/crypto/sct.zig:267`, `src/crypto/sct.zig:331`,
+`src/crypto/sct.zig:671`, `src/crypto/sct.zig:740`).
+
+CRL parsing is strict and allocation-free, but the documented default policy is
+soft-fail for unreachable or unauthenticated CRL fetches. A definitive revoked
+serial from an authenticated, current CRL is fail-closed, and a CRL signature
+that does not verify under the issuing CA is discarded and never trusted
+(`src/crypto/crl.zig:4`, `src/crypto/crl.zig:36`, `src/crypto/crl.zig:92`,
+`src/crypto/crl.zig:130`, `src/crypto/crl.zig:175`,
+`src/crypto/crl.zig:208`, `src/crypto/crl.zig:279`,
+`src/crypto/crl.zig:304`).
 
 ### TLS client and protocol codecs
 
 `src/crypto/tls_client.zig` is a socketless TLS 1.3 client used by ACME/HTTPS
-code. It offers TLS 1.3, SNI, X25519 and P-256 shares, and signature algorithms
-including RSA-PSS, ECDSA P-256/P-384, Ed25519, and RSA-PKCS1-SHA256
-(`src/crypto/tls_client.zig:1`, `src/crypto/tls_client.zig:3`,
-`src/crypto/tls_client.zig:82`, `src/crypto/tls_client.zig:121`,
-`src/crypto/tls_client.zig:122`, `src/crypto/tls_client.zig:123`,
-`src/crypto/tls_client.zig:425`, `src/crypto/tls_client.zig:430`,
-`src/crypto/tls_client.zig:434`, `src/crypto/tls_client.zig:438`,
-`src/crypto/tls_client.zig:442`, `src/crypto/tls_client.zig:448`,
-`src/crypto/tls_client.zig:449`, `src/crypto/tls_client.zig:450`). The live
-ACME runner uses this client for HTTPS and explicitly states no OpenSSL, no
-certbot, no external processes (`src/daemon/acme_runner.zig:1`,
+code. It offers TLS 1.3, SNI, X25519MLKEM768, X25519, and P-256 shares, and
+signature algorithms including RSA-PSS, ECDSA P-256/P-384, Ed25519, and
+RSA-PKCS1-SHA256 (`src/crypto/tls_client.zig:1`,
+`src/crypto/tls_client.zig:4`, `src/crypto/tls_client.zig:945`,
+`src/crypto/tls_client.zig:957`, `src/crypto/tls_client.zig:1249`,
+`src/crypto/tls_client.zig:1275`, `src/crypto/tls_client.zig:1489`,
+`src/crypto/tls_client.zig:1501`, `src/crypto/tls_client.zig:1509`,
+`src/crypto/tls_client.zig:1546`). The live
+ACME runner uses this client for HTTPS and explicitly states that it does not
+shell out to external TLS or certificate-management tools (`src/daemon/acme_runner.zig:1`,
 `src/daemon/acme_runner.zig:9`, `src/daemon/acme_runner.zig:10`,
 `src/daemon/acme_runner.zig:11`, `src/daemon/acme_runner.zig:121`,
 `src/daemon/acme_runner.zig:124`).
@@ -426,8 +522,8 @@ structures. Examples:
 | Codec | Role | Source |
 | --- | --- | --- |
 | `tls_extension.zig` | Zero-allocation extension-list envelope codec; contents parsed by sibling modules. | `src/proto/tls_extension.zig:1`, `src/proto/tls_extension.zig:3`, `src/proto/tls_extension.zig:9`, `src/proto/tls_extension.zig:14` |
-| `tls_keyshare.zig` | TLS 1.3 key_share inner codec. Defines X25519 and X25519MLKEM768 group ids; the TLS server selects either — classical X25519/secp256r1 when offered, or the X25519MLKEM768 PQ hybrid when a client (e.g. modern Chrome) offers only the PQ share (`tls_server.zig` performs the real X25519 ECDH + ML-KEM decapsulation for the hybrid). | `src/proto/tls_keyshare.zig:1`, `src/proto/tls_keyshare.zig:7`, `src/proto/tls_keyshare.zig:12`, `src/proto/tls_keyshare.zig:42`, `src/proto/tls_keyshare.zig:45`, `src/crypto/tls_server.zig` (`x25519mlkem768` group selection) |
-| `tls_signature_scheme.zig` | SignatureAlgorithms codec including Ed25519. | `src/proto/tls_signature_scheme.zig:1`, `src/proto/tls_signature_scheme.zig:26`, `src/proto/tls_signature_scheme.zig:32` |
+| `tls_keyshare.zig` | TLS 1.3 key_share inner codec. Defines X25519, secp256r1, and X25519MLKEM768 group ids; the TLS server selects classical X25519/secp256r1 when offered, or the X25519MLKEM768 PQ hybrid when only that usable share is available. | `src/proto/tls_keyshare.zig:41`, `src/proto/tls_keyshare.zig:49`, `src/crypto/tls_server.zig:1471`, `src/crypto/tls_server.zig:1499`, `src/crypto/tls_server.zig:1662`, `src/crypto/tls_server.zig:1711` |
+| `tls_signature_scheme.zig` | SignatureAlgorithms codec including Ed25519, ECDSA P-256/P-384, RSA-PSS, and RSA-PKCS1-SHA256. | `src/proto/tls_signature_scheme.zig:29`, `src/proto/tls_signature_scheme.zig:44` |
 | `tls_finished.zig` | TLS 1.3 Finished MAC using HKDF-Expand-Label and HMAC over transcript hash. | `src/proto/tls_finished.zig:1`, `src/proto/tls_finished.zig:4`, `src/proto/tls_finished.zig:6`, `src/proto/tls_finished.zig:7`, `src/proto/tls_finished.zig:10`, `src/proto/tls_finished.zig:13` |
 | `tls_key_update.zig` | KeyUpdate codec plus `"traffic upd"` application-secret ratchet helper. | `src/proto/tls_key_update.zig:1`, `src/proto/tls_key_update.zig:4`, `src/proto/tls_key_update.zig:5`, `src/proto/tls_key_update.zig:10`, `src/proto/tls_key_update.zig:91` |
 | `tls_session_ticket.zig` / `tls_psk.zig` | NewSessionTicket and PSK extension codecs. Presence of codecs does not mean early data is wired into daemon policy. | `src/proto/tls_session_ticket.zig:1`, `src/proto/tls_session_ticket.zig:3`, `src/proto/tls_psk.zig:1`, `src/proto/tls_psk.zig:3` |
@@ -692,9 +788,11 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 | --- | --- |
 | Do not claim STARTTLS support. | The daemon's TLS is implicit only; `dispatch.zig` notes STARTTLS is "deliberately never implement[ed]". |
 | Do not claim `secure_channel.zig` is live S2S wiring. | Its own header comment says live wiring waits on Tsumugi and the module is transport-agnostic. |
+| Do not claim `Secret(T)` makes all secret-dependent branches impossible by itself. | `Secret(T)` enforces explicit exposure/declassification, redacted formatting, constant-time equality, byte-wrapper checks, and wipes, but exposed/declassified bytes can still be branched on by ordinary code (`src/crypto/secret.zig:27`, `src/crypto/secret.zig:63`, `src/crypto/secret.zig:100`, `src/crypto/secret.zig:129`). |
+| Do not claim TLS 1.3 or TLS 1.2 `sealRecord`/`openRecord` stack key copies are currently secure-zeroed. | The current TLS record helpers copy AEAD keys into local arrays/values without a matching `defer secureZero(&key)`: TLS 1.3 server seal/open copies at `src/crypto/tls_server.zig:2899`, `src/crypto/tls_server.zig:2905`, `src/crypto/tls_server.zig:2911`, `src/crypto/tls_server.zig:2930`, `src/crypto/tls_server.zig:2935`, `src/crypto/tls_server.zig:2940`; TLS 1.2 seal/open copies at `src/crypto/tls12.zig:405`, `src/crypto/tls12.zig:412`, `src/crypto/tls12.zig:419`, `src/crypto/tls12.zig:464`, `src/crypto/tls12.zig:471`, `src/crypto/tls12.zig:478`. |
 
 The following former guardrails are now OBSOLETE — the capabilities they cautioned against ARE implemented as of this writing, so claiming them is correct:
 
-- **TLS server PQ/hybrid groups:** `tls_server.zig` selects `x25519mlkem768` and performs the real X25519 ECDH + ML-KEM decapsulation when a client offers the hybrid share (the modern-Chrome PQ-only path).
+- **TLS server PQ/hybrid groups:** `tls_server.zig` selects `x25519mlkem768` and performs the real X25519 ECDH + ML-KEM decapsulation when a client offers the hybrid share.
 - **`secured_s2s_link` encrypts CRDT frames:** a Post-AKE AEAD record layer (ChaCha20-Poly1305) seals every byte with the Tsumugi `Established` `send_key`/`recv_key` and opens with per-record counters.
 - **MeshPass enforced by the Tsumugi responder:** M1 carries admission bytes encrypted. Configured signer roots require a signed token bound to the peer node key and S2S frame-family capabilities; otherwise the responder constant-time-compares the shared-secret fallback.
