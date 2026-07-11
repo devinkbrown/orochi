@@ -978,6 +978,7 @@ pub const Server = struct {
             &ticket_nonce,
             self.config.now_unix_seconds * 1000,
             0, // no 0-RTT in TLS 1.2
+            0, // ticket_age_add: unused (no 0-RTT freshness window in TLS 1.2)
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // sealTicket only rejects oversized inputs, which cannot occur with

@@ -426,6 +426,12 @@ pub const Client = struct {
     /// Set when ServerHello is processed: whether the server accepted ECH. Null
     /// until then, or when ECH was never offered.
     ech_accepted: ?bool = null,
+    /// Owned `retry_configs` ECHConfigList (draft-ietf-tls-esni §7.1) the server
+    /// delivered in EncryptedExtensions when it could NOT decrypt our ECH. Only
+    /// captured when we offered ECH and the server rejected it — the EE (and thus
+    /// the retry_configs) is then authenticated by the public_name certificate, so
+    /// the caller may safely adopt these for the NEXT connection. Null otherwise.
+    ech_retry_configs: ?[]u8 = null,
 
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
@@ -674,6 +680,7 @@ pub const Client = struct {
         if (self.ech_config_list) |e| self.allocator.free(e);
         if (self.ech_public_name) |p| self.allocator.free(p);
         if (self.ech_inner_hello) |h| self.allocator.free(h);
+        if (self.ech_retry_configs) |r| self.allocator.free(r);
         freeCtLogs(self.allocator, self.ct_logs);
         self.* = undefined;
     }
@@ -773,6 +780,16 @@ pub const Client = struct {
     /// ECH was never offered.
     pub fn echAccepted(self: *const Client) ?bool {
         return self.ech_accepted;
+    }
+
+    /// The `retry_configs` ECHConfigList the server offered after rejecting our
+    /// ECH (draft-ietf-tls-esni §7.1), or null if none. Present only when ECH was
+    /// offered AND rejected — the bytes are authenticated by the public_name
+    /// certificate this handshake validated. A caller may persist them and pass
+    /// them as `ech_config_list` on the next connection to recover from a stale
+    /// config. Borrowed from the client; copy before `deinit`.
+    pub fn echRetryConfigs(self: *const Client) ?[]const u8 {
+        return self.ech_retry_configs;
     }
 
     /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
@@ -2032,6 +2049,20 @@ pub const Client = struct {
         var it = tls_extension.Iterator.init(extensions);
         var server_accepted_early = false;
         while (try it.next()) |ext| {
+            // draft-ietf-tls-esni §7.1: the server delivers retry_configs in the
+            // `encrypted_client_hello` EE extension when it could not decrypt our
+            // ECH. Capture it ONLY when we offered ECH and it was rejected — the EE
+            // is then authenticated by the public_name cert, so these bytes are
+            // trustworthy. A server MUST NOT send it otherwise; if it does while we
+            // never offered ECH we ignore it (a non-ECH client tolerates it rather
+            // than treating it as unsolicited). Not applied this connection; the
+            // caller may adopt it on the next.
+            if (ext.ext_type == ech.extension_type) {
+                if (self.ech_active and !(self.ech_accepted orelse false) and self.ech_retry_configs == null) {
+                    self.ech_retry_configs = try self.allocator.dupe(u8, ext.data);
+                }
+                continue;
+            }
             switch (ext.typed()) {
                 .alpn => {
                     var names = try tls_alpn.Iterator.fromBlock(ext.data);

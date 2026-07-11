@@ -183,6 +183,17 @@ pub const Config = struct {
     /// data is not accepted). The caller owns it and must serialize access if it
     /// is shared across threads. Null keeps the prior no-anti-replay behavior.
     replay_guard: ?*tls_resumption.ReplayGuard = null,
+    /// RFC 8446 §8.2–8.3 0-RTT freshness-window tolerance, in milliseconds. On a
+    /// 0-RTT attempt the server un-obfuscates the client's `obfuscated_ticket_age`
+    /// with the ticket's sealed `ticket_age_add` and compares it against its own
+    /// measured elapsed time since the ticket was issued; if the two differ by
+    /// more than this many ms in EITHER direction, early_data is refused (the
+    /// handshake still resumes at 1-RTT). This is the multi-node age-window replay
+    /// defense the single-process binder ring cannot provide. The check runs only
+    /// when a clock (`now_unix_seconds`) is set AND the ticket is v3 (carries an
+    /// age_add); legacy v1/v2 tickets skip it (degrading to prior behavior). The
+    /// default 10 s absorbs ordinary client/server clock skew and RTT.
+    early_data_age_skew_ms: u32 = 10_000,
     /// SNI-based additional certificates (RFC 6066). When a ClientHello's
     /// `server_name` matches an entry, the server presents that entry's chain and
     /// signs CertificateVerify with its key (and staples its OCSP response)
@@ -226,6 +237,16 @@ pub const Config = struct {
     /// any ECH extension is ignored and the handshake proceeds with the
     /// ClientHelloOuter (public_name), fail-safe. Validated at `init`.
     ech_keys: []const EchKey = &.{},
+    /// draft-ietf-tls-esni §7.1 `retry_configs`: the current published
+    /// ECHConfigList to hand a client whose ECH we could not decrypt, so it can
+    /// recover from a stale config on its next connection. Delivered in
+    /// EncryptedExtensions (authenticated by the public_name certificate) whenever
+    /// ECH keys are configured AND this handshake did not accept ECH. When empty
+    /// (the default) NO retry_configs is emitted, so a server with `ech_keys` but
+    /// no explicit retry list stays byte-identical to the pre-feature wire. Set it
+    /// to the same ECHConfigList published in DNS (typically one `ech_keys` entry's
+    /// `.config`). BORROWED; must outlive the `Server`.
+    ech_retry_config_list: []const u8 = &.{},
 };
 
 /// A pre-minted RFC 9345 delegated credential the server may present. All parts
@@ -475,6 +496,12 @@ pub const Server = struct {
     /// PSK binder of the accepted resumption (for the 0-RTT anti-replay check).
     accepted_binder: [tls_resumption.max_binder_len]u8 = undefined,
     accepted_binder_len: usize = 0,
+    /// RFC 8446 §8.2–8.3: false when the accepted PSK's reported
+    /// `obfuscated_ticket_age` fell OUTSIDE the freshness window. It only gates
+    /// early_data (a stale-age resumption still completes at 1-RTT). Defaults
+    /// true — no clock, a legacy v1/v2 ticket, or an in-window age all leave it
+    /// true, so the check never regresses tickets that predate it.
+    accepted_age_within_window: bool = true,
     legacy_session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
 
@@ -584,6 +611,13 @@ pub const Server = struct {
     /// stamp (§7.2). Stays false when ECH is off / absent / unopenable ⇒ the wire
     /// is byte-identical to a non-ECH handshake.
     ech_accepted: bool = false,
+    /// True once the ClientHello actually carried an OUTER `encrypted_client_hello`
+    /// extension (whether or not we could open it). draft-ietf-tls-esni §7.1
+    /// permits retry_configs in EncryptedExtensions only in RESPONSE to an ECH
+    /// offer; sending it to a peer that never offered ECH is an unsolicited
+    /// extension a compliant client MUST abort on (RFC 8446 §4.2). Latched in
+    /// `maybeOpenEch` from `locateOuterEch`, independent of open success.
+    ech_offered: bool = false,
     /// ClientHelloInner.random — the acceptance confirmation's HKDF IKM. Valid
     /// only when `ech_accepted`. Public transcript material (it rides inside the
     /// reconstructed inner ClientHello), zeroed on deinit for hygiene.
@@ -1375,6 +1409,10 @@ pub const Server = struct {
     fn maybeOpenEch(self: *Server, outer_body: []const u8) Allocator.Error!?[]u8 {
         if (self.config.ech_keys.len == 0) return null; // ECH off ⇒ byte-identical
         const found = locateOuterEch(outer_body) orelse return null;
+        // The client offered ECH (found an OUTER ech extension) — record it even if
+        // we cannot open it below, so retry_configs is sent ONLY in response to an
+        // offer (draft §7.1), never unsolicited to a plain client.
+        self.ech_offered = true;
         if (found.enc.len != hpke.enc_len) return null; // our KEM (X25519) enc = 32
         var enc: hpke.Enc = undefined;
         @memcpy(&enc, found.enc);
@@ -1604,6 +1642,7 @@ pub const Server = struct {
         self.early_data_done = !offered_early_data;
         self.accepted_early_data_limit = 0;
         self.accepted_psk_len = 0;
+        self.accepted_age_within_window = true;
 
         // HelloRetryRequest (RFC 8446 §4.1.4): if the client offered no key_share
         // we can use but DID advertise a group we support, ask it to retry with
@@ -1657,16 +1696,25 @@ pub const Server = struct {
                     self.selected_suite = suite;
                     self.resumed = true;
                     // Accept 0-RTT only when the limit is non-zero AND this PSK
-                    // binder has not been seen before (anti-replay). A replay
-                    // still resumes via 1-RTT; only its early data is refused.
-                    const replay_ok = if (self.config.replay_guard) |g|
-                        g.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len])
-                    else
-                        true;
-                    if (offered_early_data and self.accepted_early_data_limit > 0 and replay_ok) {
-                        self.early_data_accepted = true;
-                        self.early_data_done = false;
-                        try self.deriveClientEarlyTrafficKeys();
+                    // binder has not been seen before (anti-replay) AND the
+                    // reported ticket age is inside the §8.2–8.3 freshness window
+                    // (`accepted_age_within_window`, set in tryAcceptPsk). Any of
+                    // these failing still resumes via 1-RTT; only early data is
+                    // refused. The replay check runs LAST (after the window) so a
+                    // stale-age attempt does not consume a binder-ring slot.
+                    if (offered_early_data and
+                        self.accepted_early_data_limit > 0 and
+                        self.accepted_age_within_window)
+                    {
+                        const replay_ok = if (self.config.replay_guard) |g|
+                            g.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len])
+                        else
+                            true;
+                        if (replay_ok) {
+                            self.early_data_accepted = true;
+                            self.early_data_done = false;
+                            try self.deriveClientEarlyTrafficKeys();
+                        }
                     }
                 }
             }
@@ -1750,6 +1798,17 @@ pub const Server = struct {
                 if (now_s < issued_s) return null;
                 if (now_s - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return null;
             }
+            // RFC 8446 §8.2–8.3 0-RTT freshness window. Un-obfuscate the client's
+            // reported age with the ticket's sealed age_add and compare it to the
+            // server's own measured elapsed time. Runs only for a v3 ticket
+            // (age_add present) with a real issue time; a mismatch beyond the skew
+            // window refuses early_data (still resumes 1-RTT). Gated separately
+            // from the lifetime check because it only affects 0-RTT, not resumption.
+            self.accepted_age_within_window = self.ticketAgeWithinWindow(
+                opened.opened,
+                identity.obfuscated_ticket_age,
+                now_s,
+            );
         }
 
         const binder_list_offset = tls_psk.binderListOffset(psk_ext) catch return null;
@@ -1764,6 +1823,40 @@ pub const Server = struct {
         @memcpy(self.accepted_binder[0..binder.len], binder);
         self.accepted_binder_len = binder.len;
         return suite;
+    }
+
+    /// RFC 8446 §8.2–8.3: decide whether a 0-RTT attempt's reported ticket age is
+    /// fresh. `reported_age_ms = (obfuscated_ticket_age − ticket_age_add) mod 2^32`
+    /// (the client's own elapsed-since-receipt estimate); the server's own
+    /// estimate is `now − issue_time`. If the two differ by more than
+    /// `early_data_age_skew_ms` in either direction the attempt is not fresh and
+    /// early_data must be refused. All arithmetic on public wire values (not
+    /// secret), so ordinary branching is fine.
+    ///
+    /// Returns TRUE (fresh, permit 0-RTT) for the legacy/degrade cases: a v1/v2
+    /// ticket with no sealed age_add, or a ticket with no real issue time — those
+    /// simply keep today's binder-ring-only behavior rather than failing closed on
+    /// data the ticket cannot carry.
+    fn ticketAgeWithinWindow(
+        self: *Server,
+        opened: tls_resumption.OpenedTicket,
+        obfuscated_ticket_age: u32,
+        now_s: i64,
+    ) bool {
+        const age_add = opened.ticket_age_add orelse return true; // legacy v1/v2
+        if (opened.issued_unix_ms == 0) return true; // no real issue time sealed
+        // Client-reported elapsed time since it received the ticket (wraps mod 2^32).
+        const reported_age_ms: u32 = obfuscated_ticket_age -% age_add;
+        // Server-measured elapsed time since issuance, in ms. now_s ≥ issued (the
+        // lifetime check above already rejected a future ticket) so this is ≥ 0.
+        const issued_ms = opened.issued_unix_ms;
+        const now_ms: i64 = now_s * 1000;
+        const server_age_ms: i64 = now_ms - issued_ms;
+        if (server_age_ms < 0) return false; // defensive: future ticket ⇒ not fresh
+        // |reported − server| ≤ skew. Compute in i64 to avoid unsigned underflow.
+        const diff: i64 = @as(i64, reported_age_ms) - server_age_ms;
+        const abs_diff: i64 = if (diff < 0) -diff else diff;
+        return abs_diff <= @as(i64, self.config.early_data_age_skew_ms);
     }
 
     fn verifyPskBinder(self: *Server, suite: CipherSuite, psk: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
@@ -1892,8 +1985,13 @@ pub const Server = struct {
     }
 
     fn writeEncryptedExtensions(self: *Server, out: *std.ArrayList(u8)) Error!void {
-        var ext_storage: [256]u8 = undefined;
-        var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+        // Heap-size the extensions buffer: the fixed EE set fits in 256 bytes, but
+        // an optional ECH retry_configs list (§7.1) can be arbitrarily large, so
+        // the buffer grows with it (+ the extension header + slack).
+        const ext_cap: usize = 256 + self.config.ech_retry_config_list.len + tls_extension.header_len;
+        const ext_storage = try self.allocator.alloc(u8, ext_cap);
+        defer self.allocator.free(ext_storage);
+        var ext_builder = try tls_extension.Builder.begin(ext_storage);
         if (self.selected_alpn) |proto| {
             var alpn_buf: [260]u8 = undefined;
             var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
@@ -1910,6 +2008,16 @@ pub const Server = struct {
             );
         }
         if (self.early_data_accepted) try ext_builder.addTyped(.early_data, "");
+        // draft-ietf-tls-esni §7.1: when the client OFFERED ECH but we did NOT
+        // accept it (stale config_id or an open failure — fail-safe to the
+        // ClientHelloOuter), hand back retry_configs so the client can refresh its
+        // config next time. Gated on `ech_offered` so a plain, non-ECH client
+        // never receives this unsolicited extension (which it MUST abort on, RFC
+        // 8446 §4.2). Authenticated by the public_name cert we present. Empty list
+        // ⇒ nothing emitted (byte-identical).
+        if (self.ech_offered and !self.ech_accepted and self.config.ech_retry_config_list.len != 0) {
+            try ext_builder.add(ech.extension_type, self.config.ech_retry_config_list);
+        }
         // RFC 8449 §4: advertise the max TLSInnerPlaintext we accept (full-size
         // records — our recv path handles them), but ONLY as a response to the
         // client's own `record_size_limit` offer. RFC 8446 §4.2 forbids sending
@@ -2400,6 +2508,10 @@ pub const Server = struct {
             &ticket_nonce,
             if (self.config.now_unix_seconds) |s| s * 1000 else 0,
             self.config.max_early_data_size,
+            // Seal the SAME ticket_age_add the NewSessionTicket advertises so any
+            // node holding the ticket key can later un-obfuscate the client's
+            // reported obfuscated_ticket_age for the §8.2–8.3 freshness window.
+            ticket_age_add,
         );
         defer self.allocator.free(sealed);
 
@@ -3437,6 +3549,189 @@ test "loopback: ECH with an unknown config_id falls back to the ClientHelloOuter
     const got_c = try client.decrypt(s2c);
     defer alloc.free(got_c);
     try std.testing.expectEqualStrings("fell back", got_c);
+}
+
+test "loopback: ECH rejection delivers retry_configs the client captures (draft §7.1)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5A)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5A, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{ "irc.test", "cover.example" },
+        .is_ca = true,
+    });
+
+    // Client offers ECH under config_id 7; server holds config_id 9 → ECH cannot
+    // be opened, so the server falls back AND (with a retry list configured)
+    // advertises retry_configs in EncryptedExtensions.
+    const client_hpke = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x2A)));
+    var client_list_buf: [600]u8 = undefined;
+    const client_list = buildEchConfigList(&client_list_buf, 7, &client_hpke.public_key, "cover.example", 64);
+
+    const server_hpke = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x2B)));
+    var server_list_buf: [600]u8 = undefined;
+    const server_list = buildEchConfigList(&server_list_buf, 9, &server_hpke.public_key, "cover.example", 64);
+    const ech_keys = [_]EchKey{.{ .config = server_list, .private_key = server_hpke.secret_key }};
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ech_keys = &ech_keys,
+        .ech_retry_config_list = server_list, // publish the current config as retry
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{der},
+        .ech_config_list = client_list,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expect(!server.ech_accepted);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expectEqual(@as(?bool, false), client.echAccepted());
+    // The client captured the retry_configs the server advertised, byte-for-byte.
+    const retry = client.echRetryConfigs() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, server_list, retry);
+
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+}
+
+test "loopback: a non-ECH client against a retry-configured server is not treated as an ECH offer" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5C)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5C, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    const hpke_kp = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x2D)));
+    var list_buf: [600]u8 = undefined;
+    const ech_list = buildEchConfigList(&list_buf, 7, &hpke_kp.public_key, "cover.example", 64);
+    const ech_keys = [_]EchKey{.{ .config = ech_list, .private_key = hpke_kp.secret_key }};
+
+    // Server has ECH keys AND a retry list, but the client offers NO ECH. The
+    // server MUST NOT set ech_offered and MUST NOT emit an unsolicited
+    // retry_configs (which a compliant peer would abort on, RFC 8446 §4.2).
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ech_keys = &ech_keys,
+        .ech_retry_config_list = ech_list,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try std.testing.expect(!client.echOffered());
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    // The load-bearing gate: no ECH offer was seen, so retry_configs is suppressed.
+    try std.testing.expect(!server.ech_offered);
+    try std.testing.expect(!server.ech_accepted);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    // A non-ECH client never captures a retry list.
+    try std.testing.expectEqual(@as(?[]const u8, null), client.echRetryConfigs());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+}
+
+test "loopback: an accepted ECH handshake exposes no retry_configs" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5B)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5B, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{ "irc.test", "cover.example" },
+        .is_ca = true,
+    });
+
+    const hpke_kp = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x2C)));
+    var list_buf: [600]u8 = undefined;
+    const ech_list = buildEchConfigList(&list_buf, 7, &hpke_kp.public_key, "cover.example", 64);
+    const ech_keys = [_]EchKey{.{ .config = ech_list, .private_key = hpke_kp.secret_key }};
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ech_keys = &ech_keys,
+        .ech_retry_config_list = ech_list,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{der},
+        .ech_config_list = ech_list,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expect(server.ech_accepted);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expectEqual(@as(?bool, true), client.echAccepted());
+    // ECH accepted ⇒ no retry needed, and the server emits none.
+    try std.testing.expectEqual(@as(?[]const u8, null), client.echRetryConfigs());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
 }
 
 test "init rejects an ech_keys entry whose private key mismatches the ECHConfig" {
@@ -4538,6 +4833,191 @@ test "loopback: an expired resumption ticket is rejected (lifetime enforced)" {
     };
     defer alloc.free(rsflight);
     try std.testing.expect(!resumed_server.acceptedSessionTicket());
+}
+
+/// Shared harness for the RFC 8446 §8.2–8.3 freshness-window tests: issue a
+/// 0-RTT-capable ticket at `issue_now_s`, then resume against a server whose
+/// clock is `resume_now_s`, with the client reporting `client_age_ms` elapsed.
+/// Returns whether the resuming server accepted early data (it always resumes at
+/// 1-RTT; only 0-RTT is gated). `skew_ms` sets the server's tolerance.
+fn runFreshnessWindowCase(
+    alloc: std.mem.Allocator,
+    issue_now_s: i64,
+    resume_now_s: i64,
+    client_age_ms: u64,
+    skew_ms: u32,
+) !bool {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xD5)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xD5, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = issue_now_s,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, client_age_ms);
+    try resumed_client.setEarlyData("hello 0-RTT");
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+
+    var resume_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = resume_now_s,
+        .ticket_lifetime_seconds = 86_400,
+        .early_data_age_skew_ms = skew_ms,
+    });
+    defer resume_server.deinit();
+    const flight = switch (try resume_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    // Every case must still RESUME (PSK accepted) — only 0-RTT is gated.
+    try std.testing.expect(resume_server.acceptedSessionTicket());
+    return resume_server.earlyDataAccepted();
+}
+
+test "0-RTT freshness window: in-window age is accepted" {
+    const alloc = std.testing.allocator;
+    const t0: i64 = 1_704_067_200;
+    // Ticket issued at t0; resumed 5 s later; client reports 5 s elapsed → diff 0.
+    try std.testing.expect(try runFreshnessWindowCase(alloc, t0, t0 + 5, 5_000, 10_000));
+}
+
+test "0-RTT freshness window: a reported age far below the measured elapsed is refused" {
+    const alloc = std.testing.allocator;
+    const t0: i64 = 1_704_067_200;
+    // Server measures 100 s elapsed; the client claims only 5 s (clock skew /
+    // captured-and-held replay). diff 95 s ≫ 10 s window → early data refused.
+    try std.testing.expect(!try runFreshnessWindowCase(alloc, t0, t0 + 100, 5_000, 10_000));
+}
+
+test "0-RTT freshness window: a reported age far above the measured elapsed is refused" {
+    const alloc = std.testing.allocator;
+    const t0: i64 = 1_704_067_200;
+    // Server measures 5 s elapsed; the client claims 100 s. diff 95 s → refused.
+    try std.testing.expect(!try runFreshnessWindowCase(alloc, t0, t0 + 5, 100_000, 10_000));
+}
+
+test "0-RTT freshness window: exactly at the skew boundary is accepted, one ms past is refused" {
+    const alloc = std.testing.allocator;
+    const t0: i64 = 1_704_067_200;
+    // Server measures 5000 ms; client claims 15000 ms → diff exactly 10000 = skew.
+    try std.testing.expect(try runFreshnessWindowCase(alloc, t0, t0 + 5, 15_000, 10_000));
+    // One ms further out → refused.
+    try std.testing.expect(!try runFreshnessWindowCase(alloc, t0, t0 + 5, 15_001, 10_000));
+}
+
+test "0-RTT freshness window: no server clock skips the check (back-compatible)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xD6)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xD6, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    // A wildly wrong reported age; with no server clock the window is not applied.
+    try resumed_client.setSessionTicket(stored, 999_999_999);
+    try resumed_client.setEarlyData("hello");
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    var resume_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+    });
+    defer resume_server.deinit();
+    const flight = switch (try resume_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    try std.testing.expect(resume_server.acceptedSessionTicket());
+    try std.testing.expect(resume_server.earlyDataAccepted());
 }
 
 test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refused" {

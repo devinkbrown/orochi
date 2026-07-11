@@ -57,7 +57,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | 0-RTT accept: early keys, byte cap, EndOfEarlyData required | IMPLEMENTED | `tls_server.zig:2435–2468` (cap vs `max_early_data_size`, EOED exact-match), gated on non-zero sealed limit `:1661` (test `:4620`) | §4.2.10 |
 | 0-RTT reject path: trial-skip of early records | IMPLEMENTED | `tls_server.zig:893–894` + `:944–947` (undecryptable records skipped only when early data was offered-and-rejected) | §4.2.10 |
 | 0-RTT anti-replay: single-use binder guard | IMPLEMENTED | `tls_resumption.zig:71–108` (bounded ring, shared, locked), wired `tls_server.zig:1656–1659`; replay test `:4528` | §8.1 |
-| 0-RTT anti-replay: obfuscated_ticket_age freshness window | **MISSING — top follow-up** | `identity.obfuscated_ticket_age` (parsed, `tls_psk.zig:37`) is never checked; the sealed ticket (`tls_resumption.zig:136–155`) does not carry `ticket_age_add`, so the check needs a v3 ticket format (add age_add; keep v2/v1 decode arms). The binder ring makes single-process replay safe; the age window is the RFC's *global*/multi-node mitigation | §8.2–8.3 |
+| 0-RTT anti-replay: obfuscated_ticket_age freshness window | IMPLEMENTED **[fixed here]** | sealed ticket bumped to **v3** carrying `ticket_age_add` (`tls_resumption.zig` `sealed_magic=3`, `OpenedTicket.ticket_age_add`, legacy v1/v2 decode arms + `sealLegacyV2` cross-version test); server un-obfuscates the client's `obfuscated_ticket_age` and enforces `|reported − measured| ≤ early_data_age_skew_ms` (`tls_server.zig` `ticketAgeWithinWindow` + `accepted_age_within_window`, gated in the 0-RTT accept before the binder ring). Fail-open only for legacy tickets / no clock. Tests: in-window accept, too-old/too-new reject, skew boundary ±1 ms, no-clock back-compat. The binder ring covers single-process; this window is the multi-node/global mitigation | §8.2–8.3 |
 | Rejected-early-data skip bound | PARTIAL | `skipRejectedEarlyRecords` `tls_server.zig:2470–2483` skips without a byte cap (memory stays bounded per feed; CPU/window unbounded). LOW-MEDIUM; daemon conn limits mitigate | §4.2.10 |
 | Client 0-RTT send + accept detection | IMPLEMENTED | `setEarlyData` `tls_client.zig:824`, EE `early_data` ack validated (only if offered AND PSK accepted) `:2016–2019`, `earlyDataAccepted` `:837` | §4.2.10 |
 
@@ -69,7 +69,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | supported_groups / key_share: x25519, secp256r1, X25519MLKEM768 | IMPLEMENTED | server select `tls_server.zig:1491–1501`, `:1671–1721`; client build `tls_client.zig:1510–1530` | §4.2.7–4.2.8 |
 | X25519MLKEM768 (0x11EC): ML-KEM-768 first, raw concat to key schedule | IMPLEMENTED | server encaps `tls_server.zig:1691–1720`; client decaps `tls_client.zig:1980–1998`; loopback test `tls_server.zig:3606`; compliance brief `docs/research/pq-kem-compliance.md` | draft-ietf-tls-ecdhe-mlkem |
 | signature_algorithms (Ed25519, ECDSA-P256, RSA-PSS) | IMPLEMENTED | client `tls_client.zig:1496–1501`; server CertVerify verify paths `tls_server.zig:1034–1055` | §4.2.3 |
-| signature_algorithms_cert | MISSING | not emitted/parsed anywhere (grep-clean). LOW — chain-signature filtering falls back to signature_algorithms per spec | §4.2.3 |
+| signature_algorithms_cert | MISSING (deliberate follow-up) | still not emitted/parsed. Evaluated with this change and DEFERRED rather than half-implemented: emitting it always-on changes the ClientHello wire for every peer, and honoring it (constraining chain-signature acceptance) is an interop-risking behavior change with LOW value — RFC 8446 §4.2.3 makes fall-back to signature_algorithms fully compliant | §4.2.3 |
 | SNI (RFC 6066) + per-SNI cert selection, pinned at CH1 | IMPLEMENTED | `tls_server.zig:1579–1585` (`selectSniCert`, digest-pinned across HRR; test `:5176`) | RFC 6066; §4.1.2 |
 | ALPN | IMPLEMENTED | server select `tls_server.zig:1503`, `maybeSelectAlpn` `:1787`; client validates the echo is one it offered, single entry `tls_client.zig:2002–2015` | RFC 7301 |
 | OCSP stapling (status_request, staple in leaf CertificateEntry) | IMPLEMENTED | server `tls_server.zig:1504`, `:3664` test; client parses + status decision `tls_client.zig:2110`, `:3953` test | RFC 6066/8446 §4.4.2.1 |
@@ -77,7 +77,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | Certificate compression (RFC 8879, zlib, bomb-guarded) | IMPLEMENTED | client `tls_client.zig:2061–2070` (+unsolicited fatal `:1874`); server `tls_server.zig:1505–1508`; loopback `:5403` | RFC 8879 |
 | Raw public keys (RFC 7250), server + client cert types | IMPLEMENTED | negotiation `tls_server.zig:1509–1533`; client EE validation (unsolicited fatal) `tls_client.zig:2032–2042`; byte-identical-off test `:5588` | RFC 7250 |
 | Delegated credentials (RFC 9345) | IMPLEMENTED | client verify chain (`:4610+` tests: window, scheme pinning, tamper, no-clock reject); server presents-when-accepted `tls_server.zig:1552–1563`; byte-identical-off `:3946` | RFC 9345 |
-| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; ECH+HRR unsupported → clean refusal `tls_client.zig:1727–1730` (fail-closed); no `ech_outer_extensions` compression `:1149–1153`; retry_configs handling not present | draft-ietf-tls-esni |
+| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; **retry_configs now IMPLEMENTED [fixed here]** — server emits its published ECHConfigList in EE on ECH-not-accepted (`Config.ech_retry_config_list`, `writeEncryptedExtensions`, byte-identical when unset), client captures it only on offer+reject (`ech_retry_configs` / `echRetryConfigs()`, authenticated by the public_name cert), tests: rejection-delivers-retry + accepted-exposes-none; ECH+HRR re-seal still unsupported → clean refusal `tls_client.zig:1734` (fail-closed, remaining follow-up); no `ech_outer_extensions` compression | draft-ietf-tls-esni |
 | Certificate / CertificateVerify (server auth, all three key types) | IMPLEMENTED | client verify `tls_client.zig:2072+` (chain cap 16 `:2104`, exact context strings), CRL/OCSP/CT hooks | §4.4.2–4.4.3 |
 | certificate_request / mTLS (client Certificate, CV, possession proof) | IMPLEMENTED | server `writeCertificateRequest` `tls_server.zig:1251`, client-cert verify `:1023–1063` (failed proof clears the captured fingerprint); client `validateCertificateRequest` `tls_client.zig:4265` test | §4.3.2, §4.4.2.4 |
 | Post-handshake client auth (post_handshake_auth ext) | MISSING (deliberate) | never advertised; a post-handshake CertificateRequest is now fatal on the client **[fixed here]** — correct per §4.6.2 when not advertised | §4.6.2 |
@@ -88,12 +88,12 @@ hardening fixes landed with it — marked **[fixed here]**).
 
 ## 5. Gap ranking (security value, high→low)
 
-1. **0-RTT obfuscated_ticket_age freshness window (§8.2–8.3) — MISSING.** Needs a v3
-   sealed-ticket format carrying `ticket_age_add` (keep v2/v1 decode arms + cross-version
-   tests), then gate `early_data_accepted` on |client_age − server_age| ≤ window. The binder
-   replay ring covers the single-process case; the age window is the defense that scales
-   across processes/nodes and bounds the replay window generally. Deliberately NOT
-   half-implemented here (ticket-format change ⇒ its own reviewed change + rollout thought).
+1. ~~**0-RTT obfuscated_ticket_age freshness window (§8.2–8.3)**~~ — **DONE (fixed here).**
+   Sealed ticket bumped to v3 carrying `ticket_age_add` (v1/v2 legacy decode arms +
+   cross-version test); `early_data` gated on |client_age − server_age| ≤
+   `early_data_age_skew_ms` (default 10 s) via `ticketAgeWithinWindow`. Fail-open only for
+   legacy tickets / no clock. The binder ring covers single-process; the age window is the
+   multi-node/global mitigation.
 2. ~~Client HRR→SH suite pinning (§4.1.4 MUST)~~ — **fixed here**.
 3. ~~Client SH key_share group ∈ offered shares (§4.2.8 MUST)~~ — **fixed here**.
 4. ~~Fail-open post-handshake message handling (both roles)~~ — **fixed here** (zero-length
@@ -103,11 +103,14 @@ hardening fixes landed with it — marked **[fixed here]**).
    the client's.
 6. Rejected-early-data skip and KeyUpdate processing are unbounded (CPU, not memory).
    LOW-MEDIUM; candidate caps: skip ≤ `max_early_data_size`+slack bytes, KeyUpdates ≤ N/min.
-7. ECH retry_configs + ECH×HRR re-seal; `ech_outer_extensions` compression. Feature gaps in
-   a draft extension; current behavior is fail-safe/fail-closed respectively.
+7. ECH: retry_configs **DONE (fixed here)** — server advertises its ECHConfigList in EE on
+   ECH-not-accepted, client captures it (public_name-authenticated). ECH×HRR re-seal and
+   `ech_outer_extensions` compression remain follow-ups; current behavior is fail-closed
+   (ECH+HRR is cleanly refused) / fail-safe respectively.
 8. Cookie length interop bound (client echoes ≤512 B; spec allows 2^16−1) and no
    server-side stateless-HRR cookie. LOW (stateful HRR is compliant).
-9. `signature_algorithms_cert` absent. LOW.
+9. `signature_algorithms_cert` absent — evaluated and DEFERRED here (always-on wire change +
+   interop-risking enforcement for LOW value; sig_algs fall-back is spec-compliant). LOW.
 10. Seq `+= 1` lacks a typed exhaustion error (2^64 unreachable). Document-only.
 11. Client does not emit a middlebox-compat CCS. Interop-only note, not security.
 
@@ -128,4 +131,46 @@ hardening fixes landed with it — marked **[fixed here]**).
   instead of always reading the first message's header (previously safe only because
   `parseHandshake` re-bounds-checks; now correct by construction).
 
-Gate: `zig build test-tls` green; `zig fmt --check src/` clean.
+## 7. Follow-ups landed (this pass — tests first, all green)
+
+- **0-RTT obfuscated_ticket_age freshness window (§8.2–8.3)** — the #1 gap.
+  `tls_resumption.zig`: sealed-ticket format bumped to **v3** carrying `ticket_age_add`
+  (`OpenedTicket.ticket_age_add: ?u32`); v1/v2 tickets still open via legacy decode arms
+  and simply skip the window (graceful degrade — proven by `sealLegacyV2` +
+  `legacy v2 ticket opens with a null ticket_age_add`). `tls_server.zig`:
+  `ticketAgeWithinWindow` un-obfuscates the client's reported age with the sealed
+  `ticket_age_add`, compares to the server-measured `now − issue_time`, and refuses
+  `early_data` (still resuming at 1-RTT) when the delta exceeds `Config.early_data_age_skew_ms`
+  (default 10 s); `accepted_age_within_window` gates 0-RTT acceptance BEFORE the binder ring
+  so a stale attempt consumes no ring slot. NST now seals the SAME `ticket_age_add` it
+  advertises. Tests: in-window accept, reported-far-below / far-above reject, exact-skew ±1 ms
+  boundary, and no-clock back-compat.
+- **ECH retry_configs (draft-ietf-tls-esni §7.1)** — server emits its published ECHConfigList
+  (`Config.ech_retry_config_list`) in EncryptedExtensions only when the client actually OFFERED
+  ECH (`ech_offered` latched in `maybeOpenEch` from `locateOuterEch`) and ECH was NOT accepted;
+  gating on `ech_offered` avoids sending an unsolicited extension to a plain client (which a
+  compliant peer aborts on, RFC 8446 §4.2). Byte-identical when the retry list is unset; the
+  EE-sized buffer grows with the list. Client captures it (`ech_retry_configs` /
+  `echRetryConfigs()`) only when it offered ECH and the server rejected — i.e. authenticated by
+  the public_name cert — and never applies it this connection. Tests:
+  `ECH rejection delivers retry_configs the client captures`, `an accepted ECH handshake
+  exposes no retry_configs`, and `a non-ECH client … is not treated as an ECH offer`.
+
+Deferred (documented above, NOT half-implemented): ECH×HRR re-seal (ECH+HRR stays a clean
+fail-closed refusal), `ech_outer_extensions` compression, and `signature_algorithms_cert`.
+
+## 8. External-peer interop status (BoGo)
+
+The external BoringSSL BoGo runner (`tools/bogo.sh`) requires `go` + a network fetch of a
+pinned BoringSSL; **`go` is not installed in the current environment, so the external runner
+could not be executed here** (network + `cmake` are present). The in-repo self-contained proof
+`zig build bogo-shim-test` (which drives `tools/bogo_shim.zig` through captured scenarios) was
+run and is **green**, alongside the full `zig build test-tls` (which includes the HRR suite-pin,
+key_share-group validation, post-handshake fail-closed, and the new 0-RTT-window / ECH-retry
+tests). `tools/bogo/config.json` was intentionally left unchanged: this pass added no new
+BoGo-drivable feature (0-RTT `*EarlyData*` and `*ECH*` remain shim-undriven and disabled, and
+the freshness-window change is server-internal), so no expected-failure/allowlist entry
+legitimately needed to move. Running the full external BoGo suite on a host with `go` remains
+the honest missing interop leg.
+
+Gate: `zig build test-tls` green; `zig build bogo-shim-test` green; `zig fmt --check src/` clean.
