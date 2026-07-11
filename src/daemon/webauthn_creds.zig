@@ -97,6 +97,25 @@ pub fn validCredIdB64(s: []const u8) bool {
     return true;
 }
 
+/// Whether a user-supplied passkey label is safe to store durably and to
+/// reflect back onto the wire: in-bounds and free of control bytes (< 0x20,
+/// which covers CR/LF/NUL) and DEL (0x7f). High-bit bytes (UTF-8 continuation /
+/// multibyte) are allowed — labels are human-readable names. Empty is allowed
+/// (the label is optional).
+///
+/// This is the input-boundary guard: rejecting a control-laden label here keeps
+/// the durable store poison-free and means the `WEBAUTHN` LIST/RENAME EVENT
+/// reply never has to be silently dropped by the downstream Event-Spine render
+/// firewall. That firewall (`event_spine.unsafeTextByte`) remains the last line
+/// of defence against injection; this validator ensures nothing reaches it.
+pub fn validLabel(label: []const u8) bool {
+    if (label.len > max_label_bytes) return false;
+    for (label) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
 /// Build the props-family key for a credential record, or null if it will not
 /// fit. Caller must have validated `cred_id_b64` with `validCredIdB64`.
 pub fn credKey(buf: []u8, cred_id_b64: []const u8) ?[]const u8 {
@@ -319,6 +338,19 @@ test "validCredIdB64: accepts url-safe tokens, rejects padding/empty/alphabet" {
     try testing.expect(!validCredIdB64("abc\ndef")); // newline (list separator)
     var too_long: [max_cred_id_b64 + 1]u8 = @splat('A');
     try testing.expect(!validCredIdB64(&too_long));
+}
+
+test "validLabel: accepts printable/UTF-8, rejects control bytes + over-long" {
+    try testing.expect(validLabel("")); // optional
+    try testing.expect(validLabel("phone"));
+    try testing.expect(validLabel("Alice's YubiKey 5C")); // punctuation ok
+    try testing.expect(validLabel("passkey \xc3\xa9\xf0\x9f\x94\x91")); // UTF-8 (é + emoji)
+    try testing.expect(!validLabel("bad\r\nPRIVMSG")); // CR/LF smuggle
+    try testing.expect(!validLabel("nul\x00here")); // NUL
+    try testing.expect(!validLabel("tab\there")); // TAB (< 0x20)
+    try testing.expect(!validLabel("del\x7fhere")); // DEL
+    var too_long: [max_label_bytes + 1]u8 = @splat('a');
+    try testing.expect(!validLabel(&too_long));
 }
 
 test "record codec: round-trip" {

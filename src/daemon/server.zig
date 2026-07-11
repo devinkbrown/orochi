@@ -24400,6 +24400,8 @@ pub const LinuxServer = struct {
         const label = if (p.len >= 2) p[1] else "";
         if (label.len > webauthn_creds_mod.max_label_bytes)
             return self.failReply(conn, "WEBAUTHN", "LABEL_TOO_LONG", "Passkey label is too long");
+        if (!webauthn_creds_mod.validLabel(label))
+            return self.failReply(conn, "WEBAUTHN", "BAD_LABEL", "Passkey label contains control characters");
         var challenge: [webauthn_creds_mod.challenge_len]u8 = undefined;
         if (!self.webauthnChallenge(&challenge))
             return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
@@ -24738,6 +24740,8 @@ pub const LinuxServer = struct {
         const label = p[2];
         if (label.len > webauthn_creds_mod.max_label_bytes)
             return self.failReply(conn, "WEBAUTHN", "LABEL_TOO_LONG", "Passkey label is too long");
+        if (!webauthn_creds_mod.validLabel(label))
+            return self.failReply(conn, "WEBAUTHN", "BAD_LABEL", "Passkey label contains control characters");
         svc.webauthnRename(account, cred_id, label) catch |err| {
             const code: []const u8 = switch (err) {
                 error.Forbidden => "NOT_OWNED",
@@ -33802,6 +33806,211 @@ test "WEBAUTHN malformed base64 rejected without panic" {
     conn.send_len = 0;
     try server.handleWebauthn(conn, &rf);
     try expectContains(conn.send_buf[0..conn.send_len], "NO_PENDING");
+}
+
+// ── WEBAUTHN passkey-label exploit corpus ──────────────────────────────────
+//
+// The passkey label is user-controlled text that is stored durably (base64url,
+// so control bytes survive) and later reflected back to the caller on the
+// Event Spine (`WEBAUTHN CRED …`, `WEBAUTHN RENAMED …`). The attack class is
+// CWE-93 CRLF/command injection through a smuggled label, plus the robustness
+// gap of a control-laden label poisoning the durable record so LIST silently
+// drops that credential's line. These assert fail-closed: rejected at the
+// input boundary (BAD_LABEL), no poison stored, no forged wire line — and the
+// Event-Spine render firewall still holds as the last line of defence.
+
+/// Bind a throwaway ES256 passkey to `account` under `services`, returning the
+/// base64url credential id (borrowing `id_buf`). Keeps the exploit tests below
+/// focused on the label/ownership surface, not the full ceremony.
+fn waBindTestCred(
+    services: *services_mod.Services,
+    account: []const u8,
+    cred_id_raw: []const u8,
+    label: []const u8,
+    id_buf: []u8,
+) ![]const u8 {
+    const kp = WaEc.KeyPair.generate(std.testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    waBuildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const cred_id_b64 = try base64url.encode(id_buf, cred_id_raw);
+    try services.webauthnBind(account, cred_id_b64, &cose, 1, label, 1_700_000_000);
+    return cred_id_b64;
+}
+
+test "exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, no wire injection)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-rename.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+    var id_buf: [base64url.encodedLen("kain-key-01".len)]u8 = undefined;
+    const cred_id_b64 = try waBindTestCred(&services, "kain", "kain-key-01", "phone", &id_buf);
+
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(cid).?;
+
+    // A label carrying CR/LF and a forged trailing IRC command. The handler
+    // must reject it at the boundary — never store it, never render it.
+    conn.send_len = 0;
+    var lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    lv.params[0] = "RENAME";
+    lv.params[1] = cred_id_b64;
+    lv.params[2] = "pwn\r\nPRIVMSG #ops :hijacked-via-label";
+    lv.param_count = 3;
+    try server.handleWebauthn(conn, &lv);
+    const out = conn.send_buf[0..conn.send_len];
+
+    // Fail-closed: a clean BAD_LABEL reply, and NO forged command on the wire.
+    try expectContains(out, "BAD_LABEL");
+    try std.testing.expect(std.mem.indexOf(u8, out, "PRIVMSG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hijacked") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "RENAMED") == null);
+
+    // The durable label is UNCHANGED — no poison reached the store.
+    var cred: services_mod.Services.WebauthnCredential = .{};
+    try services.webauthnLookup(cred_id_b64, &cred);
+    try std.testing.expectEqualStrings("phone", cred.label());
+}
+
+test "exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a challenge" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-register.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(cid).?;
+    try std.testing.expect(conn.webauthn_pending.kind == .none);
+
+    conn.send_len = 0;
+    var lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    lv.params[0] = "REGISTER";
+    lv.params[1] = "nul\x00and\x0anewline";
+    lv.param_count = 2;
+    try server.handleWebauthn(conn, &lv);
+
+    try expectContains(conn.send_buf[0..conn.send_len], "BAD_LABEL");
+    // Fail-closed: no challenge was minted, so a follow-up FINISH has nothing.
+    try std.testing.expect(conn.webauthn_pending.kind == .none);
+}
+
+test "exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownership gate)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-owner.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("mallory", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("kain", "hunter2 hunter2 hunter2 xy", &scratch);
+    var id_buf: [base64url.encodedLen("mallory-key-01".len)]u8 = undefined;
+    const victim_cred = try waBindTestCred(&services, "mallory", "mallory-key-01", "mallory-key", &id_buf);
+
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // The attacker is logged in as kain and targets mallory's credential id.
+    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(cid).?;
+
+    conn.send_len = 0;
+    var lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    lv.params[0] = "RENAME";
+    lv.params[1] = victim_cred;
+    lv.params[2] = "stolen";
+    lv.param_count = 3;
+    try server.handleWebauthn(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "NOT_OWNED");
+
+    // Mallory's label is untouched — no cross-account write.
+    var cred: services_mod.Services.WebauthnCredential = .{};
+    try services.webauthnLookup(victim_cred, &cred);
+    try std.testing.expectEqualStrings("mallory-key", cred.label());
+}
+
+test "exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firewall, last line of defence)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-firewall.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(cid).?;
+
+    // Even if a future caller forgot the input-boundary guard and handed a body
+    // with embedded CR/LF straight to webauthnReply, the Event-Spine renderer
+    // must refuse it — nothing is appended to the connection.
+    conn.send_len = 0;
+    try server.webauthnReply(conn, "RENAMED x :evil\r\nPRIVMSG #ops :forged");
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+
+    // A control-free body still renders as a normal EVENT line (guard is not
+    // over-broad — it drops only the hostile input).
+    conn.send_len = 0;
+    try server.webauthnReply(conn, "STATUS :0 passkey(s) registered");
+    try expectContains(conn.send_buf[0..conn.send_len], " EVENT kain WEBAUTHN STATUS :0 passkey(s) registered");
 }
 
 test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {

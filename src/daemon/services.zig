@@ -654,7 +654,7 @@ pub const Services = struct {
     ) ServiceError!void {
         if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.InvalidValue;
         if (cose_key.len == 0 or cose_key.len > webauthn_creds.max_cose_key_bytes) return error.InvalidValue;
-        if (label.len > webauthn_creds.max_label_bytes) return error.InvalidValue;
+        if (!webauthn_creds.validLabel(label)) return error.InvalidValue;
         const key = try accountKey(account); // validates + lowercases
 
         self.lock.lockExclusive();
@@ -744,7 +744,7 @@ pub const Services = struct {
     /// or an over-long label. Every other record field is preserved verbatim.
     pub fn webauthnRename(self: *Services, account: []const u8, cred_id_b64: []const u8, label: []const u8) ServiceError!void {
         if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.InvalidValue;
-        if (label.len > webauthn_creds.max_label_bytes) return error.InvalidValue;
+        if (!webauthn_creds.validLabel(label)) return error.InvalidValue;
         const key = try accountKey(account); // validates + lowercases
 
         self.lock.lockExclusive();
