@@ -2525,6 +2525,22 @@ pub const Services = struct {
         }) catch {};
     }
 
+    /// Fail-closed authentication gate: whether `account` must be denied every
+    /// credential path because it is SUSPENDED or FORBIDDEN. This is the shared
+    /// chokepoint the SASL success path consults so SCRAM / OAUTHBEARER — whose
+    /// proof/token verification never consults account status — cannot bind a
+    /// locked account. Fail-closed: an account whose status cannot be decoded
+    /// reads as blocked. An unknown/unregistered name that carries no forbid
+    /// reservation is not blocked (guests and unknown authcids pass).
+    pub fn accountAuthBlocked(self: *Services, account: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        // A decode failure on the suspend check is treated as blocked.
+        const suspended = self.accountSuspendedUnlocked(account) catch return true;
+        if (suspended) return true;
+        return self.accountForbiddenUnlocked(account);
+    }
+
     fn accountSuspendedUnlocked(self: *Services, account: []const u8) ServiceError!bool {
         const key = try accountKey(account);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse return false;
@@ -3825,6 +3841,44 @@ test "forbidden account is locked out of every login path" {
     _ = try services.setAccountForbidden("alice", false, &scratch);
     _ = try services.identifyAccount("alice", "correct horse battery staple");
     try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
+}
+
+test "accountAuthBlocked gates the SASL success chokepoint on suspend and forbid" {
+    // The shared fail-closed predicate consulted at SASL success so that SCRAM /
+    // OAUTHBEARER (whose proof/token verification never consults account status)
+    // cannot bind a SUSPENDED or FORBIDDEN account. Mirrors the FORBID lockout
+    // test above, but targets the status accessor the chokepoint reuses.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-authblocked.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    // A healthy registered account is not blocked.
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+    // An account that does not exist is not blocked (guest/unknown authcid).
+    try std.testing.expect(!services.accountAuthBlocked("nobody"));
+
+    // SUSPEND blocks; UNSUSPEND restores.
+    _ = try services.setAccountSuspended("alice", true, &scratch);
+    try std.testing.expect(services.accountAuthBlocked("alice"));
+    _ = try services.setAccountSuspended("alice", false, &scratch);
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+
+    // FORBID blocks; UNFORBID restores.
+    _ = try services.setAccountForbidden("alice", true, &scratch);
+    try std.testing.expect(services.accountAuthBlocked("alice"));
+    _ = try services.setAccountForbidden("alice", false, &scratch);
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+
+    // A FORBID reservation on a never-registered name still blocks (the loser of
+    // a nick forbid must not slip through a credential path either).
+    _ = try services.setAccountForbidden("ghostname", true, &scratch);
+    try std.testing.expect(services.accountAuthBlocked("ghostname"));
 }
 
 test "setAccount refuses password-holder lifecycle flag changes" {

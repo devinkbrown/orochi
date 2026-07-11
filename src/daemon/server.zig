@@ -7718,6 +7718,10 @@ pub const LinuxServer = struct {
         // TOTP second-factor gate: lets the SASL completion path refuse a
         // knowledge-factor login (PLAIN/SCRAM) for a 2FA-active account.
         conn.session.sasl_totp_gate = .{ .ptr = self, .activeFn = totpGateActive };
+        // Account-status gate: refuses a SUSPENDED or FORBIDDEN account at SASL
+        // success even when the mechanism verified (closes the SCRAM/OAUTHBEARER
+        // status-bypass on the CAP AUTHENTICATE path).
+        conn.session.sasl_account_gate = .{ .ptr = self, .blockedFn = accountStatusGateBlocked };
         // SCRAM (both digests) needs a per-connection server nonce. Generate it
         // once if either SCRAM lookup is configured, then attach whichever
         // lookups are present so SCRAM-SHA-256 and SCRAM-SHA-512 share the nonce.
@@ -15499,6 +15503,18 @@ pub const LinuxServer = struct {
         return self.totpRequired(account);
     }
 
+    /// `sasl.AccountStatusGate` adapter: lets the SASL completion path (which
+    /// holds only the session) refuse a SUSPENDED or FORBIDDEN account through an
+    /// installed fat pointer. This is the chokepoint that closes the SCRAM /
+    /// OAUTHBEARER bypass — their verifiers never consult account status. When no
+    /// account store is present, no registered account can exist to succeed, so
+    /// "not blocked" is safe.
+    fn accountStatusGateBlocked(ptr: *anyopaque, account: []const u8) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ptr));
+        const svc = self.account_services orelse return false;
+        return svc.accountAuthBlocked(account);
+    }
+
     /// Whether `account` has ACTIVE TOTP 2FA, ensuring the secret is loaded into
     /// the live store (lazily restoring a persisted secret after a restart) so a
     /// subsequent `self.totp.verify` can check a code with the replay guard. Use
@@ -20719,6 +20735,21 @@ pub const LinuxServer = struct {
             self.noticeTo(conn, "Two-factor authentication required: log in with IDENTIFY <account> <password> <code>") catch {};
             try self.ircxAuthFailed(conn, package.token());
             return;
+        }
+
+        // Account-status chokepoint (IRCX AUTH): a SUSPENDED or FORBIDDEN account
+        // must never bind, even though the mechanism verified — a SCRAM proof /
+        // OAUTHBEARER token never consults account status. Same failure surface
+        // as a bad credential (no enumeration of suspended vs forbidden).
+        if (!result.guest) {
+            if (self.account_services) |svc| {
+                if (svc.accountAuthBlocked(account)) {
+                    conn.session.sasl_router = null;
+                    conn.session.sasl_pending = null;
+                    try self.ircxAuthFailed(conn, package.token());
+                    return;
+                }
+            }
         }
 
         var final_buf: [sasl_mechrouter.MAX_B64_MESSAGE]u8 = undefined;

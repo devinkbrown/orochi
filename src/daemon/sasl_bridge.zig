@@ -290,6 +290,55 @@ test "SCRAM-SHA-256 exchange rejects the wrong password for a registered account
     try std.testing.expect(!ok);
 }
 
+test "SASL SCRAM proof stays valid but the account gate blocks a suspended or forbidden account" {
+    // Regression for the SCRAM flag-gate bypass: the SCRAM proof verifies purely
+    // from the stored key material, so a SUSPENDED or FORBIDDEN account still
+    // produces a valid proof. The SASL success chokepoint must refuse the login
+    // by consulting `accountAuthBlocked` — this test proves the proof/gate split.
+    const OroStore = services_mod.OroStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram-gate.wal");
+    defer store.deinit();
+
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+
+    var services = Services.init(&store, null);
+    services.attachScramStore(&scram);
+    var scratch: [768]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    var bridge = ServicesScramLookup{ .scram = &scram };
+    const lookup = bridge.lookup();
+    const credential = lookup.lookup("alice") orelse return error.MissingCredential;
+
+    // Baseline: correct proof verifies AND the account is not blocked -> login.
+    try std.testing.expect(try runScramExchange(std.testing.allocator, credential, "alice", "correct horse battery staple"));
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+
+    // SUSPEND: the SCRAM proof is STILL valid (the material is unchanged), but the
+    // gate must now block the success -> login denied.
+    _ = try services.setAccountSuspended("alice", true, &scratch);
+    const cred_suspended = bridge.lookup().lookup("alice") orelse return error.MissingCredential;
+    try std.testing.expect(try runScramExchange(std.testing.allocator, cred_suspended, "alice", "correct horse battery staple"));
+    try std.testing.expect(services.accountAuthBlocked("alice"));
+
+    // UNSUSPEND: gate clears -> login allowed again.
+    _ = try services.setAccountSuspended("alice", false, &scratch);
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+
+    // FORBID: proof still valid, gate blocks.
+    _ = try services.setAccountForbidden("alice", true, &scratch);
+    const cred_forbidden = bridge.lookup().lookup("alice") orelse return error.MissingCredential;
+    try std.testing.expect(try runScramExchange(std.testing.allocator, cred_forbidden, "alice", "correct horse battery staple"));
+    try std.testing.expect(services.accountAuthBlocked("alice"));
+
+    // UNFORBID: login allowed again.
+    _ = try services.setAccountForbidden("alice", false, &scratch);
+    try std.testing.expect(!services.accountAuthBlocked("alice"));
+}
+
 test "bridge lookup returns null for an unregistered account" {
     // Arrange
     var scram = ScramStore.init(std.testing.allocator);

@@ -835,6 +835,12 @@ pub const ClientSession = struct {
     /// factor SASL success (PLAIN/SCRAM) for a 2FA-active account is refused —
     /// the user must complete the second factor via IDENTIFY.
     sasl_totp_gate: ?sasl.TotpGate = null,
+    /// Injected account-status gate: reports whether the just-authenticated
+    /// account is SUSPENDED or FORBIDDEN. Consulted at SASL success for every
+    /// non-guest mechanism so SCRAM / OAUTHBEARER cannot bind a locked account —
+    /// their verifiers never consult account status. Null = no gate (e.g. no
+    /// account store, where a registered account cannot exist to succeed anyway).
+    sasl_account_gate: ?sasl.AccountStatusGate = null,
     /// Config gate for SASL ANONYMOUS. Default false.
     sasl_allow_anonymous: bool = false,
     /// Effective maximum decoded SASL message bytes for this session. The router
@@ -1913,6 +1919,15 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             if (result.guest) {
                 ctx.session.loginGuest(account);
             } else {
+                // Account-status chokepoint: a SUSPENDED or FORBIDDEN account must
+                // never bind, even though the mechanism's own verification passed
+                // (a SCRAM proof verifies from stored key material alone; an
+                // OAUTHBEARER token from the IdP — neither consults account
+                // status). Same failure surface as a bad credential, so suspended
+                // vs forbidden vs bad-cred are indistinguishable (no enumeration).
+                if (ctx.session.sasl_account_gate) |gate| {
+                    if (gate.blocked(account)) return saslFail(ctx, "SASL authentication failed");
+                }
                 // TOTP second factor: a knowledge-factor SASL success (PLAIN/
                 // SCRAM) for a 2FA-active account is refused here — SASL carries
                 // no second factor, so the user must complete 2FA via IDENTIFY.
@@ -3068,6 +3083,130 @@ test "sasl SCRAM-SHA-256 full handshake through the router logs in" {
     const fl = try fd.calcSizeForSlice(written2[s2..e2]);
     try fd.decode(final_raw[0..fl], written2[s2..e2]);
     _ = try scram_server.parseServerFinal(final_raw[0..fl]);
+}
+
+const TestAccountGate = struct {
+    blocked: bool,
+
+    fn isBlocked(ptr: *anyopaque, _: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.blocked;
+    }
+};
+
+// Drive a full SCRAM-SHA-256 client-final with a correct proof through the
+// router and return the reply bytes. Factored out so the account-gate test can
+// assert both the blocked and allowed outcomes with identical, valid proofs.
+fn runScramSuccessDispatch(
+    session: *ClientSession,
+    replies: *ReplyCtx,
+    keys: sasl.ScramKeys,
+) !void {
+    const HmacSha256 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha256);
+    const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+    try dispatchText(session, replies, "AUTHENTICATE SCRAM-SHA-256");
+
+    var cf_b64: [128]u8 = undefined;
+    const cf = std.base64.standard.Encoder.encode(&cf_b64, "n,,n=user,r=CLIENTNONCE");
+    var line1: [256]u8 = undefined;
+    replies.clear();
+    try dispatchText(session, replies, try std.fmt.bufPrint(&line1, "AUTHENTICATE {s}", .{cf}));
+
+    const written1 = replies.written();
+    const marker = "AUTHENTICATE ";
+    const start = std.mem.indexOf(u8, written1, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, written1, start, '\r').?;
+    const server_first_b64 = written1[start..end];
+    var server_first_raw: [sasl.MAX_SCRAM_MESSAGE]u8 = undefined;
+    const sf_decoder = std.base64.standard.Decoder;
+    const sf_len = try sf_decoder.calcSizeForSlice(server_first_b64);
+    try sf_decoder.decode(server_first_raw[0..sf_len], server_first_b64);
+    const server_first = server_first_raw[0..sf_len];
+    const parsed_first = try scram_server.parseServerFirst(server_first);
+
+    var without_proof_buf: [256]u8 = undefined;
+    const without_proof = try std.fmt.bufPrint(&without_proof_buf, "c=biws,r={s}", .{parsed_first.nonce});
+    var auth_message_buf: [768]u8 = undefined;
+    const auth_message = try std.fmt.bufPrint(&auth_message_buf, "n=user,r=CLIENTNONCE,{s},{s}", .{ server_first, without_proof });
+    var client_sig: [digest_len]u8 = undefined;
+    HmacSha256.create(&client_sig, auth_message, &keys.stored_key);
+    var proof: [digest_len]u8 = undefined;
+    for (&proof, keys.client_key, client_sig) |*dst, ck, cs| dst.* = ck ^ cs;
+    var proof_b64_buf: [std.base64.standard.Encoder.calcSize(digest_len)]u8 = undefined;
+    const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
+    var final_buf: [320]u8 = undefined;
+    const client_final = try std.fmt.bufPrint(&final_buf, "{s},p={s}", .{ without_proof, proof_b64 });
+    var final_b64_buf: [512]u8 = undefined;
+    const final_b64 = std.base64.standard.Encoder.encode(&final_b64_buf, client_final);
+
+    var line2: [640]u8 = undefined;
+    replies.clear();
+    try dispatchText(session, replies, try std.fmt.bufPrint(&line2, "AUTHENTICATE {s}", .{final_b64}));
+}
+
+test "SASL SCRAM success is refused for a suspended account via the account gate" {
+    const salt = "saltSALTsalt";
+    const iterations: u32 = 4096;
+    const password = "pencil";
+
+    // A blocking gate mirrors a SUSPENDED or FORBIDDEN services account. Because
+    // SCRAM proof verification never consults account status, the gate is the
+    // only thing standing between a valid proof and a bound locked account.
+    {
+        var keys = try sasl.deriveScramKeys(password, salt, iterations);
+        defer keys.wipe();
+        var db = TestScramDb{ .record = .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = keys.stored_key,
+            .server_key = keys.server_key,
+        } };
+        var gate = TestAccountGate{ .blocked = true };
+
+        var session = ClientSession.init();
+        session.cap.negotiated.add(.sasl);
+        session.sasl_scram256 = .{ .ptr = &db, .lookupFn = TestScramDb.lookup };
+        session.sasl_server_nonce = "SERVERNONCE";
+        session.sasl_account_gate = .{ .ptr = &gate, .blockedFn = TestAccountGate.isBlocked };
+
+        var storage: [2048]u8 = undefined;
+        var replies = ReplyCtx.init(&storage);
+        try runScramSuccessDispatch(&session, &replies, keys);
+
+        // Same failure surface as a bad credential: 904, no 903, no login.
+        try std.testing.expect(session.account() == null);
+        try std.testing.expect(!session.logged_in);
+        try expectContains(replies.written(), " 904 ");
+        try std.testing.expect(std.mem.indexOf(u8, replies.written(), " 903 ") == null);
+    }
+
+    // Control: the identical valid proof with a non-blocking gate logs in (903),
+    // proving the refusal above is the gate and not a broken handshake.
+    {
+        var keys = try sasl.deriveScramKeys(password, salt, iterations);
+        defer keys.wipe();
+        var db = TestScramDb{ .record = .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = keys.stored_key,
+            .server_key = keys.server_key,
+        } };
+        var gate = TestAccountGate{ .blocked = false };
+
+        var session = ClientSession.init();
+        session.cap.negotiated.add(.sasl);
+        session.sasl_scram256 = .{ .ptr = &db, .lookupFn = TestScramDb.lookup };
+        session.sasl_server_nonce = "SERVERNONCE";
+        session.sasl_account_gate = .{ .ptr = &gate, .blockedFn = TestAccountGate.isBlocked };
+
+        var storage: [2048]u8 = undefined;
+        var replies = ReplyCtx.init(&storage);
+        try runScramSuccessDispatch(&session, &replies, keys);
+
+        try std.testing.expectEqualStrings("user", session.account().?);
+        try expectContains(replies.written(), " 903 ");
+    }
 }
 
 const TestScram512Db = struct {

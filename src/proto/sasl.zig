@@ -144,6 +144,21 @@ pub const TotpGate = struct {
     }
 };
 
+/// Injected predicate: is `account` SUSPENDED or FORBIDDEN and therefore barred
+/// from every credential path? Backed by the daemon's services account store.
+/// Consulted at SASL success so a mechanism whose verification never checks
+/// account status (a SCRAM proof verifies from stored key material alone; an
+/// OAUTHBEARER token from the IdP) still cannot bind a locked account. The
+/// backing implementation is fail-closed: an undecodable status reads as blocked.
+pub const AccountStatusGate = struct {
+    ptr: *anyopaque,
+    blockedFn: *const fn (ptr: *anyopaque, account: []const u8) bool,
+
+    pub fn blocked(self: AccountStatusGate, account: []const u8) bool {
+        return self.blockedFn(self.ptr, account);
+    }
+};
+
 /// Whether `mechanism` authenticates purely by a knowledge factor (a password or
 /// password-derived secret) and therefore requires a TOTP second factor when the
 /// account has 2FA. EXTERNAL (client cert) and OAUTHBEARER (external IdP) are
