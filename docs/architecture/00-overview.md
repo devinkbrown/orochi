@@ -45,6 +45,7 @@ the operational lanes used to keep the daemon deployable:
 | `test-roadmap` | Server-roadmap gate spanning server/config/IRCX/event/mesh/services/TLS. |
 | `test-media` / `test-helix` | Focused media and upgrade lanes kept independently runnable. |
 | `test-mesh` / `test-tls` / `test-server` / `test-ircx` | Focused subsystem suites for Suimyaku, Yoroi TLS, daemon integration, and IRCX behavior. |
+| `test-cli` | Tests for the standalone `yoroi` crypto toolkit (openssl-parity verbs over the Yoroi substrate). Evidence: `build.zig:478`. |
 | `all-checks` | Deterministic pre-push gate: check, WASM build, full tests, fuzz corpus replay, and BoGo shim self-tests. |
 | `release` | ReleaseFast stripped production binary. |
 | `package` | ReleaseFast daemon plus reference config and systemd unit staged into the install prefix. |
@@ -52,6 +53,12 @@ the operational lanes used to keep the daemon deployable:
 Verbose test variants use `tools/verbose_test_runner.zig` to print each test name,
 duration, summary counts, and the slowest tests, which makes long daemon suites
 observable in CI and tmux.
+
+A forward-looking assurance direction — an adversarial exploit/attack harness
+(`zig build test-exploit` over a `src/security/exploit/` tree, table-driven over
+hostile-input corpora, asserting the daemon fails closed) — is specified in
+[docs/research/exploit-suite-blueprint.md](../research/exploit-suite-blueprint.md).
+That is a design blueprint (research), not shipped behavior.
 
 ## End-to-end client request flow
 
@@ -90,6 +97,7 @@ observable in CI and tmux.
 | [event-spine.md](event-spine.md) | Typed operator/observer event plane: subscription, severity, replay, stats, flood-collapse |
 | [observability-stats.md](observability-stats.md) | Channel-statistics engine plus the public `status.json` mesh-health feed |
 | [mesh-s2s.md](mesh-s2s.md) | Mesh/S2S architecture; separate document |
+| [mesh-security.md](mesh-security.md) | S2S threat model, AEAD record layer, per-frame origin signing, host-cloak federation |
 | [crypto.md](crypto.md) | Cryptography architecture; separate document |
 
 ## Planning notes and divergences

@@ -47,6 +47,22 @@ richer `INFO`.
 - [Event Spine](architecture/event-spine.md) — typed operator/observer events: subscription, severity, replay, stats, flood-collapse
 - [Observability & stats](architecture/observability-stats.md) — channel-statistics engine and the public `status.json` mesh-health feed
 
+## Design notes & TLS development
+
+Forward-looking design and hardening docs. These describe *intent and gap
+analysis*, not necessarily shipped behavior — where they disagree with the
+architecture and reference docs above (verified against code), those are
+authoritative.
+
+- [TLS hardening roadmap](dev/tls-roadmap.md) — gap analysis vs. BoringSSL/WolfSSL, with DONE/TODO status (EMS-required, HRR pinning, 0-RTT freshness window, ECH `retry_configs`)
+- [BoGo interop](dev/tls-design/bogo.md) — the BoringSSL test-suite shim and coverage
+- [Certificate compression](dev/tls-design/cert-compression.md) — RFC 8879 `compress_certificate`
+- [kTLS](dev/tls-design/ktls.md) — kernel-offload TLS 1.3 design
+- [OCSP stapling](dev/tls-design/ocsp-stapling.md) — must-staple, freshness, delegated responders
+- [E2EE Everywhere (Kintsugi)](design/e2ee-everywhere-blueprint.md) — group/channel end-to-end encryption blueprint (design)
+- [Adversarial exploit-suite blueprint](research/exploit-suite-blueprint.md) — the direction for a `test-exploit` fail-closed attack harness (`src/security/exploit/`) (research/design)
+- [Zig 0.17 porting notes](dev/zig016-notes.md) — language/stdlib migration notes
+
 ## Command reference
 
 - [Index](reference/commands/_index.md) — every command, one line each

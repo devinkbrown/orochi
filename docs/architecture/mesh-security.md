@@ -199,6 +199,53 @@ precompute a victim's stream id and hijack or inject on the UDP port. No client
 change is required, because the server already delivers the id over the TLS IRC
 channel (`EVENT <nick> MEDIA NATIVE ... stream=<id>`).
 
+## Host cloak federation
+
+Client host cloaking is a privacy feature (see the `host-cloaking` reference),
+but its **key management is a mesh concern**: WARD host/subnet bans and account
+cloaks only federate if every node in the mesh derives the *same* cloak token
+for the same input, which requires a mesh-shared cloak secret.
+
+- **Key derivation is Argon2id, not `SHA256`.** `[cloak] secret` is stretched
+  through the memory-hard Argon2id KDF (`default_params` — t=2, m=64 MiB, p=1)
+  with a fixed domain-separation salt `"orochi/cloak-key/argon2id/v1"`
+  (`src/main.zig:491`, `src/main.zig:492`, `src/main.zig:495`,
+  `src/crypto/argon2_kdf.zig:40`, `src/crypto/argon2_kdf.zig:117`). The IPv4
+  input space is fully enumerable, so the whole model rests on key secrecy; a
+  memory-hard KDF makes a low-entropy operator passphrase resist offline brute
+  force in a way `SHA256(secret)` did not. Derivation is deterministic (fixed
+  salt), so cloaks stay stable across restarts and **identical mesh-wide**.
+- **Meshed-without-secret is a config error.** A node that meshes
+  (`[mesh] connect` or an S2S listener) but has no `[cloak] secret` falls back
+  to a per-boot *random* key, so cloaks differ per node and change on restart —
+  breaking host/subnet ban federation and persistence. The boot-time guard
+  `meshCloakSecretMissing()` refuses to start and tells the operator to set the
+  SAME secret on every mesh node (`src/main.zig:192`, `src/main.zig:193`,
+  `src/daemon/config_format.zig:829`).
+- **Rotation grace is mesh-shared too.** `[cloak] previous_secret` is derived
+  through the same Argon2id path and kept live so WARD bans written under the
+  prior key keep matching during the grace window; drop it once old bans age out
+  (`src/main.zig:508`, `src/daemon/config_format.zig:616`).
+- **Auth-split cloaks.** The cloak an identity carries depends on whether it is
+  authenticated:
+  - **Accounts** (with `[cloak] account_cloak`) get a **stable** account cloak
+    `<account>.users.<suffix>`, constant across IPs and devices
+    (`src/daemon/config_format.zig:632`, `src/daemon/config_format.zig:634`).
+  - **Anonymous clients** get an **opaque, epoch-rotating** cloak: a single
+    token over the full address plus a public wall-clock epoch counter
+    `floor(now / anon_epoch_secs)` (default 86400 s = 24 h), tagged `.opq`
+    (`src/proto/cloak.zig:176`, `src/proto/cloak.zig:187`,
+    `src/daemon/config_format.zig:637`, `src/daemon/config_format.zig:646`).
+    The epoch salt makes the same static IP **unlinkable across epochs**, and
+    the single-token opaque form leaks no subnet co-membership — so an anonymous
+    user cannot be tracked long-term by cloak, while an account's cloak stays
+    stable for moderation. Anonymous moderation shifts to account bans plus
+    registration friction; setting `anon_epoch_secs = 0` restores the
+    subnet-bannable hierarchical `.ip` cloak.
+
+The epoch cloak is domain-separated from the plain opaque token, so an epoch
+cloak never collides with a non-epoch cloak (`src/proto/cloak.zig:186`).
+
 ## What this does not cover (future, cross-component)
 
 A per-datagram MAC on the kagura media **payload** itself would add
@@ -218,3 +265,6 @@ server-only (it would be inert until the clients ship it).
 | Compromised peer forging a direct frame | Self-cert per-link signature; `originShortId(pubkey)==peer` | L4 |
 | Compromised relay forging a third node's message/prop | Self-contained origin signature verified at every hop | L4 |
 | Predicting a victim's media stream id | Keyed-PRF capability token | Media |
+| Offline brute force of a cloak passphrase | Argon2id (memory-hard) key derivation | Cloak |
+| Long-term tracking of an anonymous client by cloak | Opaque epoch-rotating cloak (unlinkable across epochs) | Cloak |
+| Cloak/ban divergence across mesh nodes | Mesh-shared `[cloak] secret` (enforced at boot) | Cloak |
