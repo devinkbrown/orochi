@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
                     // host/subnet WARD bans neither federate nor persist. Fail
                     // validation loudly so it is caught before deploy.
                     if (l.parsed.meshCloakSecretMissing()) {
-                        std.debug.print("config ERROR in {s}: meshed node ([mesh] connect set) has no shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence — set the SAME [cloak] secret on every mesh node\n", .{path});
+                        std.debug.print("config ERROR in {s}: meshed node ([mesh] connect or [listen] s2s set) has no shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence — set the SAME [cloak] secret on every mesh node\n", .{path});
                         std.process.exit(1);
                     }
                     std.debug.print("config OK: {s}\n", .{path});

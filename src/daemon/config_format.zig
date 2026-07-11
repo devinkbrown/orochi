@@ -806,13 +806,17 @@ pub const Config = struct {
         require_attestation: bool = false,
     };
 
-    /// True when this node is meshed (has configured peers) but has no shared
-    /// `[cloak] secret`. In that case each node generates its own random per-boot
-    /// cloak key, so cloaked hosts differ per node and change on restart —
-    /// `*!*@<cloak>` and subnet WARD bans neither federate across the mesh nor
-    /// survive a restart. All mesh nodes must share one `[cloak] secret`.
+    /// True when this node participates in a mesh but has no shared `[cloak]
+    /// secret`. A node is meshed whether it dials peers (`[mesh] connect`) OR
+    /// merely listens for inbound S2S (`[listen] s2s`) — a listen-only node
+    /// (peers dial in) has the identical hazard. With no shared secret each node
+    /// generates its own random per-boot cloak key, so cloaked hosts differ per
+    /// node and change on restart — `*!*@<cloak>` and subnet WARD bans neither
+    /// federate across the mesh nor survive a restart. All mesh nodes must share
+    /// one `[cloak] secret`.
     pub fn meshCloakSecretMissing(self: *const Config) bool {
-        return self.mesh.connect.len != 0 and self.cloak.secret == null;
+        const meshed = self.mesh.connect.len != 0 or self.listen.s2s != 0;
+        return meshed and self.cloak.secret == null;
     }
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
@@ -3255,8 +3259,23 @@ test "meshCloakSecretMissing: cloak federation guard flags meshed node with no s
         try testing.expect(!cfg.meshCloakSecretMissing());
     }
 
-    // Standalone node (no peers), no secret → per-boot key is fine, nothing to
-    // federate. No fire.
+    // Listen-only mesh node (peers dial IN, empty [mesh] connect) with no secret
+    // → same federation hazard; the guard must fire on [listen] s2s too.
+    {
+        var cfg = try parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\s2s = 7700
+            \\
+        , .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.meshCloakSecretMissing());
+    }
+
+    // Standalone node (no peers, no s2s listener), no secret → per-boot key is
+    // fine, nothing to federate. No fire.
     {
         var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
         defer cfg.deinit(allocator);
