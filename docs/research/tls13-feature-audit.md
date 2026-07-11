@@ -77,7 +77,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | Certificate compression (RFC 8879, zlib, bomb-guarded) | IMPLEMENTED | client `tls_client.zig:2061–2070` (+unsolicited fatal `:1874`); server `tls_server.zig:1505–1508`; loopback `:5403` | RFC 8879 |
 | Raw public keys (RFC 7250), server + client cert types | IMPLEMENTED | negotiation `tls_server.zig:1509–1533`; client EE validation (unsolicited fatal) `tls_client.zig:2032–2042`; byte-identical-off test `:5588` | RFC 7250 |
 | Delegated credentials (RFC 9345) | IMPLEMENTED | client verify chain (`:4610+` tests: window, scheme pinning, tamper, no-clock reject); server presents-when-accepted `tls_server.zig:1552–1563`; byte-identical-off `:3946` | RFC 9345 |
-| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; **retry_configs now IMPLEMENTED [fixed here]** — server emits its published ECHConfigList in EE on ECH-not-accepted (`Config.ech_retry_config_list`, `writeEncryptedExtensions`, byte-identical when unset), client captures it only on offer+reject (`ech_retry_configs` / `echRetryConfigs()`, authenticated by the public_name cert), tests: rejection-delivers-retry + accepted-exposes-none; ECH+HRR re-seal still unsupported → clean refusal `tls_client.zig:1734` (fail-closed, remaining follow-up); no `ech_outer_extensions` compression | draft-ietf-tls-esni |
+| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; **retry_configs now IMPLEMENTED [fixed here]** — server emits its published ECHConfigList in EE on ECH-not-accepted (`Config.ech_retry_config_list`, `writeEncryptedExtensions`, byte-identical when unset), client captures it only on offer+reject (`ech_retry_configs` / `echRetryConfigs()`, authenticated by the public_name cert), tests: rejection-delivers-retry + accepted-exposes-none; **ECH×HRR re-seal remains DEFERRED (fail-closed refusal)** — client refuses on an HRR while ECH was offered (`tls_client.zig:1790` `error.HelloRetryRequestUnsupported`), server stands ECH down on the HRR path (`signal_ech = ech_accepted and !hrr_sent`, `tls_server.zig:1984`). NOT shipped because it cannot be externally validated here (see §8: no BoGo ECH harness — shim lacks ECH flag wiring + HPKE is ChaCha20-only vs BoGo's AES-128-GCM). Shipping a hand-rolled CH2 transcript without that oracle is worse than the refusal; no `ech_outer_extensions` compression | draft-ietf-tls-esni (RFC 9849) |
 | Certificate / CertificateVerify (server auth, all three key types) | IMPLEMENTED | client verify `tls_client.zig:2072+` (chain cap 16 `:2104`, exact context strings), CRL/OCSP/CT hooks | §4.4.2–4.4.3 |
 | certificate_request / mTLS (client Certificate, CV, possession proof) | IMPLEMENTED | server `writeCertificateRequest` `tls_server.zig:1251`, client-cert verify `:1023–1063` (failed proof clears the captured fingerprint); client `validateCertificateRequest` `tls_client.zig:4265` test | §4.3.2, §4.4.2.4 |
 | Post-handshake client auth (post_handshake_auth ext) | MISSING (deliberate) | never advertised; a post-handshake CertificateRequest is now fatal on the client **[fixed here]** — correct per §4.6.2 when not advertised | §4.6.2 |
@@ -157,7 +157,37 @@ hardening fixes landed with it — marked **[fixed here]**).
   exposes no retry_configs`, and `a non-ECH client … is not treated as an ECH offer`.
 
 Deferred (documented above, NOT half-implemented): ECH×HRR re-seal (ECH+HRR stays a clean
-fail-closed refusal), `ech_outer_extensions` compression, and `signature_algorithms_cert`.
+fail-closed refusal) and `ech_outer_extensions` compression. (`signature_algorithms_cert` is
+now IMPLEMENTED — see row above.)
+
+**ECH×HRR re-seal — gating prerequisite (why it stays fail-closed).** The draft-ietf-tls-esni
+(RFC 9849) HRR rules are transcript-exact and unforgiving: CH2 reuses the *same* HPKE sender
+context from CH1 (second seal at HPKE sequence 1) with an EMPTY `enc`; the HRR carries the
+8-byte acceptance confirmation in an `encrypted_client_hello` extension under the
+`"hrr ech accept confirmation"` label; and — the load-bearing trap — BOTH HRR-case
+confirmation transcripts apply the RFC 8446 §4.4.1 `message_hash` substitution
+(`0xFE‖u24(Hash.len)‖Hash(ClientHelloInner1)`, the INNER CH1) before hashing, with the 8
+signal bytes zeroed. A naive `Hash(CH1inner ‖ HRR)` produces a wrong-but-plausible signal
+that fails only at interop. Per the crypto mandate, "round-trips with itself is necessary but
+NOT sufficient" — a self-consistent client↔server loopback can be self-consistently wrong, so
+this MUST be pinned against an external oracle (BoGo) before shipping. That oracle does not
+exist here yet (§8): the BoGo runner cannot exercise ANY orochi ECH path — base or HRR —
+because (a) `tools/bogo_shim.zig` has ZERO ECH flag wiring (`-ech-config-list`,
+`-ech-server-config`, `-expect-ech-accept`, `-on-retry-expect-ech-accept`, `-expect-hrr`), so
+those tests are skipped as unimplemented, and (b) `src/crypto/hpke.zig` supports only
+ChaCha20-Poly1305 (AEAD `0x0003`) while BoringSSL's ECH tests generate configs under
+AES-128-GCM (AEAD `0x0001`). The relevant BoGo cases are `TLS-ECH-Client-HelloRetryRequest`,
+`TLS-ECH-Server-ECHInner-HelloRetryRequest`, and the negative
+`TLS-ECH-Client-HelloRetryRequest-MissingServerHelloConfirmation`
+(`ssl/test/runner/ech_tests.go`). **Gating follow-up (a separate project, out of scope for
+the ECH×HRR task): build the ECH BoGo harness first** — add AES-128-GCM (and AES-256-GCM) to
+`hpke.zig`, thread suite-agility through `ech_seal`/`ech_config`, and wire the ECH shim flags —
+then enable `*ECH*` in `tools/bogo/config.json` and validate base ECH. Only once BoGo can
+prove base ECH should ECH×HRR be implemented and validated against the three cases above.
+Note: `ech_seal.acceptConfirmation` already implements both labels (`.server_hello` /
+`.hello_retry_request`) and is unit-tested for determinism + label/transcript sensitivity;
+the missing piece is the caller-side transcript assembly (the `message_hash` collapse + signal
+zeroing) proven against BoGo — not the confirmation primitive itself.
 
 ## 8. External-peer interop status (BoGo)
 
@@ -171,6 +201,14 @@ covering the HRR suite-pin, key_share-group validation, post-handshake fail-clos
 freshness window, ECH `retry_configs`, and `signature_algorithms_cert`. The in-repo
 `zig build bogo-shim-test` and the full `zig build test-tls` are also green. `tools/bogo/config.json`
 carries only the legitimately-disabled entries (shim-undriven / disclosed interop trade-offs,
-documented inline). The external-interop leg is now closed.
+documented inline). The external-interop leg is now closed **for the shipped feature set**.
+
+**Not covered by BoGo: ECH (all of it, base and ×HRR).** `config.json` disables `*ECH*` and
+the ECH-carrying `*HelloRetryRequest*` cases because the shim has no ECH flag wiring and
+`hpke.zig` speaks only ChaCha20-Poly1305 while BoringSSL's ECH configs use AES-128-GCM (see the
+ECH×HRR prerequisite note in §7). So orochi's base-ECH accept/reject path is validated ONLY by
+the in-repo client↔server loopback + confirmation-primitive KATs, and ECH×HRR is not
+implemented (fail-closed). Standing up the ECH BoGo harness (AES-GCM HPKE + suite-agility + shim
+ECH flags) is the tracked follow-up that must land before ECH×HRR — or any expanded ECH — ships.
 
 Gate: `zig build test-tls` green; `zig build bogo-shim-test` green; `zig fmt --check src/` clean.
