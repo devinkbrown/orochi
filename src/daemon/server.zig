@@ -33399,6 +33399,56 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
     } else return error.SkipZigTest;
 }
 
+// Named with the "ACCESS" token so the focused `test-ircx` suite collects it:
+// SILENCE is per-recipient access control, and a case-sensitive owner key let a
+// silenced sender bypass the ignore simply by varying the target nick's case.
+test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ignore" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const target = server.connFor(target_id).?;
+
+    // The live SILENCE list is keyed by the recipient's own (canonical) nick.
+    _ = try server.silence.add(target.session.displayName(), "Remote!*@host");
+
+    // A relayed PRIVMSG addressed with a DIFFERENT-CASE target ("target") still
+    // resolves to this recipient — nick routing is case-insensitive — so the
+    // SILENCE gate MUST also match case-insensitively. If it keys the owner
+    // case-sensitively, the silenced sender is delivered anyway (bypass).
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "target",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@host",
+        .account = "remoteacct",
+        .tags = "",
+        .text = "should be silenced",
+        .origin_node = 99,
+        .hlc = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    // A non-matching sender (different host) is still delivered — no over-match,
+    // and the case-folded owner lookup does not swallow legitimate traffic.
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "target",
+        .source_nick = "Friend",
+        .source_prefix = "Friend!f@elsewhere",
+        .account = "friendacct",
+        .tags = "",
+        .text = "delivered",
+        .origin_node = 99,
+        .hlc = 2,
+    });
+    try expectContains(target.send_buf[0..target.send_len], ":Friend!f@elsewhere PRIVMSG target :delivered\r\n");
+}
+
 test "relay direct messages honor local +C and +g callerid policy" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {

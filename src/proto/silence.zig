@@ -13,6 +13,11 @@ const limits_config = @import("limits_config.zig");
 pub const RPL_SILELIST: u16 = 271;
 pub const RPL_ENDOFSILELIST: u16 = 272;
 
+/// Upper bound on the owner-key normalization scratch buffer. Owner names are
+/// nicks; `validateOwner` already bounds them by `max_owner_bytes` (64 by
+/// default), so this comfortably covers every stored key.
+const NORM_OWNER_MAX: usize = 512;
+
 pub const DEFAULT_MAX_MASKS_PER_OWNER: usize = 32;
 pub const DEFAULT_MAX_MASK_BYTES: usize = 128;
 pub const DEFAULT_MAX_OWNER_BYTES: usize = 64;
@@ -134,12 +139,15 @@ pub const Store = struct {
         try validateOwner(owner, self.params.max_owner_bytes);
         try validateMask(mask, self.params.max_mask_bytes);
 
-        if (self.owners.getPtr(owner)) |client_list| {
+        var owner_buf: [NORM_OWNER_MAX]u8 = undefined;
+        const key = normalizeOwner(owner, &owner_buf) orelse return error.OwnerTooLong;
+
+        if (self.owners.getPtr(key)) |client_list| {
             return client_list.add(self.allocator, max_masks, mask);
         }
 
-        const owner_copy = try self.allocator.dupe(u8, owner);
-        const gop = self.owners.getOrPut(owner) catch |err| {
+        const owner_copy = try self.allocator.dupe(u8, key);
+        const gop = self.owners.getOrPut(key) catch |err| {
             self.allocator.free(owner_copy);
             return err;
         };
@@ -165,7 +173,9 @@ pub const Store = struct {
         try validateOwner(owner, self.params.max_owner_bytes);
         try validateMask(mask, self.params.max_mask_bytes);
 
-        const entry = self.owners.getEntry(owner) orelse return false;
+        var owner_buf: [NORM_OWNER_MAX]u8 = undefined;
+        const key = normalizeOwner(owner, &owner_buf) orelse return false;
+        const entry = self.owners.getEntry(key) orelse return false;
         const removed = entry.value_ptr.remove(self.allocator, mask);
         if (entry.value_ptr.masks.items.len == 0) {
             const owned_key = entry.key_ptr.*;
@@ -178,7 +188,9 @@ pub const Store = struct {
 
     /// Return true when `sender_hostmask` matches any mask owned by `owner`.
     pub fn isSilenced(self: *const Store, owner: []const u8, sender_hostmask: []const u8) bool {
-        const client_list = self.owners.getPtr(owner) orelse return false;
+        var owner_buf: [NORM_OWNER_MAX]u8 = undefined;
+        const key = normalizeOwner(owner, &owner_buf) orelse return false;
+        const client_list = self.owners.getPtr(key) orelse return false;
         for (client_list.masks.items) |mask| {
             if (listx.globMatch(mask, sender_hostmask)) return true;
         }
@@ -188,7 +200,9 @@ pub const Store = struct {
     /// Write `owner`'s masks as comma-separated bytes into caller storage.
     pub fn list(self: *const Store, owner: []const u8, out: []u8) SilenceError![]const u8 {
         try validateOwner(owner, self.params.max_owner_bytes);
-        const masks = if (self.owners.getPtr(owner)) |client| client.masks.items else return out[0..0];
+        var owner_buf: [NORM_OWNER_MAX]u8 = undefined;
+        const key = normalizeOwner(owner, &owner_buf) orelse return out[0..0];
+        const masks = if (self.owners.getPtr(key)) |client| client.masks.items else return out[0..0];
 
         var len: usize = 0;
         for (masks, 0..) |mask, index| {
@@ -373,6 +387,17 @@ fn asciiLower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
 }
 
+/// Fold `owner` to a canonical (lowercase) form in `buf` for case-insensitive
+/// keying. Nick routing is case-insensitive, so the SILENCE owner key must be
+/// too — otherwise a silenced sender bypasses the ignore by varying the target
+/// nick's case. Returns null only when `owner` exceeds the scratch buffer, in
+/// which case no stored key (bounded by `max_owner_bytes`) could ever match.
+fn normalizeOwner(owner: []const u8, buf: []u8) ?[]const u8 {
+    if (owner.len > buf.len) return null;
+    for (owner, 0..) |byte, index| buf[index] = asciiLower(byte);
+    return buf[0..owner.len];
+}
+
 const LineBuilder = struct {
     out: []u8,
     max_line_bytes: usize,
@@ -507,6 +532,25 @@ test "addWithLimit overrides the store-wide silence cap per call" {
     // The default (global) cap still tightens back to 1 for a fresh owner.
     try std.testing.expect(try store.add("bob", "one!*@host"));
     try std.testing.expectError(error.LimitReached, store.add("bob", "two!*@host"));
+}
+
+test "owner key is case-insensitive so nick-case cannot bypass the ignore" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    // Added under the canonical (mixed-case) nick...
+    try std.testing.expect(try store.add("Target", "bad!*@host"));
+    // ...must be found regardless of how the owner nick is cased at lookup.
+    try std.testing.expect(store.isSilenced("target", "bad!user@host"));
+    try std.testing.expect(store.isSilenced("TARGET", "bad!user@host"));
+    try std.testing.expect(!store.isSilenced("target", "good!user@host"));
+
+    // list/remove key case-insensitively too (no duplicate owner rows).
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("bad!*@host", try store.list("tArGeT", &out));
+    try std.testing.expect(!try store.add("target", "bad!*@host")); // dup across case
+    try std.testing.expect(try store.remove("TARGET", "bad!*@host"));
+    try std.testing.expect(!store.isSilenced("Target", "bad!user@host"));
 }
 
 test "no leak after owner removal" {
