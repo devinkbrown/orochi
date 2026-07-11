@@ -10,17 +10,24 @@
 //! so the *number* of mailboxes and wake fds must be a runtime value. This struct
 //! bundles, per shard:
 //!
-//!   * one lock-free MPMC inbox (`BoundedMpmc(DeliverMsg, capacity)`), and
-//!   * one cross-reactor wake eventfd (`ReactorWake`),
+//!   * one lock-free MPMC inbox (`BoundedMpmc(DeliverMsg, capacity)`),
+//!   * one cross-reactor wake eventfd (`ReactorWake`), and
+//!   * one pooled-buffer allocator (`DeliverPool(pool_slots)`) sized so a single
+//!     shard's pool can fill that shard's inbox (`pool_slots == capacity`).
 //!
-//! plus ONE shared pooled-buffer allocator (`DeliverPool(pool_slots)`) used by
-//! every reactor to copy bytes into pooled `DeliverBuf`s before handoff.
+//! The per-shard pool is the key sizing decision. A shard's `DeliverBuf`s are
+//! ALWAYS acquired for, and released by, that one owning reactor, so giving each
+//! shard its own pool makes the total buffer budget scale with the runtime shard
+//! count (`num_shards * pool_slots`) instead of a single fixed 256. With one
+//! shared pool a broadcast to a channel whose cross-shard recipients out-number
+//! the pool silently exhausted it; per-shard pools collapse pool exhaustion into
+//! the single, COUNTED inbox-full back-pressure signal (`dropped`).
 //!
-//! The element types are comptime-fixed in size, but the *count* of inboxes and
-//! wakes is runtime: both live as heap slices of length `num_shards`. The pool is
-//! large (~1MB at `pool_slots`), so it is heap-allocated once and shared by
-//! pointer. Everything inside is lock-free; the only allocation happens at `init`
-//! and the only deallocation at `deinit`.
+//! The element types are comptime-fixed in size, but the *count* of inboxes,
+//! wakes, and pools is runtime: all three live as heap slices of length
+//! `num_shards`. Each pool is ~1MB, so the pool slice is heap-allocated once
+//! (~`num_shards` MB total). Everything inside is lock-free; the only allocation
+//! happens at `init` and the only deallocation at `deinit`.
 //!
 //! Usage mirrors the smoke test, just behind a reusable runtime-sized struct:
 //!   * a sender copies bytes via `acquire`, addresses a `DeliverMsg`, hands it off
@@ -56,8 +63,11 @@ pub const ReactorFabric = struct {
     /// Per-shard mailbox depth (messages). Comptime: the MPMC ring needs a fixed,
     /// power-of-two capacity. Only the shard *count* is runtime.
     pub const capacity: usize = 256;
-    /// Shared pool size (buffers). Comptime for the same reason (~1MB total).
-    pub const pool_slots: usize = 256;
+    /// Per-shard pool size (buffers), ~1MB each. Comptime for the same reason.
+    /// Held == `capacity` so a shard's pool can exactly fill its inbox: when the
+    /// inbox has room a buffer is always available, so pool exhaustion never drops
+    /// independently of an inbox-full — the two back-pressure signals coincide.
+    pub const pool_slots: usize = capacity;
 
     const Mailbox = queue.BoundedMpmc(DeliverMsg, capacity);
     const Pool = deliver_handle.DeliverPool(pool_slots);
@@ -68,8 +78,15 @@ pub const ReactorFabric = struct {
     inboxes: []Mailbox,
     /// One wake eventfd per shard; index `i` is shard `i`'s wake handle.
     wakes: []ReactorWake,
-    /// The single shared pooled-buffer allocator, heap-allocated once (~1MB).
-    pool: *Pool,
+    /// One pooled-buffer allocator per shard; index `i` backs shard `i`'s handoffs.
+    /// A buffer is acquired for a target shard from `pools[target]` and released
+    /// back to the SAME pool by that shard's owning reactor. Heap slice sized to
+    /// the runtime shard count (~`num_shards` MB total).
+    pools: []Pool,
+    /// Monotonic count of cross-shard messages DROPPED under sustained inbox/pool
+    /// back-pressure. Non-zero means a fan-out shed load rather than block the
+    /// reactor; surfaced by the daemon so a silent drop can never hide.
+    dropped: std.atomic.Value(u64) = .init(0),
 
     /// Build a fabric for `num_shards` shards (>= 1, <= `shard.max_shards`).
     ///
@@ -96,22 +113,22 @@ pub const ReactorFabric = struct {
             wakes[made] = try ReactorWake.init();
         }
 
-        const pool = try allocator.create(Pool);
-        errdefer allocator.destroy(pool);
-        pool.* = Pool.init();
+        const pools = try allocator.alloc(Pool, num_shards);
+        errdefer allocator.free(pools);
+        for (pools) |*p| p.* = Pool.init();
 
         return .{
             .allocator = allocator,
             .inboxes = inboxes,
             .wakes = wakes,
-            .pool = pool,
+            .pools = pools,
         };
     }
 
-    /// Release every resource: destroy the shared pool, close every wake eventfd,
-    /// then free the two heap slices. After this the fabric is unusable.
+    /// Release every resource: free the per-shard pools, close every wake eventfd,
+    /// then free the heap slices. After this the fabric is unusable.
     pub fn deinit(self: *ReactorFabric) void {
-        self.allocator.destroy(self.pool);
+        self.allocator.free(self.pools);
         for (self.wakes) |*w| w.deinit();
         self.allocator.free(self.wakes);
         self.allocator.free(self.inboxes);
@@ -123,22 +140,36 @@ pub const ReactorFabric = struct {
         return self.inboxes.len;
     }
 
-    /// Copy `bytes_in` into a pooled `DeliverBuf`, returning null if the pool is
-    /// momentarily exhausted or `bytes_in` exceeds the pool's per-buffer maximum.
-    /// Callable from any thread.
-    pub fn acquire(self: *ReactorFabric, bytes_in: []const u8) ?*DeliverBuf {
-        return self.pool.acquire(bytes_in);
+    /// Copy `bytes_in` into a `DeliverBuf` drawn from `target`'s pool, returning
+    /// null if that pool is momentarily exhausted or `bytes_in` exceeds the
+    /// per-buffer maximum. The buffer MUST be handed to `target` and released by
+    /// `target`'s owning reactor. Callable from any thread.
+    pub fn acquire(self: *ReactorFabric, target: u12, bytes_in: []const u8) ?*DeliverBuf {
+        return self.pools[target].acquire(bytes_in);
     }
 
-    /// Drop one reference to `buf`, returning it to the pool when the last
-    /// reference is released. Callable from any thread.
-    pub fn release(self: *ReactorFabric, buf: *DeliverBuf) void {
-        self.pool.release(buf);
+    /// Drop one reference to a buffer acquired for `target`, returning it to that
+    /// shard's pool when the last reference is released. Called by `target`'s
+    /// owning reactor (or the sender undoing a failed handoff to `target`).
+    pub fn release(self: *ReactorFabric, target: u12, buf: *DeliverBuf) void {
+        self.pools[target].release(buf);
     }
 
-    /// The bytes a `DeliverBuf` currently holds.
-    pub fn bytes(self: *ReactorFabric, buf: *const DeliverBuf) []const u8 {
-        return self.pool.bytes(buf);
+    /// The bytes a `DeliverBuf` currently holds. Pool-independent (reads the
+    /// buffer directly), so no target shard is needed.
+    pub fn bytes(_: *ReactorFabric, buf: *const DeliverBuf) []const u8 {
+        return buf.data[0..buf.len];
+    }
+
+    /// Record `n` cross-shard messages dropped under back-pressure. Returns the
+    /// count observed BEFORE this call so a caller can rate-limit its logging.
+    pub fn recordDrop(self: *ReactorFabric, n: u64) u64 {
+        return self.dropped.fetchAdd(n, .monotonic);
+    }
+
+    /// Total cross-shard messages dropped under back-pressure since init.
+    pub fn droppedCount(self: *const ReactorFabric) u64 {
+        return self.dropped.load(.monotonic);
     }
 
     /// Enqueue `msg` for the reactor owning `target`. Returns false if that inbox
@@ -187,7 +218,7 @@ test "single-shard fabric round-trips one delivery and reclaims its buffer" {
     try testing.expectEqual(@as(usize, 1), fabric.numShards());
 
     // Acquire → bytes → hand off → drainWake → drain → bytes → release, shard 0.
-    const buf = fabric.acquire("PRIVMSG #zig :hello\r\n") orelse return error.TestExpectedEqual;
+    const buf = fabric.acquire(0, "PRIVMSG #zig :hello\r\n") orelse return error.TestExpectedEqual;
     try testing.expectEqualStrings("PRIVMSG #zig :hello\r\n", fabric.bytes(buf));
 
     const msg = DeliverMsg{ .to = .{ .shard = 0, .slot = 3, .gen = 1 }, .buf = buf };
@@ -200,7 +231,7 @@ test "single-shard fabric round-trips one delivery and reclaims its buffer" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expect(out[0].to.eql(.{ .shard = 0, .slot = 3, .gen = 1 }));
     try testing.expectEqualStrings("PRIVMSG #zig :hello\r\n", fabric.bytes(out[0].buf));
-    fabric.release(out[0].buf);
+    fabric.release(0, out[0].buf);
 }
 
 test "fabric routes deliveries only to the addressed shard" {
@@ -212,8 +243,8 @@ test "fabric routes deliveries only to the addressed shard" {
     };
     defer fabric.deinit();
 
-    const buf1 = fabric.acquire("one") orelse return error.TestExpectedEqual;
-    const buf3 = fabric.acquire("three") orelse return error.TestExpectedEqual;
+    const buf1 = fabric.acquire(1, "one") orelse return error.TestExpectedEqual;
+    const buf3 = fabric.acquire(3, "three") orelse return error.TestExpectedEqual;
 
     try testing.expect(fabric.sendTo(1, .{ .to = .{ .shard = 1, .slot = 5, .gen = 1 }, .buf = buf1 }));
     try testing.expect(fabric.sendTo(3, .{ .to = .{ .shard = 3, .slot = 6, .gen = 1 }, .buf = buf3 }));
@@ -226,12 +257,12 @@ test "fabric routes deliveries only to the addressed shard" {
     const n1 = fabric.drain(1, &out);
     try testing.expectEqual(@as(usize, 1), n1);
     try testing.expectEqualStrings("one", fabric.bytes(out[0].buf));
-    fabric.release(out[0].buf);
+    fabric.release(1, out[0].buf);
 
     const n3 = fabric.drain(3, &out);
     try testing.expectEqual(@as(usize, 1), n3);
     try testing.expectEqualStrings("three", fabric.bytes(out[0].buf));
-    fabric.release(out[0].buf);
+    fabric.release(3, out[0].buf);
 }
 
 /// One consumer reactor stand-in: sleeps in poll() on its wake fd, drains the
@@ -276,7 +307,7 @@ const TestReactor = struct {
     }
 
     fn consume(self: *TestReactor, msg: DeliverMsg) void {
-        defer self.fabric.release(msg.buf);
+        defer self.fabric.release(self.shard_id, msg.buf);
         if (msg.to.shard != self.shard_id) {
             self.corrupt = true;
             return;
@@ -318,7 +349,7 @@ fn produce(fabric: *ReactorFabric, num_shards: u12, per_shard: usize) void {
         // Acquire a pooled buffer (copies the bytes), retrying if in-flight
         // deliveries momentarily drained the pool.
         const buf = while (true) {
-            if (fabric.acquire(payload)) |b| break b;
+            if (fabric.acquire(target, payload)) |b| break b;
             std.Thread.yield() catch {};
         };
         const msg = DeliverMsg{ .to = .{ .shard = target, .slot = @intCast(seq), .gen = 1 }, .buf = buf };
@@ -363,17 +394,75 @@ test "two reactors deliver cross-shard through the fabric exactly once with no b
         try testing.expectEqual(@as(usize, per_shard), r.received);
     }
 
-    // Every handed-off buffer must be back in the pool: drain to exhaustion and
-    // confirm exactly the full slot count is reclaimable (no handoff leak).
-    var reclaimed: usize = 0;
-    var pinned: ?*DeliverBuf = null;
-    while (fabric.acquire("x")) |b| {
-        reclaimed += 1;
-        if (reclaimed > ReactorFabric.pool_slots) {
-            pinned = b;
-            break;
+    // Every handed-off buffer must be back in its shard's pool: for each shard,
+    // drain that pool to exhaustion and confirm exactly the full slot count is
+    // reclaimable (no handoff leak, and per-shard pools stayed independent).
+    for (0..num_shards) |i| {
+        const sid: u12 = @intCast(i);
+        var reclaimed: usize = 0;
+        var pinned: ?*DeliverBuf = null;
+        while (fabric.acquire(sid, "x")) |b| {
+            reclaimed += 1;
+            if (reclaimed > ReactorFabric.pool_slots) {
+                pinned = b;
+                break;
+            }
         }
+        if (pinned) |b| fabric.release(sid, b);
+        try testing.expectEqual(@as(usize, ReactorFabric.pool_slots), reclaimed);
     }
-    if (pinned) |b| fabric.release(b);
-    try testing.expectEqual(@as(usize, ReactorFabric.pool_slots), reclaimed);
+}
+
+test "fabric per-shard pools scale the buffer budget with shard count" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const num_shards: u12 = 3;
+    var fabric = ReactorFabric.init(testing.allocator, num_shards) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    // Draining ONE shard's pool to exhaustion must not touch any other shard's
+    // pool: the budget is per-shard, so total capacity scales as
+    // num_shards * pool_slots rather than a single fixed 256.
+    var held: [ReactorFabric.pool_slots]*DeliverBuf = undefined;
+    for (0..ReactorFabric.pool_slots) |i| {
+        held[i] = fabric.acquire(0, "x") orelse return error.TestExpectedEqual;
+    }
+    // Shard 0 is now exhausted...
+    try testing.expectEqual(@as(?*DeliverBuf, null), fabric.acquire(0, "x"));
+    // ...but shards 1 and 2 are untouched and each yields a full pool.
+    var others: usize = 0;
+    for ([_]u12{ 1, 2 }) |sid| {
+        var got: usize = 0;
+        while (fabric.acquire(sid, "y")) |b| {
+            got += 1;
+            if (got > ReactorFabric.pool_slots) {
+                fabric.release(sid, b);
+                break;
+            }
+        }
+        try testing.expectEqual(ReactorFabric.pool_slots, got);
+        others += got;
+    }
+    try testing.expectEqual(@as(usize, 2 * ReactorFabric.pool_slots), others);
+
+    for (held) |b| fabric.release(0, b);
+}
+
+test "fabric drop counter accumulates and is observable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var fabric = ReactorFabric.init(testing.allocator, 2) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    try testing.expectEqual(@as(u64, 0), fabric.droppedCount());
+    // recordDrop returns the count observed BEFORE the add (for rate-limited logs).
+    try testing.expectEqual(@as(u64, 0), fabric.recordDrop(1));
+    try testing.expectEqual(@as(u64, 1), fabric.recordDrop(3));
+    try testing.expectEqual(@as(u64, 4), fabric.droppedCount());
 }

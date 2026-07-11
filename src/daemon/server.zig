@@ -2507,6 +2507,43 @@ fn unescapeTagInto(escaped: []const u8, out: []u8) ?[]const u8 {
 /// reached via `LinuxServer.rx()`; the sharded model turns this into an array
 /// (one per thread) addressed by a thread-local current reactor, with no
 /// call-site changes (every handler already goes through `rx()`).
+/// Per-reactor fan-out wake coalescer. A channel broadcast delivers to M members
+/// spread over up to `num_shards` shards; without coalescing each cross-shard
+/// recipient triggers its own `wake()` eventfd write, so an M-member PRIVMSG costs
+/// up to M syscalls on the sending reactor. During a batch, deliveries only SET a
+/// bit for the touched target shard; the batch end fires one wake per distinct
+/// shard (K wakes, K = distinct shards touched). Wakes still land strictly after
+/// every enqueue, so no wake is ever missed. A depth counter makes nested batches
+/// safe: only the outermost `endWakeBatch` flushes.
+const WakeBatch = struct {
+    /// One bit per possible shard; `max_shards` is a comptime ceiling (4096), so
+    /// this is a fixed 64-word (512-byte) reactor-resident set — no allocation.
+    const word_bits = 64;
+    const words_len = (shard_mod.max_shards + word_bits - 1) / word_bits;
+
+    /// Re-entrancy depth. `active()` is true inside any batch; only depth→0 flushes.
+    depth: u32 = 0,
+    words: [words_len]u64 = @splat(0),
+
+    inline fn active(self: *const WakeBatch) bool {
+        return self.depth != 0;
+    }
+
+    /// Record that `shard` received at least one cross-shard delivery this batch.
+    inline fn mark(self: *WakeBatch, shard: u12) void {
+        const idx: usize = @as(usize, shard) / word_bits;
+        const bit: u6 = @intCast(@as(usize, shard) % word_bits);
+        self.words[idx] |= (@as(u64, 1) << bit);
+    }
+
+    /// Number of DISTINCT shards marked — i.e. the exact wake count a flush emits.
+    fn distinctCount(self: *const WakeBatch) usize {
+        var n: usize = 0;
+        for (self.words) |w| n += @popCount(w);
+        return n;
+    }
+};
+
 const Reactor = struct {
     /// This reactor's io_uring (accept/recv/send/poll/timeout completions).
     ring: RingCore,
@@ -2540,6 +2577,13 @@ const Reactor = struct {
     wake: ?reactor_wake.ReactorWake = null,
     wake_armed: bool = false,
     wake_count: std.atomic.Value(u32) = .init(0),
+
+    /// Fan-out wake coalescer, touched ONLY by this reactor's own thread while it
+    /// runs a broadcast (`beginWakeBatch`/`endWakeBatch`). During a batch, each
+    /// cross-shard delivery records its TARGET shard here instead of firing a wake
+    /// eventfd; the batch end fires exactly one wake per distinct target shard. No
+    /// synchronization needed: it is reactor-local, like `clients`/`send_buf`.
+    wake_batch: WakeBatch = .{},
 
     /// Tear down the reactor's ring, connection table, wake fd, and listeners.
     /// The caller drains per-connection link/tls/multiline state first.
@@ -4446,7 +4490,9 @@ pub const LinuxServer = struct {
             const n = fabric.drain(my_shard, &msgs);
             if (n == 0) break;
             for (msgs[0..n]) |msg| {
-                defer fabric.release(msg.buf);
+                // Every buffer this reactor drains was acquired for ITS shard, so
+                // it goes back to this shard's pool.
+                defer fabric.release(my_shard, msg.buf);
                 const bytes = fabric.bytes(msg.buf);
                 // Cross-shard OBSERVE fan-out: `bytes` is an encoded observe_event;
                 // decode it and push a per-watcher OBSERVE line to THIS reactor's
@@ -6863,12 +6909,13 @@ pub const LinuxServer = struct {
             return self.closeConn(tok, close_reason);
         }
         const fabric = if (self.fabric) |*f| f else return;
-        const buf = fabric.acquire("") orelse return;
+        const buf = fabric.acquire(id.shard, "") orelse return;
         if (!fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = true, .close_reason = close_reason })) {
-            fabric.release(buf);
+            fabric.release(id.shard, buf);
+            self.noteCrossShardDrop(fabric, 1);
             return;
         }
-        if (self.reactors[id.shard].wake) |*w| w.wake();
+        self.wakeShard(id.shard);
     }
 
     fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) !void {
@@ -6923,15 +6970,26 @@ pub const LinuxServer = struct {
             const chunk = bytes[off..end];
             // Retry acquire on momentary pool exhaustion; the target drains
             // continuously so a buffer frees shortly. Bounded so a wedged target
-            // cannot spin this forever.
+            // cannot spin this forever. Per-shard pools size each pool to its
+            // inbox, so an exhausted pool means the inbox is (near) full too — the
+            // full-inbox wake below is what unsticks both.
             var spins: usize = 0;
             const buf = while (true) {
-                if (fabric.acquire(chunk)) |b| break b;
+                if (fabric.acquire(id.shard, chunk)) |b| break b;
+                if (spins == 0) self.wakeShard(id.shard); // nudge the target to drain
                 spins += 1;
-                if (spins > 4096) return; // give up on this chunk; never block the reactor
+                if (spins > 4096) {
+                    // Give up on this chunk; never block the reactor. A COUNTED,
+                    // observable drop — not a silent one.
+                    self.noteCrossShardDrop(fabric, 1);
+                    return;
+                }
                 std.atomic.spinLoopHint();
             };
-            // Likewise retry a full inbox briefly, then drop to avoid a stall.
+            // Likewise retry a full inbox briefly, then drop to avoid a stall. On
+            // the first full observation wake the owning reactor so it drains and
+            // frees a slot (this is the safety valve that keeps a deferred/batched
+            // wake from wedging a large single-shard fan-out).
             var pushed = false;
             var psp: usize = 0;
             const is_last = opts.close_after and end == bytes.len;
@@ -6946,10 +7004,12 @@ pub const LinuxServer = struct {
                     pushed = true;
                     break;
                 }
+                if (psp == 0) self.wakeShard(id.shard);
                 std.atomic.spinLoopHint();
             }
             if (!pushed) {
-                fabric.release(buf);
+                fabric.release(id.shard, buf);
+                self.noteCrossShardDrop(fabric, 1);
                 return;
             }
             off = end;
@@ -6959,7 +7019,74 @@ pub const LinuxServer = struct {
         // consumes the mailbox we just pushed to. We deliberately do not use the
         // fabric's own wake fds: the reactor loop only watches `Reactor.wake`, so
         // unifying on it reuses the existing arm/poll plumbing.
-        if (self.reactors[id.shard].wake) |*w| w.wake();
+        //
+        // Inside a fan-out (`beginWakeBatch`), do NOT wake per recipient: record
+        // the touched shard and let `endWakeBatch` fire ONE wake per shard after
+        // the whole member loop. Wakes still land strictly after every enqueue, so
+        // no wake is missed; a channel with M cross-shard members costs K wakes
+        // (K = distinct shards) instead of M eventfd writes.
+        const rctr = self.rx();
+        if (rctr.wake_batch.active()) {
+            rctr.wake_batch.mark(id.shard);
+        } else {
+            self.wakeShard(id.shard);
+        }
+    }
+
+    /// Wake the reactor owning `shard` through its own wake eventfd so its loop
+    /// runs and drains its fabric inbox. No-op if that reactor has no eventfd.
+    inline fn wakeShard(self: *LinuxServer, shard: u12) void {
+        if (self.reactors[shard].wake) |*w| w.wake();
+    }
+
+    /// Account `n` cross-shard messages shed under sustained back-pressure. Bumps
+    /// the fabric's observable counter and emits a rate-limited warn (first drop,
+    /// then every 1024th) so a lossy fan-out surfaces in logs without spamming.
+    fn noteCrossShardDrop(self: *LinuxServer, fabric: *reactor_fabric.ReactorFabric, n: u64) void {
+        const prior = fabric.recordDrop(n);
+        if (prior % 1024 == 0) {
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &buf,
+                "cross-shard delivery dropped under back-pressure (total {d})",
+                .{prior + n},
+            ) catch "cross-shard delivery dropped under back-pressure";
+            self.traceLog(.warn, .reactor, line);
+        }
+    }
+
+    /// Total cross-shard messages dropped under back-pressure (0 without a fabric).
+    fn crossShardDrops(self: *LinuxServer) u64 {
+        const fabric = if (self.fabric) |*f| f else return 0;
+        return fabric.droppedCount();
+    }
+
+    /// Open a fan-out wake batch on the calling reactor. Until the matching
+    /// `endWakeBatch`, cross-shard deliveries record their target shard instead of
+    /// waking it, so an M-member broadcast coalesces to one wake per touched shard.
+    /// Re-entrant (depth-counted); pair with `defer self.endWakeBatch()`.
+    inline fn beginWakeBatch(self: *LinuxServer) void {
+        self.rx().wake_batch.depth += 1;
+    }
+
+    /// Close a fan-out wake batch. The OUTERMOST close (depth→0) fires exactly one
+    /// wake per distinct shard touched during the batch and clears the set. Because
+    /// every enqueue happened before this flush, no wake can be missed.
+    fn endWakeBatch(self: *LinuxServer) void {
+        const batch = &self.rx().wake_batch;
+        std.debug.assert(batch.depth > 0);
+        batch.depth -= 1;
+        if (batch.depth != 0) return;
+        for (&batch.words, 0..) |*w, wi| {
+            var bits = w.*;
+            while (bits != 0) {
+                const b: u6 = @intCast(@ctz(bits));
+                const shard: u12 = @intCast(wi * WakeBatch.word_bits + b);
+                self.wakeShard(shard);
+                bits &= bits - 1;
+            }
+            w.* = 0;
+        }
     }
 
     fn deliver(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
@@ -7129,6 +7256,9 @@ pub const LinuxServer = struct {
         except: ?client_model.ClientId,
     ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        // Coalesce per-recipient cross-shard wakes into one wake per touched shard.
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
             if (except) |skip| {
@@ -7147,6 +7277,8 @@ pub const LinuxServer = struct {
         var tag_buf: [48]u8 = undefined;
         const tag = serverTimeTag(&tag_buf);
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         while (members.next()) |member| {
             const id = clientIdFromWorld(member.*);
             if (except) |skip| {
@@ -7166,6 +7298,8 @@ pub const LinuxServer = struct {
         var tag_buf: [48]u8 = undefined;
         const tag = serverTimeTag(&tag_buf);
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         while (members.next()) |member| {
             const id = clientIdFromWorld(member.*);
             if (except) |skip| {
@@ -7186,6 +7320,8 @@ pub const LinuxServer = struct {
         except: ?client_model.ClientId,
     ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         while (members.next()) |member| {
             const id = clientIdFromWorld(member.*);
             if (except) |skip| {
@@ -7208,6 +7344,8 @@ pub const LinuxServer = struct {
         min_rank: u8,
     ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         while (members.next()) |member| {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
             if (mm.rank() < min_rank) continue;
@@ -18282,15 +18420,21 @@ pub const LinuxServer = struct {
             var shard: u12 = 0;
             while (shard < total) : (shard += 1) {
                 if (shard == my_shard) continue;
-                const buf = fabric.acquire(wire) orelse continue;
+                const buf = fabric.acquire(shard, wire) orelse {
+                    self.noteCrossShardDrop(fabric, 1);
+                    continue;
+                };
                 const fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
                     .broadcast_observe = true,
                 };
                 if (fabric.sendTo(shard, fan)) {
-                    if (self.reactors[shard].wake) |*w| w.wake();
-                } else fabric.release(buf);
+                    self.wakeShard(shard);
+                } else {
+                    fabric.release(shard, buf);
+                    self.noteCrossShardDrop(fabric, 1);
+                }
             }
         }
     }
@@ -27972,7 +28116,10 @@ pub const LinuxServer = struct {
             var shard: u12 = 0;
             while (shard < total) : (shard += 1) {
                 if (shard == my_shard) continue;
-                const buf = fabric.acquire(message) orelse continue;
+                const buf = fabric.acquire(shard, message) orelse {
+                    self.noteCrossShardDrop(fabric, 1);
+                    continue;
+                };
                 var fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
@@ -27988,8 +28135,11 @@ pub const LinuxServer = struct {
                 @memcpy(fan.broadcast_origin[0..on], origin_server[0..on]);
                 fan.broadcast_origin_len = @intCast(on);
                 if (fabric.sendTo(shard, fan)) {
-                    if (self.reactors[shard].wake) |*w| w.wake();
-                } else fabric.release(buf);
+                    self.wakeShard(shard);
+                } else {
+                    fabric.release(shard, buf);
+                    self.noteCrossShardDrop(fabric, 1);
+                }
             }
         }
     }
@@ -41574,6 +41724,76 @@ test "event spine: +U OPMODERATE POLICY fan-out reaches oper on another shard" {
         try expectContains(written, " EVENT RemoteOper ");
         try expectContains(written, "#o held message from B: held-cross-shard");
     } else return error.SkipZigTest;
+}
+
+test "broadcast wake batch coalesces M member marks into K distinct shard wakes" {
+    // FIX B: a broadcast to M cross-shard members must cost one wake per DISTINCT
+    // touched shard (K), not one per member (M). The coalescer's distinct-shard
+    // count IS that wake count, so proving it collapses duplicates proves the fix.
+    var wb: WakeBatch = .{};
+    // A 10-member fan-out landing on shards {0,1,2}: 10 marks, 3 distinct shards.
+    const member_shards = [_]u12{ 1, 2, 0, 1, 2, 0, 1, 2, 0, 1 };
+    for (member_shards) |s| wb.mark(s);
+    try std.testing.expectEqual(@as(usize, 3), wb.distinctCount());
+
+    // A single shard hammered by hundreds of members still costs exactly one wake.
+    var single: WakeBatch = .{};
+    for (0..300) |_| single.mark(2);
+    try std.testing.expectEqual(@as(usize, 1), single.distinctCount());
+
+    // A high shard index must land in a later bitmap word (word-index + bit math).
+    var hi: WakeBatch = .{};
+    hi.mark(0);
+    hi.mark(shard_mod.max_shards - 1);
+    try std.testing.expectEqual(@as(usize, 2), hi.distinctCount());
+}
+
+test "cross-shard deliver: pool-exhaustion drops are counted, never silent" {
+    // FIX A: when a shard's pool/inbox is saturated the fan-out sheds load rather
+    // than block the reactor — but the drop MUST be observable (counter/warn), not
+    // a silent black-hole. Drive one delivery into a deliberately-exhausted shard
+    // pool and assert the drop counter rises by exactly one.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const prev_reactor = current_reactor;
+    defer current_reactor = prev_reactor;
+    current_reactor = &server.reactors[0]; // send FROM shard 0
+
+    const fabric = &server.fabric.?;
+    // Exhaust shard 1's per-shard pool so every cross-shard acquire for shard 1
+    // fails; hold the buffers for the whole test.
+    var held: [reactor_fabric.ReactorFabric.pool_slots]*reactor_fabric.DeliverBuf = undefined;
+    for (0..held.len) |i| held[i] = fabric.acquire(1, "x") orelse return error.TestExpectedEqual;
+    defer for (held) |b| fabric.release(1, b);
+
+    // Independence: shard 0's pool is untouched while shard 1 is dry (per-shard
+    // pools scale the budget rather than sharing one fixed pool).
+    const probe = fabric.acquire(0, "y") orelse return error.TestExpectedEqual;
+    fabric.release(0, probe);
+
+    const before = server.crossShardDrops();
+    // A client pinned to shard 1: cross-shard delivery does not check target
+    // liveness, only the routing shard, so a bare id suffices. The bounded retry
+    // must give up and count exactly one drop.
+    const target = client_model.ClientId{ .shard = 1, .slot = 0, .gen = 1 };
+    try server.enqueueDelivery(target, "PRIVMSG #x :hi\r\n");
+    try std.testing.expectEqual(before + 1, server.crossShardDrops());
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {
