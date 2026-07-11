@@ -13,7 +13,8 @@
 //!
 //! Responses use Discord-shaped status codes:
 //!   204 success · 400 bad payload · 401 bad token · 404 unknown id ·
-//!   405 wrong method · 413 too large · 429 rate-limited (+ `Retry-After`).
+//!   405 wrong method · 411 missing Content-Length · 413 too large ·
+//!   429 rate-limited (+ `Retry-After`).
 //!
 //! TLS is intentionally out of scope: front this listener with a reverse proxy
 //! (nginx/Caddy) that terminates HTTPS and forwards to the configured loopback
@@ -104,20 +105,24 @@ pub fn handleRequest(
     if (!std.mem.eql(u8, method, "POST"))
         return writeSimple(out, "405 Method Not Allowed", "method not allowed\n", null);
 
-    // --- Body size gate -------------------------------------------------
+    // --- Body length gate -----------------------------------------------
+    // A POST body MUST declare a valid Content-Length. Rejecting fast with 411
+    // (rather than falling back to "read the body until the peer closes or the
+    // read timeout fires") closes an unauthenticated slow-read DoS on the
+    // single-threaded accept loop: a body-bearing request with no length header
+    // otherwise pins the one-connection-at-a-time serveConn loop for the whole
+    // RCVTIMEO window. A buffering reverse proxy always supplies Content-Length.
     const headers = request_bytes[0..head_end];
     const body = request_bytes[head_end + 4 ..];
-    const declared = contentLength(headers);
-    const effective_len = declared orelse body.len;
-    if (effective_len > cfg.max_body)
+    const declared = contentLength(headers) orelse
+        return writeSimple(out, "411 Length Required", "length required\n", null);
+    if (declared > cfg.max_body)
         return writeSimple(out, "413 Payload Too Large", "payload too large\n", null);
-    // If a length was declared, honour exactly that many body bytes (a client
-    // may pipeline; we never read past the declared body).
-    const body_slice = if (declared) |d| body[0..@min(d, body.len)] else body;
-    if (declared) |d| {
-        if (d > body_slice.len)
-            return writeSimple(out, "400 Bad Request", "truncated body\n", null);
-    }
+    // Honour exactly the declared body length (a client may pipeline; we never
+    // read past the declared body).
+    const body_slice = body[0..@min(declared, body.len)];
+    if (declared > body_slice.len)
+        return writeSimple(out, "400 Bad Request", "truncated body\n", null);
 
     // --- Token verification (constant-time) + rate limit ----------------
     var resolved: webhook.Resolved = .{};
@@ -299,6 +304,9 @@ pub const WebhookServer = struct {
 /// byte count, or null on read error before any bytes. Stops early once the
 /// declared `Content-Length` body is complete so a keep-alive-less client that
 /// leaves the socket open does not stall the loop for the whole read timeout.
+/// A request with no `Content-Length` completes at the header boundary (its
+/// body, if any, is never awaited — `handleRequest` answers such a POST 411),
+/// which is what keeps a length-less slow body from pinning the accept loop.
 fn readRequest(fd: linux.fd_t, buf: []u8, max_body: usize) ?usize {
     var total: usize = 0;
     var header_end: ?usize = null;
@@ -403,6 +411,16 @@ fn buildRequest(buf: []u8, id: []const u8, token: []const u8, body: []const u8) 
     ) catch unreachable;
 }
 
+/// Like `buildRequest`, but deliberately omits the `Content-Length` header — a
+/// body-bearing POST that must be rejected fast (411) rather than awaited.
+fn buildRequestNoLen(buf: []u8, id: []const u8, token: []const u8, body: []const u8) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\r\n{s}",
+        .{ id, token, body },
+    ) catch unreachable;
+}
+
 test "handleRequest returns 204 and enqueues a post on a valid request" {
     var store = webhook.WebhookStore.init();
     const creds = seed(&store);
@@ -449,6 +467,69 @@ test "handleRequest 400 for bad JSON and empty payload" {
 
     const empty = try handleRequest(&store, rec.sink(), .{}, testing.allocator, buildRequest(&reqbuf, &creds.id, &creds.token, "{}"), 0, &out);
     try testing.expect(std.mem.startsWith(u8, empty, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+test "handleRequest 411 when a POST body has no Content-Length" {
+    // Regression for the unauthenticated slow-read DoS: a body-bearing POST with
+    // no Content-Length header must fail fast (411) instead of being accepted or
+    // stalling the accept loop until the read timeout fires. Pre-fix this
+    // returned 204 (the body was silently honoured via a length fallback).
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var rec = RecordingSink{};
+    var reqbuf: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+
+    const req = buildRequestNoLen(&reqbuf, &creds.id, &creds.token, "{\"content\":\"hi\"}");
+    const resp = try handleRequest(&store, rec.sink(), .{}, testing.allocator, req, 0, &out);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 411 Length Required\r\n"));
+    // The 411 short-circuits before token verify / render — nothing enqueued.
+    try testing.expect(rec.got == null);
+}
+
+test "handleRequest 411 rejects an unparseable Content-Length on a POST body" {
+    // A syntactically invalid length is treated as "no valid Content-Length".
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var rec = RecordingSink{};
+    var reqbuf: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const req = std.fmt.bufPrint(
+        &reqbuf,
+        "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n{{\"content\":\"x\"}}",
+        .{ creds.id, creds.token },
+    ) catch unreachable;
+    const resp = try handleRequest(&store, rec.sink(), .{}, testing.allocator, req, 0, &out);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 411 Length Required\r\n"));
+    try testing.expect(rec.got == null);
+}
+
+test "handleRequest still returns 204 for a well-formed POST with Content-Length" {
+    // No regression: the length-present happy path reaches the handler and posts.
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var rec = RecordingSink{};
+    var reqbuf: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const req = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"ok\"}");
+    const resp = try handleRequest(&store, rec.sink(), .{}, testing.allocator, req, 0, &out);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 204 No Content\r\n"));
+    try testing.expect(rec.got != null);
+    try testing.expectEqualStrings("ok", rec.got.?.body());
+}
+
+test "handleRequest 405 for a bodiless non-POST is not masked by the 411 gate" {
+    // A GET carries no body and no Content-Length; it must still be answered 405
+    // (wrong method), never 411 — the length gate is POST-only and sits after
+    // the method check.
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var rec = RecordingSink{};
+    var out: [1024]u8 = undefined;
+    var reqbuf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&reqbuf, "GET /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\n\r\n", .{ creds.id, creds.token }) catch unreachable;
+    const resp = try handleRequest(&store, rec.sink(), .{}, testing.allocator, req, 0, &out);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 405 Method Not Allowed\r\n"));
 }
 
 test "handleRequest 405 for a non-POST method on a valid webhook path" {
@@ -541,6 +622,41 @@ test "WebhookServer serves a POST over loopback and enqueues a post" {
     while (rec.got == null and tries < 1000) : (tries += 1) std.Thread.yield() catch {};
     try testing.expect(rec.got != null);
     try testing.expectEqualStrings("loop", rec.got.?.body());
+}
+
+test "WebhookServer answers 411 promptly for a length-less POST body over loopback" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var rec = RecordingSink{};
+
+    var server = WebhookServer.init(&store, rec.sink(), 0, .{}) catch return error.SkipZigTest;
+    try server.spawn();
+    defer server.shutdown();
+
+    const cfd = try socketTcp();
+    defer closeFd(cfd);
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, server.port),
+        .addr = std.mem.nativeToBig(u32, loopback_addr),
+    };
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+
+    // A complete header block, a JSON body, and NO Content-Length. Pre-fix the
+    // server would honour the fallback body (204); it now short-circuits 411
+    // without waiting for the read timeout.
+    var reqbuf: [512]u8 = undefined;
+    const req = buildRequestNoLen(&reqbuf, &creds.id, &creds.token, "{\"content\":\"nolen\"}");
+    writeAll(cfd, req);
+
+    var buf: [512]u8 = undefined;
+    const rc = linux.read(cfd, &buf, buf.len);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
+    const got = buf[0..@intCast(rc)];
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 411 Length Required\r\n"));
+
+    // Nothing was enqueued for the reactor.
+    try testing.expect(rec.got == null);
 }
 
 test {
