@@ -567,6 +567,10 @@ fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *cons
     var s2c_key: [32]u8 = undefined;
     var c2s_nonce: [12]u8 = undefined;
     var s2c_nonce: [12]u8 = undefined;
+    // ChainKey.init copies the bytes into the Secret(T), so wiping the raw stack
+    // arrays afterward is safe. Nonces are public and are not wiped.
+    defer secureZero(&c2s_key);
+    defer secureZero(&s2c_key);
     try Hkdf.expand(&root, "c2s aead key gen0", &c2s_key);
     try Hkdf.expand(&root, "s2c aead key gen0", &s2c_key);
     try Hkdf.expand(&root, "c2s nonce gen0", &c2s_nonce);
@@ -587,6 +591,8 @@ fn m2Secret(first: *const xwing.SharedSecret, second: *const xwing.SharedSecret,
     h.update(prefix);
     var out: [32]u8 = undefined;
     h.final(&out);
+    // SharedSecret.init copies the bytes; wipe the raw stack residue afterward.
+    defer secureZero(&out);
     return xwing.SharedSecret.init(out);
 }
 

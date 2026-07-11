@@ -168,6 +168,7 @@ pub fn verify(token: Token, trust_root: anytype, now_ms: u64) VerifyError!void {
 
     if (!std.mem.eql(u8, token.fields.realm, root.realm)) return error.WrongRealm;
     if (token.fields.revocation_epoch < root.min_revocation_epoch) return error.Revoked;
+    if (now_ms < token.fields.issued_ms) return error.Expired;
     if (now_ms > token.fields.expiry_ms) return error.Expired;
 }
 
@@ -435,6 +436,18 @@ test "expired token fails as Expired" {
     const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
 
     try std.testing.expectError(error.Expired, verify(token, issuer.public_key.toBytes(), 10_001));
+}
+
+test "not-yet-valid token fails as Expired" {
+    const issuer = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x15)));
+    const node = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x26)));
+    // sampleFields issues at 1_000ms; a clock before the not-before must be rejected.
+    const token = try issue(issuer, sampleFields(node.public_key.toBytes()));
+
+    try std.testing.expectError(error.Expired, verify(token, issuer.public_key.toBytes(), 999));
+    // A clock exactly at issued_ms (and within expiry) is valid.
+    try verify(token, issuer.public_key.toBytes(), 1_000);
+    try verify(token, issuer.public_key.toBytes(), 2_000);
 }
 
 test "wrong realm fails as WrongRealm" {
