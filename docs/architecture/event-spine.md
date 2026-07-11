@@ -27,7 +27,7 @@ Both wire planes share the same daemon triad: a local cross-shard fan-out (`deli
 
 `EventCategory` is an `enum(u6)` of thirteen variants: `connect`, `disconnect`, `server_link`, `flood`, `error`, `announce`, `oper_action`, `kill`, `spam`, `debug`, `policy`, `service`, `security` ([src/daemon/event_spine.zig](../../src/daemon/event_spine.zig)). Each has an uppercase wire `code()` (e.g. `OPER_ACTION`) and a lowercase `token()`. `EventCategory.parse` matches either form case-insensitively, but is deliberately **alias-free**: it never resolves the IRCX draft names `CHANNEL`/`MEMBER`/`USER`, so the token-routed IRCX plane can never fold back into the category mask (a regression the tests pin explicitly).
 
-`EventSeverity` is ordered low→high — `debug`, `info`, `notice`, `warn`, `error`, `critical` — so `@intFromEnum(sev) >= min` is a valid threshold test. `parse` accepts the tag names plus the alias `warning → warn`.
+`EventSeverity` is ordered low→high — `debug`, `info`, `notice`, `warn`, `error`, `critical` — so `@intFromEnum(sev) >= min` is a valid threshold test. That declaration order is comptime-pinned, and `EventSeverity.atLeast` is the shared threshold predicate used by session delivery filters and the replay/collapse safety rules. `parse` accepts the tag names plus the alias `warning → warn`.
 
 `CategoryMask` is a `u64` bitset over the categories with `add`/`remove`/`include`/`exclude`/`contains`/`intersects`. `categoryMaskFromTokens` builds a mask from config tokens (case-insensitive names or the special `ALL`) and backs `[[opers]] presubscribe`. The parallel `IrcxEventMask` (a `u8`) tracks the four IRCX types; `IrcxEventType.fromMessage` classifies an event body by its leading TYPE token, which is the authoritative, wire-stable routing key for IRCX subscribers.
 
@@ -115,7 +115,7 @@ Both codecs are bounded per-field (so a hostile peer cannot pin large buffers), 
 
 ## Operator commands
 
-`EVENT` is the single command surface (`handleEvent`), registered by the IRCX module. There are no live module registrations for separate `WALLOPS`, `OPERWALL`, snomask, or `+w` delivery commands; those operator surfaces are represented as typed Event Spine categories, and the former wallops send path is `EVENT BROADCAST`. Opers are gated by the `event_subscribe` privilege. Ordinary clients are limited to the IRCX plane, and subscription-changing use is MEDIA-only.
+`EVENT` is the single command surface (`handleEvent`), registered by the IRCX module. There are no live module registrations for separate `WALLOPS`, `OPERWALL`, or snomask commands; those operator surfaces are represented as typed Event Spine categories, and the former wallops send path is `EVENT BROADCAST`. The legacy user-mode `+w` oper-notice surface is represented by typed subscriptions too; this is distinct from the current IRCX channel `+w` NOWHISPER flag. Opers are gated by the `event_subscribe` privilege. Ordinary clients are limited to the IRCX plane, and subscription-changing use is MEDIA-only.
 
 | Subcommand | Behavior |
 | --- | --- |
