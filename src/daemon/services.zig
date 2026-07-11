@@ -1259,7 +1259,18 @@ pub const Services = struct {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
-        var record = try self.loadAccount(name);
+        var record = self.loadAccount(name) catch |err| switch (err) {
+            // A missing account must cost the same as a present account with a
+            // wrong password so ACCOUNTSET cannot be used as a timing oracle to
+            // enumerate registered accounts (handleAccountSet has no login
+            // throttle and returns the identical ERR_PASSWDMISMATCH). Run the
+            // dummy PBKDF2, matching identifyAccount, before returning NotFound.
+            error.NotFound => {
+                try rejectMissingAccount(password, self.cfg.pbkdf2_rounds);
+                return error.NotFound;
+            },
+            else => return err,
+        };
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         switch (field) {
             .email => |email| {
@@ -1496,6 +1507,12 @@ pub const Services = struct {
 
         switch (action) {
             .query => {
+                // Reading back another account's access level is moderation
+                // state: gate it with the same .admin requirement as the
+                // list-all sibling (channelAccessList) so an actor with no
+                // access cannot probe who holds FOUNDER/OP/VOICE on a channel
+                // they do not administer.
+                try self.requireAccess(record, actor, .admin);
                 const access = try self.loadAccess(record, target_key.asSlice());
                 return .{ .access = access.info() };
             },
@@ -1579,6 +1596,11 @@ pub const Services = struct {
         const clean_mask = try validateMask(mask);
         switch (action) {
             .query => {
+                // An AKICK mask + its reason text is moderation state: gate the
+                // query with the same .admin requirement as the list-all sibling
+                // (channelAkickList) so an actor with no access to the channel
+                // cannot read back the ban list mask/reason.
+                try self.requireAccess(record, actor, .admin);
                 const akick = try self.loadAkick(record, clean_mask.asSlice());
                 return .{ .akick = akick.info() };
             },
@@ -3972,8 +3994,11 @@ test "channel register and access grant" {
     const granted = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
     try std.testing.expectEqual(AccessLevel.op, granted.access.level);
 
-    const queried = try services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch);
+    // The founder (admin+) may read back another account's access level.
+    const queried = try services.channelAccess("#orochi", "alice", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, queried.access.level);
+    // But an actor lacking .admin (op-level bob) may NOT probe access state.
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch));
 }
 
 test "channel mlock access akick and ward replay from durable services" {
@@ -4198,6 +4223,79 @@ test "non-admin channel mutations are forbidden" {
     try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "carol", .revoke, .op, &scratch));
     try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .add, "bad", &scratch));
     try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .remove, "", &scratch));
+}
+
+test "channel access and akick query require admin" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-query-gate.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
+    _ = try services.registerAccount("mallory", "a third correct battery staple", &scratch);
+    _ = try services.registerChannel("#Orochi", "alice", &scratch);
+    _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
+    _ = try services.channelAkick("#orochi", "alice", "Bad!*@*", .add, "go away", &scratch);
+
+    // mallory has NO access to #orochi: both query paths must be Forbidden and
+    // must not leak the access level or the akick mask/reason.
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "mallory", "bob", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "mallory", "Bad!*@*", .query, "", &scratch));
+
+    // bob holds op (below .admin): still Forbidden on either query.
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "Bad!*@*", .query, "", &scratch));
+
+    // The founder (admin+) may still read both back.
+    const acc = try services.channelAccess("#orochi", "alice", "bob", .query, .voice, &scratch);
+    try std.testing.expectEqual(AccessLevel.op, acc.access.level);
+    const ak = try services.channelAkick("#orochi", "alice", "Bad!*@*", .query, "", &scratch);
+    try std.testing.expectEqualStrings("go away", ak.akick.reason.asSlice());
+}
+
+test "setAccount on a missing account runs the dummy hash reject path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-setaccount-missing.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    // A missing account must take the same rejection path (dummy PBKDF2) as a
+    // present account with the wrong password so ACCOUNTSET is not a timing
+    // oracle. Structurally we assert both reach the credential-failure surface
+    // rather than a fast NotFound short-circuit: a MISSING account with a
+    // policy-passing password returns NotFound (after the dummy hash), and a
+    // PRESENT account with a wrong password returns AuthFailed.
+    try std.testing.expectError(error.NotFound, services.setAccount(
+        "ghost",
+        "correct horse battery staple",
+        .{ .email = "ghost@example.test" },
+        &scratch,
+    ));
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    try std.testing.expectError(error.AuthFailed, services.setAccount(
+        "alice",
+        "wrong horse battery staple",
+        .{ .email = "alice@example.test" },
+        &scratch,
+    ));
+
+    // A password that fails the length/char policy short-circuits identically
+    // on both the missing and present paths (validatePassword precedes any
+    // hashing in both rejectMissingAccount and verifyPassword).
+    try std.testing.expectError(error.InvalidPassword, services.setAccount(
+        "ghost",
+        "x",
+        .{ .email = "ghost@example.test" },
+        &scratch,
+    ));
 }
 
 test "missing access and akick removals return not found" {
