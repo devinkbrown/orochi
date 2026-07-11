@@ -2,7 +2,7 @@
 
 *Presence, identity, and channel lookups, plus away state, realname changes, and built-in help.*
 
-These commands are registered by `user.query` (`src/daemon/modules/user_query.zig:71`), along with disabled and heartbeat helpers from `feature.misc` (`src/daemon/modules/feature_misc.zig:56`).
+Most of these commands are registered by `user.query` (`src/daemon/modules/user_query.zig:72`); `LUSERS` is registered by `query.info` (`src/daemon/modules/query_info.zig:46`, `src/daemon/modules/query_info.zig:75`) and `LISTX` by `ircx` (`src/daemon/modules/ircx.zig:51`, `src/daemon/modules/ircx.zig:71`).
 
 ## ISON
 
@@ -13,7 +13,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 - Replies: `RPL_ISON 303`.
 - Errors: Registry `ERR_NEEDMOREPARAMS 461` is not configured for this command; handler has no command-specific errors.
 - Example: `ISON alice bob carol`
-- Sources: `src/daemon/modules/user_query.zig:72`, `src/daemon/server.zig:4622`
+- Sources: `src/daemon/modules/user_query.zig:75`, `src/daemon/server.zig:12632`
 
 ## USERHOST
 
@@ -24,51 +24,73 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 - Replies: `RPL_USERHOST 302`.
 - Errors: None specific in handler.
 - Example: `USERHOST alice bob`
-- Sources: `src/daemon/modules/user_query.zig:73`, `src/daemon/server.zig:4640`
+- Sources: `src/daemon/modules/user_query.zig:76`, `src/daemon/server.zig:12652`
+
+## LUSERS
+
+- Syntax: `LUSERS`
+- Description: Returns network and local population counters. Registered local users come from the shared world nick registry, while global user totals include established Suimyaku peer route-table users.
+- Privileges: Registered client.
+- Parameters: None.
+- Replies: `RPL_LUSERCLIENT 251`, `RPL_LUSEROP 252`, `RPL_LUSERUNKNOWN 253`, `RPL_LUSERCHANNELS 254`, `RPL_LUSERME 255`, `RPL_STATSCONN 250`, `RPL_LOCALUSERS 265`, `RPL_GLOBALUSERS 266`.
+- Errors: None specific in handler.
+- Example: `LUSERS`
+- Sources: `src/daemon/modules/query_info.zig:46`, `src/daemon/modules/query_info.zig:75`, `src/daemon/server.zig:21735`, `src/proto/lusers.zig:60`, `src/proto/lusers.zig:80`
 
 ## WHOIS
 
 - Syntax: `WHOIS [server] <nick>`
-- Description: Emits a local WHOIS sequence covering account, away state, channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP text (for opers and self).
+- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester.
 - Privileges: Registered client.
 - Parameters: Target nick is the last parameter.
-- Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, plus other WHOIS numerics produced by the writer.
+- Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISBOT 335`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, and `RPL_AWAY 301` when applicable.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`.
 - Example: `WHOIS alice`
-- Sources: `src/daemon/modules/user_query.zig:74`, `src/daemon/server.zig:4863`
+- Sources: `src/daemon/modules/user_query.zig:77`, `src/daemon/server.zig:13086`, `src/daemon/server.zig:13149`, `src/daemon/server.zig:13209`, `src/daemon/whois.zig:203`, `src/daemon/whois.zig:236`
 
 ## LIST
 
-- Syntax: `LIST [filters...]`
-- Description: Lists non-secret, non-hidden channels. ELIST-style filters are parsed; malformed filters fall back to listing all visible channels.
+- Syntax: `LIST [filter[,filter...]]`
+- Description: Lists visible channels from the mesh-wide union of local and remote-only channels. Secret and hidden channels are skipped. ELIST-style filters support member-count thresholds, creation-age `C` filters, topic-age `T` filters, include masks, and `!` exclude masks; malformed filters fail closed instead of falling back to a broad listing.
 - Privileges: Registered client.
-- Parameters: Optional list filters.
+- Parameters: Zero or one comma-separated filter parameter.
 - Replies: `RPL_LISTSTART 321`, `RPL_LIST 322`, `RPL_LISTEND 323`.
-- Errors: None specific in handler.
+- Errors: `ERR_NEEDMOREPARAMS 461` for invalid LIST filters.
 - Example: `LIST >10`
-- Sources: `src/daemon/modules/user_query.zig:75`, `src/daemon/server.zig:4810`
+- Sources: `src/daemon/modules/user_query.zig:78`, `src/daemon/server.zig:12901`, `src/daemon/server.zig:12908`, `src/proto/list.zig:132`, `src/proto/elist.zig:92`, `src/proto/list.zig:163`
+
+## LISTX
+
+- Syntax: `LISTX [filter[,filter...]]`
+- Description: Lists visible channels using IRCX extended channel-list numerics. Filters support strict and inclusive member-count thresholds (`>N`, `<N`, `>=N`, `<=N`), creation-age `C` thresholds, topic-age `T` thresholds, `TOPICONLY`, channel/name/topic/subject/language masks, and `R=0`/`R=1` registration state. Results are capped; truncated replies emit `RPL_LISTXTRUNC 816`.
+- Privileges: Registered client.
+- Parameters: Zero or one comma-separated filter parameter.
+- Replies: `RPL_LISTXSTART 811`, `RPL_LISTXENTRY 812`, optional `RPL_LISTXPICS 813`, optional `RPL_LISTXTRUNC 816`, `RPL_LISTXEND 817`.
+- Errors: `ERR_NEEDMOREPARAMS 461` for invalid LISTX filters.
+- Example: `LISTX >=10,C<=3600,S=project*`
+- Sources: `src/daemon/modules/ircx.zig:51`, `src/daemon/modules/ircx.zig:71`, `src/daemon/server.zig:12998`, `src/daemon/server.zig:13007`, `src/proto/listx.zig:73`, `src/proto/listx.zig:170`, `src/proto/listx.zig:236`, `src/proto/listx.zig:369`
 
 ## WHO
 
 - Syntax: `WHO <channel|nick> [%fields[,token]]`; `WHOX <channel|nick> %fields[,token]`
-- Description: Plain WHO emits channel or nick rows. When the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead. `WHOX` is a command-name alias for clients that send the extended form directly.
+- Description: Plain WHO emits channel or nick rows. When the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead. `WHOX` is a command-name alias for clients that send the extended form directly. For secret (`+s`) or private (`+p`) channel rosters, non-member non-opers receive only a bare `RPL_ENDOFWHO 315`.
 - Privileges: Registered client.
 - Parameters: Target; optional WHOX selector.
 - Replies: Plain `RPL_WHOREPLY 352` and `RPL_ENDOFWHO 315`; WHOX `RPL_WHOSPCRPL 354` and `RPL_ENDOFWHO 315`.
 - Errors: `ERR_NEEDMOREPARAMS 461`.
 - Example: `WHOX #zig %tcuhsnfar`
-- Sources: `src/daemon/modules/user_query.zig:76`, `src/daemon/server.zig:4741`, `src/daemon/server.zig:4663`
+- Sources: `src/daemon/modules/user_query.zig:79`, `src/daemon/modules/user_query.zig:80`, `src/daemon/server.zig:12673`, `src/daemon/server.zig:12676`, `src/daemon/server.zig:12820`, `src/daemon/server.zig:12828`, `src/proto/who.zig:159`, `src/proto/who.zig:221`
 
 ## WHOWAS
 
-- Syntax: `WHOWAS <nick>`
-- Description: Looks up the recorded WHOWAS snapshot for a nick.
+- Syntax: `WHOWAS <nick> [count]`
+- Description: Looks up recorded WHOWAS snapshots for a nick, most recent first. The optional count is parsed as a decimal value and capped to 16 records; malformed counts fall back to 16.
 - Privileges: Registered client.
-- Parameters: Nick.
-- Replies: `RPL_WHOWASUSER 314`, `RPL_WHOWASREAL 360`, `RPL_ENDOFWHOWAS 369` when data exists.
+- Parameters: Nick and optional count.
+- Replies: `RPL_WHOWASUSER 314` plus `RPL_WHOISSERVER 312` signoff lines when data exists, `ERR_WASNOSUCHNICK 406` when no data exists, and `RPL_ENDOFWHOWAS 369`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_WASNOSUCHNICK 406`.
 - Example: `WHOWAS alice`
-- Sources: `src/daemon/modules/user_query.zig:77`, `src/daemon/server.zig:5120`
+- Sources: `src/daemon/modules/user_query.zig:81`, `src/daemon/server.zig:13783`, `src/daemon/server.zig:13791`, `src/proto/whowas_reply.zig:83`, `src/proto/whowas_reply.zig:113`, `src/proto/whowas_reply.zig:164`
 
 ## AWAY
 
