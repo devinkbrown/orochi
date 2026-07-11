@@ -201,6 +201,10 @@ pub const NativeMediaTransport = struct {
         if (!self.mac_key_configured) return;
         const peek = native_feedback.peekEnvelope(datagram) catch return;
 
+        // Pass 1 (AUTH prerequisites): resolve the channel/participant that owns
+        // this stream_id and copy them out under the lock, WITHOUT mutating any
+        // address-ownership trust state. The envelope is still unauthenticated, so
+        // we must not bind (or otherwise trust) the source address yet.
         var channel_buf: [256]u8 = undefined;
         var channel_len: usize = 0;
         var participant_buf: [64]u8 = undefined;
@@ -210,7 +214,7 @@ pub const NativeMediaTransport = struct {
             if (channel.len <= channel_buf.len) {
                 if (self.channels.getPtr(channel)) |link| {
                     if (link.idForStream(peek.sender_stream_id)) |participant| {
-                        if (participant.len <= participant_buf.len and link.bindAddressForStream(peek.sender_stream_id, from)) {
+                        if (participant.len <= participant_buf.len) {
                             @memcpy(channel_buf[0..channel.len], channel);
                             channel_len = channel.len;
                             @memcpy(participant_buf[0..participant.len], participant);
@@ -223,6 +227,9 @@ pub const NativeMediaTransport = struct {
         self.mutex.unlock();
         if (channel_len == 0 or participant_len == 0) return;
 
+        // AUTH: verify the envelope MAC before touching any trust state. A forged
+        // or short tag is dropped here, so it can never rebind the victim's
+        // inbound-media return path. The lock is NOT held across openEnvelope.
         var key: [native_feedback.envelope_key_len]u8 = undefined;
         kagura_frame.deriveNativeMediaMacKey(
             &self.mac_stream_key,
@@ -233,6 +240,17 @@ pub const NativeMediaTransport = struct {
         defer std.crypto.secureZero(u8, key[0..]);
         const opened = native_feedback.openEnvelope(datagram, &key) catch return;
         if (opened.sender_stream_id != peek.sender_stream_id) return;
+
+        // Pass 2 (BIND): only now, on an authenticated envelope, take the lock
+        // again and bind the sender's address (anti-spoofing address ownership).
+        // The channel may have been torn down between passes, so re-resolve.
+        lockSpin(&self.mutex);
+        const bound = if (self.channels.getPtr(channel_buf[0..channel_len])) |link|
+            link.bindAddressForStream(opened.sender_stream_id, from)
+        else
+            false;
+        self.mutex.unlock();
+        if (!bound) return;
 
         if (self.cross) |sink| _ = sink.onNativeFeedback(channel_buf[0..channel_len], opened.sender_stream_id, opened.payload);
     }
@@ -760,6 +778,92 @@ test "NativeMediaTransport: pump rejects native feedback with a bad tag" {
 
     var rbuf: [media_socket.max_datagram]u8 = undefined;
     try testing.expect(capture.recvFrom(&rbuf) == null);
+}
+
+const FeedbackFlagCtx = struct {
+    hits: usize = 0,
+    last_stream: u32 = 0,
+
+    fn onFrame(_: *anyopaque, _: []const u8, _: []const u8) void {}
+
+    fn onFeedback(ctx: *anyopaque, channel: []const u8, sender_stream_id: u32, feedback: []const u8) bool {
+        _ = feedback;
+        if (!std.mem.eql(u8, channel, "#call")) return false;
+        const self: *FeedbackFlagCtx = @ptrCast(@alignCast(ctx));
+        self.hits += 1;
+        self.last_stream = sender_stream_id;
+        return true;
+    }
+};
+
+// Regression: the native feedback path must be AUTH-THEN-BIND. A structurally
+// valid envelope with a BAD tag, arriving from a WRONG source address under
+// require_mac, must NOT rebind the victim's inbound-media return path. Before
+// the fix `handleFeedback` bound the address (mutating trust state) off an
+// unauthenticated peekEnvelope, so a forged flood right after the victim
+// re-OFFERed (addr_bound reset to false) would hijack the return path.
+test "NativeMediaTransport: forged feedback with a bad tag does not rebind the victim address" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const root = @as([16]u8, @splat(0x77));
+    nmt.configureMac(&root, true); // hardened require_mac deployment
+
+    // Victim registered with a placeholder address (addr_bound reset), stream 100.
+    try nmt.register("#call", "alice", .voice, 100, .{});
+
+    // Correct per-{channel,participant} key + a valid envelope, then corrupt the tag.
+    var key: [native_feedback.envelope_key_len]u8 = undefined;
+    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    defer std.crypto.secureZero(u8, key[0..]);
+    var payload_buf: [32]u8 = undefined;
+    const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);
+    var env_buf: [96]u8 = undefined;
+    const envelope = try native_feedback.encodeEnvelope(100, payload, &key, &env_buf);
+    env_buf[envelope.len - 1] ^= 0x80; // forge the tag
+
+    // Attacker source address, distinct from the victim's (still-unbound) addr.
+    const attacker = mkAddr(9, 9999);
+    nmt.handleFeedback(attacker, envelope);
+
+    // The victim's return path must NOT have moved to the attacker; it is still
+    // the unbound placeholder.
+    const bound = nmt.remoteFor("#call", "alice").?;
+    try testing.expect(!bound.eql(attacker));
+    try testing.expect(bound.eql(TransportAddress{}));
+}
+
+// The authenticated case is unchanged: a valid feedback envelope from the
+// correct source still binds the sender's address and reaches the sink.
+test "NativeMediaTransport: valid feedback from the correct source still binds and is processed" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const root = @as([16]u8, @splat(0x77));
+    nmt.configureMac(&root, true);
+
+    var ctx = FeedbackFlagCtx{};
+    nmt.setCrossLegSink(.{
+        .ctx = &ctx,
+        .on_native_frame = FeedbackFlagCtx.onFrame,
+        .on_native_feedback = FeedbackFlagCtx.onFeedback,
+    });
+
+    try nmt.register("#call", "alice", .voice, 100, .{});
+
+    var key: [native_feedback.envelope_key_len]u8 = undefined;
+    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    defer std.crypto.secureZero(u8, key[0..]);
+    var payload_buf: [32]u8 = undefined;
+    const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);
+    var env_buf: [96]u8 = undefined;
+    const envelope = try native_feedback.encodeEnvelope(100, payload, &key, &env_buf);
+
+    const sender = mkAddr(3, 4000);
+    nmt.handleFeedback(sender, envelope);
+
+    const bound = nmt.remoteFor("#call", "alice").?;
+    try testing.expect(bound.eql(sender));
+    try testing.expectEqual(@as(usize, 1), ctx.hits);
+    try testing.expectEqual(@as(u32, 100), ctx.last_stream);
 }
 
 test "NativeMediaTransport: start/shutdown is clean and re-startable" {
