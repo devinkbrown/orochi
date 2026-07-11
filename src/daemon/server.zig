@@ -32309,6 +32309,48 @@ fn connectLoopback(port: u16) ServerError!linux.fd_t {
     } else return error.Unsupported;
 }
 
+/// Deterministically stop a threaded server and join its reactor thread within a
+/// bounded deadline. A throwaway SO_REUSEPORT connection only nudges the ONE
+/// reactor the kernel happens to route it to, so on a multi-reactor server the
+/// other reactors can stay blocked in `submitAndWait` forever and the unbounded
+/// `pool.join()` never returns — the classic "several threads parked in
+/// futex_do_wait" hang. `requestStop` avoids the lottery: it clears the run flag
+/// AND writes every reactor's wake eventfd, so each blocked loop returns, re-reads
+/// the flag, and exits. A watchdog turns any residual hang (a wake regression, or
+/// an orphan `orochi`/`test` process from a force-killed prior run still holding a
+/// loopback port) into a loud, bounded failure instead of an opaque futex park.
+fn stopThreadedServer(server: *Server, run: *std.atomic.Value(bool), thr: std.Thread) void {
+    server.requestStop(run);
+
+    var joined = std.atomic.Value(bool).init(false);
+    const Watchdog = struct {
+        fn guard(done: *std.atomic.Value(bool)) void {
+            const deadline = platform.monotonicMillis() + 30_000;
+            while (!done.load(.acquire)) {
+                if (platform.monotonicMillis() >= deadline) {
+                    std.debug.print(
+                        "\nstopThreadedServer: reactor thread did not stop within 30s — a " ++
+                            "reactor is wedged in submitAndWait. Sweep stale `orochi`/`test` " ++
+                            "processes holding a loopback port and re-run from a clean table.\n",
+                        .{},
+                    );
+                    @panic("stopThreadedServer watchdog: reactor never stopped");
+                }
+                var req = linux.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+                _ = linux.nanosleep(&req, null);
+            }
+        }
+    };
+    const watchdog = std.Thread.spawn(.{}, Watchdog.guard, .{&joined}) catch {
+        // No spare thread for the guard — fall back to a plain (unbounded) join.
+        thr.join();
+        return;
+    };
+    thr.join();
+    joined.store(true, .release);
+    watchdog.join();
+}
+
 fn writeAllFd(fd: linux.fd_t, bytes: []const u8) ServerError!void {
     var sent: usize = 0;
     while (sent < bytes.len) {
@@ -32960,16 +33002,10 @@ test "threaded server: multi-reactor (num_shards=4) survives concurrent clients"
         const port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-        defer {
-            run.store(false, .release);
-            // Nudge every reactor (SO_REUSEPORT spreads these) so each observes the stop.
-            var k: usize = 0;
-            while (k < 8) : (k += 1) {
-                if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
-            }
-            thr.join();
-        }
+        const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        // Deterministic wake-all + bounded join: nudging via SO_REUSEPORT connects
+        // could leave one of the 4 reactors blocked in submitAndWait and hang join().
+        defer stopThreadedServer(&server, &run, thr);
 
         const Worker = struct {
             fn client(p: u16, idx: usize, ok: *std.atomic.Value(u32)) void {
