@@ -3716,6 +3716,37 @@ test "webauthn bind/lookup/list/delete round-trip" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
+// FIX 2 premise: AUTH-FINISH logs in via `finishLogin(cred.account())`, not the
+// client-echoed AUTH argument. This proves cred.account() is the CANONICAL,
+// lowercased stored owner even when the credential was bound (and later named at
+// AUTH time) with a different case, and that the case-insensitive binding gate
+// still admits the case-variant client argument.
+test "WEBAUTHN AUTH-FINISH: cred.account() is the canonical lowercased owner, not the client case-variant" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-webauthn-canonical.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01 };
+    // Bind with a mixed-case account; the store lowercases it at bind time.
+    try services.webauthnBind("MixedCase", "credCANON", &cose, 1, "phone", 1_700_000_000);
+
+    var cred: Services.WebauthnCredential = .{};
+    try services.webauthnLookup("credCANON", &cred);
+    // The value finishLogin now receives is the canonical lowercase owner.
+    try std.testing.expectEqualStrings("mixedcase", cred.account());
+
+    // A different-CASE AUTH argument still passes the eqlIgnoreCase binding gate,
+    // so login proceeds — but as the canonical owner, never the client string.
+    const client_auth_arg = "MIXEDCASE";
+    try std.testing.expect(std.ascii.eqlIgnoreCase(cred.account(), client_auth_arg));
+    try std.testing.expect(!std.mem.eql(u8, cred.account(), client_auth_arg));
+
+    // A genuinely different account fails the binding gate (credential mismatch).
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(cred.account(), "eve"));
+}
+
 test "webauthn credential persists across a store reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -1435,6 +1435,43 @@ fn regAuthDataEs256(
     return i;
 }
 
+// Mirror the daemon's legacy (no-attestation) REGISTER-FINISH binding sequence
+// against synthesized authData. The legacy branch checks: parseAuthData ->
+// rpIdHash == SHA-256(rp_id) -> UP present -> (require_uv) UV -> attested-cred.
+// This pins the User-Present guard the branch enforces (WebAuthn §7.1): a
+// registration authData with UP=0 MUST be rejected; UP=1 passes the same gate.
+test "WEBAUTHN legacy registration binding rejects UP=0 authData, accepts UP=1" {
+    const rp_id = "example.com";
+    const rp_id_hash = sha256Str(rp_id);
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    buildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const aaguid: [16]u8 = @splat(0);
+    const cred_id = "legacy-cred-01";
+
+    // UP=0 (attested-credential data present, but no user-presence): the fixed
+    // legacy branch rejects this via `webauthn.userPresent`.
+    var no_up_buf: [37 + 16 + 2 + 14 + 77]u8 = undefined;
+    const no_up_len = regAuthDataEs256(rp_id_hash, FLAG_AT, 1, aaguid, cred_id, cose, &no_up_buf);
+    const no_up = no_up_buf[0..no_up_len];
+    const ad_no_up = try parseAuthData(no_up);
+    try testing.expect(mem.eql(u8, &ad_no_up.rp_id_hash, &rp_id_hash)); // rpIdHash gate passes
+    try testing.expect(!userPresent(ad_no_up)); // ...but the UP gate rejects it
+    try testing.expect(hasAttestedCredentialData(no_up)); // AT present, so pre-fix this was accepted
+
+    // UP=1: same input with the presence flag set clears every legacy gate.
+    var up_buf: [37 + 16 + 2 + 14 + 77]u8 = undefined;
+    const up_len = regAuthDataEs256(rp_id_hash, FLAG_UP | FLAG_AT, 1, aaguid, cred_id, cose, &up_buf);
+    const up = up_buf[0..up_len];
+    const ad_up = try parseAuthData(up);
+    try testing.expect(mem.eql(u8, &ad_up.rp_id_hash, &rp_id_hash));
+    try testing.expect(userPresent(ad_up));
+    try testing.expect(hasAttestedCredentialData(up));
+    const att = try parseAttestedCredentialData(up);
+    try testing.expectEqualSlices(u8, cred_id, att.credential_id);
+}
+
 test "verifyAttestation: fmt=none accepted as TOFU, rejected when attestation required" {
     const rp_id = "example.com";
     const rp_id_hash = sha256Str(rp_id);

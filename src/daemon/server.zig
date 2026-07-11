@@ -24172,6 +24172,10 @@ pub const LinuxServer = struct {
             std.crypto.hash.sha2.Sha256.hash(rp.rp_id, &rp_hash, .{});
             if (!std.mem.eql(u8, &ad.rp_id_hash, &rp_hash))
                 return self.failReply(conn, "WEBAUTHN", "RP_MISMATCH", "authenticatorData rpIdHash does not match rp_id");
+            // User Presence is mandatory at registration (WebAuthn §7.1), matching
+            // the attestation path (webauthn.verifyAttestation checks UP always).
+            if (!webauthn.userPresent(ad))
+                return self.failReply(conn, "WEBAUTHN", "USER_PRESENCE_REQUIRED", "authenticatorData has no user-presence (UP) flag");
             if (rp.require_uv and !webauthn.userVerified(ad))
                 return self.failReply(conn, "WEBAUTHN", "USER_VERIFICATION_REQUIRED", "This network requires user verification (UV)");
             if (!webauthn.hasAttestedCredentialData(auth_data))
@@ -24345,8 +24349,12 @@ pub const LinuxServer = struct {
         if (new_count > cred.sign_count) svc.webauthnUpdateSignCount(cred_id_b64, new_count) catch {};
 
         // Success: clear the throttle and log the caller in via the shared path.
+        // Log in as the CANONICAL stored owner (cred.account(), already lowercased
+        // at bind time), not the client-echoed AUTH argument case-variant — the
+        // eqlIgnoreCase gate above already proved they name the same account, and
+        // downstream account keying (metadata/silence restore) is case-sensitive.
         self.loginRecordSuccess(conn, target_account);
-        try self.finishLogin(conn, target_account);
+        try self.finishLogin(conn, cred.account());
         var b: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), conn.session.account() orelse target_account }) catch return;
         try appendToConn(conn, line);

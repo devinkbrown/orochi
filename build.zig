@@ -247,6 +247,7 @@ pub fn build(b: *std.Build) void {
         "CertFP",
         "raw-public-key",
         "raw public key",
+        "WEBAUTHN",
     };
     const server_tests = b.addTest(.{
         .root_module = mod,
