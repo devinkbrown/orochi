@@ -7173,9 +7173,12 @@ pub const LinuxServer = struct {
         // Cap inspection is a serialized read of the owning reactor's session; the
         // byte handoff below routes to that reactor (local append or fabric).
         if (tag.len != 0 and conn.session.hasCap(.server_time)) {
-            // Concatenate so the tag + line cross the shard boundary as one ordered
-            // unit (two enqueues could interleave a foreign reactor's drain).
-            if (id.shard != self.rx().shard_id) {
+            // Concatenate tag + line into ONE buffer when either it must cross a
+            // shard boundary as one ordered unit (two enqueues could interleave a
+            // foreign reactor's drain) OR the recipient is a userspace-TLS conn,
+            // where each append seals a discrete record — so two appends would
+            // double the AEAD/record-header/GCM-tag work for one logical message.
+            if (id.shard != self.rx().shard_id or prefersJoinedAppend(conn)) {
                 var joined: [default_reply_bytes]u8 = undefined;
                 if (tag.len + bytes.len <= joined.len) {
                     @memcpy(joined[0..tag.len], tag);
@@ -7217,8 +7220,11 @@ pub const LinuxServer = struct {
         // negotiated caps; the bytes then route to that reactor via enqueueDelivery.
         var tagbuf: [256]u8 = undefined;
         const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
-        if (prefix.len != 0 and id.shard != self.rx().shard_id) {
-            // Cross-shard: send prefix + line as one ordered unit.
+        // Merge the @-tag segment + line into ONE buffer when either it must cross
+        // a shard boundary as one ordered unit OR the recipient is a userspace-TLS
+        // conn, where each append seals a discrete record — so two appends would
+        // double the AEAD/record-header/GCM-tag work for one logical message.
+        if (prefix.len != 0 and (id.shard != self.rx().shard_id or prefersJoinedAppend(conn))) {
             var joined: [default_reply_bytes]u8 = undefined;
             if (prefix.len + bytes.len <= joined.len) {
                 @memcpy(joined[0..prefix.len], prefix);
@@ -30967,6 +30973,18 @@ fn emitReplyLine(conn: *ConnState, line: []const u8) ServerError!void {
     if (line.len < 2 or line[line.len - 2] != '\r' or line[line.len - 1] != '\n') return;
     if (dispatch.hasControlByte(line[0 .. line.len - 2])) return;
     return appendToConn(conn, line);
+}
+
+/// Whether merging a tag prefix + line into ONE `appendToConn` is materially
+/// cheaper than two appends. True only for a raw userspace-TLS conn: its
+/// `appendSecuredToConn` seals a DISCRETE TLS record per call (AEAD + 5-byte
+/// header + 16-byte GCM tag + a record alloc), so two appends double that work
+/// for one logical message. Plaintext and kTLS-offloaded conns append straight
+/// into `send_buf` and coalesce on the wire for free, and WS conns already
+/// coalesce a partial line in `tx_buf` and emit one frame per '\n'; joining any
+/// of those would only add a redundant copy, so they keep the two-append path.
+fn prefersJoinedAppend(conn: *const ConnState) bool {
+    return conn.ws == null and conn.tls != null and !conn.tls_tx_offloaded;
 }
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {

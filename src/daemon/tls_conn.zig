@@ -703,6 +703,95 @@ test "onInbound drives a full handshake against tls_client and streams app data 
     try std.testing.expectEqualStrings("hello client", got);
 }
 
+/// Drive an in-memory TLS 1.3 handshake to completion (server = `conn`).
+fn perfHandshake(conn: *TlsConn, client: *tls_client.Client, alloc: Allocator) !void {
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+}
+
+/// Count the TLS records framed in `buf` (each: 5-byte header + u16 length body).
+fn countAppRecords(buf: []const u8) usize {
+    var off: usize = 0;
+    var n: usize = 0;
+    while (off + tls_record.record_header_len <= buf.len) {
+        const len = std.mem.readInt(u16, buf[off + 3 ..][0..2], .big);
+        off += tls_record.record_header_len + len;
+        n += 1;
+    }
+    return n;
+}
+
+// Measurement for the server.zig deliverTagged/deliverTimed local-TLS coalescing
+// (prefersJoinedAppend): a tagged channel message to a userspace-TLS recipient
+// used to append the @-tag prefix and the line as TWO separate writes, sealing
+// TWO discrete TLS records; joining them into ONE append seals ONE record. This
+// pins the halving and reports the per-message record + wire-byte overhead the
+// change removes for every tagged fan-out recipient on a userspace-TLS conn.
+test "perf: joining a tag prefix + line halves TLS records vs two appends" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    const prefix = "@time=2026-07-12T00:00:00.000Z;msgid=abcd1234ef;account=alice ";
+    const line = ":alice!alice@host PRIVMSG #chan :hello everyone in this channel\r\n";
+
+    // OLD: two appends -> two records. write() reuses write_buf, so measure the
+    // first record blob before issuing the second write.
+    var records_two: usize = 0;
+    var wire_two: usize = 0;
+    {
+        var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer conn.deinit();
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer client.deinit();
+        try perfHandshake(&conn, &client, alloc);
+
+        const c1 = try conn.write(prefix);
+        records_two += countAppRecords(c1);
+        wire_two += c1.len;
+        const c2 = try conn.write(line);
+        records_two += countAppRecords(c2);
+        wire_two += c2.len;
+    }
+
+    // NEW: one joined append -> one record.
+    var records_one: usize = 0;
+    var wire_one: usize = 0;
+    {
+        var joined_buf: [512]u8 = undefined;
+        @memcpy(joined_buf[0..prefix.len], prefix);
+        @memcpy(joined_buf[prefix.len..][0..line.len], line);
+        const joined = joined_buf[0 .. prefix.len + line.len];
+
+        var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer conn.deinit();
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer client.deinit();
+        try perfHandshake(&conn, &client, alloc);
+
+        const c1 = try conn.write(joined);
+        records_one += countAppRecords(c1);
+        wire_one += c1.len;
+    }
+
+    // The win: 2 records (2 AEAD seals + 2 headers + 2 GCM tags) collapse to 1.
+    try std.testing.expectEqual(@as(usize, 2), records_two);
+    try std.testing.expectEqual(@as(usize, 1), records_one);
+    try std.testing.expect(wire_one < wire_two);
+    std.debug.print(
+        "\n[perf] tagged TLS delivery: records {d} -> {d}, wire bytes {d} -> {d} (saved {d}/msg)\n",
+        .{ records_two, records_one, wire_two, wire_one, wire_two - wire_one },
+    );
+}
+
 test "buildKtlsTxCryptoInfo produces a kernel-shaped TLS 1.3 crypto_info post-handshake" {
     const alloc = std.testing.allocator;
     const native = @import("builtin").cpu.arch.endian();
