@@ -8376,9 +8376,11 @@ pub const LinuxServer = struct {
             }
             var sink = QueueSink{ .conn = conn };
             // Same per-client firewall as dispatchRegistered below: a full send
-            // buffer or oversize reply during preregistration closes only this
+            // buffer, oversize reply, or an outbound control-byte reflection
+            // (error.ControlByte) during preregistration closes only this
             // connection instead of escaping to the reactor loop.
             processLine(conn, line, &sink) catch |err| switch (err) {
+                error.ControlByte,
                 error.OutputTooSmall,
                 error.TextTooLong,
                 error.NoSpaceLeft,
@@ -8467,6 +8469,7 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(parsed.command, "PING")) {
             var sink = QueueSink{ .conn = conn };
             processLine(conn, line, &sink) catch |err| switch (err) {
+                error.ControlByte,
                 error.OutputTooSmall,
                 error.TextTooLong,
                 error.NoSpaceLeft,
@@ -8480,7 +8483,12 @@ pub const LinuxServer = struct {
 
         // A per-client fault (oversized reply, malformed param) must close only
         // THAT connection — never escalate to runOnce and tear down the reactor.
+        // `error.ControlByte` is such a fault: the outbound reply builders reject
+        // reflecting a control byte into a prefix/command/param/trailing/target
+        // (the CWE-93 CRLF/command-injection guard in dispatch.zig) — dropping
+        // this client's reply, not faulting the shard.
         self.dispatchRegistered(id, conn, &parsed, line) catch |err| switch (err) {
+            error.ControlByte,
             error.OutputTooSmall,
             error.TextTooLong,
             error.NoSpaceLeft,
@@ -40418,6 +40426,56 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
     try recvUntil(&a, "PONG orochi.local :tok2", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
+}
+
+test "threaded server: control byte reflected into a reply closes only that client" {
+    // Regression for the firewall hole where `error.ControlByte` — raised by the
+    // outbound reply builders' requireNoControlBytes guard (CWE-93 CRLF/command
+    // injection defense) when reflected client data would carry a control byte —
+    // escaped the per-connection firewall to `runOnce`, surfacing as a bogus
+    // "reactor loop error ControlByte". It must be handled per-connection.
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Client A registers.
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK ctlA\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&a, " 001 ctlA ", 200);
+
+    // A sends an unknown command whose verb carries a control byte (0x01 SOH).
+    // The inbound line parser tolerates it (only NUL/CR/LF are rejected), so it
+    // reaches the ERR_UNKNOWNCOMMAND builder, which reflects the verb and trips
+    // the outbound control-byte guard → DispatchError.ControlByte. The firewall
+    // must close ONLY A, never fault the reactor.
+    try writeAllFd(fd_a, "WA\x01T\r\n");
+
+    // Post-fix the server closes A (per-client firewall → conn.closing → EOF).
+    // Pre-fix the error escaped `handleRecv` before `closeConn` ran, leaving A
+    // open indefinitely, so this timed out instead of seeing the reset.
+    try std.testing.expectError(error.ConnectionReset, recvUntil(&a, "__never__", 200));
+
+    // The reactor kept serving: a fresh client still registers and gets replies.
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK ctlB\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 ctlB ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PING :tok\r\n");
+    try recvUntil(&b, "PONG orochi.local :tok", 200);
 }
 
 test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
