@@ -268,6 +268,21 @@ pub fn build(b: *std.Build) void {
     const test_server_verbose_step = b.step("test-server-verbose", "Run focused server tests with per-test progress output");
     test_server_verbose_step.dependOn(&run_server_tests_verbose.step);
 
+    // The adversarial exploit/attack corpus: every `test "exploit: ..."` drives
+    // a hostile input at a daemon surface and asserts it FAILS CLOSED (rejects /
+    // bounds / survives). These are ordinary tests that also run in the full
+    // `zig build test`; this focused step (alias `test-attack`) runs just the
+    // corpus with the count visible.
+    const exploit_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{"exploit:"},
+    });
+    const run_exploit_tests = b.addRunArtifact(exploit_tests);
+    const test_exploit_step = b.step("test-exploit", "Run the adversarial exploit/attack fail-closed corpus");
+    test_exploit_step.dependOn(&run_exploit_tests.step);
+    const test_attack_step = b.step("test-attack", "Alias of test-exploit: the adversarial fail-closed corpus");
+    test_attack_step.dependOn(&run_exploit_tests.step);
+
     const config_test_filters: []const []const u8 = &.{
         "parseToml",
         "config",
