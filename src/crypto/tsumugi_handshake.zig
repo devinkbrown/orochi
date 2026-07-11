@@ -190,7 +190,8 @@ pub const Established = struct {
     pub fn sealRecord(self: *const Established, counter: u64, aad: []const u8, pt: []const u8, out: []u8) void {
         std.debug.assert(out.len == pt.len + ChaCha.tag_length);
         const nonce = recordNonce(self.send_nonce, counter);
-        const key: [ChaCha.key_length]u8 = self.send_key.declassify();
+        var key: [ChaCha.key_length]u8 = self.send_key.declassify();
+        defer secureZero(&key);
         ChaCha.encrypt(out[0..pt.len], out[pt.len..][0..ChaCha.tag_length], pt, aad, nonce, key);
     }
 
@@ -201,7 +202,8 @@ pub const Established = struct {
     pub fn openRecord(self: *const Established, counter: u64, aad: []const u8, ct: []const u8, tag: [ChaCha.tag_length]u8, out: []u8) error{AuthFailed}!void {
         std.debug.assert(out.len == ct.len);
         const nonce = recordNonce(self.recv_nonce, counter);
-        const key: [ChaCha.key_length]u8 = self.recv_key.declassify();
+        var key: [ChaCha.key_length]u8 = self.recv_key.declassify();
+        defer secureZero(&key);
         ChaCha.decrypt(out, ct, tag, aad, nonce, key) catch return error.AuthFailed;
     }
 };
