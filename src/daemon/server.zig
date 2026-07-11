@@ -16419,6 +16419,11 @@ pub const LinuxServer = struct {
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
+            // Record whether this connection was secured (had a live TLS engine).
+            // The successor uses it as the fail-safe join: a secured client that
+            // arrives without a decodable TLS-engine capsule is DROPPED, never
+            // adopted as plaintext (a secured socket must not fall back to cleartext).
+            snap.was_secured = e.value.tls != null;
             // Carry the monotonic signon/last-message clocks so WHOIS idle/signon
             // survive the in-place UPGRADE (CLOCK_MONOTONIC is unchanged by execve).
             snap.connected_at_ms = e.value.connected_at_ms;
@@ -16589,8 +16594,9 @@ pub const LinuxServer = struct {
         }
 
         // Pass 1: index the carried TLS engine states by socket fd (the join key
-        // back to the matching client snapshot). Undecodable capsules are skipped
-        // — the matching client is then dropped below rather than mis-adopted.
+        // back to the matching client snapshot). Undecodable capsules are skipped;
+        // Pass 2 then ENFORCES the drop — a client sealed as `was_secured` that finds
+        // no TLS state here is dropped rather than adopted as plaintext.
         var tls_snaps: std.ArrayList(tls_snapshot.Snapshot) = .empty;
         defer tls_snaps.deinit(self.allocator);
         for (caps) |c| {
@@ -16619,7 +16625,16 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .clients) continue;
             if (c.fields.len == 0) continue;
-            const snap = session_snapshot.decode(c.fields[0].bytes) catch continue;
+            const snap = session_snapshot.decode(c.fields[0].bytes) catch {
+                // The inherited socket fd lives ONLY inside the blob that failed to
+                // parse; recover it from the fixed mandatory prefix and close it so a
+                // decode failure drops the client cleanly instead of leaking the fd
+                // (parity with the .s2s_link path above).
+                if (session_snapshot.peekFd(c.fields[0].bytes)) |leaked_fd| {
+                    if (leaked_fd >= 0) closeFd(leaked_fd);
+                }
+                continue;
+            };
             if (snap.fd < 0) continue;
             var tls_state: ?tls_snapshot.Snapshot = null;
             for (tls_snaps.items) |ts| {
@@ -16627,6 +16642,14 @@ pub const LinuxServer = struct {
                     tls_state = ts;
                     break;
                 }
+            }
+            // Fail-SAFE: a client that WAS secured but has no restored TLS engine
+            // (its TLS capsule was absent or undecodable) must never be adopted as
+            // plaintext. Drop it — close the inherited fd, free no slot — so the
+            // browser reconnects over TLS against the still-bound listener.
+            if (snap.was_secured and tls_state == null) {
+                closeFd(snap.fd);
+                continue;
             }
             var ws_state: ?ws_snapshot.Snapshot = null;
             for (ws_snaps.items) |wss| {

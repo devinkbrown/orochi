@@ -77,7 +77,11 @@ pub const Descriptor = struct {
 };
 
 pub const registry = [_]Descriptor{
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 appends a trailing `was_secured` byte to the session snapshot so the
+    // successor drops a secured client that arrives without its TLS engine rather
+    // than adopting it as plaintext. `min_supported = 1` keeps accepting v1 capsules
+    // sealed by pre-bump binaries; `session_snapshot.decode` reads the byte tolerantly.
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 1, .min_supported = 1, .max_supported = 1 },

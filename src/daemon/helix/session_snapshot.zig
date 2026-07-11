@@ -22,6 +22,7 @@
 //!   [u16 len][caps]   OPTIONAL trailing CAP list (space-separated names)
 //!   [u64 oper_priv_bits][u16 len][oper_class][u16 len][oper_title]  OPTIONAL
 //!   [u16 len][username]   OPTIONAL trailing USER ident (past the oper grant)
+//!   [u8 was_secured]      OPTIONAL trailing secured-flag (past the username)
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -44,6 +45,17 @@
 //! name survives that and an unknown name is simply dropped on restore. Omitting
 //! it (pre-caps build) decodes to "" so the successor restores no caps — exactly
 //! the pre-fix behavior, never a misattributed bit.
+//!
+//! The secured-flag block (OPTIONAL, one byte, written last — past the username)
+//! records whether the connection had a live TLS engine when it was sealed. It is
+//! the fail-SAFE join for the successor's adoption path: a client that WAS secured
+//! but arrives without a decodable TLS-engine capsule is DROPPED, never adopted as
+//! plaintext — a secured socket must never silently fall back to cleartext. It is
+//! APPEND-ONLY: a capsule from a pre-flag build omits it and decodes to
+//! `was_secured = false`, which is exactly the historical (never-drop) behavior.
+//! Because this grows the `.clients` payload, the `.clients` capsule descriptor is
+//! bumped to `current_version = 2` (`min_supported = 1` still adopts old capsules;
+//! see helix/capsule.zig) and `decode` reads the byte tolerantly.
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -70,6 +82,13 @@ pub const Snapshot = struct {
     logged_in: bool = false,
     away_active: bool = false,
     is_oper: bool = false,
+    /// True when the connection had a live TLS engine at seal time. Carried as an
+    /// OPTIONAL trailing byte so a capsule from a pre-flag build decodes to false
+    /// (the historical never-drop behavior). On adopt, a snapshot with
+    /// `was_secured = true` that arrives WITHOUT its TLS-engine capsule is dropped
+    /// rather than adopted as plaintext — a secured socket never falls back to
+    /// cleartext.
+    was_secured: bool = false,
     /// The client's socket fd, preserved across execve (CLOEXEC cleared by the
     /// predecessor) so the successor re-attaches the live connection. -1 = none.
     fd: i32 = -1,
@@ -166,6 +185,11 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     std.mem.writeInt(u16, &uname_len_le, @intCast(snap.username.len), .little);
     try out.appendSlice(allocator, &uname_len_le);
     try out.appendSlice(allocator, snap.username);
+    // Trailing secured-flag byte (see header): 1 = the connection had a live TLS
+    // engine at seal time. APPEND-ONLY past the username block; a capsule from a
+    // pre-flag build omits it and decodes to `was_secured = false`. Growing the
+    // payload is why the `.clients` descriptor is at version 2 (capsule.zig).
+    try out.append(allocator, @intFromBool(snap.was_secured));
     return out.toOwnedSlice(allocator);
 }
 
@@ -194,6 +218,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var oper_class: []const u8 = "";
     var oper_title: []const u8 = "";
     var username: []const u8 = "";
+    var was_secured: bool = false;
     // Walk the optional trailing blocks with a running cursor `p`: signon (16) →
     // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]) → username
     // ([u16][bytes]). Each is gated on enough bytes remaining, so a capsule from a
@@ -235,6 +260,12 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                         p += ul;
                     }
                 }
+                // Trailing secured-flag byte (past the username block). Gated on a
+                // byte remaining so a pre-flag (v1) capsule defaults it to false.
+                if (r.buf.len - p >= 1) {
+                    was_secured = r.buf[p] != 0;
+                    p += 1;
+                }
             }
         }
     }
@@ -257,7 +288,35 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .oper_class = oper_class,
         .oper_title = oper_title,
         .username = username,
+        .was_secured = was_secured,
     };
+}
+
+/// Best-effort recovery of the inherited socket fd from a `.clients` snapshot blob
+/// whose full `decode` failed (or was force-failed under fault). Unlike the s2s
+/// snapshot, the fd is NOT the leading field — it sits past the six length-prefixed
+/// identity strings and the flags byte (the last mandatory field before the tolerant
+/// trailing tail) — so this walks that fixed prefix and returns the fd, letting the
+/// adoption path `close()` the inherited socket instead of leaking it (the fd lives
+/// ONLY inside this blob post-execve). Returns null if the blob is truncated before
+/// the fd. Mirrors `s2s_snapshot.peekFd` — the same fd-recovery parity seam.
+pub fn peekFd(bytes: []const u8) ?i32 {
+    var p: usize = 0;
+    // Six leading length-prefixed strings: nick, realname, account, real_host,
+    // host, away — the fixed mandatory prefix that precedes the fd.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        if (p + 2 > bytes.len) return null;
+        const n = std.mem.readInt(u16, bytes[p..][0..2], .little);
+        p += 2;
+        if (p + n > bytes.len) return null;
+        p += n;
+    }
+    // Flags byte, then the little-endian i32 fd.
+    if (p + 1 > bytes.len) return null;
+    p += 1;
+    if (p + 4 > bytes.len) return null;
+    return std.mem.readInt(i32, bytes[p..][0..4], .little);
 }
 
 /// Iterator over a decoded snapshot's `channels_blob` (the trailing channel list).
@@ -456,7 +515,8 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const caps_block = "echo-message".len + 2; // u16 len + bytes
     const oper_block = 8 + 2 + 2; // priv bits + empty class + empty title
     const username_block = 2; // empty username len prefix
-    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block];
+    const secured_block = 1; // trailing was_secured flag byte
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);
@@ -504,4 +564,74 @@ test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absen
 test "decode rejects a truncated buffer" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 5, 0, 'a' })); // claims 5, has 1
     try testing.expectError(error.Truncated, decode(&[_]u8{0})); // first length cut off
+}
+
+test "session_snapshot was_secured round-trips across an upgrade (true and false)" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |secured| {
+        const bytes = try encode(allocator, .{ .nick = "eve", .fd = 12, .was_secured = secured });
+        defer allocator.free(bytes);
+        const got = try decode(bytes);
+        try testing.expectEqual(secured, got.was_secured);
+        try testing.expectEqualStrings("eve", got.nick);
+        try testing.expectEqual(@as(i32, 12), got.fd);
+    }
+}
+
+test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrade defaults false)" {
+    const allocator = testing.allocator;
+    // A capsule from the pre-flag (v1) build: identical bytes minus the single
+    // trailing was_secured byte. It MUST decode cleanly with was_secured=false —
+    // exactly the historical never-drop behavior — while every other field survives.
+    const bytes = try encode(allocator, .{
+        .nick = "frank",
+        .account = "frank",
+        .fd = 33,
+        .logged_in = true,
+        .is_oper = true,
+        .caps = "sasl",
+        .oper_priv_bits = 0x0000_0000_0000_00c0,
+        .oper_class = "admin",
+        .username = "frankusr",
+        .was_secured = true,
+    });
+    defer allocator.free(bytes);
+    const old = bytes[0 .. bytes.len - 1]; // strip the trailing was_secured byte
+
+    const got = try decode(old);
+    try testing.expect(!got.was_secured); // legacy blob → defaults false
+    try testing.expectEqualStrings("frank", got.nick);
+    try testing.expectEqualStrings("frankusr", got.username);
+    try testing.expectEqualStrings("admin", got.oper_class);
+    try testing.expectEqual(@as(u64, 0x0000_0000_0000_00c0), got.oper_priv_bits);
+    try testing.expect(got.is_oper and got.logged_in);
+    try testing.expectEqualStrings("sasl", got.caps);
+    try testing.expectEqual(@as(i32, 33), got.fd);
+}
+
+test "session_snapshot peekFd recovers the fd for a decode-failure drop on resume" {
+    const allocator = testing.allocator;
+    // A valid, fully-populated blob: peekFd must recover the exact fd the successor
+    // would need to close on a (fault-forced) decode failure. Walking the fixed
+    // mandatory prefix must agree with the fd `decode` itself reports.
+    const bytes = try encode(allocator, .{
+        .nick = "grace",
+        .realname = "Grace Example",
+        .account = "grace",
+        .real_host = "10.0.0.9",
+        .host = "cloak-99.orochi",
+        .away = "brb",
+        .fd = 57,
+        .was_secured = true,
+    });
+    defer allocator.free(bytes);
+    try testing.expectEqual(@as(?i32, 57), peekFd(bytes));
+    try testing.expectEqual((try decode(bytes)).fd, peekFd(bytes).?);
+
+    // Too short to even hold the fd → null (nothing to bogus-close).
+    try testing.expectEqual(@as(?i32, null), peekFd(&[_]u8{ 1, 2, 3 }));
+    // A prefix truncated right before the fd (six empty strings + flags, no fd) → null.
+    var no_fd: [13]u8 = @splat(0);
+    no_fd[12] = 0; // flags byte present, fd bytes absent
+    try testing.expectEqual(@as(?i32, null), peekFd(&no_fd));
 }
