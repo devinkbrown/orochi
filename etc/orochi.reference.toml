@@ -672,6 +672,17 @@ allow_anonymous = false
 # When true, a logged-in client's visible host becomes <account>.users.<suffix> —
 # stable across IPs/devices. Explicit VHOST personas still override it.
 # account_cloak = false
+# Anonymous-client cloak rotation cadence, in SECONDS (default 86400 = 24 h).
+# When non-zero, an UNAUTHENTICATED client's IP is cloaked with an OPAQUE, epoch-
+# rotated token: the same anonymous IP maps to a fresh opaque cloak each epoch and
+# leaks no subnet co-membership — retiring the forever-linkability of a static-IP
+# anonymous user. Wall-clock based so every mesh node agrees on the epoch. Logged-
+# in clients are unaffected (they keep the stable account/hierarchical cloak, which
+# stays subnet-bannable). Set 0 to disable rotation (anonymous clients keep the
+# stable hierarchical cloak — the pre-2026-07 behavior). Moderation of anonymous
+# abuse shifts to account bans + registration friction, which opaque anon cloaks
+# are designed to require.
+# anon_epoch_secs = 86400
 
 
 # --- [acme] — automatic TLS certificate renewal (Linux only) -----------------

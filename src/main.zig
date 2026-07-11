@@ -465,21 +465,54 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Hostname cloaking: derive the cloak key from `[cloak] secret` (hashed to
-    // 32 bytes), or generate a random per-boot key so a client's real IP is
-    // never shown to other users by default.
+    // Hostname cloaking: derive the cloak key from `[cloak] secret`, or generate
+    // a random per-boot key so a client's real IP is never shown to other users
+    // by default.
+    //
+    // The secret is stretched through Argon2id (memory-hard) with a fixed
+    // domain-separation salt, NOT a bare `SHA256(secret)`. The whole cloak
+    // security model rests on key secrecy (the IPv4 input space is fully
+    // enumerable), so a low-entropy operator passphrase must not be
+    // offline-brute-forceable: SHA256 costs one hash per guess, Argon2id costs
+    // ~64 MiB + t iterations per guess. Derivation is deterministic (fixed salt),
+    // so cloaked hosts stay stable across restarts and identical mesh-wide.
+    //
+    // MIGRATION NOTE: this changes the derived key for any existing deployment
+    // with a `[cloak] secret`, so every client's cloak reshuffles ONCE on the
+    // first boot after this upgrade. Pre-upgrade host/subnet WARD bans on the
+    // old SHA256-derived cloaks do NOT carry over — they were computed under a
+    // key the daemon can no longer reproduce, so `previous_secret` grace applies
+    // only to FUTURE rotations under this new Argon2id KDF, not to the SHA256→
+    // Argon2id transition itself. That one-time invalidation is the accepted cost
+    // of retiring the weak KDF. (Separately, `[cloak] anon_epoch_secs` defaults to
+    // 24 h, so anonymous clients also switch from the hierarchical `.ip` cloak to
+    // the opaque `.opq` epoch cloak on upgrade unless the operator sets it to 0.)
     var cloak_key_bytes: [orochi.proto.cloak.key_len]u8 = undefined;
+    const cloak_kdf_params = orochi.crypto.argon2_kdf.default_params;
+    const cloak_kdf_salt = orochi.crypto.argon2_kdf.cloak_key_salt;
     if (held) |h| {
         if (h.parsed.cloak.secret) |secret| {
-            std.crypto.hash.sha2.Sha256.hash(secret, &cloak_key_bytes, .{});
-            srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
+            if (orochi.crypto.argon2_kdf.deriveKey(allocator, &cloak_key_bytes, secret, cloak_kdf_salt, cloak_kdf_params)) {
+                srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
+            } else |err| {
+                // Only reachable under catastrophic conditions (OOM for the
+                // 64 MiB scratch / thread-spawn failure). Leave cloak_key null so
+                // the random per-boot fallback below still keeps privacy on, and
+                // warn loudly (the mesh-federation caveat is printed there too).
+                std.debug.print("orochi: cloak key derivation failed ({s}); falling back to a per-boot random key\n", .{@errorName(err)});
+            }
         }
         // Previous cloak key (`[cloak] previous_secret`): kept live across a key
         // rotation so WARD host/mask bans written under the old key keep matching.
+        // Derived through the same Argon2id path so old and new keys agree on KDF.
         if (h.parsed.cloak.previous_secret) |prev| {
             var prev_bytes: [orochi.proto.cloak.key_len]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(prev, &prev_bytes, .{});
-            srv_cfg.cloak_prev_key = orochi.proto.cloak.SecretKey.init(prev_bytes);
+            if (orochi.crypto.argon2_kdf.deriveKey(allocator, &prev_bytes, prev, cloak_kdf_salt, cloak_kdf_params)) {
+                srv_cfg.cloak_prev_key = orochi.proto.cloak.SecretKey.init(prev_bytes);
+            } else |err| {
+                std.debug.print("orochi: previous cloak key derivation failed ({s}); rotation grace disabled this boot\n", .{@errorName(err)});
+            }
+            std.crypto.secureZero(u8, &prev_bytes);
         }
         // Network-identifying cloak suffix (`[cloak] suffix`); borrowed from
         // the held config, which outlives the server.
@@ -491,6 +524,9 @@ pub fn main(init: std.process.Init) !void {
         // Per-account cloak (`[cloak] account_cloak`): logged-in clients show
         // <account>.users.<suffix>.
         srv_cfg.cloak_account = h.parsed.cloak.account_cloak;
+        // Anonymous-cloak rotation cadence (`[cloak] anon_epoch_secs`): non-zero
+        // routes unauthenticated clients to the epoch-salted opaque cloak.
+        srv_cfg.cloak_anon_epoch_secs = h.parsed.cloak.anon_epoch_secs;
     }
     if (srv_cfg.cloak_key == null) {
         init.io.random(&cloak_key_bytes);
@@ -505,6 +541,10 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("orochi: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.\n", .{});
         }
     }
+    // `srv_cfg.cloak_key` owns its own copy of the key; the local scratch buffer
+    // has served both the Argon2id-derive and random-fallback consumers, so wipe
+    // it — no live key material should linger on main's stack.
+    std.crypto.secureZero(u8, &cloak_key_bytes);
 
     // Background forward-confirmed reverse-DNS resolver: client IPs are resolved
     // off the accept path so hosts present a cloaked hostname rather than a

@@ -632,6 +632,18 @@ pub const Config = struct {
         /// `<account>.users.<suffix>` — stable across IPs and devices. Explicit
         /// VHOST personas set the host directly and still override it.
         account_cloak: bool = false,
+        /// Anonymous-client cloak rotation cadence, in SECONDS. When non-zero, an
+        /// UNAUTHENTICATED (not-logged-in) client gets an OPAQUE cloak salted by
+        /// the current wall-clock epoch (`floor(now/anon_epoch_secs)`), so a
+        /// static-IP anonymous user is neither linkable across epochs nor leaks
+        /// subnet co-membership. Logged-in clients are unaffected — they keep
+        /// their stable, moderatable account/hierarchical cloak. Wall-clock based
+        /// so every mesh node agrees on the epoch. `0` disables rotation
+        /// (anonymous clients keep the stable cloak — pre-2026-07 behavior).
+        /// Default 86400 (24 h). Moderation of anonymous abuse shifts to account
+        /// bans + registration friction, which these opaque cloaks are designed
+        /// to require.
+        anon_epoch_secs: u64 = 86400,
     };
 
     /// TLS listener settings. The live listener is wired elsewhere; this section
@@ -1262,6 +1274,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("cloak.suffix"), &cfg.cloak.suffix);
     try setOpt(allocator, resolver, doc.getString("cloak.mode"), &cfg.cloak.mode);
     if (doc.getBool("cloak.account_cloak")) |b| cfg.cloak.account_cloak = b;
+    // 0 disables anon rotation; cap at ~1 year so a fat-fingered value can't
+    // wedge the epoch far in the future.
+    cfg.cloak.anon_epoch_secs = try uintField(doc, "cloak.anon_epoch_secs", cfg.cloak.anon_epoch_secs, 0, 31_536_000);
 
     // [tls]
     if (doc.getBool("tls.enabled")) |b| cfg.tls.enabled = b;
@@ -2679,6 +2694,44 @@ test "parseToml: [cloak] mode and account_cloak parse" {
     try testing.expectEqualStrings("opaque", cfg.cloak.mode.?);
     try testing.expect(cfg.cloak.account_cloak == true);
     try testing.expectEqualStrings("old-s3kr3t", cfg.cloak.previous_secret.?);
+    // anon_epoch_secs defaults to 24 h when absent.
+    try testing.expectEqual(@as(u64, 86400), cfg.cloak.anon_epoch_secs);
+}
+
+test "parseToml: [cloak] anon_epoch_secs parses and 0 disables rotation" {
+    const allocator = testing.allocator;
+    const on =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[cloak]
+        \\anon_epoch_secs = 3600
+        \\
+    ;
+    var cfg_on = try parseToml(allocator, on, .{});
+    defer cfg_on.deinit(allocator);
+    try testing.expectEqual(@as(u64, 3600), cfg_on.cloak.anon_epoch_secs);
+
+    const off =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[cloak]
+        \\anon_epoch_secs = 0
+        \\
+    ;
+    var cfg_off = try parseToml(allocator, off, .{});
+    defer cfg_off.deinit(allocator);
+    try testing.expectEqual(@as(u64, 0), cfg_off.cloak.anon_epoch_secs);
+
+    // Out-of-range (> ~1 year) is rejected.
+    try testing.expectError(error.ParseError, parseToml(
+        allocator,
+        "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\nanon_epoch_secs=99999999999\n",
+        .{},
+    ));
 }
 
 test "parseToml: required fields and ranges are enforced" {

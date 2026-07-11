@@ -173,6 +173,34 @@ pub fn cloakOpaque(
     return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
 }
 
+/// Cloak an IP into an OPAQUE cloak that ROTATES with `epoch`: a single 64-bit
+/// token over the full address plus the current epoch counter, then the `opq`
+/// marker and network suffix. Serves two anonymity goals for *unauthenticated*
+/// clients: the epoch salt makes the same address unlinkable across epochs
+/// (retiring forever-linkability of a static-IP anonymous user), and the opaque
+/// single-token form leaks no subnet co-membership. `epoch` is a PUBLIC
+/// wall-clock rotation counter supplied by the caller; a fixed `epoch`
+/// degenerates to a stable opaque cloak. Cannot be subnet-banned (by design —
+/// anonymous moderation shifts to account bans + registration friction). A
+/// distinct domain tag (`opqe`) keeps these tokens in their own key-separated
+/// family, so an epoch cloak never equals the plain `cloakOpaque` token.
+pub fn cloakOpaqueEpoch(
+    out: []u8,
+    key: *const SecretKey,
+    address: []const u8,
+    epoch: u64,
+    options: Options,
+) CloakError![]const u8 {
+    var full: [full_token_hex_len]u8 = undefined;
+    if (Net.IpAddress.parse(address, 0)) |parsed| {
+        switch (parsed) {
+            .ip4 => |ip4| token64Epoch(&full, key, "ip4/v2/opqe|", ip4.bytes[0..4], epoch),
+            .ip6 => |ip6| token64Epoch(&full, key, "ip6/v2/opqe|", ip6.bytes[0..16], epoch),
+        }
+    } else |_| return error.InvalidHostname;
+    return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
+}
+
 /// Cloak raw IPv4 bytes hierarchically: a 64-bit token over the full address,
 /// then 32-bit tokens per cumulative prefix (/24, /16, /8), most specific
 /// first, then the mixed-in `a<asn>.<cc>` geo labels, the `ip` marker, and the
@@ -352,14 +380,43 @@ fn token64(out: *[full_token_hex_len]u8, key: *const SecretKey, domain: []const 
     hexEncode(out, tag[0 .. full_token_hex_len / 2]);
 }
 
+/// Like `token64` but folds a public rotation `epoch` into the MAC, so the same
+/// address under the same key rotates to a fresh token each epoch. Used only by
+/// the anonymous opaque-cloak path (`cloakOpaqueEpoch`).
+fn token64Epoch(out: *[full_token_hex_len]u8, key: *const SecretKey, domain: []const u8, data: []const u8, epoch: u64) void {
+    var tag = macTagEpoch(key, domain, data, epoch);
+    defer secureZero(&tag);
+    hexEncode(out, tag[0 .. full_token_hex_len / 2]);
+}
+
 /// HMAC-SHA256(key, domain || data). Key bytes are wiped after use.
 fn macTag(key: *const SecretKey, domain: []const u8, data: []const u8) [tag_len]u8 {
+    return macCore(key, domain, data, null);
+}
+
+/// HMAC-SHA256(key, domain || data || epoch_be64). `epoch` is a PUBLIC value (a
+/// wall-clock rotation counter), so folding it in adds no secret-dependent
+/// branch — the only branch is on its presence, never on the key.
+fn macTagEpoch(key: *const SecretKey, domain: []const u8, data: []const u8, epoch: u64) [tag_len]u8 {
+    return macCore(key, domain, data, epoch);
+}
+
+/// Shared HMAC core. With `epoch == null` this is byte-identical to the plain
+/// `HMAC-SHA256(key, domain || data)` used by every non-epoch token, so the
+/// account/hierarchical/opaque/hostname paths are provably unchanged. Key bytes
+/// are wiped after use.
+fn macCore(key: *const SecretKey, domain: []const u8, data: []const u8, epoch: ?u64) [tag_len]u8 {
     var key_bytes = key.declassify();
     defer secureZero(&key_bytes);
     var tag: [tag_len]u8 = undefined;
     var mac = HmacSha256.init(&key_bytes);
     mac.update(domain);
     mac.update(data);
+    if (epoch) |e| {
+        var ebuf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &ebuf, e, .big);
+        mac.update(&ebuf);
+    }
     mac.final(&tag);
     return tag;
 }
@@ -787,6 +844,68 @@ test "small output buffers fail cleanly" {
     try testing.expectError(error.OutputTooSmall, cloak(&out, &test_key, "203.0.113.99", geo_us, .{}));
     try testing.expectError(error.OutputTooSmall, cloakOpaque(&out, &test_key, "203.0.113.99", .{}));
     try testing.expectError(error.OutputTooSmall, cloakAccount(&out, "kain", "ircxnet"));
+}
+
+test "opaque epoch cloak: stable within an epoch, rotates across epochs" {
+    var a: [max_cloak_len]u8 = undefined;
+    var a2: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const e1a = try cloakOpaqueEpoch(&a, &test_key, "203.0.113.5", 100, .{});
+    const e1b = try cloakOpaqueEpoch(&a2, &test_key, "203.0.113.5", 100, .{});
+    const e2 = try cloakOpaqueEpoch(&b, &test_key, "203.0.113.5", 101, .{});
+
+    // Same epoch + IP + key => identical (stable within one epoch).
+    try testing.expectEqualSlices(u8, e1a, e1b);
+    // Different epoch => different cloak (forever-linkability retired).
+    try testing.expect(!std.mem.eql(u8, e1a, e2));
+
+    // Still the opaque shape: <full16>.opq.<suffix>.
+    var lbuf: [16][]const u8 = undefined;
+    const labels = splitLabels(&lbuf, e1a);
+    try testing.expectEqual(@as(usize, 3), labels.len);
+    try testing.expect(isHexToken(labels[0], full_token_hex_len));
+    try testing.expectEqualStrings(opaque_marker, labels[1]);
+    try testing.expectEqualStrings(default_suffix, labels[2]);
+}
+
+test "opaque epoch cloak hides subnet co-membership" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const ca = try cloakOpaqueEpoch(&a, &test_key, "203.0.113.5", 7, .{});
+    const cb = try cloakOpaqueEpoch(&b, &test_key, "203.0.113.77", 7, .{}); // same /24
+    // Opaque form shares NOTHING for two addresses in the same /24.
+    try testing.expect(!std.mem.eql(u8, ca, cb));
+}
+
+test "opaque epoch cloak is a key-separated family from the plain opaque cloak" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const plain = try cloakOpaque(&a, &test_key, "203.0.113.5", .{});
+    const epoched = try cloakOpaqueEpoch(&b, &test_key, "203.0.113.5", 0, .{});
+    // Distinct domain tag (`opqe`) => even epoch 0 differs from the plain token.
+    try testing.expect(!std.mem.eql(u8, plain, epoched));
+}
+
+test "opaque epoch cloak: IPv6 rotates and keeps the opaque tail" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const e1 = try cloakOpaqueEpoch(&a, &test_key, "2001:db8::1", 5, .{});
+    const e2 = try cloakOpaqueEpoch(&b, &test_key, "2001:db8::1", 6, .{});
+    try testing.expect(!std.mem.eql(u8, e1, e2));
+    try testing.expect(std.mem.endsWith(u8, e1, ".opq.ircxnet"));
+}
+
+test "opaque epoch cloak: a different key yields an unlinkable rotation" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const ka = try cloakOpaqueEpoch(&a, &test_key, "203.0.113.5", 42, .{});
+    const kb = try cloakOpaqueEpoch(&b, &other_key, "203.0.113.5", 42, .{});
+    try testing.expect(!std.mem.eql(u8, ka, kb));
+}
+
+test "opaque epoch cloak: small output buffer fails cleanly" {
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, cloakOpaqueEpoch(&out, &test_key, "203.0.113.5", 1, .{}));
 }
 
 test "classify recognizes address kinds" {

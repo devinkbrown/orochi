@@ -1907,6 +1907,13 @@ pub const Config = struct {
     /// client's visible host is the friendly `<account>.users.<suffix>` — stable
     /// across IPs/devices. Requires a cloak key; explicit VHOST personas win.
     cloak_account: bool = false,
+    /// Anonymous-client cloak rotation cadence in seconds (`[cloak]
+    /// anon_epoch_secs`). When non-zero, an UNAUTHENTICATED client's IP is
+    /// cloaked with the epoch-salted opaque form (`cloakOpaqueEpoch`) so it
+    /// rotates each `anon_epoch_secs` and never leaks subnet co-membership.
+    /// Logged-in clients are unaffected (they keep the account/hierarchical
+    /// cloak). 0 = disabled (anonymous clients keep the stable cloak).
+    cloak_anon_epoch_secs: u64 = 0,
     /// Background forward-confirmed reverse-DNS resolver (owned by main). When
     /// set, each non-loopback client IP is resolved off the hot path and its
     /// confirmed hostname becomes the cloak base (so hosts show a cloaked
@@ -5808,6 +5815,21 @@ pub const LinuxServer = struct {
                     } else |_| {}
                 }
             }
+            // Auth-split (P0-1): an ANONYMOUS (not-logged-in) client, when anon
+            // epoch rotation is enabled, gets an OPAQUE cloak salted by the
+            // current wall-clock epoch — so a static-IP anonymous user is neither
+            // linkable across epochs nor leaks subnet co-membership. Logged-in
+            // clients skip this (account() != null) and fall through to the stable
+            // account/hierarchical cloak, keeping subnet-bannability. Moderation of
+            // anonymous abuse shifts to account bans + registration friction.
+            if (self.config.cloak_anon_epoch_secs != 0 and conn.session.account() == null) {
+                const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+                conn.session.setVisibleHost(cloak.cloakOpaqueEpoch(&cbuf, &key, ip_text, self.anonCloakEpoch(), opts) catch {
+                    conn.session.setVisibleHost(ip_text);
+                    return;
+                });
+                return;
+            }
             // Cloak the IP ITSELF — never the reverse-DNS name, which would leak
             // the ISP's registrable domain (`....comcast.net`). rDNS still resolves
             // (for the oper-only real-host WHOIS line); it just never feeds the
@@ -5948,6 +5970,19 @@ pub const LinuxServer = struct {
     fn grantNowU64(self: *const LinuxServer) u64 {
         _ = self;
         return @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+    }
+
+    /// Current anonymous-cloak rotation epoch: `floor(wall_clock_seconds /
+    /// anon_epoch_secs)`. Wall-clock based so every mesh node computes the same
+    /// epoch for a given instant (same cross-node clock-domain rule as oper
+    /// grants and HLC LWW; a per-node monotonic clock would desync the anon
+    /// cloak across the mesh). Returns 0 when rotation is disabled, so the
+    /// division is never reached with a zero divisor.
+    fn anonCloakEpoch(self: *const LinuxServer) u64 {
+        const secs = self.config.cloak_anon_epoch_secs;
+        if (secs == 0) return 0;
+        const now_ms: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        return (now_ms / 1000) / secs;
     }
 
     /// Whether IP reputation is active (a non-zero refuse threshold configured).
@@ -34911,6 +34946,69 @@ test "rotatable cloak key: a ward on the old-key cloak misses the new-key cloak"
     // NOT — which is exactly why the server must also test the previous-key host.
     try std.testing.expect(reg.check(.{ .host = old_host }, 100) != null);
     try std.testing.expect(reg.check(.{ .host = new_host }, 100) == null);
+}
+
+test "cloak auth-split: anonymous gets epoch opaque, logged-in keeps the stable account cloak" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    server.config.cloak_key = cloak.SecretKey.init(@as([cloak.key_len]u8, @splat(0x3c)));
+    server.config.cloak_suffix = "ircxnet";
+    server.config.cloak_account = true;
+    server.config.cloak_anon_epoch_secs = 86400;
+
+    const id = try addTestLocalClient(&server, "anon", null);
+    const conn = server.connFor(id).?;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+
+    // Anonymous + epoch enabled => the OPAQUE epoch cloak (`.opq.<suffix>`), NOT
+    // the hierarchical `.ip.<suffix>` form (so no subnet co-membership leaks).
+    server.applyVisibleHost(conn);
+    var host_buf: [cloak.max_cloak_len]u8 = undefined;
+    const anon_host = blk: {
+        const h = conn.session.host();
+        @memcpy(host_buf[0..h.len], h);
+        break :blk host_buf[0..h.len];
+    };
+    try std.testing.expect(std.mem.endsWith(u8, anon_host, ".opq.ircxnet"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, anon_host, 1, ".ip.ircxnet"));
+
+    // Stable within the same epoch: recomputing back-to-back yields the same host
+    // (the copy above survives the store rewrite the second call performs).
+    server.applyVisibleHost(conn);
+    try std.testing.expectEqualStrings(anon_host, conn.session.host());
+
+    // Log the SAME client in: it now wears the stable, moderatable account cloak
+    // `<acct>.users.<suffix>`, unaffected by anon epoch rotation.
+    conn.session.loginAs("kain");
+    server.applyVisibleHost(conn);
+    try std.testing.expectEqualStrings("kain.users.ircxnet", conn.session.host());
+}
+
+test "cloak auth-split: anon_epoch_secs=0 keeps the stable hierarchical cloak (back-compat)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    server.config.cloak_key = cloak.SecretKey.init(@as([cloak.key_len]u8, @splat(0x77)));
+    server.config.cloak_suffix = "ircxnet";
+    server.config.cloak_anon_epoch_secs = 0; // rotation disabled
+
+    const id = try addTestLocalClient(&server, "anon2", null);
+    const conn = server.connFor(id).?;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 8 } };
+
+    server.applyVisibleHost(conn);
+    // Disabled => the anonymous client keeps the stable, subnet-bannable
+    // hierarchical cloak, exactly as before this feature.
+    try std.testing.expect(std.mem.endsWith(u8, conn.session.host(), ".ip.ircxnet"));
 }
 
 // Build a relay PRIVMSG signed by `kp`, stamping the carried pubkey/sig into the

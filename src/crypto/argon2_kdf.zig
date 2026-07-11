@@ -107,6 +107,37 @@ pub fn verify(allocator: std.mem.Allocator, password: []const u8, phc: []const u
     return true;
 }
 
+/// Fixed domain-separation salt for DETERMINISTIC key derivation via `deriveKey`.
+/// Argon2id normally wants a unique random salt per password, but a derived
+/// server key (e.g. the host-cloak key) must be *reproducible* — identical
+/// across restarts and on every mesh node — so we derive deterministically from
+/// the operator secret with this fixed, purpose-labeled salt. The label pins the
+/// derivation to the cloak-key use so the same secret reused elsewhere would not
+/// yield the same key. Must be >= 8 bytes (Argon2 KDF minimum).
+pub const cloak_key_salt = "orochi/cloak-key/argon2id/v1";
+
+/// Deterministically stretch an operator `secret` into `out` (fixed-width key
+/// material) with Argon2id and a FIXED `salt`. Unlike a bare `SHA256(secret)`,
+/// this makes an offline brute-force of a weak operator passphrase pay the full
+/// Argon2 memory + time cost per guess — the one place a low-entropy cloak
+/// passphrase was previously enumerable. Deterministic: the same
+/// `(secret, salt, params)` always yields the same key, which is required so
+/// cloaked hosts stay stable across restarts and identical mesh-wide.
+///
+/// `out.len` must be >= 4 and `salt.len` >= 8 (Argon2 KDF minimums); the caller
+/// owns wiping `out` when the key is retired. `params.m` KiB of scratch memory
+/// is allocated from `allocator` for the duration of the call.
+pub fn deriveKey(
+    allocator: std.mem.Allocator,
+    out: []u8,
+    secret: []const u8,
+    salt: []const u8,
+    params: Params,
+) HashError!void {
+    const io = getIo();
+    try argon2.kdf(allocator, out, secret, salt, params, .argon2id, io);
+}
+
 // ---------------------------------------------------------------------------
 // Tests — use TINY memory/time parameters so the suite stays fast. These are
 // NOT acceptable for production; production callers use `default_params`.
@@ -166,4 +197,61 @@ test "empty password round-trips" {
 
     try std.testing.expect(try verify(allocator, "", phc));
     try std.testing.expect(!try verify(allocator, "x", phc));
+}
+
+test "deriveKey: cloak key derivation is deterministic" {
+    const allocator = std.testing.allocator;
+    var k1: [32]u8 = undefined;
+    var k2: [32]u8 = undefined;
+    try deriveKey(allocator, &k1, "operator secret", cloak_key_salt, test_params);
+    try deriveKey(allocator, &k2, "operator secret", cloak_key_salt, test_params);
+    // Same secret + salt + params => identical key (stable across restarts /
+    // mesh-wide). This is the property the SHA256 path also had; the win is the
+    // memory-hard stretching below, not a change in determinism.
+    try std.testing.expectEqualSlices(u8, &k1, &k2);
+}
+
+test "deriveKey: cloak key equals a direct Argon2id KDF over the same inputs" {
+    const allocator = std.testing.allocator;
+    var got: [32]u8 = undefined;
+    try deriveKey(allocator, &got, "weak", cloak_key_salt, test_params);
+    // Independent-path KAT: recompute via the std Argon2id KDF directly. This
+    // pins the exact composition (mode = argon2id, this salt, these params) so a
+    // future refactor that silently changes any of them fails here rather than
+    // orphaning every deployment's cloaks.
+    var want: [32]u8 = undefined;
+    try argon2.kdf(allocator, &want, "weak", cloak_key_salt, test_params, .argon2id, getIo());
+    try std.testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "deriveKey: a weak short cloak secret is stretched to full-width key material" {
+    const allocator = std.testing.allocator;
+    var k: [32]u8 = undefined;
+    try deriveKey(allocator, &k, "x", cloak_key_salt, test_params);
+
+    // Not all-zero and not a trivial single-byte fill.
+    var all_zero = true;
+    var all_same = true;
+    for (k) |b| {
+        if (b != 0) all_zero = false;
+        if (b != k[0]) all_same = false;
+    }
+    try std.testing.expect(!all_zero);
+    try std.testing.expect(!all_same);
+
+    // And distinct from the old bare-SHA256 derivation of the same secret — the
+    // whole point of the hardening (a weak secret no longer maps through a
+    // single unsalted hash an attacker can precompute).
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("x", &sha, .{});
+    try std.testing.expect(!std.mem.eql(u8, &k, &sha));
+}
+
+test "deriveKey: distinct cloak secrets yield distinct keys" {
+    const allocator = std.testing.allocator;
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    try deriveKey(allocator, &a, "secret-a", cloak_key_salt, test_params);
+    try deriveKey(allocator, &b, "secret-b", cloak_key_salt, test_params);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }
