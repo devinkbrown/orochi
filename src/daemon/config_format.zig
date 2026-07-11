@@ -806,6 +806,15 @@ pub const Config = struct {
         require_attestation: bool = false,
     };
 
+    /// True when this node is meshed (has configured peers) but has no shared
+    /// `[cloak] secret`. In that case each node generates its own random per-boot
+    /// cloak key, so cloaked hosts differ per node and change on restart —
+    /// `*!*@<cloak>` and subnet WARD bans neither federate across the mesh nor
+    /// survive a restart. All mesh nodes must share one `[cloak] secret`.
+    pub fn meshCloakSecretMissing(self: *const Config) bool {
+        return self.mesh.connect.len != 0 and self.cloak.secret == null;
+    }
+
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
         const host = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(host);
@@ -3208,6 +3217,51 @@ test "parseToml: [webauthn] omitted leaves the feature inert" {
     try testing.expectEqual(@as(usize, 0), cfg.webauthn.origins.len);
     try testing.expect(!cfg.webauthn.require_uv);
     try testing.expect(!cfg.webauthn.require_attestation);
+}
+
+test "meshCloakSecretMissing: cloak federation guard flags meshed node with no shared secret" {
+    const allocator = testing.allocator;
+
+    // Meshed (has a peer) but no [cloak] secret → per-boot random keys that break
+    // ban federation and evaporate on restart. The guard must fire.
+    {
+        var cfg = try parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh]
+            \\connect = ["[::1]:6900"]
+            \\
+        , .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.meshCloakSecretMissing());
+    }
+
+    // Meshed WITH a shared secret → keys are derived, cloaks federate. No fire.
+    {
+        var cfg = try parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh]
+            \\connect = ["[::1]:6900"]
+            \\[cloak]
+            \\secret = "shared-across-the-mesh"
+            \\
+        , .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(!cfg.meshCloakSecretMissing());
+    }
+
+    // Standalone node (no peers), no secret → per-boot key is fine, nothing to
+    // federate. No fire.
+    {
+        var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(!cfg.meshCloakSecretMissing());
+    }
 }
 
 test {

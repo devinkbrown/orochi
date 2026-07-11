@@ -439,6 +439,18 @@ fn countLabels(hostname: []const u8) usize {
 /// Append `value` lowercased with non-hostname bytes mapped to '-', trimmed
 /// of leading/trailing '-'. Fails with `empty_err` when nothing usable
 /// remains or the resulting label would exceed the DNS label limit.
+/// Sanitize `value` into a single hostname label — lowercased, non-hostname
+/// bytes mapped to `-`, and leading/trailing `-` trimmed — exactly the transform
+/// `cloakAccount` applies to the account label. Returns null when `value` reduces
+/// to empty or overflows `out`. Public so callers (e.g. the VHOST CLAIM
+/// account-binding) can compare a requested host's leading label against the
+/// account apples-to-apples with the friendly `<account>.users.<suffix>` cloak.
+pub fn sanitizeLabel(out: []u8, value: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    appendSanitizedLabel(out, &n, value, error.InvalidAccount) catch return null;
+    return out[0..n];
+}
+
 fn appendSanitizedLabel(
     out: []u8,
     n: *usize,

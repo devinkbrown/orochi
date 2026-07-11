@@ -16,11 +16,15 @@
 //!     grant, self-claim from a template, domain-verified, or auto/cloak — so
 //!     the trust origin of an apparent identity is always auditable.
 //!
-//! This module is pure: it owns the persona + offer storage and the matching
-//! logic. The live server applies the active persona to a session (CHGHOST) and
-//! gates who may publish offers.
+//! This module owns the persona + offer storage and the matching logic. The live
+//! server applies the active persona to a session (CHGHOST) and gates who may
+//! publish offers. Its one outward dependency is the stateless `cloak`
+//! label-sanitizer: `claim` binds a self-claimed host's leading label to the
+//! caller's account the same way `cloakAccount` derives `<account>.users.<...>`,
+//! so a user can only self-claim a host that spells their own account.
 
 const std = @import("std");
+const cloak = @import("../proto/cloak.zig");
 
 /// How a persona's host was obtained — its trust provenance.
 pub const Source = enum {
@@ -74,6 +78,8 @@ pub const GuiseError = std.mem.Allocator.Error || error{
     TooManyOffers,
     TooManyAccounts,
     NotOffered,
+    NotYours,
+    HostClaimedByOther,
     Duplicate,
 };
 
@@ -132,11 +138,45 @@ pub const Registry = struct {
 
     /// Self-claim `host` if it matches an operator OFFER template. Stored as a
     /// `.claimed` persona named after the host's first label. Returns the offer.
+    ///
+    /// The claim is bound to `account`: the host's leading label — sanitized the
+    /// way `cloakAccount` sanitizes an account — must equal the sanitized
+    /// account, and no *other* account may already wear the same host. Without
+    /// this a logged-in user could self-claim `<someone-else>.users.<suffix>` off
+    /// a wildcard community offer and wear another account's apparent identity.
     pub fn claim(self: *Registry, account: []const u8, host: []const u8, now_ms: i64) GuiseError!Offer {
         const offer = self.matchOffer(host) orelse return error.NotOffered;
+        if (!leadingLabelMatchesAccount(account, host)) return error.NotYours;
+        if (self.hostOwnedByOther(account, host)) return error.HostClaimedByOther;
         const name = firstLabel(host);
         try self.grant(account, name, host, .claimed, now_ms);
         return offer;
+    }
+
+    /// True when `host`'s leading label, sanitized as a hostname label, equals
+    /// the sanitized `account` — i.e. the host spells the caller's own account.
+    fn leadingLabelMatchesAccount(account: []const u8, host: []const u8) bool {
+        var abuf: [cloak.max_cloak_len]u8 = undefined;
+        var hbuf: [cloak.max_cloak_len]u8 = undefined;
+        const acct_label = cloak.sanitizeLabel(&abuf, account) orelse return false;
+        const lead_label = cloak.sanitizeLabel(&hbuf, firstLabel(host)) orelse return false;
+        return std.mem.eql(u8, acct_label, lead_label);
+    }
+
+    /// True when some account OTHER than `account` already wears `host` as a
+    /// persona (case-insensitive). Blocks two accounts holding the identical
+    /// apparent host.
+    fn hostOwnedByOther(self: *const Registry, account: []const u8, host: []const u8) bool {
+        var kbuf: [Params_account_key_max]u8 = undefined;
+        const key = lowerKey(&kbuf, account) orelse return false;
+        var it = self.accounts.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, key)) continue; // same account
+            for (e.value_ptr.items) |p| {
+                if (std.ascii.eqlIgnoreCase(p.host, host)) return true;
+            }
+        }
+        return false;
     }
 
     pub fn personas(self: *const Registry, account: []const u8) []const Persona {
@@ -324,6 +364,47 @@ test "limits enforced" {
     try std.testing.expectError(error.NameTooLong, reg.grant("u", "toolong", "h.example", .granted, 0));
     try reg.addOffer("*.a", "x");
     try std.testing.expectError(error.TooManyOffers, reg.addOffer("*.b", "y"));
+}
+
+test "vhost claim binds host leading-label to the caller's account" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.addOffer("*.users.eshmaki.me", "community vhosts");
+
+    // Impersonation attempt: carol claiming bob's host is rejected, and nothing
+    // is stored for carol.
+    try std.testing.expectError(error.NotYours, reg.claim("carol", "bob.users.eshmaki.me", 1));
+    try std.testing.expectEqual(@as(usize, 0), reg.personas("carol").len);
+
+    // The account's own host succeeds (leading label == account).
+    const offer = try reg.claim("carol", "carol.users.eshmaki.me", 2);
+    try std.testing.expectEqualStrings("community vhosts", offer.label);
+    try std.testing.expectEqualStrings("carol.users.eshmaki.me", reg.find("carol", "carol").?.host);
+}
+
+test "vhost claim rejects a host already worn by another account" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.addOffer("*.users.eshmaki.me", "community vhosts");
+
+    // Operator granted bob the host (a granted persona, any name/host).
+    try reg.grant("bob", "main", "shared.users.eshmaki.me", .granted, 1);
+    // Another account whose name sanitizes to the same leading label cannot claim
+    // the identical host bob already wears.
+    try std.testing.expectError(error.HostClaimedByOther, reg.claim("shared", "shared.users.eshmaki.me", 2));
+    try std.testing.expectEqual(@as(usize, 0), reg.personas("shared").len);
+}
+
+test "vhost claim sanitizes account and label apples-to-apples" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.addOffer("*.users.eshmaki.me", "community vhosts");
+
+    // Account "some_user" sanitizes to label "some-user"; the canonical host
+    // spelling is accepted, an unrelated label is not.
+    _ = try reg.claim("some_user", "some-user.users.eshmaki.me", 1);
+    try std.testing.expectEqualStrings("some-user.users.eshmaki.me", reg.find("some_user", "some-user").?.host);
+    try std.testing.expectError(error.NotYours, reg.claim("some_user", "eve.users.eshmaki.me", 2));
 }
 
 test "no leak under churn" {

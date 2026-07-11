@@ -183,7 +183,16 @@ pub fn main(init: std.process.Init) !void {
                 defer allocator.free(text);
                 if (orochi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                     var l = loaded;
-                    l.deinit(allocator);
+                    defer l.deinit(allocator);
+                    // A meshed node with no shared [cloak] secret is a
+                    // misconfiguration, not merely a style nit: per-boot random
+                    // cloak keys differ per node and change on restart, so
+                    // host/subnet WARD bans neither federate nor persist. Fail
+                    // validation loudly so it is caught before deploy.
+                    if (l.parsed.meshCloakSecretMissing()) {
+                        std.debug.print("config ERROR in {s}: meshed node ([mesh] connect set) has no shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence — set the SAME [cloak] secret on every mesh node\n", .{path});
+                        std.process.exit(1);
+                    }
                     std.debug.print("config OK: {s}\n", .{path});
                     return;
                 } else |err| {
@@ -487,6 +496,14 @@ pub fn main(init: std.process.Init) !void {
         init.io.random(&cloak_key_bytes);
         srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
         std.debug.print("orochi: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
+        // On a MESHED node a per-boot random cloak key is a federation hazard:
+        // cloaked hosts differ per node and change on every restart, so
+        // `*!*@<cloak>` and subnet WARD bans neither cross the mesh nor survive a
+        // restart. Warn loudly so the operator sets one shared [cloak] secret.
+        if (held) |h| {
+            if (h.parsed.meshCloakSecretMissing())
+                std.debug.print("orochi: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.\n", .{});
+        }
     }
 
     // Background forward-confirmed reverse-DNS resolver: client IPs are resolved

@@ -27237,7 +27237,13 @@ pub const LinuxServer = struct {
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST CLAIM <host>");
         const host = p[1];
         chghost.validateHost(host) catch return self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
-        _ = self.guises.claim(account, host, self.nowMs()) catch return self.noticeTo(conn, "VHOST: no operator offer matches that host");
+        _ = self.guises.claim(account, host, self.nowMs()) catch |err| switch (err) {
+            // Self-service CLAIM is account-bound: a user may only claim a host
+            // that spells their own account, and not one another account wears.
+            error.NotYours => return self.failReply(conn, "VHOST", "HOST_NOT_YOURS", "You may only claim a vhost whose leading label is your account name"),
+            error.HostClaimedByOther => return self.failReply(conn, "VHOST", "HOST_TAKEN", "That host is already claimed by another account"),
+            else => return self.noticeTo(conn, "VHOST: no operator offer matches that host"),
+        };
         try applyVhostLine(self, id, conn, host);
     }
 

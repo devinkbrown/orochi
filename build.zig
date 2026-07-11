@@ -248,6 +248,8 @@ pub fn build(b: *std.Build) void {
         "raw-public-key",
         "raw public key",
         "WEBAUTHN",
+        "vhost",
+        "cloak",
     };
     const server_tests = b.addTest(.{
         .root_module = mod,
