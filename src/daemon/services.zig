@@ -1502,22 +1502,21 @@ pub const Services = struct {
         scratch: []u8,
     ) ServiceError!CommandResult {
         const record = try self.loadChannel(channel);
+        // Authorize BEFORE probing target-account existence. All three actions
+        // require .admin, so hoisting the gate above the `.accounts` lookup
+        // closes a registration-enumeration oracle: without it a non-admin
+        // actor distinguished a registered target (Forbidden) from an
+        // unregistered one (NotFound) on a channel they do not administer.
+        try self.requireAccess(record, actor, .admin);
         const target_key = try accountKey(target);
         if (self.store.family(.accounts).get(target_key.asSlice()) == null) return error.NotFound;
 
         switch (action) {
             .query => {
-                // Reading back another account's access level is moderation
-                // state: gate it with the same .admin requirement as the
-                // list-all sibling (channelAccessList) so an actor with no
-                // access cannot probe who holds FOUNDER/OP/VOICE on a channel
-                // they do not administer.
-                try self.requireAccess(record, actor, .admin);
                 const access = try self.loadAccess(record, target_key.asSlice());
                 return .{ .access = access.info() };
             },
             .grant => {
-                try self.requireAccess(record, actor, .admin);
                 if (level == .founder) try self.requireAccess(record, actor, .founder);
                 const access = try self.putAccess(record, AccountName.init(target_key.asSlice()) catch return error.InvalidName, level, scratch);
                 return .{ .access = access.info() };
@@ -4249,6 +4248,13 @@ test "channel access and akick query require admin" {
     // bob holds op (below .admin): still Forbidden on either query.
     try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch));
     try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "Bad!*@*", .query, "", &scratch));
+
+    // A non-admin querying an UNREGISTERED target must get Forbidden, NOT
+    // NotFound: the .admin gate is hoisted above the target-account existence
+    // probe so the reply cannot distinguish a registered from an unregistered
+    // account (a registration-enumeration oracle). Pre-hoist this returned
+    // error.NotFound.
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "mallory", "no_such_account", .query, .voice, &scratch));
 
     // The founder (admin+) may still read both back.
     const acc = try services.channelAccess("#orochi", "alice", "bob", .query, .voice, &scratch);
