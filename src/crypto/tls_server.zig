@@ -116,6 +116,16 @@ pub const Error = error{
     /// suite, or its private key does not match the ECHConfig public key. Raised
     /// only at `init` (fail-fast) — a bad ECH extension on the wire never errors.
     BadEchConfig,
+    /// draft-ietf-tls-esni (RFC 9849) §7: we ACCEPTED an ECH ClientHelloInner on
+    /// ClientHello1 but the negotiation then requires a HelloRetryRequest, whose
+    /// ClientHello2 would have to re-seal the inner under the SAME HPKE sender
+    /// context and carry the "hrr ech accept confirmation" — a transcript-exact
+    /// re-seal that is NOT implemented here (deferred, gated on an external ECH
+    /// oracle). Rather than send a plain HRR that abandons an accepted inner
+    /// mid-handshake (a transcript/acceptance inconsistency and a silent downgrade
+    /// of the client's ECH), the server FAILS CLOSED — the symmetric counterpart of
+    /// the client's `HelloRetryRequestUnsupported`.
+    EchHrrUnsupported,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
@@ -1326,7 +1336,22 @@ pub const Server = struct {
 
     fn buildServerFlight(self: *Server, client_hello_body: []const u8, client_hello_raw: []const u8) Error![]u8 {
         const shared = switch (try self.processClientHello(client_hello_body, client_hello_raw)) {
-            .retry => |group| return try self.buildHelloRetryRequest(group),
+            .retry => |group| {
+                // ECH×HRR fail-closed (draft-ietf-tls-esni / RFC 9849 §7). If
+                // `maybeOpenEch` ACCEPTED a ClientHelloInner on ClientHello1
+                // (`ech_accepted`) and negotiation now demands a HelloRetryRequest,
+                // ClientHello2 would have to re-seal the inner under the same HPKE
+                // context (second seal, empty `enc`) and the HRR carry the
+                // "hrr ech accept confirmation" — a transcript-exact re-seal that is
+                // deferred (gated on the external ECH oracle). Emitting a plain HRR
+                // here would abandon an accepted inner mid-handshake: the transcript
+                // already holds Hash(ClientHelloInner1) (see `buildHelloRetryRequest`)
+                // yet the acceptance would silently drop, a downgrade+mismatch the
+                // peer only detects at Finished. Abort now instead — the symmetric
+                // counterpart of the client's `HelloRetryRequestUnsupported`.
+                if (self.ech_accepted) return error.EchHrrUnsupported;
+                return try self.buildHelloRetryRequest(group);
+            },
             .proceed => |s| s,
         };
 
@@ -1974,13 +1999,13 @@ pub const Server = struct {
 
         // ECH acceptance (draft-ietf-tls-esni §7.2) is signaled ONLY on the
         // ServerHello of a single-round handshake. ECH+HRR is a deferred combination
-        // (the HRR ServerHello would need the "hrr ech accept confirmation" label,
-        // and the orochi client stands ECH+HRR down to plain): a ClientHelloOuter
-        // that we opened (`ech_accepted`) but must then HelloRetryRequest reaches
-        // `writeServerHello` again for ClientHello2 with `hrr_sent` set — do NOT
-        // stamp there (an unreproducible confirmation), so that path fail-closes
-        // rather than emitting a bogus signal. Only OROCHI clients withholding the
-        // inner key_share could reach it; browsers/orochi never do.
+        // (the HRR ServerHello would need the "hrr ech accept confirmation" label
+        // and a CH2 inner re-seal): `buildServerFlight` now FAILS CLOSED with
+        // `EchHrrUnsupported` the moment an accepted ECH inner would require a
+        // HelloRetryRequest, so `ech_accepted and hrr_sent` is unreachable here. The
+        // `and !self.hrr_sent` guard is retained as belt-and-suspenders — if the
+        // abort were ever bypassed, we still refuse to stamp an unreproducible
+        // confirmation into a second ServerHello rather than emit a bogus signal.
         const signal_ech = self.ech_accepted and !self.hrr_sent;
 
         try appendU16(self.allocator, &body, tls_record.legacy_record_version);
@@ -3576,6 +3601,169 @@ test "loopback: a no-ECH ClientHello against an ECH-configured server takes the 
     const got_c = try client.decrypt(s2c);
     defer alloc.free(got_c);
     try std.testing.expectEqualStrings("plain", got_c);
+}
+
+test "ECH×HRR: server FAILS CLOSED when an accepted inner would require a HelloRetryRequest" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x54)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x54, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{ "irc.test", "cover.example" },
+        .is_ca = true,
+    });
+
+    const hpke_kp = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x26)));
+    var list_buf: [600]u8 = undefined;
+    const ech_list = buildEchConfigList(&list_buf, 7, &hpke_kp.public_key, "cover.example", 64);
+    const ech_keys = [_]EchKey{.{ .config = ech_list, .private_key = hpke_kp.secret_key }};
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .ech_keys = &ech_keys });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{der},
+        .ech_config_list = ech_list,
+    });
+    defer client.deinit();
+    // The ECH ClientHelloInner advertises groups but withholds every key_share, so
+    // the server — after opening the inner — must ask for a HelloRetryRequest.
+    client.offerNoSharesForTest();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try std.testing.expect(client.echOffered());
+
+    // The server opens the sealed inner (latching ech_accepted) and, finding no
+    // usable key_share, would HRR — which cannot carry the accepted ECH across two
+    // ClientHellos here. It MUST abort rather than stand ECH down / downgrade.
+    try std.testing.expectError(error.EchHrrUnsupported, server.feed(ch));
+    // It genuinely accepted the inner first (proving this is the ECH-accepted×HRR
+    // path, not a silent fall-through to the outer ClientHello)...
+    try std.testing.expect(server.ech_accepted);
+    // ...and it emitted NO HelloRetryRequest: no downgrade, no bogus signal.
+    try std.testing.expect(!server.hrr_sent);
+    try std.testing.expectEqual(State.wait_client_hello, server.state);
+}
+
+test "ECH×HRR: an ECH-active client FAILS CLOSED on receiving a HelloRetryRequest" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x55)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x55, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{ "irc.test", "cover.example" },
+        .is_ca = true,
+    });
+
+    // A config the client offers ECH under; the server has NO ech_keys, so it opens
+    // nothing and processes the ClientHelloOuter (public_name = cover.example). With
+    // the outer withholding shares it answers a plain HelloRetryRequest.
+    const hpke_kp = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x27)));
+    var list_buf: [600]u8 = undefined;
+    const ech_list = buildEchConfigList(&list_buf, 7, &hpke_kp.public_key, "cover.example", 64);
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{der},
+        .ech_config_list = ech_list,
+    });
+    defer client.deinit();
+    client.offerNoSharesForTest();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try std.testing.expect(client.echOffered());
+    const hrr = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    try std.testing.expect(server.hrr_sent);
+    try std.testing.expect(!server.ech_accepted); // no ech_keys ⇒ never accepted
+
+    // The client offered ECH; an HRR would need a CH2 inner re-seal it does not
+    // implement, so it refuses rather than emit a non-compliant / downgrading CH2.
+    try std.testing.expectError(error.HelloRetryRequestUnsupported, client.feed(hrr));
+}
+
+test "ECH×HRR: the fail-closed guard does not disturb a normal (non-accepted) HRR" {
+    // A server WITH ech_keys must still HelloRetryRequest a plain, non-ECH client
+    // normally — the new guard is scoped to an *accepted* inner (`ech_accepted`),
+    // so an ordinary HRR-and-recover handshake is unaffected.
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x56)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x56, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    const hpke_kp = try hpke.KeyPair.generateDeterministic(@as([32]u8, @splat(0x28)));
+    var list_buf: [600]u8 = undefined;
+    const ech_list = buildEchConfigList(&list_buf, 7, &hpke_kp.public_key, "cover.example", 64);
+    const ech_keys = [_]EchKey{.{ .config = ech_list, .private_key = hpke_kp.secret_key }};
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .ech_keys = &ech_keys });
+    defer server.deinit();
+    // Plain client (no ECH) that withholds shares ⇒ ordinary HelloRetryRequest.
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    client.offerNoSharesForTest();
+
+    const ch1 = try client.start();
+    defer alloc.free(ch1);
+    try std.testing.expect(!client.echOffered());
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    try std.testing.expect(server.hrr_sent);
+    try std.testing.expect(!server.ech_accepted);
+
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(ch2);
+    const sflight = switch (try server.feed(ch2)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
 }
 
 test "loopback: ECH with an unknown config_id falls back to the ClientHelloOuter (no abort)" {

@@ -1324,11 +1324,18 @@ pub const Client = struct {
         @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
         @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
         var keyshare_buf: [1400]u8 = undefined;
-        const keyshares = try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-            .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
-            .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
-            .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-        });
+        // `force_no_shares_for_test` withholds all key_shares (advertising the
+        // groups only) so a test can drive the server to a HelloRetryRequest through
+        // the ECH path — exercising the ECH×HRR fail-closed abort. Off in production
+        // (the default), so the inner/outer bodies stay byte-identical.
+        const keyshares = if (self.force_no_shares_for_test)
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{})
+        else
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
+                .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
+                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+            });
         try eb.addTyped(.key_share, keyshares);
 
         if (self.alpn_protocols.len != 0) {
@@ -1784,9 +1791,13 @@ pub const Client = struct {
             if (isHelloRetryRequest(msg.body)) {
                 // A second HelloRetryRequest in one connection is fatal.
                 if (self.hrr_seen) return error.BadHandshake;
-                // ECH + HRR (re-seal with an empty `enc`, the "hrr ech accept
-                // confirmation" transcript) is not yet implemented. Rather than
-                // emit a subtly non-compliant CH2, refuse. Deferred follow-up.
+                // ECH + HRR (re-seal the ClientHelloInner under the same HPKE
+                // context with an empty `enc`, plus the "hrr ech accept
+                // confirmation" transcript) is not yet implemented (deferred, gated
+                // on an external ECH oracle). Rather than emit a subtly non-compliant
+                // CH2 that silently downgrades ECH, refuse — FAIL CLOSED. The server
+                // enforces the symmetric guard (`EchHrrUnsupported`) when it accepted
+                // an inner and would itself need to HelloRetryRequest.
                 if (self.ech_active) return error.HelloRetryRequestUnsupported;
                 const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
                 consumePrefix(&self.recv_buf, rec.wire_len);

@@ -77,7 +77,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | Certificate compression (RFC 8879, zlib, bomb-guarded) | IMPLEMENTED | client `tls_client.zig:2061–2070` (+unsolicited fatal `:1874`); server `tls_server.zig:1505–1508`; loopback `:5403` | RFC 8879 |
 | Raw public keys (RFC 7250), server + client cert types | IMPLEMENTED | negotiation `tls_server.zig:1509–1533`; client EE validation (unsolicited fatal) `tls_client.zig:2032–2042`; byte-identical-off test `:5588` | RFC 7250 |
 | Delegated credentials (RFC 9345) | IMPLEMENTED | client verify chain (`:4610+` tests: window, scheme pinning, tamper, no-clock reject); server presents-when-accepted `tls_server.zig:1552–1563`; byte-identical-off `:3946` | RFC 9345 |
-| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; **retry_configs now IMPLEMENTED [fixed here]** — server emits its published ECHConfigList in EE on ECH-not-accepted (`Config.ech_retry_config_list`, `writeEncryptedExtensions`, byte-identical when unset), client captures it only on offer+reject (`ech_retry_configs` / `echRetryConfigs()`, authenticated by the public_name cert), tests: rejection-delivers-retry + accepted-exposes-none; **ECH×HRR re-seal remains DEFERRED (fail-closed refusal)** — client refuses on an HRR while ECH was offered (`tls_client.zig:1790` `error.HelloRetryRequestUnsupported`), server stands ECH down on the HRR path (`signal_ech = ech_accepted and !hrr_sent`, `tls_server.zig:1984`). NOT shipped because it cannot be externally validated here (see §8: no BoGo ECH harness — shim lacks ECH flag wiring + HPKE is ChaCha20-only vs BoGo's AES-128-GCM). Shipping a hand-rolled CH2 transcript without that oracle is worse than the refusal; no `ech_outer_extensions` compression | draft-ietf-tls-esni (RFC 9849) |
+| ECH (draft-ietf-tls-esni) | PARTIAL (deliberate, documented) | client seal + acceptance confirmation `tls_client.zig:1187+`, server open + inner transcript switch `tls_server.zig:872–882`; **retry_configs now IMPLEMENTED [fixed here]** — server emits its published ECHConfigList in EE on ECH-not-accepted (`Config.ech_retry_config_list`, `writeEncryptedExtensions`, byte-identical when unset), client captures it only on offer+reject (`ech_retry_configs` / `echRetryConfigs()`, authenticated by the public_name cert), tests: rejection-delivers-retry + accepted-exposes-none; **ECH×HRR is now FAIL-CLOSED ON BOTH SIDES [fixed here]** — client refuses on an HRR while ECH was offered (`tls_client.zig` `error.HelloRetryRequestUnsupported`), AND the server now aborts with `error.EchHrrUnsupported` (`tls_server.zig` `buildServerFlight` `.retry` branch) the moment an *accepted* ECH inner (`ech_accepted`) would require a HelloRetryRequest — previously it silently stood ECH down (used the CH2 outer, signalled ECH-not-accepted), a transcript/acceptance inconsistency + silent downgrade the peer only caught at Finished. Tests: `ECH×HRR: server FAILS CLOSED …`, `ECH×HRR: an ECH-active client FAILS CLOSED …`, and a scoping test proving a normal (non-accepted) HRR is unaffected. The re-seal ITSELF (a compliant ECH×HRR CH2) remains DEFERRED. NOT shipped because it cannot be externally validated here (see §8: no BoGo ECH harness — shim lacks ECH flag wiring + HPKE is ChaCha20-only vs BoGo's AES-128-GCM). Shipping a hand-rolled CH2 transcript without that oracle is worse than the refusal; no `ech_outer_extensions` compression | draft-ietf-tls-esni (RFC 9849) |
 | Certificate / CertificateVerify (server auth, all three key types) | IMPLEMENTED | client verify `tls_client.zig:2072+` (chain cap 16 `:2104`, exact context strings), CRL/OCSP/CT hooks | §4.4.2–4.4.3 |
 | certificate_request / mTLS (client Certificate, CV, possession proof) | IMPLEMENTED | server `writeCertificateRequest` `tls_server.zig:1251`, client-cert verify `:1023–1063` (failed proof clears the captured fingerprint); client `validateCertificateRequest` `tls_client.zig:4265` test | §4.3.2, §4.4.2.4 |
 | Post-handshake client auth (post_handshake_auth ext) | MISSING (deliberate) | never advertised; a post-handshake CertificateRequest is now fatal on the client **[fixed here]** — correct per §4.6.2 when not advertised | §4.6.2 |
@@ -104,9 +104,13 @@ hardening fixes landed with it — marked **[fixed here]**).
 6. Rejected-early-data skip and KeyUpdate processing are unbounded (CPU, not memory).
    LOW-MEDIUM; candidate caps: skip ≤ `max_early_data_size`+slack bytes, KeyUpdates ≤ N/min.
 7. ECH: retry_configs **DONE (fixed here)** — server advertises its ECHConfigList in EE on
-   ECH-not-accepted, client captures it (public_name-authenticated). ECH×HRR re-seal and
-   `ech_outer_extensions` compression remain follow-ups; current behavior is fail-closed
-   (ECH+HRR is cleanly refused) / fail-safe respectively.
+   ECH-not-accepted, client captures it (public_name-authenticated). ECH×HRR is now
+   **fail-closed on BOTH sides (fixed here)** — the client already refused an HRR under ECH;
+   the server now also aborts (`EchHrrUnsupported`) when an *accepted* inner would require an
+   HRR, instead of silently standing ECH down (the prior `signal_ech = ech_accepted and
+   !hrr_sent` behavior emitted a downgrade the peer caught only at Finished). The compliant
+   ECH×HRR *re-seal* and `ech_outer_extensions` compression remain follow-ups (gated on the
+   BoGo ECH oracle); current behavior is fail-closed / fail-safe respectively.
 8. Cookie length interop bound (client echoes ≤512 B; spec allows 2^16−1) and no
    server-side stateless-HRR cookie. LOW (stateful HRR is compliant).
 9. `signature_algorithms_cert` absent — evaluated and DEFERRED here (always-on wire change +
@@ -156,9 +160,10 @@ hardening fixes landed with it — marked **[fixed here]**).
   `ECH rejection delivers retry_configs the client captures`, `an accepted ECH handshake
   exposes no retry_configs`, and `a non-ECH client … is not treated as an ECH offer`.
 
-Deferred (documented above, NOT half-implemented): ECH×HRR re-seal (ECH+HRR stays a clean
-fail-closed refusal) and `ech_outer_extensions` compression. (`signature_algorithms_cert` is
-now IMPLEMENTED — see row above.)
+Deferred (documented above, NOT half-implemented): the compliant ECH×HRR re-seal (ECH+HRR is
+now a clean fail-closed refusal on BOTH sides — client `HelloRetryRequestUnsupported`, server
+`EchHrrUnsupported` — see §7 item 7) and `ech_outer_extensions` compression.
+(`signature_algorithms_cert` is now IMPLEMENTED — see row above.)
 
 **ECH×HRR re-seal — gating prerequisite (why it stays fail-closed).** The draft-ietf-tls-esni
 (RFC 9849) HRR rules are transcript-exact and unforgiving: CH2 reuses the *same* HPKE sender
