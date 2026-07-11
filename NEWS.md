@@ -10,6 +10,66 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## Unreleased
+
+Committed on `main` and pushed; not yet deployed to the live IRCXNet nodes. A
+security + mesh-hardening pass on top of 0.3.0.
+
+### Security
+- **Hidden-channel roster leak closed.** `NAMES <channel>`, bare `NAMES`, `WHO
+  <channel>`, and WHOX (`WHO <channel> %fields`) returned the full member list of
+  a secret (`+s`) or private (`+p`) channel to non-members — enabling roster
+  enumeration. A non-member non-oper now gets a bare `RPL_ENDOFNAMES 366` /
+  `RPL_ENDOFWHO 315`, matching the WHOIS visibility gate. Fail-closed on an
+  unknown viewer.
+  (`fix(security): NAMES/WHO must not leak a secret/private channel roster`)
+- **Suspended/forbidden accounts can no longer authenticate.** `ACCOUNT FORBID`
+  and account suspension only blocked the session-token paths; `IDENTIFY`,
+  SASL PLAIN, and SASL EXTERNAL (certfp) still let a locked account in, and
+  SCRAM-SHA-256/512 + OAUTHBEARER bypassed the check entirely (they verify from
+  stored material / an IdP token and never consulted account status). A locked
+  account is now rejected at the single SASL-success chokepoint for **every**
+  mechanism, with the generic `SASL authentication failed` surface (suspended vs
+  forbidden vs bad-credential are indistinguishable — no enumeration).
+  (`fix(security): gate SASL success on account status`)
+- **AEAD key stack hygiene.** The Tsumugi secured-mesh record layer left a
+  plaintext ChaCha key copy un-zeroed on the stack in `sealRecord`/`openRecord`
+  (every post-handshake record); now `secureZero`'d on scope exit like its
+  siblings — defense-in-depth against core-dump / co-resident disclosure.
+  (`fix(crypto): secure-zero the AEAD key stack copy`)
+
+### Fixed
+- **Anti-entropy no longer stalls on busy channels.** A member's causal context
+  was expanded into dense per-counter dots capped at 512; on a channel where one
+  replica authored >512 membership adds, Merkle anti-entropy and full-state burst
+  (handshake + RESYNC-after-USR2) silently failed with `Oversize`, diverging
+  freshly-connected / hot-upgraded peers. Member context is now sent as a compact
+  version-vector frontier (≤64 entries) via a new, canonically-encoded burst
+  record kind — added alongside the unchanged dense form so legacy peers parse
+  every currently-working burst. Canonical (sorted) encoding prevents an
+  anti-entropy livelock where two replicas at the same state produced different
+  bytes and repaired forever.
+  (`fix(mesh): compact VV-frontier member context` + `canonicalize compact encoding`)
+- **Timed IRCX `ACCESS` entries now actually expire** — temporary bans/access
+  grants were effectively permanent. (`fix(ircx): expire timed ACCESS entries`)
+- **RTCP feedback behind a report reaches the publisher** — compound RTCP packets
+  are now fully parsed. (`fix(media): parse compound RTCP`)
+- **Mesh route table** decrements `nick_count` on the rename-collision path,
+  fixing a false `RouteTableFull`. (`fix(mesh): decrement nick_count on renameNick`)
+
+### Hardened
+- Certificate-Transparency quorum accepts **OCSP-delivered SCTs** as a third
+  RFC 6962 source. (`feat(tls): OCSP-delivered SCTs`)
+- `EventSeverity` ordering + `atLeast()` are comptime-pinned so a reordering can't
+  silently weaken severity gates. (`harden(event-spine): comptime-pin EventSeverity`)
+
+### Docs
+- Full reference sweep verified against source: every command reference
+  (connection, messaging, queries, channels, accounts-services, oper-moderation,
+  informational, IRCX), the numerics table, the IRCv3 capability reference, and
+  the mesh / crypto / event-spine architecture docs. Stale prior-project naming
+  removed throughout.
+
 ## 0.3.0 — "Sumi-e onboarding" (2026-07-08)
 
 The Torii onboarding + interop features and the first Sumi-e (v1.1) server
