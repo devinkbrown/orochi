@@ -13,3 +13,4 @@ dist/
 
 # Claude Code personal (uncommitted) settings
 .claude/settings.local.json
+.bogo/

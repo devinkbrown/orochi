@@ -17,7 +17,9 @@ set -euo pipefail
 
 # Pin BoringSSL to a fixed commit — BoGo drifts, so pinning is mandatory for
 # determinism. Bump deliberately and re-baseline DisabledTests/ErrorMap.
-BORINGSSL_COMMIT="${BORINGSSL_COMMIT:-master}"
+# (BoringSSL renamed its default branch master->main; pin to a fixed commit,
+# never a moving branch.)
+BORINGSSL_COMMIT="${BORINGSSL_COMMIT:-5ac7567c2}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache_dir="${repo_root}/.bogo"

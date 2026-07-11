@@ -216,6 +216,10 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         /// The subject `Name` TLV (full tag+len+value). When this cert is a CA,
         /// this is the `issuer_name_der` an OCSP CertID hashes (RFC 6960).
         subject_der: []const u8,
+        /// The issuer `Name` TLV (full tag+len+value). Equal to `subject_der`
+        /// exactly when the certificate is self-issued (self-signed / a trust
+        /// anchor) — the signature_algorithms_cert exemption in RFC 8446 §4.2.3.
+        issuer_der: []const u8,
         /// The raw subjectPublicKey BIT STRING value WITHOUT the leading
         /// unused-bits octet — the `issuer_key_bytes` an OCSP CertID hashes.
         subject_public_key: []const u8,
@@ -273,6 +277,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .spki_der = &.{},
                 .spki_value = &.{},
                 .subject_der = &.{},
+                .issuer_der = &.{},
                 .subject_public_key = &.{},
                 .aia_ocsp_url = &.{},
                 .must_staple = false,
@@ -875,7 +880,8 @@ fn parseTbs(comptime CertType: type, cert: *CertType, parent: DerReader, tbs: Tl
     cert.serial_der = serial.value;
 
     _ = try tbs_reader.readExpected(Tag.sequence); // TBSCertificate.signature
-    _ = try tbs_reader.readExpected(Tag.sequence); // issuer
+    const issuer = try tbs_reader.readExpected(Tag.sequence); // issuer
+    cert.issuer_der = issuer.raw;
 
     const validity = try tbs_reader.readExpected(Tag.sequence);
     var validity_reader = try tbs_reader.child(validity);

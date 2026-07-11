@@ -930,8 +930,9 @@ fn writeSpkiEd25519(w: *W, pub_key: [32]u8) void {
 
 /// Mint a leaf cert whose issuer DN is `issuer_cn`, subject DN is `subject_cn`,
 /// embedding `subject_pub`, signed (Ed25519) with `issuer_kp`. Returns the DER
-/// in `out`.
-fn mintEd25519Leaf(
+/// in `out`. `pub` so sibling crypto tests can mint an issuer≠subject leaf (e.g.
+/// the signature_algorithms_cert chain-conformance tests in `tls_server.zig`).
+pub fn mintEd25519Leaf(
     out: []u8,
     issuer_cn: []const u8,
     subject_cn: []const u8,

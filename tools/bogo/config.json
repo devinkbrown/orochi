@@ -32,16 +32,19 @@
     "*DelegatedCredential*": "delegated credentials not driven by the shim"
   },
 
+  "//_________": "ErrorMap values are string ARRAYS as of BoringSSL's current runner",
+  "//__________": "(ShimConfiguration.ErrorMap is map[string][]string); each expected",
+  "//___________": "BoringSSL error maps to the set of orochi error-name substrings.",
   "ErrorMap": {
-    ":UNEXPECTED_MESSAGE:": "BadHandshake",
-    ":DECODE_ERROR:": "DecodeError",
-    ":WRONG_VERSION_NUMBER:": "ProtocolVersion",
-    ":UNSUPPORTED_PROTOCOL:": "ProtocolVersion",
-    ":NO_SHARED_CIPHER:": "UnsupportedCipherSuite",
-    ":WRONG_CURVE:": "UnsupportedGroup",
-    ":DIGEST_CHECK_FAILED:": "FinishedMismatch",
-    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": "BadRecord",
-    ":CERTIFICATE_VERIFY_FAILED:": "BadSignature",
-    ":NO_APPLICATION_PROTOCOL:": "AlpnMismatch"
+    ":UNEXPECTED_MESSAGE:": ["BadHandshake"],
+    ":DECODE_ERROR:": ["DecodeError"],
+    ":WRONG_VERSION_NUMBER:": ["ProtocolVersion"],
+    ":UNSUPPORTED_PROTOCOL:": ["ProtocolVersion"],
+    ":NO_SHARED_CIPHER:": ["UnsupportedCipherSuite"],
+    ":WRONG_CURVE:": ["UnsupportedGroup"],
+    ":DIGEST_CHECK_FAILED:": ["FinishedMismatch"],
+    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": ["BadRecord"],
+    ":CERTIFICATE_VERIFY_FAILED:": ["BadSignature"],
+    ":NO_APPLICATION_PROTOCOL:": ["AlpnMismatch"]
   }
 }

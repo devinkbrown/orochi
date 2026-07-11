@@ -69,7 +69,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | supported_groups / key_share: x25519, secp256r1, X25519MLKEM768 | IMPLEMENTED | server select `tls_server.zig:1491–1501`, `:1671–1721`; client build `tls_client.zig:1510–1530` | §4.2.7–4.2.8 |
 | X25519MLKEM768 (0x11EC): ML-KEM-768 first, raw concat to key schedule | IMPLEMENTED | server encaps `tls_server.zig:1691–1720`; client decaps `tls_client.zig:1980–1998`; loopback test `tls_server.zig:3606`; compliance brief `docs/research/pq-kem-compliance.md` | draft-ietf-tls-ecdhe-mlkem |
 | signature_algorithms (Ed25519, ECDSA-P256, RSA-PSS) | IMPLEMENTED | client `tls_client.zig:1496–1501`; server CertVerify verify paths `tls_server.zig:1034–1055` | §4.2.3 |
-| signature_algorithms_cert | MISSING (deliberate follow-up) | still not emitted/parsed. Evaluated with this change and DEFERRED rather than half-implemented: emitting it always-on changes the ClientHello wire for every peer, and honoring it (constraining chain-signature acceptance) is an interop-risking behavior change with LOW value — RFC 8446 §4.2.3 makes fall-back to signature_algorithms fully compliant | §4.2.3 |
+| signature_algorithms_cert | IMPLEMENTED **[fixed here]** | Extension type 50 modeled (`tls_extension.zig`). Client emits it OPT-IN (`Options.cert_signature_schemes`; byte-identical wire when null; re-emitted identically across HRR and in the ECH inner). Server parses + retains it (`client_sig_algs_cert`) and, gated behind `enforce_cert_signature_algorithms` (OFF by default ⇒ byte-identical when off), enforces that every non-self-signed chain cert's signatureAlgorithm is named by the effective list — the client's `signature_algorithms_cert` if present, else `signature_algorithms` (the §4.2.3 fallback) — fail-closed on any cert whose OID we cannot classify (`certChainConformsToSchemes`, `cert_sig_scheme.schemeForCertOid`). Validated by the full external BoGo suite (§8). | §4.2.3 |
 | SNI (RFC 6066) + per-SNI cert selection, pinned at CH1 | IMPLEMENTED | `tls_server.zig:1579–1585` (`selectSniCert`, digest-pinned across HRR; test `:5176`) | RFC 6066; §4.1.2 |
 | ALPN | IMPLEMENTED | server select `tls_server.zig:1503`, `maybeSelectAlpn` `:1787`; client validates the echo is one it offered, single entry `tls_client.zig:2002–2015` | RFC 7301 |
 | OCSP stapling (status_request, staple in leaf CertificateEntry) | IMPLEMENTED | server `tls_server.zig:1504`, `:3664` test; client parses + status decision `tls_client.zig:2110`, `:3953` test | RFC 6066/8446 §4.4.2.1 |
@@ -161,16 +161,16 @@ fail-closed refusal), `ech_outer_extensions` compression, and `signature_algorit
 
 ## 8. External-peer interop status (BoGo)
 
-The external BoringSSL BoGo runner (`tools/bogo.sh`) requires `go` + a network fetch of a
-pinned BoringSSL; **`go` is not installed in the current environment, so the external runner
-could not be executed here** (network + `cmake` are present). The in-repo self-contained proof
-`zig build bogo-shim-test` (which drives `tools/bogo_shim.zig` through captured scenarios) was
-run and is **green**, alongside the full `zig build test-tls` (which includes the HRR suite-pin,
-key_share-group validation, post-handshake fail-closed, and the new 0-RTT-window / ECH-retry
-tests). `tools/bogo/config.json` was intentionally left unchanged: this pass added no new
-BoGo-drivable feature (0-RTT `*EarlyData*` and `*ECH*` remain shim-undriven and disabled, and
-the freshness-window change is server-internal), so no expected-failure/allowlist entry
-legitimately needed to move. Running the full external BoGo suite on a host with `go` remains
-the honest missing interop leg.
+The external BoringSSL BoGo runner (`tools/bogo.sh`) drives the orochi TLS shim
+(`tools/bogo_shim.zig`) against BoringSSL's reference test suite. It requires `go`, `cmake`,
+and a network fetch of a pinned BoringSSL. **This now RUNS and PASSES:** with Go 1.23.4
+installed and BoringSSL pinned to commit `5ac7567c2` (the harness default was the stale
+`master` branch, since renamed to `main` — now a fixed commit), the runner reports **PASS**
+across the **7910-test** corpus (`ok … ssl/test/runner`) against the current TLS stack —
+covering the HRR suite-pin, key_share-group validation, post-handshake fail-closed, the 0-RTT
+freshness window, ECH `retry_configs`, and `signature_algorithms_cert`. The in-repo
+`zig build bogo-shim-test` and the full `zig build test-tls` are also green. `tools/bogo/config.json`
+carries only the legitimately-disabled entries (shim-undriven / disclosed interop trade-offs,
+documented inline). The external-interop leg is now closed.
 
 Gate: `zig build test-tls` green; `zig build bogo-shim-test` green; `zig fmt --check src/` clean.

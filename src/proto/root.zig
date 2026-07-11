@@ -303,6 +303,7 @@ pub const tls_alert = @import("tls_alert.zig");
 pub const tls_alpn = @import("tls_alpn.zig");
 pub const tls_cert_message = @import("tls_cert_message.zig");
 pub const tls_cookie = @import("tls_cookie.zig");
+pub const cert_sig_scheme = @import("cert_sig_scheme.zig");
 pub const tls_extension = @import("tls_extension.zig");
 pub const tls_finished = @import("tls_finished.zig");
 pub const tls_keyshare = @import("tls_keyshare.zig");
@@ -647,6 +648,7 @@ test {
     _ = tls12_key_exchange;
     _ = tls12_prf;
     _ = tls12_record;
+    _ = cert_sig_scheme;
     _ = tls_alert;
     _ = tls_alpn;
     _ = tls_cert_message;

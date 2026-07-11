@@ -176,6 +176,16 @@ pub const Options = struct {
     /// resumption offer or 0-RTT is configured (ECH-over-PSK is a follow-up).
     /// Borrowed for the call; the client copies it.
     ech_config_list: ?[]const u8 = null,
+    /// Optional `signature_algorithms_cert` list (RFC 8446 §4.2.3): the signature
+    /// schemes the client will accept on the CERTIFICATES in the server's chain,
+    /// as distinct from `signature_algorithms` (which governs the CertificateVerify
+    /// signature). OPT-IN and byte-identical when null — the default omits the
+    /// extension entirely, so the peer applies `signature_algorithms` to
+    /// certificates too (the compliant fallback, §4.2.3). When set, the schemes are
+    /// emitted in descending preference in a `signature_algorithms_cert(50)`
+    /// extension in the ClientHello (and, under ECH, the ClientHelloInner).
+    /// Borrowed for the call; the client copies it.
+    cert_signature_schemes: ?[]const tls_signature_scheme.SignatureScheme = null,
     /// Optional caller-supplied set of pinned Certificate Transparency logs (RFC
     /// 6962) for verifying SCTs embedded in the leaf certificate. Orochi ships NO
     /// log list; a deployment that wants CT enforcement supplies the logs it
@@ -373,6 +383,11 @@ pub const Client = struct {
     alpn_protocols: []const []const u8,
     /// Owned copy of the caller-supplied CRL DER (see `Options.crl`), or null.
     crl: ?[]u8 = null,
+    /// Owned copy of the caller-supplied `signature_algorithms_cert` schemes (see
+    /// `Options.cert_signature_schemes`), or null when the extension is not
+    /// offered. Retained (not just consumed at CH1) so the second ClientHello
+    /// after a HelloRetryRequest re-emits the identical extension.
+    cert_signature_schemes: ?[]tls_signature_scheme.SignatureScheme = null,
     /// Owned deep copy of the caller-supplied pinned CT logs (see
     /// `Options.ct_logs`). Empty when CT verification is not configured; each
     /// entry's `key_spki_der` is separately owned and freed on `deinit`.
@@ -621,6 +636,11 @@ pub const Client = struct {
         errdefer if (crl_owned) |c| allocator.free(c);
         const ech_list_owned = if (options.ech_config_list) |e| try allocator.dupe(u8, e) else null;
         errdefer if (ech_list_owned) |e| allocator.free(e);
+        const cert_sig_owned = if (options.cert_signature_schemes) |s|
+            try allocator.dupe(tls_signature_scheme.SignatureScheme, s)
+        else
+            null;
+        errdefer if (cert_sig_owned) |s| allocator.free(s);
         const ct_logs_owned = try dupeCtLogs(allocator, options.ct_logs);
         errdefer freeCtLogs(allocator, ct_logs_owned);
 
@@ -631,6 +651,7 @@ pub const Client = struct {
             .alpn_protocols = alpn,
             .crl = crl_owned,
             .ech_config_list = ech_list_owned,
+            .cert_signature_schemes = cert_sig_owned,
             .ech_inner_random = ech_inner_random,
             .ct_logs = ct_logs_owned,
             .enforce_sct = options.enforce_sct,
@@ -676,6 +697,7 @@ pub const Client = struct {
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
         if (self.crl) |c| self.allocator.free(c);
+        if (self.cert_signature_schemes) |s| self.allocator.free(s);
         secureZero(&self.ech_inner_random);
         if (self.ech_config_list) |e| self.allocator.free(e);
         if (self.ech_public_name) |p| self.allocator.free(p);
@@ -1291,6 +1313,7 @@ pub const Client = struct {
             .rsa_pkcs1_sha256,
         });
         try eb.addTyped(.signature_algorithms, sigs);
+        try self.appendCertSigAlgs(&eb);
 
         var rsl_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
@@ -1477,6 +1500,21 @@ pub const Client = struct {
         }
     }
 
+    /// Emit the opt-in `signature_algorithms_cert` extension (RFC 8446 §4.2.3)
+    /// immediately after `signature_algorithms`, when the caller supplied a
+    /// cert-scheme list; a no-op (byte-identical wire) otherwise. Called from
+    /// every ClientHello variant — the plain CH1, the HRR-retry CH2, and the ECH
+    /// ClientHelloInner/Outer — so the extension is identical across the retry.
+    fn appendCertSigAlgs(self: *Client, eb: *tls_extension.Builder) Error!void {
+        const schemes = self.cert_signature_schemes orelse return;
+        // Bounded: the SignatureSchemeList body is 2-byte length + 2 bytes/scheme.
+        // 128 schemes (258 bytes) is far beyond any real advertisement.
+        if (schemes.len == 0 or schemes.len > 128) return error.BadState;
+        var buf: [2 + 128 * 2]u8 = undefined;
+        const body = try tls_signature_scheme.build(&buf, schemes);
+        try eb.addTyped(.signature_algorithms_cert, body);
+    }
+
     fn writeClientHello(self: *Client, out: *std.ArrayList(u8)) Error!void {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
@@ -1531,6 +1569,7 @@ pub const Client = struct {
             .rsa_pkcs1_sha256,
         });
         try ext_builder.addTyped(.signature_algorithms, sigs);
+        try self.appendCertSigAlgs(&ext_builder);
 
         // RFC 8449 record_size_limit: advertise the largest TLSInnerPlaintext we
         // accept (the protocol max — our recv path handles full-size records).

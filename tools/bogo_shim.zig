@@ -219,6 +219,17 @@ fn shimRun(alloc: std.mem.Allocator, init: std.process.Init) u8 {
     defer argv.deinit(alloc);
     while (it.next()) |a| argv.append(alloc, a) catch return exit_error;
 
+    // Capability probe: the runner asks whether a separate handshaker binary is
+    // supported (split-handshake / handoff tests). We do not implement a
+    // handshaker, so answer "No" on stdout and exit cleanly — a non-zero exit
+    // here aborts the WHOLE runner ("Error making split handshake tests").
+    for (argv.items) |a| {
+        if (std.mem.eql(u8, a, "-is-handshaker-supported")) {
+            outWrite("No\n");
+            return exit_success;
+        }
+    }
+
     const flags = Flags.parse(argv.items) catch |e| switch (e) {
         error.Unimplemented => return exit_unimplemented,
         error.Usage => {
@@ -516,9 +527,17 @@ fn sockReadSome(fd: linux.fd_t, buf: []u8) !usize {
 }
 
 fn errWrite(bytes: []const u8) void {
+    fdWrite(2, bytes);
+}
+
+fn outWrite(bytes: []const u8) void {
+    fdWrite(1, bytes);
+}
+
+fn fdWrite(fd: linux.fd_t, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(2, bytes.ptr + off, bytes.len - off);
+        const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
         const signed: isize = @bitCast(rc);
         if (signed <= 0) return;
         off += @intCast(rc);

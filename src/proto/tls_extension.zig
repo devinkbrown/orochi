@@ -57,6 +57,7 @@ pub const ExtensionType = enum(u16) {
     supported_versions = 43,
     cookie = 44,
     psk_key_exchange_modes = 45,
+    signature_algorithms_cert = 50,
     key_share = 51,
     _,
 
@@ -89,6 +90,7 @@ pub const ExtensionType = enum(u16) {
             .supported_versions,
             .cookie,
             .psk_key_exchange_modes,
+            .signature_algorithms_cert,
             .key_share,
             => true,
             _ => false,

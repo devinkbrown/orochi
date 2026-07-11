@@ -49,6 +49,7 @@ const sni = @import("../proto/sni.zig");
 const tls_extension = @import("../proto/tls_extension.zig");
 const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
+const cert_sig_scheme = @import("../proto/cert_sig_scheme.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
 const tls_psk = @import("../proto/tls_psk.zig");
@@ -104,6 +105,10 @@ pub const Error = error{
     NoCertificate,
     NoSigningKey,
     LeafKeyMismatch,
+    /// RFC 8446 §4.2.3 / §4.4.2.2 (opt-in `enforce_cert_signature_algorithms`):
+    /// the configured chain's certificate signatures use an algorithm the client
+    /// did not advertise, and no conforming chain is available ⇒ handshake_failure.
+    NoCompatibleCertificate,
     /// RFC 9345: a configured `delegated_credential` did not parse, or its
     /// leaf-signature `algorithm` does not correspond to the default leaf key.
     BadDelegatedCredential,
@@ -154,6 +159,19 @@ pub const Config = struct {
     /// until opted in, and even then only clients that advertised support (and
     /// therefore can decode it) ever receive the compressed form.
     enable_cert_compression: bool = false,
+    /// RFC 8446 §4.2.3 / §4.4.2.2: when true, the server refuses to present an
+    /// X.509 chain whose (non-self-signed) certificate signatures use an
+    /// algorithm the client did not advertise, aborting with `handshake_failure`.
+    /// The effective set is the client's `signature_algorithms_cert` if present,
+    /// else its `signature_algorithms` (the compliant fallback). Self-signed /
+    /// trust-anchor certificates are exempt (§4.2.3 — their signatures are never
+    /// validated). Default false ⇒ this check never runs, the wire is
+    /// byte-identical, and the existing `signature_algorithms` (CertificateVerify)
+    /// enforcement is untouched. This is stricter than the RFC's SHOULD-send-anyway
+    /// fallback (§4.4.2.2) by deliberate operator opt-in: orochi presents one chain
+    /// per name, so refusing a chain the client declared it cannot validate is the
+    /// safe choice for a server that opts into strict certificate-algorithm policy.
+    enforce_cert_signature_algorithms: bool = false,
     /// Optional reusable ticket key. When omitted, `Server.init` generates a
     /// fresh per-server key; callers can retrieve it with `ticketKey()`.
     ticket_key: ?tls_resumption.TicketKey = null,
@@ -340,6 +358,8 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         error.ProtocolVersion => .protocol_version,
         error.MissingExtension => .missing_extension,
         error.UnsupportedGroup, error.UnsupportedCipherSuite => .handshake_failure,
+        // RFC 8446 §4.2.3: opt-in cert-chain algorithm policy refused the chain.
+        error.NoCompatibleCertificate => .handshake_failure,
         // RFC 7627: the hardened 1.2 profile refuses a non-EMS handshake.
         error.EmsRequired => .handshake_failure,
         // RFC 7507: TLS_FALLBACK_SCSV offered below our highest version.
@@ -352,6 +372,26 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         // Any other parse/negotiation failure: a generic fatal handshake_failure.
         else => .handshake_failure,
     };
+}
+
+/// RFC 8446 §4.2.3: return true iff every non-self-signed certificate in `chain`
+/// is signed with an algorithm named by the `effective` SignatureSchemeList body
+/// (the client's `signature_algorithms_cert`, or `signature_algorithms` as the
+/// compliant fallback). Self-signed / trust-anchor certificates are exempt (their
+/// signatures are never validated). A certificate whose signatureAlgorithm this
+/// stack cannot classify as a TLS SignatureScheme is treated as NON-conforming
+/// (fail-closed: never admit a chain signed with an algorithm we cannot name).
+fn certChainConformsToSchemes(chain: []const []const u8, effective: []const u8) bool {
+    for (chain) |der| {
+        const cert = x509.parse(der) catch return false;
+        // §4.2.3: a self-signed / trust-anchor cert MAY use any algorithm.
+        if (std.mem.eql(u8, cert.issuer_der, cert.subject_der)) continue;
+        const scheme = cert_sig_scheme.schemeForCertOid(cert.signature_algorithm_oid) orelse return false;
+        if (!tls_signature_scheme.offers(effective, tls_signature_scheme.SignatureScheme.fromInt(scheme))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Encode a fatal-alert PLAINTEXT record (content_type 21) for `err`, or null
@@ -604,6 +644,14 @@ pub const Server = struct {
     /// Presentation additionally requires that no SNI cert was selected (the DC
     /// is bound to the default leaf key).
     client_accepts_dc: bool = false,
+    /// Owned copy of the current ClientHello's `signature_algorithms` body (RFC
+    /// 8446 §4.2.3), or null. Re-captured per ClientHello; used only when
+    /// `Config.enforce_cert_signature_algorithms` is set. Freed on `deinit`.
+    client_sig_algs: ?[]u8 = null,
+    /// Owned copy of the current ClientHello's `signature_algorithms_cert` body,
+    /// or null when the client did not send it (⇒ `signature_algorithms` governs
+    /// certificates too, §4.2.3). Re-captured per ClientHello; freed on `deinit`.
+    client_sig_algs_cert: ?[]u8 = null,
 
     // --- Encrypted Client Hello (ECH) acceptance state (roadmap 5.1) ---
     /// True once `maybeOpenEch` has successfully opened a ClientHelloInner and the
@@ -717,6 +765,8 @@ pub const Server = struct {
         self.client_flight.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
         if (self.client_cert_der) |der| self.allocator.free(der);
+        if (self.client_sig_algs) |s| self.allocator.free(s);
+        if (self.client_sig_algs_cert) |s| self.allocator.free(s);
         self.* = undefined;
     }
 
@@ -1533,6 +1583,16 @@ pub const Server = struct {
         var offered_early_data = false;
         var offered_record_size_limit = false; // RFC 8449: echo only when offered
         var dc_accepted = false; // RFC 9345: client's delegated_credential accepts our DC's scheme
+        // Re-capture the sig-alg lists fresh per ClientHello (so a CH2 that drops
+        // an extension is reflected, not left stale from CH1).
+        if (self.client_sig_algs) |old| {
+            self.allocator.free(old);
+            self.client_sig_algs = null;
+        }
+        if (self.client_sig_algs_cert) |old| {
+            self.allocator.free(old);
+            self.client_sig_algs_cert = null;
+        }
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
             switch (ext.typed()) {
@@ -1590,6 +1650,19 @@ pub const Server = struct {
                     if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
                     self.peer_record_size_limit = limit;
                     offered_record_size_limit = true;
+                },
+                .signature_algorithms => {
+                    // Captured only for the opt-in signature_algorithms_cert chain
+                    // check; the CertificateVerify scheme selection is unchanged.
+                    // Free-if-present guards against a duplicate extension leaking.
+                    if (self.client_sig_algs) |old| self.allocator.free(old);
+                    self.client_sig_algs = try self.allocator.dupe(u8, ext.data);
+                },
+                .signature_algorithms_cert => {
+                    // RFC 8446 §4.2.3: constrains the algorithms on the CERTIFICATES
+                    // in the chain (vs signature_algorithms → CertificateVerify).
+                    if (self.client_sig_algs_cert) |old| self.allocator.free(old);
+                    self.client_sig_algs_cert = try self.allocator.dupe(u8, ext.data);
                 },
                 .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
                 .delegated_credential => {
@@ -2102,6 +2175,25 @@ pub const Server = struct {
         return self.config.cert_chain;
     }
 
+    /// RFC 8446 §4.2.3 / §4.4.2.2: when opted in, refuse to present an X.509 chain
+    /// whose (non-self-signed) certificate signatures use an algorithm the client
+    /// did not advertise. The effective set is the client's
+    /// `signature_algorithms_cert` if present, else its `signature_algorithms`
+    /// (the compliant fallback). Self-signed / trust-anchor certificates are
+    /// exempt (their signatures are never validated). A chain certificate whose
+    /// signatureAlgorithm this stack cannot classify as a TLS SignatureScheme is
+    /// treated as non-conforming (fail-closed). Off by default ⇒ never runs.
+    fn enforceCertChainSigAlgs(self: *Server) Error!void {
+        if (!self.config.enforce_cert_signature_algorithms) return;
+        // signature_algorithms is mandatory in a TLS 1.3 ClientHello, so `effective`
+        // is normally the cert list or the sig_algs list (§4.2.3 fallback); a client
+        // that somehow sent neither cannot constrain us — nothing to enforce.
+        const effective = self.client_sig_algs_cert orelse self.client_sig_algs orelse return;
+        if (!certChainConformsToSchemes(self.activeCertChain(), effective)) {
+            return error.NoCompatibleCertificate;
+        }
+    }
+
     /// The OCSP staple to attach for this handshake (SNI-selected or default).
     fn activeOcspStaple(self: *const Server) []const u8 {
         if (self.sni_cert) |i| return self.config.sni_certs[i].ocsp_staple;
@@ -2144,8 +2236,13 @@ pub const Server = struct {
     fn writeCertificate(self: *Server, out: *std.ArrayList(u8)) Error!void {
         // RFC 7250: when RawPublicKey was negotiated, present a bare SPKI instead
         // of the X.509 chain. Split out so the classic path below stays exactly as
-        // it was (byte-identical when RPK is off / not negotiated).
+        // it was (byte-identical when RPK is off / not negotiated). RPK carries no
+        // certificate signatures, so signature_algorithms_cert does not apply.
         if (self.server_cert_type_rpk) return self.writeRawPublicKeyCertificate(out);
+
+        // RFC 8446 §4.2.3: opt-in refusal to present a chain the client declared it
+        // cannot validate (no-op / byte-identical unless enforcement is enabled).
+        try self.enforceCertChainSigAlgs();
 
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
