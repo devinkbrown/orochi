@@ -31,6 +31,18 @@ links here.
 | **KaguraVox** | The native voice/audio codec used on the media plane and in the browser WASM export. | `src/proto/server_about.zig:66`, `src/wasm/kagura_wasm.zig:1` |
 | **KaguraVis** | The native video codec (intra/inter frames) paired with KaguraVox. | `src/proto/server_about.zig:66`, `src/wasm/kagura_wasm.zig:1` |
 
+## Cryptographic terms
+
+These are standard cryptographic concepts (not mythos codenames) that recur in
+the TLS, cloak, and account docs.
+
+| Term | What it is | Source |
+| --- | --- | --- |
+| **argon2id** | Memory-hard KDF (Password Hashing Competition winner). Used for account-password storage (PHC strings) and to stretch the `[cloak] secret` into the cloak key with a fixed domain-separation salt — so a low-entropy operator passphrase is not offline-brute-forceable against the enumerable IPv4 space. | `src/crypto/argon2_kdf.zig:130` (`deriveKey`), `src/crypto/argon2_kdf.zig:117` (`cloak_key_salt`) |
+| **Epoch cloak** | The auth-split anonymous cloak: an unauthenticated client's IP is cloaked with an opaque 64-bit token that folds in a wall-clock epoch (`floor(now/anon_epoch_secs)`), so the same address is unlinkable across epochs and leaks no subnet co-membership. See [host cloaking](host-cloaking.md#anonymous-auth-split-cloak-epoch-rotating). | `src/proto/cloak.zig:187` (`cloakOpaqueEpoch`), `src/daemon/server.zig:5981` (`anonCloakEpoch`) |
+| **EMS** (Extended Master Secret, RFC 7627) | TLS-1.2 master-secret derivation bound to the full handshake transcript, closing the triple-handshake class of attacks. Orochi's hardened TLS 1.2 profile **refuses a non-EMS handshake**. | `src/crypto/tls12.zig:302` (`deriveExtendedMasterSecret`), `src/crypto/tls_server.zig:343` |
+| **0-RTT freshness window** | The RFC 8446 §8.2–8.3 anti-replay bound on TLS 1.3 early data. v3 session tickets seal the `ticket_age_add`, so any node holding the ticket key can un-obfuscate the client's reported `obfuscated_ticket_age` and enforce the window; legacy v1/v2 tickets degrade to no window check (never a failure). | `src/crypto/tls_resumption.zig:27`, `src/crypto/tls_resumption.zig:386` |
+
 ## See also
 
 - [Mesh & S2S architecture](../architecture/mesh-s2s.md) — how Suimyaku, Tsumugi, Sazanami, and Goryu fit together.

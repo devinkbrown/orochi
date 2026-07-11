@@ -507,17 +507,31 @@ Automatic in-daemon TLS certificate renewal (Linux only). A background thread ch
 | `http01_accept_poll` | duration string | `"250ms"` | `50ms..5s` | Accept-loop wake interval used to re-check shutdown. |
 | `http01_conn_read_timeout` | duration string | `"5s"` | `1s..60s` | Per-challenge-connection read timeout. Whole seconds only. |
 
-## `[cloak]`
+## `[ocsp]`
 
-Source: struct at `src/daemon/config_format.zig:201`, parsing at `src/daemon/config_format.zig:405`, boot wiring at `src/main.zig:200`.
+OCSP stapling. Source: struct `Ocsp` at `src/daemon/config_format.zig:766`, parsing at `src/daemon/config_format.zig:1384`. When enabled, a background worker keeps a fresh OCSP staple for the served leaf certificate; the responder is contacted only when the cached staple is stale or missing.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `secret` | string or null | unset | any string | Hash-derived stable hostname cloak key. If absent, `main.zig` generates a per-boot key (`src/main.zig:205`, `src/main.zig:210`). |
-| `previous_secret` | string or null | unset | any string | Prior cloak key kept live across a `secret` rotation. New cloaks use `secret`; WARD host/mask matching additionally tests the cloak under this key, so bans written before the rotation keep matching during a grace window. Drop once old bans have aged out. |
-| `suffix` | string or null | unset | any string | Optional network-identifying suffix for generated cloak hosts (`src/daemon/config_format.zig:299`, `src/daemon/config_boot.zig:40`). |
-| `mode` | string or null | `hierarchical` | `hierarchical` \| `opaque` | IP cloak granularity. `hierarchical` emits subnet-bannable prefix tokens plus `a<asn>.<cc>` geo labels; `opaque` emits a single token over the whole address (nothing leaks — not even country/ASN or subnet membership — but it cannot be subnet-banned). |
-| `account_cloak` | bool | `false` | `true` \| `false` | When true, a logged-in client's visible host becomes the friendly `<account>.users.<suffix>`, stable across IPs and devices. Explicit VHOST personas still override it. |
+| `enabled` | bool | `false` | `true` or `false` | Master switch for OCSP staple fetching/attachment. |
+| `check_interval` | duration string | `"15m"` | duration | How often the worker wakes to check whether a (re)fetch is due (parsed via `durationMs`, `src/daemon/config_format.zig:1385`). |
+
+## `[cloak]`
+
+Source: struct `Cloak` at `src/daemon/config_format.zig:611`, parsing at `src/daemon/config_format.zig:1272`, boot wiring at `src/main.zig:468`. See [Host cloaking](host-cloaking.md) for the full model.
+
+The cloak key is not a bare `SHA256(secret)`: `secret` (and `previous_secret`) are stretched through **argon2id** (memory-hard KDF, 64 MiB / t=2 / p=1) with a fixed domain-separation salt `orochi/cloak-key/argon2id/v1`, so a low-entropy operator passphrase is not offline-brute-forceable against the fully-enumerable IPv4 input space (`src/main.zig:491`, `src/crypto/argon2_kdf.zig:117`, `src/crypto/argon2_kdf.zig:130`). Derivation is deterministic (fixed salt), so cloaked hosts stay stable across restarts and identical mesh-wide.
+
+**Mesh requirement:** every mesh node MUST share one `[cloak] secret`. A meshed node with no shared secret generates a per-boot random key, so cloaked hosts differ per node and change on restart — `*!*@<cloak>` and subnet WARD bans neither federate nor persist. `--check-config` **hard-errors** (`meshCloakSecretMissing`) when `[mesh] connect` OR `[listen] s2s` is set without a `[cloak] secret` (`src/daemon/config_format.zig:829`, `src/main.zig:192`).
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `secret` | string or null | unset | any string | argon2id-derived stable hostname cloak key. If absent, `main.zig` generates a per-boot random key so real IPs are never shown by default (`src/main.zig:494`, `src/main.zig:531`). |
+| `previous_secret` | string or null | unset | any string | Prior cloak key kept live across a `secret` rotation (derived through the same argon2id path). New cloaks use `secret`; WARD host/mask matching additionally tests the cloak under this key, so bans written before the rotation keep matching during a grace window. Drop once old bans have aged out (`src/main.zig:508`). |
+| `suffix` | string or null | unset | any string | Optional network-identifying suffix for generated cloak hosts (`src/daemon/config_format.zig:622`). |
+| `mode` | string or null | `hierarchical` | `hierarchical` \| `opaque` | IP cloak granularity. `hierarchical` emits subnet-bannable prefix tokens plus `a<asn>.<cc>` geo labels; `opaque` emits a single token over the whole address (nothing leaks — not even country/ASN or subnet membership — but it cannot be subnet-banned) (`src/daemon/config_format.zig:626`, `src/main.zig:523`). |
+| `account_cloak` | bool | `false` | `true` \| `false` | When true, a logged-in client's visible host becomes the friendly `<account>.users.<suffix>`, stable across IPs and devices. Explicit VHOST personas still override it (`src/daemon/config_format.zig:634`). |
+| `anon_epoch_secs` | integer (seconds) | `86400` | `0..31536000` | Anonymous-client cloak rotation cadence. When non-zero, an **unauthenticated** client gets an OPAQUE cloak salted by the current wall-clock epoch `floor(now/anon_epoch_secs)`, so a static-IP anonymous user is neither linkable across epochs nor leaks subnet co-membership. Logged-in clients are unaffected (they keep the stable account/hierarchical cloak). Wall-clock based so every mesh node agrees on the epoch. `0` disables rotation (pre-2026-07 behavior). Default 86400 (24 h) (`src/daemon/config_format.zig:646`, `src/daemon/config_format.zig:1279`, `src/daemon/server.zig:5825`). |
 
 ## `[webpush]`
 
@@ -586,6 +600,17 @@ Source: struct at `src/daemon/config_format.zig:229`, parsing at `src/daemon/con
 | `preload` | bool | `false` | `true` or `false` | Adds `preload` to the STS value (`src/main.zig:252`). |
 
 STS is omitted entirely unless a policy is present; this prevents clients from being stranded by a nonexistent TLS listener (`src/daemon/dispatch.zig:369`).
+
+## `[webauthn]`
+
+Passkey (WebAuthn/FIDO2) registration and passwordless login (the `WEBAUTHN` command). Source: struct `Webauthn` at `src/daemon/config_format.zig:796`, parsing at `src/daemon/config_format.zig:1120`. The command fails closed until BOTH `rp_id` and one or more `origins` are configured — a passkey ceremony must be bound to the deploy's exact domain.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `rp_id` | string or null | unset | registrable domain | Relying Party ID (e.g. `chat.example`). Passkeys are scoped to this; it must match the site the client's `navigator.credentials` call runs on. Null ⇒ WEBAUTHN unavailable. |
+| `origins` | array of strings | `[]` | `https://…` origins | Allowed top-level origins. A ceremony whose clientDataJSON `origin` is not listed is rejected. Empty ⇒ WEBAUTHN unavailable. |
+| `require_uv` | bool | `false` | `true` or `false` | Require the User-Verified (UV) flag (not just User-Present) in authenticatorData for both registration and login. When off, wire behaviour is byte-identical to the UP-only default. |
+| `require_attestation` | bool | `false` | `true` or `false` | Require a verified attestation statement at registration (`fmt` may not be `none`). The attestation signature is verified fail-closed, but the x5c leaf is NOT anchored to a bundled FIDO metadata root — this proves tamper-evidence, not hardware provenance. When off, registration keeps trust-on-first-use. |
 
 ## `[oper]`
 

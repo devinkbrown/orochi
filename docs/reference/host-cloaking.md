@@ -40,6 +40,7 @@ in `macTag`).
 IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet
 IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet
 opaque             -> <f>.opq.ircxnet
+opaque + epoch     -> <f(epoch)>.opq.ircxnet   (anon auth-split; see below)
 account            -> kain.users.ircxnet
 ```
 
@@ -90,12 +91,66 @@ recomputed by `applyVisibleHost`. An unusable account label (or a logged-out
 client) falls through to the IP cloak. Loopback (`127.x` / `::1`) always stays
 the conventional `localhost`.
 
+## Anonymous auth-split cloak (epoch-rotating)
+
+When `[cloak] anon_epoch_secs` is non-zero (default `86400` = 24 h), the cloak
+engine **splits on authentication state**. An **unauthenticated** client
+(`session.account() == null`) is cloaked with `cloakOpaqueEpoch`
+([src/proto/cloak.zig:187](../../src/proto/cloak.zig)): a single 64-bit token
+over the full address **plus the current epoch counter**, then the `opq` marker
+and suffix (`<f(epoch)>.opq.<suffix>`). The epoch is folded into the HMAC
+(`token64Epoch` / `macTagEpoch` → `HMAC-SHA256(key, domain || data || epoch_be64)`,
+domain tags `ip4/v2/opqe|` / `ip6/v2/opqe|`, so an epoch cloak never equals the
+plain `cloakOpaque` token). Two consequences:
+
+- the same address is **unlinkable across epochs** (each rollover yields a fresh,
+  unrelatable token), retiring the forever-linkability of a static-IP anonymous
+  user;
+- the opaque single-token form leaks **no subnet co-membership** and no geo.
+
+The epoch is `floor(wall_clock_seconds / anon_epoch_secs)`, computed by
+`anonCloakEpoch` ([src/daemon/server.zig:5981](../../src/daemon/server.zig)). It
+is **wall-clock** based, not per-node monotonic, so every mesh node computes the
+same epoch for a given instant — the same cross-node clock-domain rule as oper
+grants and HLC LWW; a monotonic clock would desync the anon cloak across the
+mesh.
+
+**Logged-in clients are unaffected.** The auth-split branch in `applyVisibleHost`
+([src/daemon/server.zig:5825](../../src/daemon/server.zig)) fires only when
+`account() == null`; an authenticated client falls through to its stable,
+moderatable account/hierarchical cloak and keeps subnet-bannability. The
+trade-off is deliberate: moderation of anonymous abuse shifts to **account bans +
+registration friction**, which these opaque, unlinkable cloaks are designed to
+require. Set `anon_epoch_secs = 0` to disable rotation and keep anonymous clients
+on the stable hierarchical cloak (pre-2026-07 behavior). Because
+`anon_epoch_secs` defaults to 24 h, anonymous clients switch from the
+hierarchical `.ip` cloak to the opaque `.opq` epoch cloak on upgrade unless the
+operator sets it to `0`.
+
 ## Rotatable cloak key
 
-The cloak key is derived at boot by SHA-256 of `[cloak] secret`
-([src/main.zig](../../src/main.zig)); with no secret, the daemon generates a
-random per-boot key so privacy is on by default. `[cloak] previous_secret`
-derives a second key kept live for **ban continuity across a rotation**.
+The cloak key is derived at boot from `[cloak] secret` by **argon2id**, not a
+bare `SHA256(secret)` ([src/main.zig:491](../../src/main.zig),
+[deriveKey in src/crypto/argon2_kdf.zig:130](../../src/crypto/argon2_kdf.zig)).
+The secret is stretched with the memory-hard KDF (64 MiB / t=2 / p=1,
+`default_params`) under a fixed domain-separation salt
+`orochi/cloak-key/argon2id/v1` (`cloak_key_salt`). The whole cloak security model
+rests on key secrecy — the IPv4 input space is fully enumerable — so a
+low-entropy operator passphrase must not be offline-brute-forceable: SHA-256
+costs one hash per guess, argon2id costs ~64 MiB + t iterations per guess.
+Derivation is **deterministic** (fixed salt), so cloaked hosts stay stable across
+restarts and identical mesh-wide. With no secret, the daemon generates a random
+per-boot key so privacy is on by default. `[cloak] previous_secret` derives a
+second key (through the same argon2id path) kept live for **ban continuity across
+a rotation**.
+
+**One-time reshuffle on upgrade.** This argon2id KDF replaced the prior
+`SHA256(secret)` derivation, so on the first boot after that upgrade every
+client's cloak reshuffles once: the derived key changed. Pre-upgrade host/subnet
+WARD bans on the old SHA-256 cloaks do **not** carry over — they were computed
+under a key the daemon can no longer reproduce, so the `previous_secret` grace
+window applies only to *future* rotations under this argon2id KDF, not to the
+SHA-256 → argon2id transition itself ([src/main.zig:480](../../src/main.zig)).
 
 New cloaks always use the primary key. But bans written under the old key
 reference old host/mask tokens, so `enforceWard`
@@ -171,8 +226,19 @@ wired in [src/main.zig](../../src/main.zig).
 
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `secret` | string | random per-boot | Passphrase SHA-256'd to the 32-byte cloak key. Absent → random key (privacy still on; cloaks are not stable across restarts). |
-| `previous_secret` | string | none | Prior secret kept live so WARD host/mask bans written under it keep matching during a rotation grace window. Drop once old bans age out. |
+| `secret` | string | random per-boot | Passphrase stretched to the 32-byte cloak key by **argon2id** (64 MiB / t=2 / p=1, fixed salt). Absent → random key (privacy still on; cloaks are not stable across restarts). |
+| `previous_secret` | string | none | Prior secret (same argon2id path) kept live so WARD host/mask bans written under it keep matching during a rotation grace window. Drop once old bans age out. |
 | `suffix` | string | `ircxnet` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
 | `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one token, no subnet/geo leak, not subnet-bannable. |
 | `account_cloak` | bool | `false` | Logged-in clients show the key-free `<account>.users.<suffix>`. Explicit VHOST personas still override. |
+| `anon_epoch_secs` | integer (seconds) | `86400` | Anonymous auth-split cadence. Non-zero → unauthenticated clients get the epoch-rotating opaque cloak (above). `0` disables the split (anonymous clients keep the stable hierarchical cloak). |
+
+**Mesh requirement.** Every mesh node MUST share one `[cloak] secret`. On a
+meshed node with no shared secret, each node derives its own random per-boot key,
+so cloaked hosts differ per node and change on restart — `*!*@<cloak>` and subnet
+WARD bans neither federate across the mesh nor survive a restart.
+`--check-config` **hard-errors** on this: `meshCloakSecretMissing`
+([src/daemon/config_format.zig:829](../../src/daemon/config_format.zig)) is true
+when the node is meshed (`[mesh] connect` set **or** `[listen] s2s` set) and
+`[cloak] secret` is null, and `main.zig` refuses to boot
+([src/main.zig:192](../../src/main.zig)).
