@@ -2,29 +2,29 @@
 
 *Account, service, and persona commands exposed as real server commands — Orochi has no pseudo-clients.*
 
-The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:59`), with additional commands from feature and service modules. Orochi services are real server commands that reply through server notices; no pseudo-clients exist in these handlers (`src/daemon/server.zig:8698`, `src/daemon/server.zig:8709`).
+The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:125`, `src/daemon/modules/accounts.zig:155`), with additional commands from feature and service modules. Orochi services are real server commands that reply through raw server lines and server notices; these handlers do not model pseudo-clients (`src/daemon/server.zig:22987`, `src/daemon/server.zig:23472`).
 
 ## REGISTER
 
-- Syntax: `REGISTER <account> <email|*> <password>`
-- Description: Registers an account immediately and logs the session in. Optionally issues an email verification token, applies SASL-account oper elevation when configured, tracks the session, delivers tegami, applies autojoin, and emits welcome and client-registration side effects.
+- Syntax: `REGISTER <account|*> <email|*> <password>`
+- Description: Registers an account immediately and logs the session in. `*` uses the current nick as the account name. When mail is configured and an email is supplied, the verification code is sent out of band and the client gets a notice telling it to run `VERIFY <code>`; the code is not shown in-band. Registration applies SASL-account oper elevation when configured, tracks the session, delivers tegami, applies autojoin, and emits welcome and client-registration side effects.
 - Privileges: Registered client.
 - Parameters: Account, email or `*`, password.
-- Replies: Raw `REGISTER SUCCESS <account> :Account registered`, optional `VERIFY <token>` notice, welcome/account side effects.
-- Errors: IRCv3 `FAIL REGISTER` with `TEMPORARILY_UNAVAILABLE`, `NEED_MORE_PARAMS`, `ACCOUNT_EXISTS`, `BAD_ACCOUNT_NAME`, `INVALID_PASSWORD`.
+- Replies: Raw `REGISTER SUCCESS <account> :Account registered`, optional email-status notice, welcome/account side effects.
+- Errors: IRCv3 `FAIL REGISTER` with `TEMPORARILY_UNAVAILABLE`, `NEED_MORE_PARAMS`, `ACCOUNT_EXISTS`, `BAD_ACCOUNT_NAME`, `INVALID_PASSWORD`, `INVALID_EMAIL`, `ACCOUNT_FORBIDDEN`.
 - Example: `REGISTER alice alice@example.net correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:60`, `src/daemon/server.zig:8475`
+- Sources: `src/daemon/modules/accounts.zig:125`, `src/daemon/server.zig:22832`, `src/daemon/server.zig:22965`
 
 ## VERIFY
 
-- Syntax: `VERIFY <token>`
+- Syntax: `VERIFY [account] <code>`
 - Description: Confirms a pending account email verification token.
 - Privileges: Registered client.
-- Parameters: Verification token.
-- Replies: Server notice/failure from handler.
-- Errors: Handler-specific failure replies for missing or invalid token.
-- Example: `VERIFY abcdef012345`
-- Sources: `src/daemon/modules/accounts.zig:61`, `src/daemon/server.zig:5717`
+- Parameters: Verification code, with an optional account name. The one-argument form verifies the caller's logged-in account.
+- Replies: Server notice `VERIFY: your account email is now verified`, `VERIFY: nothing to verify for your account`, or IRCv3 `FAIL VERIFY`.
+- Errors: `FAIL VERIFY ACCOUNT_REQUIRED`, `EXPIRED`, `INVALID_CODE`, `TOO_MANY_ATTEMPTS`; missing parameters produce a usage notice.
+- Example: `VERIFY alice abcdef012345`
+- Sources: `src/daemon/modules/accounts.zig:126`, `src/daemon/server.zig:15424`
 
 ## IDENTIFY
 
@@ -35,12 +35,12 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` confirming login plus account-notify/welcome side effects.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL IDENTIFY TEMPORARILY_UNAVAILABLE`, `FAIL IDENTIFY TOTP_REQUIRED` (2FA code missing/incorrect).
 - Example: `IDENTIFY alice correct-horse 492817`
-- Sources: `src/daemon/modules/accounts.zig:62`, `src/daemon/server.zig:8519`
+- Sources: `src/daemon/modules/accounts.zig:127`, `src/daemon/server.zig:23072`, `src/daemon/services.zig:1140`
 
 ## TOTP
 
 - Syntax: `TOTP <ENROLL | CONFIRM <code> | DISABLE | STATUS>`
-- Description: Manages the logged-in account's TOTP (RFC 6238) two-factor authentication. `ENROLL` mints a 160-bit shared secret and returns it plus an `otpauth://` URI for an authenticator app (requires a TLS link — the secret must not cross plaintext). `CONFIRM <code>` activates the enrollment after verifying a code and durably saves the secret. `DISABLE` removes it. `STATUS` reports active/pending/disabled. Enabling or disabling 2FA revokes any existing SASL session token. Once active, every login path enforces the second factor: `IDENTIFY` requires the code; knowledge-factor SASL (PLAIN/SCRAM, over both IRCv3 `AUTHENTICATE` and IRCX `AUTH`) is refused with a pointer to use `IDENTIFY`. EXTERNAL (client cert) and OAUTHBEARER are not gated.
+- Description: Manages the logged-in account's TOTP (RFC 6238) two-factor authentication. `ENROLL` mints a 160-bit shared secret and returns it plus an `otpauth://` URI for an authenticator app (requires a TLS link — the secret must not cross plaintext). `CONFIRM <code>` activates the enrollment after verifying a code and durably saves the secret. `DISABLE` removes it. `STATUS` reports active/pending/disabled. Enabling or disabling 2FA revokes any existing SASL session token. Once active, every login path enforces the second factor: `IDENTIFY` requires the code; knowledge-factor SASL (PLAIN/SCRAM, over both IRCv3 `AUTHENTICATE` and IRCX `AUTH`) is refused with a pointer to use `IDENTIFY`. EXTERNAL, OAUTHBEARER, and SESSION-TOKEN are not gated by TOTP.
 - Privileges: Registered client logged in to an account.
 - Parameters: A subcommand; `CONFIRM` additionally takes the current 6-digit code.
 - Replies: Server `NOTICE` lines (secret + otpauth URI on `ENROLL`; status/confirmation otherwise).
@@ -54,10 +54,10 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Description: Removes the account login, removes the live session from the session registry, sends account-notify, and revokes `+o` when oper status came from the account.
 - Privileges: Registered client.
 - Parameters: None.
-- Replies: Optional `MODE <nick> :-o`, then server `NOTICE` confirming logout.
+- Replies: `RPL_LOGGEDOUT 901` when an account binding was cleared, optional `MODE <nick> :-o`, then server `NOTICE` confirming logout.
 - Errors: None specific.
 - Example: `LOGOUT`
-- Sources: `src/daemon/modules/accounts.zig:63`, `src/daemon/server.zig:8545`
+- Sources: `src/daemon/modules/accounts.zig:129`, `src/daemon/server.zig:23128`
 
 ## DROP
 
@@ -68,7 +68,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` confirming drop.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL DROP TEMPORARILY_UNAVAILABLE`.
 - Example: `DROP alice correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:64`, `src/daemon/server.zig:8568`
+- Sources: `src/daemon/modules/accounts.zig:130`, `src/daemon/server.zig:23169`, `src/daemon/services.zig:1158`
 
 ## RESETPASS
 
@@ -88,21 +88,30 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Description: Reports account name and flags. Without an argument, uses the caller's logged-in account.
 - Privileges: Registered client.
 - Parameters: Optional account.
-- Replies: Server `NOTICE` `account=<name> flags=<n>`.
+- Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool>`.
 - Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
 - Example: `ACCOUNTINFO alice`
-- Sources: `src/daemon/modules/accounts.zig:65`, `src/daemon/server.zig:8585`
+- Sources: `src/daemon/modules/accounts.zig:134`, `src/daemon/server.zig:23457`, `src/daemon/services.zig:1284`
 
 ## SASLINFO
 
 - Syntax: `SASLINFO`
-- Description: Shows configured SASL mechanisms and whether the caller is currently logged in. Live mechanism listings are limited to wired mechanisms: `PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` when their backends are configured.
+- Description: Shows configured SASL mechanisms and whether the caller is currently logged in. Live mechanism listings are limited to mechanisms wired on this connection: `PLAIN`, `EXTERNAL`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `SCRAM-SHA-512-PLUS` when the TLS exporter is present, `SESSION-TOKEN`, `OAUTHBEARER`, and `ANONYMOUS`. The SASL router also parses `SCRAM-SHA-256-PLUS`, but current advertised CAP/SASLINFO/IRCX lists do not include it.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: Server notices.
 - Errors: None specific.
 - Example: `SASLINFO`
-- Sources: `src/daemon/modules/accounts.zig:66`, `src/daemon/server.zig:8605`
+- Sources: `src/daemon/modules/accounts.zig:136`, `src/daemon/server.zig:23582`, `src/daemon/dispatch.zig:1418`, `src/proto/sasl_mechrouter.zig:16`
+
+## SASL AUTHENTICATE and numerics
+
+- Syntax: `AUTHENTICATE <mechanism|payload|*>`
+- Description: IRCv3 SASL runs through the `AUTHENTICATE` dispatcher. It supports configured `PLAIN`, `EXTERNAL`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `SCRAM-SHA-512-PLUS`, `SESSION-TOKEN`, `OAUTHBEARER`, and `ANONYMOUS` mechanisms on the live connection. The router can parse `SCRAM-SHA-256-PLUS`, but that name is not currently advertised by CAP, SASLINFO, or IRCX package lists. `SESSION-TOKEN` is a SASL re-entry credential, distinct from the `SESSION TOKEN` / `SESSION MTOKEN` reclaim tokens used with `SESSION RESUME`.
+- Replies: `AUTHENTICATE +` or challenge data during the exchange; `RPL_LOGGEDIN 900` plus `RPL_SASLSUCCESS 903` on success; optional final SCRAM verifier before success.
+- Errors and numerics: `ERR_SASLFAIL 904`, `ERR_SASLTOOLONG 905`, `ERR_SASLABORTED 906`, `ERR_SASLALREADY 907`, and `RPL_SASLMECHS 908` before `904` for an unsupported mechanism. `RPL_LOGGEDOUT 901` is emitted when aborting an already-authenticated SASL exchange or on `LOGOUT`. The current dispatcher defines `900`, `901`, and `903`-`908`; it does not define or emit a `902` account-auth numeric.
+- Account-status lockout: A SUSPENDED or FORBIDDEN account is rejected at the SASL success chokepoint for every non-guest mechanism, including SCRAM and OAUTHBEARER. The user-facing IRCv3 surface is the generic `904 :SASL authentication failed`, so account status is not enumerated.
+- Sources: `src/daemon/dispatch.zig:169`, `src/daemon/dispatch.zig:1805`, `src/daemon/dispatch.zig:1833`, `src/daemon/dispatch.zig:1919`, `src/daemon/dispatch.zig:1979`, `src/daemon/dispatch.zig:2034`, `src/daemon/server.zig:20740`, `src/daemon/services.zig:2528`
 
 ## ACCOUNTSET
 
@@ -111,9 +120,9 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Privileges: Registered client (the account owner).
 - Parameters: Account, password, field, value.
 - Replies: Server `NOTICE` confirming update.
-- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL ACCOUNTSET INVALID_VALUE`, `FAIL ACCOUNTSET INVALID_FIELD`, `FAIL ACCOUNTSET TEMPORARILY_UNAVAILABLE`.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL ACCOUNTSET INVALID_VALUE`, `INVALID_FIELD`, `PRIVILEGED_FLAGS`, `TEMPORARILY_UNAVAILABLE`.
 - Example: `ACCOUNTSET alice correct-horse secure on`
-- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleAccountSet`, `src/daemon/svc_enforce.zig`
+- Sources: `src/daemon/modules/accounts.zig:137`, `src/daemon/server.zig:24377`, `src/daemon/services.zig:1252`
 
 ## RECOVER
 
@@ -140,13 +149,13 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## GHOST
 
 - Syntax: `GHOST <nick> <password>`
-- Description: Password-verifies the account associated with the target nick and disconnects the stale live session if present.
-- Privileges: Registered client.
+- Description: Password-verifies the caller's logged-in account and disconnects a different live session only when the target nick is logged in to that same account.
+- Privileges: Registered client logged in to an account.
 - Parameters: Target nick and password.
 - Replies: Victim receives `ERROR :Ghosted by <nick>`; caller receives server `NOTICE`.
-- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL GHOST TEMPORARILY_UNAVAILABLE`.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL GHOST TEMPORARILY_UNAVAILABLE`, `ACCOUNT_REQUIRED`, `NICK_NOT_OWNED`.
 - Example: `GHOST alice_ correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:68`, `src/daemon/server.zig:8668`
+- Sources: `src/daemon/modules/accounts.zig:138`, `src/daemon/server.zig:24427`, `src/daemon/services.zig:1242`
 
 ## CHANNEL
 
@@ -173,13 +182,13 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## SESSION
 
 - Syntax: `SESSION [LIST|TOKEN|RESUME <token>]`
-- Description: Lists live sessions for the caller's account, reveals this session's local and optional mesh reclaim tokens, or resumes a detached session.
+- Description: Lists live sessions for the caller's account, reveals this session's local and optional mesh reclaim tokens, or resumes a detached session. `SESSION TOKEN` replies with `NOTICE ... :SESSION TOKEN <hex>` and, when mesh reclaim is enabled, `NOTICE ... :SESSION MTOKEN <hex>`; either token is supplied to `SESSION RESUME <token>`.
 - Privileges: Registered client logged in to an account.
 - Parameters: Optional subcommand; `LIST` is default.
-- Replies: Server notices for `SESSION LIST`, `SESSION TOKEN`, optional `SESSION MTOKEN`, resume, redirect, and list end. Reclaim and migration state changes are also published on the Event Spine service plane.
-- Errors: `FAIL SESSION INVALID_TOKEN`, `FAIL SESSION NO_SESSION`; account-required notice.
+- Replies: Server notices for `SESSION LIST`, `SESSION TOKEN`, optional `SESSION MTOKEN`, `SESSION RESUME: ...`, redirect, and list end. Reclaim and migration state changes are also published on the Event Spine service plane.
+- Errors: `FAIL SESSION INVALID_TOKEN`, `NO_SESSION`, `SESSION_ATTACHED`; account-required notice.
 - Example: `SESSION TOKEN`
-- Sources: `src/daemon/modules/accounts.zig:71`, `src/daemon/server.zig:8880`, `src/daemon/server.zig:8930`
+- Sources: `src/daemon/modules/accounts.zig:143`, `src/daemon/server.zig:24958`, `src/daemon/server.zig:25007`, `src/daemon/services.zig:899`
 
 ## CERTADD
 
@@ -190,7 +199,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notice confirming fingerprint binding.
 - Errors: `FAIL CERTADD TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NO_CLIENT_CERT`, `CERT_ADD_FAILED`.
 - Example: `CERTADD`
-- Sources: `src/daemon/modules/accounts.zig:85`, `src/daemon/server.zig:12157`
+- Sources: `src/daemon/modules/accounts.zig:145`, `src/daemon/server.zig:23640`, `src/daemon/services.zig:531`
 
 ## CERTLIST
 
@@ -201,7 +210,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notices, one `CERTLIST <fingerprint>` per bound fingerprint, or a no-fingerprints notice.
 - Errors: `FAIL CERTLIST TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `CERT_LIST_FAILED`.
 - Example: `CERTLIST`
-- Sources: `src/daemon/modules/accounts.zig:86`, `src/daemon/server.zig:12167`
+- Sources: `src/daemon/modules/accounts.zig:150`, `src/daemon/server.zig:23653`
 
 ## CERTDEL
 
@@ -212,7 +221,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notice confirming removal.
 - Errors: `FAIL CERTDEL TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NEED_MORE_PARAMS`, `CERT_NOT_OWNED`, `CERT_NOT_FOUND`, `CERT_DEL_FAILED`.
 - Example: `CERTDEL SHA256:...`
-- Sources: `src/daemon/modules/accounts.zig:87`, `src/daemon/server.zig:12183`
+- Sources: `src/daemon/modules/accounts.zig:151`, `src/daemon/server.zig:23669`
 
 ## KEYTRANS
 
