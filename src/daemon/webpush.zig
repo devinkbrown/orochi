@@ -26,6 +26,7 @@ const http1 = @import("../proto/http1_client.zig");
 const platform = @import("../substrate/platform.zig");
 
 const Allocator = std.mem.Allocator;
+const net = std.Io.net;
 const b64url = std.base64.url_safe_no_pad;
 
 pub const max_subscriptions_per_account: usize = 3;
@@ -148,6 +149,69 @@ pub fn validEndpoint(endpoint: []const u8) bool {
     }
     return true;
 }
+
+// ── SSRF guard for outbound push delivery ────────────────────────────────────
+
+/// True when a resolved IPv4 target sits in a range a client must never be able
+/// to aim the daemon at: unspecified, private (RFC 1918), loopback, link-local
+/// (cloud-metadata `169.254.169.254`), or the limited broadcast.
+fn isDisallowedIp4(b: [4]u8) bool {
+    return switch (b[0]) {
+        0 => true, // 0.0.0.0/8 (incl. unspecified)
+        10 => true, // 10.0.0.0/8 private
+        127 => true, // 127.0.0.0/8 loopback
+        169 => b[1] == 254, // 169.254.0.0/16 link-local
+        172 => b[1] >= 16 and b[1] <= 31, // 172.16.0.0/12 private
+        192 => b[1] == 168, // 192.168.0.0/16 private
+        255 => b[1] == 255 and b[2] == 255 and b[3] == 255, // 255.255.255.255 broadcast
+        else => false,
+    };
+}
+
+/// SSRF guard: reject a RESOLVED push target in loopback / private / link-local
+/// / ULA / unspecified space. Applied on the exact address the connect uses (one
+/// resolution, checked inline), so a DNS-rebinding answer cannot slip a public
+/// hostname past the block; IP-literal endpoints hit the same check.
+pub fn isDisallowedPushAddr(addr: net.IpAddress) bool {
+    switch (addr) {
+        .ip4 => |a| return isDisallowedIp4(a.bytes),
+        .ip6 => |a| {
+            // An IPv4-mapped address (::ffff:a.b.c.d) is screened as its IPv4.
+            if (net.Ip4Address.fromIp6(a)) |mapped| return isDisallowedIp4(mapped.bytes);
+            const b = a.bytes;
+            var hi_zero = true;
+            for (b[0..12]) |x| {
+                if (x != 0) {
+                    hi_zero = false;
+                    break;
+                }
+            }
+            if (hi_zero) return true; // ::, ::1, and the deprecated ::a.b.c.d space
+            if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+            if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA
+            return false;
+        },
+    }
+}
+
+/// Wraps a resolver so every resolved push target is SSRF-screened inline with
+/// the single resolution the connect performs. Scoped to the webpush delivery
+/// path — ACME keeps its own unguarded resolver (it may legitimately reach
+/// arbitrary hosts / configured internal endpoints).
+const GuardedResolver = struct {
+    inner: acme_runner.Resolver,
+
+    fn resolveThunk(ctx: *anyopaque, host: []const u8, port: u16) anyerror!net.IpAddress {
+        const self: *GuardedResolver = @ptrCast(@alignCast(ctx));
+        const addr = try self.inner.resolveFn(self.inner.ctx, host, port);
+        if (isDisallowedPushAddr(addr)) return error.DisallowedPushEndpoint;
+        return addr;
+    }
+
+    fn resolver(self: *GuardedResolver) acme_runner.Resolver {
+        return .{ .ctx = @ptrCast(self), .resolveFn = resolveThunk };
+    }
+};
 
 // ── VAPID key persistence ────────────────────────────────────────────────────
 
@@ -327,9 +391,13 @@ pub const Worker = struct {
             .{ .name = "urgency", .value = "high" },
         };
 
+        // SSRF guard: screen the resolved address inline with the single
+        // resolution the connect uses, so a client-supplied endpoint can never
+        // steer the daemon at an internal/loopback/metadata target.
+        var guard = GuardedResolver{ .inner = self.resolver };
         const raw = try acme_runner.httpsRequest(
             self.allocator,
-            self.resolver,
+            guard.resolver(),
             self.trust_anchors,
             "POST",
             url,
@@ -413,6 +481,75 @@ test "validEndpoint enforces https, length and character rules" {
     try testing.expect(!validEndpoint("https://x.example/a\tb"));
     const long = "https://x.example/" ++ &@as([(max_endpoint_len)]u8, @splat('a'));
     try testing.expect(!validEndpoint(long));
+}
+
+test "webpush tls SSRF guard classifies push endpoint addresses" {
+    const ip4 = struct {
+        fn a(b: [4]u8) net.IpAddress {
+            return .{ .ip4 = .{ .bytes = b, .port = 443 } };
+        }
+    }.a;
+    // Disallowed: loopback / metadata / RFC-1918 / broadcast / unspecified.
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 127, 0, 0, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 169, 254, 169, 254 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 10, 0, 0, 5 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 172, 16, 0, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 172, 31, 255, 255 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 192, 168, 1, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 0, 0, 0, 0 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 255, 255, 255, 255 })));
+    // Allowed: public IPv4 (example.com) and a neighbouring 172.x outside /12.
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 93, 184, 216, 34 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 172, 32, 0, 1 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 8, 8, 8, 8 })));
+
+    // IPv6: ::1 loopback, fe80:: link-local, fc00:: ULA, and ::ffff-mapped
+    // internal all blocked; a public v6 allowed.
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    try testing.expect(isDisallowedPushAddr(.{ .ip6 = .{ .bytes = lo6, .port = 443 } }));
+    var ll6: [16]u8 = @splat(0);
+    ll6[0] = 0xfe;
+    ll6[1] = 0x80;
+    try testing.expect(isDisallowedPushAddr(.{ .ip6 = .{ .bytes = ll6, .port = 443 } }));
+    var ula6: [16]u8 = @splat(0);
+    ula6[0] = 0xfd;
+    try testing.expect(isDisallowedPushAddr(.{ .ip6 = .{ .bytes = ula6, .port = 443 } }));
+    var mapped: [16]u8 = @splat(0);
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12] = 169;
+    mapped[13] = 254;
+    mapped[14] = 169;
+    mapped[15] = 254;
+    try testing.expect(isDisallowedPushAddr(.{ .ip6 = .{ .bytes = mapped, .port = 443 } }));
+    var pub6: [16]u8 = @splat(0);
+    pub6[0] = 0x2a; // 2a00::/… global unicast
+    try testing.expect(!isDisallowedPushAddr(.{ .ip6 = .{ .bytes = pub6, .port = 443 } }));
+}
+
+test "webpush tls SSRF guard refuses an internal-IP endpoint before connect" {
+    const FakeInner = struct {
+        addr: net.IpAddress,
+        fn resolve(ctx: *anyopaque, _: []const u8, _: u16) anyerror!net.IpAddress {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.addr;
+        }
+    };
+    // A client-supplied metadata endpoint is refused at resolution — before any
+    // socket/connect — so delivery never touches the internal target.
+    var meta = FakeInner{ .addr = .{ .ip4 = .{ .bytes = .{ 169, 254, 169, 254 }, .port = 443 } } };
+    var g_bad = GuardedResolver{ .inner = .{ .ctx = @ptrCast(&meta), .resolveFn = FakeInner.resolve } };
+    const r_bad = g_bad.resolver();
+    try testing.expectError(error.DisallowedPushEndpoint, r_bad.resolveFn(r_bad.ctx, "metadata.internal", 443));
+
+    // A public target passes through unchanged.
+    var good = FakeInner{ .addr = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 443 } } };
+    var g_ok = GuardedResolver{ .inner = .{ .ctx = @ptrCast(&good), .resolveFn = FakeInner.resolve } };
+    const r_ok = g_ok.resolver();
+    const got = try r_ok.resolveFn(r_ok.ctx, "push.example.net", 443);
+    try testing.expect(got == .ip4);
+    try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, &got.ip4.bytes);
 }
 
 test "Vapid.loadOrCreate persists and reloads the same key" {

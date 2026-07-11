@@ -61,26 +61,38 @@ pub fn encrypt(
 ) Error![]u8 {
     if (plaintext.len > max_plaintext) return error.PayloadTooLarge;
 
+    // Work on a private copy of the ephemeral key pair so the transient secret
+    // scalar is wiped on every exit path (forward secrecy is already ensured by
+    // the fresh ephemeral+salt per message; this is defense-in-depth).
+    var eph = as_keys;
+    defer secureZero(&eph.secret);
+
     // ecdh_secret = ECDH(as_private, ua_public)
-    const ecdh_secret = ecdh.sharedSecret(as_keys.secret, ua_public) catch
+    var ecdh_secret = ecdh.sharedSecret(eph.secret, ua_public) catch
         return error.InvalidSubscriptionKey;
+    defer secureZero(&ecdh_secret);
 
     // IKM = HKDF(salt=auth_secret, ikm=ecdh_secret,
     //            info="WebPush: info" ‖ 0x00 ‖ ua_public ‖ as_public, L=32)
-    const prk_key = HkdfSha256.extract(&auth_secret, &ecdh_secret);
+    var prk_key = HkdfSha256.extract(&auth_secret, &ecdh_secret);
+    defer secureZero(&prk_key);
     var key_info: ["WebPush: info".len + 1 + ua_public_length * 2]u8 = undefined;
     @memcpy(key_info[0.."WebPush: info".len], "WebPush: info");
     key_info["WebPush: info".len] = 0;
     @memcpy(key_info["WebPush: info".len + 1 ..][0..ua_public_length], &ua_public);
-    @memcpy(key_info["WebPush: info".len + 1 + ua_public_length ..][0..ua_public_length], &as_keys.public_sec1);
+    @memcpy(key_info["WebPush: info".len + 1 + ua_public_length ..][0..ua_public_length], &eph.public_sec1);
     var ikm: [32]u8 = undefined;
+    defer secureZero(&ikm);
     HkdfSha256.expand(&ikm, &key_info, prk_key);
 
     // CEK / NONCE from HKDF(salt, IKM) with the aes128gcm info strings.
-    const prk = HkdfSha256.extract(&salt, &ikm);
+    var prk = HkdfSha256.extract(&salt, &ikm);
+    defer secureZero(&prk);
     var cek: [16]u8 = undefined;
+    defer secureZero(&cek);
     HkdfSha256.expand(&cek, "Content-Encoding: aes128gcm\x00", prk);
     var nonce: [12]u8 = undefined;
+    defer secureZero(&nonce);
     HkdfSha256.expand(&nonce, "Content-Encoding: nonce\x00", prk);
 
     // Single record: plaintext ‖ 0x02 (final-record delimiter), then seal.
@@ -92,7 +104,7 @@ pub fn encrypt(
     @memcpy(body[0..16], &salt);
     std.mem.writeInt(u32, body[16..20], record_size, .big);
     body[20] = @intCast(ua_public_length);
-    @memcpy(body[21..][0..ua_public_length], &as_keys.public_sec1);
+    @memcpy(body[21..][0..ua_public_length], &eph.public_sec1);
 
     const record = try allocator.alloc(u8, plaintext.len + 1);
     defer allocator.free(record);
@@ -115,7 +127,8 @@ pub fn encryptRandom(
     auth_secret: [auth_secret_length]u8,
     plaintext: []const u8,
 ) Error![]u8 {
-    const as_keys = try ecdh.generate();
+    var as_keys = try ecdh.generate();
+    defer secureZero(&as_keys.secret); // wipe the owning copy of the ephemeral scalar
     var salt: [16]u8 = undefined;
     rnd.fillOsEntropy(&salt) catch return error.EntropyUnavailable;
     return encrypt(allocator, ua_public, auth_secret, as_keys, salt, plaintext);
@@ -171,6 +184,11 @@ pub fn vapidAuthValue(allocator: Allocator, jwt: []const u8, public_sec1: [65]u8
     return std.fmt.allocPrint(allocator, "vapid t={s}, k={s}", .{ jwt, &pub_b64 });
 }
 
+/// Volatile secure-zero of any fixed-size value's bytes (survives DCE).
+fn secureZero(ptr: anytype) void {
+    std.crypto.secureZero(u8, std.mem.asBytes(ptr));
+}
+
 // ── base64url helpers (subscription key parsing) ─────────────────────────────
 
 pub fn decodeFixed(comptime n: usize, text: []const u8) error{InvalidSubscriptionKey}![n]u8 {
@@ -216,6 +234,30 @@ test "RFC 8291 Appendix A — full known-answer vector" {
     defer testing.allocator.free(expected);
     try b64url.Decoder.decode(expected, expected_b64);
 
+    try testing.expectEqualSlices(u8, expected, body);
+}
+
+test "webpush tls encrypt wipes transient key material and preserves the RFC 8291 KAT" {
+    // Regression guard for the secret-zeroing pass: encrypt() now works on a
+    // wiped-on-exit copy of the ephemeral key and zeroes every derived secret,
+    // and must still reproduce the RFC 8291 Appendix A body byte-for-byte.
+    const plaintext = "When I grow up, I want to be a watermelon";
+    const ua_public = try b64(65, "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4");
+    const auth_secret = try b64(16, "BTBZMqHH6r4Tts7J_aSIgg");
+    const as_private = try b64(32, "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw");
+    const salt = try b64(16, "DGv6ra1nlYgDCS1FRnbzlw");
+
+    const as_keys = try ecdh.generateDeterministic(as_private);
+    const body = try encrypt(testing.allocator, ua_public, auth_secret, as_keys, salt, plaintext);
+    defer testing.allocator.free(body);
+
+    const expected_b64 = "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlml" ++
+        "MoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3o" ++
+        "ZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN";
+    const expected_len = try b64url.Decoder.calcSizeForSlice(expected_b64);
+    const expected = try testing.allocator.alloc(u8, expected_len);
+    defer testing.allocator.free(expected);
+    try b64url.Decoder.decode(expected, expected_b64);
     try testing.expectEqualSlices(u8, expected, body);
 }
 
