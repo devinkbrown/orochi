@@ -354,7 +354,6 @@ test "builds FAIL and WARN replies" {
         "WARN CHATHISTORY MESSAGE_RATE_LIMITED :History query was throttled",
         warn_line,
     );
-
 }
 
 test "builds replies with context params" {
