@@ -14935,6 +14935,14 @@ pub const LinuxServer = struct {
         const owner = conn.session.account() orelse return;
         const marker = (self.read_markers.get(owner, channel) catch null) orelse return;
         const marker_ms = markerToMillis(marker.slice()) orelse return;
+        // Bouncer rewind replays *channel* history, so it must honor the same
+        // history-policy gate the explicit CHATHISTORY path enforces (see
+        // `ensureChathistoryTargetVisible`). The joiner is already a member at
+        // this point in the JOIN flow, so pass is_member = true; a
+        // `history-policy=opers` channel therefore still suppresses a non-oper
+        // member's rewind, matching the FAIL ... ACCESS_DENIED an explicit
+        // `CHATHISTORY LATEST` on the same channel would return.
+        if (!self.historyPolicyAllows(channel, true, conn.session.isOper())) return;
         var buf: [64]lotus.Message = undefined;
         const found = self.history.after(channel, marker_ms, buf.len, buf[0..]) catch return;
         if (found.len == 0) return;
@@ -31752,6 +31760,137 @@ fn multiOperTestConfig(port: u16) Config {
         .sasl_checker = test_multi_oper_checker,
         .oper_registry = oper_mod.OperRegistry.init(&test_multi_oper_bindings) catch unreachable,
     };
+}
+
+// --- Bouncer-rewind history-policy test fixture ---------------------------
+// A SASL PLAIN verifier accepting two accounts, "member" and "boss", both with
+// password "rewind". Only "boss" carries an oper binding, so a login as
+// "member" yields a NON-oper account while "boss" yields an oper — the exact
+// contrast the bouncer-rewind history-policy tests need to prove the rewind
+// path honors `history-policy=opers`.
+fn testRewindVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "member") or std.mem.eql(u8, creds.authcid, "boss")) and
+        std.mem.eql(u8, creds.password, "rewind");
+}
+var test_rewind_anchor: u8 = 0;
+const test_rewind_checker = sasl.PlainChecker{ .ptr = &test_rewind_anchor, .verifyFn = testRewindVerify };
+const test_rewind_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "boss", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full, .presubscribe_bits = test_presub_all_bits },
+};
+fn bouncerRewindConfig(port: u16) Config {
+    return .{
+        .host = "127.0.0.1",
+        .port = port,
+        .num_shards = 1,
+        .sasl_checker = test_rewind_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_rewind_bindings) catch unreachable,
+    };
+}
+
+/// Shared driver for the bouncer-rewind history-policy tests. `account` selects
+/// the bouncer member's SASL identity ("member" = non-oper, "boss" = oper);
+/// `set_opers_policy` sets `history-policy=opers` on the channel; `expect_replay`
+/// asserts whether the rewind fires on the member's (re)join. Single-shard so
+/// cross-connection ordering is deterministic, and heap-allocates three
+/// LiveClients (founder/poster, witness member, bouncer member).
+fn runBouncerRewindScenario(account: []const u8, set_opers_policy: bool, expect_replay: bool) !void {
+    var server = Server.init(std.testing.allocator, bouncerRewindConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const alloc = std.testing.allocator;
+    const clients = try alloc.alloc(LiveClient, 3);
+    defer alloc.free(clients);
+
+    const fd_p = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_p);
+    const fd_w = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_w);
+    const fd_m = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_m);
+    clients[0] = LiveClient{ .fd = fd_p };
+    clients[1] = LiveClient{ .fd = fd_w };
+    clients[2] = LiveClient{ .fd = fd_m };
+    const p = &clients[0];
+    const w = &clients[1];
+    const m = &clients[2];
+
+    // Founder P (also the poster) and witness W both join #rewind so the message
+    // is guaranteed recorded before the bouncer member joins.
+    try writeAllFd(fd_p, "NICK P\r\nUSER pat 0 * :Pat\r\n");
+    try recvUntil(p, " 001 P ", 200);
+    try writeAllFd(fd_p, "JOIN #rewind\r\n");
+    try recvUntil(p, " 366 P #rewind ", 200);
+
+    try writeAllFd(fd_w, "NICK W\r\nUSER wit 0 * :Wit\r\n");
+    try recvUntil(w, " 001 W ", 200);
+    try writeAllFd(fd_w, "JOIN #rewind\r\n");
+    try recvUntil(w, " 366 W #rewind ", 200);
+
+    if (set_opers_policy) {
+        p.reset();
+        try writeAllFd(fd_p, "IRCX\r\n");
+        try recvUntil(p, " 800 P 1 0 ", 200);
+        p.reset();
+        try writeAllFd(fd_p, "PROP #rewind history-policy :opers\r\n");
+        try recvUntil(p, " 819 P #rewind ", 200);
+    }
+
+    // Bouncer member M logs in (SASL PLAIN) and negotiates the rewind caps.
+    try saslPlainPreludeWithCaps(fd_m, account, "rewind", "draft/read-marker draft/chathistory batch orochi/bouncer");
+    try writeAllFd(fd_m, "NICK M\r\nUSER mem 0 * :Mem\r\n");
+    try recvUntil(m, " 001 M ", 200);
+
+    // M stores an early read marker, so the about-to-be-posted message counts as
+    // "missed" and is eligible for rewind.
+    m.reset();
+    try writeAllFd(fd_m, "MARKREAD #rewind timestamp=2000-01-01T00:00:00.000Z\r\n");
+    try recvUntil(m, "MARKREAD #rewind timestamp=2000-01-01T00:00:00.000Z\r\n", 200);
+
+    // P posts; W (a member) witnessing it confirms the message is recorded before
+    // M joins.
+    try writeAllFd(fd_p, "PRIVMSG #rewind :rewind-me-now\r\n");
+    try recvUntil(w, "PRIVMSG #rewind :rewind-me-now", 200);
+
+    // M joins → the bouncer rewind fires here (or is suppressed by policy).
+    m.reset();
+    try writeAllFd(fd_m, "JOIN #rewind\r\n");
+    try recvUntil(m, " 366 M #rewind ", 200);
+    // PING/PONG barrier: on a single shard the PONG is emitted only after all
+    // JOIN-triggered output (including any rewind), so once it arrives M's buffer
+    // holds the complete post-join reply.
+    try writeAllFd(fd_m, "PING :barrier\r\n");
+    try recvUntil(m, "PONG", 200);
+
+    if (expect_replay) {
+        try std.testing.expect(std.mem.indexOf(u8, m.written(), "BATCH +rewind chathistory #rewind") != null);
+        try std.testing.expect(std.mem.indexOf(u8, m.written(), "rewind-me-now") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, m.written(), "rewind-me-now") == null);
+        try std.testing.expect(std.mem.indexOf(u8, m.written(), "BATCH +rewind") == null);
+    }
+}
+
+test "threaded server: bouncer rewind is suppressed for a non-oper member on a history-policy=opers channel" {
+    try runBouncerRewindScenario("member", true, false);
+}
+
+test "threaded server: bouncer rewind still replays for an oper member on a history-policy=opers channel" {
+    try runBouncerRewindScenario("boss", true, true);
+}
+
+test "threaded server: bouncer rewind replays normally for a non-oper member on a default-policy channel" {
+    try runBouncerRewindScenario("member", false, true);
 }
 
 fn runtimeGrantTestConfig(port: u16) Config {
