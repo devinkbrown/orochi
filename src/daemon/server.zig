@@ -17588,6 +17588,13 @@ pub const LinuxServer = struct {
 
     /// Send a server NOTICE to a single connection.
     fn noticeTo(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
+        // CWE-93 (CRLF injection): `text` is reflected into a NOTICE line by many
+        // callers that pass user-influenced content (WEBHOOK URLs, echoed params,
+        // service messages). This builder bypasses the `ReplyCtx` control-byte
+        // guard, so a raw CR/LF in `text` would smuggle a forged IRC line onto the
+        // wire. Fail closed: drop the notice rather than inject. Legitimate
+        // notices (all-printable) are byte-identical.
+        if (dispatch.hasControlByte(text)) return;
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), text }) catch return;
         try appendToConn(conn, line);
@@ -27631,6 +27638,15 @@ pub const LinuxServer = struct {
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
     fn failReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
+        // CWE-93 (CRLF/command injection): these FAIL/NOTICE builders reflect
+        // caller-supplied fields onto the wire WITHOUT the `ReplyCtx`
+        // `requireNoControlBytes` guard that numeric/message replies enforce.
+        // Some call sites pass user-influenced bytes (e.g. a reflected command
+        // verb), so a raw CR/LF here would inject a forged IRC line that the
+        // peer/relay parses as a separate message. Fail closed: if any reflected
+        // field carries a control byte, drop the reply rather than emit an
+        // injectable line. Legitimate (control-byte-free) replies are unchanged.
+        if (dispatch.hasControlByte(command) or dispatch.hasControlByte(code) or dispatch.hasControlByte(reason)) return;
         if (!conn.session.hasCap(.standard_replies)) {
             var notice_buf: [default_reply_bytes]u8 = undefined;
             const notice = std.fmt.bufPrint(&notice_buf, "FAIL {s} {s}: {s}", .{ command, code, reason }) catch return;
@@ -40523,6 +40539,127 @@ test "OroWasm message_pre_deliver hook can stop delivery" {
     const id = try addTestLocalClient(&server, "alice", null);
     const conn = server.connFor(id).?;
     try std.testing.expect(!try server.messageContentGates(id, conn, "PRIVMSG", "#room", "hello", false));
+}
+
+// --- Exploit corpus: CRLF/command injection into the FAIL/NOTICE reply sinks
+// (CWE-93). `failReply`/`noticeTo` reflect caller-supplied fields onto the wire
+// and historically bypassed the ReplyCtx control-byte guard, so a smuggled
+// CR/LF forged a second IRC line the peer/relay would parse. These drive the
+// real reply builders through a live ConnState (reply_capture) with hostile
+// input and assert the daemon FAILS CLOSED — it emits no injected wire line.
+
+/// A captured reply must not carry a CR/LF that begins a SECOND wire line. The
+/// only newline allowed is a single trailing "\r\n" terminator at the very end;
+/// an empty capture (the reply was dropped fail-closed) trivially passes.
+fn assertNoInjectedWireLine(captured: []const u8) !void {
+    var body = captured;
+    // Peel one legitimate trailing CRLF terminator, if present.
+    if (body.len >= 2 and body[body.len - 2] == '\r' and body[body.len - 1] == '\n') {
+        body = body[0 .. body.len - 2];
+    }
+    // Anything remaining must be a single line: no embedded CR or LF.
+    if (std.mem.indexOfScalar(u8, body, '\r') != null or std.mem.indexOfScalar(u8, body, '\n') != null) {
+        return error.WireLineInjected;
+    }
+}
+
+test "exploit: failReply rejects CRLF-smuggled command (notice branch, fail-closed)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "victim", null);
+    const conn = server.connFor(id).?;
+
+    // No standard-replies cap => failReply takes the NOTICE branch.
+    var cap_buf: [default_reply_bytes]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    conn.reply_capture = &capture;
+    defer conn.reply_capture = null;
+
+    // A hostile "command" verb carrying a full CRLF + a forged OPER line.
+    try server.failReply(conn, "BOGUS\r\nOPER attacker hunter2", "CODE", "nope");
+    try assertNoInjectedWireLine(capture.captured());
+    // Fail-closed drop: nothing at all reaches the wire.
+    try std.testing.expectEqual(@as(usize, 0), capture.captured().len);
+}
+
+test "exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "victim", null);
+    const conn = server.connFor(id).?;
+    conn.session.addCap(.standard_replies); // FAIL ... :reason\r\n branch (appendToConn)
+
+    // Each reflected position (command / code / reason) with each newline
+    // variant: full CRLF, lone LF, lone CR. All must be dropped fail-closed.
+    const cases = [_][3][]const u8{
+        .{ "X\r\nPRIVMSG #c :owned", "CODE", "reason" },
+        .{ "X", "CO\nDE", "reason" },
+        .{ "X", "CODE", "rea\rson" },
+        .{ "X", "CODE", "done\r\n:evil!e@e PRIVMSG #c :forged" },
+    };
+    for (cases) |c| {
+        var cap_buf: [default_reply_bytes]u8 = undefined;
+        var capture = ReplyCapture{ .buf = &cap_buf };
+        conn.reply_capture = &capture;
+        try server.failReply(conn, c[0], c[1], c[2]);
+        conn.reply_capture = null;
+        try assertNoInjectedWireLine(capture.captured());
+        try std.testing.expectEqual(@as(usize, 0), capture.captured().len);
+    }
+}
+
+test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "victim", null);
+    const conn = server.connFor(id).?;
+
+    var cap_buf: [default_reply_bytes]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    conn.reply_capture = &capture;
+    defer conn.reply_capture = null;
+
+    // e.g. a reflected WEBHOOK URL / echoed param carrying a forged line.
+    try server.noticeTo(conn, "WEBHOOK: created\r\n:orochi 001 victim :forged welcome");
+    try assertNoInjectedWireLine(capture.captured());
+    try std.testing.expectEqual(@as(usize, 0), capture.captured().len);
+}
+
+test "exploit: control-byte-free FAIL reply is still emitted byte-for-byte" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "victim", null);
+    const conn = server.connFor(id).?;
+    conn.session.addCap(.standard_replies);
+
+    var cap_buf: [default_reply_bytes]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    conn.reply_capture = &capture;
+    defer conn.reply_capture = null;
+
+    // The legitimate path is untouched: a clean reply is emitted verbatim.
+    try server.failReply(conn, "RENAME", "INVALID_PARAMS", "Invalid RENAME parameters");
+    try std.testing.expectEqualStrings(
+        "FAIL RENAME INVALID_PARAMS :Invalid RENAME parameters\r\n",
+        capture.captured(),
+    );
+    try assertNoInjectedWireLine(capture.captured());
 }
 
 test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {

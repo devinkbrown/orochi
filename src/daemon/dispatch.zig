@@ -2273,7 +2273,12 @@ fn dispatchText(session: *ClientSession, replies: *ReplyCtx, text: []const u8) D
     try dispatchLine(session, replies, &line);
 }
 
-fn hasControlByte(bytes: []const u8) bool {
+/// True if `bytes` contains any C0 control (< 0x20, incl. CR/LF/NUL/TAB) or DEL
+/// (0x7f). The single predicate behind every outbound control-byte guard — the
+/// ReplyCtx builders (`requireNoControlBytes`) AND the server-side FAIL/NOTICE
+/// reply sinks reuse it so no wire-facing reflection path can smuggle a raw
+/// CR/LF that starts a forged IRC line (CWE-93).
+pub fn hasControlByte(bytes: []const u8) bool {
     for (bytes) |byte| {
         if (byte < 0x20 or byte == 0x7f) return true;
     }

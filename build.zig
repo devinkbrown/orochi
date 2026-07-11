@@ -241,6 +241,7 @@ pub fn build(b: *std.Build) void {
 
     const server_test_filters: []const []const u8 = &.{
         "threaded server:",
+        "exploit:",
         "tls13Config",
         "banContextFor",
         "SASL EXTERNAL",
