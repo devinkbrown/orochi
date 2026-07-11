@@ -34,7 +34,7 @@ pub const max_cred_id_b64: usize = base64url.encodedLen(max_cred_id_bytes);
 
 /// Max user-supplied label length (bytes, pre-encoding).
 pub const max_label_bytes: usize = 64;
-const max_label_b64: usize = base64url.encodedLen(max_label_bytes);
+pub const max_label_b64: usize = base64url.encodedLen(max_label_bytes);
 
 /// Max COSE public-key length (bytes). ES256 ≈ 77, EdDSA ≈ 42; 512 is generous.
 pub const max_cose_key_bytes: usize = 512;

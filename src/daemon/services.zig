@@ -738,6 +738,36 @@ pub const Services = struct {
         try self.store.family(.props).put(cred_key, record);
     }
 
+    /// Update the user label of a passkey the caller owns, identified by
+    /// credential id. Fail-closed: `NotFound` when the id is unbound, `Forbidden`
+    /// when it resolves to a different account, `InvalidValue` on a malformed id
+    /// or an over-long label. Every other record field is preserved verbatim.
+    pub fn webauthnRename(self: *Services, account: []const u8, cred_id_b64: []const u8, label: []const u8) ServiceError!void {
+        if (!webauthn_creds.validCredIdB64(cred_id_b64)) return error.InvalidValue;
+        if (label.len > webauthn_creds.max_label_bytes) return error.InvalidValue;
+        const key = try accountKey(account); // validates + lowercases
+
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+        const cred_key = webauthn_creds.credKey(&cred_key_buf, cred_id_b64) orelse return error.NotFound;
+        const value = self.store.family(.props).get(cred_key) orelse return error.NotFound;
+        const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
+        if (!std.ascii.eqlIgnoreCase(rec.account, key.asSlice())) return error.Forbidden;
+
+        // Encode the new label (base64url, delimiter-safe) and re-encode the
+        // record, preserving every other field. `encodeRecord` copies rec's
+        // borrowed fields into `rec_buf` BEFORE the put, so the borrow into the
+        // store value never dangles across the write (matches webauthnUpdateSignCount).
+        var label_b64_buf: [webauthn_creds.max_label_b64]u8 = undefined;
+        const label_b64 = std.base64.url_safe_no_pad.Encoder.encode(label_b64_buf[0..std.base64.url_safe_no_pad.Encoder.calcSize(label.len)], label);
+        var rec_buf: [webauthn_creds.record_value_max]u8 = undefined;
+        const record = webauthn_creds.encodeRecord(rec.account, rec.sign_count, rec.created_unix, label_b64, rec.cose_key_b64, &rec_buf) catch
+            return error.BufferTooSmall;
+        try self.store.family(.props).put(cred_key, record);
+    }
+
     /// List the passkeys bound to `account` into `out`, returning the populated
     /// prefix. Silently skips any list entry whose record is missing/corrupt.
     pub fn webauthnList(self: *Services, account: []const u8, out: []WebauthnListEntry) ServiceError![]const WebauthnListEntry {
@@ -3714,6 +3744,33 @@ test "webauthn bind/lookup/list/delete round-trip" {
     try std.testing.expectError(error.NotFound, services.webauthnLookup("credAAA", &cred));
     const empty = try services.webauthnList("alice", entries[0..]);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "webauthn rename relabels, preserves fields, and enforces ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-webauthn-rename.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01 };
+    try services.webauthnBind("alice", "credAAA", &cose, 5, "phone", 1_700_000_000);
+
+    // Rename preserves sign_count, created_unix, and the COSE key verbatim.
+    try services.webauthnRename("alice", "credAAA", "work-laptop");
+    var cred: Services.WebauthnCredential = .{};
+    try services.webauthnLookup("credAAA", &cred);
+    try std.testing.expectEqualStrings("work-laptop", cred.label());
+    try std.testing.expectEqual(@as(u32, 5), cred.sign_count);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), cred.created_unix);
+    try std.testing.expectEqualSlices(u8, &cose, cred.coseKey());
+
+    // An unbound id is NotFound; a foreign owner is Forbidden (no relabel).
+    try std.testing.expectError(error.NotFound, services.webauthnRename("alice", "credZZZ", "ghost"));
+    try services.webauthnBind("bob", "credBBB", &cose, 0, "bob-key", 1_700_000_100);
+    try std.testing.expectError(error.Forbidden, services.webauthnRename("alice", "credBBB", "steal"));
+    try services.webauthnLookup("credBBB", &cred);
+    try std.testing.expectEqualStrings("bob-key", cred.label());
 }
 
 // FIX 2 premise: AUTH-FINISH logs in via `finishLogin(cred.account())`, not the

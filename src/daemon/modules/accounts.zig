@@ -143,7 +143,7 @@ pub const CS_spec = registry.CommandSpec{ .name = "CS", .feature = accounts_feat
 pub const SESSION_spec = registry.CommandSpec{ .name = "SESSION", .feature = accounts_feature, .handler = session };
 pub const SESSIONTOKEN_spec = registry.CommandSpec{ .name = "SESSIONTOKEN", .feature = accounts_feature, .handler = sessionToken };
 pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = accounts_feature, .handler = certAdd };
-pub const WEBAUTHN_spec = registry.CommandSpec{ .name = "WEBAUTHN", .min_params = 1, .feature = accounts_feature, .handler = webauthn, .summary = "manage passkeys / passwordless login (REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS)" };
+pub const WEBAUTHN_spec = registry.CommandSpec{ .name = "WEBAUTHN", .min_params = 1, .feature = accounts_feature, .handler = webauthn, .summary = "manage passkeys / passwordless login (REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS)" };
 pub const KEYTRANS_spec = registry.CommandSpec{ .name = "KEYTRANS", .feature = accounts_feature, .handler = keytrans, .summary = "inspect account credential transparency roots and inclusion proofs" };
 pub const E2EEKEY_spec = registry.CommandSpec{ .name = "E2EEKEY", .feature = accounts_feature, .handler = e2eeKey, .summary = "manage public E2EE device keys (ADD|LIST|DEL|STATUS)" };
 pub const IDENTITY_spec = registry.CommandSpec{ .name = "IDENTITY", .feature = accounts_feature, .handler = identity, .summary = "manage portable account identity keys (ADD|LIST|DEL|STATUS|VERIFY)" };

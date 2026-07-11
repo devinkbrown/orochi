@@ -24331,12 +24331,25 @@ pub const LinuxServer = struct {
         };
     }
 
-    /// Emit a WEBAUTHN service reply as a server NOTICE. `body` is a
-    /// preformatted, CRLF-free payload.
+    /// Emit a WEBAUTHN service reply as a caller-targeted Event Spine line:
+    /// `:<server> EVENT <caller-nick> WEBAUTHN <body>`. `body` is a preformatted,
+    /// CRLF-free `<SUBTYPE> <args>` payload. This mirrors the MEDIA EVENT plane
+    /// (`sendMediaEventReply`) — the result is targeted to the requesting
+    /// connection, never published to subscribers. The Event Spine renderer
+    /// validates every message byte (rejecting CR/LF/control), so a hostile
+    /// label can never smuggle a forged line; a render failure drops the reply,
+    /// fail-closed, exactly like the old NOTICE control-byte guard did.
     fn webauthnReply(self: *LinuxServer, conn: *ConnState, body: []const u8) !void {
-        var buf: [default_reply_bytes]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "WEBAUTHN {s}", .{body}) catch return;
-        try self.noticeTo(conn, text);
+        var msg_buf: [event_spine.max_event_line_len]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "WEBAUTHN {s}", .{body}) catch return;
+        var tag_buf: [128]u8 = undefined;
+        const tags = if (conn.session.hasCap(.message_tags))
+            event_spine.buildEventTags(&tag_buf, .service, .notice) catch ""
+        else
+            "";
+        var line_buf: [event_spine.max_event_line_len]u8 = undefined;
+        const line = event_spine.renderEventTagged(tags, self.serverName(), conn.session.displayName(), message, &line_buf) catch return;
+        try appendToConn(conn, line);
     }
 
     pub fn handleWebauthn(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -24346,7 +24359,7 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "WEBAUTHN", "NOT_CONFIGURED", "Passkey login is not configured on this network");
         const p = parsed.paramSlice();
         if (p.len == 0)
-            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS>");
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS>");
         const sub = p[0];
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS")) return self.webauthnStatus(conn, svc);
@@ -24356,7 +24369,8 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "AUTH-FINISH")) return self.webauthnAuthFinish(conn, svc, rp, p);
         if (std.ascii.eqlIgnoreCase(sub, "LIST")) return self.webauthnListCmd(conn, svc);
         if (std.ascii.eqlIgnoreCase(sub, "REMOVE")) return self.webauthnRemove(conn, svc, p);
-        return self.failReply(conn, "WEBAUTHN", "INVALID_SUBCOMMAND", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|STATUS>");
+        if (std.ascii.eqlIgnoreCase(sub, "RENAME")) return self.webauthnRename(conn, svc, p);
+        return self.failReply(conn, "WEBAUTHN", "INVALID_SUBCOMMAND", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS>");
     }
 
     /// Fill `out` with a fresh CSPRNG challenge. Returns false (fail-closed) when
@@ -24682,7 +24696,10 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "WEBAUTHN", "INTERNAL_ERROR", "Could not list passkeys");
         for (listed) |*e| {
             var b: [webauthn_creds_mod.max_cred_id_b64 + 128]u8 = undefined;
-            const body = std.fmt.bufPrint(&b, "CRED {s} {d} :{s}", .{ e.credId(), e.sign_count, e.label() }) catch continue;
+            // `CRED <credId> <sign_count> <created_unix> :<label>` — the 3rd
+            // numeric column is backward-compatible (older clients parse it as
+            // an optional field).
+            const body = std.fmt.bufPrint(&b, "CRED {s} {d} {d} :{s}", .{ e.credId(), e.sign_count, e.created_unix, e.label() }) catch continue;
             try self.webauthnReply(conn, body);
         }
         var eb: [64]u8 = undefined;
@@ -24706,6 +24723,32 @@ pub const LinuxServer = struct {
         };
         var b: [256]u8 = undefined;
         const body = std.fmt.bufPrint(&b, "REMOVED :{s}", .{target}) catch return;
+        try self.webauthnReply(conn, body);
+    }
+
+    /// `WEBAUTHN RENAME <cred_id> :<label>` — update the stored label of a
+    /// passkey the caller owns, keyed by credential id. Replies
+    /// `WEBAUTHN RENAMED <cred_id> :<label>` through the Event Spine.
+    fn webauthnRename(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, p: []const []const u8) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before renaming a passkey");
+        if (p.len < 3)
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN RENAME <cred_id> :<label>");
+        const cred_id = p[1];
+        const label = p[2];
+        if (label.len > webauthn_creds_mod.max_label_bytes)
+            return self.failReply(conn, "WEBAUTHN", "LABEL_TOO_LONG", "Passkey label is too long");
+        svc.webauthnRename(account, cred_id, label) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.Forbidden => "NOT_OWNED",
+                error.NotFound => "NOT_FOUND",
+                error.InvalidValue => "BAD_CREDENTIAL_ID",
+                else => "RENAME_FAILED",
+            };
+            return self.failReply(conn, "WEBAUTHN", code, "No matching passkey bound to your account");
+        };
+        var b: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "RENAMED {s} :{s}", .{ cred_id, label }) catch return;
         try self.webauthnReply(conn, body);
     }
 
@@ -33535,7 +33578,10 @@ test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regre
     rf_lv.params[3] = ad_b64;
     rf_lv.param_count = 4;
     try server.handleWebauthn(reg_conn, &rf_lv);
-    try expectContains(reg_conn.send_buf[0..reg_conn.send_len], "REGISTERED");
+    // The result rides the Event Spine (`:server EVENT kain WEBAUTHN …`), NOT a
+    // NOTICE — the onyx client consumes the WEBAUTHN EVENT plane.
+    try expectContains(reg_conn.send_buf[0..reg_conn.send_len], " EVENT kain WEBAUTHN REGISTERED");
+    try std.testing.expect(std.mem.indexOf(u8, reg_conn.send_buf[0..reg_conn.send_len], " NOTICE ") == null);
     // The credential is now durably bound to "kain".
     var cred: services_mod.Services.WebauthnCredential = .{};
     try services.webauthnLookup(cred_id_b64, &cred);
@@ -33620,6 +33666,91 @@ test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regre
     const wc_conn = try Ceremony.run(&server, "sasha", kp, cred_id_b64, rp_id, origin, 30, false, true);
     try std.testing.expect(wc_conn.session.account() == null);
     try expectContains(wc_conn.send_buf[0..wc_conn.send_len], "CHALLENGE_MISMATCH");
+}
+
+test "WEBAUTHN LIST/RENAME ride the EVENT plane; CRED carries created_unix; RENAME round-trips" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-event.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    // Bind a credential directly (the full ceremony is exercised elsewhere).
+    const kp = WaEc.KeyPair.generate(std.testing.io);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var cose: [77]u8 = undefined;
+    waBuildCoseEs256(sec1[1..33].*, sec1[33..65].*, &cose);
+    const cred_id_raw = "kain-passkey-01";
+    var cred_id_b64_buf: [base64url.encodedLen(cred_id_raw.len)]u8 = undefined;
+    const cred_id_b64 = try base64url.encode(&cred_id_b64_buf, cred_id_raw);
+    try services.webauthnBind("kain", cred_id_b64, &cose, 7, "phone", 1_700_000_000);
+
+    const rp_id = "chat.example";
+    const origins = [_][]const u8{"https://chat.example"};
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .webauthn_rp_id = rp_id,
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(cid).?;
+
+    // ── LIST: reply is an EVENT line (NOT a NOTICE) and carries created_unix ──
+    conn.send_len = 0;
+    var list_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    list_lv.params[0] = "LIST";
+    list_lv.param_count = 1;
+    try server.handleWebauthn(conn, &list_lv);
+    const list_out = conn.send_buf[0..conn.send_len];
+    var exp_buf: [256]u8 = undefined;
+    const exp_cred = try std.fmt.bufPrint(&exp_buf, " EVENT kain WEBAUTHN CRED {s} 7 1700000000 :phone", .{cred_id_b64});
+    try expectContains(list_out, exp_cred);
+    try expectContains(list_out, " EVENT kain WEBAUTHN LIST :end (1)");
+    try std.testing.expect(std.mem.indexOf(u8, list_out, " NOTICE ") == null);
+
+    // ── RENAME: relabels the passkey, replies via the EVENT plane, round-trips ──
+    conn.send_len = 0;
+    var ren_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    ren_lv.params[0] = "RENAME";
+    ren_lv.params[1] = cred_id_b64;
+    ren_lv.params[2] = "laptop";
+    ren_lv.param_count = 3;
+    try server.handleWebauthn(conn, &ren_lv);
+    const ren_out = conn.send_buf[0..conn.send_len];
+    var exp2_buf: [256]u8 = undefined;
+    const exp_ren = try std.fmt.bufPrint(&exp2_buf, " EVENT kain WEBAUTHN RENAMED {s} :laptop", .{cred_id_b64});
+    try expectContains(ren_out, exp_ren);
+    try std.testing.expect(std.mem.indexOf(u8, ren_out, " NOTICE ") == null);
+
+    // The new label is durable; sign_count + created_unix are preserved.
+    var cred: services_mod.Services.WebauthnCredential = .{};
+    try services.webauthnLookup(cred_id_b64, &cred);
+    try std.testing.expectEqualStrings("laptop", cred.label());
+    try std.testing.expectEqual(@as(u32, 7), cred.sign_count);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), cred.created_unix);
+
+    // ── RENAME of an unbound id → NOT_FOUND FAIL (still not a NOTICE) ──
+    conn.send_len = 0;
+    var missing_id_buf: [base64url.encodedLen("nope-nope-nope-01".len)]u8 = undefined;
+    const missing_id = try base64url.encode(&missing_id_buf, "nope-nope-nope-01");
+    var bad_lv = irc_line.LineView{ .raw = "", .command = "WEBAUTHN" };
+    bad_lv.params[0] = "RENAME";
+    bad_lv.params[1] = missing_id;
+    bad_lv.params[2] = "ghost";
+    bad_lv.param_count = 3;
+    try server.handleWebauthn(conn, &bad_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "NOT_FOUND");
 }
 
 test "WEBAUTHN malformed base64 rejected without panic" {
