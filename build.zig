@@ -452,15 +452,51 @@ pub fn build(b: *std.Build) void {
     const test_helix_verbose_step = b.step("test-helix-verbose", "Run focused Helix/upgrade tests with per-test progress output");
     test_helix_verbose_step.dependOn(&run_helix_tests_verbose.step);
 
+    // `yoroi` — the standalone Yoroi crypto toolkit CLI (openssl-parity verbs,
+    // every one a thin front-end over the src/crypto substrate). Declared like
+    // the daemon executable: its own root module importing "orochi".
+    const yoroi_exe = b.addExecutable(.{
+        .name = "yoroi",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli/yoroi_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .strip = strip_release,
+            .imports = &.{
+                .{ .name = "orochi", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(yoroi_exe);
+
+    const cli_tests = b.addTest(.{
+        .root_module = yoroi_exe.root_module,
+        .filters = test_filters,
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const test_cli_step = b.step("test-cli", "Run the yoroi CLI toolkit tests; accepts -Dtest-filter=<text>");
+    test_cli_step.dependOn(&run_cli_tests.step);
+    const cli_tests_verbose = b.addTest(.{
+        .root_module = yoroi_exe.root_module,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_cli_tests_verbose = b.addRunArtifact(cli_tests_verbose);
+    const test_cli_verbose_step = b.step("test-cli-verbose", "Run yoroi CLI tests with per-test progress output");
+    test_cli_verbose_step.dependOn(&run_cli_tests_verbose.step);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
     const test_verbose_step = b.step("test-verbose", "Run full tests with per-test progress output");
     test_verbose_step.dependOn(&run_mod_tests_verbose.step);
     test_verbose_step.dependOn(&run_exe_tests_verbose.step);
+    test_verbose_step.dependOn(&run_cli_tests_verbose.step);
 
     // `zig build wasm` — compile the KaguraVox/KaguraVis codecs to a freestanding
     // WASM module for the in-browser client (#11/#32). Pure-integer +
