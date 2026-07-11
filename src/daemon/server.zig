@@ -15883,6 +15883,9 @@ pub const LinuxServer = struct {
         // A `mesh`-scope ward propagates to every secured peer so already-running
         // nodes enforce it live. A `node`-scope ward stays local.
         if (scope == .mesh) self.broadcastMeshWard(ward, .add);
+        // Act on already-connected clients now — a ban must bite during a live
+        // raid, not only refuse the abuser's next reconnect.
+        self.reapWardMatches();
         const proof_id = self.recordOperAudit(conn.session.displayName(), audit_action, pattern, if (reason.len != 0) reason else "WARD ADD");
         var b: [default_reply_bytes]u8 = undefined;
         const note = if (proof_id) |pid|
@@ -18421,10 +18424,16 @@ pub const LinuxServer = struct {
     ///   * require_auth        → close unless authenticated to an account
     ///   * quarantine          → admitted but restricted (network silence / SHUN)
     /// Opers are never warded off. Returns true if the connection was closed.
-    fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
-        if (self.warden.count() == 0) return false;
-        if (conn.session.isOper()) return false;
-
+    /// The active Ward matching this connection's live identity facets, or null.
+    /// Builds the subject's facets (address / host / mask / account / realname /
+    /// certfp / GeoIP country+asn) exactly as the registration-time checkpoint
+    /// does, checks them against the registry on the WALL clock, and — on a miss —
+    /// re-checks the key-derived host/mask facets recomputed under the PREVIOUS
+    /// cloak key so bans survive a key rotation for a grace window. Shared by the
+    /// registration-time `enforceWard` and the live sweep `reapWardMatches`, so a
+    /// ward matches identically whether the subject is connecting now or already
+    /// connected. Pure read of session fields — safe under `world.lockWrite`.
+    fn wardMatch(self: *LinuxServer, conn: *ConnState) ?*const warden.Ward {
         var mask_buf: [256]u8 = undefined;
         const mask = clientPrefix(conn, &mask_buf) catch "";
         // GeoIP country + ASN facets (e.g. `WARD ADD country RU ...` /
@@ -18457,14 +18466,14 @@ pub const LinuxServer = struct {
         // against it would leave a wall-epoch expires_ms always in the "future"
         // → a temporary ward would never expire for new connections.
         const now_wall = platform.realtimeMillis();
-        const hit = self.warden.check(facets, now_wall) orelse blk: {
+        return self.warden.check(facets, now_wall) orelse blk: {
             // Rotatable cloak key: bans written against the PREVIOUS key's cloak
             // still reference old host/mask tokens. Re-check the host + mask facets
             // recomputed under the previous key so those bans survive a rotation
             // for a grace window. Only the key-derived facets differ; address /
             // account / country / asn / certfp / realname are key-independent.
             var prev_host_buf: [cloak.max_cloak_len]u8 = undefined;
-            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return false;
+            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return null;
             var prev_mask_buf: [256]u8 = undefined;
             const prev_mask = std.fmt.bufPrint(&prev_mask_buf, "{s}!{s}@{s}", .{
                 conn.session.displayName(),
@@ -18474,8 +18483,14 @@ pub const LinuxServer = struct {
             var alt = facets;
             alt.host = prev_host;
             alt.mask = prev_mask;
-            break :blk self.warden.check(alt, now_wall) orelse return false;
+            break :blk self.warden.check(alt, now_wall) orelse return null;
         };
+    }
+
+    fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
+        if (self.warden.count() == 0) return false;
+        if (conn.session.isOper()) return false;
+        const hit = self.wardMatch(conn) orelse return false;
 
         switch (hit.action) {
             .quarantine => {
@@ -18514,6 +18529,71 @@ pub const LinuxServer = struct {
         conn.closing = true;
         self.armSendIfNeeded(conn) catch {};
         return true;
+    }
+
+    /// Sweep every live, registered, non-oper client session against the active
+    /// Warden registry and apply the first matching ward's action IMMEDIATELY, so
+    /// a ward added locally (`addWardLive`) or propagated from the mesh
+    /// (`applyRemoteWard`) acts on already-connected abusers instead of only
+    /// refusing their next reconnect — a network ban must bite during a live raid,
+    /// not one reconnect later. Oper sessions and S2S links are exempt (opers are
+    /// never restricted; a link is not a subject). Matching reuses `wardMatch`, so
+    /// the sweep and the registration checkpoint agree exactly (facets + previous-
+    /// cloak-key fallback).
+    ///
+    /// Runs under `world.lockWrite` (both call sites — the WARD command dispatch
+    /// and the mesh-WARD drain — execute inside `onCompletion`, which holds it), so
+    /// the cross-reactor session reads are race-free and no other reactor mutates a
+    /// session concurrently. The close path (`reapClose` → `enqueueDeliveryThenClose`)
+    /// only marks the connection `closing` (local) or hands off through the fabric
+    /// (foreign); it NEVER frees a slot the way `closeConn` does, so applying it
+    /// inline while iterating `clients.slots` cannot invalidate the iteration.
+    fn reapWardMatches(self: *LinuxServer) void {
+        if (self.warden.count() == 0) return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                // S2S links share the slab but are not ban subjects.
+                if (conn.s2s != null or conn.s2s_secured != null) continue;
+                if (conn.closing) continue;
+                // Pre-registration clients present no facets yet — they face the
+                // ward at their own registration checkpoint (`enforceWard`).
+                if (!conn.session.registered()) continue;
+                if (conn.session.isOper()) continue; // opers are exempt
+                const hit = self.wardMatch(conn) orelse continue;
+                const id = slotClientId(reactor, i, slot.gen);
+                switch (hit.action) {
+                    // Restrict in place: no JOIN, no PRIVMSG/NOTICE (enforced at the
+                    // join/message gates via isRestricted). A plain field write, no
+                    // teardown — slot-safe.
+                    .quarantine => conn.session.setRestricted(true),
+                    // Authenticated subjects pass; everyone else is expelled.
+                    .require_auth => {
+                        if (conn.session.account() != null) continue;
+                        self.reapClose(conn, id, hit.reason);
+                    },
+                    .refuse, .expel => self.reapClose(conn, id, hit.reason),
+                }
+            }
+        }
+    }
+
+    /// Expel a live client matched by a newly-active ward, mirroring the
+    /// registration `closeWarded` wire shape
+    /// (`:server ERROR :Closing Link: <name> (Banned: <reason>)`). Routed through
+    /// `enqueueDeliveryThenClose` so it is correct for a client on THIS reactor
+    /// (append + arm + mark closing) AND one on ANOTHER shard (fabric handoff +
+    /// wake) — and, unlike `closeConn`, it defers teardown, so it never frees the
+    /// slot being iterated.
+    fn reapClose(self: *LinuxServer, conn: *ConnState, id: client_model.ClientId, reason: []const u8) void {
+        var eb: [640]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &eb,
+            ":{s} ERROR :Closing Link: {s} (Banned: {s})\r\n",
+            .{ protocol_inventory.currentServerName(), conn.session.displayName(), reason },
+        ) catch return;
+        self.enqueueDeliveryThenClose(id, line, "Banned (WARD)") catch {};
     }
 
     /// Connect-time DNS blocklist enforcement, run at registration. Returns true
@@ -22495,6 +22575,10 @@ pub const LinuxServer = struct {
             for (payloads) |p| self.allocator.free(p);
             self.allocator.free(payloads);
         }
+        // Coalesce the live sweep: a peer may burst several ward adds in one frame,
+        // and each reap is an O(clients) walk under the coarse world lock — do it
+        // ONCE after the whole batch applies rather than per add.
+        var need_reap = false;
         for (payloads) |p| {
             const wire = warden.decodeWire(p) catch {
                 // A malformed mesh-WARD frame from a (signature-)trusted peer is a
@@ -22503,14 +22587,20 @@ pub const LinuxServer = struct {
                 self.traceLog(.warn, .s2s, "dropped malformed mesh-WARD frame from peer");
                 continue;
             };
-            self.applyRemoteWard(wire);
+            if (self.applyRemoteWard(wire)) need_reap = true;
         }
+        if (need_reap) self.reapWardMatches();
     }
 
-    fn applyRemoteWard(self: *LinuxServer, wire: warden.WireWard) void {
+    /// Apply one decoded mesh-WARD record to the local registry. Returns true when
+    /// a successful `add` warrants a live sweep (`reapWardMatches`) so the caller
+    /// can coalesce the sweep across a batch; a `remove` or a failed add returns
+    /// false (nothing new to enforce).
+    fn applyRemoteWard(self: *LinuxServer, wire: warden.WireWard) bool {
         switch (wire.op) {
             .remove => {
                 _ = self.warden.remove(wire.match, wire.pattern);
+                return false;
             },
             .add => {
                 // Force mesh scope locally: the entry only reached us because the
@@ -22535,7 +22625,12 @@ pub const LinuxServer = struct {
                         .{ wire.match.token(), wire.pattern, @errorName(err) },
                     ) catch "failed to apply mesh-WARD from peer";
                     self.traceLog(.warn, .s2s, note);
+                    return false;
                 };
+                // A freshly-installed network ban must bite already-connected
+                // clients here immediately (not one reconnect later). Signal the
+                // caller to sweep; the sweep is coalesced across the drain batch.
+                return true;
             },
         }
     }
@@ -34609,7 +34704,7 @@ test "mesh WARD applies and removes via applyRemoteWard" {
         try std.testing.expectEqual(@as(usize, 0), server.warden.count());
 
         // A received mesh-WARD add is enforced locally as a mesh-scope ward.
-        server.applyRemoteWard(.{
+        _ = server.applyRemoteWard(.{
             .op = .add,
             .match = .mask,
             .pattern = "*!*@*.evil.example",
@@ -34625,7 +34720,7 @@ test "mesh WARD applies and removes via applyRemoteWard" {
         try std.testing.expectEqual(warden.Action.expel, hit.action);
 
         // A received mesh-WARD remove forgets it (only op/match/pattern load-bearing).
-        server.applyRemoteWard(.{
+        _ = server.applyRemoteWard(.{
             .op = .remove,
             .match = .mask,
             .pattern = "*!*@*.evil.example",
@@ -41987,6 +42082,145 @@ test "threaded server: local KILL disconnects the victim; unknown nick is 401" {
     o.reset();
     try writeAllFd(fd_o, "KILL ghost :x\r\n");
     try recvUntil(&o, " 401 O ghost ", 300);
+}
+
+test "threaded server: warden ward reaps a matching connected client (expel)" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    // Heap-allocate the live clients (bounded recvUntil reads into each).
+    const o = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(o);
+    const a = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(a);
+    const b = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(b);
+    o.* = .{ .fd = fd_o };
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(o, " 381 O ", 300); // elevated to oper
+    // Two ALREADY-CONNECTED non-opers distinguished by realname (GECOS): A matches
+    // the ward, B does not.
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :spammer\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :clean\r\n");
+    try recvUntil(b, " 001 B ", 200);
+
+    // The ward is added AFTER both are connected: it must expel A now, not merely
+    // refuse A's next reconnect. B (non-matching) is untouched.
+    try writeAllFd(fd_o, "WARD ADD realname spammer node expel 0 :raid\r\n");
+    try recvUntil(a, "ERROR :Closing Link: A (Banned: raid)", 300);
+
+    // B stays live: it still answers a PING and never saw a ban close.
+    try writeAllFd(fd_b, "PING :keep\r\n");
+    try recvUntil(b, "PONG", 300);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "Banned") == null);
+}
+
+test "threaded server: warden ward quarantines a connected client (restrict, no close)" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const o = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(o);
+    const a = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(a);
+    o.* = .{ .fd = fd_o };
+    a.* = .{ .fd = fd_a };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(o, " 381 O ", 300);
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :quarry\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    a.reset();
+
+    // The quarantine gate only fires for an EXISTING channel (creating a fresh one
+    // makes the client its founder), so the oper opens #x first.
+    try writeAllFd(fd_o, "JOIN #x\r\n");
+    try recvUntil(o, " 366 O #x ", 300);
+    o.reset();
+
+    // A quarantine ward restricts the live client in place (not closed). Sync on
+    // the oper-action event so the JOIN below is ordered strictly AFTER the reap
+    // (the reap runs inside the WARD ADD completion, before the event publishes).
+    try writeAllFd(fd_o, "WARD ADD realname quarry node quarantine 0 :restrict\r\n");
+    try recvUntil(o, "WARD ADD realname quarry node/quarantine", 300);
+
+    // The restricted client is still connected but may not JOIN the existing #x (474).
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(a, " 474 A #x ", 300);
+    try recvUntil(a, "quarantined", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "Banned") == null);
+}
+
+test "threaded server: warden ward does not reap a matching oper" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const o = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(o);
+    o.* = .{ .fd = fd_o };
+
+    try saslAdminPrelude(fd_o);
+    // The oper's own realname matches the ward it is about to add — the reap must
+    // NOT expel it, because opers are exempt.
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :operraid\r\n");
+    try recvUntil(o, " 381 O ", 300);
+
+    try writeAllFd(fd_o, "WARD ADD realname operraid node expel 0 :self\r\n");
+    // The oper-action event is only delivered if the oper survived the reap (a
+    // closing connection drops queued delivery); its arrival proves O was exempt.
+    try recvUntil(o, "WARD ADD realname operraid node/expel", 300);
+    // And O is fully live: it still answers a PING and never saw a ban close.
+    try writeAllFd(fd_o, "PING :alive\r\n");
+    try recvUntil(o, "PONG", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "Banned") == null);
 }
 
 test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
