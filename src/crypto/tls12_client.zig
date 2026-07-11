@@ -32,6 +32,9 @@ const sig_rsa_pkcs1_sha384: u16 = 0x0501;
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
 
+/// RFC 7627 extended_master_secret extension type (always empty).
+const ext_extended_master_secret: u16 = 0x0017;
+
 /// RFC 8446 §4.1.3 downgrade-protection sentinels ("DOWNGRD" + a version tag). A
 /// TLS-1.3-capable server that is forced to negotiate a lower version stamps the
 /// last 8 bytes of ServerHello.random with one of these, letting a client that
@@ -64,6 +67,7 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     CertificateNameMismatch,
     DowngradeDetected,
     EmptyCertificateChain,
+    EmsRequired,
     FinishedMismatch,
     NeedMore,
     NoServerCertificate,
@@ -82,6 +86,12 @@ pub const Options = struct {
     trust_anchors: []const []const u8,
     alpn_protocols: []const []const u8 = &.{},
     now_unix_seconds: ?i64 = null,
+    /// RFC 7627 Extended Master Secret policy. REQUIRED by default in this
+    /// hardened profile: the ClientHello always offers the extension, and a
+    /// ServerHello that fails to echo it aborts with `EmsRequired` — no silent
+    /// fallback to the classic (Triple-Handshake-exposed) derivation. Set false
+    /// only for legacy interop; EMS is still used whenever the server echoes it.
+    require_extended_master_secret: bool = true,
 };
 
 pub const FeedResult = union(enum) {
@@ -148,6 +158,18 @@ pub const Client = struct {
     leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
     leaf_rsa_e: [16]u8 = undefined,
 
+    /// RFC 7627 policy copied from `Options.require_extended_master_secret`.
+    require_ems: bool = true,
+    /// The ServerHello echoed the extended_master_secret extension; the master
+    /// secret derives from the session hash (RFC 7627) instead of the randoms.
+    ems_negotiated: bool = false,
+    /// ECDHE pre-master secret held between ServerKeyExchange and the client
+    /// flight: EMS needs the session hash to include ClientKeyExchange, so the
+    /// master-secret derivation is deferred until the CKE joins the transcript
+    /// (see `buildClientFlight`). Wiped immediately after derivation.
+    pre_master_secret: [32]u8 = @splat(0),
+    has_pre_master_secret: bool = false,
+
     master_secret: [tls12.master_secret_len]u8 = @splat(0),
     keys: tls12.KeyMaterial = .{},
     app_read_seq: u64 = 0,
@@ -187,6 +209,9 @@ pub const Client = struct {
     force_aes128_only_for_test: bool = false,
     force_aes256_only_for_test: bool = false,
     skip_cert_verify_for_test: bool = false,
+    /// Test-only: omit the extended_master_secret extension from the
+    /// ClientHello, emulating a legacy non-EMS client.
+    omit_ems_for_test: bool = false,
 
     // ---- mTLS client auth ----
     /// True once the server's CertificateRequest is seen; the full-handshake
@@ -208,6 +233,7 @@ pub const Client = struct {
             .trust_anchors = options.trust_anchors,
             .alpn_protocols = options.alpn_protocols,
             .now_unix_seconds = options.now_unix_seconds,
+            .require_ems = options.require_extended_master_secret,
             .key_pair = try ecdh_p256.generate(),
             .client_random = random,
         };
@@ -221,6 +247,7 @@ pub const Client = struct {
         self.recv_buf.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         std.crypto.secureZero(u8, &self.key_pair.secret);
+        std.crypto.secureZero(u8, &self.pre_master_secret);
         std.crypto.secureZero(u8, &self.master_secret);
         std.crypto.secureZero(u8, &self.resume_master_secret);
         self.keys.wipe();
@@ -503,6 +530,16 @@ pub const Client = struct {
         try writeEcPointFormatsExtension(self.allocator, &exts);
         try writeSignatureAlgorithmsExtension(self.allocator, &exts);
         try writeSupportedVersionsExtension(self.allocator, &exts);
+        // RFC 7627: always offer the (empty) extended_master_secret extension;
+        // whether a non-echoing server aborts is governed by `require_ems`.
+        if (!self.omit_ems_for_test) {
+            try writeExtension(self.allocator, &exts, ext_extended_master_secret, "");
+        }
+        // RFC 5746: signal secure-renegotiation support with an EMPTY
+        // renegotiated_connection (one zero length byte) on the initial
+        // handshake. This engine never renegotiates; the signal lets strict
+        // servers bind the session and lets us validate the server's echo.
+        try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
         try self.writeAlpnExtension(&exts);
         try writeRecordSizeLimitExtension(self.allocator, &exts);
         try self.writeSessionTicketExtension(&exts);
@@ -591,6 +628,11 @@ pub const Client = struct {
     /// fresh server_random the server just sent.
     fn beginResumedHandshake(self: *Client) Error!void {
         const suite = self.selected_suite orelse return error.BadState;
+        // RFC 7627 §5.3: this client only stores sessions that negotiated EMS
+        // (see captureNewSessionTicket), so the abbreviated ServerHello MUST
+        // echo the extension; a server resuming our EMS session without it is
+        // a downgrade splice and the handshake aborts.
+        if (!self.ems_negotiated) return error.EmsRequired;
         // The server must resume the same suite the ticket was issued under.
         if (self.resume_suite) |rs| {
             if (rs != suite) return error.UnsupportedCipherSuite;
@@ -608,6 +650,10 @@ pub const Client = struct {
         const ticket = try c.take(try c.readU16());
         try c.expectEmpty();
         if (ticket.len == 0) return; // a server may send an empty placeholder.
+        // RFC 7627 §5.3: only EMS sessions are resumable — never store a ticket
+        // from a non-EMS session (possible only with require_ems loosened), so a
+        // later resume can insist on the EMS echo (see beginResumedHandshake).
+        if (!self.ems_negotiated) return;
         const suite = self.selected_suite orelse return error.BadState;
         const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
             .suite = @intFromEnum(suite),
@@ -641,6 +687,14 @@ pub const Client = struct {
             try self.parseServerExtensions(ext_bytes);
         }
         try c.expectEmpty();
+
+        // RFC 7627: we offered EMS unconditionally (test hook aside); a hardened
+        // client refuses a server that will not commit to the session-hash
+        // derivation. Fires whether the echo was absent or there were no
+        // extensions at all.
+        if (self.require_ems and !self.omit_ems_for_test and !self.ems_negotiated) {
+            return error.EmsRequired;
+        }
     }
 
     fn parseServerExtensions(self: *Client, bytes: []const u8) Error!void {
@@ -649,35 +703,62 @@ pub const Client = struct {
             const typ = try c.readU16();
             const len = try c.readU16();
             const body = try c.take(len);
-            if (typ == 0x0010) {
-                var a = Cursor.init(body);
-                const list = try a.take(try a.readU16());
-                var l = Cursor.init(list);
-                const proto = try l.take(try l.readU8());
-                try l.expectEmpty();
-                try a.expectEmpty();
-                const copy = try self.allocator.dupe(u8, proto);
-                errdefer self.allocator.free(copy);
-                if (self.selected_alpn) |old| self.allocator.free(old);
-                self.selected_alpn = copy;
-            } else if (typ == ext_session_ticket) {
-                // RFC 5077: an (empty) SessionTicket extension in ServerHello
-                // means the server will issue a NewSessionTicket. It is sent BOTH
-                // when resuming AND when issuing a fresh ticket on a full
-                // handshake, so it does NOT by itself imply the abbreviated path
-                // — that is decided by whether a Certificate follows.
-                if (body.len != 0) return error.BadHandshake;
-                self.server_signaled_ticket = true;
-            } else if (typ == 0x001c) {
-                // RFC 8449 record_size_limit: a 2-byte value in [64, 2^14+1];
-                // anything else is illegal_parameter. Store it so our outbound
-                // records honor the server's limit.
-                if (body.len != 2) return error.BadHandshake;
-                const limit = std.mem.readInt(u16, body[0..2], .big);
-                if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
-                self.peer_record_size_limit = limit;
-            } else if (typ == 0x002b) {
-                return error.ProtocolVersion; // supported_versions would select TLS 1.3.
+            switch (typ) {
+                0x0010 => {
+                    var a = Cursor.init(body);
+                    const list = try a.take(try a.readU16());
+                    var l = Cursor.init(list);
+                    const proto = try l.take(try l.readU8());
+                    try l.expectEmpty();
+                    try a.expectEmpty();
+                    const copy = try self.allocator.dupe(u8, proto);
+                    errdefer self.allocator.free(copy);
+                    if (self.selected_alpn) |old| self.allocator.free(old);
+                    self.selected_alpn = copy;
+                },
+                ext_session_ticket => {
+                    // RFC 5077: an (empty) SessionTicket extension in ServerHello
+                    // means the server will issue a NewSessionTicket. It is sent BOTH
+                    // when resuming AND when issuing a fresh ticket on a full
+                    // handshake, so it does NOT by itself imply the abbreviated path
+                    // — that is decided by whether a Certificate follows.
+                    if (body.len != 0) return error.BadHandshake;
+                    self.server_signaled_ticket = true;
+                },
+                ext_extended_master_secret => {
+                    // RFC 7627: always empty; the echo commits both sides to the
+                    // session-hash master-secret derivation.
+                    if (body.len != 0) return error.BadHandshake;
+                    self.ems_negotiated = true;
+                },
+                0xff01 => {
+                    // RFC 5746 §3.4: on the initial handshake the server's
+                    // renegotiated_connection MUST be empty; anything else means
+                    // a renegotiation splice and the client must abort.
+                    if (body.len != 1 or body[0] != 0) return error.BadHandshake;
+                },
+                0x001c => {
+                    // RFC 8449 record_size_limit: a 2-byte value in [64, 2^14+1];
+                    // anything else is illegal_parameter. Store it so our outbound
+                    // records honor the server's limit.
+                    if (body.len != 2) return error.BadHandshake;
+                    const limit = std.mem.readInt(u16, body[0..2], .big);
+                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                    self.peer_record_size_limit = limit;
+                },
+                0x002b => return error.ProtocolVersion, // supported_versions would select TLS 1.3.
+                // Harmless acknowledgements of extensions we offered: an empty
+                // server_name ack (RFC 6066 §3) and ec_point_formats (RFC 8422 —
+                // servers commonly echo it; the list must be well-formed and
+                // include uncompressed(0), the only format we ever emit/parse).
+                0x0000 => if (body.len != 0) return error.BadHandshake,
+                0x000b => {
+                    if (body.len < 2 or body[0] != body.len - 1) return error.BadHandshake;
+                    if (std.mem.indexOfScalar(u8, body[1..], 0) == null) return error.BadHandshake;
+                },
+                // RFC 5246 §7.4.1.4: a server MUST NOT send an extension the
+                // client did not offer — fail closed on anything unsolicited.
+                else => return error.BadHandshake,
             }
         }
     }
@@ -721,9 +802,13 @@ pub const Client = struct {
 
         var server_pub: [ecdh_p256.public_length]u8 = undefined;
         @memcpy(&server_pub, point);
-        const shared = try ecdh_p256.sharedSecret(self.key_pair.secret, server_pub);
-        self.master_secret = try tls12.deriveMasterSecret(self.selected_suite orelse return error.BadState, &shared, &self.client_random, &self.server_random);
-        self.keys = try tls12.deriveKeyMaterial(self.selected_suite orelse return error.BadState, &self.master_secret, &self.client_random, &self.server_random);
+        // RFC 7627: the (extended) master secret needs the session hash, which
+        // covers the transcript THROUGH ClientKeyExchange — a message not built
+        // yet. Hold only the pre-master secret here; `buildClientFlight` derives
+        // the master secret and traffic keys right after the CKE joins the
+        // transcript, then wipes this copy.
+        self.pre_master_secret = try ecdh_p256.sharedSecret(self.key_pair.secret, server_pub);
+        self.has_pre_master_secret = true;
 
         var signed: std.ArrayList(u8) = .empty;
         defer signed.deinit(self.allocator);
@@ -760,6 +845,22 @@ pub const Client = struct {
         const cke_rec = try tls12.writePlainRecord(self.allocator, .handshake, cke.items);
         defer self.allocator.free(cke_rec);
         try out.appendSlice(self.allocator, cke_rec);
+
+        // Derive the master secret now that the transcript ends at the
+        // ClientKeyExchange (the exact RFC 7627 session-hash coverage; the
+        // CertificateVerify below is correctly excluded), then wipe the
+        // pre-master secret.
+        if (!self.has_pre_master_secret) return error.BadState;
+        if (self.ems_negotiated) {
+            var hash_buf: [tls12.max_hash_len]u8 = undefined;
+            const session_hash = tls12.transcriptHash(suite.hashAlg(), self.transcript.items, &hash_buf);
+            self.master_secret = try tls12.deriveExtendedMasterSecret(suite, &self.pre_master_secret, session_hash);
+        } else {
+            self.master_secret = try tls12.deriveMasterSecret(suite, &self.pre_master_secret, &self.client_random, &self.server_random);
+        }
+        self.keys = try tls12.deriveKeyMaterial(suite, &self.master_secret, &self.client_random, &self.server_random);
+        std.crypto.secureZero(u8, &self.pre_master_secret);
+        self.has_pre_master_secret = false;
 
         if (self.cert_requested and self.client_cert_der != null) {
             const cv_msg = try self.buildClientCertificateVerify();
@@ -1235,6 +1336,70 @@ test "tls12 client downgrade sentinel (RFC 8446 4.1.3): inert for a 1.2-only cli
     try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls12_sentinel));
     try testing.expectError(error.DowngradeDetected, checkDowngradeSentinel(true, &with_tls11_sentinel));
     try checkDowngradeSentinel(true, &normal_random);
+}
+
+test "tls12 EMS required: client aborts when the ServerHello does not echo the extension" {
+    const allocator = std.testing.allocator;
+    const anchors = [_][]const u8{};
+    var client = try Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+
+    // Synthetic ServerHello body: 1.2, random, empty session_id, ECDHE-ECDSA
+    // AES-128-GCM, null compression, and ONLY a renegotiation_info extension —
+    // no extended_master_secret echo.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, tls12.tls_version);
+    const rnd: [32]u8 = @splat(0x42);
+    try body.appendSlice(allocator, &rnd);
+    try body.append(allocator, 0);
+    try appendU16(allocator, &body, 0xc02b);
+    try body.append(allocator, 0);
+    try appendU16(allocator, &body, 5); // extensions length
+    try body.appendSlice(allocator, &.{ 0xff, 0x01, 0x00, 0x01, 0x00 });
+    try std.testing.expectError(error.EmsRequired, client.parseServerHello(body.items));
+
+    // A ServerHello with NO extensions block at all is refused the same way.
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(allocator);
+    try appendU16(allocator, &bare, tls12.tls_version);
+    try bare.appendSlice(allocator, &rnd);
+    try bare.append(allocator, 0);
+    try appendU16(allocator, &bare, 0xc02b);
+    try bare.append(allocator, 0);
+    var client2 = try Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client2.deinit();
+    try std.testing.expectError(error.EmsRequired, client2.parseServerHello(bare.items));
+}
+
+test "tls12 client fails closed on hostile ServerHello extensions" {
+    const allocator = std.testing.allocator;
+    const anchors = [_][]const u8{};
+    var client = try Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+
+    // A non-empty extended_master_secret body is malformed (RFC 7627: always empty).
+    const bad_ems = [_]u8{ 0x00, 0x17, 0x00, 0x01, 0x00 };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&bad_ems));
+
+    // A non-empty renegotiated_connection on the initial handshake is a splice
+    // (RFC 5746 §3.4) and must abort.
+    const bad_reneg = [_]u8{ 0xff, 0x01, 0x00, 0x02, 0x01, 0xaa };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&bad_reneg));
+
+    // An unsolicited extension (heartbeat, 0x000f) is refused outright
+    // (RFC 5246 §7.4.1.4: servers may only echo what was offered).
+    const unsolicited = [_]u8{ 0x00, 0x0f, 0x00, 0x01, 0x01 };
+    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&unsolicited));
+
+    // The well-formed hardened echo set is accepted.
+    const ok = [_]u8{
+        0xff, 0x01, 0x00, 0x01, 0x00, // renegotiation_info: empty marker
+        0x00, 0x17, 0x00, 0x00, // extended_master_secret
+        0x00, 0x0b, 0x00, 0x02, 0x01, 0x00, // ec_point_formats (echo)
+    };
+    try client.parseServerExtensions(&ok);
+    try std.testing.expect(client.ems_negotiated);
 }
 
 test "TLS 1.2 client rejects an out-of-range server record_size_limit (RFC 8449)" {

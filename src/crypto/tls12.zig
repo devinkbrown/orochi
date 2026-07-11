@@ -294,6 +294,21 @@ pub fn deriveMasterSecret(
     return out;
 }
 
+/// RFC 7627 extended master secret:
+///   master_secret = PRF(pre_master_secret, "extended master secret", session_hash)
+/// where session_hash = Hash(ClientHello .. ClientKeyExchange inclusive) under
+/// the suite's PRF hash. Binds the master secret to the full handshake log,
+/// closing the Triple-Handshake master-secret-synchronization class.
+pub fn deriveExtendedMasterSecret(
+    suite: CipherSuite,
+    pre_master_secret: []const u8,
+    session_hash: []const u8,
+) Error![master_secret_len]u8 {
+    var out: [master_secret_len]u8 = undefined;
+    try prf(suite.hashAlg(), pre_master_secret, "extended master secret", session_hash, &out);
+    return out;
+}
+
 pub fn deriveKeyMaterial(
     suite: CipherSuite,
     master_secret: *const [master_secret_len]u8,
@@ -565,6 +580,39 @@ test "TLS 1.2 SHA-256 PRF RFC vector" {
     var out: [expected.len]u8 = undefined;
     try prf(.sha256, &secret, "test label", &seed, &out);
     try std.testing.expectEqualSlices(u8, &expected, &out);
+}
+
+test "tls12 EMS derivation matches an independent P_hash implementation (RFC 7627 KAT)" {
+    // Expected values computed with an INDEPENDENT P_SHA256/P_SHA384
+    // implementation (Python stdlib hmac/hashlib), not this module's PRF:
+    //   master = P_hash(pms, "extended master secret" || session_hash)[0..48].
+    // The PRF primitive itself is separately pinned by the RFC 5246 vector above.
+    var pms: [32]u8 = undefined;
+    for (&pms, 0..) |*b, i| b.* = @intCast(i + 1); // 0x01..0x20
+
+    // SHA-256 suite (session_hash is 32 bytes).
+    var sh256: [32]u8 = undefined;
+    for (&sh256, 0..) |*b, i| b.* = @intCast(0xa0 + (i % 16));
+    const expected256 = [_]u8{
+        0x68, 0x42, 0xac, 0x6b, 0x95, 0x5c, 0x45, 0xaa, 0xe1, 0x57, 0x39, 0x4d,
+        0xac, 0xb1, 0xab, 0x79, 0xfd, 0x69, 0x83, 0xf7, 0x9b, 0x71, 0x69, 0x0d,
+        0x20, 0x2c, 0x76, 0xcc, 0x64, 0xf4, 0xbf, 0x7e, 0x4b, 0x53, 0xaf, 0x11,
+        0xca, 0x30, 0xdb, 0x95, 0xa0, 0xcb, 0xd4, 0x72, 0x7d, 0xdb, 0xd1, 0x22,
+    };
+    const got256 = try deriveExtendedMasterSecret(.tls_ecdhe_ecdsa_with_aes_128_gcm_sha256, &pms, &sh256);
+    try std.testing.expectEqualSlices(u8, &expected256, &got256);
+
+    // SHA-384 suite (session_hash is 48 bytes).
+    var sh384: [48]u8 = undefined;
+    for (&sh384, 0..) |*b, i| b.* = @intCast(0xb0 ^ (i & 0xff));
+    const expected384 = [_]u8{
+        0x01, 0x17, 0xd1, 0x2e, 0xdd, 0xfc, 0x3c, 0x83, 0x9d, 0x4f, 0xf3, 0xca,
+        0x0e, 0x66, 0x09, 0x4d, 0x57, 0x7e, 0xb9, 0x54, 0x77, 0x33, 0xb3, 0x46,
+        0xec, 0xb3, 0x74, 0xed, 0x92, 0x97, 0x9f, 0xbb, 0xfe, 0xa4, 0x7e, 0x3e,
+        0xf0, 0xb0, 0x80, 0xfa, 0xf0, 0x92, 0x48, 0xce, 0x61, 0xbb, 0xa0, 0x7a,
+    };
+    const got384 = try deriveExtendedMasterSecret(.tls_ecdhe_ecdsa_with_aes_256_gcm_sha384, &pms, &sh384);
+    try std.testing.expectEqualSlices(u8, &expected384, &got384);
 }
 
 test "TLS 1.2 AEAD record round trips GCM and ChaCha" {

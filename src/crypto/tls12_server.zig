@@ -34,6 +34,20 @@ const sig_rsa_pkcs1_sha256: u16 = 0x0401;
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
 
+/// RFC 7627 extended_master_secret extension type (always empty).
+const ext_extended_master_secret: u16 = 0x0017;
+
+/// RFC 7507 TLS_FALLBACK_SCSV pseudo cipher-suite value.
+const suite_fallback_scsv: u16 = 0x5600;
+
+/// Domain tag stamped into the first 4 bytes of the AEAD-sealed ticket_nonce of
+/// every TLS 1.2 ticket this server issues. Tickets are only ever minted for
+/// EMS-negotiated sessions (see `issuingTicket`), so on resume the tag proves —
+/// under the ticket AEAD, unforgeably — that the original session used the
+/// extended master secret (RFC 7627 §5.3). Tickets sealed by older builds lack
+/// the tag and silently fall back to a full handshake.
+const tls12_ems_ticket_tag = [4]u8{ 'E', 'M', '1', '2' };
+
 /// RFC 8446 §4.1.3 downgrade-protection sentinel ("DOWNGRD" + 0x01). A server
 /// that supports TLS 1.3 but negotiates TLS 1.2 MUST stamp the last 8 bytes of
 /// ServerHello.random with this value. This daemon ALWAYS supports TLS 1.3 (the
@@ -48,7 +62,9 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     Allocator.Error || error{
     BadHandshake,
     BadState,
+    EmsRequired,
     FinishedMismatch,
+    InappropriateFallback,
     NoCertificate,
     NoSigningKey,
     ProtocolVersion,
@@ -76,6 +92,15 @@ pub const Config = struct {
     /// `clientCertDer()` stays null. Only rsa_pkcs1_sha256 and
     /// ecdsa_secp256r1_sha256 client signatures are accepted (RFC 5246 §7.4.8).
     request_client_cert: bool = false,
+
+    /// RFC 7627 Extended Master Secret policy. REQUIRED by default in this
+    /// hardened profile: a ClientHello that does not offer the
+    /// extended_master_secret extension aborts with `EmsRequired` — there is no
+    /// silent fallback to the classic (Triple-Handshake-exposed) derivation.
+    /// Set false only for legacy interop; even then EMS is negotiated and used
+    /// whenever the client offers it, and session tickets are issued/resumed
+    /// ONLY for EMS sessions (RFC 7627 §5.3).
+    require_extended_master_secret: bool = true,
 
     // ---- RFC 5077 stateless session resumption (opt-in) ----
     //
@@ -166,6 +191,12 @@ pub const Server = struct {
     session_id_len: usize = 0,
     /// The client offered status_request (wants an OCSP staple).
     client_requested_ocsp: bool = false,
+    /// The client offered the RFC 7627 extended_master_secret extension.
+    client_offered_ems: bool = false,
+    /// EMS was negotiated: the ServerHello echoes the (empty) extension and the
+    /// master secret is derived from the session hash instead of the randoms.
+    /// Always equal to `client_offered_ems` — the server never declines EMS.
+    ems_negotiated: bool = false,
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
     /// RFC 8449 record_size_limit advertised by the client: the max
@@ -347,8 +378,11 @@ pub const Server = struct {
                     var off: usize = 0;
                     const msg = try parseHandshake(rec.fragment, &off);
                     if (off != rec.fragment.len or msg.typ != .client_key_exchange) return error.BadHandshake;
-                    try self.parseClientKeyExchange(msg.body);
+                    // RFC 7627: the session hash covers ClientHello THROUGH
+                    // ClientKeyExchange inclusive, so the CKE must be in the
+                    // transcript BEFORE the master secret is derived.
                     try self.transcript.appendSlice(self.allocator, msg.raw);
+                    try self.parseClientKeyExchange(msg.body);
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     // A presented client cert must prove key possession via
                     // CertificateVerify before CCS; a declined cert skips it.
@@ -521,7 +555,13 @@ pub const Server = struct {
         var selected: ?tls12.CipherSuite = null;
         var s = Cursor.init(suites_bytes);
         while (s.remaining() != 0) {
-            const suite = tls12.CipherSuite.fromWire(try s.readU16()) catch continue;
+            const wire = try s.readU16();
+            // RFC 7507: TLS_FALLBACK_SCSV in a 1.2 ClientHello signals a client
+            // that downgraded from a higher offer. This daemon always supports
+            // TLS 1.3 (the 1.2 engine is a fallback), so the fallback is
+            // inappropriate and MUST abort with inappropriate_fallback.
+            if (wire == suite_fallback_scsv) return error.InappropriateFallback;
+            const suite = tls12.CipherSuite.fromWire(wire) catch continue;
             if (!suiteMatchesAuth(suite, auth)) continue;
             if (selected == null) selected = suite;
         }
@@ -533,6 +573,15 @@ pub const Server = struct {
             try self.parseClientExtensions(exts);
         }
         try c.expectEmpty();
+
+        // RFC 7627: the hardened profile requires the extended master secret;
+        // this fires whether the extension was absent from the list or the
+        // ClientHello carried no extensions block at all. When the operator
+        // loosened the requirement, EMS is still used whenever offered.
+        if (self.config.require_extended_master_secret and !self.client_offered_ems) {
+            return error.EmsRequired;
+        }
+        self.ems_negotiated = self.client_offered_ems;
     }
 
     fn parseClientExtensions(self: *Server, bytes: []const u8) Error!void {
@@ -553,6 +602,18 @@ pub const Server = struct {
                 },
                 0x0010 => try self.selectAlpn(body),
                 0x0005 => self.client_requested_ocsp = true, // status_request (OCSP)
+                ext_extended_master_secret => {
+                    // RFC 7627: the extension is always empty.
+                    if (body.len != 0) return error.BadHandshake;
+                    self.client_offered_ems = true;
+                },
+                0xff01 => {
+                    // RFC 5746 §3.6: on the initial handshake the client's
+                    // renegotiated_connection MUST be empty (one zero length
+                    // byte). Anything else is a renegotiation splice attempt —
+                    // and this engine never renegotiates at all.
+                    if (body.len != 1 or body[0] != 0) return error.BadHandshake;
+                },
                 0x001c => {
                     // RFC 8449 record_size_limit: a 2-byte value in [64, 2^14+1];
                     // anything else is illegal_parameter. Store it so our outbound
@@ -644,6 +705,10 @@ pub const Server = struct {
         // abort with "unsafe legacy renegotiation" if the server omits this, so
         // it must always be present even though we never renegotiate.
         try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
+        // RFC 7627: echo the (empty) extended_master_secret extension whenever
+        // the client offered it; the master secret then derives from the
+        // session hash (see parseClientKeyExchange).
+        if (self.ems_negotiated) try writeExtension(self.allocator, &exts, ext_extended_master_secret, "");
         if (self.selected_alpn) |proto| {
             var alpn_body: [3 + 255]u8 = undefined;
             std.mem.writeInt(u16, alpn_body[0..2], @intCast(1 + proto.len), .big);
@@ -822,9 +887,18 @@ pub const Server = struct {
         if (point.len != ecdh_p256.public_length) return error.UnsupportedGroup;
         var client_pub: [ecdh_p256.public_length]u8 = undefined;
         @memcpy(&client_pub, point);
-        const shared = try ecdh_p256.sharedSecret(self.key_pair.secret, client_pub);
+        var shared = try ecdh_p256.sharedSecret(self.key_pair.secret, client_pub);
+        defer std.crypto.secureZero(u8, &shared);
         const suite = self.selected_suite orelse return error.BadState;
-        self.master_secret = try tls12.deriveMasterSecret(suite, &shared, &self.client_random, &self.server_random);
+        if (self.ems_negotiated) {
+            // RFC 7627: session_hash over the transcript, which the caller has
+            // already extended with this ClientKeyExchange message.
+            var hash_buf: [tls12.max_hash_len]u8 = undefined;
+            const session_hash = tls12.transcriptHash(suite.hashAlg(), self.transcript.items, &hash_buf);
+            self.master_secret = try tls12.deriveExtendedMasterSecret(suite, &shared, session_hash);
+        } else {
+            self.master_secret = try tls12.deriveMasterSecret(suite, &shared, &self.client_random, &self.server_random);
+        }
         self.keys = try tls12.deriveKeyMaterial(suite, &self.master_secret, &self.client_random, &self.server_random);
     }
 
@@ -868,9 +942,13 @@ pub const Server = struct {
     /// SessionTicket support, and we are not on the abbreviated (resumed) path
     /// (a resumed connection already has the client's ticket).
     fn issuingTicket(self: *const Server) bool {
+        // RFC 7627 §5.3: only EMS sessions are resumable — a non-EMS session
+        // (possible only when the operator loosened require_extended_master_secret)
+        // never gets a ticket, so an EMS/non-EMS resumption mismatch cannot arise.
         return self.config.enable_session_tickets and
             self.config.ticket_key != null and
             self.client_offered_empty_ticket and
+            self.ems_negotiated and
             !self.resuming;
     }
 
@@ -885,6 +963,11 @@ pub const Server = struct {
         try osEntropy(&aead_nonce);
         var ticket_nonce: [tls_resumption.ticket_nonce_len]u8 = undefined;
         try osEntropy(&ticket_nonce);
+        // Stamp the AEAD-protected EMS domain tag (see tls12_ems_ticket_tag):
+        // tickets are only issued for EMS sessions, and tryResume requires the
+        // tag, so a pre-EMS-build (or foreign) ticket can never take the
+        // abbreviated path.
+        @memcpy(ticket_nonce[0..tls12_ems_ticket_tag.len], &tls12_ems_ticket_tag);
 
         const sealed = tls_resumption.sealTicket(
             self.allocator,
@@ -924,6 +1007,11 @@ pub const Server = struct {
         if (!self.config.enable_session_tickets) return false;
         const key = self.config.ticket_key orelse return false;
         const ticket = self.presented_ticket orelse return false;
+        // RFC 7627 §5.3: every resumable session used EMS, so the resuming
+        // ClientHello must offer it again or the server falls back to a full
+        // handshake (which itself enforces the require_extended_master_secret
+        // policy before this point).
+        if (!self.client_offered_ems) return false;
 
         const opened = tls_resumption.openTicketWithRotation(self.allocator, key, self.config.previous_ticket_key, ticket) catch return false;
         // opened.plain holds the cleartext session (incl. the 48-byte master_secret);
@@ -941,6 +1029,14 @@ pub const Server = struct {
         if (!clientOfferedSuite(self.offered_suites, suite)) return false;
         // The recovered PSK must be exactly the 48-byte master_secret.
         if (opened.opened.psk.len != tls12.master_secret_len) return false;
+        // The AEAD-sealed EMS domain tag proves the original session used the
+        // extended master secret (RFC 7627 §5.3); untagged tickets (older
+        // builds, other legs) fall back to a full handshake.
+        if (opened.opened.ticket_nonce.len < tls12_ems_ticket_tag.len or
+            !std.mem.eql(u8, opened.opened.ticket_nonce[0..tls12_ems_ticket_tag.len], &tls12_ems_ticket_tag))
+        {
+            return false;
+        }
 
         // Lifetime enforcement (when a real clock and issue time are present):
         // reject expired or future tickets.
@@ -992,6 +1088,11 @@ pub const Server = struct {
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
         try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
+        // RFC 7627 §5.3: the resumed session was established with EMS (tickets
+        // are only ever issued for EMS sessions, and tryResume required the
+        // resuming ClientHello to offer it again), so the abbreviated
+        // ServerHello MUST echo the extension.
+        if (self.ems_negotiated) try writeExtension(self.allocator, &exts, ext_extended_master_secret, "");
         if (self.selected_alpn) |proto| {
             var alpn_body: [3 + 255]u8 = undefined;
             std.mem.writeInt(u16, alpn_body[0..2], @intCast(1 + proto.len), .big);
@@ -2418,6 +2519,406 @@ test "TLS 1.2 tickets disabled issues no ticket and leaves the transcript unchan
     try std.testing.expect(client.handshakeDone());
     try std.testing.expect(client.takeSessionTicket() == null);
 }
+
+// ---- Hardened-profile enforcement tests (EMS, weak suites, SCSV, reneg,
+// compression, malformed bytes) ----
+
+/// Synthetic ClientHello body for driving parseClientHello directly with
+/// attacker-chosen suites / compression / extension bytes.
+fn synthClientHelloBody(
+    allocator: Allocator,
+    suites: []const u16,
+    compression: []const u8,
+    exts: []const u8,
+) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try appendU16(allocator, &body, tls12.tls_version);
+    const rnd: [32]u8 = @splat(0x11);
+    try body.appendSlice(allocator, &rnd);
+    try body.append(allocator, 0); // empty session_id
+    try appendU16(allocator, &body, @intCast(suites.len * 2));
+    for (suites) |s| try appendU16(allocator, &body, s);
+    try body.append(allocator, @intCast(compression.len));
+    try body.appendSlice(allocator, compression);
+    try appendU16(allocator, &body, @intCast(exts.len));
+    try body.appendSlice(allocator, exts);
+    return body.toOwnedSlice(allocator);
+}
+
+/// supported_groups=[secp256r1] + extended_master_secret — the minimum a
+/// well-behaved hardened client sends.
+const synth_ok_exts = [_]u8{
+    0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups: [secp256r1]
+    0x00, 0x17, 0x00, 0x00, // extended_master_secret (empty)
+};
+
+test "tls12 EMS: default loopback negotiates extended master secret on the wire" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    // The ClientHello offers the empty extended_master_secret extension
+    // (00 17 00 00) and the empty renegotiation_info (ff 01 00 01 00).
+    try std.testing.expect(std.mem.indexOf(u8, ch, &[_]u8{ 0x00, 0x17, 0x00, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ch, &[_]u8{ 0xff, 0x01, 0x00, 0x01, 0x00 }) != null);
+
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // The ServerHello echoes the empty extension.
+    try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0x00, 0x17, 0x00, 0x00 }) != null);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+    try std.testing.expect(server.ems_negotiated and client.ems_negotiated);
+
+    // Both sides derived the SAME session-hash-bound master secret: app data
+    // round-trips (a derivation mismatch would fail the Finished long before).
+    const c_app = try client.encrypt("ems bound");
+    defer allocator.free(c_app);
+    const s_plain = try server.decrypt(c_app);
+    defer allocator.free(s_plain);
+    try std.testing.expectEqualSlices(u8, "ems bound", s_plain);
+}
+
+test "tls12 EMS required: a legacy ClientHello without the extension is rejected, alert = handshake_failure" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .require_extended_master_secret = false,
+    });
+    defer client.deinit();
+    client.omit_ems_for_test = true;
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    try std.testing.expect(std.mem.indexOf(u8, ch, &[_]u8{ 0x00, 0x17, 0x00, 0x00 }) == null);
+    try std.testing.expectError(error.EmsRequired, server.feed(ch));
+    try std.testing.expect(!server.handshakeDone());
+
+    // The refusal maps to a fatal handshake_failure(40) plaintext alert.
+    const rec = server.takeAlert(error.EmsRequired) orelse return error.BadHandshake;
+    defer allocator.free(rec);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
+    try std.testing.expectEqual(@as(u8, 40), rec[6]);
+}
+
+test "tls12 EMS optional: with the requirement loosened a non-EMS client completes via classic derivation" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .require_extended_master_secret = false,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+        .require_extended_master_secret = false,
+    });
+    defer client.deinit();
+    client.omit_ems_for_test = true;
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // No EMS on the wire in either direction: the legacy path is byte-compatible.
+    try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0x00, 0x17, 0x00, 0x00 }) == null);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+    try std.testing.expect(!server.ems_negotiated and !client.ems_negotiated);
+
+    const c_app = try client.encrypt("classic prf");
+    defer allocator.free(c_app);
+    const s_plain = try server.decrypt(c_app);
+    defer allocator.free(s_plain);
+    try std.testing.expectEqualSlices(u8, "classic prf", s_plain);
+}
+
+test "tls12 weak cipher suites offered alone are rejected (no RSA-kx / CBC / 3DES / RC4 / NULL)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+
+    const weak = [_]u16{
+        0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256 (static-RSA key transport)
+        0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
+        0xc013, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA (MAC-then-encrypt)
+        0x000a, // TLS_RSA_WITH_3DES_EDE_CBC_SHA
+        0x0005, // TLS_RSA_WITH_RC4_128_SHA
+        0x0001, // TLS_RSA_WITH_NULL_MD5
+        0x0039, // TLS_DHE_RSA_WITH_AES_256_CBC_SHA (finite-field DHE)
+    };
+    const body = try synthClientHelloBody(allocator, &weak, &.{0}, &synth_ok_exts);
+    defer allocator.free(body);
+    try std.testing.expectError(error.UnsupportedCipherSuite, server.parseClientHello(body));
+}
+
+test "tls12 FALLBACK_SCSV in a 1.2 ClientHello aborts with inappropriate_fallback (RFC 7507)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+
+    // Even alongside a perfectly good suite, the SCSV means the client fell
+    // back from a higher offer — and this daemon supports TLS 1.3.
+    const suites = [_]u16{ 0xc02b, suite_fallback_scsv };
+    const body = try synthClientHelloBody(allocator, &suites, &.{0}, &synth_ok_exts);
+    defer allocator.free(body);
+    try std.testing.expectError(error.InappropriateFallback, server.parseClientHello(body));
+    // ...and it maps to the RFC 7507 inappropriate_fallback(86) alert.
+    try std.testing.expectEqual(
+        tls_server.AlertDescription.inappropriate_fallback,
+        tls_server.alertDescriptionForError(error.InappropriateFallback).?,
+    );
+}
+
+test "tls12 renegotiation_info: a non-empty renegotiated_connection in the initial ClientHello is rejected" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+
+    // renegotiated_connection = 1 byte of "previous verify data" — a splice
+    // attempt on an initial handshake (RFC 5746 §3.6 MUST abort).
+    const hostile = [_]u8{ 0xff, 0x01, 0x00, 0x02, 0x01, 0xaa };
+    try std.testing.expectError(error.BadHandshake, server.parseClientExtensions(&hostile));
+
+    // The well-formed empty marker is accepted (alongside the required group).
+    const ok = [_]u8{
+        0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups
+        0xff, 0x01, 0x00, 0x01, 0x00, // renegotiation_info: empty
+    };
+    try server.parseClientExtensions(&ok);
+}
+
+test "tls12 compression: a ClientHello without null compression is rejected (CRIME closed)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+
+    const suites = [_]u16{0xc02b};
+    // DEFLATE(1) only — and even DEFLATE+null is refused (list must be exactly [null]).
+    const deflate_only = try synthClientHelloBody(allocator, &suites, &.{1}, &synth_ok_exts);
+    defer allocator.free(deflate_only);
+    try std.testing.expectError(error.BadHandshake, server.parseClientHello(deflate_only));
+
+    const deflate_and_null = try synthClientHelloBody(allocator, &suites, &.{ 1, 0 }, &synth_ok_exts);
+    defer allocator.free(deflate_and_null);
+    try std.testing.expectError(error.BadHandshake, server.parseClientHello(deflate_and_null));
+}
+
+test "tls12 malformed handshake bytes yield typed errors, never a crash" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+
+    // An unknown record content type fails record parsing.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const bad_ct = [_]u8{ 99, 0x03, 0x03, 0x00, 0x01, 0x00 };
+        try std.testing.expectError(error.BadRecord, server.feed(&bad_ct));
+    }
+    // A handshake header whose declared length overruns the record is refused.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const overrun = [_]u8{ 22, 0x03, 0x03, 0x00, 0x05, 1, 0x00, 0x00, 0xff, 0x00 };
+        try std.testing.expectError(error.BadHandshake, server.feed(&overrun));
+    }
+    // A wrong first message type (Finished where ClientHello belongs) is refused.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const wrong_type = [_]u8{ 22, 0x03, 0x03, 0x00, 0x04, 20, 0x00, 0x00, 0x00 };
+        try std.testing.expectError(error.BadHandshake, server.feed(&wrong_type));
+    }
+    // A truncated ClientHello body (random cut short) is refused, not crashed on.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const truncated = [_]u8{ 22, 0x03, 0x03, 0x00, 0x08, 1, 0x00, 0x00, 0x04, 0x03, 0x03, 0x11, 0x22 };
+        try std.testing.expectError(error.BadHandshake, server.feed(&truncated));
+    }
+}
+
+test "tls12 EMS ticket binding: non-EMS sessions get no ticket and a non-EMS resume falls back to a full handshake" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    // (a) A non-EMS session (requirement loosened both sides) must NOT be
+    // issued a NewSessionTicket even when the client asks for one.
+    {
+        var server = try Server.init(allocator, .{
+            .cert_chain = &chain,
+            .ecdsa_p256_signing_key = fixture.key,
+            .require_extended_master_secret = false,
+            .enable_session_tickets = true,
+            .ticket_key = test_ticket_key,
+            .replay_guard = &guard,
+            .now_unix_seconds = 1_700_000_000,
+        });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+            .require_extended_master_secret = false,
+        });
+        defer client.deinit();
+        client.omit_ems_for_test = true;
+        try client.requestSessionTicket();
+
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sf);
+        // No SessionTicket extension echo for a session that can never resume.
+        try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0x00, 0x23, 0x00, 0x00 }) == null);
+        const cf = switch (try client.feed(sf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(cf);
+        const sfin = switch (try server.feed(cf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sfin);
+        try std.testing.expect(!finalFlightHasNewSessionTicket(sfin));
+        _ = try client.feed(sfin);
+        try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+        try std.testing.expect(client.takeSessionTicket() == null);
+    }
+
+    // (b) A valid EMS-issued ticket presented by a ClientHello that does NOT
+    // offer EMS must not take the abbreviated path (RFC 7627 §5.3): the server
+    // (requirement loosened) falls back to a FULL handshake.
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+    {
+        var server = try Server.init(allocator, .{
+            .cert_chain = &chain,
+            .ecdsa_p256_signing_key = fixture.key,
+            .require_extended_master_secret = false,
+            .enable_session_tickets = true,
+            .ticket_key = test_ticket_key,
+            .replay_guard = &guard,
+            .now_unix_seconds = 1_700_000_001,
+        });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+            .require_extended_master_secret = false,
+        });
+        defer client.deinit();
+        try client.setSessionTicket(stored);
+        client.omit_ems_for_test = true;
+
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sf);
+        // Full handshake (Certificate present) — the fast path was refused.
+        try std.testing.expect(serverHelloFlightHasCertificate(sf));
+        const cf = switch (try client.feed(sf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(cf);
+        const sfin = switch (try server.feed(cf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sfin);
+        _ = try client.feed(sfin);
+        try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+    }
+}
+
+// NOTE (RFC 7627 session-hash coverage): the derivation-input ordering — the
+// CKE joining the transcript BEFORE the master secret derives — is pinned by
+// every default (EMS) loopback above: client and server compute their session
+// hashes from independently-assembled transcripts, so a server deriving before
+// its CKE append would disagree with the client and fail the Finished/AEAD.
 
 /// True when a plaintext ServerHello flight contains a Certificate handshake
 /// message (type 11). Used to distinguish full (Certificate present) from

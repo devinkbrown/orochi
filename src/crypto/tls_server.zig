@@ -304,6 +304,7 @@ pub const AlertDescription = enum(u8) {
     decrypt_error = 51,
     protocol_version = 70,
     internal_error = 80,
+    inappropriate_fallback = 86,
     missing_extension = 109,
     _,
 };
@@ -318,6 +319,10 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         error.ProtocolVersion => .protocol_version,
         error.MissingExtension => .missing_extension,
         error.UnsupportedGroup, error.UnsupportedCipherSuite => .handshake_failure,
+        // RFC 7627: the hardened 1.2 profile refuses a non-EMS handshake.
+        error.EmsRequired => .handshake_failure,
+        // RFC 7507: TLS_FALLBACK_SCSV offered below our highest version.
+        error.InappropriateFallback => .inappropriate_fallback,
         error.FinishedMismatch => .decrypt_error, // (post-ServerHello ⇒ sent encrypted, see takeAlert)
         error.NoCertificate, error.NoSigningKey, error.LeafKeyMismatch => .internal_error,
         // Malformed handshake bytes or a wrong first-record content type: the peer
