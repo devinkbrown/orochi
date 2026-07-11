@@ -76,6 +76,22 @@ pub fn matches(bytes: []const u8) bool {
     return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], &magic);
 }
 
+fn lessEntry(_: void, a: Entry, b: Entry) bool {
+    if (a.replica != b.replica) return a.replica < b.replica;
+    return a.counter < b.counter;
+}
+
+fn lessAdd(_: void, a: [add_value_len]u8, b: [add_value_len]u8) bool {
+    return std.mem.order(u8, &a, &b) == .lt;
+}
+
+/// Encode a canonical compact member payload. The context frontier and add
+/// values are sorted so equal logical state ALWAYS yields identical bytes,
+/// regardless of the internal merge/delivery order of the caller's arrays. This
+/// is load-bearing: anti-entropy hashes the encoded payload into a Merkle
+/// digest, so two replicas that reached the same member state via different
+/// orders must produce the same bytes or they would repair forever. Mirrors the
+/// dense codec's `sortDots`/`sortAdds`.
 pub fn encode(
     out: []u8,
     member_id: u64,
@@ -84,18 +100,27 @@ pub fn encode(
     adds: []const [add_value_len]u8,
 ) EncodeError![]const u8 {
     if (context.len > max_context or adds.len > max_adds) return error.Oversize;
+
+    var ctx: [max_context]Entry = undefined;
+    @memcpy(ctx[0..context.len], context);
+    std.mem.sort(Entry, ctx[0..context.len], {}, lessEntry);
+
+    var av: [max_adds][add_value_len]u8 = undefined;
+    for (adds, 0..) |a, i| av[i] = a;
+    std.mem.sort([add_value_len]u8, av[0..adds.len], {}, lessAdd);
+
     var w = Writer{ .buf = out };
     try w.writeBytes(&magic);
     try w.writeU8(version);
     try w.writeU64(member_id);
     try w.writeU64(hlc_key);
     try w.writeVarint(context.len);
-    for (context) |e| {
+    for (ctx[0..context.len]) |e| {
         try w.writeU64(e.replica);
         try w.writeU64(e.counter);
     }
     try w.writeVarint(adds.len);
-    for (adds) |a| try w.writeBytes(&a);
+    for (av[0..adds.len]) |a| try w.writeBytes(&a);
     return w.written();
 }
 
@@ -112,13 +137,22 @@ pub fn decode(bytes: []const u8) DecodeError!View {
     if (cc > max_context) return error.Oversize;
     v.context_len = cc;
     var i: usize = 0;
+    var prev_entry: ?Entry = null;
     while (i < cc) : (i += 1) {
         const replica = try r.readU64();
         const counter = try r.readU64();
         // A frontier never carries a zero counter; reject fail-closed, mirroring
         // the dense codec's `validateDot` rejection of counter-0 dots.
         if (counter == 0) return error.InvalidMember;
-        v.context[i] = .{ .replica = replica, .counter = counter };
+        const entry = Entry{ .replica = replica, .counter = counter };
+        // Enforce the canonical strict-ascending order the encoder emits, so a
+        // non-canonical or duplicate-replica frame is rejected (parity with the
+        // dense codec's NonCanonicalOrder/DuplicateDot rules).
+        if (prev_entry) |p| {
+            if (!lessEntry({}, p, entry)) return error.InvalidMember;
+        }
+        prev_entry = entry;
+        v.context[i] = entry;
     }
 
     const ac = try r.readVarint();
@@ -128,6 +162,13 @@ pub fn decode(bytes: []const u8) DecodeError!View {
     while (i < ac) : (i += 1) {
         const slice = try r.readFixed(add_value_len);
         @memcpy(&v.adds[i], slice);
+        if (i > 0) {
+            // Strict ascending value order rejects duplicate/non-canonical adds…
+            if (std.mem.order(u8, &v.adds[i - 1], &v.adds[i]) != .lt) return error.InvalidMember;
+            // …and the dot prefix (first 16 bytes) must differ, mirroring the
+            // dense codec's DuplicateDot rule for two adds sharing one dot.
+            if (std.mem.eql(u8, v.adds[i - 1][0..16], v.adds[i][0..16])) return error.InvalidMember;
+        }
     }
 
     if (!r.done()) return error.TrailingBytes;
@@ -267,6 +308,51 @@ test "Suimyaku mesh member_compact rejects malformed frames fail-closed" {
     const counter_off = magic.len + 1 + 8 + 8 + 1 + 8;
     @memset(zero[counter_off .. counter_off + 8], 0);
     try std.testing.expectError(error.InvalidMember, decode(zero[0..bytes.len]));
+}
+
+test "Suimyaku mesh member_compact encode is canonical regardless of input order" {
+    // Two replicas reaching the same logical member state via different merge
+    // orders must produce byte-identical payloads, or the anti-entropy Merkle
+    // digest never converges and the channel repairs forever.
+    var ctx_a = [_]Entry{ .{ .replica = 5, .counter = 2 }, .{ .replica = 1, .counter = 900 } };
+    var ctx_b = [_]Entry{ .{ .replica = 1, .counter = 900 }, .{ .replica = 5, .counter = 2 } };
+
+    var add0: [add_value_len]u8 = undefined;
+    var add1: [add_value_len]u8 = undefined;
+    @memset(&add0, 0);
+    @memset(&add1, 0);
+    add0[0] = 1; // dot replica 1
+    add1[0] = 5; // dot replica 5
+    var adds_a = [_][add_value_len]u8{ add1, add0 };
+    var adds_b = [_][add_value_len]u8{ add0, add1 };
+
+    var buf_a: [max_bytes]u8 = undefined;
+    var buf_b: [max_bytes]u8 = undefined;
+    const a = try encode(&buf_a, 9, 0, ctx_a[0..], adds_a[0..]);
+    const b = try encode(&buf_b, 9, 0, ctx_b[0..], adds_b[0..]);
+    try std.testing.expectEqualSlices(u8, a, b);
+
+    // Decode enforces the canonical order the encoder emits.
+    const v = try decode(a);
+    try std.testing.expectEqual(@as(u64, 1), v.context[0].replica);
+    try std.testing.expectEqual(@as(u64, 5), v.context[1].replica);
+}
+
+test "Suimyaku mesh member_compact decode rejects non-canonical order" {
+    // Hand-build a frame with descending context replicas (5 then 1).
+    var buf: [max_bytes]u8 = undefined;
+    var w = Writer{ .buf = &buf };
+    try w.writeBytes(&magic);
+    try w.writeU8(version);
+    try w.writeU64(9); // member_id
+    try w.writeU64(0); // hlc
+    try w.writeVarint(2); // context_len
+    try w.writeU64(5);
+    try w.writeU64(1);
+    try w.writeU64(1);
+    try w.writeU64(1);
+    try w.writeVarint(0); // adds
+    try std.testing.expectError(error.InvalidMember, decode(w.written()));
 }
 
 test "Suimyaku mesh member_compact encode rejects oversize context and adds" {
