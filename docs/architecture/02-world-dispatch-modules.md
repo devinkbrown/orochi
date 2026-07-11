@@ -49,6 +49,15 @@ The server-level route is:
 
 This diverges from older planning and request wording: `dispatchRegistered` no longer holds a large post-registration daemon-owned if/else command chain. The source comment states, "Everything daemon-owned is a SerpentRegistry command." Evidence: `src/daemon/server.zig:8371`.
 
+### Control-byte firewall (CWE-93)
+
+Every wire-facing path funnels through one predicate, `dispatch.hasControlByte`, which is true for any C0 control (`< 0x20`, including CR/LF/NUL/TAB) or DEL (`0x7f`). Evidence: `src/daemon/dispatch.zig:2281`.
+
+- **Inbound**, the `ReplyCtx` line builders and prereg field setters reject fields carrying a control byte with `error.ControlByte` before a line is serialized. Evidence: `src/daemon/dispatch.zig:2288`, `src/daemon/dispatch.zig:1504`, `src/daemon/dispatch.zig:197`.
+- **Outbound reply sinks** reuse the same predicate as a fail-closed guard so no reflected/interpolated value (a nick, a fantasy `!weather` body, a `FAIL`/`NOTICE` reason) can smuggle a raw CR/LF that starts a forged IRC line. `noticeTo`, `fantasyReply`, and `failReply` each drop the reply rather than emit it when a control byte is present. Evidence: `src/daemon/server.zig:17597`, `src/daemon/server.zig:19419`, `src/daemon/server.zig:27661`.
+
+This is a single choke point on both directions: the builders validate what clients send, and the reply sinks validate what the daemon reflects back, so CRLF-injection has no reachable emission path.
+
 ## SerpentRegistry
 
 `registry.zig` statically assembles module metadata, command tables, and hook tables at comptime. Its header says module metadata is validated at comptime, command/hook tables are generated once, and dispatch scans immutable declarations. Evidence: `src/daemon/registry.zig:4`, `src/daemon/registry.zig:8`, `src/daemon/registry.zig:9`.

@@ -615,12 +615,13 @@ Passkey (WebAuthn/FIDO2) registration and passwordless login (the `WEBAUTHN` com
 ## `[oper]`
 
 Operator subsystem settings, distinct from the per-operator `[[opers]]` bindings
-below. Source: struct `OperSection` at `src/daemon/config_format.zig`, mapping at
-`src/daemon/config_boot.zig`.
+below. Source: struct `OperSection` at `src/daemon/config_format.zig:238`, parsing at
+`src/daemon/config_format.zig:1035`, mapping at `src/daemon/config_boot.zig`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `grants_path` | string or null | unset | path | File for persisting runtime `GRANT`/`REVOKE` operator grants. When set, active grants are written here on change and reloaded at boot, so runtime-granted opers survive a restart; revoked accounts are dropped. See [commands/oper-moderation.md](commands/oper-moderation.md#grant). |
+| `event_history_path` | string or null | unset | path | File for persisting the Event Spine history ring so `EVENT REPLAY` survives a USR2 hot-upgrade and a cold restart. Loaded at boot and rewritten by reactor 0 on the stats cadence; unset keeps the history per-process-lifetime (`src/daemon/config_format.zig:244`, `src/daemon/config_format.zig:1036`, `src/daemon/server.zig:23138`, `src/daemon/server.zig:23151`). |
 | `auto_override` | bool | `false` | — | Auto-enable the `+j` override umode on elevation for any operator holding the `oper_override` privilege, so admins get full channel authority (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. `false` keeps override an explicit, audited opt-in (`src/daemon/server.zig` `applyOperAutoOverride`). |
 
 ## `[wasm]`
@@ -641,13 +642,15 @@ OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format
 
 ## `[[opers]]`
 
-Source: struct at `src/daemon/config_format.zig:101`, parsing at `src/daemon/config_format.zig:422`, SASL-only runtime behavior at `src/daemon/server.zig:8300`.
+Source: struct `Oper` at `src/daemon/config_format.zig:289`, parsing at `src/daemon/config_format.zig:1399`, SASL-only runtime behavior at `src/daemon/server.zig:8300`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `account` | string | required per table | non-empty; registry validation max 128 bytes | SASL account name that becomes oper after successful SASL login (`src/daemon/config_format.zig:433`, `src/daemon/oper.zig:11`). |
+| `account` | string | required per table | non-empty; registry validation max 128 bytes | SASL account name that becomes oper after successful SASL login (`src/daemon/config_format.zig:290`, `src/daemon/oper.zig:11`). |
 | `class` | string | `""` | registry validation max 64 bytes | Operator privilege group name. It must name a non-empty configured group with effective privileges; otherwise the oper binding is skipped (`src/daemon/config_boot.zig:183`). |
-| `title` | string | `""` | any string | Optional WHOIS/operator title (`src/daemon/config_format.zig:441`, `src/daemon/oper.zig:139`). |
+| `title` | string | `""` | any string | Optional WHOIS/operator title (`src/daemon/config_format.zig:294`, `src/daemon/oper.zig:139`). |
+| `presubscribe` | array of strings | `[]` | Event-Spine category names (e.g. `["ANNOUNCE","KILL"]` or `["ALL"]`) | Event-Spine categories this oper is auto-subscribed to on elevation. Empty = none (the oper opts in per-category with `EVENT ADD`). A cross-mesh grant carries no presubscribe, so a remotely granted oper defaults to none (`src/daemon/config_format.zig:298`, `src/daemon/config_format.zig:1425`, `src/daemon/server.zig:22892`). |
+| `certfp` | string or array of strings | `[]` | lowercase-hex SHA-256 fingerprint(s), 64 chars each | TLS client-certificate fingerprints pre-bound to this oper's `account` at boot, so SASL EXTERNAL works without a prior runtime `CERTADD`. Accepts a single string or an array; each is seeded into the certfp bind store and coexists with runtime `CERTADD` bindings. Malformed entries are skipped with a boot warning (never fatal); case is normalized to lowercase (`src/daemon/config_format.zig:306`, `src/daemon/config_format.zig:1433`). |
 
 There is no oper password. `OPER` is disabled and directs users to authenticate through SASL (`src/daemon/server.zig:8300`). Operator status is granted after SASL when the account matches a configured binding (`src/daemon/server.zig:8308`).
 
@@ -668,7 +671,7 @@ Note one current behavior: if an oper names a class that has no group, or that r
 ## Parsed but not yet wired
 
 No top-level key in this reference is currently known to be parser-only in the
-`main.zig` / `config_boot.zig` / `server.zig` path as of `c471a06`. When a future
+`main.zig` / `config_boot.zig` / `server.zig` path as of `c0e4a23`. When a future
 key is accepted before it changes live behavior, add it here in the same change.
 
 ## Comptime-bound values not yet configurable
