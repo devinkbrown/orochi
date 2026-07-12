@@ -104,9 +104,12 @@ pub const Config = struct {
     },
     registry: server_registry.Config = .{},
     routes: route_table.Config = .{},
-    /// When this peer has a node signing key, require the remote handshake to
-    /// advertise frame signing and reject unsigned direct-owned state frames.
-    /// Plaintext peers with no signing key cannot enforce this gate.
+    /// Receiver-side policy: reject unsigned direct-owned state frames. A keyed
+    /// peer additionally requires the remote handshake to advertise frame signing
+    /// (a non-signing peer is faulted at handshake). A KEYLESS peer cannot sign
+    /// its own egress, but it STILL enforces the inbound gate — an unsigned
+    /// in-scope frame is dropped + counted rather than applied (fail closed).
+    /// Set false only for an explicitly-permitted unsigned/plaintext deployment.
     require_signed_frames: bool = true,
 
     /// Consolidated applier for the EFFECTIVE production path
@@ -146,7 +149,9 @@ pub const Options = struct {
     /// of direct-owned state frames. When set (secured links pass the node
     /// identity's key), this peer advertises `frame_signing` in its handshake and
     /// signs every in-scope outbound frame; receivers self-certify the origin.
-    /// Null (plaintext links) cannot enforce `require_signed_frames`.
+    /// Null (plaintext links) cannot SIGN, so it cannot fault a non-signing peer
+    /// on egress; it still ENFORCES `require_signed_frames` on ingress by dropping
+    /// unsigned in-scope frames (fail closed) — see `inboundSignedFramesRequired`.
     ///
     /// INVARIANT for self-certification to hold: when a key is supplied,
     /// `local_node_id` MUST equal `signed_frame.originShortId(key.public_key)`
@@ -1223,8 +1228,25 @@ pub const S2sPeer = struct {
         return false;
     }
 
+    /// OUTBOUND fault predicate: whether we must FAULT the link rather than emit
+    /// an unsigned frame to a non-signing peer. Gated on `signing_key != null`
+    /// because a keyless node cannot sign its own egress at all — it must not
+    /// fault every outbound frame just because the policy is set; it simply emits
+    /// unsigned (and the far side's inbound gate decides whether to keep it).
     fn signedFramesRequired(self: *const S2sPeer) bool {
         return self.config.require_signed_frames and self.signing_key != null;
+    }
+
+    /// INBOUND admission predicate: whether an unsigned in-scope frame from a
+    /// non-signing peer must be REJECTED. This is a receiver-side policy and is
+    /// intentionally NOT gated on `signing_key != null`: verifying a signed
+    /// envelope only needs the peer's embedded pubkey, so a keyless node can (and
+    /// under `require_signed_frames` MUST) fail CLOSED on unsigned direct-owned
+    /// state rather than raw-pass it. Decoupling this from `signedFramesRequired`
+    /// closes the keyless fail-OPEN where a plaintext link applied unauthenticated
+    /// peer state despite the operator setting the policy.
+    fn inboundSignedFramesRequired(self: *const S2sPeer) bool {
+        return self.config.require_signed_frames;
     }
 
     /// Emit an in-scope direct-owned frame, wrapping it in a `signed_frame`
@@ -1256,10 +1278,12 @@ pub const S2sPeer = struct {
     ///     not equal the remote peer's authenticated node id.
     /// Every rejection increments the signature-audit counter. For a non-signing
     /// peer the raw payload is returned unchanged only when unsigned operation is
-    /// explicitly permitted.
+    /// explicitly permitted (`require_signed_frames = false`) — even a KEYLESS
+    /// node fails closed here when the policy is set (see
+    /// `inboundSignedFramesRequired`).
     fn verifiedPayload(self: *S2sPeer, frame_type: s2s_frame.FrameType, payload: []const u8) ?[]const u8 {
         if (!self.peer_supports_signing) {
-            if (self.signedFramesRequired()) {
+            if (self.inboundSignedFramesRequired()) {
                 self.rejected_signature_frames +|= 1;
                 return null;
             }
@@ -2680,6 +2704,11 @@ test "two s2s peer drivers repair divergent state without explicit delta send" {
     defer a.deinit();
     var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
     defer b.deinit();
+    // Keyless (plaintext) peers exchanging REPAIR_* (in-scope) frames: model an
+    // explicitly-permitted unsigned deployment so the anti-entropy repair path is
+    // exercised on its own terms. The keyless signing policy is proven separately.
+    a.config.require_signed_frames = false;
+    b.config.require_signed_frames = false;
     var a_to_b = BufferSink{};
     defer a_to_b.deinit(allocator);
     var b_to_a = BufferSink{};
@@ -3526,6 +3555,98 @@ test "explicitly-permitted non-signing peers still interoperate unsigned" {
     // A sends an UNSIGNED membership; B accepts it (legacy path, no rejection).
     try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A1);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("bob", changes[0].nick);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "keyless node fails CLOSED: require_signed_frames rejects an unsigned in-scope frame" {
+    // Reviewer-flagged fail-OPEN (fixed here): a node with NO signing key (a
+    // plaintext link) used to RAW-PASS an unsigned direct-owned frame even when
+    // the operator set `require_signed_frames`, because the inbound gate was
+    // wrongly coupled to `signing_key != null`. A keyless receiver CAN still
+    // enforce the policy (it just cannot sign its OWN egress), so it must now
+    // DROP + COUNT the unsigned in-scope frame instead of applying it.
+    //
+    // Deterministic: fixed TestClock + fixed pump seeds, so any failure replays
+    // byte-for-byte.
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    // Both peers are keyless (plaintext-style). B keeps the default policy on.
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    try std.testing.expect(b.config.require_signed_frames); // default: policy ON
+    try std.testing.expect(b.signing_key == null); // and B holds no key
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xFA11);
+
+    // Neither side negotiated signing (both keyless).
+    try std.testing.expect(!a.peer_supports_signing);
+    try std.testing.expect(!b.peer_supports_signing);
+
+    // A emits an UNSIGNED membership; keyless B WITH the policy must reject it:
+    // zero state applied, exactly one rejection counted.
+    try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xFA12);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+}
+
+test "keyless node with require_signed_frames disabled still accepts an unsigned in-scope frame" {
+    // The negative of the fail-CLOSED fix: an explicitly-permitted unsigned
+    // deployment (policy OFF) on a keyless node keeps applying unsigned
+    // direct-owned frames, unchanged from legacy behavior.
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    b.config.require_signed_frames = false; // opt into unsigned interop
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xFB11);
+
+    try std.testing.expect(!a.peer_supports_signing);
+    try std.testing.expect(!b.peer_supports_signing);
+
+    try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xFB12);
 
     const changes = try b.takeMembershipChanges();
     defer {

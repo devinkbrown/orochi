@@ -36294,13 +36294,17 @@ test "mesh LIST: remote-only channels join the union with the global count, secr
 
     // Peer side of the mesh link (node 1) — announces the remote channels.
     var peer: s2s_link.S2sLink = undefined;
-    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi" });
+    // Keyless (plaintext) mesh links model an explicitly-permitted unsigned
+    // deployment: a keyless node now fails CLOSED on unsigned in-scope frames when
+    // require_signed_frames is set (the default), so this propagation test opts
+    // into unsigned interop as a plaintext operator would.
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi", .config = .{ .require_signed_frames = false } });
     defer peer.deinit();
 
     // Server side of the link (node 2), attached to a conn slot; server.deinit
     // tears it down (deinit + destroy) as it would any real peer link.
     const link = try alloc.create(s2s_link.S2sLink);
-    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi" });
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi", .config = .{ .require_signed_frames = false } });
     const link_id = try server.rx().clients.alloc(ConnState.init(-1));
     server.rx().clients.get(link_id).?.s2s = link;
 
@@ -48115,6 +48119,11 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         defer ident.deinit();
         var cfg = operTestConfig(0);
         cfg.node_identity = &ident;
+        // Plaintext CONNECT ⇒ keyless S2S link. A keyless node now fails CLOSED on
+        // unsigned in-scope frames when require_signed_frames is set (the default),
+        // so this plaintext-link integration smoke test opts into unsigned interop
+        // as a plaintext operator would; signing enforcement is proven separately.
+        cfg.s2s_config.require_signed_frames = false;
         var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -48168,6 +48177,7 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
             .remote_node_id = 1,
             .local_epoch_ms = 3000,
             .server_name = "remote.test",
+            .config = .{ .require_signed_frames = false },
         });
         defer peer.deinit();
 
