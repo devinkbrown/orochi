@@ -10702,6 +10702,15 @@ pub const LinuxServer = struct {
         const victim = self.connFor(victim_id) orelse return;
         const victim_account = victim.session.account() orelse return;
         if (!std.ascii.eqlIgnoreCase(victim_account, d.account)) return;
+        // Multi-device: a still-LIVE local session of the same account is a
+        // concurrent device (the bouncer model — sessions.zig tracks up to
+        // max_sessions_per_account of them), NOT a stale ghost. A newer login on
+        // another mesh node must never kill it; only a connection already tearing
+        // down is a genuine ghost worth retiring here. Deliberately reclaiming a
+        // *specific* session is the explicit token-based SESSION RESUME path, not
+        // this mesh-claim heuristic. Without this guard, opening a second client
+        // anywhere on the mesh disconnects the first ("resume anywhere" broken).
+        if (!victim.closing) return;
         var buf: [default_reply_bytes]u8 = undefined;
         const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Session reclaimed (newer login for {s} elsewhere)\r\n", .{ self.serverName(), victim_account }) catch return;
         self.enqueueDeliveryThenClose(victim_id, ln, "Session reclaimed") catch {};
