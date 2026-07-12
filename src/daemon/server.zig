@@ -40231,6 +40231,271 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
     } else return error.SkipZigTest;
 }
 
+/// A live TLS client that frames the encrypted socket into DISCRETE application
+/// records, keeping BOTH the concatenated plaintext (for substring waits) AND
+/// each record's decrypted bytes separately (so a test can assert how a single
+/// logical message was split across records). Used to prove the userspace-TLS
+/// tag+line coalescing (`prefersJoinedAppend`): a tagged fan-out to this client
+/// must arrive as ONE record whose plaintext holds both the `@tag` and the line.
+const TlsRecordProbe = struct {
+    const tls_client = @import("../crypto/tls_client.zig");
+    const rec_hdr_len: usize = 5; // 1 type + 2 legacy version + 2 length
+
+    fd: linux.fd_t,
+    alloc: std.mem.Allocator,
+    client: *tls_client.Client,
+    cipher: std.ArrayList(u8) = .empty,
+    plain: std.ArrayList(u8) = .empty,
+    records: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *TlsRecordProbe) void {
+        for (self.records.items) |r| self.alloc.free(r);
+        self.records.deinit(self.alloc);
+        self.cipher.deinit(self.alloc);
+        self.plain.deinit(self.alloc);
+    }
+
+    /// TLS 1.3 handshake driven over the live socket (server side is the reactor).
+    fn handshake(self: *TlsRecordProbe) !void {
+        const ch = try self.client.start();
+        defer self.alloc.free(ch);
+        try writeAllFd(self.fd, ch);
+        var rbuf: [4096]u8 = undefined;
+        var guard: usize = 0;
+        while (!self.client.handshakeDone()) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(self.fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            switch (try self.client.feed(rbuf[0..n])) {
+                .bytes_to_send => |b| {
+                    defer self.alloc.free(b);
+                    try writeAllFd(self.fd, b);
+                },
+                .need_more => {},
+            }
+        }
+    }
+
+    fn send(self: *TlsRecordProbe, text: []const u8) !void {
+        const ct = try self.client.encrypt(text);
+        defer self.alloc.free(ct);
+        try writeAllFd(self.fd, ct);
+    }
+
+    /// Frame every COMPLETE TLS record currently buffered, decrypting each into
+    /// its own `records` entry (application_data only; control records like a
+    /// post-handshake ticket are consumed but not counted).
+    fn frame(self: *TlsRecordProbe) !void {
+        while (self.cipher.items.len >= rec_hdr_len) {
+            const body_len = std.mem.readInt(u16, self.cipher.items[3..5], .big);
+            const wire_len = rec_hdr_len + @as(usize, body_len);
+            if (self.cipher.items.len < wire_len) break;
+            switch (try self.client.decryptApp(self.cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    // Ownership of `pt` transfers to `records`; also mirror into
+                    // the concatenated `plain` view for substring waits.
+                    try self.plain.appendSlice(self.alloc, pt);
+                    try self.records.append(self.alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, self.cipher.items[0 .. self.cipher.items.len - wire_len], self.cipher.items[wire_len..]);
+            self.cipher.shrinkRetainingCapacity(self.cipher.items.len - wire_len);
+        }
+    }
+
+    /// Read + frame until the concatenated plaintext contains `needle`, bounded by
+    /// a wall-clock budget so a delivery regression fails loudly instead of hanging.
+    fn pumpUntil(self: *TlsRecordProbe, needle: []const u8, budget_ms: i64) !void {
+        const deadline = platform.monotonicMillis() + budget_ms;
+        var rbuf: [4096]u8 = undefined;
+        while (std.mem.indexOf(u8, self.plain.items, needle) == null) {
+            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 50) catch return error.Unexpected;
+            if (ready == 0) continue;
+            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            const n = try readFd(self.fd, &rbuf);
+            if (n == 0) return error.ConnectionReset;
+            try self.cipher.appendSlice(self.alloc, rbuf[0..n]);
+            try self.frame();
+        }
+    }
+
+    /// The single record whose plaintext carries `body_needle`, or null.
+    fn recordCarrying(self: *const TlsRecordProbe, body_needle: []const u8) ?[]const u8 {
+        for (self.records.items) |r| {
+            if (std.mem.indexOf(u8, r, body_needle) != null) return r;
+        }
+        return null;
+    }
+};
+
+// Regression pin for the userspace-TLS tag+line coalescing (server.zig
+// deliverTagged/deliverTimed `prefersJoinedAppend`, commit 63119cf). A tagged
+// channel PRIVMSG to a userspace-TLS recipient must seal the `@tag` prefix and
+// the line into ONE TLS record on the wire, not two: two `appendSecuredToConn`
+// calls would double the AEAD + record-header + GCM-tag work per fan-out
+// recipient. This drives a REAL tagged fan-out through the reactor's delivery
+// path and asserts the recipient's single body-bearing record ALSO carries the
+// tag (one record), while a plaintext member of the same channel still receives
+// the fully tagged line intact (the plaintext path is unaffected).
+test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS record; plaintext unaffected" {
+    if (comptime builtin.os.tag == .linux) {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const tls_client = @import("../crypto/tls_client.zig");
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const alloc = std.testing.allocator;
+
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5c)));
+        var cert_buf: [1024]u8 = undefined;
+        const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x5c, 0x01 },
+            .key_pair = kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const chain = [_][]const u8{der};
+
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = kp,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const tls_port = try server.tlsBoundPort();
+        const plain_port = try server.boundPort();
+
+        var run = std.atomic.Value(bool).init(true);
+        const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        defer stopThreadedServer(&server, &run, thr);
+
+        // Recipient A: a userspace-TLS member that negotiates server-time +
+        // message-tags, so a relayed channel PRIVMSG carries a non-empty
+        // `@time=…;msgid=… ` prefix — the exact input to the coalescing branch.
+        const fd_a = connectLoopback(tls_port) catch return error.SkipZigTest;
+        defer closeFd(fd_a);
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+        defer client.deinit();
+        var a = TlsRecordProbe{ .fd = fd_a, .alloc = alloc, .client = &client };
+        defer a.deinit();
+        try a.handshake();
+
+        try a.send("CAP REQ :server-time message-tags\r\n");
+        try a.pumpUntil("ACK", 4_000);
+        try a.send("NICK A\r\nUSER a 0 * :Alice\r\nCAP END\r\n");
+        try a.pumpUntil(" 001 A ", 4_000);
+        try a.send("JOIN #tls\r\n");
+        try a.pumpUntil(" 366 A #tls ", 4_000);
+
+        // Plaintext member C: same caps, so it too gets the fully tagged line —
+        // proving the plaintext path still delivers the tag+line intact.
+        const fd_c = connectLoopback(plain_port) catch return error.SkipZigTest;
+        defer closeFd(fd_c);
+        var c = LiveClient{ .fd = fd_c };
+        try writeAllFd(fd_c, "CAP REQ :server-time message-tags\r\n");
+        try recvUntil(&c, "ACK", 200);
+        try writeAllFd(fd_c, "NICK C\r\nUSER c 0 * :Carol\r\nCAP END\r\n");
+        try recvUntil(&c, " 001 C ", 200);
+        try writeAllFd(fd_c, "JOIN #tls\r\n");
+        try recvUntil(&c, " 366 C #tls ", 200);
+
+        // Sender B (plaintext) joins and messages the channel once.
+        const fd_b = connectLoopback(plain_port) catch return error.SkipZigTest;
+        defer closeFd(fd_b);
+        var b = LiveClient{ .fd = fd_b };
+        try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :Bob\r\n");
+        try recvUntil(&b, " 001 B ", 200);
+        try writeAllFd(fd_b, "JOIN #tls\r\n");
+        try recvUntil(&b, " 366 B #tls ", 200);
+
+        // Drain A + C past B's JOIN notification so the measurement window holds
+        // only the PRIVMSG delivery.
+        try a.pumpUntil(":B", 4_000);
+        try a.pumpUntil("JOIN #tls", 4_000);
+        try recvUntil(&c, "JOIN #tls", 200);
+        c.reset();
+
+        const marker = "one-record-9a7c3f";
+        const body = ":B!b@localhost PRIVMSG #tls :" ++ marker;
+        try writeAllFd(fd_b, "PRIVMSG #tls :" ++ marker ++ "\r\n");
+
+        // The recipient must see the message body. Find the record carrying it and
+        // assert the SAME record also carries the tag prefix — proving the tag and
+        // line coalesced into ONE TLS record (not two discrete records).
+        try a.pumpUntil("PRIVMSG #tls :" ++ marker, 4_000);
+        const rec = a.recordCarrying(marker) orelse return error.TestExpectedEqual;
+        // One-record proof: the body-bearing record opens with the `@`-tag segment
+        // and includes the server-time tag. A two-append regression would put the
+        // tag in a PRIOR record, leaving this one starting at the `:` prefix.
+        try std.testing.expect(rec.len != 0 and rec[0] == '@');
+        try expectContains(rec, "@time=");
+        try expectContains(rec, body);
+        // And no record is a bare tag segment lacking the line (the split shape).
+        for (a.records.items) |r| {
+            if (std.mem.indexOf(u8, r, "@time=") != null and std.mem.indexOf(u8, r, marker) != null) {
+                try expectContains(r, "PRIVMSG #tls :");
+            }
+        }
+
+        // Plaintext member C received the fully tagged line intact (unaffected):
+        // the delivered line begins with the `@`-tag and carries the body.
+        try recvUntil(&c, marker, 200);
+        const cbytes = c.written();
+        const cpos = std.mem.indexOf(u8, cbytes, body) orelse return error.TestExpectedEqual;
+        const line_start = if (std.mem.lastIndexOfScalar(u8, cbytes[0..cpos], '\n')) |nl| nl + 1 else 0;
+        try std.testing.expect(cbytes[line_start] == '@');
+        try expectContains(cbytes[line_start..], "@time=");
+    } else return error.SkipZigTest;
+}
+
+// Unit pin for the coalescing DECISION itself (`prefersJoinedAppend`): only a
+// raw userspace-TLS conn benefits (each `appendSecuredToConn` seals a discrete
+// record). WS conns coalesce a partial line in `tx_buf`, plaintext conns
+// coalesce on the wire, and kTLS-offloaded conns let the kernel coalesce — so
+// all three MUST take the two-append path. This is the wire test's companion for
+// the kTLS + WS + plaintext arms that cannot be attached on a bare test socket.
+test "threaded server: prefersJoinedAppend gates coalescing to raw userspace-TLS conns only" {
+    if (comptime builtin.os.tag == .linux) {
+        var dummy_tls: tls_conn.TlsConn = undefined;
+        var dummy_ws: WsState = undefined;
+
+        // Plaintext: no TLS, no WS -> two-append (coalesces on the wire).
+        var plain = ConnState.init(-1);
+        try std.testing.expect(!prefersJoinedAppend(&plain));
+
+        // Raw userspace-TLS: the one case that benefits -> joined append.
+        var tls = ConnState.init(-1);
+        tls.tls = &dummy_tls;
+        try std.testing.expect(prefersJoinedAppend(&tls));
+
+        // kTLS TX-offloaded: the kernel seals records, so joining only adds a copy.
+        var ktls = ConnState.init(-1);
+        ktls.tls = &dummy_tls;
+        ktls.tls_tx_offloaded = true;
+        try std.testing.expect(!prefersJoinedAppend(&ktls));
+
+        // WebSocket over TLS: tx_buf already coalesces per '\n' -> two-append.
+        var wss = ConnState.init(-1);
+        wss.tls = &dummy_tls;
+        wss.ws = &dummy_ws;
+        try std.testing.expect(!prefersJoinedAppend(&wss));
+
+        // WebSocket over plaintext: still framed via tx_buf -> two-append.
+        var ws_plain = ConnState.init(-1);
+        ws_plain.ws = &dummy_ws;
+        try std.testing.expect(!prefersJoinedAppend(&ws_plain));
+    } else return error.SkipZigTest;
+}
+
 test "threaded server: implicit-TLS raw public key negotiates and registers" {
     if (comptime builtin.os.tag == .linux) {
         const Ed25519 = std.crypto.sign.Ed25519;
