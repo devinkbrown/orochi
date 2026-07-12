@@ -80,6 +80,32 @@ pub fn build(b: *std.Build) void {
     // working tree has uncommitted changes) so the running binary can report
     // exactly which commit it was built from (banner + VERSION). Available to
     // module source as `@import("build_info").git_commit`.
+    //
+    // `gitCommit` reads HEAD via a subprocess at configure time. Zig 0.17's
+    // CONFIGURATION cache cannot see that read, so when only the commit moved
+    // (build.zig and every source file unchanged) `zig build` reused the cached
+    // configuration — including the previously-generated options module — and
+    // silently stamped the OLD commit: the banner, 002/004, and RPL_VERSION (351)
+    // lagged HEAD, and a clean `zig build release` could ship mislabeled
+    // provenance. Declaring a CONTENT dependency on the git ref files below folds
+    // them into the configuration-cache key, so the configure phase re-runs — and
+    // the stamp regenerates — the instant HEAD moves, while staying a fast cache
+    // hit when it does not.
+    //   * .git/HEAD      — moves on a branch switch / detached-HEAD update.
+    //   * .git/logs/HEAD — the reflog, appended on every commit/checkout/reset/
+    //                      fetch regardless of loose-vs-packed refs: the reliable
+    //                      trigger for a commit on the current branch.
+    //
+    // Each dependency is wired ONLY when the file actually exists as a plain file
+    // under a real `.git` DIRECTORY: `dependOnFileContents` hashes the file at
+    // configure and hard-fails (FileNotFound / CacheCheckFailed) if it is absent
+    // or if `.git` is a FILE (a linked worktree). So a `.git`-less source tarball
+    // (git-archive) and a worktree build skip the dependency and keep working via
+    // `gitCommit`'s subprocess fallback ("unknown" with no git, or the resolved
+    // commit in a worktree); they simply do not auto-refresh the stamp on a bare
+    // commit — an acceptable trade for not regressing those builds.
+    if (gitRefExists(b, ".git/HEAD")) b.dependOnFileContents(b.path(".git/HEAD"));
+    if (gitRefExists(b, ".git/logs/HEAD")) b.dependOnFileContents(b.path(".git/logs/HEAD"));
     const build_info = b.addOptions();
     const git = gitCommit(b);
     build_info.addOption([]const u8, "git_commit", git);
@@ -842,6 +868,16 @@ fn manifestVersion() []const u8 {
 /// "unknown" when git is unavailable or this is not a checkout, so builds from a
 /// source tarball still succeed. The `-C <build_root>` keeps it correct
 /// regardless of the build's working directory.
+/// Whether `rel` (relative to the build root, which is the process cwd during
+/// `zig build`) exists as an accessible plain file. Guards the configure-time
+/// `dependOnFileContents` calls so a `.git`-less tarball or a linked-worktree
+/// checkout (where `.git` is a FILE, making `.git/HEAD` unresolvable) skips the
+/// dependency instead of hard-failing the configure phase.
+fn gitRefExists(b: *std.Build, rel: []const u8) bool {
+    std.Io.Dir.cwd().access(b.graph.io, rel, .{}) catch return false;
+    return true;
+}
+
 fn gitCommit(b: *std.Build) []const u8 {
     const root = b.root.root_dir.path orelse ".";
     const hash = b.runAllowFail(
