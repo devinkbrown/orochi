@@ -1524,6 +1524,74 @@ test "pruneStale uses the local last-seen stamp, not the announcer's wire hlc (c
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
 }
 
+test "mesh route_table re-affirming a present member refreshes local last-seen so pruneStale never reaps a live member (roster-decay regression)" {
+    // Federation roster-decay bug: on a 2-node mesh, the 30s anti-entropy re-burst
+    // re-affirms every PRESENT remote member, but the receive path must refresh that
+    // member's RECEIVER-LOCAL last-seen stamp on EVERY present apply — otherwise the
+    // stamp freezes at first-join and pruneStale reaps a still-live member after the
+    // TTL, leaving NAMES showing only local members ("eventually shows everyone, then
+    // decays"). The liveness touch must be ORTHOGONAL to CRDT/LWW value convergence:
+    // it must fire even when the re-affirmation carries a NON-advancing hlc that the
+    // LWW guard collapses to `unchanged`, because a "still here" signal is not a value
+    // change. This models one receiver's clock domain (the same nowMs pruneStale uses).
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const T0: i64 = 1_000_000;
+    const window: i64 = 90_000; // stale_member_ttl_ms
+    const hlc: u64 = 42; // the announcer's wire hlc — held CONSTANT across re-affirms
+
+    // T0: member M learned from remote node 10 in #root.
+    _ = try table.applyMembership("#root", "mallory", 10, 0, hlc, true, .{ .username = "mallory" }, T0);
+
+    // 30s re-burst: SAME hlc (idempotent CRDT no-op) → LWW collapses to `unchanged`,
+    // but the local last-seen MUST advance to T0+30k anyway.
+    const r1 = try table.applyMembership("#root", "mallory", 10, 0, hlc, true, .{ .username = "mallory" }, T0 + 30_000);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, r1.outcome);
+
+    // 60s re-burst: same again → stamp advances to T0+60k.
+    const r2 = try table.applyMembership("#root", "mallory", 10, 0, hlc, true, .{ .username = "mallory" }, T0 + 60_000);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, r2.outcome);
+
+    // Prune at T0+95k: 95k since T0 (> window) but only 35k since the last re-affirm
+    // at T0+60k (< window). A LIVE re-affirmed member must SURVIVE. Under the frozen-
+    // stamp regression this reaps her — the live NAMES-decay bug.
+    try std.testing.expectEqual(@as(usize, 0), table.pruneStale(T0 + 95_000, window));
+    // Still visible in the peer's roster (NAMES shows her).
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#root").len);
+    // Still ROUTABLE: the member and its nick->node route are the SAME RouteTable
+    // entry, so a spurious prune also drops the route and breaks cross-node PRIVMSG
+    // (the live "401 No such nick" symptom). Assert the route survives too.
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("mallory"));
+    try std.testing.expect(table.findMember("mallory") != null);
+}
+
+test "mesh route_table pruneStale still reaps a member whose re-affirmation genuinely stopped (zombie-reap intent preserved)" {
+    // The dual of the regression above: the liveness touch must NOT defeat the
+    // zombie reaper. A member whose PART/QUIT was lost stops being re-affirmed by the
+    // sender, so its local stamp stops advancing and it MUST age out after the TTL.
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const T0: i64 = 1_000_000;
+    const window: i64 = 90_000;
+    const hlc: u64 = 7;
+
+    _ = try table.applyMembership("#root", "ghost", 10, 0, hlc, true, .{ .username = "ghost" }, T0);
+    // One re-affirm at +30k, then the sender stops listing her (lost PART).
+    _ = try table.applyMembership("#root", "ghost", 10, 0, hlc, true, .{ .username = "ghost" }, T0 + 30_000);
+
+    // +100k since the last stamp (T0+30k) is 70k — still inside the window, survives.
+    try std.testing.expectEqual(@as(usize, 0), table.pruneStale(T0 + 100_000, window));
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#root").len);
+
+    // +125k: now 95k past the frozen T0+30k stamp (> window) → the zombie is reaped.
+    try std.testing.expectEqual(@as(usize, 1), table.pruneStale(T0 + 125_000, window));
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#root").len);
+    try std.testing.expect(table.nickNode("ghost") == null);
+    try std.testing.expect(table.findMember("ghost") == null);
+}
+
 test "applyChannelList tracks list masks with last-writer-wins tombstones" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();

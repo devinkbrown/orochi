@@ -2862,6 +2862,16 @@ pub const LinuxServer = struct {
     /// `rejected_origin_frames`/`rejected_signature_frames` audit counters that
     /// the direct-owned state frames use, but at the daemon (multi-hop) layer.
     rejected_relay_signatures: u64 = 0,
+    /// Count of inbound relayed MESSAGEs whose sender nick is homed on a KNOWN
+    /// mesh node that is NOT the frame's `origin_node` (a keyed-but-Byzantine peer
+    /// asserting a prefix for a user this receiver homes on a *different* node).
+    /// Such a message is dropped LOCALLY (never rendered / folded into local
+    /// state) but is still re-forwarded, so a downstream node with fresher routing
+    /// makes its own decision. Distinct from `rejected_relay_signatures`: the
+    /// signature check binds `origin_node` to the signing key, this binds the
+    /// *sender identity* to its home node (and also guards the legacy unsigned
+    /// path, where `origin_node` is otherwise fully spoofable).
+    rejected_relay_home_mismatch: u64 = 0,
     /// Per-reactor I/O (ring, connection table, listeners, wake). One entry per
     /// shard, heap-allocated at init (`reactors.len == clamped num_shards`).
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
@@ -4623,21 +4633,31 @@ pub const LinuxServer = struct {
         // Mesh anti-entropy: periodically re-burst this node's local channel
         // state to every established peer so anything missed during a split or a
         // reconnect race converges within the cadence instead of staying out of
-        // sync forever.
-        const now = self.nowMs();
-        if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
-            self.last_membership_resync_ms = now;
-            self.resyncMeshStateToPeers();
-            // Anti-entropy is additive (the re-burst only re-affirms PRESENT
-            // members), so a remote member whose PART/QUIT was never propagated
-            // would linger forever. Reap such stale projections from each peer's
-            // RouteTable on the same cadence: their local last-seen stamp froze
-            // when they departed, so they age past `stale_member_ttl_ms` while live
-            // members keep being refreshed. Runs under the completion-wide
-            // `world.lockWrite` (see
-            // onCompletion) on whichever reactor's timer fired; S2S links live on
-            // reactor 0, so it only does work there — exactly like resync.
-            self.pruneStaleMeshMembers(now);
+        // sync forever. Reactor-0-GATED: S2S peer links live only on reactor 0, so
+        // both `resyncMeshStateToPeers` and `pruneStaleMeshMembers` walk reactor 0's
+        // slots and do nothing on any other reactor. The `last_membership_resync_ms`
+        // guard is shared server state, so it MUST only be advanced by the reactor
+        // that actually performs the re-burst: on a multi-reactor node, letting a
+        // sibling reactor consume the guard (while doing no work, because it holds no
+        // peer links) starves reactor 0's real re-burst below the intended cadence.
+        // The receiver then never sees a re-affirmation within `stale_member_ttl_ms`
+        // and reaps every live peer-homed member (empty NAMES + broken cross-node
+        // PRIVMSG). Gating both the guard and the work to reactor 0 keeps the send
+        // cadence honest — mirroring the reactor-0-only sweeps above.
+        if (self.rx() == &self.reactors[0]) {
+            const now = self.nowMs();
+            if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
+                self.last_membership_resync_ms = now;
+                self.resyncMeshStateToPeers();
+                // Anti-entropy is additive (the re-burst only re-affirms PRESENT
+                // members), so a remote member whose PART/QUIT was never propagated
+                // would linger forever. Reap such stale projections from each peer's
+                // RouteTable on the same cadence: their local last-seen stamp froze
+                // when they departed, so they age past `stale_member_ttl_ms` while
+                // live members keep being refreshed. Runs under the completion-wide
+                // `world.lockWrite` (see onCompletion).
+                self.pruneStaleMeshMembers(now);
+            }
         }
         self.maybeWriteStats();
     }
@@ -7527,6 +7547,63 @@ pub const LinuxServer = struct {
         self.traceLog(.warn, .s2s, line);
     }
 
+    /// Resolve which mesh node a nick is homed on, from THIS receiver's routing
+    /// view (the per-link `route_table` fed by MEMBERSHIP/PRESENCE gossip). Returns
+    /// the home `NodeId` when any established peer link routes the nick, or `null`
+    /// when this node has not yet learned where the nick lives. Both the route
+    /// table's node id and a relay frame's `origin_node` are stamped from the
+    /// ORIGIN's `config.node_id` (membership gossip and the relay codec agree on
+    /// that id space — see `sendMembership`/`origin_node = self.config.node_id`), so
+    /// the two are directly comparable. First established link that knows the nick
+    /// wins; a converged mesh agrees across links.
+    fn meshNickHomeNode(self: *LinuxServer, nick: []const u8) ?s2s_link.NodeId {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (link.routeNickNode(nick)) |node| return node;
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    if (link.routeNickNode(nick)) |node| return node;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Inbound sender-identity binding: true when the relayed message's sender nick
+    /// is homed on a mesh node this receiver KNOWS, and that home is NOT the frame's
+    /// claimed `origin_node`. That is the spoof the origin-signature check cannot
+    /// catch on its own — `source_nick`/`source_prefix` are NOT covered by the
+    /// signed transcript (see `message_relay.originTranscript`), so a keyed peer can
+    /// author a validly-signed frame from its OWN node while rendering another
+    /// node's user's prefix. The receiver's route table homes that user elsewhere,
+    /// so the claim is rejected here. Deliberately account-INDEPENDENT: `account` is
+    /// origin-controlled/unsigned and must never wave a mismatched sender through.
+    /// An UNKNOWN nick (route not yet learned) returns false — the message follows
+    /// the existing deliver+re-forward path so cross-node delivery is not stranded
+    /// by convergence lag. See the TODO in `deliverRelay` for the stricter
+    /// fail-closed-on-unknown + transcript-signing hardening left as follow-up.
+    fn relaySenderHomeMismatch(self: *LinuxServer, source_nick: []const u8, origin_node: u64) bool {
+        const home = self.meshNickHomeNode(source_nick) orelse return false;
+        return home != origin_node;
+    }
+
+    /// Account + audit a relayed message dropped locally because its sender nick is
+    /// homed on a different node than the frame claims. Mirrors
+    /// `recordRelaySignatureReject`, on the dedicated home-mismatch counter.
+    fn recordRelayHomeMismatch(self: *LinuxServer, msg: s2s_link.RelayMessage, home_node: u64) void {
+        self.rejected_relay_home_mismatch +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped relayed {s} from {s} claiming origin {d}: nick is homed on node {d}",
+            .{ msg.verb.commandWord(), msg.source_nick, msg.origin_node, home_node },
+        ) catch "dropped relayed message: sender nick homed on a different node";
+        self.traceLog(.warn, .s2s, line);
+    }
+
     /// Sign a relay message's canonical origin transcript in place at the ORIGIN
     /// (this node authored it), stamping `origin_pubkey`/`origin_sig` so every hop
     /// can verify it. No-op (legacy unsigned path) when this node has no node
@@ -7730,6 +7807,32 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // Sender-identity binding: a keyed-but-Byzantine peer can author a frame
+        // (even a validly-SIGNED one — `source_nick`/`source_prefix` are excluded
+        // from the origin transcript) that renders another node's user's prefix.
+        // If this receiver homes that nick on a KNOWN node other than the claimed
+        // `origin_node`, the claim is a cross-node impersonation: drop it locally
+        // (never render / fold into history) but still re-forward so a downstream
+        // node with fresher routing decides for itself. Account is NOT consulted —
+        // it is origin-controlled and unsigned.
+        //
+        // TODO(mesh-nick-binding): follow-up hardening — (1) fold `source_nick`
+        // into `message_relay.originTranscript` (a WIRE change: bump the relay
+        // version + keep a legacy-decode arm) so a signed frame cannot even author
+        // a mismatched prefix; (2) consider fail-closed-on-UNKNOWN once cross-node
+        // presence convergence is guaranteed, so an unlearned sender is dropped
+        // rather than delivered. Both left out here to avoid regressing legitimate
+        // convergence-lagged / legacy-unsigned cross-node delivery.
+        if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node)) {
+            self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
+            const drop_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
+                .{ .channel = clean_msg.target }
+            else
+                .{ .nick = clean_msg.target };
+            _ = self.relayToPeers(clean_msg, drop_scope);
+            return;
+        }
+
         if (world_model.isChannelName(clean_msg.target)) {
             // Receiver-side defense-in-depth: re-enforce THIS node's channel
             // policy (+n/+m/+M/+b/+Z) against the REMOTE sender before delivering
@@ -7849,6 +7952,14 @@ pub const LinuxServer = struct {
         if (self.nickIsLiveLocal(msg.source_nick) and
             !self.localNickSameAccount(msg.source_nick, msg.account))
         {
+            _ = self.relayToPeers(msg, reforward);
+            return;
+        }
+        // Sender-identity binding (see deliverRelay): a nick homed on a KNOWN node
+        // other than the claimed origin is a cross-node impersonation — drop the
+        // local WHISPER (never render it to the recipient) but still re-forward.
+        if (self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node)) {
+            self.recordRelayHomeMismatch(msg, self.meshNickHomeNode(msg.source_nick) orelse msg.origin_node);
             _ = self.relayToPeers(msg, reforward);
             return;
         }
@@ -35628,6 +35739,81 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
         server.deliverRelay(msg);
         try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
     } else return error.SkipZigTest;
+}
+
+test "deliverRelay binds sender nick to its home node: cross-node impersonation is dropped, legit delivered, unknown passes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Local recipient of the relayed DMs.
+    const target_id = try addTestLocalClient(&server, "Target", null);
+    const target = server.connFor(target_id).?;
+
+    // A peer link (node 1) that homes "ricky" on node 1 via a MEMBERSHIP gossip.
+    // Keyless/plaintext interop mirrors the existing mesh-LIST scaffolding.
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi", .config = .{ .require_signed_frames = false } });
+    defer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi", .config = .{ .require_signed_frames = false } });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#room", "ricky", 0, 100, true, .{ .username = "ricky", .host = "h" }, "");
+    try pumpLinkPair(&peer, link, alloc);
+    try std.testing.expect(link.established());
+    // Sanity: this receiver now homes "ricky" on node 1.
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, 1), server.meshNickHomeNode("ricky"));
+
+    const base = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "Target",
+        .source_nick = "ricky",
+        .source_prefix = "ricky!ricky@h",
+        .account = "",
+        .tags = "",
+        .text = "legit cross-node line",
+        .origin_node = 1, // matches ricky's home
+        .hlc = 1001,
+    };
+
+    // (1) Legitimate: origin_node == ricky's home (1) => delivered, no reject.
+    server.deliverRelay(base);
+    try expectContains(target.send_buf[0..target.send_len], ":ricky!ricky@h PRIVMSG Target :legit cross-node line\r\n");
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_home_mismatch);
+
+    // (2) Impersonation: a keyed peer authors a frame claiming origin_node 777 while
+    // asserting "ricky" (whom THIS node homes on node 1). It must be dropped locally
+    // (not rendered) and counted. `account` is empty here and irrelevant to the bind.
+    target.send_len = 0;
+    var spoof = base;
+    spoof.origin_node = 777;
+    spoof.hlc = 1002; // distinct hlc so the seen-set does not dedup it
+    spoof.text = "IMPERSONATED do not render";
+    server.deliverRelay(spoof);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+    try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "IMPERSONATED") == null);
+
+    // (3) Unknown sender (no route home) still delivers — the binding rejects only a
+    // KNOWN-and-different home, never strands convergence-lagged / legacy traffic.
+    target.send_len = 0;
+    var unknown = base;
+    unknown.source_nick = "ghostly";
+    unknown.source_prefix = "ghostly!g@elsewhere";
+    unknown.origin_node = 555;
+    unknown.hlc = 1003;
+    unknown.text = "unknown sender still flows";
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, null), server.meshNickHomeNode("ghostly"));
+    server.deliverRelay(unknown);
+    try expectContains(target.send_buf[0..target.send_len], ":ghostly!g@elsewhere PRIVMSG Target :unknown sender still flows\r\n");
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch); // unchanged
 }
 
 // ---------------------------------------------------------------------------
