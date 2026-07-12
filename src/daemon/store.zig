@@ -299,7 +299,15 @@ pub const OroStore = struct {
             const expected_sum = readU32(header[4..8]);
             const record_end = offset + payload_len;
 
-            if (payload_len > self.cfg.max_record_bytes) return StoreError.RecordTooLarge;
+            if (payload_len > self.cfg.max_record_bytes) {
+                // A length that overruns the file is a torn header from a crash
+                // mid-append: only the final record can be in-flight (appendRecord
+                // fsyncs one record at a time), so truncate the trailing region
+                // exactly like the short-payload path below. A fully-present
+                // oversize record is a real limit violation and stays fatal.
+                if (replay_kind == .wal and record_end > stat.size) return record_offset;
+                return StoreError.RecordTooLarge;
+            }
             if (stat.size - offset < payload_len) {
                 if (replay_kind == .wal) return record_offset;
                 return StoreError.BadRecord;
@@ -313,7 +321,19 @@ pub const OroStore = struct {
                 return StoreError.BadRecord;
             }
             if (checksum(payload) != expected_sum) {
-                if (replay_kind == .wal and record_end == stat.size) return record_offset;
+                // A checksum failure with too little room after it for even
+                // another record header is the final in-flight record (crash
+                // mid-append): truncate the torn tail. Records are written
+                // gaplessly and each appendRecord fsyncs one record, so only the
+                // last write can be in-flight and any 1..7 trailing bytes are its
+                // torn remnant — a real following record needs a full header plus
+                // payload. If a full record COULD still follow (>= record_header_len
+                // bytes remain), this is interior corruption and truncating would
+                // silently discard the committed records after it, so fail closed.
+                // `record_end == stat.size` (nothing follows) is the historical
+                // at-EOF case, subsumed here.
+                if (replay_kind == .wal and stat.size - record_end < record_header_len)
+                    return record_offset;
                 return StoreError.ChecksumMismatch;
             }
             self.applyPayload(payload) catch |err| switch (err) {
@@ -787,6 +807,82 @@ test "torn WAL tail is truncated at open so a later append cannot poison the log
     }
 
     var store = try openTestStore(tmp, "poison.wal");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+    try std.testing.expectEqualStrings("also-ok", store.family(.accounts).get("bob").?);
+}
+
+test "zero-filled final WAL tail is truncated at open (in-flight torn tail)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "zerotail.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "ok");
+    }
+
+    // Crash mid-append leaves a short run of zero bytes (a partial header +
+    // partial payload) after the valid prefix. A zero header decodes to a
+    // 0-length record whose empty-payload checksum (0x811c9dc5) never matches
+    // the zero sum, and record_end lands BEFORE EOF because trailing zeros
+    // remain — the exact asymmetry that used to hard-fail replay.
+    {
+        var file = try tmp.dir.openFile(std.testing.io, "zerotail.wal", .{ .mode = .read_write, .allow_directory = false });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        const zeros = std.mem.zeroes([12]u8);
+        try file.writePositionalAll(std.testing.io, &zeros, stat.size);
+        try file.sync(std.testing.io);
+    }
+
+    // First reopen tolerates AND truncates the torn tail; a later append must
+    // land on the valid prefix, so the second reopen sees both records (an
+    // untruncated log would refuse to open on the second pass).
+    {
+        var store = try openTestStore(tmp, "zerotail.wal");
+        defer store.deinit();
+        try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+        try store.family(.accounts).put("bob", "also-ok");
+    }
+
+    var store = try openTestStore(tmp, "zerotail.wal");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+    try std.testing.expectEqualStrings("also-ok", store.family(.accounts).get("bob").?);
+}
+
+test "oversize final WAL header is truncated at open (in-flight torn tail)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "oversize.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "ok");
+    }
+
+    // Crash mid-append leaves a header whose declared length overruns the file
+    // (here max_record_bytes+1) with no payload behind it.
+    {
+        var file = try tmp.dir.openFile(std.testing.io, "oversize.wal", .{ .mode = .read_write, .allow_directory = false });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        var header: [record_header_len]u8 = undefined;
+        writeU32(header[0..4], default_max_record_len + 1);
+        writeU32(header[4..8], 0);
+        try file.writePositionalAll(std.testing.io, &header, stat.size);
+        try file.sync(std.testing.io);
+    }
+
+    {
+        var store = try openTestStore(tmp, "oversize.wal");
+        defer store.deinit();
+        try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+        try store.family(.accounts).put("bob", "also-ok");
+    }
+
+    var store = try openTestStore(tmp, "oversize.wal");
     defer store.deinit();
     try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
     try std.testing.expectEqualStrings("also-ok", store.family(.accounts).get("bob").?);
