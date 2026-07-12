@@ -621,6 +621,31 @@ pub const S2sPeer = struct {
         return self.remote_node_id;
     }
 
+    /// The remote peer's own server description, or null before establishment /
+    /// when the peer carried none.
+    ///
+    /// The peer's description can land in the registry under EITHER of two u64
+    /// node-id spaces: the id it advertised in the direct handshake (for a
+    /// secured link, `shortId(identity)`; for a plaintext link, its
+    /// `config.node_id`) and the id its gossiped registry/membership frames carry
+    /// — and, depending on which leg populated which entry, only one of them may
+    /// hold a non-empty description. Keying by `remoteNodeId()` therefore missed
+    /// the populated entry (LINKS fell back to "Suimyaku peer") while the WHOIS
+    /// 312 path, keyed by the membership-frame `member.node`, resolved it.
+    ///
+    /// Resolve by the one identifier both spaces agree on — the server NAME —
+    /// preferring an entry that actually carries a description. Borrowed from the
+    /// registry entry; valid until the next mutation.
+    pub fn remoteDescription(self: *const S2sPeer) ?[]const u8 {
+        if (!self.established or self.remote_name.len == 0) return null;
+        for (self.registry.list()) |node| {
+            if (node.description.len != 0 and std.ascii.eqlIgnoreCase(node.name, self.remote_name)) {
+                return node.description;
+            }
+        }
+        return null;
+    }
+
     pub fn routeNickNode(self: *const S2sPeer, nick: []const u8) ?NodeId {
         return self.routes.nickNode(nick);
     }
@@ -2687,6 +2712,70 @@ test "two s2s peer drivers handshake and converge channel CRDT state" {
     try a.sendDelta(&delta, a_to_b.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xD317A);
     try std.testing.expect(ChannelCrdt.eql(&a_state, &b_state));
+}
+
+// Regression: LINKS rendered a remote peer's description as the generic
+// "Suimyaku peer" placeholder because it keyed `nodeDescription` on
+// `remoteNodeId()` (a secured link's authenticated shortId), while the peer's
+// real description was homed under its OTHER node-id space (its gossiped
+// config.node_id) — the same space the working WHOIS 312 path resolves via
+// `member.node`. `remoteDescription()` must resolve by the stable server NAME,
+// so it finds the populated entry regardless of which u64 key holds it.
+test "remoteDescription resolves the peer description by name across the node-id split" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    // `b` carries NO handshake description (mirrors the plaintext accept path,
+    // which passes an empty description), so a's direct-handshake registry entry
+    // for `b` — keyed under b's advertised node id (2, == a.remoteNodeId) — has an
+    // empty description.
+    var b = try S2sPeer.init(.{
+        .allocator = allocator,
+        .state = &b_state,
+        .clock = tc.clock(),
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 2000,
+        .server_name = "b.test",
+        .description = "",
+        .config = .{ .link = .{ .gossip_interval_ms = 10, .repair_interval_ms = 20, .gossip_config = .{ .fanout = 1 } } },
+    });
+    defer b.deinit();
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+    try std.testing.expect(a.established);
+
+    // The OLD path: keyed on remoteNodeId() (2), the description is empty →
+    // exactly the null that made LINKS fall back to the placeholder.
+    try std.testing.expectEqual(@as(?NodeId, 2), a.remoteNodeId());
+    try std.testing.expectEqual(@as(?[]const u8, null), a.nodeDescription(2));
+
+    // Now the peer's real description arrives gossiped under its OTHER node-id
+    // space (77), keyed under the SAME server name.
+    _ = try a.registry.addOrUpdate(.{
+        .node_id = 77,
+        .name = "b.test",
+        .description = "i fucking hate winter",
+        .hopcount = 1,
+        .uplink = 1,
+        .last_seen_ms = 3000,
+    });
+
+    // The FIX: resolve by name, finding the populated entry regardless of key.
+    try std.testing.expectEqualStrings("i fucking hate winter", a.remoteDescription().?);
 }
 
 test "two s2s peer drivers repair divergent state without explicit delta send" {

@@ -426,6 +426,14 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.remoteName() else "";
     }
 
+    /// The remote peer's own gossiped server description, resolved in the
+    /// route-table/registry id space (matching WHOIS 312) rather than via
+    /// `remoteNodeId()` (the authenticated shortId, which does NOT key the
+    /// registry). Null before the inner link stands up / when none was carried.
+    pub fn remoteDescription(self: *const SecuredLink) ?[]const u8 {
+        return if (self.inner) |l| l.remoteDescription() else null;
+    }
+
     /// Which node (if known) owns `nick`, per this peer's route table.
     pub fn routeNickNode(self: *const SecuredLink, nick: []const u8) ?u64 {
         return if (self.inner) |l| l.routeNickNode(nick) else null;

@@ -271,6 +271,12 @@ pub const S2sLink = struct {
         return self.peer.remoteName();
     }
 
+    /// The remote peer's own gossiped server description, resolved in the
+    /// route-table/registry id space (matching WHOIS 312), or null when unknown.
+    pub fn remoteDescription(self: *const S2sLink) ?[]const u8 {
+        return self.peer.remoteDescription();
+    }
+
     /// The remote node id once learned from the handshake (null before).
     pub fn remoteNodeId(self: *const S2sLink) ?NodeId {
         return self.peer.remoteNodeId();

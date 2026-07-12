@@ -28998,15 +28998,18 @@ pub const LinuxServer = struct {
 
     /// The handshake-gossiped description of the established S2S peer on `conn`,
     /// or null when not an established peer / no description was carried.
+    ///
+    /// Resolves via `remoteDescription()`, which keys the registry through the
+    /// peer's name → route-table node id (the same id space as the WHOIS 312
+    /// path). Using `remoteNodeId()` here was WRONG for a secured link: it
+    /// returns the authenticated Ed25519 shortId, which is a different u64 than
+    /// the peer's advertised registry node id, so `nodeDescription` missed and
+    /// LINKS fell back to the generic "Suimyaku peer" placeholder.
     fn peerDescription(conn: *const ConnState) ?[]const u8 {
         if (conn.s2s) |l| {
-            if (l.established()) if (l.remoteNodeId()) |nid| {
-                if (l.nodeDescription(nid)) |d| if (d.len != 0) return d;
-            };
+            if (l.established()) if (l.remoteDescription()) |d| if (d.len != 0) return d;
         } else if (conn.s2s_secured) |l| {
-            if (l.established()) if (l.remoteNodeId()) |nid| {
-                if (l.nodeDescription(nid)) |d| if (d.len != 0) return d;
-            };
+            if (l.established()) if (l.remoteDescription()) |d| if (d.len != 0) return d;
         }
         return null;
     }
