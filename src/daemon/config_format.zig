@@ -2304,6 +2304,58 @@ test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
     , .{}));
 }
 
+test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of-range" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\max_accounts = 2048
+        \\max_per_account = 9
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 2048), cfg.sessions.max_accounts);
+    try testing.expectEqual(@as(u32, 9), cfg.sessions.max_per_account);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(@as(u64, 65536), omitted.sessions.max_accounts);
+    try testing.expectEqual(@as(u32, 64), omitted.sessions.max_per_account);
+
+    // Zero and above-max are hard parse errors, never a silent clamp.
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\max_per_account = 0
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\max_per_account = 1000001
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\max_accounts = 0
+        \\
+    , .{}));
+}
+
 test "parseToml: [filter] koshi limits project with bounded policy ranges" {
     const allocator = testing.allocator;
     const text =

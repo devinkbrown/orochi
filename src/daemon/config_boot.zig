@@ -1122,6 +1122,34 @@ test "minimal config: unspecified optional fields keep defaults" {
     try testing.expectEqual(@as(u16, 0), loaded.config.s2s_port); // unspecified -> default
 }
 
+test "[sessions] registry sizing projects onto the boot config and defaults to 64" {
+    const allocator = testing.allocator;
+    const base = server.Config{ .port = 6680 };
+
+    // Omitted section: the built-in defaults reach the server config the
+    // SessionStore is constructed from (server.zig initWithConfig).
+    var defaults = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", base, .{});
+    defer defaults.deinit(allocator);
+    try testing.expectEqual(@as(u64, 65536), defaults.config.session_max_accounts);
+    try testing.expectEqual(@as(u32, 64), defaults.config.session_max_per_account);
+
+    // Explicit override projects through loadFromText -> mapToServerConfig.
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\max_accounts = 2048
+        \\max_per_account = 9
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, base, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(u64, 2048), loaded.config.session_max_accounts);
+    try testing.expectEqual(@as(u32, 9), loaded.config.session_max_per_account);
+}
+
 test "tls section projects onto the boot tls config" {
     const allocator = testing.allocator;
     const text =

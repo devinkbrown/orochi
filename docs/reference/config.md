@@ -371,12 +371,12 @@ OroStore append-only WAL/snapshot and recent-mutation feed limits. These values 
 
 ## `[sessions]`
 
-Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/config_format.zig:384`, mapping at `src/daemon/config_boot.zig:58`.
+Source: struct `Sessions` at `src/daemon/config_format.zig:429`, parsing at `src/daemon/config_format.zig:1189`, mapping at `src/daemon/config_boot.zig:166`, consumed by the SessionStore at construction (`src/daemon/server.zig:3642`).
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `max_accounts` | integer | `65536` | `1..4294967295` | Multi-session/bouncer account registry size (`src/daemon/server.zig:1024`). |
-| `max_per_account` | integer | `64` | `1..1000000` | Max live sessions per account (`src/daemon/server.zig:1024`). |
+| `max_accounts` | integer | `65536` | `1..4294967295` | Multi-session/bouncer account registry size (`src/daemon/sessions.zig:24`). |
+| `max_per_account` | integer | `64` | `1..1000000` | Max live bouncer/multi-device sessions per account, enforced at session attach (`src/daemon/sessions.zig:102`). Note: session-sync fan-out surfaces currently snapshot at most 64 sessions per account (`sessions.zig snapshot_capacity`), so values above `64` raise the attach cap but do not widen sibling mirroring. |
 
 ## `[ircv3]`
 
