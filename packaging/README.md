@@ -52,7 +52,7 @@ Because the build is hermetic (pure Zig, no C interop) and static
 reproducible**. You never have to trust the release machine.
 
 ```sh
-packaging/release.sh          # → dist/orochi-<ver>-x86_64-linux-musl, SHA256SUMS, orochi.cdx.json
+packaging/release.sh          # → dist/{orochi-<ver>-x86_64-linux-musl, SHA256SUMS, orochi.cdx.json, orochi.provenance.json}
 packaging/verify-release.sh   # rebuild from source with a clean cache; must match SHA256SUMS
 ```
 
@@ -61,14 +61,51 @@ tampered or differently-sourced binary is caught mechanically. Both scripts
 refuse to run on a dirty tree (which would embed a non-reproducible `-dirty`
 version).
 
-### Signing
+**The whole release is reproducible, not just the binary** — for a given
+`(commit, Zig toolchain)`. The SBOM carries no timestamps and the provenance pins
+its build times *and* its source `ref` to the commit (not the wall clock or the
+local branch), so re-running `release.sh` on the same commit with the same `zig`
+reproduces every file — binary, SBOM, provenance, and `SHA256SUMS` — bit-for-bit.
+(Reproducible builds always require a fixed toolchain; Orochi's is pinned in
+`build.zig.zon`'s `minimum_zig_version`.) Only `git`, `zig`, and `sha256sum` are
+required; `cosign` and `jq` are optional and degrade to a note when absent.
+
+`verify-release.sh` rebuilds and proves the **binary** is byte-identical, binds
+the shipped binary to the manifest, and re-checks the SBOM/provenance integrity;
+the SBOM and provenance are reproducible *by construction* (no wall-clock inputs),
+so re-running `release.sh` on the same commit regenerates them identically.
+
+### `SHA256SUMS` — one manifest, all artifacts
+
+`SHA256SUMS` lists the binary (first line), the SBOM, and the provenance. A
+single cosign signature over it therefore anchors the integrity of the entire
+release. `verify-release.sh` rebuilds the binary and, if the SBOM/provenance are
+present, re-checks them against the manifest to catch post-publish tampering.
+
+### Signing (cosign)
 
 `release.sh` cosign-signs `SHA256SUMS` when a signer is configured
-(`COSIGN_KEY=...` or keyless `COSIGN_EXPERIMENTAL=1` in CI OIDC), producing
-`SHA256SUMS.sig`. `verify-release.sh` checks it when `COSIGN_PUBKEY` is set.
+(`COSIGN_KEY=<key>` for a key file, or keyless `COSIGN_EXPERIMENTAL=1` under CI
+OIDC), producing `SHA256SUMS.sig`. `verify-release.sh` checks it when
+`COSIGN_PUBKEY` is set. If `cosign` is not installed or no signer is configured,
+signing is **skipped with a note** — the release still builds and verifies.
 
-### SBOM
+### SBOM (CycloneDX)
 
-`orochi.cdx.json` is a CycloneDX SBOM — and it fits on one screen, because the
-component graph is a single binary with **zero external dependencies**. That is
-the whole security pitch: the software bill of materials is one line.
+`orochi.cdx.json` is a CycloneDX 1.5 SBOM — and it fits on one screen, because the
+component graph is a single binary with **zero external dependencies**. The only
+thing recorded is the Zig toolchain that produced it, as a build *tool* (not a
+runtime component). That is the whole security pitch: the software bill of
+materials is effectively one line.
+
+### Provenance (SLSA v1 shape)
+
+`orochi.provenance.json` is an in-toto Statement carrying an SLSA-provenance-v1
+predicate. It records **what** was built (the artifact + its sha256), **from
+what** (repo, ref, full commit), **how** (the exact `zig build …` command +
+toolchain version), and **by whom** (the `release.sh` builder id). Because it is
+listed in `SHA256SUMS`, the cosign signature authenticates it — the local-builder
+equivalent of SLSA L2. Running the identical steps on a hosted runner (e.g. the
+`slsa-github-generator` GitHub Action with an isolated builder identity) is what
+elevates this to *true* SLSA L2/L3; the field shapes here are drop-in compatible
+with that upgrade.

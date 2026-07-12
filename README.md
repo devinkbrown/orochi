@@ -23,6 +23,38 @@ native **Suimyaku + Tsumugi** cryptographic mesh.
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
 [Security](SECURITY.md) · [License](LICENSE)
 
+## From clone to live chat
+
+Orochi is a single static binary with **zero external dependencies** — no database
+server, no OpenSSL, no runtime to install.
+
+**Docker (build from source).** There is no published registry image yet, so you
+build `orochi:latest` locally from the verified static binary:
+
+```sh
+git clone https://github.com/devinkbrown/orochi && cd orochi
+packaging/release.sh                                   # reproducible static binary → dist/
+docker build -f packaging/Dockerfile -t orochi:latest .
+docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest
+```
+
+**Native (fastest to a running node).**
+
+```sh
+zig build                                              # → zig-out/bin/orochi
+./zig-out/bin/orochi packaging/orochi.quickstart.toml
+```
+
+Either way you get a working node — **`ws://localhost:8080`** for the Onyx browser
+client and **`irc://localhost:6667`** for any IRC client. The node's sovereign
+identity key and account store self-generate in the data directory on first run;
+nothing to configure. For production, swap the quickstart config for a TLS config
+(real certs or the built-in ACME client) and set `ws_plain = false`.
+
+The binary is **bit-for-bit reproducible** and ships a CycloneDX SBOM plus an SLSA
+provenance attestation — see [`packaging/`](packaging/README.md) to rebuild and
+verify it yourself (`packaging/verify-release.sh`).
+
 ## Highlights
 
 - **Pure Zig, top to bottom** — substrate, crypto, TLS, and daemon, with zero C dependencies.
