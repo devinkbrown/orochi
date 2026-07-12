@@ -141,7 +141,7 @@ pub const Config = struct {
     /// Network-wide presentation. `name` is advertised in ISUPPORT `NETWORK=`
     /// and the registration welcome burst.
     pub const Network = struct {
-        name: []const u8 = "Orochi",
+        name: []const u8 = "Onyx",
         /// This server's own name (source prefix + S2S identity). Unique per node.
         server_name: ?[]const u8 = null,
         /// Human description of THIS node, shown in VERSION and WHOIS 312 and
@@ -857,7 +857,7 @@ pub const Config = struct {
         const webpush_vapid_key_path = try allocator.dupe(u8, "orochi-webpush-vapid.key");
         errdefer allocator.free(webpush_vapid_key_path);
         return .{
-            .network = .{ .name = try allocator.dupe(u8, "Orochi") },
+            .network = .{ .name = try allocator.dupe(u8, "Onyx") },
             .admin = .{
                 .location = try allocator.dupe(u8, "Orochi IRC network"),
                 .email = try allocator.dupe(u8, "admin@orochi.local"),
@@ -1929,6 +1929,36 @@ test "parseToml: network discoverable defaults private and parses opt-in" {
     , .{});
     defer public.deinit(allocator);
     try testing.expect(public.network.discoverable);
+}
+
+test "parseToml: network name defaults to Onyx and parses an override" {
+    const allocator = testing.allocator;
+
+    // No [network] name -> the built-in public network-name default (Onyx),
+    // which feeds ISUPPORT NETWORK= and the 001 RPL_WELCOME burst via
+    // config_boot -> setNetworkName at boot.
+    var dflt = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqualStrings("Onyx", dflt.network.name);
+
+    // An explicit [network] name overrides the default verbatim.
+    var named = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[network]
+        \\name = "Acme"
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{});
+    defer named.deinit(allocator);
+    try testing.expectEqualStrings("Acme", named.network.name);
 }
 
 test "parseToml: wasm allowed_caps parses hostcall policy and rejects unknown tokens" {

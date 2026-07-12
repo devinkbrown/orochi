@@ -34,8 +34,8 @@ id = 1
 # --- [network] — network presentation ----------------------------------------
 [network]
 # Network name advertised in ISUPPORT NETWORK= and the registration welcome
-# burst. Default: "Orochi".
-name = "Orochi"
+# burst. Default: "Onyx".
+name = "Onyx"
 # This server's OWN name — the source prefix of server-originated lines (welcome
 # numerics, the !weather/!news bot replies, etc.) and the identity presented to
 # S2S peers. MUST be unique per node in a mesh so replies/identities don't

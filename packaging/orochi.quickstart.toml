@@ -13,7 +13,7 @@
 id = 1 # this node's mesh id; the sovereign identity key self-generates on first run
 
 [network]
-name = "Orochi"
+name = "Onyx"
 server_name = "localhost"
 description = "A self-hosted Orochi node."
 
