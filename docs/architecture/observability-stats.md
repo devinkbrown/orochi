@@ -62,7 +62,7 @@ The format is a 4-byte magic followed by an explicit format-version byte. The cu
 ```json
 {
   "generated_at": 1700000000,
-  "network": "IRCXNet",
+  "network": "Onyx",
   "node": "eshmaki.me",
   "users_online": 214,
   "network_days": [{"date": "2026-06-28", "messages": 4200}, "...last 14..."],
@@ -111,7 +111,7 @@ The same chanstats flush also emits `status.json` beside the channel stats ([src
 ```json
 {
   "generated_at": 1700000000,
-  "network": "IRCXNet",
+  "network": "Onyx",
   "node": "eshmaki.me",
   "description": "Orochi flagship node",
   "icon_url": "https://example.test/orochi.png",
@@ -129,7 +129,7 @@ The same chanstats flush also emits `status.json` beside the channel stats ([src
     "listed": true,
     "rank_score": 2678,
     "last_active": 1700000000,
-    "entry": {"network": "IRCXNet", "node": "eshmaki.me",
+    "entry": {"network": "Onyx", "node": "eshmaki.me",
               "description": "Orochi flagship node", "users_online": 214,
               "channels": 12, "messages": 2048, "active_channels_24h": 5}
   },

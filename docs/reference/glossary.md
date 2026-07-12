@@ -1,15 +1,40 @@
-# Codename glossary
+# Glossary & brand names
 
-*Audience: all readers. A key to the Orochi mythos vocabulary — each invented
-codename, what it actually is, and where it lives in the source. Every entry is
-cited to `src/`; the daemon's own `/INFO` body renders the same summary
-(`src/proto/server_about.zig:63`).*
+*Audience: all readers. The one authoritative key to the naming — the branded
+house (Onyx / Orochi / IRCXNet) and the Orochi mythos vocabulary. Each invented
+codename says what it actually is and where it lives in the source. Every
+codename entry is cited to `src/`; the daemon's own `/INFO` body renders the
+same subsystem summary (`src/proto/server_about.zig:63`). The site, the Onyx
+client, the MOTD, and every other doc defer to this file for what each name
+means.*
+
+## Brand & product names
+
+Three names, one product family — a branded house. Keep these distinct; do not
+use "IRCXNet" as a public product or network identity in new copy.
+
+| Name | What it is | Use it for |
+| --- | --- | --- |
+| **Onyx** | The consumer-facing **network and product** — the thing people join. It is the browser client (`/home/kain/onyx`, SolidJS) *and* the community/network that client connects to. | "Join **Onyx**." The network name, the web app, the brand a user sees. |
+| **Orochi** | The **engine**: the pure-Zig, clean-room daemon you self-host (`/home/kain/orochi`), the `orochi/*` protocol/config namespace, and the Japanese-mythos internal subsystem names below (Suimyaku, Sazanami, Tsumugi, Yoroi, Helix …). | "Run your own **Orochi** node." The daemon, the wire/config surface, the codebase. |
+| **IRCXNet** | **Retired** as a public identity. Survives **only** as a legacy/wire token where it is a literal value, not a brand — e.g. the `[cloak] suffix` tail (`kain.users.ircxnet`) and existing server/host slugs. | Never in new user-facing copy. Leave in place only as a wire/legacy literal. |
+| **IRCX** | The **protocol** (extended IRC: `PROP`/`ACCESS`/`EVENT`/`AUTH`). Unrelated to the retired "IRCXNet" name — do not conflate. | The wire protocol Orochi speaks. |
+| **Ink & Vermillion** | The **visual identity** — the palette/typography direction of the Onyx surfaces. | The look-and-feel, not the product name. |
+
+The **network name is operator-configured**, not hard-coded to any brand: `[network]
+name` sets the string emitted in the `001` welcome (`src/daemon/dispatch.zig:2089`),
+the `NETWORK` `005` token (`src/proto/isupport.zig:265`, `:350`), and the `/INFO`
+`Network:` line (`src/proto/server_about.zig:70`). The in-source **default is
+`Orochi`** (`src/daemon/config_format.zig:860`, `src/proto/isupport.zig:265`) — the
+neutral value a fresh self-hosted node advertises. The **flagship deployment's
+network is branded `Onyx`**; an operator running their own node picks their own
+name.
+
+## Subsystems
 
 Orochi names its major subsystems after Japanese mythos/terms rather than
 generic acronyms. First use of a codename in the guides and architecture docs
 links here.
-
-## Subsystems
 
 | Codename | What it is | Source |
 | --- | --- | --- |
