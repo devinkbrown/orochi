@@ -245,6 +245,30 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             return;
+        } else if (std.mem.eql(u8, first, "--version") or
+            std.mem.eql(u8, first, "-v") or std.mem.eql(u8, first, "-V"))
+        {
+            // The version banner already printed above; exit WITHOUT booting.
+            // (Previously `--version` fell through to the config-path branch,
+            // failed to read a file named "--version", kept defaults, and booted
+            // a stray daemon on port 6680.)
+            return;
+        } else if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
+            std.debug.print(
+                \\usage: orochi [CONFIG_PATH]
+                \\       orochi --check-config <path>
+                \\       orochi --version
+                \\       orochi acme-issue ...
+                \\       orochi delegated-credential inspect|validate ...
+                \\
+            , .{});
+            return;
+        } else if (first.len > 0 and first[0] == '-') {
+            // An unrecognized dash-flag must NEVER be treated as a config path — a
+            // real config path never starts with '-'. Treating it as one silently
+            // boots the DEFAULT identity (wrong ports/certs/opers). Fail loudly.
+            std.debug.print("orochi: unknown option '{s}' (try --help)\n", .{first});
+            std.process.exit(2);
         } else {
             config_path_arg = first;
         }
