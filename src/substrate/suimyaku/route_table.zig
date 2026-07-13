@@ -988,6 +988,23 @@ pub const RouteTable = struct {
         ident: MemberIdentity,
     ) Error!bool {
         try self.validateName(new_nick);
+
+        // Ownership guard (mesh identity == home node): a caller may only rename an
+        // entry HOMED on `node`. `renameNick` is reached from the wire
+        // (recvNickChange) with a PEER-CONTROLLED `old_nick` whose `node` is the
+        // sending peer's own id (pinned by acceptsDirectOrigin + the signed-frame
+        // origin check) — but that peer does not necessarily OWN `old_nick`. If
+        // old_nick currently routes to a DIFFERENT node, this is a cross-node
+        // hijack (a Byzantine admitted peer moving another node's nick onto
+        // itself); drop it wholesale and mutate nothing. The legitimate same-node
+        // rename and the collision-displacement path (which passes
+        // node = nickNode(nick)) both satisfy home == node and proceed. A nick with
+        // no route entry falls through — the roster loop below only ever renames
+        // entries it also owns (`m.node == node`).
+        if (self.nick_to_node.get(old_nick)) |home| {
+            if (home != node) return false;
+        }
+
         var existed = false;
 
         // nick_to_node: move old -> new (preserving the node mapping).
@@ -1018,6 +1035,10 @@ pub const RouteTable = struct {
             const list = entry.value_ptr;
             const idx = list.find(old_nick) orelse continue;
             const m = &list.entries.items[idx];
+            // Never re-home a roster entry owned by a DIFFERENT node — defends the
+            // cross-node hijack even if the route index (nick_to_node) has diverged
+            // from a roster row (degraded index; see applyMembership).
+            if (m.node != node) continue;
             const new_owned = self.allocator.dupe(u8, new_nick) catch continue;
             self.allocator.free(m.nick);
             m.nick = new_owned;
@@ -1210,6 +1231,52 @@ test "mesh route_table renameNick keeps nick_count consistent across the collisi
     // consistent count of 1 there is room for more nicks up to the cap.
     try table.setNickLocation("dave", 30);
     try std.testing.expectEqual(@as(usize, 2), table.nickCount());
+}
+
+test "mesh route_table renameNick rejects hijacking a nick homed on another node" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // "victim" is homed on node 10. A Byzantine peer on node 20 sends a rename
+    // for a nick it does NOT own (origin_node is pinned to the peer, but old_nick
+    // is peer-controlled). The ownership guard MUST drop it wholesale.
+    try table.setNickLocation("victim", 10);
+    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+
+    try std.testing.expect(!(try table.renameNick("victim", "pwned", 20, .{})));
+
+    // Nothing moved: victim stays homed on 10, the attacker's target never
+    // materialised, and the count is untouched.
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("victim"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("pwned"));
+    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+}
+
+test "mesh route_table renameNick allows same-node rename but not cross-node roster hijack" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // "alice" homed on node 10, present in #chan on node 10 (route + roster).
+    _ = try table.applyMembership("#chan", "alice", 10, 0, 1, true, .{}, 0);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+
+    // Legitimate same-node rename (node 10 renames ITS OWN alice) still works and
+    // moves both the route and the roster entry.
+    try std.testing.expect(try table.renameNick("alice", "allie", 10, .{}));
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("allie"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
+    try std.testing.expect(table.findMember("allie") != null);
+    try std.testing.expect(table.findMember("alice") == null);
+
+    // Cross-node attempt: node 20 tries to rename node 10's live user. Rejected —
+    // route and roster stay homed on 10 under the original nick.
+    try std.testing.expect(!(try table.renameNick("allie", "gotcha", 20, .{})));
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("allie"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("gotcha"));
+    if (table.findMember("allie")) |m| {
+        try std.testing.expectEqual(@as(NodeId, 10), m.node);
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(table.findMember("gotcha") == null);
 }
 
 test "channel fan-out node set" {
