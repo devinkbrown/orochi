@@ -4634,6 +4634,13 @@ pub const LinuxServer = struct {
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
             // Evict unlocked, decayed-to-floor login-throttle records too.
             _ = self.login_throttle.sweep(self.nowMs());
+            // Evict staged cross-mesh session-migration capsules whose reclaim
+            // window lapsed — same TTL as the mesh reclaim token that unlocks
+            // them, so a capsule never outlives the only token that could
+            // consume it. Together with `PendingMigrations.max_entries` this
+            // bounds what a signed peer can pin in memory. Reactor-0-gated
+            // shared-state maintenance like the sweeps above.
+            if (self.pending_migrations) |*pm| _ = pm.sweep(self.nowMs(), mesh_reclaim_ttl_ms);
         }
         self.sweepTempModes();
         // Keep the IRCX ACCESS store clock current on every reactor (a JOIN
@@ -16587,7 +16594,13 @@ pub const LinuxServer = struct {
     /// reconnect against the still-bound listener.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
-        return self.performUpgrade(conn);
+        return self.performUpgrade(conn) catch |e| switch (e) {
+            // A refusal, not a failure: the oper already got the NOTICE
+            // explaining why; swallowing it here keeps the connection alive
+            // (a propagated handler error would tear it down).
+            error.MultiShardUpgradeUnsupported => {},
+            else => e,
+        };
     }
 
     /// Emit one UPGRADE progress line: a NOTICE to the requesting oper when the
@@ -16754,10 +16767,71 @@ pub const LinuxServer = struct {
         return sealed;
     }
 
+    /// Seal every staged cross-mesh session-migration entry (`pending_migrations`)
+    /// into one `.pending_migration` capsule each — a `session_migrate.encode`
+    /// wire blob (token + account + verified snapshot) — so a migration a peer
+    /// shipped just before the swap survives the USR2 instead of dying with the
+    /// predecessor (the client's reclaim would silently fall back to the legacy
+    /// redirect). Best-effort: an entry that cannot be sealed is skipped, never
+    /// fatal to the upgrade. Returns entries sealed.
+    fn sealPendingMigrations(
+        self: *LinuxServer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) usize {
+        const pm = if (self.pending_migrations) |*p| p else return 0;
+        var sealed: usize = 0;
+        var it = pm.map.iterator();
+        while (it.next()) |entry| {
+            const buf = session_migrate.encode(self.allocator, .{
+                .token = entry.key_ptr.*,
+                .account = entry.value_ptr.account,
+                .snapshot = entry.value_ptr.snapshot,
+            }) catch continue;
+            blobs.append(self.allocator, buf) catch {
+                self.allocator.free(buf);
+                continue;
+            };
+            pieces.append(self.allocator, .{ .kind = .pending_migration, .bytes = buf }) catch continue;
+            sealed += 1;
+        }
+        return sealed;
+    }
+
+    /// Successor side of `sealPendingMigrations`: decode one carried
+    /// `.pending_migration` payload and re-stage it in `pending_migrations`
+    /// (lazily initializing the store — adoption runs before `start()`), so the
+    /// client's eventual reconnect+reclaim finds it exactly as the predecessor
+    /// would have. The TTL clock restarts at adoption (`staged_at_ms = now`),
+    /// which only ever extends a capsule's life by the upgrade's in-flight time.
+    /// Returns false on an undecodable payload or a full store — the pre-fix
+    /// behavior (that one migration dies), never fatal.
+    fn adoptPendingMigrationCapsule(self: *LinuxServer, bytes: []const u8) bool {
+        const cap = session_migrate.decode(bytes) catch return false;
+        if (self.pending_migrations == null) {
+            self.pending_migrations = session_migrate.PendingMigrations.init(self.allocator);
+        }
+        self.pending_migrations.?.put(cap, self.nowMs()) catch return false;
+        return true;
+    }
+
     fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
         if (comptime builtin.os.tag != .linux) {
             self.upgradeNotice(requester, "UPGRADE is Linux-only");
             return;
+        }
+        // Multi-reactor topology guard: the seal loop below walks ONLY reactor
+        // 0's client table (`self.rx().clients`), and per-connection state is
+        // single-writer by its owning reactor — sealing shards 1..N-1 from this
+        // thread would race their live reactor threads. Until a full
+        // quiesce-and-seal of every shard lands, REFUSE the upgrade outright:
+        // proceeding would keep FD_CLOEXEC on every shard-1..N-1 client socket
+        // and silently drop them all at execve (zero-drop would hold only for
+        // shard 0). Fail safe, loudly; operators restart to deploy instead.
+        if (self.reactors.len > 1) {
+            self.upgradeNotice(requester, "UPGRADE refused: [limits] num_shards > 1 — multi-shard seal not yet supported (a hot upgrade would drop every client on shards 1..N-1); restart to deploy");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: multi-shard topology (num_shards > 1) would drop non-shard-0 clients") catch {};
+            return error.MultiShardUpgradeUnsupported;
         }
         const requester_fd: ?linux.fd_t = if (requester) |c| c.fd else null;
         var nbuf: [128]u8 = undefined;
@@ -16794,6 +16868,10 @@ pub const LinuxServer = struct {
         // swap. Adopted by the successor's Pass 2c, AFTER the clients pass —
         // an attached session re-joins its carried connection by fd.
         const session_accounts_sealed = self.sealSessionRegistry(&pieces, &blobs);
+        // Seal staged cross-mesh session migrations (one `.pending_migration`
+        // capsule per entry) so a capsule shipped by a peer just before the
+        // swap still unlocks the client's reclaim on the successor.
+        const migrations_sealed = self.sealPendingMigrations(&pieces, &blobs);
         const carried_fds = try self.allocator.alloc(linux.fd_t, self.rx().clients.slots.items.len);
         defer self.allocator.free(carried_fds);
         var carried_fd_count: usize = 0;
@@ -17030,8 +17108,8 @@ pub const LinuxServer = struct {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             return self.upgradeListenerOnly(requester);
         };
-        var sbuf: [192]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed }) catch "UPGRADE: re-exec");
+        var sbuf: [224]u8 = undefined;
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} staged migration(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, migrations_sealed }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -17187,6 +17265,18 @@ pub const LinuxServer = struct {
             }
         }
 
+        // Pass 2d: re-stage carried cross-mesh session-migration capsules (one
+        // `.pending_migration` piece per staged entry) so a migration a peer
+        // shipped just before the swap still unlocks the client's eventual
+        // reconnect+reclaim on this successor. Undecodable payloads are skipped
+        // (that one migration dies — the pre-fix behavior), never fatal.
+        var migrations_staged: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .pending_migration) continue;
+            if (c.fields.len == 0) continue;
+            if (self.adoptPendingMigrationCapsule(c.fields[0].bytes)) migrations_staged += 1;
+        }
+
         // Pass 3: re-dial carried mesh peers NOW (not on the sweep timer), so a
         // hand-opened S2S link is re-established within one connect+handshake
         // round-trip of the swap. Config-managed [mesh].connect peers are not in
@@ -17236,8 +17326,8 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} session(s) across {d} account(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, sessions_restored, session_accounts, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
         );
     }
 
@@ -26319,7 +26409,7 @@ pub const LinuxServer = struct {
             .token = outer.token,
             .account = outer.account,
             .snapshot = snap_bytes,
-        }) catch return;
+        }, self.nowMs()) catch return;
     }
 
     /// Consume the staged migration capsule for `session_token` and restore the
@@ -33197,6 +33287,26 @@ test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
         server.rebroadcastLocalOpers();
         const g = server.oper_grants.lookup("kain", server.grantNowU64()) orelse return error.TestExpectedGrant;
         try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
+    } else return error.SkipZigTest;
+}
+
+test "UPGRADE is refused on a multi-shard topology (num_shards > 1)" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
+        // The seal loop only walks reactor 0's client table and only clears
+        // CLOEXEC on reactor 0's sockets + listener: with num_shards > 1 every
+        // client on shards 1..N-1 would be silently dropped at execve. The
+        // upgrade must therefore refuse loudly instead of proceeding lossily.
+        try std.testing.expectError(
+            error.MultiShardUpgradeUnsupported,
+            server.performUpgrade(null),
+        );
     } else return error.SkipZigTest;
 }
 
@@ -50594,6 +50704,67 @@ test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
     // The account with a malformed entry restored NOTHING — even its valid
     // entry is absent (atomic reject), and the registry never panicked.
     try std.testing.expect(server.sessions.findTokenInAccount("torn", tok_valid) == null);
+}
+
+test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // Predecessor: one staged cross-mesh migration awaiting the client's
+    // reconnect, sealed exactly like performUpgrade does.
+    var pred = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer pred.deinit();
+    pred.pending_migrations = session_migrate.PendingMigrations.init(alloc);
+    const token: session_migrate.Token = @as([15]u8, @splat(0)) ++ .{9};
+    try pred.pending_migrations.?.put(.{ .token = token, .account = "kain", .snapshot = "verified-relay-snapshot" }, 1);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| alloc.free(b);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pred.sealPendingMigrations(&pieces, &blobs));
+
+    // Add a truncated (undecodable) piece too: the successor must skip it
+    // cleanly while still adopting the good one (tolerant decode).
+    try pieces.append(alloc, .{ .kind = .pending_migration, .bytes = blobs.items[0][0..5] });
+
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-pm-adopt",
+        .pieces = pieces.items,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    // Successor: adoption re-stages the migration under the SAME token, so the
+    // client's eventual reconnect+reclaim still finds it after the swap.
+    var succ = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer succ.deinit();
+    succ.config.resume_arena_fd = arena_dup;
+    succ.adoptInheritedSessions();
+    current_reactor = null;
+
+    const pm = &succ.pending_migrations.?;
+    try std.testing.expectEqual(@as(usize, 1), pm.count()); // truncated piece skipped
+    const e = pm.take(token) orelse return error.TestUnexpectedResult;
+    defer pm.freeEntry(e);
+    try std.testing.expectEqualStrings("kain", e.account);
+    try std.testing.expectEqualStrings("verified-relay-snapshot", e.snapshot);
 }
 
 test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
