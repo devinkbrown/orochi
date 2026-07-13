@@ -180,6 +180,8 @@ const session_capsule = @import("helix/session_capsule.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
 const ws_snapshot = @import("helix/ws_snapshot.zig");
 const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
+const monitor_capsule = @import("helix/monitor_capsule.zig");
+const silence_capsule = @import("helix/silence_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -2047,22 +2049,34 @@ const WsState = struct {
     tx_len: usize = 0,
 };
 
-/// Whether a WebSocket adapter is at a clean framing boundary — safe to carry
-/// across a Helix UPGRADE by rebuilding a fresh empty adapter on the successor.
-/// True only when the handshake is complete (phase=open) and nothing is in
-/// flight in either direction: no partial inbound frame buffered in the
-/// deframer, no pending deframed event or error, no open fragmented message,
-/// and no partial outbound line accumulated in tx. If any residue exists,
-/// rebuilding a fresh adapter would drop those bytes and corrupt the stream, so
-/// the client is not carried (it reconnects instead).
-fn wsCleanBoundary(ws: *const WsState) bool {
+/// Whether a WebSocket adapter can be carried across a Helix UPGRADE. The
+/// handshake must be complete (phase=open) and the deframer must hold no
+/// popped-but-unconsumed event and no latent error — both exist only
+/// transiently INSIDE one `driveWs` turn (the drive loop drains events until
+/// `next()` returns null and an error sets `closing`), so between reactor
+/// turns they are always null; this only excludes a pathological mid-turn
+/// seal. Partial state that legitimately persists between turns IS carried:
+/// the deframer's buffered partial inbound frame bytes (+ fragmentation
+/// flags) and the tx accumulator's partial outbound line are serialized into
+/// the `.ws_session` capsule (v2) and restored verbatim on the successor, so
+/// a mid-frame browser client survives the upgrade with no lost bytes — the
+/// v1 clean-boundary-only gate dropped essentially every active wss client.
+/// A handshake-phase adapter is never carried (the browser reconnects).
+fn wsCarryable(ws: *const WsState) bool {
     return ws.phase == .open and
-        ws.tx_len == 0 and
-        ws.deframer.len == 0 and
-        !ws.deframer.fragmented and
         ws.deframer.pending == null and
         ws.deframer.pending_error == null;
 }
+
+/// Ceiling on MONITOR targets carried per client across a Helix UPGRADE. The
+/// seal CLAMPS to this (a client watching more carries a truncated list) and
+/// the adopt decode buffer is sized by it — the two MUST stay in lockstep, or
+/// an over-cap capsule fails decode with TooMany and the whole list is lost
+/// (`[limits] monitorlimit` is configurable well above any fixed buffer).
+const max_carried_monitor_targets = 512;
+/// Same contract for SILENCE masks (`[limits] silencelimit`); seal enumeration
+/// and adopt decode both use this bound, so an over-cap list truncates.
+const max_carried_silence_masks = 256;
 
 const AcceptKind = enum { plain, tls, ws };
 
@@ -16637,8 +16651,9 @@ pub const LinuxServer = struct {
     /// hand-dialed initiator links seal a re-dial hint the successor dials at
     /// boot, and config-managed [mesh].connect peers re-dial via the mesh boot
     /// pass, keeping the netsplit window to one connect+handshake round-trip.
-    /// wss browser clients are not carried yet (no WS adapter resume); they
-    /// reconnect against the still-bound listener.
+    /// wss browser clients are carried too: the WS adapter's partial framing
+    /// state rides the v2 `.ws_session` capsule (see wsCarryable), so even a
+    /// mid-frame browser client survives with no lost bytes.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
         return self.performUpgrade(conn) catch |e| switch (e) {
@@ -16980,16 +16995,18 @@ pub const LinuxServer = struct {
             if (requester_fd) |rfd| {
                 if (e.value.fd == rfd) continue;
             }
-            // wss browser client (Ruri & friends): carry it ONLY when its
-            // WebSocket adapter is at a clean framing boundary — handshake done
-            // (phase=open), no partial inbound frame in the deframer, no partial
-            // outbound line in the tx accumulator. At such a boundary the
-            // successor rebuilds a fresh empty adapter and resumes framing with
-            // no lost bytes (the TLS crypto rides its own capsule below). If the
-            // adapter is mid-frame, fall back to the historical behavior: don't
-            // carry it, its socket closes at execve and the browser reconnects
-            // against the still-bound listener.
-            const carry_ws = if (e.value.ws) |wsst| wsCleanBoundary(wsst) else false;
+            // wss browser client (Ruri & friends): carry it whenever its
+            // WebSocket adapter is past the HTTP Upgrade (phase=open) — the
+            // adapter's partial framing state (a mid-frame deframer + a partial
+            // outbound line) is serialized into the `.ws_session` capsule (v2)
+            // and restored verbatim on the successor, so being mid-frame no
+            // longer drops the client (the TLS crypto rides its own capsule
+            // below). Only a handshake-phase adapter — or the pathological
+            // popped-event-pending state that cannot exist between reactor
+            // turns — falls back to the historical behavior: not carried, its
+            // socket closes at execve and the browser reconnects against the
+            // still-bound listener.
+            const carry_ws = if (e.value.ws) |wsst| wsCarryable(wsst) else false;
             if (e.value.ws != null and !carry_ws) continue;
             // TLS client: export the live engine state FIRST — if it cannot be
             // exported the connection is not carried at all (its fd keeps
@@ -17082,6 +17099,34 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
+            // v4 tail: the partial inbound line pending in the RecvQ (inline
+            // line_buf or its heap overflow) — dropping it made the next
+            // recv'd bytes parse as a torn line on the successor.
+            snap.pending_in = if (e.value.recv_overflow.items.len != 0)
+                e.value.recv_overflow.items
+            else
+                e.value.line_buf[0..e.value.line_len];
+            // v4 tail: a PLAINTEXT connection's unsent SendQ tail (inline +
+            // overflow, contiguous). A TLS connection's unsent ciphertext is
+            // carried by its `.tls_session` capsule above — never both.
+            var plain_pend_tmp: ?[]u8 = null;
+            defer if (plain_pend_tmp) |p| self.allocator.free(p);
+            if (e.value.tls == null) {
+                const ptail = e.value.send_buf[e.value.send_offset..e.value.send_len];
+                const povf = e.value.send_overflow.items;
+                if (povf.len == 0) {
+                    snap.pending_out = ptail;
+                } else if (self.allocator.alloc(u8, ptail.len + povf.len)) |buf| {
+                    @memcpy(buf[0..ptail.len], ptail);
+                    @memcpy(buf[ptail.len..], povf);
+                    plain_pend_tmp = buf;
+                    snap.pending_out = buf;
+                } else |_| {
+                    // Allocation failure: carry the inline tail only (the
+                    // overflow is lost — pre-v4 behavior lost both).
+                    snap.pending_out = ptail;
+                }
+            }
             const blob = session_snapshot.encode(self.allocator, snap) catch {
                 if (tls_blob) |tb| self.allocator.free(tb);
                 continue;
@@ -17106,7 +17151,18 @@ pub const LinuxServer = struct {
             // WebSocket adapter for this fd. An orphaned WS capsule is harmless
             // (ignored when no client matches its fd).
             if (carry_ws) {
-                const wb = ws_snapshot.encode(self.allocator, .{ .fd = e.value.fd, .phase_open = true }) catch {
+                const wsst = e.value.ws.?;
+                const wb = ws_snapshot.encode(self.allocator, .{
+                    .fd = e.value.fd,
+                    .phase_open = true,
+                    .fragmented = wsst.deframer.fragmented,
+                    .msg_binary = wsst.deframer.msg_binary,
+                    // Partial framing state (v2): the buffered partial inbound
+                    // frame's wire bytes + the partial outbound line, restored
+                    // verbatim by the successor so no byte is lost mid-frame.
+                    .deframer = wsst.deframer.buf[0..wsst.deframer.len],
+                    .tx = wsst.tx_buf[0..wsst.tx_len],
+                }) catch {
                     self.allocator.free(blob);
                     continue;
                 };
@@ -17125,6 +17181,60 @@ pub const LinuxServer = struct {
                 continue;
             };
             pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch continue;
+            // Carry the client's MONITOR watch list (its capsule's client_id
+            // field holds the inherited socket FD — the fd is the join key,
+            // client ids do not survive the swap). Best-effort: any failure
+            // loses only the watch list, never the client.
+            const mon_client = monitorIdFromClient(e.id);
+            // Clamp the seal to what the adopt side can decode: the restore
+            // buffer holds max_carried_monitor_targets entries, and a capsule
+            // exceeding it would fail decode with TooMany — losing the WHOLE
+            // list. A node configured with `monitorlimit` above the clamp
+            // carries a partial (truncated) list instead of nothing.
+            const mon_n = @min(self.monitor.monitorCount(mon_client), max_carried_monitor_targets);
+            if (mon_n != 0) carry_mon: {
+                const targets = self.allocator.alloc([]const u8, mon_n) catch break :carry_mon;
+                defer self.allocator.free(targets);
+                const got = self.monitor.targetsInto(mon_client, targets);
+                var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
+                for (targets[0..got]) |t| wire_len += 2 + t.len;
+                const mbuf = self.allocator.alloc(u8, wire_len) catch break :carry_mon;
+                const wire = (monitor_capsule.MonitorCapsule{
+                    .client_id = @intCast(e.value.fd),
+                    .targets = targets[0..got],
+                }).encode(mbuf) catch {
+                    self.allocator.free(mbuf);
+                    break :carry_mon;
+                };
+                blobs.append(self.allocator, mbuf) catch {
+                    self.allocator.free(mbuf);
+                    break :carry_mon;
+                };
+                pieces.append(self.allocator, .{ .kind = .monitor_list, .bytes = wire }) catch break :carry_mon;
+            }
+            // Carry the client's SILENCE list the same way (join key = fd in
+            // client_id). The store is keyed by owner nick; the successor
+            // resolves the adopted client's nick from the fd. Best-effort.
+            carry_sil: {
+                var sil_masks: [max_carried_silence_masks][]const u8 = undefined;
+                const sil_n = self.silence.masksInto(e.value.session.displayName(), &sil_masks);
+                if (sil_n == 0) break :carry_sil;
+                var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
+                for (sil_masks[0..sil_n]) |m| wire_len += 2 + m.len;
+                const sbuf = self.allocator.alloc(u8, wire_len) catch break :carry_sil;
+                const wire = (silence_capsule.SilenceCapsule{
+                    .client_id = @intCast(e.value.fd),
+                    .masks = sil_masks[0..sil_n],
+                }).encode(sbuf) catch {
+                    self.allocator.free(sbuf);
+                    break :carry_sil;
+                };
+                blobs.append(self.allocator, sbuf) catch {
+                    self.allocator.free(sbuf);
+                    break :carry_sil;
+                };
+                pieces.append(self.allocator, .{ .kind = .silence_list, .bytes = wire }) catch break :carry_sil;
+            }
             if (tls_blob != null) tls_carried += 1;
             if (carry_ws) ws_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
@@ -17240,7 +17350,7 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .ws_session) continue;
             if (c.fields.len == 0) continue;
-            const wss = ws_snapshot.decode(c.fields[0].bytes) catch continue;
+            const wss = ws_snapshot.decode(c.fields[0].bytes, c.header.version) catch continue;
             ws_snaps.append(self.allocator, wss) catch continue;
         }
 
@@ -17289,6 +17399,44 @@ pub const LinuxServer = struct {
                 if (tls_state != null) adopted_tls += 1;
                 if (ws_state != null) adopted_ws += 1;
             }
+        }
+
+        // Pass 2b: restore carried MONITOR watch lists onto the adopted clients.
+        // The capsule's client_id field carries the inherited socket FD (the
+        // Helix join key); a capsule whose fd matched no adopted client is
+        // skipped (its client was dropped — the watch list dies with it, the
+        // pre-fix behavior). Restore is SILENT: the client already knows the
+        // online state of everything it watches, so no MONONLINE/MONOFFLINE
+        // is re-emitted. Undecodable capsules are skipped, never fatal.
+        var monitor_lists_restored: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .monitor_list) continue;
+            if (c.fields.len == 0) continue;
+            var tgt_buf: [max_carried_monitor_targets][]const u8 = undefined;
+            const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch continue;
+            if (mc.client_id > std.math.maxInt(i32)) continue;
+            const watcher = self.adoptedClientIdByFd(@intCast(mc.client_id)) orelse continue;
+            var restored_any = false;
+            for (mc.targets) |t| {
+                self.monitor.restoreTarget(watcher, t) catch continue;
+                restored_any = true;
+            }
+            if (restored_any) monitor_lists_restored += 1;
+        }
+
+        // Pass 2b (cont.): restore carried SILENCE lists. Same fd join key; the
+        // silence store is keyed by owner nick, resolved from the adopted
+        // connection. Duplicates/failures are skipped (`add` is idempotent-ish:
+        // a duplicate returns false), never fatal.
+        for (caps) |c| {
+            if (c.header.kind != .silence_list) continue;
+            if (c.fields.len == 0) continue;
+            var mask_buf: [max_carried_silence_masks][]const u8 = undefined;
+            const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch continue;
+            if (sc.client_id > std.math.maxInt(i32)) continue;
+            const owner_conn = self.adoptedConnByFd(@intCast(sc.client_id)) orelse continue;
+            const owner = owner_conn.session.displayName();
+            for (sc.masks) |m| _ = self.silence.add(owner, m) catch continue;
         }
 
         // Pass 2c: restore the account-level multi-session/bouncer registry
@@ -17373,8 +17521,8 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
         );
     }
 
@@ -17433,6 +17581,16 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// As `adoptedClientIdByFd`, but returns the connection itself — for
+    /// adoption passes that need session state (e.g. the SILENCE owner nick).
+    fn adoptedConnByFd(self: *LinuxServer, fd: i32) ?*ConnState {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |e| {
+            if (e.value.fd == fd) return e.value;
+        }
+        return null;
+    }
+
     /// Re-attach one carried-over client: take ownership of its inherited socket
     /// fd, restore its session (and live TLS engine when carried), and arm recv.
     /// Returns true on success; ANY failure closes the fd and frees the slot.
@@ -17477,15 +17635,36 @@ pub const LinuxServer = struct {
                 return false;
             }
         }
-        // wss browser client: rebuild the WebSocket framing adapter. It was
-        // carried only from a clean boundary, so a FRESH, empty adapter (phase
-        // open) resumes framing with no lost bytes — the TLS engine rebuilt
-        // above sits beneath it. Allocation failure drops the client cleanly
-        // (its fd is closed and the slot freed), never adopting a wss socket as
-        // raw IRC bytes (which would corrupt every frame the browser receives).
+        // wss browser client: rebuild the WebSocket framing adapter, restoring
+        // the carried partial framing state (v2 capsule) — the deframer's
+        // buffered partial inbound frame + fragmentation flags and the tx
+        // accumulator's partial outbound line — so a mid-frame client resumes
+        // with no lost bytes. A v1 capsule (clean-boundary seal) carries empty
+        // partials and rebuilds a fresh adapter exactly as before. The TLS
+        // engine rebuilt above sits beneath it. ANY failure (allocation, or a
+        // partial blob that cannot fit the adapter's buffers — impossible from
+        // an honest predecessor, but the arena is validated fail-closed) drops
+        // the client cleanly (fd closed, slot freed), never adopting a wss
+        // socket as raw IRC bytes (which would corrupt every frame).
         if (ws_state) |wsv| {
             if (wsv.phase_open) {
-                const ws = self.allocator.create(WsState) catch {
+                const ws_ok = blk: {
+                    const ws = self.allocator.create(WsState) catch break :blk false;
+                    ws.* = .{ .phase = .open };
+                    if (wsv.deframer.len > ws.deframer.buf.len or wsv.tx.len > ws.tx_buf.len) {
+                        self.allocator.destroy(ws);
+                        break :blk false;
+                    }
+                    @memcpy(ws.deframer.buf[0..wsv.deframer.len], wsv.deframer);
+                    ws.deframer.len = wsv.deframer.len;
+                    ws.deframer.fragmented = wsv.fragmented;
+                    ws.deframer.msg_binary = wsv.msg_binary;
+                    @memcpy(ws.tx_buf[0..wsv.tx.len], wsv.tx);
+                    ws.tx_len = wsv.tx.len;
+                    conn.ws = ws;
+                    break :blk true;
+                };
+                if (!ws_ok) {
                     if (conn.tls) |t| {
                         t.deinit();
                         self.allocator.destroy(t);
@@ -17495,10 +17674,54 @@ pub const LinuxServer = struct {
                     _ = self.rx().clients.free(id);
                     closeFd(snap.fd);
                     return false;
-                };
-                ws.* = .{ .phase = .open };
-                conn.ws = ws;
+                }
             }
+        }
+        // v4: restore the partial inbound line into the RecvQ (inline fast path
+        // when it fits, heap overflow otherwise) so the client's next bytes
+        // continue the SAME line instead of parsing as a torn one. An overflow
+        // allocation failure drops the client cleanly (reconnect is safe;
+        // adopting with a torn inbound stream is not).
+        if (snap.pending_in.len != 0) {
+            if (snap.pending_in.len <= conn.line_buf.len) {
+                @memcpy(conn.line_buf[0..snap.pending_in.len], snap.pending_in);
+                conn.line_len = snap.pending_in.len;
+            } else {
+                conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch {
+                    if (conn.tls) |t| {
+                        t.deinit();
+                        self.allocator.destroy(t);
+                        conn.tls = null;
+                        conn.is_tls = false;
+                    }
+                    if (conn.ws) |w| {
+                        self.allocator.destroy(w);
+                        conn.ws = null;
+                    }
+                    _ = self.rx().clients.free(id);
+                    closeFd(snap.fd);
+                    return false;
+                };
+            }
+        }
+        // v4: re-queue a plaintext connection's unsent SendQ tail verbatim (the
+        // bytes are already framed/formatted wire bytes — bypass every seam).
+        // A TLS connection's pending ciphertext was re-queued by adoptTlsState
+        // above; the seal path guarantees this field is empty for those.
+        if (snap.pending_out.len != 0 and tls_state == null) {
+            conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
+            rawAppendToConn(conn, snap.pending_out) catch {
+                conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+                conn.send_overflow.clearAndFree(conn.overflow_allocator);
+                if (conn.ws) |w| {
+                    self.allocator.destroy(w);
+                    conn.ws = null;
+                }
+                _ = self.rx().clients.free(id);
+                closeFd(snap.fd);
+                return false;
+            };
+            self.armSendIfNeeded(conn) catch {};
         }
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
@@ -17514,6 +17737,8 @@ pub const LinuxServer = struct {
         }
         self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
             self.world.removeClient(worldIdFromClient(id));
+            conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+            conn.send_overflow.clearAndFree(conn.overflow_allocator);
             if (conn.tls) |t| {
                 t.deinit();
                 self.allocator.destroy(t);
@@ -50423,38 +50648,46 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
     } else return error.SkipZigTest;
 }
 
-test "wsCleanBoundary: only an idle, open, residue-free adapter is carriable" {
+test "wsCarryable: any open adapter carries, incl. mid-frame; handshake/pending never" {
     const alloc = std.testing.allocator;
     const ws = try alloc.create(WsState); // heap: WsState holds MiB-sized buffers
     defer alloc.destroy(ws);
 
     // A fresh adapter is still in the HTTP Upgrade handshake — never carried.
     ws.* = .{};
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(!wsCarryable(ws));
 
-    // Open, with nothing buffered in either direction: safe to carry.
+    // Open, with nothing buffered in either direction: carried.
     ws.* = .{ .phase = .open };
-    try std.testing.expect(wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A partial inbound frame mid-arrival would be lost by a fresh deframer.
+    // A partial inbound frame mid-arrival is carried now — its wire bytes are
+    // serialized into the v2 capsule and restored verbatim by the successor
+    // (the v1 clean-boundary gate dropped exactly this, i.e. every busy client).
     ws.* = .{ .phase = .open };
     ws.deframer.len = 3;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A partial outbound line in the tx accumulator would be lost.
+    // A partial outbound line in the tx accumulator is carried too.
     ws.* = .{ .phase = .open };
     ws.tx_len = 5;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // An open fragmented message must complete before a clean handoff.
+    // An open fragmented message carries with its fragmentation flags.
     ws.* = .{ .phase = .open };
     ws.deframer.fragmented = true;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A buffered, not-yet-dispatched deframed event blocks the carry.
+    // A popped-but-unconsumed deframed event cannot exist between reactor turns;
+    // a mid-turn seal that sees one still refuses to carry (fail-safe).
     ws.* = .{ .phase = .open };
     ws.deframer.pending = .pong;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(!wsCarryable(ws));
+
+    // Same for a latent deframe error awaiting its next() surface.
+    ws.* = .{ .phase = .open };
+    ws.deframer.pending_error = error.BufferFull;
+    try std.testing.expect(!wsCarryable(ws));
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {

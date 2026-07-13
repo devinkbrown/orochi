@@ -39,6 +39,8 @@ pub const CapsuleKind = enum(u8) {
     ws_session = 9,
     tls_ticket_keys = 10,
     pending_migration = 11,
+    monitor_list = 12,
+    silence_list = 13,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -53,6 +55,8 @@ pub const CapsuleKind = enum(u8) {
             9 => .ws_session,
             10 => .tls_ticket_keys,
             11 => .pending_migration,
+            12 => .monitor_list,
+            13 => .silence_list,
             else => error.UnknownKind,
         };
     }
@@ -85,8 +89,12 @@ pub const registry = [_]Descriptor{
     // block ([u8 tlen][bytes]) so a carried client re-tracks in the SessionStore
     // under the SAME reclaim token instead of becoming a registry orphan.
     // `min_supported = 1` keeps accepting v1/v2 capsules sealed by pre-bump
-    // binaries; `session_snapshot.decode` reads both tails tolerantly.
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 3, .min_supported = 1, .max_supported = 3 },
+    // binaries; `session_snapshot.decode` reads both tails tolerantly. v4
+    // (2026-07) appends a trailing [u64 umode_bits][u32 ilen][pending_in]
+    // [u32 olen][pending_out] block so client-set umodes, the partial inbound
+    // line, and a plaintext connection's unsent SendQ tail all survive the
+    // swap (previously silently reset/dropped).
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 4, .min_supported = 1, .max_supported = 4 },
     .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07): each session record appends the attached connection's join
     // fd (i32) and the detached restore snapshot (u32 len + bytes), so bouncer
@@ -102,7 +110,14 @@ pub const registry = [_]Descriptor{
     // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
     // v1 capsules sealed by pre-bump binaries; `s2s_snapshot.decode` is version-aware.
     .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 2, .min_supported = 1, .max_supported = 2 },
-    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07): appends the WS adapter's partial framing state — the
+    // deframer's buffered partial inbound frame + fragmentation flags and the tx
+    // accumulator's partial outbound line — so a mid-frame wss client is carried
+    // instead of dropped (v1 only sealed at a clean framing boundary, which an
+    // active browser client almost never sits at, so every busy wss client
+    // reconnected on every upgrade). `min_supported = 1` keeps accepting v1
+    // capsules sealed by pre-bump binaries; `ws_snapshot.decode` is version-aware.
+    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // One staged cross-mesh session-migration entry (a `session_migrate.encode`
     // wire blob: token + account + verified snapshot), one capsule per entry, so
@@ -110,6 +125,19 @@ pub const registry = [_]Descriptor{
     // dying with the predecessor (the client's reclaim would silently fall back
     // to the legacy redirect).
     .{ .kind = .pending_migration, .schema_id = 0x4850_4d47, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // One carried per-client MONITOR watch list (a `monitor_capsule` wire blob;
+    // its client_id field carries the inherited socket FD — the same join key
+    // the TLS/WS capsules use — NOT a client id, which does not survive the
+    // swap). Without it every carried client silently lost its watch list on
+    // USR2: the client believed it was still monitoring, but no MONONLINE/
+    // MONOFFLINE ever arrived again until it re-issued MONITOR.
+    .{ .kind = .monitor_list, .schema_id = 0x484d_4f4e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // One carried per-client SILENCE list (a `silence_capsule` wire blob; its
+    // client_id field carries the inherited socket FD — the Helix join key —
+    // exactly like `.monitor_list`). Without it every carried client silently
+    // lost its server-side ignore masks on USR2: a silenced abuser became
+    // audible again after every deploy with no indication to the victim.
+    .{ .kind = .silence_list, .schema_id = 0x4853_494c, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
