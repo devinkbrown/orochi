@@ -10,6 +10,26 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.5.2 (2026-07-13)
+
+Multi-shard zero-drop hot-upgrades.
+
+- **A USR2 hot-upgrade now preserves clients on ALL reactor shards.**
+  `performUpgrade` previously sealed only reactor 0's clients + listener, so a
+  multi-shard node (e.g. `num_shards=4`) had to cold-restart to deploy (the guard
+  refused a USR2 that would drop clients on shards 1..N-1). Now sibling reactors
+  are quiesced (parked via a CAS-claimed acq_rel handshake — a shard that can't
+  park in 5 s refuses the upgrade rather than dropping anyone), every shard's
+  clients are sealed with CLOEXEC cleared on every carried fd, all N per-shard
+  SO_REUSEPORT listener fds are carried across execve, and each client is
+  re-pinned to its deterministic fd-derived shard on adoption. No capsule format
+  change (the shard is derived, not carried). The `num_shards>1` refusal is
+  replaced by the quiesce fail-safe. Multi-shard `upgrade_smoke` proves clients on
+  every shard survive (with the wss-mid-frame / token / umode / MONITOR / SILENCE
+  guarantees intact).
+  - *Rollback caveat:* a USR2 rollback from this to a pre-feature binary would
+    black-hole the sibling per-shard listeners — roll back with a cold restart.
+
 ## 0.5.1 (2026-07-13)
 
 Account-attribution turned ON (secure multi-device coexistence) + an oper-elevation
