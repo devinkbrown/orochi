@@ -10,11 +10,68 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
-## 0.4.0 (committed; pending deploy)
+## 0.5.0 (2026-07-13)
 
-Committed on `main` and pushed; not yet deployed to the live IRCXNet nodes. A
-security-, TLS-, and anti-abuse-hardening pass on top of 0.3.0, plus the new
-standalone `yoroi` crypto CLI.
+Multi-client, session-resume, and hot-upgrade-survivability release. A user can
+now be present from more than one client at once, resume a session, and — after
+this release — keep browser/onyx (wss) connections alive across a hot-upgrade.
+Deployed to the live nodes (eshmaki.me + ircx.us).
+
+### Multi-client & sessions
+- **A newer login no longer kills your existing live session.** The mesh
+  ghost-reclaim path only retires a connection that is already tearing down
+  (`!victim.closing`); a second device anywhere on the mesh now coexists (the
+  bouncer model, up to `[sessions] max_per_account`) instead of disconnecting
+  the first. (`src/daemon/server.zig` `reclaimGhostSession`)
+- **Cross-node DM fan-out.** A DM to a user with sessions on more than one node
+  now reaches every device — the origin node relays a locally-resolved DM to the
+  mesh instead of delivering only to its local session. Sent-copy mirroring to
+  your own other devices is consistent. (`messageOne`, `deliverRelay`)
+- **Session reclaim hardening.** The replay-ring nonce is burned only on a truly
+  consuming outcome (redirects/denies are idempotent, no stranded capsule);
+  local `SESSION RESUME` restores before consuming the ghost (fail-closed on
+  decode failure); a CSPRNG-less boot disables reclaim rather than issuing a
+  constant token. (`src/proto/session_reclaim_mesh.zig`)
+
+### Hot-upgrade survivability (Helix)
+- **The session registry survives USR2 (CRITICAL).** `performUpgrade` now seals
+  the `.sessions` capsule and the `.clients` capsule carries each connection's
+  reclaim token — before, every hot-upgrade wiped the multi-session/bouncer
+  registry and invalidated every stored resume token.
+- **wss/browser clients survive a hot-upgrade.** The `.ws_session` capsule now
+  carries the WebSocket deframer's partial inbound frame + tx accumulator and
+  carries open adapters unconditionally — previously an active browser client was
+  mid-frame at the upgrade and got dropped every time ("everyone disconnects on
+  upgrade"). (`ws_session` v2)
+- **Full capsule-coverage audit.** `.clients` v4 also carries client umodes (a
+  dropped `+i` was becoming visible after every upgrade), the partial inbound
+  line, and the plaintext SendQ tail; **MONITOR** (`.monitor_list`) and
+  **SILENCE** (`.silence_list`) lists are now carried (they were silently lost
+  every deploy). Every format change is versioned with a legacy decode arm +
+  cross-version test; `tools/upgrade_smoke.py` now asserts wss-mid-frame + TLS +
+  bouncer-token + umode/MONITOR/SILENCE survival.
+- **USR2 hardening.** Refuse a hot-upgrade on a multi-shard topology (only
+  reactor 0's clients seal); bounded `PendingMigrations` (cap + TTL sweep + USR2
+  carry); version-tolerant `migration_relay` decode for rolling deploys.
+
+### Mesh operator & trust
+- **The network-operator `*` prefix propagates reliably.** `rebroadcastLocalOpers`
+  scans all reactors (an oper on a non-zero shard was never re-propagated),
+  grants are re-minted inside their TTL, and the grant lookup is case-insensitive
+  — fixing an intermittently-missing remote `*`.
+- **Account-attribution substrate (Design C), gated OFF.** A per-claim residence
+  proof (`IDENTITY RESIDENCE`, `ACCOUNTRESIDENCE` ISUPPORT) verified against the
+  replicated account key lays the groundwork to close mesh account-forgery while
+  preserving multi-device — but is fail-closed pending a non-forgeable
+  account-key authority gate (rooted in SASL) and the onyx signer, so behaviour
+  is unchanged (conservative UID path) this release.
+- `renameNick` verifies the existing nick entry is homed on the origin node
+  before applying a cross-node rename.
+
+## 0.4.0 (deployed 2026-07-13)
+
+Deployed to the live IRCXNet nodes. A security-, TLS-, and anti-abuse-hardening
+pass on top of 0.3.0, plus the new standalone `yoroi` crypto CLI.
 
 ### TLS
 - **Extended Master Secret (RFC 7627) is now REQUIRED by default** on the
