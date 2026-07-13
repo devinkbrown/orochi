@@ -10,6 +10,29 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.5.1 (2026-07-13)
+
+Account-attribution turned ON (secure multi-device coexistence) + an oper-elevation
+fix. Deployed to the live nodes.
+
+- **Multi-device coexistence is now live and verified.** Account-attribution
+  (Design C) is enabled: a client signs a login-time residence proof, the daemon
+  verifies it against the account's replicated key, and a **proven** same-account
+  claim now COEXISTS across devices/nodes as the real you — while a forged claim
+  from a Byzantine peer takes the conservative UID path. F1 (mesh account-forgery)
+  is closed for home/warm (converged) nodes via a non-forgeable, SASL-rooted
+  account-key-authority gate on ENTITY_PROP ingest (P1) + store-side account
+  blanking of untrusted claims (P2). Requires the onyx client (this release's
+  companion) to sign residence proofs. Known bounded residual (deferred): a cold
+  node relinking through a Byzantine burst source before converging can be
+  poisoned (sticky, low exposure on a trusted mesh) — the fully-sound cold-node
+  anchor is future work.
+- **Oper elevation survives a session reclaim.** A SASL login that reclaimed a
+  detached ghost session was re-granting a zero-privilege oper over the
+  freshly-elevated session (→ 481 on the next privileged action / UPGRADE); the
+  live grant is now preserved (union of live+restored privileges), no downward
+  clobber.
+
 ## 0.5.0 (2026-07-13)
 
 Multi-client, session-resume, and hot-upgrade-survivability release. A user can
