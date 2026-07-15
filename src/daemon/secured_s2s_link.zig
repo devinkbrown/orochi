@@ -681,6 +681,17 @@ pub const SecuredLink = struct {
         return link.takeSessionMigrations();
     }
 
+    pub fn sendSessionMigrateConsumed(self: *SecuredLink, payload: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendSessionMigrateConsumed(payload);
+        try self.drainInner();
+    }
+
+    pub fn takeSessionMigrateConsumed(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeSessionMigrateConsumed();
+    }
+
     /// Emit a CLONE_COUNT batch over the encrypted leg, then flush ciphertext.
     pub fn sendCloneCounts(self: *SecuredLink, payload: []const u8) anyerror!void {
         const link = self.inner orelse return;

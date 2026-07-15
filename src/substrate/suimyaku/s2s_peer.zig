@@ -298,6 +298,9 @@ pub const S2sPeer = struct {
     /// (MigrationTarget.accept) + stage into PendingMigrations. The peer driver
     /// stays substrate-pure: it never opens the signed capsule, only stages it.
     session_migrations: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Inbound signed session-consumption tombstones. The daemon drains these
+    /// before offers so a delayed offer cannot resurrect consumed state.
+    session_migration_consumed: std.ArrayListUnmanaged([]u8) = .empty,
     /// Inbound CLONE_COUNT payloads (raw `mesh_clones` counts-codec bytes) from
     /// this peer, awaiting the daemon to decode + fold into its network-wide clone
     /// aggregate. The peer driver stays substrate-pure: it never decodes them.
@@ -521,6 +524,8 @@ pub const S2sPeer = struct {
         self.nick_changes.deinit(self.allocator);
         for (self.session_migrations.items) |m| self.allocator.free(m);
         self.session_migrations.deinit(self.allocator);
+        for (self.session_migration_consumed.items) |m| self.allocator.free(m);
+        self.session_migration_consumed.deinit(self.allocator);
         for (self.clone_counts.items) |m| self.allocator.free(m);
         self.clone_counts.deinit(self.allocator);
         for (self.oper_events.items) |m| self.allocator.free(m);
@@ -737,6 +742,7 @@ pub const S2sPeer = struct {
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
             .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
             .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
+            .SESSION_MIGRATE_CONSUMED => try self.recvSessionMigrateConsumed(frame.payload),
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
@@ -793,6 +799,20 @@ pub const S2sPeer = struct {
     /// Best-effort; only meaningful once established.
     pub fn sendSessionMigrate(self: *S2sPeer, sink: ByteSink, frame_bytes: []const u8) !void {
         try emitFrame(self.allocator, sink, .SESSION_MIGRATE, frame_bytes);
+    }
+
+    fn recvSessionMigrateConsumed(self: *S2sPeer, payload: []const u8) !void {
+        if (!self.acceptsDirectOrigin(self.remote_node_id)) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.session_migration_consumed.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    pub fn takeSessionMigrateConsumed(self: *S2sPeer) ![][]u8 {
+        return self.session_migration_consumed.toOwnedSlice(self.allocator);
+    }
+
+    pub fn sendSessionMigrateConsumed(self: *S2sPeer, sink: ByteSink, payload: []const u8) !void {
+        try emitFrame(self.allocator, sink, .SESSION_MIGRATE_CONSUMED, payload);
     }
 
     /// Queue an inbound CLONE_COUNT payload (raw `mesh_clones` counts bytes) for
@@ -3063,6 +3083,34 @@ test "SESSION_MIGRATE frame is dispatched and staged for the daemon to drain" {
     try std.testing.expectEqual(@as(usize, 0), again.len);
 }
 
+test "SESSION_MIGRATE_CONSUMED is dispatched to its convergence queue" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 10, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 20, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.sendSessionMigrateConsumed(a_to_b.sink(), "consume-tombstone");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xC0DE);
+
+    const staged = try b.takeSessionMigrateConsumed();
+    defer {
+        for (staged) |item| allocator.free(item);
+        allocator.free(staged);
+    }
+    try std.testing.expectEqual(@as(usize, 1), staged.len);
+    try std.testing.expectEqualStrings("consume-tombstone", staged[0]);
+}
+
 test "SESSION_MIGRATE from an unknown origin is rejected, not staged" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 1 };
@@ -4122,12 +4170,12 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
 
     // Every wire frame type, including unknown/unmapped tags (skipped, not fatal).
     const frame_types = [_]s2s_frame.FrameType{
-        .HANDSHAKE,          .BURST,           .DELTA,        .GOSSIP,      .PING,
-        .PONG,               .QUIT,            .MEMBERSHIP,   .MESSAGE,     .OPER_GRANT,
-        .CHANNEL_MODE_FLAGS, .CHANNEL_LIST,    .CHANNEL_PROP, .TOPIC,       .NICKCHANGE,
-        .CHANNEL_MODE_STATE, .SESSION_MIGRATE, .ENTITY_PROP,  .CLONE_COUNT, .OPER_EVENT,
-        .OBSERVE_EVENT,      .KILL,            .WARD,         .RESYNC,      .REPAIR_SUMMARY,
-        .REPAIR_REQUEST,     .REPAIR_RESPONSE, .TEGAMI_PUSH,
+        .HANDSHAKE,          .BURST,           .DELTA,                    .GOSSIP,      .PING,
+        .PONG,               .QUIT,            .MEMBERSHIP,               .MESSAGE,     .OPER_GRANT,
+        .CHANNEL_MODE_FLAGS, .CHANNEL_LIST,    .CHANNEL_PROP,             .TOPIC,       .NICKCHANGE,
+        .CHANNEL_MODE_STATE, .SESSION_MIGRATE, .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP, .CLONE_COUNT,
+        .OPER_EVENT,         .OBSERVE_EVENT,   .KILL,                     .WARD,        .RESYNC,
+        .REPAIR_SUMMARY,     .REPAIR_REQUEST,  .REPAIR_RESPONSE,          .TEGAMI_PUSH,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

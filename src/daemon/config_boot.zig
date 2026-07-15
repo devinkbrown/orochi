@@ -165,6 +165,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
+    out.session_migrate_on_detach = cfg.sessions.migrate_on_detach;
+    out.session_max_pending_migrations = cfg.sessions.max_pending_migrations;
     out.multiline_max_bytes = @intCast(cfg.ircv3.multiline_max_bytes);
     out.multiline_max_lines = @intCast(cfg.ircv3.multiline_max_lines);
     out.multiline_ref_len = @intCast(cfg.ircv3.multiline_ref_len);
@@ -1132,6 +1134,8 @@ test "[sessions] registry sizing projects onto the boot config and defaults to 6
     defer defaults.deinit(allocator);
     try testing.expectEqual(@as(u64, 65536), defaults.config.session_max_accounts);
     try testing.expectEqual(@as(u32, 64), defaults.config.session_max_per_account);
+    try testing.expect(defaults.config.session_migrate_on_detach);
+    try testing.expectEqual(@as(u32, 4096), defaults.config.session_max_pending_migrations);
 
     // Explicit override projects through loadFromText -> mapToServerConfig.
     const text =
@@ -1142,12 +1146,16 @@ test "[sessions] registry sizing projects onto the boot config and defaults to 6
         \\[sessions]
         \\max_accounts = 2048
         \\max_per_account = 9
+        \\migrate_on_detach = false
+        \\max_pending_migrations = 128
         \\
     ;
     var loaded = try loadFromText(allocator, text, base, .{});
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u64, 2048), loaded.config.session_max_accounts);
     try testing.expectEqual(@as(u32, 9), loaded.config.session_max_per_account);
+    try testing.expect(!loaded.config.session_migrate_on_detach);
+    try testing.expectEqual(@as(u32, 128), loaded.config.session_max_pending_migrations);
 }
 
 test "tls section projects onto the boot tls config" {

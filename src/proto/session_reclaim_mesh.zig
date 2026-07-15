@@ -30,6 +30,7 @@ pub const max_field_len: usize = std.math.maxInt(u16);
 /// Magic + version prefix so a token from a different codec version is rejected
 /// at the format layer rather than silently mis-parsed.
 const magic: [4]u8 = .{ 'S', 'R', 'M', 1 };
+const consume_magic: [4]u8 = .{ 'S', 'R', 'C', 1 };
 
 /// Number of variable-length byte fields in the serialization.
 const str_field_count = 3;
@@ -52,6 +53,63 @@ pub const ReclaimFields = struct {
     nonce: u64,
 };
 
+/// Mesh convergence record emitted after one node successfully consumes a
+/// session. `nonce` is present for a portable-token claim and absent for a
+/// local-token claim; the session token tombstone applies in either case.
+pub const ConsumeNotice = struct {
+    session_token: [16]u8,
+    account: []const u8,
+    nonce: ?u64 = null,
+};
+
+pub const ConsumeNoticeError = error{ BadFormat, BufferTooSmall };
+
+/// Wire: magic(4), token(16), flags(1), nonce(8), account_len(u16 BE), account.
+/// A fixed nonce slot keeps v1 decoding simple; flags bit 0 says whether it is
+/// meaningful. The outer S2S frame supplies origin authentication/signing.
+pub fn encodeConsumeNotice(notice: ConsumeNotice, out: []u8) ConsumeNoticeError![]const u8 {
+    if (notice.account.len > max_field_len) return error.BadFormat;
+    const needed = consume_magic.len + 16 + 1 + 8 + 2 + notice.account.len;
+    if (out.len < needed) return error.BufferTooSmall;
+    var pos: usize = 0;
+    @memcpy(out[pos..][0..consume_magic.len], &consume_magic);
+    pos += consume_magic.len;
+    @memcpy(out[pos..][0..16], &notice.session_token);
+    pos += 16;
+    out[pos] = @intFromBool(notice.nonce != null);
+    pos += 1;
+    std.mem.writeInt(u64, out[pos..][0..8], notice.nonce orelse 0, .big);
+    pos += 8;
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(notice.account.len), .big);
+    pos += 2;
+    @memcpy(out[pos..][0..notice.account.len], notice.account);
+    pos += notice.account.len;
+    return out[0..pos];
+}
+
+pub fn decodeConsumeNotice(bytes: []const u8) ConsumeNoticeError!ConsumeNotice {
+    const fixed = consume_magic.len + 16 + 1 + 8 + 2;
+    if (bytes.len < fixed) return error.BadFormat;
+    if (!std.mem.eql(u8, bytes[0..consume_magic.len], &consume_magic)) return error.BadFormat;
+    var pos: usize = consume_magic.len;
+    var token: [16]u8 = undefined;
+    @memcpy(&token, bytes[pos..][0..16]);
+    pos += 16;
+    const flags = bytes[pos];
+    if (flags & ~@as(u8, 1) != 0) return error.BadFormat;
+    pos += 1;
+    const raw_nonce = std.mem.readInt(u64, bytes[pos..][0..8], .big);
+    pos += 8;
+    const account_len = std.mem.readInt(u16, bytes[pos..][0..2], .big);
+    pos += 2;
+    if (pos + account_len != bytes.len) return error.BadFormat;
+    return .{
+        .session_token = token,
+        .account = bytes[pos..],
+        .nonce = if (flags & 1 != 0) raw_nonce else null,
+    };
+}
+
 /// Errors surfaced when opening a token.
 pub const OpenError = error{
     /// Structural problem: bad magic, truncation, or a length that overruns.
@@ -72,6 +130,9 @@ pub const ReclaimDecision = union(enum) {
     deny_expired,
     /// Origin node is neither us nor reachable; cannot place the session.
     deny_unknown,
+    /// Origin is known but no established mesh link currently reaches it. This
+    /// is transient and must not invalidate the resume credential.
+    deny_unreachable,
     /// Nonce already seen; replayed token.
     deny_replay,
 };
@@ -221,11 +282,13 @@ pub fn open(key: []const u8, bytes: []const u8, now_ms: u64) OpenError!ReclaimFi
 ///   3. local holds session  -> grant_local
 ///   4. origin is self       -> deny_unknown (we are origin yet hold nothing;
 ///                              the live session is gone)
-///   5. origin is elsewhere  -> grant_redirect(origin_node)
+///   5. origin reachable     -> grant_redirect(origin_node)
+///   6. origin unreachable   -> deny_unreachable (retryable)
 pub fn decide(
     fields: ReclaimFields,
     local_holds_session: bool,
     origin_is_self: bool,
+    origin_reachable: bool,
     seen_nonce: bool,
     now_ms: u64,
 ) ReclaimDecision {
@@ -233,7 +296,8 @@ pub fn decide(
     if (seen_nonce) return .deny_replay;
     if (local_holds_session) return .grant_local;
     if (origin_is_self) return .deny_unknown;
-    return .{ .grant_redirect = fields.origin_node };
+    if (origin_reachable) return .{ .grant_redirect = fields.origin_node };
+    return .deny_unreachable;
 }
 
 /// A tiny, pure, fixed-capacity nonce-replay tracker. Bounded ring of recently
@@ -323,6 +387,20 @@ test "round-trip seal then open recovers all fields" {
     try testing.expectEqual(fields.issued_ms, got.issued_ms);
     try testing.expectEqual(fields.expiry_ms, got.expiry_ms);
     try testing.expectEqual(fields.nonce, got.nonce);
+}
+
+test "consume notice round-trips local and portable claims" {
+    const token: [16]u8 = @splat(0xA5);
+    var buf: [128]u8 = undefined;
+    const portable = try encodeConsumeNotice(.{ .session_token = token, .account = "alice", .nonce = 42 }, &buf);
+    const got = try decodeConsumeNotice(portable);
+    try testing.expectEqualSlices(u8, &token, &got.session_token);
+    try testing.expectEqualStrings("alice", got.account);
+    try testing.expectEqual(@as(?u64, 42), got.nonce);
+
+    const local = try encodeConsumeNotice(.{ .session_token = token, .account = "alice" }, &buf);
+    try testing.expectEqual(@as(?u64, null), (try decodeConsumeNotice(local)).nonce);
+    try testing.expectError(error.BadFormat, decodeConsumeNotice(local[0 .. local.len - 1]));
 }
 
 test "seal is deterministic for identical inputs" {
@@ -488,7 +566,7 @@ test "decide grant_local when this node holds the session" {
     const fields = sampleFields();
 
     // Act
-    const d = decide(fields, true, false, false, fields.issued_ms);
+    const d = decide(fields, true, false, true, false, fields.issued_ms);
 
     // Assert
     try testing.expectEqual(ReclaimDecision.grant_local, d);
@@ -499,7 +577,7 @@ test "decide grant_redirect to origin when held elsewhere" {
     const fields = sampleFields();
 
     // Act
-    const d = decide(fields, false, false, false, fields.issued_ms);
+    const d = decide(fields, false, false, true, false, fields.issued_ms);
 
     // Assert
     switch (d) {
@@ -513,7 +591,7 @@ test "decide deny_expired takes precedence over everything" {
     const fields = sampleFields();
 
     // Act: expired, yet local holds the session and nonce is fresh.
-    const d = decide(fields, true, true, false, fields.expiry_ms + 1);
+    const d = decide(fields, true, true, true, false, fields.expiry_ms + 1);
 
     // Assert
     try testing.expectEqual(ReclaimDecision.deny_expired, d);
@@ -524,7 +602,7 @@ test "decide deny_replay when nonce already seen" {
     const fields = sampleFields();
 
     // Act: replay outranks grant_local but not expiry.
-    const d = decide(fields, true, false, true, fields.issued_ms);
+    const d = decide(fields, true, false, true, true, fields.issued_ms);
 
     // Assert
     try testing.expectEqual(ReclaimDecision.deny_replay, d);
@@ -535,10 +613,16 @@ test "decide deny_unknown when origin is self but session is gone" {
     const fields = sampleFields();
 
     // Act: we are the origin, but we no longer hold the session.
-    const d = decide(fields, false, true, false, fields.issued_ms);
+    const d = decide(fields, false, true, true, false, fields.issued_ms);
 
     // Assert
     try testing.expectEqual(ReclaimDecision.deny_unknown, d);
+}
+
+test "decide reports an unreachable origin as retryable, not unknown" {
+    const fields = sampleFields();
+    const d = decide(fields, false, false, false, false, fields.issued_ms);
+    try testing.expectEqual(ReclaimDecision.deny_unreachable, d);
 }
 
 test "ReplayRing detects a replayed nonce" {
@@ -587,11 +671,11 @@ test "non-consuming decisions do not burn the nonce for a later consume" {
 
     // Act: two redirect evaluations, then the session arrives locally and the
     // SAME token is consumed.
-    const d1 = decide(fields, false, false, ring.contains(fields.nonce), fields.issued_ms);
-    const d2 = decide(fields, false, false, ring.contains(fields.nonce), fields.issued_ms);
-    const d3 = decide(fields, true, false, ring.contains(fields.nonce), fields.issued_ms);
+    const d1 = decide(fields, false, false, true, ring.contains(fields.nonce), fields.issued_ms);
+    const d2 = decide(fields, false, false, true, ring.contains(fields.nonce), fields.issued_ms);
+    const d3 = decide(fields, true, false, true, ring.contains(fields.nonce), fields.issued_ms);
     if (d3 == .grant_local) ring.record(fields.nonce); // consume burns it
-    const d4 = decide(fields, true, false, ring.contains(fields.nonce), fields.issued_ms);
+    const d4 = decide(fields, true, false, true, ring.contains(fields.nonce), fields.issued_ms);
 
     // Assert: redirects are idempotent; the consume succeeds; only after the
     // consume is a re-presentation a replay.
@@ -625,11 +709,11 @@ test "full pipeline: seal, open, replay-track, decide" {
     const tok = try sealToBuf(test_key, fields, &buf);
     const opened = try open(test_key, tok, fields.issued_ms);
     const first_seen = ring.check(opened.nonce);
-    const d1 = decide(opened, false, false, first_seen, fields.issued_ms);
+    const d1 = decide(opened, false, false, true, first_seen, fields.issued_ms);
 
     // A second presentation of the same nonce must be denied as replay.
     const second_seen = ring.check(opened.nonce);
-    const d2 = decide(opened, false, false, second_seen, fields.issued_ms);
+    const d2 = decide(opened, false, false, true, second_seen, fields.issued_ms);
 
     // Assert
     try testing.expect(!first_seen);

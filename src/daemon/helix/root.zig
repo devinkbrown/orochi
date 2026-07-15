@@ -54,6 +54,7 @@ pub const session_migration_dst = @import("session_migration_dst.zig");
 pub const world_migration_dst = @import("world_migration_dst.zig");
 pub const s2s_adopt_dst = @import("s2s_adopt_dst.zig");
 pub const session_adopt_dst = @import("session_adopt_dst.zig");
+pub const multishard_upgrade_dst = @import("multishard_upgrade_dst.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -376,7 +376,9 @@ Source: struct `Sessions` at `src/daemon/config_format.zig:429`, parsing at `src
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `max_accounts` | integer | `65536` | `1..4294967295` | Multi-session/bouncer account registry size (`src/daemon/sessions.zig:24`). |
-| `max_per_account` | integer | `64` | `1..1000000` | Max live bouncer/multi-device sessions per account, enforced at session attach (`src/daemon/sessions.zig:102`). Note: session-sync fan-out surfaces currently snapshot at most 64 sessions per account (`sessions.zig snapshot_capacity`), so values above `64` raise the attach cap but do not widen sibling mirroring. |
+| `max_per_account` | integer | `64` | `1..65535` | Max live bouncer/multi-device sessions per account, enforced at session attach. Complete account snapshots are allocated to the configured size for fan-out and Helix carry; the upper bound matches the session-capsule u16 count. |
+| `migrate_on_detach` | boolean | `true` | boolean | Enable proactive portable-session replication. MTOKEN issuance immediately offers live state; last-local-attachment detach offers its retained snapshot; secured-peer establishment/reconnect re-offers live and detached portable state. Set false as a rolling-deploy kill switch; local resume is unaffected. |
+| `max_pending_migrations` | integer | `4096` | `16..1000000` | Global bound for peer-staged reusable signed replicas and rolling-compatibility consumed-token tombstones. `max_per_account` is also enforced as a per-account staging bound; inserts fail closed at either limit instead of evicting another valid replica. |
 
 ## `[ircv3]`
 

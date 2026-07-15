@@ -429,6 +429,10 @@ pub const Config = struct {
     pub const Sessions = struct {
         max_accounts: u64 = 65536,
         max_per_account: u32 = 64,
+        /// Replicate detached state only for sessions that requested a portable
+        /// resume credential. Runtime kill switch for rolling deploys.
+        migrate_on_detach: bool = true,
+        max_pending_migrations: u32 = 4096,
     };
 
     /// `[ircv3]` — live IRCv3 protocol limits surfaced in CAP values and
@@ -1188,7 +1192,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [sessions]
     cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
-    cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, 1_000_000));
+    // Session registry capsules encode the per-account count as u16. Keep the
+    // runtime cap inside that durable/hot-upgrade representation.
+    cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, std.math.maxInt(u16)));
+    if (doc.getBool("sessions.migrate_on_detach")) |b| cfg.sessions.migrate_on_detach = b;
+    cfg.sessions.max_pending_migrations = @intCast(try uintField(doc, "sessions.max_pending_migrations", cfg.sessions.max_pending_migrations, 16, 1_000_000));
 
     // [ircv3]
     cfg.ircv3.multiline_max_bytes = try uintField(doc, "ircv3.multiline_max_bytes", cfg.ircv3.multiline_max_bytes, 4096, 262144);
@@ -2314,17 +2322,23 @@ test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of
         \\[sessions]
         \\max_accounts = 2048
         \\max_per_account = 9
+        \\migrate_on_detach = false
+        \\max_pending_migrations = 128
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
     try testing.expectEqual(@as(u64, 2048), cfg.sessions.max_accounts);
     try testing.expectEqual(@as(u32, 9), cfg.sessions.max_per_account);
+    try testing.expect(!cfg.sessions.migrate_on_detach);
+    try testing.expectEqual(@as(u32, 128), cfg.sessions.max_pending_migrations);
 
     var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
     defer omitted.deinit(allocator);
     try testing.expectEqual(@as(u64, 65536), omitted.sessions.max_accounts);
     try testing.expectEqual(@as(u32, 64), omitted.sessions.max_per_account);
+    try testing.expect(omitted.sessions.migrate_on_detach);
+    try testing.expectEqual(@as(u32, 4096), omitted.sessions.max_pending_migrations);
 
     // Zero and above-max are hard parse errors, never a silent clamp.
     try testing.expectError(error.ParseError, parseToml(allocator,
@@ -2342,7 +2356,7 @@ test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of
         \\[listen]
         \\irc = 6680
         \\[sessions]
-        \\max_per_account = 1000001
+        \\max_per_account = 65536
         \\
     , .{}));
     try testing.expectError(error.ParseError, parseToml(allocator,

@@ -41,6 +41,7 @@ pub const CapsuleKind = enum(u8) {
     pending_migration = 11,
     monitor_list = 12,
     silence_list = 13,
+    session_tombstone = 14,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -57,6 +58,7 @@ pub const CapsuleKind = enum(u8) {
             11 => .pending_migration,
             12 => .monitor_list,
             13 => .silence_list,
+            14 => .session_tombstone,
             else => error.UnknownKind,
         };
     }
@@ -101,7 +103,9 @@ pub const registry = [_]Descriptor{
     // sessions restore byte-identically across USR2 instead of degrading to a
     // bare reclaim token. `min_supported = 1` keeps accepting v1 capsules sealed
     // by pre-bump binaries; `session_capsule.decode` is version-aware.
-    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 2, .min_supported = 1, .max_supported = 2 },
+    // v3 (2026-07): appends the portable-resume issuance bit so the successor
+    // preserves detach-time mesh replication policy. Legacy v1/v2 decode false.
+    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 3, .min_supported = 1, .max_supported = 3 },
     .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tsumugi_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
@@ -138,6 +142,9 @@ pub const registry = [_]Descriptor{
     // lost its server-side ignore masks on USR2: a silenced abuser became
     // audible again after every deploy with no indication to the victim.
     .{ .kind = .silence_list, .schema_id = 0x4853_494c, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // Consumed migration-token tombstones carried across USR2 so a delayed peer
+    // offer cannot resurrect a session immediately after the swap.
+    .{ .kind = .session_tombstone, .schema_id = 0x4853_544d, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {

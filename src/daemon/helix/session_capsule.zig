@@ -29,6 +29,7 @@
 //!   session_count: u16
 //!   each session:  token(u16 len + bytes) client(u64) signon_unix(i64) detached(u8)
 //!                  [v2+] fd(i32) snapshot(u32 len + bytes)
+//!                  [v3+] portable_resume(u8)
 //!
 //! v2 (2026-07) appends, per session, the attached connection's socket fd (the
 //! Helix join key back to the carried client snapshot; -1 when detached) and
@@ -36,7 +37,8 @@
 //! bouncer session RESTORES across an upgrade instead of degrading to a bare
 //! reclaim token. `decode` is version-aware: a v1 body simply lacks both
 //! trailing fields and reconstructs them at their defaults (fd = -1, empty
-//! snapshot).
+//! snapshot). v3 appends whether a portable resume credential was issued, so a
+//! hot-upgraded live session still replicates its snapshot on a later detach.
 
 const std = @import("std");
 
@@ -44,7 +46,7 @@ const std = @import("std");
 pub const magic = [_]u8{ 'H', 'S', 'S', 'N' };
 
 /// Wire format version written by `encode`. Bump on any layout change.
-pub const version: u8 = 2;
+pub const version: u8 = 3;
 
 /// Oldest wire version `decode` still accepts.
 pub const min_version: u8 = 1;
@@ -85,6 +87,8 @@ pub const SessionEntry = struct {
     /// v2: the detached session's encoded restore snapshot; empty when none
     /// (attached sessions never carry one). Borrows the decode input buffer.
     snapshot: []const u8 = &.{},
+    /// v3: a mesh-sealed resume credential was revealed for this session.
+    portable_resume: bool = false,
 };
 
 /// One account's full session record, ready to migrate across an upgrade.
@@ -126,6 +130,8 @@ pub const SessionCapsule = struct {
             try writeI32(out, &pos, entry.fd);
             // v2: snapshot(u32 len + bytes)
             try writeLongStr(out, &pos, entry.snapshot);
+            // v3: portable-resume issuance bit
+            try writeByte(out, &pos, @intFromBool(entry.portable_resume));
         }
 
         return out[0..pos];
@@ -136,7 +142,7 @@ pub const SessionCapsule = struct {
     pub fn encodedLen(self: SessionCapsule) usize {
         var n: usize = magic.len + 1 + 2 + self.account.len + 2;
         for (self.sessions) |entry| {
-            n += 2 + entry.token.len + 8 + 8 + 1 + 4 + 4 + entry.snapshot.len;
+            n += 2 + entry.token.len + 8 + 8 + 1 + 4 + 4 + entry.snapshot.len + 1;
         }
         return n;
     }
@@ -172,6 +178,7 @@ pub const SessionCapsule = struct {
             // fields at their defaults (no join fd, no restore snapshot).
             const fd: i32 = if (got_version >= 2) try readI32(bytes, &pos) else -1;
             const snapshot: []const u8 = if (got_version >= 2) try readLongStr(bytes, &pos) else &.{};
+            const portable_resume = if (got_version >= 3) (try readByte(bytes, &pos)) != 0 else false;
             sessions_out[i] = .{
                 .token = token,
                 .signon_unix = signon_unix,
@@ -179,12 +186,26 @@ pub const SessionCapsule = struct {
                 .client = client,
                 .fd = fd,
                 .snapshot = snapshot,
+                .portable_resume = portable_resume,
             };
         }
 
         return .{ .account = account, .sessions = sessions_out[0..count] };
     }
 };
+
+/// Read only the fixed header/account prefix and return the encoded session
+/// count. Lets Helix allocate an exact decode buffer instead of truncating at a
+/// historical stack constant.
+pub fn peekSessionCount(bytes: []const u8) Error!usize {
+    var pos: usize = 0;
+    const got_magic = try readBytes(bytes, &pos, magic.len);
+    if (!std.mem.eql(u8, got_magic, &magic)) return error.BadMagic;
+    const got_version = try readByte(bytes, &pos);
+    if (got_version < min_version or got_version > version) return error.BadVersion;
+    _ = try readStr(bytes, &pos);
+    return try readU16(bytes, &pos);
+}
 
 // --- encode helpers ---------------------------------------------------------
 
@@ -308,7 +329,7 @@ fn readLongStr(bytes: []const u8, pos: *usize) Error![]const u8 {
 
 test "round-trip an account with two sessions (one detached, one attached)" {
     const sessions = [_]SessionEntry{
-        .{ .token = "tok-attached-0001", .signon_unix = 1_700_000_000, .detached = false, .client = 42 },
+        .{ .token = "tok-attached-0001", .signon_unix = 1_700_000_000, .detached = false, .client = 42, .portable_resume = true },
         .{ .token = "tok-detached-0002", .signon_unix = 1_700_009_999, .detached = true, .client = 99 },
     };
     const original = SessionCapsule{ .account = "alice", .sessions = &sessions };
@@ -326,11 +347,34 @@ test "round-trip an account with two sessions (one detached, one attached)" {
     try std.testing.expectEqual(sessions[0].signon_unix, decoded.sessions[0].signon_unix);
     try std.testing.expectEqual(false, decoded.sessions[0].detached);
     try std.testing.expectEqual(@as(u64, 42), decoded.sessions[0].client);
+    try std.testing.expect(decoded.sessions[0].portable_resume);
 
     try std.testing.expectEqualStrings(sessions[1].token, decoded.sessions[1].token);
     try std.testing.expectEqual(sessions[1].signon_unix, decoded.sessions[1].signon_unix);
     try std.testing.expectEqual(true, decoded.sessions[1].detached);
     try std.testing.expectEqual(@as(u64, 99), decoded.sessions[1].client);
+    try std.testing.expect(!decoded.sessions[1].portable_resume);
+}
+
+test "round-trip preserves duplicate tokens for simultaneous attachments" {
+    const shared = "shared-token-001";
+    const sessions = [_]SessionEntry{
+        .{ .token = shared, .signon_unix = 10, .detached = false, .client = 101, .fd = 11, .portable_resume = true },
+        .{ .token = shared, .signon_unix = 11, .detached = false, .client = 202, .fd = 12, .portable_resume = true },
+        .{ .token = shared, .signon_unix = 12, .detached = true, .client = 303, .snapshot = "last-state", .portable_resume = true },
+    };
+    const original = SessionCapsule{ .account = "multi", .sessions = &sessions };
+    var buf: [512]u8 = undefined;
+    const wire = try original.encode(&buf);
+    var out: [3]SessionEntry = undefined;
+    const decoded = try SessionCapsule.decode(wire, &out);
+
+    try std.testing.expectEqual(@as(usize, 3), decoded.sessions.len);
+    for (decoded.sessions) |entry| {
+        try std.testing.expectEqualStrings(shared, entry.token);
+        try std.testing.expect(entry.portable_resume);
+    }
+    try std.testing.expectEqualSlices(u8, "last-state", decoded.sessions[2].snapshot);
 }
 
 test "round-trip an account with zero sessions" {

@@ -1,21 +1,22 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! S2S session migration — the capsule a node ships to a peer to hand off a live
-//! client session, plus the receiving node's holding area.
+//! S2S session replication — the capsule a node ships to a peer so clients can
+//! attach to the same logical session across the mesh, plus the receiving node's
+//! bounded holding area.
 //!
 //! Unlike a hot UPGRADE (same machine, the socket fd is inherited), an S2S
-//! migration crosses processes/machines: the fd CANNOT move, so the client
-//! reconnects to the target node and RECLAIMS its session by token. This module
-//! is the data layer for that:
+//! replica crosses processes/machines: the fd CANNOT move, so a client attaches
+//! on the target node with the same reusable token. This module is the data layer
+//! for that:
 //!
 //!   * `Capsule` — token + account + a `session_snapshot` blob (nick/account/
 //!     hosts/away/oper/channels). The `fd` inside the snapshot is meaningless
 //!     across machines and ignored on reclaim.
 //!   * `PendingMigrations` — the target node's holding area: token -> (account,
-//!     snapshot), inserted when the capsule arrives and consumed when the client
-//!     reconnects with that token. Pairs with `sessions.SessionStore` (which
-//!     tracks the reclaimable detached session) — this holds the state to restore.
+//!     snapshot), inserted when the capsule arrives and borrowed by every client
+//!     attaching with that token until bounded TTL expiry. Pairs with
+//!     `sessions.SessionStore`, which tracks local logical-session attachments.
 //!
 //! Transport-agnostic: the capsule rides whatever carries it (S2S relay frame,
 //! conduit, ...). Wiring it onto the live S2S link + the reclaim path are later
@@ -69,6 +70,26 @@ pub fn decode(bytes: []const u8) Error!Capsule {
     return .{ .token = token, .account = account, .snapshot = snapshot };
 }
 
+pub const Tombstone = struct {
+    token: Token,
+    consumed_at_ms: i64,
+};
+
+pub const tombstone_wire_len: usize = @sizeOf(Token) + @sizeOf(i64);
+
+pub fn encodeTombstone(tombstone: Tombstone, out: *[tombstone_wire_len]u8) []const u8 {
+    @memcpy(out[0..16], &tombstone.token);
+    std.mem.writeInt(i64, out[16..24], tombstone.consumed_at_ms, .big);
+    return out;
+}
+
+pub fn decodeTombstone(bytes: []const u8) Error!Tombstone {
+    if (bytes.len != tombstone_wire_len) return error.Truncated;
+    var token: Token = undefined;
+    @memcpy(&token, bytes[0..16]);
+    return .{ .token = token, .consumed_at_ms = std.mem.readInt(i64, bytes[16..24], .big) };
+}
+
 /// Target-node holding area: migrated sessions awaiting the client's reconnect.
 /// Bounded two ways — a hard entry cap enforced in `put` and a TTL enforced by
 /// the server's periodic `sweep` — so a signed-but-hostile (or buggy) peer
@@ -76,24 +97,41 @@ pub fn decode(bytes: []const u8) Error!Capsule {
 pub const PendingMigrations = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Token, Entry) = .empty,
+    /// Compatibility tombstones received/carried from legacy one-shot peers.
+    /// Modern reusable-session attachment never creates one; a fresh verified
+    /// signed offer supersedes one during a rolling upgrade.
+    consumed: std.AutoHashMapUnmanaged(Token, i64) = .empty,
+    cfg: Config,
 
-    /// Hard ceiling on staged entries. A staged entry is one detached session
-    /// awaiting a reconnect; even a large mesh stages far fewer than this. On a
+    /// Hard ceiling on staged entries. A staged entry is one reusable logical
+    /// session replica; even a large mesh stages far fewer than this. On a
     /// full map `put` fails closed (the client's reclaim then falls back to the
     /// legacy redirect path) rather than evicting a legitimate pending entry.
-    pub const max_entries: usize = 4096;
+    pub const default_max_entries: usize = 4096;
 
-    pub const PutError = error{PendingFull} || std.mem.Allocator.Error;
+    pub const Config = struct {
+        max_entries: usize = default_max_entries,
+        max_per_account: usize = 64,
+    };
+
+    pub const PutError = error{ PendingFull, AlreadyConsumed, StaleOffer, TokenAccountMismatch } || std.mem.Allocator.Error;
 
     pub const Entry = struct {
         account: []u8,
         snapshot: []u8,
         /// Monotonic-ms staging time; `sweep` evicts entries older than the TTL.
         staged_at_ms: i64,
+        /// Signed relay epoch for this exact session token. Zero denotes legacy
+        /// or locally-seeded state without ordering metadata.
+        offer_epoch: u64 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator) PendingMigrations {
-        return .{ .allocator = allocator };
+        return initWithConfig(allocator, .{});
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) PendingMigrations {
+        return .{ .allocator = allocator, .cfg = cfg };
     }
 
     pub fn deinit(self: *PendingMigrations) void {
@@ -103,6 +141,7 @@ pub const PendingMigrations = struct {
             self.allocator.free(e.snapshot);
         }
         self.map.deinit(self.allocator);
+        self.consumed.deinit(self.allocator);
     }
 
     /// Store a freshly-arrived capsule (copies the account + snapshot), stamped
@@ -110,19 +149,46 @@ pub const PendingMigrations = struct {
     /// (freeing the old). Fails closed with `PendingFull` when inserting a NEW
     /// token into a map already at `max_entries` (a replacement always succeeds).
     pub fn put(self: *PendingMigrations, cap: Capsule, now_ms: i64) PutError!void {
-        if (self.map.count() >= max_entries and !self.map.contains(cap.token)) {
+        return self.putAtEpoch(cap, now_ms, 0);
+    }
+
+    /// Stage a signed offer with token-scoped ordering. The pending map is the
+    /// bounded lifecycle authority: a replayed or reordered offer cannot replace
+    /// a newer snapshot for the same resume token, while different authenticated
+    /// origin peers never collide merely because their local nonce counters match.
+    pub fn putAtEpoch(self: *PendingMigrations, cap: Capsule, now_ms: i64, offer_epoch: u64) PutError!void {
+        // Legacy one-shot peers may have converged a consume tombstone during a
+        // rolling upgrade. An unsigned/legacy restage must still respect it;
+        // only a newly verified, ordered relay offer proves that the reusable
+        // logical session is live again and may reactivate the replica.
+        if (self.consumed.contains(cap.token) and offer_epoch == 0) return error.AlreadyConsumed;
+        const replacing = self.map.contains(cap.token);
+        if (replacing) {
+            const current = self.map.getPtr(cap.token).?;
+            if (!std.ascii.eqlIgnoreCase(current.account, cap.account)) return error.TokenAccountMismatch;
+            if (offer_epoch != 0 and current.offer_epoch != 0 and offer_epoch <= current.offer_epoch) return error.StaleOffer;
+        }
+        if (!replacing and self.map.count() >= self.cfg.max_entries) {
+            return error.PendingFull;
+        }
+        if (!replacing and self.countForAccount(cap.account) >= self.cfg.max_per_account) {
             return error.PendingFull;
         }
         const account = try self.allocator.dupe(u8, cap.account);
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
         errdefer self.allocator.free(snapshot);
+        // v3+ session credentials are reusable multi-attachment capabilities.
+        // A freshly verified signed offer reactivates a token tombstoned by an
+        // older one-shot peer during a rolling upgrade. Do this only after all
+        // bounds/allocation checks pass so a failed stage preserves old state.
+        if (offer_epoch != 0) _ = self.consumed.remove(cap.token);
         const gop = try self.map.getOrPut(self.allocator, cap.token);
         if (gop.found_existing) {
             self.allocator.free(gop.value_ptr.account);
             self.allocator.free(gop.value_ptr.snapshot);
         }
-        gop.value_ptr.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms };
+        gop.value_ptr.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms, .offer_epoch = offer_epoch };
     }
 
     /// Evict every entry staged at least `ttl_ms` before `now_ms` (freeing its
@@ -144,7 +210,17 @@ pub const PendingMigrations = struct {
             self.allocator.free(kv.value.account);
             self.allocator.free(kv.value.snapshot);
         }
-        return expired.items.len;
+        const pending_evicted = expired.items.len;
+        expired.clearRetainingCapacity();
+        var consumed_it = self.consumed.iterator();
+        while (consumed_it.next()) |entry| {
+            const age = now_ms -| entry.value_ptr.*;
+            if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
+                expired.append(self.allocator, entry.key_ptr.*) catch return pending_evicted;
+            }
+        }
+        for (expired.items) |token| _ = self.consumed.remove(token);
+        return pending_evicted + expired.items.len;
     }
 
     /// Whether a migrated session is waiting for `token`.
@@ -152,8 +228,35 @@ pub const PendingMigrations = struct {
         return self.map.contains(token);
     }
 
-    /// Remove and return the migrated session for `token` (caller owns the slices;
-    /// release with `freeEntry`). Null if none — the client reclaims on reconnect.
+    /// Borrow a staged reusable replica without consuming it. Multiple clients
+    /// may restore from this view until its bounded TTL expires.
+    pub fn get(self: *const PendingMigrations, token: Token) ?*const Entry {
+        return self.map.getPtr(token);
+    }
+
+    pub fn isConsumed(self: *const PendingMigrations, token: Token) bool {
+        return self.consumed.contains(token);
+    }
+
+    /// Legacy one-shot compatibility: remove a staged copy and retain a bounded
+    /// token tombstone. Modern successful attachment deliberately does not call
+    /// this because the signed replica is reusable by concurrent clients.
+    pub fn markConsumed(self: *PendingMigrations, token: Token, now_ms: i64) std.mem.Allocator.Error!void {
+        // Remove the live copy first even if allocating the tombstone fails: a
+        // memory-pressure event must not leave an immediately double-consumable
+        // snapshot in place.
+        if (self.map.fetchRemove(token)) |kv| {
+            self.allocator.free(kv.value.account);
+            self.allocator.free(kv.value.snapshot);
+        }
+        if (self.consumed.contains(token)) return;
+        if (self.consumed.count() >= self.cfg.max_entries) self.evictOldestConsumed();
+        try self.consumed.put(self.allocator, token, now_ms);
+    }
+
+    /// Legacy destructive access used by compatibility tests/capsule adoption.
+    /// Modern attachment borrows with `get`. Caller owns the returned slices and
+    /// releases them with `freeEntry`.
     pub fn take(self: *PendingMigrations, token: Token) ?Entry {
         const e = self.map.fetchRemove(token) orelse return null;
         return e.value;
@@ -166,6 +269,32 @@ pub const PendingMigrations = struct {
 
     pub fn count(self: *const PendingMigrations) usize {
         return self.map.count();
+    }
+
+    pub fn consumedCount(self: *const PendingMigrations) usize {
+        return self.consumed.count();
+    }
+
+    fn evictOldestConsumed(self: *PendingMigrations) void {
+        var oldest_token: ?Token = null;
+        var oldest_at: i64 = std.math.maxInt(i64);
+        var it = self.consumed.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* < oldest_at) {
+                oldest_at = entry.value_ptr.*;
+                oldest_token = entry.key_ptr.*;
+            }
+        }
+        if (oldest_token) |token| _ = self.consumed.remove(token);
+    }
+
+    fn countForAccount(self: *const PendingMigrations, account: []const u8) usize {
+        var matches: usize = 0;
+        var it = @constCast(&self.map).valueIterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.account, account)) matches += 1;
+        }
+        return matches;
     }
 };
 
@@ -187,6 +316,15 @@ test "migration capsule encode/decode round-trips" {
     try testing.expectEqualSlices(u8, &token, &got.token);
     try testing.expectEqualStrings("alice", got.account);
     try testing.expectEqualStrings("snap-bytes-here", got.snapshot);
+}
+
+test "consumption tombstone wire round-trips exactly" {
+    const original = Tombstone{ .token = @splat(0x5A), .consumed_at_ms = 123_456 };
+    var buf: [tombstone_wire_len]u8 = undefined;
+    const got = try decodeTombstone(encodeTombstone(original, &buf));
+    try testing.expectEqualSlices(u8, &original.token, &got.token);
+    try testing.expectEqual(original.consumed_at_ms, got.consumed_at_ms);
+    try testing.expectError(error.Truncated, decodeTombstone(buf[0 .. buf.len - 1]));
 }
 
 test "decode rejects truncated input" {
@@ -218,32 +356,62 @@ test "PendingMigrations stores, finds, and consumes by token" {
     try testing.expectEqual(@as(usize, 1), pm.count()); // bob remains
 }
 
-test "put replaces an existing token without leaking" {
+test "put replaces an existing token snapshot without leaking" {
     const allocator = testing.allocator;
     var pm = PendingMigrations.init(allocator);
     defer pm.deinit();
     const t: Token = @splat(9);
-    try pm.put(.{ .token = t, .account = "old", .snapshot = "x" }, 1000);
-    try pm.put(.{ .token = t, .account = "new", .snapshot = "yy" }, 1000);
+    try pm.put(.{ .token = t, .account = "alice", .snapshot = "x" }, 1000);
+    try pm.put(.{ .token = t, .account = "ALICE", .snapshot = "yy" }, 1000);
     try testing.expectEqual(@as(usize, 1), pm.count());
     const e = pm.take(t).?;
     defer pm.freeEntry(e);
-    try testing.expectEqualStrings("new", e.account);
+    try testing.expectEqualStrings("ALICE", e.account);
+    try testing.expectEqualStrings("yy", e.snapshot);
+}
+
+test "signed offer epoch rejects replay and stale replacement per token" {
+    const allocator = testing.allocator;
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    const token: Token = @splat(7);
+
+    try pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "new" }, 100, 42);
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "replay" }, 101, 42),
+    );
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "old" }, 102, 41),
+    );
+    try testing.expectError(
+        error.TokenAccountMismatch,
+        pm.putAtEpoch(.{ .token = token, .account = "mallory", .snapshot = "splice" }, 103, 43),
+    );
+    try pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "newer" }, 103, 43);
+
+    const entry = pm.get(token).?;
+    try testing.expectEqual(@as(u64, 43), entry.offer_epoch);
+    try testing.expectEqualStrings("newer", entry.snapshot);
 }
 
 test "put fails closed at max_entries; a replacement of an existing token still succeeds" {
     const allocator = testing.allocator;
-    var pm = PendingMigrations.init(allocator);
+    var pm = PendingMigrations.initWithConfig(allocator, .{
+        .max_entries = PendingMigrations.default_max_entries,
+        .max_per_account = PendingMigrations.default_max_entries,
+    });
     defer pm.deinit();
 
     // Fill to the cap (distinct tokens derived from the loop index).
     var i: usize = 0;
-    while (i < PendingMigrations.max_entries) : (i += 1) {
+    while (i < PendingMigrations.default_max_entries) : (i += 1) {
         var t: Token = @splat(0);
         std.mem.writeInt(u64, t[0..8], i, .little);
         try pm.put(.{ .token = t, .account = "acct", .snapshot = "s" }, 1);
     }
-    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+    try testing.expectEqual(PendingMigrations.default_max_entries, pm.count());
 
     // A NEW token is rejected — the map never grows past the cap.
     const fresh: Token = @splat(0xFF);
@@ -251,20 +419,75 @@ test "put fails closed at max_entries; a replacement of an existing token still 
         error.PendingFull,
         pm.put(.{ .token = fresh, .account = "evil", .snapshot = "x" }, 2),
     );
-    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+    try testing.expectEqual(PendingMigrations.default_max_entries, pm.count());
     try testing.expect(!pm.has(fresh));
 
     // Replacing an EXISTING token at the cap succeeds (count unchanged).
     const t0: Token = @splat(0);
-    try pm.put(.{ .token = t0, .account = "replaced", .snapshot = "zz" }, 3);
-    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+    try pm.put(.{ .token = t0, .account = "acct", .snapshot = "zz" }, 3);
+    try testing.expectEqual(PendingMigrations.default_max_entries, pm.count());
     const e = pm.take(t0).?;
     defer pm.freeEntry(e);
-    try testing.expectEqualStrings("replaced", e.account);
+    try testing.expectEqualStrings("acct", e.account);
 
     // Consuming an entry frees a slot; a new token is admitted again.
     try pm.put(.{ .token = fresh, .account = "ok", .snapshot = "y" }, 4);
     try testing.expect(pm.has(fresh));
+}
+
+test "per-account staging cap cannot evict another account" {
+    var pm = PendingMigrations.initWithConfig(testing.allocator, .{
+        .max_entries = 4,
+        .max_per_account = 1,
+    });
+    defer pm.deinit();
+
+    const alice_1: Token = @as([15]u8, @splat(0)) ++ .{1};
+    const alice_2: Token = @as([15]u8, @splat(0)) ++ .{2};
+    const bob: Token = @as([15]u8, @splat(0)) ++ .{3};
+    try pm.put(.{ .token = alice_1, .account = "alice", .snapshot = "a" }, 1);
+    try testing.expectError(error.PendingFull, pm.put(.{ .token = alice_2, .account = "ALICE", .snapshot = "b" }, 2));
+    try pm.put(.{ .token = bob, .account = "bob", .snapshot = "c" }, 3);
+    try testing.expect(pm.has(alice_1));
+    try testing.expect(pm.has(bob));
+}
+
+test "consumption tombstone blocks late migration resurrection and expires" {
+    var pm = PendingMigrations.initWithConfig(testing.allocator, .{
+        .max_entries = 4,
+        .max_per_account = 4,
+    });
+    defer pm.deinit();
+
+    const token: Token = @splat(0xAC);
+    try pm.put(.{ .token = token, .account = "alice", .snapshot = "state" }, 10);
+    try pm.markConsumed(token, 20);
+    try testing.expect(!pm.has(token));
+    try testing.expect(pm.isConsumed(token));
+    try testing.expectError(error.AlreadyConsumed, pm.put(.{ .token = token, .account = "alice", .snapshot = "late" }, 21));
+
+    try testing.expectEqual(@as(usize, 1), pm.sweep(120, 100));
+    try testing.expect(!pm.isConsumed(token));
+    try pm.put(.{ .token = token, .account = "alice", .snapshot = "new-generation" }, 121);
+    try testing.expect(pm.has(token));
+}
+
+test "verified reusable-session offer supersedes a legacy consumption tombstone" {
+    var pm = PendingMigrations.init(testing.allocator);
+    defer pm.deinit();
+
+    const token: Token = @splat(0xAD);
+    try pm.markConsumed(token, 20);
+    try testing.expect(pm.isConsumed(token));
+
+    try pm.putAtEpoch(.{
+        .token = token,
+        .account = "alice",
+        .snapshot = "fresh-signed-state",
+    }, 21, 7);
+    try testing.expect(pm.has(token));
+    try testing.expect(!pm.isConsumed(token));
+    try testing.expectEqualStrings("fresh-signed-state", pm.get(token).?.snapshot);
 }
 
 test "sweep evicts entries past the TTL and keeps fresh ones" {
