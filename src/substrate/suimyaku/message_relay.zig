@@ -12,9 +12,25 @@ const std = @import("std");
 const cpv = @import("../../proto/coilpack_value.zig");
 const sign = @import("../../crypto/sign.zig");
 const signed_frame = @import("signed_frame.zig");
+const utf8 = @import("../utf8.zig");
 
 pub const pubkey_len = sign.public_key_len; // 32
 pub const sig_len = sign.signature_len; // 64
+
+// Hard protocol bounds. These deliberately do not depend on a receiving
+// daemon's runtime configuration: every peer must agree on whether a relay
+// frame is structurally safe before it can be rendered as an IRC line.
+pub const max_nick_len: usize = 64;
+pub const max_user_len: usize = 64;
+pub const max_host_len: usize = 255;
+pub const max_channel_len: usize = 200;
+pub const max_account_len: usize = 64;
+pub const max_tags_len: usize = 4094;
+pub const max_tag_count: usize = 32;
+pub const max_tag_key_len: usize = 96;
+pub const max_text_len: usize = 4096;
+pub const max_data_tag_len: usize = 15;
+pub const max_prefix_len: usize = max_nick_len + 1 + max_user_len + 1 + max_host_len;
 
 /// Domain label folded into the Ed25519 transcript of a self-contained MESSAGE
 /// origin signature (via `sign.signCtx`). Distinct from `signed_frame`'s
@@ -109,9 +125,171 @@ pub const DecodeError = error{
     InvalidDocument,
     InvalidFieldType,
     InvalidVerb,
+    InvalidSemantic,
     MissingField,
     UnknownField,
 };
+
+pub const SemanticError = error{InvalidSemantic};
+
+fn invalid() SemanticError {
+    return error.InvalidSemantic;
+}
+
+fn hasControl(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return true;
+    }
+    return false;
+}
+
+fn validUtf8Field(bytes: []const u8, max_len: usize, allow_empty: bool) bool {
+    if ((!allow_empty and bytes.len == 0) or bytes.len > max_len) return false;
+    return !hasControl(bytes) and utf8.validateUtf8(bytes);
+}
+
+fn validNick(nick: []const u8) bool {
+    return utf8.isValidNickWith(.utf8_only, nick, .{ .max_nick_bytes = max_nick_len });
+}
+
+fn validChannel(channel: []const u8) bool {
+    if (channel.len > max_channel_len) return false;
+    // IRCX prefixes UTF-8 channel names with '%', while the following '#'/ '&'
+    // remains the actual channel sigil. Validate the remainder with the same
+    // grammar as an ordinary channel and include '%' in the total bound above.
+    const name = if (channel.len >= 2 and channel[0] == '%') channel[1..] else channel;
+    return utf8.isValidChannelWith(.utf8_only, name, .{
+        .max_channel_bytes = max_channel_len,
+        .allow_ampersand_channel = true,
+    });
+}
+
+fn validUser(user: []const u8) bool {
+    if (!validUtf8Field(user, max_user_len, false)) return false;
+    for (user) |byte| {
+        if (byte == '!' or byte == '@' or byte == ':' or byte == ' ') return false;
+    }
+    return true;
+}
+
+fn validHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > max_host_len) return false;
+    for (host) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or
+            byte == '.' or byte == '-' or byte == '_' or byte == ':' or
+            byte == '[' or byte == ']' or byte == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn validPrefix(prefix: []const u8, source_nick: []const u8) bool {
+    if (prefix.len == 0 or prefix.len > max_prefix_len or prefix[0] == ':') return false;
+    const bang = std.mem.indexOfScalar(u8, prefix, '!') orelse return false;
+    const at_rel = std.mem.indexOfScalar(u8, prefix[bang + 1 ..], '@') orelse return false;
+    const at = bang + 1 + at_rel;
+    const nick = prefix[0..bang];
+    const user = prefix[bang + 1 .. at];
+    const host = prefix[at + 1 ..];
+
+    // Require exactly nick!user@host. Extra separators are not meaningful IRC
+    // prefix syntax and would make downstream identity parsing ambiguous.
+    if (std.mem.indexOfScalar(u8, prefix[bang + 1 ..], '!') != null) return false;
+    if (std.mem.indexOfScalar(u8, host, '@') != null) return false;
+    if (!validNick(nick) or !utf8.eql(.utf8_only, nick, source_nick)) return false;
+    if (!validUser(user) or !validHost(host)) return false;
+    return true;
+}
+
+fn validAccount(account: []const u8) bool {
+    if (account.len == 0) return true;
+    if (!validUtf8Field(account, max_account_len, false)) return false;
+    for (account) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn validTagKey(key: []const u8) bool {
+    // The relay field carries client-only tags, so every key retains the IRCv3
+    // '+' marker. Server tags (time/account/msgid) are stamped at each hop.
+    if (key.len < 2 or key.len > max_tag_key_len or key[0] != '+') return false;
+    for (key[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '.' and byte != '/') return false;
+    }
+    return true;
+}
+
+fn validTags(raw: []const u8) bool {
+    if (raw.len == 0) return true;
+    if (!validUtf8Field(raw, max_tags_len, false)) return false;
+
+    var seen: [max_tag_count][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |tag| {
+        if (tag.len == 0 or count == max_tag_count) return false;
+        const eq = std.mem.indexOfScalar(u8, tag, '=') orelse tag.len;
+        const key = tag[0..eq];
+        if (!validTagKey(key)) return false;
+        for (seen[0..count]) |prior| {
+            if (std.mem.eql(u8, prior, key)) return false;
+        }
+        if (eq < tag.len) {
+            for (tag[eq + 1 ..]) |byte| {
+                if (byte == ' ' or byte == ';') return false;
+            }
+        }
+        seen[count] = key;
+        count += 1;
+    }
+    return count != 0;
+}
+
+fn validDataTag(tag: []const u8) bool {
+    if (tag.len == 0 or tag.len > max_data_tag_len or !std.ascii.isAlphabetic(tag[0])) return false;
+    for (tag) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.') return false;
+    }
+    return true;
+}
+
+/// Validate all semantic invariants required before a relay message is rendered
+/// into an IRC line. `decode` calls this before allocating owned field copies;
+/// direct/in-process callers must call it at their trust boundary too.
+pub fn validateSemantic(msg: RelayMessage) SemanticError!void {
+    if (msg.min_rank > 4) return invalid();
+    if (!validNick(msg.source_nick)) return invalid();
+    if (!validPrefix(msg.source_prefix, msg.source_nick)) return invalid();
+    if (!validAccount(msg.account)) return invalid();
+    if (!validTags(msg.tags)) return invalid();
+    if (!validUtf8Field(msg.text, max_text_len, true)) return invalid();
+
+    const target_is_channel = validChannel(msg.target);
+    const target_is_nick = validNick(msg.target);
+    if (!target_is_channel and !target_is_nick) return invalid();
+    if (!target_is_channel and msg.min_rank != 0) return invalid();
+
+    if (msg.origin_pubkey.len != 0 and msg.origin_pubkey.len != pubkey_len) return invalid();
+    if (msg.origin_sig.len != 0 and msg.origin_sig.len != sig_len) return invalid();
+    if ((msg.origin_pubkey.len == 0) != (msg.origin_sig.len == 0)) return invalid();
+
+    switch (msg.verb) {
+        .privmsg, .notice => {
+            if (msg.text.len == 0 or msg.data_tag.len != 0 or msg.recipient.len != 0) return invalid();
+        },
+        .tagmsg => {
+            if (msg.text.len != 0 or msg.tags.len == 0 or msg.data_tag.len != 0 or msg.recipient.len != 0) return invalid();
+        },
+        .data, .request, .reply => {
+            if (msg.text.len == 0 or !validDataTag(msg.data_tag) or msg.recipient.len != 0) return invalid();
+        },
+        .whisper => {
+            if (!target_is_channel or msg.min_rank != 0 or msg.text.len == 0 or msg.data_tag.len != 0 or !validNick(msg.recipient)) return invalid();
+        },
+    }
+}
 
 /// Canonical CoilPack encode (stable field order - signature-stable).
 pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
@@ -136,7 +314,8 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     return cpv.Encoder.encode(allocator, .{ .map = entries[0..] });
 }
 
-/// Decode into owned copies (validates field presence + verb range).
+/// Decode into owned copies, rejecting unsafe or semantically inconsistent
+/// relay frames before any rendered field reaches daemon code.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     var value = try cpv.Decoder.decode(allocator, bytes);
     defer value.deinit(allocator);
@@ -215,6 +394,24 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     if (origin_sig.len != 0 and origin_sig.len != sig_len) return DecodeError.InvalidFieldType;
     if ((origin_pubkey.len == 0) != (origin_sig.len == 0)) return DecodeError.InvalidFieldType;
 
+    const verb = verb_opt orelse return DecodeError.MissingField;
+    try validateSemantic(.{
+        .verb = verb,
+        .target = target,
+        .source_nick = source_nick,
+        .source_prefix = source_prefix,
+        .account = account,
+        .tags = tags,
+        .text = text,
+        .data_tag = data_tag,
+        .recipient = recipient,
+        .min_rank = min_rank,
+        .origin_node = origin_node_opt orelse return DecodeError.MissingField,
+        .hlc = hlc_opt orelse return DecodeError.MissingField,
+        .origin_pubkey = origin_pubkey,
+        .origin_sig = origin_sig,
+    });
+
     const target_owned = try allocator.dupe(u8, target);
     errdefer allocator.free(target_owned);
     const source_nick_owned = try allocator.dupe(u8, source_nick);
@@ -237,7 +434,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     errdefer allocator.free(origin_sig_owned);
 
     return .{ .msg = .{
-        .verb = verb_opt orelse return DecodeError.MissingField,
+        .verb = verb,
         .target = target_owned,
         .source_nick = source_nick_owned,
         .source_prefix = source_prefix_owned,
@@ -381,6 +578,7 @@ pub const SeenSet = struct {
     const Key = struct {
         origin_node: u64,
         hlc: u64,
+        authenticated: bool,
     };
 
     allocator: std.mem.Allocator,
@@ -394,9 +592,20 @@ pub const SeenSet = struct {
     }
 
     pub fn observe(self: *SeenSet, origin_node: u64, hlc: u64) bool {
+        return self.observeClass(origin_node, hlc, true);
+    }
+
+    /// Legacy unsigned relays occupy an independent dedup namespace. An
+    /// admitted legacy/byzantine peer therefore cannot claim a victim's signed
+    /// `(origin,hlc)` first and suppress the later authenticated event.
+    pub fn observeUnsigned(self: *SeenSet, origin_node: u64, hlc: u64) bool {
+        return self.observeClass(origin_node, hlc, false);
+    }
+
+    fn observeClass(self: *SeenSet, origin_node: u64, hlc: u64, authenticated: bool) bool {
         if (self.capacity == 0) return false;
 
-        const key = Key{ .origin_node = origin_node, .hlc = hlc };
+        const key = Key{ .origin_node = origin_node, .hlc = hlc, .authenticated = authenticated };
         if (self.seen.contains(key)) return true;
         self.ensureCapacity() catch return true;
 
@@ -489,6 +698,315 @@ fn expectRoundTrip(msg: RelayMessage) !void {
     try std.testing.expectEqual(msg.hlc, owned.msg.hlc);
     try std.testing.expectEqualSlices(u8, msg.origin_pubkey, owned.msg.origin_pubkey);
     try std.testing.expectEqualSlices(u8, msg.origin_sig, owned.msg.origin_sig);
+}
+
+fn semanticSample() RelayMessage {
+    return .{
+        .verb = .privmsg,
+        .target = "#orochi",
+        .source_nick = "alice",
+        .source_prefix = "alice!user@example.invalid",
+        .account = "alice",
+        .tags = "+draft/reply=42",
+        .text = "hello mesh",
+        .origin_node = 7,
+        .hlc = 101,
+    };
+}
+
+fn expectSemanticInvalidOnWire(msg: RelayMessage) !void {
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
+    const allocator = std.testing.allocator;
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    try std.testing.expectError(error.InvalidSemantic, decode(allocator, wire));
+}
+
+test "semantic validation rejects CR LF NUL and controls in every rendered field" {
+    const Field = enum {
+        target,
+        source_nick,
+        source_prefix,
+        account,
+        tags,
+        text,
+        data_tag,
+        recipient,
+    };
+    const BadByte = enum { cr, lf, crlf, nul, c0, del };
+
+    inline for (std.meta.tags(Field)) |field| {
+        inline for (std.meta.tags(BadByte)) |bad| {
+            var msg = semanticSample();
+            switch (field) {
+                .target => msg.target = switch (bad) {
+                    .cr => "#bad\rtarget",
+                    .lf => "#bad\ntarget",
+                    .crlf => "#bad\r\ntarget",
+                    .nul => "#bad\x00target",
+                    .c0 => "#bad\x01target",
+                    .del => "#bad\x7ftarget",
+                },
+                .source_nick => msg.source_nick = switch (bad) {
+                    .cr => "ali\rce",
+                    .lf => "ali\nce",
+                    .crlf => "ali\r\nce",
+                    .nul => "ali\x00ce",
+                    .c0 => "ali\x01ce",
+                    .del => "ali\x7fce",
+                },
+                .source_prefix => msg.source_prefix = switch (bad) {
+                    .cr => "alice!user@bad\rhost",
+                    .lf => "alice!user@bad\nhost",
+                    .crlf => "alice!user@bad\r\nhost",
+                    .nul => "alice!user@bad\x00host",
+                    .c0 => "alice!user@bad\x01host",
+                    .del => "alice!user@bad\x7fhost",
+                },
+                .account => msg.account = switch (bad) {
+                    .cr => "ali\rce",
+                    .lf => "ali\nce",
+                    .crlf => "ali\r\nce",
+                    .nul => "ali\x00ce",
+                    .c0 => "ali\x01ce",
+                    .del => "ali\x7fce",
+                },
+                .tags => msg.tags = switch (bad) {
+                    .cr => "+draft/reply=bad\rvalue",
+                    .lf => "+draft/reply=bad\nvalue",
+                    .crlf => "+draft/reply=bad\r\nvalue",
+                    .nul => "+draft/reply=bad\x00value",
+                    .c0 => "+draft/reply=bad\x01value",
+                    .del => "+draft/reply=bad\x7fvalue",
+                },
+                .text => msg.text = switch (bad) {
+                    .cr => "hello\rNOTICE victim :forged",
+                    .lf => "hello\nNOTICE victim :forged",
+                    .crlf => "hello\r\nNOTICE victim :forged",
+                    .nul => "hello\x00world",
+                    .c0 => "hello\x01world",
+                    .del => "hello\x7fworld",
+                },
+                .data_tag => {
+                    msg.verb = .data;
+                    msg.data_tag = switch (bad) {
+                        .cr => "SYS\rProbe",
+                        .lf => "SYS\nProbe",
+                        .crlf => "SYS\r\nProbe",
+                        .nul => "SYS\x00Probe",
+                        .c0 => "SYS\x01Probe",
+                        .del => "SYS\x7fProbe",
+                    };
+                },
+                .recipient => {
+                    msg.verb = .whisper;
+                    msg.tags = "";
+                    msg.recipient = switch (bad) {
+                        .cr => "bo\rb",
+                        .lf => "bo\nb",
+                        .crlf => "bo\r\nb",
+                        .nul => "bo\x00b",
+                        .c0 => "bo\x01b",
+                        .del => "bo\x7fb",
+                    };
+                },
+            }
+            try expectSemanticInvalidOnWire(msg);
+        }
+    }
+}
+
+test "semantic validation enforces full prefix target and tag grammar" {
+    for ([_][]const u8{
+        "aliceuser@example.invalid",
+        "alice!userexample.invalid",
+        "!user@example.invalid",
+        "alice!@example.invalid",
+        "alice!user@",
+        "alice!!user@example.invalid",
+        "alice!user@example.invalid@evil",
+        "alice!bad:user@example.invalid",
+        "alice!user@bad,host",
+        "bob!user@example.invalid",
+    }) |prefix| {
+        var msg = semanticSample();
+        msg.source_prefix = prefix;
+        try expectSemanticInvalidOnWire(msg);
+    }
+
+    for ([_][]const u8{ "", "#", "%#", "#bad,name", "9invalid", "bad target" }) |target| {
+        var msg = semanticSample();
+        msg.target = target;
+        try expectSemanticInvalidOnWire(msg);
+    }
+
+    for ([_][]const u8{
+        "draft/reply=42",
+        "+bad_key=value",
+        "+empty=ok;",
+        "+dup=one;+dup=two",
+        "+space=not allowed",
+        "+semi=not;allowed",
+    }) |tags| {
+        var msg = semanticSample();
+        msg.tags = tags;
+        try expectSemanticInvalidOnWire(msg);
+    }
+
+    var invalid_utf8_tag = semanticSample();
+    invalid_utf8_tag.tags = "+invalid=\xff";
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(invalid_utf8_tag));
+    try std.testing.expectError(cpv.FormatError.InvalidUtf8, encode(std.testing.allocator, invalid_utf8_tag));
+
+    var ranked_nick = semanticSample();
+    ranked_nick.target = "bob";
+    ranked_nick.min_rank = 1;
+    try expectSemanticInvalidOnWire(ranked_nick);
+
+    var whisper_to_nick = semanticSample();
+    whisper_to_nick.verb = .whisper;
+    whisper_to_nick.target = "bob";
+    whisper_to_nick.tags = "";
+    whisper_to_nick.recipient = "carol";
+    try expectSemanticInvalidOnWire(whisper_to_nick);
+}
+
+test "semantic validation enforces verb-specific fields" {
+    var msg = semanticSample();
+    msg.text = "";
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.data_tag = "SYS.Probe";
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.recipient = "bob";
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.verb = .tagmsg;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.verb = .tagmsg;
+    msg.text = "";
+    msg.tags = "";
+    try expectSemanticInvalidOnWire(msg);
+
+    inline for (.{ Verb.data, Verb.request, Verb.reply }) |verb| {
+        msg = semanticSample();
+        msg.verb = verb;
+        msg.data_tag = "";
+        try expectSemanticInvalidOnWire(msg);
+
+        msg.data_tag = "9bad";
+        try expectSemanticInvalidOnWire(msg);
+
+        msg.data_tag = "SYS.Probe";
+        msg.text = "";
+        try expectSemanticInvalidOnWire(msg);
+    }
+
+    msg = semanticSample();
+    msg.verb = .whisper;
+    msg.tags = "";
+    msg.recipient = "";
+    try expectSemanticInvalidOnWire(msg);
+
+    msg.recipient = "bob";
+    msg.min_rank = 1;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg.min_rank = 0;
+    msg.data_tag = "SYS.Probe";
+    try expectSemanticInvalidOnWire(msg);
+}
+
+test "semantic validation enforces hard field bounds" {
+    var too_long_nick: [max_nick_len + 1]u8 = @splat('a');
+    var too_long_channel: [max_channel_len + 1]u8 = @splat('a');
+    too_long_channel[0] = '#';
+    var too_long_account: [max_account_len + 1]u8 = @splat('a');
+    var too_long_tags: [max_tags_len + 1]u8 = @splat('a');
+    too_long_tags[0] = '+';
+    var too_long_text: [max_text_len + 1]u8 = @splat('a');
+    var too_long_data_tag: [max_data_tag_len + 1]u8 = @splat('a');
+    const too_long_user: [max_user_len + 1]u8 = @splat('u');
+    const too_long_host: [max_host_len + 1]u8 = @splat('h');
+
+    var msg = semanticSample();
+    msg.source_nick = &too_long_nick;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.target = &too_long_channel;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.account = &too_long_account;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.tags = &too_long_tags;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.text = &too_long_text;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.verb = .data;
+    msg.data_tag = &too_long_data_tag;
+    try expectSemanticInvalidOnWire(msg);
+
+    msg = semanticSample();
+    msg.verb = .whisper;
+    msg.tags = "";
+    msg.recipient = &too_long_nick;
+    try expectSemanticInvalidOnWire(msg);
+
+    var prefix_buf: [max_prefix_len + 2]u8 = undefined;
+    msg = semanticSample();
+    msg.source_prefix = try std.fmt.bufPrint(&prefix_buf, "alice!{s}@host", .{too_long_user});
+    try expectSemanticInvalidOnWire(msg);
+
+    msg.source_prefix = try std.fmt.bufPrint(&prefix_buf, "alice!user@{s}", .{too_long_host});
+    try expectSemanticInvalidOnWire(msg);
+}
+
+test "semantic validation preserves supported UTF8 IRCX and prefix forms" {
+    try expectRoundTrip(.{
+        .verb = .privmsg,
+        .target = "%#\xe9\x83\xa8\xe5\xb1\x8b",
+        .source_nick = "\xce\x94elta",
+        .source_prefix = "\xce\x94elta!~user@[2001:db8::1]",
+        .tags = "+draft/reply=one\\stwo;+vendor.example/tag=ok",
+        .text = "mesh UTF8",
+        .origin_node = 20,
+        .hlc = 200,
+    });
+
+    try expectRoundTrip(.{
+        .verb = .notice,
+        .target = "[Nick]",
+        .source_nick = "Service",
+        .source_prefix = "Service!svc@cloak/services/notice",
+        .text = "RFC special nick and cloaked host",
+        .origin_node = 21,
+        .hlc = 201,
+    });
+
+    try expectRoundTrip(.{
+        .verb = .whisper,
+        .target = "%&local",
+        .source_nick = "alice",
+        .source_prefix = "alice!user@example.invalid",
+        .text = "IRCX local UTF8 channel",
+        .recipient = "bob",
+        .origin_node = 22,
+        .hlc = 202,
+    });
 }
 
 test "relay messages round-trip for each verb" {
@@ -609,6 +1127,16 @@ test "seen set detects repeats and evicts oldest" {
     try std.testing.expect(!seen.observe(3, 30));
     try std.testing.expect(!seen.observe(1, 10));
     try std.testing.expect(seen.observe(3, 30));
+}
+
+test "unsigned dedup cannot poison the authenticated event namespace" {
+    var seen = SeenSet.init(std.testing.allocator, 8);
+    defer seen.deinit();
+
+    try std.testing.expect(!seen.observeUnsigned(7, 11));
+    try std.testing.expect(seen.observeUnsigned(7, 11));
+    try std.testing.expect(!seen.observe(7, 11));
+    try std.testing.expect(seen.observe(7, 11));
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@
 const std = @import("std");
 
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
+const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const sign = @import("../crypto/sign.zig");
@@ -35,9 +36,12 @@ const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
 const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
 pub const NodeId = s2s_peer.NodeId;
+pub const NickClaim = s2s_peer.NickClaim;
 pub const ChannelCrdt = s2s_peer.ChannelCrdt;
 pub const ChannelModeStateEvent = s2s_peer.ChannelModeStateEvent;
 pub const PeerConfig = s2s_peer.Config;
+pub const SessionReplicaKind = s2s_peer.SessionReplicaKind;
+pub const InboundSessionReplica = s2s_peer.InboundSessionReplica;
 
 /// Caller-supplied identity/config for one S2S link. The sovereign node_id is the
 /// single mesh identity (no legacy server-id): it keys the registry and is the
@@ -64,6 +68,9 @@ pub const Options = struct {
     /// Signed MeshPass frame-family rights admitted for the remote peer. Zero
     /// preserves open/shared-secret behavior.
     admitted_frame_families: u32 = 0,
+    /// Internal outer-transport assertion. Only `SecuredLink` sets this after a
+    /// successful Tsumugi AKE; standalone/plaintext links must leave it false.
+    session_replica_transport_enabled: bool = false,
 };
 
 pub const S2sLink = struct {
@@ -121,6 +128,7 @@ pub const S2sLink = struct {
             .config = opts.config,
             .signing_key = opts.signing_key,
             .admitted_frame_families = opts.admitted_frame_families,
+            .session_replica_transport_enabled = opts.session_replica_transport_enabled,
         });
     }
 
@@ -217,6 +225,7 @@ pub const S2sLink = struct {
             .config = opts.config,
             .signing_key = opts.signing_key,
             .admitted_frame_families = opts.admitted_frame_families,
+            .session_replica_transport_enabled = opts.session_replica_transport_enabled,
         }, hdr, remote_name, opts.now_ms, rng_seed);
     }
 
@@ -252,6 +261,10 @@ pub const S2sLink = struct {
     /// Which remote node currently owns `nick`, per the route table.
     pub fn routeNickNode(self: *const S2sLink, nick: []const u8) ?NodeId {
         return self.peer.routeNickNode(nick);
+    }
+
+    pub fn bestNickClaim(self: *const S2sLink, nick: []const u8) ?NickClaim {
+        return self.peer.bestNickClaim(nick);
     }
 
     /// Find `nick` in this peer's converged remote channel rosters (ASCII
@@ -516,6 +529,38 @@ pub const S2sLink = struct {
 
     pub fn takeSessionMigrateConsumed(self: *S2sLink) ![][]u8 {
         return self.peer.takeSessionMigrateConsumed();
+    }
+
+    /// SESSION_REPLICA v2 is active only after secured signing + explicit remote
+    /// capability negotiation. Plaintext and rolling-old links return false.
+    pub fn supportsSessionReplicaV2(self: *const S2sLink) bool {
+        return self.peer.supportsSessionReplicaV2();
+    }
+
+    pub fn sendSessionReplica(self: *S2sLink, kind: SessionReplicaKind, signed_payload: []const u8) !void {
+        try self.peer.sendSessionReplica(self.sink(), kind, signed_payload);
+    }
+
+    pub fn sendSessionReplicaOffer(self: *S2sLink, signed_offer: []const u8) !void {
+        try self.peer.sendSessionReplicaOffer(self.sink(), signed_offer);
+    }
+
+    pub fn sendSessionReplicaAck(self: *S2sLink, signed_ack: []const u8) !void {
+        try self.peer.sendSessionReplicaAck(self.sink(), signed_ack);
+    }
+
+    pub fn sendSessionReplicaRevoke(self: *S2sLink, signed_revoke: []const u8) !void {
+        try self.peer.sendSessionReplicaRevoke(self.sink(), signed_revoke);
+    }
+
+    /// Caller owns the slice and must deinit every item. Each item includes the
+    /// authenticated immediate hop as `via_peer` for future multipath storage.
+    pub fn takeSessionReplicaFrames(self: *S2sLink) ![]InboundSessionReplica {
+        return self.peer.takeSessionReplicaFrames();
+    }
+
+    pub fn takeDroppedSessionReplicaFrames(self: *S2sLink) u64 {
+        return self.peer.takeDroppedSessionReplicaFrames();
     }
 
     /// Emit a CLONE_COUNT batch (`mesh_clones` counts bytes) to this peer.
@@ -1136,6 +1181,48 @@ fn pumpLinks(a: *S2sLink, b: *S2sLink, allocator: std.mem.Allocator, start_now: 
         if (b_copy.len != 0) try a.feed(b_copy, now, 9);
         now += 1;
     }
+}
+
+test "session replica v2 signed plaintext S2sLink remains disabled" {
+    const allocator = std.testing.allocator;
+    const kp_a = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0xa1)));
+    const kp_b = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0xa2)));
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a: S2sLink = undefined;
+    try a.init(.{
+        .allocator = allocator,
+        .local_node_id = a_short,
+        .remote_node_id = b_short,
+        .local_epoch_ms = 1000,
+        .server_name = "a.orochi",
+        .signing_key = kp_a,
+    });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{
+        .allocator = allocator,
+        .local_node_id = b_short,
+        .remote_node_id = a_short,
+        .local_epoch_ms = 1001,
+        .server_name = "b.orochi",
+        .signing_key = kp_b,
+    });
+    defer b.deinit();
+
+    try a.start(10);
+    try pumpLinks(&a, &b, allocator, 11);
+    try std.testing.expect(a.peer.peer_supports_signing);
+    try std.testing.expect(b.peer.peer_supports_signing);
+    try std.testing.expect(!a.supportsSessionReplicaV2());
+    try std.testing.expect(!b.supportsSessionReplicaV2());
+
+    var ack: [189]u8 = @splat(0);
+    @memcpy(ack[0..4], "SRA2");
+    ack[4] = 1;
+    try std.testing.expectError(error.SecuredLinkRequired, a.sendSessionReplicaAck(&ack));
+    try std.testing.expectEqual(@as(usize, 0), a.outbound().len);
 }
 
 test "a remote nick colliding with a LOCAL nick is renamed to its UID, not overwritten" {

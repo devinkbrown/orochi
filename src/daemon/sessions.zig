@@ -48,6 +48,14 @@ pub const ResumeHandle = struct {
     portable: bool,
 };
 
+pub const AttachOutcome = struct {
+    session: Session,
+    /// Authority silently displaced to make room for the new live attachment.
+    /// The daemon uses this to publish a mesh REVOKE if this was the last local
+    /// row for an opted-in portable token.
+    evicted: ?ResumeHandle = null,
+};
+
 pub const DetachedSnapshot = struct {
     client: ClientId,
     signon_ms: i64,
@@ -114,26 +122,40 @@ pub const SessionStore = struct {
     /// Register a live session for `account`. Idempotent on `client` (re-attach
     /// refreshes its token/signon and marks it attached). Returns the session.
     pub fn attach(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!Session {
+        return (try self.attachReportingEviction(account, client, token, signon_ms)).session;
+    }
+
+    /// `attach`, plus the portable authority of an oldest detached row evicted
+    /// at the per-account cap. Keeping the legacy `attach` wrapper makes pure
+    /// callers simple while letting the live daemon close the mesh lifecycle.
+    pub fn attachReportingEviction(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!AttachOutcome {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
         const list = try self.ensureAccount(account);
         if (list.indexOfClient(client)) |idx| {
+            const displaced = list.items.items[idx];
             freeSnapshot(self.allocator, &list.items.items[idx]);
             list.items.items[idx] = .{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
-            return list.items.items[idx];
+            return .{
+                .session = list.items.items[idx],
+                .evicted = .{ .token = displaced.token, .portable = displaced.portable_resume },
+            };
         }
+        var evicted: ?ResumeHandle = null;
         if (list.items.items.len >= self.cfg.max_sessions_per_account) {
             // At cap: evict the oldest *detached* ghost to make room for the live
             // session. Never evict an attached session (that would drop a peer).
             if (oldestDetached(list)) |evict| {
+                const displaced = list.items.items[evict];
+                evicted = .{ .token = displaced.token, .portable = displaced.portable_resume };
                 freeSnapshot(self.allocator, &list.items.items[evict]);
                 _ = list.items.swapRemove(evict);
             } else return error.TooManySessions;
         }
         const session = Session{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
         try list.items.append(self.allocator, session);
-        return session;
+        return .{ .session = session, .evicted = evicted };
     }
 
     /// Index of the oldest (lowest signon) detached session in `list`, or null.
@@ -610,6 +632,33 @@ test "portable resume issuance is explicit and resets on a normal re-attach" {
     // Helix adoption is the exceptional path: it restores the carried bit.
     try testing.expect(s.restorePortableResumeIssued("alice", 1, true));
     try testing.expectEqual(true, s.resumeHandleForClient("alice", 1).?.portable);
+}
+
+test "attach reports portable authority displaced by same-client replacement" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    const outcome = try s.attachReportingEviction("alice", 1, tok(2), 20);
+    const evicted = outcome.evicted orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &tok(1), &evicted.token);
+    try testing.expect(evicted.portable);
+    try testing.expectEqualSlices(u8, &tok(2), &outcome.session.token);
+}
+
+test "attach reports portable detached authority evicted at account cap" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markDetached("alice", 1));
+    const outcome = try s.attachReportingEviction("alice", 2, tok(2), 20);
+    const evicted = outcome.evicted orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &tok(1), &evicted.token);
+    try testing.expect(evicted.portable);
+    try testing.expectEqualSlices(u8, &tok(2), &outcome.session.token);
 }
 
 test "portable detached anti-entropy copies only opted-in snapshots" {

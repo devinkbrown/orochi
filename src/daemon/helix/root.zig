@@ -25,7 +25,9 @@ pub const ws_snapshot = @import("ws_snapshot.zig");
 pub const ticket_key_capsule = @import("ticket_key_capsule.zig");
 pub const s2s_snapshot = @import("s2s_snapshot.zig");
 pub const mesh_redial = @import("mesh_redial.zig");
+pub const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
+pub const session_replica = @import("session_replica.zig");
 pub const migration_relay = @import("migration_relay.zig");
 // S2S migration support modules (fsm + signed token + journal + policy + metrics).
 pub const migration_fsm = @import("migration_fsm.zig");

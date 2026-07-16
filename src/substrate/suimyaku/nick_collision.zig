@@ -39,14 +39,21 @@ pub const Claim = struct {
     account: []const u8 = "",
 };
 
+/// Strict total priority for claim selection: higher HLC wins, then higher node.
+/// Unlike collision handling, this deliberately accepts a newer claim from the
+/// same node so roster folds cannot depend on hash iteration order.
+pub fn higherPriority(candidate: Claim, incumbent: Claim) bool {
+    if (candidate.hlc != incumbent.hlc) return candidate.hlc > incumbent.hlc;
+    return candidate.node_id > incumbent.node_id;
+}
+
 /// Whether `candidate` beats `incumbent` for the same nick. A candidate from the
 /// same node as the incumbent is treated as the same owner re-asserting (returns
 /// false: keep the incumbent slot, the caller updates it in place), so only a
 /// genuinely different node can wrest a nick away.
 pub fn candidateWins(candidate: Claim, incumbent: Claim) bool {
     if (candidate.node_id == incumbent.node_id) return false;
-    if (candidate.hlc != incumbent.hlc) return candidate.hlc > incumbent.hlc;
-    return candidate.node_id > incumbent.node_id;
+    return higherPriority(candidate, incumbent);
 }
 
 /// Derive the stable fallback nick a collision loser is renamed to. The mesh UID
@@ -86,6 +93,26 @@ test "candidateWins: hlc tie breaks by higher node id" {
 
 test "candidateWins: same node is never a self-collision" {
     try testing.expect(!candidateWins(.{ .node_id = 5, .hlc = 100 }, .{ .node_id = 5, .hlc = 1 }));
+}
+
+test "higherPriority is a strict total order including same-node refreshes" {
+    try testing.expect(higherPriority(.{ .node_id = 5, .hlc = 100 }, .{ .node_id = 5, .hlc = 1 }));
+    try testing.expect(higherPriority(.{ .node_id = 9, .hlc = 7 }, .{ .node_id = 3, .hlc = 7 }));
+    try testing.expect(!higherPriority(.{ .node_id = 3, .hlc = 7 }, .{ .node_id = 9, .hlc = 7 }));
+    try testing.expect(!higherPriority(.{ .node_id = 9, .hlc = 7 }, .{ .node_id = 9, .hlc = 7 }));
+
+    const claims = [_]Claim{
+        .{ .node_id = 1, .hlc = 1 },
+        .{ .node_id = 2, .hlc = 1 },
+        .{ .node_id = 1, .hlc = 2 },
+        .{ .node_id = 2, .hlc = 2 },
+    };
+    for (claims) |a| for (claims) |b| {
+        if (higherPriority(a, b)) try testing.expect(!higherPriority(b, a));
+        for (claims) |c| {
+            if (higherPriority(a, b) and higherPriority(b, c)) try testing.expect(higherPriority(a, c));
+        }
+    };
 }
 
 test "loserUid: stable, node-scoped, and per-nick distinct" {

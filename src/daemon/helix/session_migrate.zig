@@ -22,6 +22,7 @@
 //! conduit, ...). Wiring it onto the live S2S link + the reclaim path are later
 //! slices.
 const std = @import("std");
+const session_replica = @import("session_replica.zig");
 
 pub const Token = [16]u8;
 pub const Error = error{ Truncated, TooLong };
@@ -124,6 +125,13 @@ pub const PendingMigrations = struct {
         /// Signed relay epoch for this exact session token. Zero denotes legacy
         /// or locally-seeded state without ordering metadata.
         offer_epoch: u64 = 0,
+        /// SESSION_REPLICA v2 projection order. Null means the entry came from
+        /// the incomparable legacy epoch domain. Once present, a legacy sidecar
+        /// can refresh neither nor downgrade this projection.
+        replica_revision: ?session_replica.Revision = null,
+        /// Absolute mesh-wall expiry copied from the verified signed OFFER.
+        /// Present exactly when `replica_revision` is present.
+        replica_expires_at_ms: ?i64 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator) PendingMigrations {
@@ -166,6 +174,7 @@ pub const PendingMigrations = struct {
         if (replacing) {
             const current = self.map.getPtr(cap.token).?;
             if (!std.ascii.eqlIgnoreCase(current.account, cap.account)) return error.TokenAccountMismatch;
+            if (current.replica_revision != null) return error.StaleOffer;
             if (offer_epoch != 0 and current.offer_epoch != 0 and offer_epoch <= current.offer_epoch) return error.StaleOffer;
         }
         if (!replacing and self.map.count() >= self.cfg.max_entries) {
@@ -189,6 +198,60 @@ pub const PendingMigrations = struct {
             self.allocator.free(gop.value_ptr.snapshot);
         }
         gop.value_ptr.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms, .offer_epoch = offer_epoch };
+    }
+
+    /// Project the Store's already-selected best v2 identity into the token-keyed
+    /// reconnect view. V2 always supersedes legacy regardless of their unrelated
+    /// numeric clock magnitudes. The Store is the ordering authority: this API
+    /// replaces atomically even when its selected best live origin has a lower
+    /// revision after a higher origin expires or revokes.
+    pub fn putReplica(
+        self: *PendingMigrations,
+        cap: Capsule,
+        now_ms: i64,
+        revision: session_replica.Revision,
+        expires_at_ms: i64,
+    ) PutError!void {
+        const replacing = self.map.contains(cap.token);
+        if (replacing) {
+            const current = self.map.getPtr(cap.token).?;
+            if (!std.ascii.eqlIgnoreCase(current.account, cap.account)) return error.TokenAccountMismatch;
+        }
+        if (!replacing and self.map.count() >= self.cfg.max_entries) return error.PendingFull;
+        if (!replacing and self.countForAccount(cap.account) >= self.cfg.max_per_account) return error.PendingFull;
+
+        const account = try self.allocator.dupe(u8, cap.account);
+        errdefer self.allocator.free(account);
+        const snapshot = try self.allocator.dupe(u8, cap.snapshot);
+        errdefer self.allocator.free(snapshot);
+
+        _ = self.consumed.remove(cap.token);
+        const gop = try self.map.getOrPut(self.allocator, cap.token);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.account);
+            self.allocator.free(gop.value_ptr.snapshot);
+        }
+        gop.value_ptr.* = .{
+            .account = account,
+            .snapshot = snapshot,
+            .staged_at_ms = now_ms,
+            .offer_epoch = 0,
+            .replica_revision = revision,
+            .replica_expires_at_ms = expires_at_ms,
+        };
+    }
+
+    /// Remove only a v2-derived reconnect projection after the Store reports no
+    /// surviving signed origin. This is not a consume tombstone: a later valid
+    /// v2 OFFER can stage normally, and unrelated rolling-legacy state is left
+    /// untouched.
+    pub fn removeReplica(self: *PendingMigrations, token: Token) bool {
+        const current = self.map.get(token) orelse return false;
+        if (current.replica_revision == null) return false;
+        const removed = self.map.fetchRemove(token) orelse return false;
+        self.allocator.free(removed.value.account);
+        self.allocator.free(removed.value.snapshot);
+        return true;
     }
 
     /// Evict every entry staged at least `ttl_ms` before `now_ms` (freeing its
@@ -232,6 +295,15 @@ pub const PendingMigrations = struct {
     /// may restore from this view until its bounded TTL expires.
     pub fn get(self: *const PendingMigrations, token: Token) ?*const Entry {
         return self.map.getPtr(token);
+    }
+
+    /// Borrow a reconnect projection only while its signed v2 lease is live.
+    /// Legacy entries have no signed wall expiry here and preserve their existing
+    /// TTL-based compatibility behavior.
+    pub fn getLive(self: *const PendingMigrations, token: Token, now_wall_ms: i64) ?*const Entry {
+        const entry = self.map.getPtr(token) orelse return null;
+        if (entry.replica_expires_at_ms) |expires| if (now_wall_ms > expires) return null;
+        return entry;
     }
 
     pub fn isConsumed(self: *const PendingMigrations, token: Token) bool {
@@ -513,6 +585,51 @@ test "sweep evicts entries past the TTL and keeps fresh ones" {
     try pm.put(.{ .token = stale, .account = "old2", .snapshot = "c" }, 10_000);
     try testing.expectEqual(@as(usize, 0), pm.sweep(11_000, 5_000));
     try testing.expect(pm.has(stale));
+}
+
+test "v2 projection supersedes legacy and legacy can never downgrade it" {
+    const allocator = testing.allocator;
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    const token: Token = @splat(0x41);
+    try pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "legacy-high-clock" }, 1, std.math.maxInt(u64));
+
+    const revision = session_replica.Revision{ .epoch = 10, .sequence = 20, .origin_node = 30 };
+    try pm.putReplica(.{ .token = token, .account = "alice", .snapshot = "v2-authority" }, 2, revision, 10_000);
+    try testing.expectEqualStrings("v2-authority", pm.get(token).?.snapshot);
+    try testing.expect(pm.get(token).?.replica_revision.?.eql(revision));
+
+    try testing.expectError(error.StaleOffer, pm.putAtEpoch(
+        .{ .token = token, .account = "alice", .snapshot = "legacy-downgrade" },
+        3,
+        std.math.maxInt(u64),
+    ));
+    try testing.expectEqualStrings("v2-authority", pm.get(token).?.snapshot);
+}
+
+test "v2 projection follows Store fallback when a higher origin disappears" {
+    const allocator = testing.allocator;
+    const token: Token = @splat(0x52);
+    const low = session_replica.Revision{ .epoch = 100, .sequence = 200, .origin_node = 3 };
+    const high = session_replica.Revision{ .epoch = 100, .sequence = 200, .origin_node = 9 };
+
+    var projection = PendingMigrations.init(allocator);
+    defer projection.deinit();
+    try projection.putReplica(.{ .token = token, .account = "alice", .snapshot = "high" }, 1, high, 9_000);
+    // Store.bestLiveIdentity selected the lower origin after the higher lease
+    // expired/revoked. Pending must follow that authoritative projection.
+    try projection.putReplica(.{ .token = token, .account = "alice", .snapshot = "low" }, 2, low, 10_000);
+    try testing.expectEqualStrings("low", projection.get(token).?.snapshot);
+    try testing.expect(projection.get(token).?.replica_revision.?.eql(low));
+
+    var low_first = PendingMigrations.init(allocator);
+    defer low_first.deinit();
+    try low_first.putReplica(.{ .token = token, .account = "alice", .snapshot = "low" }, 1, low, 10_000);
+    try low_first.putReplica(.{ .token = token, .account = "alice", .snapshot = "high" }, 2, high, 10_000);
+    try testing.expectEqualStrings("high", low_first.get(token).?.snapshot);
+    try testing.expect(low_first.get(token).?.replica_revision.?.eql(high));
+    try testing.expect(low_first.getLive(token, 10_000) != null);
+    try testing.expect(low_first.getLive(token, 10_001) == null);
 }
 
 test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> PendingMigrations -> reclaim consume" {

@@ -45,6 +45,11 @@ pub const MeshClock = struct {
     /// Highest physical (wall-clock ms) component ever emitted. The guard that
     /// makes the clock never run backward across a wall-clock step-back.
     last_physical: u64 = 0,
+    /// Highest complete packed stamp emitted. `seq` is supplied by callers and
+    /// eventually wraps its 16-bit wire lane; retaining the full high-water mark
+    /// prevents that wrap (or a process-local counter reset after adoption) from
+    /// making a later event compare older than an earlier one.
+    last_stamp: u64 = 0,
 
     /// Produce the next hlc for an outbound mesh write. `wall_ms` is the current
     /// wall-clock reading (`Reactor.wallMillis`, or `platform.realtimeMillis`
@@ -55,7 +60,13 @@ pub const MeshClock = struct {
         // Never regress: hold at the high-water mark if the wall clock jumped
         // back. Advancing normally, `physical` simply tracks `wall_ms`.
         if (wall_ms > self.last_physical) self.last_physical = wall_ms;
-        return (self.last_physical << seq_bits) | (seq & seq_mask);
+        var candidate = (self.last_physical << seq_bits) | (seq & seq_mask);
+        if (candidate <= self.last_stamp) {
+            candidate = self.last_stamp +| 1;
+            self.last_physical = physicalOf(candidate);
+        }
+        self.last_stamp = candidate;
+        return candidate;
     }
 
     /// The physical (wall-clock ms) component of a packed hlc — for diagnostics
@@ -119,4 +130,23 @@ test "same millisecond orders by seq" {
     const b = c.stamp(1_700_000_000_000, 11);
     try testing.expect(b > a);
     try testing.expectEqual(MeshClock.physicalOf(a), MeshClock.physicalOf(b));
+}
+
+test "more than one full sequence lane in one millisecond never repeats or regresses" {
+    var c: MeshClock = .{};
+    var previous: u64 = 0;
+    var seq: u64 = 0;
+    while (seq < (@as(u64, 1) << seq_bits) + 1024) : (seq += 1) {
+        const current = c.stamp(1_700_000_000_000, seq);
+        try testing.expect(current > previous);
+        previous = current;
+    }
+    try testing.expect(MeshClock.physicalOf(previous) > 1_700_000_000_000);
+}
+
+test "counter reset at the physical high-water mark still advances" {
+    var c: MeshClock = .{};
+    const before = c.stamp(1_700_000_000_000, 40_000);
+    const after = c.stamp(1_700_000_000_000, 1);
+    try testing.expect(after > before);
 }

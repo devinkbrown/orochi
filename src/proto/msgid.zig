@@ -39,6 +39,24 @@ pub const Generator = struct {
     }
 };
 
+/// Stable event id shared by every attachment and receiving mesh node. The
+/// authenticated `(origin_node, hlc)` pair already names one mesh event; hash it
+/// under a dedicated domain and encode the first 128 bits in the existing
+/// Crockford format so local and remote clients can reference the same msgid.
+pub fn fromMeshEvent(origin_node: u64, hlc: u64, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= id_len);
+    const domain = "orochi-msgid-mesh-event-v1\x00";
+    var material: [domain.len + 16]u8 = undefined;
+    @memcpy(material[0..domain.len], domain);
+    std.mem.writeInt(u64, material[domain.len..][0..8], origin_node, .big);
+    std.mem.writeInt(u64, material[domain.len + 8 ..][0..8], hlc, .big);
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&material, &digest, .{});
+    const hi = std.mem.readInt(u64, digest[0..8], .big);
+    const lo = std.mem.readInt(u64, digest[8..16], .big);
+    return encode128(hi, lo, buf[0..id_len]);
+}
+
 fn splitmix64(x0: u64) u64 {
     var z = x0 +% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -97,4 +115,15 @@ test "different seeds yield different id streams" {
     var ba: [id_len]u8 = undefined;
     var bb: [id_len]u8 = undefined;
     try testing.expect(!std.mem.eql(u8, a.next(&ba), b.next(&bb)));
+}
+
+test "mesh event ids are deterministic and bind both origin and hlc" {
+    var a: [id_len]u8 = undefined;
+    var b: [id_len]u8 = undefined;
+    var c: [id_len]u8 = undefined;
+    var d: [id_len]u8 = undefined;
+    try testing.expectEqualStrings(fromMeshEvent(7, 11, &a), fromMeshEvent(7, 11, &b));
+    try testing.expect(!std.mem.eql(u8, fromMeshEvent(8, 11, &c), a[0..]));
+    try testing.expect(!std.mem.eql(u8, fromMeshEvent(7, 12, &d), a[0..]));
+    try testing.expect(msgedit.isValidMsgid(a[0..]));
 }

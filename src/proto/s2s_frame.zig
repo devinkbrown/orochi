@@ -109,6 +109,13 @@ pub const FrameType = enum(u8) {
     /// Signed consume tombstone for a portable session migration. Peers remove
     /// staged copies and retain a token tombstone so delayed offers cannot fork.
     SESSION_MIGRATE_CONSUMED = 0x1D,
+    /// SESSION_REPLICA v2 signed upsert offer. Secured-link and capability gated;
+    /// payload is a versioned `session_replica_frame` transport envelope.
+    SESSION_REPLICA_OFFER = 0x1E,
+    /// SESSION_REPLICA v2 signed receiver acknowledgment and route observation.
+    SESSION_REPLICA_ACK = 0x1F,
+    /// SESSION_REPLICA v2 signed removal tombstone (REVOKE).
+    SESSION_REPLICA_REVOKE = 0x20,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -145,6 +152,9 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.REPAIR_RESPONSE) => .REPAIR_RESPONSE,
             @intFromEnum(FrameType.TEGAMI_PUSH) => .TEGAMI_PUSH,
             @intFromEnum(FrameType.SESSION_MIGRATE_CONSUMED) => .SESSION_MIGRATE_CONSUMED,
+            @intFromEnum(FrameType.SESSION_REPLICA_OFFER) => .SESSION_REPLICA_OFFER,
+            @intFromEnum(FrameType.SESSION_REPLICA_ACK) => .SESSION_REPLICA_ACK,
+            @intFromEnum(FrameType.SESSION_REPLICA_REVOKE) => .SESSION_REPLICA_REVOKE,
             else => null,
         };
     }
@@ -157,6 +167,7 @@ pub const Capability = enum(u3) {
     member_account = 1,
     member_oper_info = 2,
     repair_frames = 3,
+    session_replica_v2 = 4,
 
     pub fn bit(self: Capability) u3 {
         return @intFromEnum(self);
@@ -171,6 +182,7 @@ pub const cap_frame_signing: u8 = Capability.frame_signing.mask();
 pub const cap_member_account: u8 = Capability.member_account.mask();
 pub const cap_member_oper_info: u8 = Capability.member_oper_info.mask();
 pub const cap_repair_frames: u8 = Capability.repair_frames.mask();
+pub const cap_session_replica_v2: u8 = Capability.session_replica_v2.mask();
 
 pub const CapabilitySpec = struct {
     cap: Capability,
@@ -207,6 +219,11 @@ pub const capability_catalog = [_]CapabilitySpec{
         .token = "repair-frames",
         .summary = "Merkle-guided anti-entropy repair summary, request, and response frames.",
     },
+    .{
+        .cap = .session_replica_v2,
+        .token = "session-replica-v2",
+        .summary = "Secured signed OFFER, ACK, and REVOKE transport for reusable session replicas.",
+    },
 };
 
 pub fn capabilitySpec(cap: Capability) CapabilitySpec {
@@ -232,6 +249,7 @@ pub const FrameFamily = enum {
     control,
     repair,
     notification,
+    session,
 
     pub fn token(self: FrameFamily) []const u8 {
         return switch (self) {
@@ -243,6 +261,7 @@ pub const FrameFamily = enum {
             .control => "control",
             .repair => "repair",
             .notification => "notification",
+            .session => "session",
         };
     }
 };
@@ -302,6 +321,9 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .REPAIR_RESPONSE, .token = "REPAIR_RESPONSE", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Repair records that backfill requested CRDT entities." },
     .{ .frame_type = .TEGAMI_PUSH, .token = "TEGAMI_PUSH", .family = .notification, .auth = .secured_signed, .summary = "Secured-only Web Push hint for offline Tegami delivery." },
     .{ .frame_type = .SESSION_MIGRATE_CONSUMED, .token = "SESSION_MIGRATE_CONSUMED", .family = .relay, .auth = .signed, .summary = "Converges a successful session claim and prevents stale migration resurrection." },
+    .{ .frame_type = .SESSION_REPLICA_OFFER, .token = "SESSION_REPLICA_OFFER", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed upsert offer." },
+    .{ .frame_type = .SESSION_REPLICA_ACK, .token = "SESSION_REPLICA_ACK", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed acknowledgment and route observation." },
+    .{ .frame_type = .SESSION_REPLICA_REVOKE, .token = "SESSION_REPLICA_REVOKE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed removal tombstone." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -626,9 +648,11 @@ test "capability catalog exposes stable wire bits" {
     try testing.expectEqual(@as(u8, 0x02), cap_member_account);
     try testing.expectEqual(@as(u8, 0x04), cap_member_oper_info);
     try testing.expectEqual(@as(u8, 0x08), cap_repair_frames);
+    try testing.expectEqual(@as(u8, 0x10), cap_session_replica_v2);
 
     try testing.expectEqual(@as(u3, 0), capabilitySpec(.frame_signing).bit());
     try testing.expectEqual(@as(u3, 1), capabilityByToken("member-account").?.bit());
+    try testing.expectEqual(@as(u3, 4), capabilityByToken("session-replica-v2").?.bit());
     try testing.expect(capabilityByToken("does-not-exist") == null);
 }
 
@@ -659,4 +683,16 @@ test "repair frames are capability catalog gated" {
             try testing.expectEqual(FrameAuth.signed, spec.auth);
         }
     }
+}
+
+test "session replica v2 frames are secured and capability gated" {
+    inline for (frame_catalog) |spec| {
+        if (spec.family == .session) {
+            try testing.expectEqual(cap_session_replica_v2, spec.capability_mask);
+            try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+        }
+    }
+    try testing.expectEqual(FrameType.SESSION_REPLICA_OFFER, frameSpecByToken("SESSION_REPLICA_OFFER").?.frame_type);
+    try testing.expectEqual(FrameType.SESSION_REPLICA_ACK, frameSpecByTag(0x1f).?.frame_type);
+    try testing.expectEqual(FrameType.SESSION_REPLICA_REVOKE, FrameType.fromTag(0x20).?);
 }

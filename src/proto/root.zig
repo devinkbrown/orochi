@@ -251,6 +251,7 @@ pub const rtp_red = @import("rtp_red.zig");
 pub const rtt_estimator = @import("rtt_estimator.zig");
 pub const rtx = @import("rtx.zig");
 pub const s2s_frame = @import("s2s_frame.zig");
+pub const session_replica_frame = @import("session_replica_frame.zig");
 pub const sasl_anonymous = @import("sasl_anonymous.zig");
 pub const sasl_external = @import("sasl_external.zig");
 pub const sasl_external_verify = @import("sasl_external_verify.zig");
@@ -600,6 +601,7 @@ test {
     _ = rtt_estimator;
     _ = rtx;
     _ = s2s_frame;
+    _ = session_replica_frame;
     _ = sasl_anonymous;
     _ = sasl_external;
     _ = sasl_external_verify;

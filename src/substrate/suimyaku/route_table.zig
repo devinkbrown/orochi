@@ -9,10 +9,42 @@
 const std = @import("std");
 const toml = @import("../../proto/toml.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
+const membership_event = @import("../../proto/membership_event.zig");
 const nick_collision = @import("nick_collision.zig");
 const uid_alloc = @import("uid_alloc.zig");
 
 pub const NodeId = u64;
+
+/// Value-only projection of the best roster-backed claim for a nick. Account is
+/// intentionally excluded so routing priority cannot become identity-dependent
+/// and callers never retain a borrowed roster slice.
+pub const NickClaim = struct {
+    node_id: NodeId,
+    hlc: u64,
+
+    pub fn higherPriorityThan(candidate: NickClaim, incumbent: NickClaim) bool {
+        return nick_collision.higherPriority(
+            .{ .node_id = candidate.node_id, .hlc = candidate.hlc },
+            .{ .node_id = incumbent.node_id, .hlc = incumbent.hlc },
+        );
+    }
+};
+
+/// Allocation-free, owned key for the S2S protocol's bounded nick namespace.
+/// Every byte is initialized so AutoHashMap equality/hash never observes padding
+/// or stale stack contents. Route-table-only names beyond the wire bound bypass
+/// the optional index and use the authoritative roster scan.
+const NickKey = struct {
+    bytes: [membership_event.max_nick_len]u8 = @splat(0),
+    len: u8 = 0,
+
+    fn init(nick: []const u8) ?NickKey {
+        if (nick.len == 0 or nick.len > membership_event.max_nick_len) return null;
+        var key = NickKey{ .len = @intCast(nick.len) };
+        _ = std.ascii.lowerString(key.bytes[0..nick.len], nick);
+        return key;
+    }
+};
 
 /// Borrowed predicate the daemon installs so the route table can ask "is `nick`
 /// currently held in the LOCAL world?" without depending on the daemon. Local
@@ -321,6 +353,11 @@ pub const RouteTable = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     nick_to_node: std.StringHashMap(NodeId),
+    /// Optional ASCII-case-folded nick -> deterministic best roster claim. The
+    /// roster remains authoritative: when an insert/rebuild cannot complete, the
+    /// dirty flag makes every query scan until a later one-pass rebuild succeeds.
+    best_nick_claims: std.AutoHashMap(NickKey, NickClaim),
+    claim_index_dirty: bool = false,
     channels: std.StringHashMap(ChannelState),
     /// channel name -> roster of remote members (nick + status), populated by
     /// MEMBERSHIP propagation (see docs/planning/16). Independent of `channels`
@@ -350,6 +387,7 @@ pub const RouteTable = struct {
             .allocator = allocator,
             .cfg = cfg,
             .nick_to_node = std.StringHashMap(NodeId).init(allocator),
+            .best_nick_claims = std.AutoHashMap(NickKey, NickClaim).init(allocator),
             .channels = std.StringHashMap(ChannelState).init(allocator),
             .channel_members = std.StringHashMap(MemberList).init(allocator),
             .channel_mode_flags = std.StringHashMap(ChannelModeFlags).init(allocator),
@@ -361,6 +399,7 @@ pub const RouteTable = struct {
     pub fn deinit(self: *Self) void {
         self.clear();
         self.nick_to_node.deinit();
+        self.best_nick_claims.deinit();
         self.channels.deinit();
         self.channel_members.deinit();
         self.channel_mode_flags.deinit();
@@ -373,6 +412,9 @@ pub const RouteTable = struct {
         var nicks = self.nick_to_node.iterator();
         while (nicks.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.nick_to_node.clearRetainingCapacity();
+
+        self.best_nick_claims.clearRetainingCapacity();
+        self.claim_index_dirty = false;
 
         var channels = self.channels.iterator();
         while (channels.next()) |entry| {
@@ -447,17 +489,116 @@ pub const RouteTable = struct {
     /// remote member holds it. "Best" uses the same `(hlc, node)` ordering the
     /// collision resolver does, so the incumbent we compare against is the one
     /// that actually won the nick on prior applies.
-    fn nickClaim(self: *const Self, nick: []const u8) ?nick_collision.Claim {
+    fn identityNickClaim(self: *const Self, nick: []const u8) ?nick_collision.Claim {
         var best: ?nick_collision.Claim = null;
         var it = self.channel_members.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.entries.items) |m| {
                 if (!std.ascii.eqlIgnoreCase(m.nick, nick)) continue;
                 const cand = nick_collision.Claim{ .node_id = m.node, .hlc = m.hlc, .account = m.account };
-                if (best == null or nick_collision.candidateWins(cand, best.?)) best = cand;
+                if (best == null or nick_collision.higherPriority(cand, best.?)) best = cand;
             }
         }
         return best;
+    }
+
+    fn projectedIdentityNickClaim(self: *const Self, nick: []const u8) ?NickClaim {
+        const claim = self.identityNickClaim(nick) orelse return null;
+        return .{ .node_id = claim.node_id, .hlc = claim.hlc };
+    }
+
+    /// Authoritative value-only scan for an already-normalized protocol nick.
+    /// This deliberately stores no Member pointer or borrowed account slice:
+    /// roster ArrayLists move on growth/swapRemove and identity strings are
+    /// replaced independently of routing priority.
+    fn scannedBestNickKey(self: *const Self, key: NickKey) ?NickClaim {
+        var best: ?NickClaim = null;
+        var channels = self.channel_members.iterator();
+        while (channels.next()) |entry| {
+            for (entry.value_ptr.entries.items) |member| {
+                const member_key = NickKey.init(member.nick) orelse continue;
+                if (!std.meta.eql(member_key, key)) continue;
+                const candidate = NickClaim{ .node_id = member.node, .hlc = member.hlc };
+                if (best == null or candidate.higherPriorityThan(best.?)) best = candidate;
+            }
+        }
+        return best;
+    }
+
+    /// Add or raise one claim without rescanning. Existing-value updates never
+    /// allocate. A new-key OOM or the configured global index bound makes the
+    /// whole optional index dirty, so no partial map can be mistaken for truth.
+    fn noteBestNickClaim(self: *Self, nick: []const u8, claim: NickClaim) void {
+        const key = NickKey.init(nick) orelse return;
+        if (self.claim_index_dirty) return;
+        if (self.best_nick_claims.getPtr(key)) |current| {
+            if (claim.higherPriorityThan(current.*)) current.* = claim;
+            return;
+        }
+        if (self.best_nick_claims.count() >= self.cfg.max_nicks) {
+            self.claim_index_dirty = true;
+            return;
+        }
+        self.best_nick_claims.putNoClobber(key, claim) catch {
+            self.claim_index_dirty = true;
+        };
+    }
+
+    /// Re-select one key after a destructive mutation. The roster is scanned
+    /// before touching the cached value, so an existing winner is never removed
+    /// merely because allocating a previously-missing map slot fails.
+    fn reselectBestNickKey(self: *Self, key: NickKey) void {
+        if (self.claim_index_dirty) return;
+        const best = self.scannedBestNickKey(key);
+        if (best) |claim| {
+            if (self.best_nick_claims.getPtr(key)) |current| {
+                current.* = claim;
+                return;
+            }
+            if (self.best_nick_claims.count() >= self.cfg.max_nicks) {
+                self.claim_index_dirty = true;
+                return;
+            }
+            self.best_nick_claims.putNoClobber(key, claim) catch {
+                self.claim_index_dirty = true;
+            };
+        } else {
+            _ = self.best_nick_claims.remove(key);
+        }
+    }
+
+    /// Rebuild the complete bounded index in one roster pass. The dirty flag is
+    /// set before clearing and reset only after every indexable roster claim was
+    /// folded successfully. On OOM/overflow the partial map remains ignored.
+    fn rebuildAllBestNickClaims(self: *Self) bool {
+        self.claim_index_dirty = true;
+        self.best_nick_claims.clearRetainingCapacity();
+
+        var channels = self.channel_members.iterator();
+        while (channels.next()) |entry| {
+            for (entry.value_ptr.entries.items) |member| {
+                const key = NickKey.init(member.nick) orelse continue;
+                const candidate = NickClaim{ .node_id = member.node, .hlc = member.hlc };
+                if (self.best_nick_claims.getPtr(key)) |current| {
+                    if (candidate.higherPriorityThan(current.*)) current.* = candidate;
+                    continue;
+                }
+                if (self.best_nick_claims.count() >= self.cfg.max_nicks) return false;
+                self.best_nick_claims.putNoClobber(key, candidate) catch return false;
+            }
+        }
+
+        self.claim_index_dirty = false;
+        return true;
+    }
+
+    /// Deterministic, ASCII-case-insensitive best claim across every roster. The
+    /// healthy path is an allocation-free O(1) lookup. Oversized route-table-only
+    /// names and any dirty/partial index fall back to the authoritative scan.
+    pub fn bestNickClaim(self: *const Self, nick: []const u8) ?NickClaim {
+        const key = NickKey.init(nick) orelse return self.projectedIdentityNickClaim(nick);
+        if (self.claim_index_dirty) return self.scannedBestNickKey(key);
+        return self.best_nick_claims.get(key);
     }
 
     /// Decide how to apply an incoming REMOTE nick claim `(nick, node, hlc,
@@ -494,7 +635,7 @@ pub const RouteTable = struct {
         // expired (partition / USR2 / loss delaying the refresh) cannot
         // UID-rename a live member mid-session. Departure stays the local-clock
         // staleness GC (`pruneStale`), which is orthogonal to this decision.
-        const incumbent = self.nickClaim(nick);
+        const incumbent = self.identityNickClaim(nick);
         if (incumbent) |inc| {
             if (inc.node_id == node) return .keep;
         }
@@ -545,7 +686,7 @@ pub const RouteTable = struct {
     /// from the incumbent's owning node, so every node computes the same loser
     /// name. Returns null when no remote member currently holds `nick`.
     pub fn incumbentLoserUid(self: *const Self, nick: []const u8) ?nick_collision.Uid {
-        const incumbent = self.nickClaim(nick) orelse return null;
+        const incumbent = self.identityNickClaim(nick) orelse return null;
         return nick_collision.loserUid(incumbent.node_id, nick);
     }
 
@@ -675,8 +816,10 @@ pub const RouteTable = struct {
                 // NAMES/WHOIS-only, never breaks membership). Re-run even on a
                 // re-affirmation so entries predating this wiring self-heal.
                 self.setNickLocation(nick, node) catch {};
+                self.noteBestNickClaim(nick, .{ .node_id = node, .hlc = hlc });
                 return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
+                const claim_key = NickKey.init(cur.nick);
                 cur.freeStrings(self.allocator);
                 _ = list.entries.swapRemove(idx);
                 self.pruneIfEmpty(chan);
@@ -684,6 +827,7 @@ pub const RouteTable = struct {
                 // known channel; channel membership is the only mesh-wide nick
                 // replication, so a still-present membership keeps the route alive.
                 if (self.findMember(nick) == null) _ = self.removeNick(nick);
+                if (claim_key) |key| self.reselectBestNickKey(key);
                 return .{ .outcome = .parted, .prev_status = prev };
             }
         }
@@ -699,10 +843,12 @@ pub const RouteTable = struct {
                 if (cur.node == node) {
                     const prev = cur.status;
                     if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev };
+                    const claim_key = NickKey.init(cur.nick);
                     cur.freeStrings(self.allocator);
                     _ = list.entries.swapRemove(idx);
                     self.pruneIfEmpty(chan);
                     if (self.findMember(uid[0..]) == null) _ = self.removeNick(uid[0..]);
+                    if (claim_key) |key| self.reselectBestNickKey(key);
                     return .{ .outcome = .parted, .prev_status = prev };
                 }
             }
@@ -739,6 +885,7 @@ pub const RouteTable = struct {
         // Index this newly-learned remote nick for PRIVMSG relay routing
         // (best-effort, see the upsert branch above).
         self.setNickLocation(nick, node) catch {};
+        self.noteBestNickClaim(nick, .{ .node_id = node, .hlc = hlc });
         return .{ .outcome = .joined };
     }
 
@@ -791,6 +938,11 @@ pub const RouteTable = struct {
                 // clock (see the clock-domain note above), so a plain signed
                 // difference is correct and overflow-safe for realistic ms values.
                 if (now_ms - m.last_refreshed_ms > window_ms) {
+                    // The cached winner may be this row. Mark the optional map
+                    // unusable before freeing anything; one authoritative rebuild
+                    // after the complete sweep will either restore it atomically
+                    // (via the clean flag) or leave scan fallback active.
+                    self.claim_index_dirty = true;
                     // Capture the nick before freeStrings invalidates the slice.
                     if (self.allocator.dupe(u8, m.nick)) |owned| {
                         orphan_nicks.append(self.allocator, owned) catch self.allocator.free(owned);
@@ -813,6 +965,11 @@ pub const RouteTable = struct {
         // Pass 3: prune channels emptied by the sweep (mutates the channels map, so
         // it runs after the outer iteration completes).
         for (empties.items) |chan| self.pruneIfEmpty(chan);
+
+        // `pruneStale` is the bounded periodic repair point as well as a bulk
+        // mutation: retry a prior transient-OOM rebuild even when nothing aged
+        // out on this particular pass.
+        if (self.claim_index_dirty) _ = self.rebuildAllBestNickClaims();
 
         return pruned;
     }
@@ -988,6 +1145,11 @@ pub const RouteTable = struct {
         ident: MemberIdentity,
     ) Error!bool {
         try self.validateName(new_nick);
+        // Capture copied normalized keys before any route/roster owned string can
+        // be freed, so post-mutation claim reselection never dereferences one of
+        // the strings the roster loop just replaced.
+        const old_claim_key = NickKey.init(old_nick);
+        const new_claim_key = NickKey.init(new_nick);
 
         // Ownership guard (mesh identity == home node): a caller may only rename an
         // entry HOMED on `node`. `renameNick` is reached from the wire
@@ -1049,7 +1211,17 @@ pub const RouteTable = struct {
             replaceOwned(self.allocator, &m.host, ident.host) catch {};
             existed = true;
         }
-
+        // Roster renames are intentionally best-effort per channel, so derive both
+        // keys from the actual post-loop state rather than moving a cached winner.
+        // A case-only rename has one normalized key and needs one scan.
+        if (old_claim_key) |old_key| self.reselectBestNickKey(old_key);
+        if (!self.claim_index_dirty) {
+            if (new_claim_key) |new_key| {
+                if (old_claim_key == null or !std.meta.eql(old_claim_key.?, new_key)) {
+                    self.reselectBestNickKey(new_key);
+                }
+            }
+        }
         return existed;
     }
 
@@ -1081,9 +1253,11 @@ pub const RouteTable = struct {
     }
 
     pub fn removeNode(self: *Self, node: NodeId) void {
+        self.claim_index_dirty = true;
         self.removeNodeNicks(node);
         self.removeNodeChannels(node);
         self.removeNodeMembers(node);
+        _ = self.rebuildAllBestNickClaims();
     }
 
     /// Alias used by daemon peer-drop cleanup: remove every route/member whose
@@ -1267,6 +1441,8 @@ test "mesh route_table renameNick allows same-node rename but not cross-node ros
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
     try std.testing.expect(table.findMember("allie") != null);
     try std.testing.expect(table.findMember("alice") == null);
+    try std.testing.expectEqual(@as(NodeId, 10), table.bestNickClaim("ALLIE").?.node_id);
+    try std.testing.expect(table.bestNickClaim("alice") == null);
 
     // Cross-node attempt: node 20 tries to rename node 10's live user. Rejected —
     // route and roster stay homed on 10 under the original nick.
@@ -1277,6 +1453,8 @@ test "mesh route_table renameNick allows same-node rename but not cross-node ros
         try std.testing.expectEqual(@as(NodeId, 10), m.node);
     } else return error.TestUnexpectedResult;
     try std.testing.expect(table.findMember("gotcha") == null);
+    try std.testing.expectEqual(@as(NodeId, 10), table.bestNickClaim("allie").?.node_id);
+    try std.testing.expect(table.bestNickClaim("gotcha") == null);
 }
 
 test "channel fan-out node set" {
@@ -1472,6 +1650,7 @@ test "applyMembership part removes a collision-renamed UID member" {
         .account = "trev",
     }, 0);
     try std.testing.expect(table.findMember(uid[0..]) != null);
+    try std.testing.expectEqual(@as(NodeId, 10), table.bestNickClaim(uid[0..]).?.node_id);
 
     // The PART wire event carries the user's real nick, not the fallback UID
     // assigned by the receiver during collision resolution. It must still remove
@@ -1480,6 +1659,7 @@ test "applyMembership part removes a collision-renamed UID member" {
     try std.testing.expectEqual(RouteTable.ApplyOutcome.parted, res.outcome);
     try std.testing.expect(table.findMember(uid[0..]) == null);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#root").len);
+    try std.testing.expect(table.bestNickClaim(uid[0..]) == null);
 }
 
 test "channelNames enumerates channels with a live remote roster (LIST union input)" {
@@ -1553,6 +1733,7 @@ test "pruneStale reaps members whose local last-seen aged past the window" {
     try std.testing.expectEqual(@as(usize, 0), table.pruneStale(T + 50_000, window));
     try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#chat").len);
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+    try std.testing.expectEqual(@as(NodeId, 10), table.bestNickClaim("ALICE").?.node_id);
 
     // Now strictly past the window: the member is reaped, its emptied channel is
     // pruned, and its nick→node route is dropped (last channel gone).
@@ -1560,6 +1741,8 @@ test "pruneStale reaps members whose local last-seen aged past the window" {
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
     try std.testing.expect(table.nickNode("alice") == null);
     try std.testing.expect(table.findMember("alice") == null);
+    try std.testing.expect(table.bestNickClaim("alice") == null);
+    try std.testing.expect(!table.claim_index_dirty);
 }
 
 test "pruneStale keeps a route while the nick remains fresh in another channel" {
@@ -1583,6 +1766,7 @@ test "pruneStale keeps a route while the nick remains fresh in another channel" 
     try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#new").len);
     // alice's route survives (still in #new); bob untouched.
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+    try std.testing.expectEqual(@as(NodeId, 10), table.bestNickClaim("ALICE").?.node_id);
     try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode("bob"));
     try std.testing.expect(table.findMember("alice") != null);
 
@@ -1788,6 +1972,248 @@ test "resolveIncomingNick keeps an uncontested nick" {
     var table = try RouteTable.init(std.testing.allocator, .{});
     defer table.deinit();
     try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, "", true));
+}
+
+test "bestNickClaim is case-insensitive and independent of roster iteration order" {
+    const ClaimInput = struct { nick: []const u8, node: NodeId, hlc: u64 };
+    const claims = [_]ClaimInput{
+        .{ .nick = "RICKY", .node = 1, .hlc = 10 },
+        .{ .nick = "ricky", .node = 1, .hlc = 20 },
+        .{ .nick = "RiCkY", .node = 2, .hlc = 15 },
+    };
+    const permutations = [_][3]usize{
+        .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 },
+        .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 },
+    };
+
+    for (permutations) |permutation| {
+        var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+        defer table.deinit();
+        for (permutation, 0..) |claim_idx, channel_idx| {
+            var channel_buf: [8]u8 = undefined;
+            const channel = try std.fmt.bufPrint(&channel_buf, "#c{d}", .{channel_idx});
+            const claim = claims[claim_idx];
+            _ = try table.applyMembership(channel, claim.nick, claim.node, 0, claim.hlc, true, .{}, 0);
+        }
+        const best = table.bestNickClaim("rIcKy") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(NodeId, 1), best.node_id);
+        try std.testing.expectEqual(@as(u64, 20), best.hlc);
+        try std.testing.expect(!table.claim_index_dirty);
+        try std.testing.expectEqual(@as(usize, 1), table.best_nick_claims.count());
+    }
+}
+
+test "bestNickClaim incrementally raises a claim and ignores stale reaffirmation" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "RICKY", 1, 0, 10, true, .{}, 1);
+    _ = try table.applyMembership("#b", "ricky", 2, 0, 20, true, .{}, 1);
+
+    // Stale HLC only refreshes liveness; it cannot change the indexed winner.
+    _ = try table.applyMembership("#a", "RICKY", 3, 0, 10, true, .{}, 2);
+    var best = table.bestNickClaim("ricky").?;
+    try std.testing.expectEqual(@as(NodeId, 2), best.node_id);
+    try std.testing.expectEqual(@as(u64, 20), best.hlc);
+
+    // A newer update to the lower row stays below the incumbent, then overtakes.
+    _ = try table.applyMembership("#a", "RICKY", 3, 0, 15, true, .{}, 3);
+    best = table.bestNickClaim("RICKY").?;
+    try std.testing.expectEqual(@as(NodeId, 2), best.node_id);
+    _ = try table.applyMembership("#a", "RICKY", 3, 0, 25, true, .{}, 4);
+    best = table.bestNickClaim("rIcKy").?;
+    try std.testing.expectEqual(@as(NodeId, 3), best.node_id);
+    try std.testing.expectEqual(@as(u64, 25), best.hlc);
+
+    // Equal HLC resolves by the same higher-node tiebreak as collision handling.
+    _ = try table.applyMembership("#c", "RiCkY", 4, 0, 25, true, .{}, 5);
+    best = table.bestNickClaim("ricky").?;
+    try std.testing.expectEqual(@as(NodeId, 4), best.node_id);
+    _ = try table.applyMembership("#c", "RiCkY", 4, 0, 26, false, .{}, 6);
+    best = table.bestNickClaim("ricky").?;
+    try std.testing.expectEqual(@as(NodeId, 3), best.node_id);
+    try std.testing.expect(!table.claim_index_dirty);
+}
+
+test "bestNickClaim falls back deterministically as claims part" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "RICKY", 1, 0, 10, true, .{}, 0);
+    _ = try table.applyMembership("#b", "ricky", 1, 0, 20, true, .{}, 0);
+    _ = try table.applyMembership("#c", "RiCkY", 2, 0, 15, true, .{}, 0);
+
+    // The roster-backed query is authoritative even if the best-effort exact-key
+    // route index is absent.
+    _ = table.removeNick("ricky");
+    try std.testing.expectEqual(@as(u64, 20), table.bestNickClaim("RICKY").?.hlc);
+    _ = try table.applyMembership("#b", "ricky", 1, 0, 21, false, .{}, 0);
+    var best = table.bestNickClaim("ricky").?;
+    try std.testing.expectEqual(@as(NodeId, 2), best.node_id);
+    try std.testing.expectEqual(@as(u64, 15), best.hlc);
+    _ = try table.applyMembership("#c", "RiCkY", 2, 0, 16, false, .{}, 0);
+    best = table.bestNickClaim("ricky").?;
+    try std.testing.expectEqual(@as(NodeId, 1), best.node_id);
+    try std.testing.expectEqual(@as(u64, 10), best.hlc);
+    _ = try table.applyMembership("#a", "RICKY", 1, 0, 11, false, .{}, 0);
+    try std.testing.expect(table.bestNickClaim("ricky") == null);
+}
+
+test "bestNickClaim bounded overflow degrades to scans and a rebuild recovers" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 1, .max_channels = 4, .max_nodes_per_channel = 4 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "alpha", 1, 0, 10, true, .{}, 0);
+    _ = try table.applyMembership("#b", "beta", 2, 0, 20, true, .{}, 0);
+
+    try std.testing.expect(table.claim_index_dirty);
+    try std.testing.expectEqual(@as(NodeId, 1), table.bestNickClaim("ALPHA").?.node_id);
+    try std.testing.expectEqual(@as(NodeId, 2), table.bestNickClaim("BETA").?.node_id);
+
+    _ = try table.applyMembership("#b", "beta", 2, 0, 21, false, .{}, 0);
+    try std.testing.expect(table.rebuildAllBestNickClaims());
+    try std.testing.expect(!table.claim_index_dirty);
+    try std.testing.expectEqual(@as(usize, 1), table.best_nick_claims.count());
+    try std.testing.expectEqual(@as(NodeId, 1), table.bestNickClaim("alpha").?.node_id);
+    try std.testing.expect(table.bestNickClaim("beta") == null);
+}
+
+test "bestNickClaim scans route-table-only nicks beyond the S2S wire bound" {
+    const long_nick = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789xyz";
+    try std.testing.expect(long_nick.len > membership_event.max_nick_len);
+    var table = try RouteTable.init(std.testing.allocator, .{
+        .max_nicks = 4,
+        .max_channels = 4,
+        .max_nodes_per_channel = 4,
+        .max_name_len = long_nick.len,
+    });
+    defer table.deinit();
+    _ = try table.applyMembership("#long", long_nick, 7, 0, 77, true, .{}, 0);
+
+    const best = table.bestNickClaim(long_nick).?;
+    try std.testing.expectEqual(@as(NodeId, 7), best.node_id);
+    try std.testing.expectEqual(@as(u64, 77), best.hlc);
+    try std.testing.expect(!table.claim_index_dirty);
+    try std.testing.expectEqual(@as(usize, 0), table.best_nick_claims.count());
+}
+
+test "bestNickClaim rename reselects old and contested new normalized keys" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "old", 1, 0, 10, true, .{}, 0);
+    _ = try table.applyMembership("#b", "old", 1, 0, 20, true, .{}, 0);
+    _ = try table.applyMembership("#c", "new", 2, 0, 15, true, .{}, 0);
+
+    try std.testing.expect(try table.renameNick("old", "new", 1, .{}));
+    try std.testing.expect(table.bestNickClaim("old") == null);
+    var best = table.bestNickClaim("NEW").?;
+    try std.testing.expectEqual(@as(NodeId, 1), best.node_id);
+    try std.testing.expectEqual(@as(u64, 20), best.hlc);
+
+    // A case-only rename is one normalized-key reselect and must retain the
+    // unrelated node's contested spelling in the same winner set.
+    try std.testing.expect(try table.renameNick("new", "NeW", 1, .{}));
+    best = table.bestNickClaim("new").?;
+    try std.testing.expectEqual(@as(NodeId, 1), best.node_id);
+    try std.testing.expectEqual(@as(usize, 1), table.best_nick_claims.count());
+    try std.testing.expect(!table.claim_index_dirty);
+}
+
+test "bestNickClaim partial rename OOM reflects both actual roster names" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var table = try RouteTable.init(failing.allocator(), .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "old", 1, 0, 10, true, .{}, 0);
+    _ = try table.applyMembership("#b", "old", 1, 0, 10, true, .{}, 0);
+
+    // Allow the exact-route re-key and one roster nick copy, then fail every
+    // subsequent allocation. renameNick deliberately leaves the second roster
+    // untouched; claim lookup must describe that real partial state.
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expect(try table.renameNick("old", "new", 1, .{}));
+    try std.testing.expect(failing.has_induced_failure);
+
+    var old_rows: usize = 0;
+    var new_rows: usize = 0;
+    var channels = table.channel_members.iterator();
+    while (channels.next()) |entry| {
+        for (entry.value_ptr.entries.items) |member| {
+            if (std.mem.eql(u8, member.nick, "old")) old_rows += 1;
+            if (std.mem.eql(u8, member.nick, "new")) new_rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), old_rows);
+    try std.testing.expectEqual(@as(usize, 1), new_rows);
+    try std.testing.expect(table.bestNickClaim("old") != null);
+    try std.testing.expect(table.bestNickClaim("new") != null);
+}
+
+test "bestNickClaim prune survives orphan-name capture OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var table = try RouteTable.init(failing.allocator(), .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#stale", "ghost", 1, 0, 30, true, .{}, 0);
+    _ = try table.applyMembership("#fresh", "GHOST", 2, 0, 20, true, .{}, 100);
+    try std.testing.expectEqual(@as(NodeId, 1), table.bestNickClaim("ghost").?.node_id);
+
+    // The next allocation is pruneStale's orphan-name capture. Its failure must
+    // not leave node 1 cached after that roster row has been freed.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqual(@as(usize, 1), table.pruneStale(101, 50));
+    try std.testing.expect(failing.has_induced_failure);
+    const best = table.bestNickClaim("ghost").?;
+    try std.testing.expectEqual(@as(NodeId, 2), best.node_id);
+    try std.testing.expectEqual(@as(u64, 20), best.hlc);
+}
+
+test "bestNickClaim removeNode reselects a surviving claimant" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "same", 1, 0, 30, true, .{}, 0);
+    _ = try table.applyMembership("#b", "SAME", 2, 0, 20, true, .{}, 0);
+    _ = try table.applyMembership("#c", "same", 1, 0, 10, true, .{}, 0);
+
+    table.removeNode(1);
+    const best = table.bestNickClaim("same").?;
+    try std.testing.expectEqual(@as(NodeId, 2), best.node_id);
+    try std.testing.expectEqual(@as(u64, 20), best.hlc);
+    try std.testing.expect(!table.claim_index_dirty);
+    table.clearOrigin(2);
+    try std.testing.expect(table.bestNickClaim("same") == null);
+    try std.testing.expect(!table.claim_index_dirty);
+}
+
+test "bestNickClaim OOM dirties incremental insert and rebuild then recovers" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var table = try RouteTable.init(failing.allocator(), .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "alpha", 1, 0, 10, true, .{}, 0);
+    _ = try table.applyMembership("#b", "beta", 2, 0, 20, true, .{}, 0);
+
+    // Reset only the optional cache so the allocator-backed roster remains a
+    // valid oracle. Force the next map allocation to fail first through the
+    // incremental helper, then through the one-pass rebuild.
+    table.best_nick_claims.deinit();
+    table.best_nick_claims = std.AutoHashMap(NickKey, NickClaim).init(failing.allocator());
+    table.claim_index_dirty = false;
+    failing.fail_index = failing.alloc_index;
+    table.noteBestNickClaim("alpha", .{ .node_id = 1, .hlc = 10 });
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(table.claim_index_dirty);
+    try std.testing.expectEqual(@as(NodeId, 1), table.bestNickClaim("ALPHA").?.node_id);
+    try std.testing.expectEqual(@as(NodeId, 2), table.bestNickClaim("beta").?.node_id);
+    try std.testing.expect(!table.rebuildAllBestNickClaims());
+    try std.testing.expect(table.claim_index_dirty);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(table.rebuildAllBestNickClaims());
+    try std.testing.expect(!table.claim_index_dirty);
+    try std.testing.expectEqual(@as(usize, 2), table.best_nick_claims.count());
+    try std.testing.expectEqual(@as(NodeId, 1), table.bestNickClaim("alpha").?.node_id);
+    try std.testing.expectEqual(@as(NodeId, 2), table.bestNickClaim("BETA").?.node_id);
+
+    table.clear();
+    try std.testing.expect(!table.claim_index_dirty);
+    try std.testing.expectEqual(@as(usize, 0), table.best_nick_claims.count());
+    _ = try table.applyMembership("#again", "gamma", 3, 0, 30, true, .{}, 0);
+    try std.testing.expectEqual(@as(NodeId, 3), table.bestNickClaim("GAMMA").?.node_id);
 }
 
 test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" {

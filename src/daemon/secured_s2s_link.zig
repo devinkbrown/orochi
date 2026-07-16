@@ -30,6 +30,7 @@ const tsumugi_session = @import("../crypto/tsumugi_session.zig");
 const hs = @import("../crypto/tsumugi_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
+const session_replica = @import("helix/session_replica.zig");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
@@ -271,6 +272,7 @@ pub const SecuredLink = struct {
             .now_ms = rs.now_ms,
             .signing_key = self.identity.sign_kp,
             .admitted_frame_families = rs.established.admitted_frame_families,
+            .session_replica_transport_enabled = true,
         }, rs.inner, rs.remote_name, rs.rng_seed);
         self.inner = link;
         return self;
@@ -448,6 +450,10 @@ pub const SecuredLink = struct {
     /// Which node (if known) owns `nick`, per this peer's route table.
     pub fn routeNickNode(self: *const SecuredLink, nick: []const u8) ?u64 {
         return if (self.inner) |l| l.routeNickNode(nick) else null;
+    }
+
+    pub fn bestNickClaim(self: *const SecuredLink, nick: []const u8) ?s2s_link.NickClaim {
+        return if (self.inner) |l| l.bestNickClaim(nick) else null;
     }
 
     /// Find `nick` in this peer's converged remote channel rosters (ASCII
@@ -692,6 +698,41 @@ pub const SecuredLink = struct {
         return link.takeSessionMigrateConsumed();
     }
 
+    pub fn supportsSessionReplicaV2(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsSessionReplicaV2();
+    }
+
+    pub fn sendSessionReplica(self: *SecuredLink, kind: s2s_link.SessionReplicaKind, signed_payload: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendSessionReplica(kind, signed_payload);
+        try self.drainInner();
+    }
+
+    pub fn sendSessionReplicaOffer(self: *SecuredLink, signed_offer: []const u8) anyerror!void {
+        try self.sendSessionReplica(.offer, signed_offer);
+    }
+
+    pub fn sendSessionReplicaAck(self: *SecuredLink, signed_ack: []const u8) anyerror!void {
+        try self.sendSessionReplica(.ack, signed_ack);
+    }
+
+    pub fn sendSessionReplicaRevoke(self: *SecuredLink, signed_revoke: []const u8) anyerror!void {
+        try self.sendSessionReplica(.revoke, signed_revoke);
+    }
+
+    /// Caller owns the slice and must deinit each item. `via_peer` is preserved
+    /// from the authenticated inner link for future multipath Store application.
+    pub fn takeSessionReplicaFrames(self: *SecuredLink) anyerror![]s2s_link.InboundSessionReplica {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundSessionReplica, 0);
+        return link.takeSessionReplicaFrames();
+    }
+
+    pub fn takeDroppedSessionReplicaFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeDroppedSessionReplicaFrames();
+    }
+
     /// Emit a CLONE_COUNT batch over the encrypted leg, then flush ciphertext.
     pub fn sendCloneCounts(self: *SecuredLink, payload: []const u8) anyerror!void {
         const link = self.inner orelse return;
@@ -893,6 +934,7 @@ pub const SecuredLink = struct {
             // deinit; `self.identity.sign_kp` is unaffected.
             .signing_key = self.identity.sign_kp,
             .admitted_frame_families = self.establishedKeys().admitted_frame_families,
+            .session_replica_transport_enabled = true,
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
@@ -1192,6 +1234,82 @@ const EstablishedPair = struct {
         self.idb.deinit();
     }
 };
+
+test "session replica v2 activates only inside established Tsumugi SecuredLink" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    try testing.expect(p.a.supportsSessionReplicaV2());
+    try testing.expect(p.b.supportsSessionReplicaV2());
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    var token: session_replica.Token = @splat(0);
+    token[15] = 0x42;
+    const revision = session_replica.Revision{
+        .epoch = 7,
+        .sequence = 1,
+        .origin_node = p.ida.shortId(),
+    };
+    const offer = try session_replica.encodeOffer(testing.allocator, .{
+        .operation = .upsert,
+        .token = token,
+        .revision = revision,
+        .issued_at_ms = 100,
+        .expires_at_ms = 10_000,
+        .account = "alice",
+        .nick = "Alice",
+        .snapshot = "portable-state",
+    }, &p.ida.sign_kp);
+    defer testing.allocator.free(offer);
+    const ack = try session_replica.encodeAck(testing.allocator, .{
+        .status = .accepted,
+        .token = token,
+        .offered_revision = revision,
+        .observed_revision = revision,
+        .ack_node = p.ida.shortId(),
+        .issued_at_ms = 101,
+        .expires_at_ms = 10_000,
+    }, &p.ida.sign_kp);
+    defer testing.allocator.free(ack);
+    const revoke = try session_replica.encodeOffer(testing.allocator, .{
+        .operation = .remove,
+        .token = token,
+        .revision = .{ .epoch = 7, .sequence = 2, .origin_node = p.ida.shortId() },
+        .issued_at_ms = 102,
+        .expires_at_ms = 10_000,
+    }, &p.ida.sign_kp);
+    defer testing.allocator.free(revoke);
+
+    try p.a.sendSessionReplicaOffer(offer);
+    try p.a.sendSessionReplicaAck(ack);
+    try p.a.sendSessionReplicaRevoke(revoke);
+    // The transport object is inside an authenticated encrypted record; neither
+    // its inner magic nor plaintext payload is exposed on the TCP wire.
+    try testing.expect(p.a.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "SRTF") == null);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "SRA2") == null);
+    try pump(&p.a, &p.b, false);
+
+    const frames = try p.b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(testing.allocator);
+        testing.allocator.free(frames);
+    }
+    try testing.expectEqual(@as(usize, 3), frames.len);
+    try testing.expectEqual(s2s_link.SessionReplicaKind.offer, frames[0].kind);
+    try testing.expectEqual(s2s_link.SessionReplicaKind.ack, frames[1].kind);
+    try testing.expectEqual(s2s_link.SessionReplicaKind.revoke, frames[2].kind);
+    for (frames) |frame| try testing.expectEqual(p.ida.shortId(), frame.via_peer);
+
+    const decoded_offer = try session_replica.decodeOffer(frames[0].signed_payload);
+    try session_replica.verifyOffer(decoded_offer);
+    const decoded_ack = try session_replica.decodeAck(frames[1].signed_payload);
+    try session_replica.verifyAck(decoded_ack);
+    const decoded_revoke = try session_replica.decodeOffer(frames[2].signed_payload);
+    try session_replica.verifyOffer(decoded_revoke);
+    try testing.expectEqual(session_replica.OfferOperation.upsert, decoded_offer.offer.operation);
+    try testing.expectEqual(session_replica.OfferOperation.remove, decoded_revoke.offer.operation);
+}
 
 test "post-handshake bytes on the wire are ciphertext, not inner plaintext" {
     var p = try EstablishedPair.init();

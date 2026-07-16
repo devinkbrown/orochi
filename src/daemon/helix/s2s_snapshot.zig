@@ -31,7 +31,8 @@
 //!   inner identity/caps:
 //!     [u64 remote_node_id][u64 remote_epoch_ms][u8 caps]  (bit0 signing, bit1
 //!                                                          account, bit2 oper_info,
-//!                                                          bit3 repair_frames)
+//!                                                          bit3 repair_frames,
+//!                                                          bit4 session_replica_v2)
 //!   [u16 len][remote_name]
 //!   [u16 len][connect_addr] raw sockaddr.in6 of the dial target (initiator only)
 //!   [u32 len][rec_inbuf]    partial inbound record buffered at export
@@ -60,6 +61,7 @@ pub const cap_signing: u8 = s2s_frame.cap_frame_signing;
 pub const cap_account: u8 = s2s_frame.cap_member_account;
 pub const cap_oper_info: u8 = s2s_frame.cap_member_oper_info;
 pub const cap_repair: u8 = s2s_frame.cap_repair_frames;
+pub const cap_session_replica_v2: u8 = s2s_frame.cap_session_replica_v2;
 
 /// A plain view of one carried secured link. `remote_name`/`rec_inbuf`/`pending_out`
 /// borrow the source (encode input) or the decoded buffer (decode output); the
@@ -252,7 +254,7 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
         .pl_last_acked = 66,
         .remote_node_id = 0xDEADBEEFCAFEF00D,
         .remote_epoch_ms = 2000,
-        .caps = cap_signing | cap_oper_info | cap_repair,
+        .caps = cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2,
         .remote_name = "ircx.us",
         .connect_addr = &@as([28]u8, @splat('\x0a')),
         .rec_inbuf = "\x04\x00\x00\x00partial",
@@ -277,7 +279,7 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
     try testing.expectEqual(@as(u64, 77), got.pl_next_in_seq);
     try testing.expectEqual(@as(u64, 66), got.pl_last_acked);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEF00D), got.remote_node_id);
-    try testing.expectEqual(cap_signing | cap_oper_info | cap_repair, got.caps);
+    try testing.expectEqual(cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2, got.caps);
     try testing.expectEqualStrings("ircx.us", got.remote_name);
     try testing.expectEqualStrings(&@as([28]u8, @splat('\x0a')), got.connect_addr);
     try testing.expectEqualStrings("\x04\x00\x00\x00partial", got.rec_inbuf);
