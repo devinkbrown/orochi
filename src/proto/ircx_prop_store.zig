@@ -1120,15 +1120,43 @@ pub fn PropStore(comptime params: Params) type {
             };
         }
 
-        pub fn setProp(self: *Self, entity: Entity, key: []const u8, value: []const u8, setter: Setter) PropError!EntryView {
+        /// Validate every deterministic policy and capacity condition for a SET
+        /// without allocating or mutating the store. Allocation can still make a
+        /// later `setProp` fail with `LimitReached`; callers that need a no-fail
+        /// commit must use a prepared mutation rather than treating this as a
+        /// reservation.
+        pub fn preflightSetProp(
+            self: *const Self,
+            entity: Entity,
+            key: []const u8,
+            value: []const u8,
+            setter: Setter,
+        ) PropError!void {
             try validateEntity(entity, params.max_entity_id);
             try validateKeyWithLimit(key, params.max_key);
             try validateOwner(setter.id, params.max_owner_bytes);
             try validateValueFor(entity, key, value, setter.access, params.max_value);
 
+            var entity_key_buf: [max_entity_key]u8 = undefined;
+            const entity_key = try writeEntityKey(&entity_key_buf, entity, params.max_entity_id);
+            const state = self.entities.getPtr(entity_key) orelse {
+                if (self.entity_count >= params.max_entities) return error.LimitReached;
+                return;
+            };
+
+            var prop_key_buf: [params.max_key]u8 = undefined;
+            const prop_key = try writePropKey(&prop_key_buf, key, params.max_key);
+            if (!state.props.contains(prop_key) and state.prop_count >= params.max_props_per_entity)
+                return error.LimitReached;
+        }
+
+        pub fn setProp(self: *Self, entity: Entity, key: []const u8, value: []const u8, setter: Setter) PropError!EntryView {
+            try self.preflightSetProp(entity, key, value, setter);
+
             var state = try self.getOrCreateEntity(entity);
-            const existing = state.props.getEntry(key);
-            if (existing == null and state.prop_count >= params.max_props_per_entity) return error.LimitReached;
+            var prop_key_buf: [params.max_key]u8 = undefined;
+            const prop_key = try writePropKey(&prop_key_buf, key, params.max_key);
+            const existing = state.props.getEntry(prop_key);
 
             const value_copy = self.allocator.dupe(u8, value) catch return error.LimitReached;
             errdefer self.allocator.free(value_copy);
@@ -1873,6 +1901,11 @@ test "limits and built-in channel property metadata are enforced" {
 
     const entity = try Entity.fromId("#c");
     _ = try store.setProp(entity, "custom", "12345678", .{ .id = "owner", .access = .host });
+    // Capacity checks use the normalized lookup key: a differently-cased
+    // spelling updates the existing row even when the entity is otherwise full.
+    try store.preflightSetProp(entity, "CUSTOM", "changed", .{ .id = "owner", .access = .host });
+    _ = try store.setProp(entity, "CUSTOM", "changed", .{ .id = "owner", .access = .host });
+    try std.testing.expectEqualStrings("changed", (try store.getPropRaw(entity, "custom")).value);
     try std.testing.expectError(error.LimitReached, store.setProp(entity, "other", "1", .{ .id = "owner", .access = .host }));
     try std.testing.expectError(error.LimitReached, store.setProp(try Entity.fromId("#d"), "custom", "1", .{ .id = "owner", .access = .host }));
     try std.testing.expectError(error.InvalidValue, store.setProp(entity, "custom", "123456789", .{ .id = "owner", .access = .host }));

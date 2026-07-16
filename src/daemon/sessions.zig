@@ -2894,7 +2894,7 @@ test "token group stays portable when issuing sibling detaches" {
     try testing.expect(s.resumeHandleForClient("alice", 2).?.portable);
 }
 
-test "prepared token join aborts cleanly then commits without allocation" {
+test "prepared token join aborts cleanly then prepared commit needs no allocation" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var s = SessionStore.init(failing.allocator());
     defer s.deinit();
@@ -2918,12 +2918,14 @@ test "prepared token join aborts cleanly then commits without allocation" {
     try testing.expect(s.clientHasToken("alice", 2, generated));
     try testing.expect(!s.clientHasToken("alice", 2, target));
 
-    // Fail the allocator's very next request. Neither preparation nor commit may
-    // touch it, so the exact group transition still completes in one step.
-    failing.fail_index = failing.alloc_index;
+    // Preparation intentionally allocates the complete folded-account snapshot
+    // and any missing projection journals while holding the lock. Once that
+    // plan exists, fail the allocator's very next request: commit itself must
+    // remain allocation-free and publish the exact group transition in one step.
     var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
         return error.TestUnexpectedResult;
     defer prepared.deinit();
+    failing.fail_index = failing.alloc_index;
     try testing.expect(prepared.commit());
     try testing.expect(!failing.has_induced_failure);
     // Commit publishes the row change but deliberately retains the lock until

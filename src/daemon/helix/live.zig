@@ -134,21 +134,79 @@ pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
 /// Multi-shard listener handoff: comma-separated per-shard client-listener fds
 /// in shard order (`fd0,fd1,...`), preserved across execve so EVERY shard's
 /// SO_REUSEPORT listener survives the swap (no accept-queue drop on shards
-/// 1..N-1). `env_listen_fd` still carries shard 0's fd alone so an older
-/// successor image (which only knows the singular variable) adopts shard 0.
-/// Emitted only when more than one shard listener exists.
-///
-/// ROLLBACK CAVEAT: a hot USR2 from a MULTI-SHARD predecessor down to a
-/// binary that predates this variable inherits shards 1..N-1's un-CLOEXEC'd
-/// listener fds without knowing to adopt OR close them — they stay in the
-/// SO_REUSEPORT group, silently black-holing the share of NEW connections the
-/// kernel hashes onto their never-accepted queues (existing/carried
-/// connections are unaffected; a cold restart self-heals). Roll back across
-/// this boundary with a cold restart, never USR2.
+/// 1..N-1). `env_listen_fd` still carries shard 0's fd as the canonical
+/// singular alias. Emitted only when more than one shard listener exists. The
+/// pinned target capability handshake runs before any CLOEXEC mutation, so a
+/// binary that predates this ownership contract is refused while the
+/// predecessor keeps every listener and connection live; it can never inherit
+/// and strand unrecognized SO_REUSEPORT listeners.
 pub const env_listen_fds = "OROCHI_HELIX_LISTEN_FDS";
-/// Hard cap on inherited per-shard listener fds parsed from the environment
-/// (bounds the fixed `Resume` buffer; shards beyond it bind fresh listeners).
+/// Hard cap on inherited per-shard listener fds. Producer and parser share the
+/// fixed `Resume` bound; an upgrade with more listeners is refused rather than
+/// truncating the list and leaking unowned sockets in the successor.
 pub const max_inherited_listeners = 64;
+/// Authoritative list of every client and S2S socket fd carried inside the
+/// state arena. Unlike the capsule stream this manifest is version-independent:
+/// a successor can close the sockets even when the arena is corrupt or uses a
+/// future schema that it cannot decode.
+pub const env_state_fds = "OROCHI_HELIX_STATE_FDS";
+/// Hard cap for the authoritative state-fd manifest. Both producer and parser
+/// reject lists above this bound; the list is never silently truncated because
+/// losing even one fd would strand that connection across a refused upgrade.
+pub const max_inherited_state_fds = 4096;
+
+/// Exact machine-readable answer returned by the daemon's private upgrade
+/// capability probe. A predecessor requires this complete line before it makes
+/// any client, mesh, listener, or arena descriptor inheritable. Keep this token
+/// in lockstep with the mandatory outer capsule and fd-ownership contracts.
+pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
+pub const upgrade_capability_token =
+    "OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1";
+
+/// Require the capability token as a complete output line. Substring matching
+/// would let a diagnostic such as "missing TOKEN" accidentally authorize a
+/// handoff to an incompatible image.
+pub fn hasUpgradeCapabilityLine(output: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.eql(u8, line, upgrade_capability_token)) return true;
+    }
+    return false;
+}
+
+/// Execute an already-open target image in private capability mode. The child
+/// resolves its inherited CLOEXEC descriptor through `/proc/self/fd` as part of
+/// exec; the descriptor closes only after that resolution succeeds. This keeps
+/// the probe pinned to the retained inode without depending on parent-pid procfs
+/// visibility.
+pub fn probeUpgradeExecutableFd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable_fd: handoff.Fd,
+) !bool {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    if (executable_fd < 0) return error.InvalidExecutableFd;
+    var proc_path_buf: [64]u8 = undefined;
+    const proc_path = try std.fmt.bufPrint(&proc_path_buf, "/proc/self/fd/{d}", .{executable_fd});
+    // Use one absolute deadline for the complete probe. A relative duration is
+    // restarted by each stdout/stderr fill, allowing a child that drips output
+    // to stretch a nominal two-second compatibility check far beyond its bound.
+    const deadline = (std.Io.Timeout{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(2),
+    } }).toDeadline(io);
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ proc_path, upgrade_capability_arg },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+        .timeout = deadline,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term.success() and
+        (hasUpgradeCapabilityLine(result.stdout) or hasUpgradeCapabilityLine(result.stderr));
+}
 
 pub const ExecPlan = struct {
     argv: []const [:0]const u8,
@@ -177,6 +235,40 @@ pub const ExecPlan = struct {
         for (self.envp, 0..) |entry, i| envp_ptrs[i] = entry.ptr;
 
         const rc = linux.execve(self.argv[0].ptr, argv_ptrs.ptr, envp_ptrs.ptr);
+        switch (linux.errno(rc)) {
+            .SUCCESS => unreachable,
+            else => return error.ExecFailed,
+        }
+    }
+
+    /// Execute an already-open, probed binary rather than resolving argv[0]
+    /// again. `execveat(AT_EMPTY_PATH)` closes the probe/exec TOCTOU window: the
+    /// image that answered the capability handshake is exactly the image that
+    /// receives the inherited descriptors. The caller retains fd ownership if
+    /// exec fails; successful exec closes a CLOEXEC target fd in the new image.
+    pub fn commitExecutableFd(
+        self: ExecPlan,
+        allocator: std.mem.Allocator,
+        executable_fd: handoff.Fd,
+    ) anyerror!noreturn {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        if (executable_fd < 0) return error.InvalidExecutableFd;
+
+        const argv_ptrs = try allocator.allocSentinel(?[*:0]const u8, self.argv.len, null);
+        defer allocator.free(argv_ptrs);
+        for (self.argv, 0..) |arg, i| argv_ptrs[i] = arg.ptr;
+
+        const envp_ptrs = try allocator.allocSentinel(?[*:0]const u8, self.envp.len, null);
+        defer allocator.free(envp_ptrs);
+        for (self.envp, 0..) |entry, i| envp_ptrs[i] = entry.ptr;
+
+        const rc = linux.execveat(
+            executable_fd,
+            "",
+            argv_ptrs.ptr,
+            envp_ptrs.ptr,
+            .{ .SYMLINK_NOFOLLOW = false, .EMPTY_PATH = true },
+        );
         switch (linux.errno(rc)) {
             .SUCCESS => unreachable,
             else => return error.ExecFailed,
@@ -261,8 +353,10 @@ pub fn buildListenerExecPlan(
     errdefer allocator.free(argv[1]);
     if (config_path) |cp| {
         argv[2] = try allocator.dupeSentinel(u8, cp, 0);
-        errdefer allocator.free(argv[2]);
     }
+    // Registered at function scope (not inside the `if` block), so later env
+    // allocation failures still release the optional config-path argument.
+    errdefer if (config_path != null) allocator.free(argv[2]);
 
     var envp = try allocator.alloc([:0]const u8, 1);
     errdefer allocator.free(envp);
@@ -277,16 +371,33 @@ pub fn buildListenerExecPlan(
 /// fd list in shard order; `listen_fds[0]` (shard 0) rides the singular
 /// `env_listen_fd` for older successors, and the full list additionally rides
 /// `env_listen_fds` when more than one shard listener is carried. The successor
-/// reads the arena's capsules and adopts the listeners. The caller must clear
-/// `FD_CLOEXEC` on the arena fd and every listener fd before `commit`.
+/// reads the arena's capsules and adopts the listeners. `state_fds` is the exact
+/// set of client/S2S descriptors referenced by that arena and rides a separate,
+/// version-independent manifest. The caller must clear `FD_CLOEXEC` on the
+/// arena, listener, and state fds before `commit`.
 pub fn buildArenaListenerExecPlan(
     allocator: std.mem.Allocator,
     binary_path: []const u8,
     arena_fd: handoff.Fd,
     listen_fds: []const handoff.Fd,
+    state_fds: []const handoff.Fd,
     config_path: ?[]const u8,
 ) anyerror!ExecPlan {
     if (listen_fds.len == 0) return error.NoListener;
+    if (listen_fds.len > max_inherited_listeners) return error.TooManyListeners;
+    if (state_fds.len > max_inherited_state_fds) return error.TooManyStateFds;
+    if (arena_fd < 0) return error.InvalidArenaFd;
+    for (listen_fds, 0..) |listen_fd, i| {
+        if (listen_fd < 0) return error.InvalidListenerFd;
+        if (listen_fd == arena_fd) return error.ArenaFdCollidesWithListener;
+        for (listen_fds[0..i]) |prior| if (prior == listen_fd) return error.DuplicateListenerFd;
+    }
+    for (state_fds, 0..) |fd, i| {
+        if (fd < 0) return error.InvalidStateFd;
+        if (fd == arena_fd) return error.StateFdCollidesWithArena;
+        for (listen_fds) |listen_fd| if (fd == listen_fd) return error.StateFdCollidesWithListener;
+        for (state_fds[0..i]) |prior| if (prior == fd) return error.DuplicateStateFd;
+    }
     // argv = [binary, --supervisor, (config_path)?]. The config path is passed
     // through so the successor boots with the SAME config (ports, certs, opers,
     // cloak) rather than the built-in defaults.
@@ -299,19 +410,32 @@ pub fn buildArenaListenerExecPlan(
     errdefer allocator.free(argv[1]);
     if (config_path) |cp| {
         argv[2] = try allocator.dupeSentinel(u8, cp, 0);
-        errdefer allocator.free(argv[2]);
     }
+    // Registered in the function body rather than the conditional block, so
+    // any later environment allocation failure still releases this argument.
+    errdefer if (config_path != null) allocator.free(argv[2]);
 
-    const envc: usize = if (listen_fds.len > 1) 3 else 2;
+    const envc: usize = 2 +
+        @as(usize, @intFromBool(listen_fds.len > 1)) +
+        @as(usize, @intFromBool(state_fds.len != 0));
     var envp = try allocator.alloc([:0]const u8, envc);
     errdefer allocator.free(envp);
     envp[0] = try fdEnvEntry(allocator, env_arena_fd, arena_fd);
     errdefer allocator.free(envp[0]);
     envp[1] = try fdEnvEntry(allocator, env_listen_fd, listen_fds[0]);
     errdefer allocator.free(envp[1]);
+    var env_i: usize = 2;
     if (listen_fds.len > 1) {
-        envp[2] = try fdListEnvEntry(allocator, env_listen_fds, listen_fds);
-        errdefer allocator.free(envp[2]);
+        const listen_env_i = env_i;
+        envp[listen_env_i] = try fdListEnvEntry(allocator, env_listen_fds, listen_fds);
+        env_i += 1;
+    }
+    // Like argv[2], this cleanup must outlive the conditional block because the
+    // following state-manifest allocation can fail.
+    errdefer if (listen_fds.len > 1) allocator.free(envp[2]);
+    if (state_fds.len != 0) {
+        const state_env_i = env_i;
+        envp[state_env_i] = try fdListEnvEntry(allocator, env_state_fds, state_fds);
     }
 
     return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = -1 };
@@ -332,9 +456,19 @@ pub const Resume = struct {
     /// shard 0 alone.
     listen_fds: [max_inherited_listeners]handoff.Fd = @splat(-1),
     listen_fd_count: usize = 0,
+    /// Authoritative carried client/S2S fds. Empty means a legacy predecessor
+    /// omitted the manifest and the successor must fall back to capsule peeks.
+    state_fds: [max_inherited_state_fds]handoff.Fd = @splat(-1),
+    state_fd_count: usize = 0,
+    state_fd_manifest_present: bool = false,
+    state_fd_manifest_valid: bool = false,
 
     pub fn listenFds(self: *const Resume) []const handoff.Fd {
         return self.listen_fds[0..self.listen_fd_count];
+    }
+
+    pub fn stateFds(self: *const Resume) []const handoff.Fd {
+        return self.state_fds[0..self.state_fd_count];
     }
 };
 
@@ -355,13 +489,25 @@ pub fn resumeFromEnv() ?Resume {
         else => return null,
     }
     const env = buf[0..@as(usize, @intCast(read_len))];
+    return resumeFromEnvBlock(env);
+}
+
+fn resumeFromEnvBlock(env: []const u8) ?Resume {
     const arena_fd = readFdFromEnvBlock(env, env_arena_fd);
     const control_fd = readFdFromEnvBlock(env, env_control_fd);
     const listen_fd = readFdFromEnvBlock(env, env_listen_fd);
-    if (arena_fd == null and control_fd == null and listen_fd == null) return null;
+    const state_fd_value = findEnvValue(env, env_state_fds);
+    if (arena_fd == null and control_fd == null and listen_fd == null and state_fd_value == null) return null;
     var r: Resume = .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
     if (findEnvValue(env, env_listen_fds)) |list| {
         r.listen_fd_count = parseFdList(list, &r.listen_fds);
+    }
+    if (state_fd_value) |list| {
+        r.state_fd_manifest_present = true;
+        if (parseFdListExact(list, &r.state_fds)) |count| {
+            r.state_fd_count = count;
+            r.state_fd_manifest_valid = true;
+        }
     }
     return r;
 }
@@ -431,6 +577,23 @@ fn parseFdList(value: []const u8, out: []handoff.Fd) usize {
             out[n] = fd;
             n += 1;
         }
+    }
+    return n;
+}
+
+/// Parse an authoritative fd list without truncation. Any malformed/negative
+/// element, empty list, or element beyond `out` rejects the complete manifest.
+fn parseFdListExact(value: []const u8, out: []handoff.Fd) ?usize {
+    if (value.len == 0) return null;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |tok| {
+        if (tok.len == 0 or n == out.len) return null;
+        const fd = std.fmt.parseInt(handoff.Fd, tok, 10) catch return null;
+        if (fd < 0) return null;
+        for (out[0..n]) |prior| if (prior == fd) return null;
+        out[n] = fd;
+        n += 1;
     }
     return n;
 }
@@ -525,6 +688,53 @@ test "readArena round-trips the sealed capsule stream" {
     try std.testing.expect(std.mem.eql(u8, "channel-state", caps[1].fields[0].bytes));
 }
 
+test "mesh state pieces advertise ordinary overlap and exact property requirement" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const pieces = [_]StatePiece{
+        .{ .kind = .mesh_checkpoint, .bytes = "ordinary-mesh-state" },
+        .{ .kind = .mesh_checkpoint, .bytes = "exact-property-state", .min_supported = 2 },
+    };
+    var prepared = try prepare(allocator, .{
+        .epoch = 8,
+        .now_ms = 2,
+        .timeout_ms = 1000,
+        .arena_name = "helix-mesh-v2-ranges",
+        .pieces = pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+
+    const caps = try readArena(allocator, prepared.runtime.arena.?.fd);
+    defer {
+        for (caps) |*c| c.deinit(allocator);
+        allocator.free(caps);
+    }
+    try std.testing.expectEqual(@as(usize, 2), caps.len);
+    for (caps) |cap| {
+        try std.testing.expectEqual(capsule.CapsuleKind.mesh_checkpoint, cap.header.kind);
+        try std.testing.expectEqual(@as(u16, 2), cap.header.version);
+        try std.testing.expectEqual(@as(u16, 2), cap.header.max_supported);
+        try std.testing.expectEqual(@as(usize, 1), cap.fields.len);
+        try std.testing.expectEqual(@as(u32, 1), cap.fields[0].ordinal);
+    }
+    try std.testing.expectEqual(@as(u16, 1), caps[0].header.min_supported);
+    try std.testing.expectEqualStrings("ordinary-mesh-state", caps[0].fields[0].bytes);
+    try std.testing.expectEqual(@as(u16, 2), caps[1].header.min_supported);
+    try std.testing.expectEqualStrings("exact-property-state", caps[1].fields[0].bytes);
+
+    var legacy = capsule.descriptor(.mesh_checkpoint);
+    legacy.current_version = 1;
+    legacy.min_supported = 1;
+    legacy.max_supported = 1;
+    try std.testing.expectEqual(@as(u16, 1), try capsule.negotiate(legacy, caps[0].header));
+    try std.testing.expectError(
+        error.VersionUnsupported,
+        capsule.negotiate(legacy, caps[1].header),
+    );
+}
+
 test "exec plan with listener carries the listen fd env entry" {
     const allocator = std.testing.allocator;
     var plan = try buildExecPlanWithListener(allocator, "/tmp/orochi", 10, 11, 12);
@@ -561,9 +771,63 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
     try std.testing.expectEqual(@as(i32, 0), (status >> 8) & 0xff); // exit code
 }
 
+test "upgrade capability token must occupy a complete output line" {
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(hasUpgradeCapabilityLine("banner\r\n" ++ upgrade_capability_token ++ "\r\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine("prefix " ++ upgrade_capability_token ++ "\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine(upgrade_capability_token ++ " suffix\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine("OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v1\n"));
+}
+
+test "std.process.run can execute a CLOEXEC image through proc self fd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const open_rc = linux.open("/bin/true", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(open_rc) != .SUCCESS) return error.SkipZigTest;
+    const executable_fd: handoff.Fd = @intCast(open_rc);
+    defer _ = linux.close(executable_fd);
+
+    var proc_path_buf: [64]u8 = undefined;
+    const proc_path = try std.fmt.bufPrint(&proc_path_buf, "/proc/self/fd/{d}", .{executable_fd});
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{proc_path},
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(2),
+        } },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expect(result.term.success());
+}
+
+test "ExecPlan.commitExecutableFd executes the already-open image" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const open_rc = linux.open("/bin/true", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(open_rc) != .SUCCESS) return error.SkipZigTest;
+    const executable_fd: handoff.Fd = @intCast(open_rc);
+    defer _ = linux.close(executable_fd);
+
+    var plan = try buildListenerExecPlan(allocator, "/ignored/after-open", 0, null);
+    defer plan.deinit(allocator);
+    const pid_rc = linux.fork();
+    const pid: i32 = @intCast(@as(isize, @bitCast(pid_rc)));
+    if (pid == 0) {
+        plan.commitExecutableFd(allocator, executable_fd) catch {};
+        linux.exit(127);
+    }
+    var status: i32 = 0;
+    _ = linux.wait4(pid, &status, 0, null);
+    try std.testing.expectEqual(@as(i32, 0), status & 0x7f);
+    try std.testing.expectEqual(@as(i32, 0), (status >> 8) & 0xff);
+}
+
 test "arena+listener exec plan carries both fds, no control" {
     const allocator = std.testing.allocator;
-    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, null);
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{}, null);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
     try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
@@ -573,7 +837,7 @@ test "arena+listener exec plan carries both fds, no control" {
 
 test "arena+listener exec plan carries the per-shard listener list (multi-shard)" {
     const allocator = std.testing.allocator;
-    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{ 6, 9, 12 }, null);
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{ 6, 9, 12 }, &.{}, null);
     defer plan.deinit(allocator);
     // Singular var still carries shard 0 (older-successor compatibility), and
     // the full shard-ordered list rides the plural var.
@@ -582,7 +846,77 @@ test "arena+listener exec plan carries the per-shard listener list (multi-shard)
     try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
     try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9,12", plan.envp[2]);
     // An empty listener set is a caller bug — fail closed, never exec plan-less.
-    try std.testing.expectError(error.NoListener, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{}, null));
+    try std.testing.expectError(error.NoListener, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{}, &.{}, null));
+    try std.testing.expectError(error.InvalidArenaFd, buildArenaListenerExecPlan(allocator, "/proc/self/exe", -1, &.{6}, &.{}, null));
+    try std.testing.expectError(error.InvalidListenerFd, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{-1}, &.{}, null));
+    try std.testing.expectError(error.ArenaFdCollidesWithListener, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{5}, &.{}, null));
+    try std.testing.expectError(error.DuplicateListenerFd, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{ 6, 6 }, &.{}, null));
+    var too_many: [max_inherited_listeners + 1]handoff.Fd = undefined;
+    for (&too_many, 0..) |*fd, index| fd.* = @intCast(index + 10);
+    try std.testing.expectError(error.TooManyListeners, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &too_many, &.{}, null));
+}
+
+test "arena exec plan carries authoritative state fds without truncation" {
+    const allocator = std.testing.allocator;
+    var plan = try buildArenaListenerExecPlan(
+        allocator,
+        "/proc/self/exe",
+        5,
+        &.{ 6, 9 },
+        &.{ 21, 34, 55 },
+        null,
+    );
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), plan.envp.len);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
+
+    var too_many: [max_inherited_state_fds + 1]handoff.Fd = @splat(7);
+    try std.testing.expectError(
+        error.TooManyStateFds,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &too_many, null),
+    );
+    try std.testing.expectError(
+        error.DuplicateStateFd,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{ 21, 21 }, null),
+    );
+    try std.testing.expectError(
+        error.StateFdCollidesWithArena,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{5}, null),
+    );
+    try std.testing.expectError(
+        error.StateFdCollidesWithListener,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{6}, null),
+    );
+    try std.testing.expectError(
+        error.InvalidStateFd,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{-1}, null),
+    );
+    try std.testing.expectError(
+        error.StateFdCollidesWithListener,
+        buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{ 6, 9 }, &.{9}, null),
+    );
+}
+
+test "arena exec plan with both fd manifests is allocation-failure clean" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var plan = try buildArenaListenerExecPlan(
+                allocator,
+                "/proc/self/exe",
+                5,
+                &.{ 6, 9 },
+                &.{ 21, 34, 55 },
+                "/tmp/orochi.conf",
+            );
+            defer plan.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 4), plan.envp.len);
+            try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
+            try std.testing.expectEqualStrings("OROCHI_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
 }
 
 test "parseFdList round-trips, rejects malformed lists fail-closed" {
@@ -602,10 +936,42 @@ test "parseFdList round-trips, rejects malformed lists fail-closed" {
     try std.testing.expectEqual(@as(usize, 0), parseFdList("", &out));
 }
 
+test "authoritative state fd parser rejects overflow rather than truncating" {
+    var out: [3]handoff.Fd = @splat(-1);
+    try std.testing.expectEqual(@as(?usize, 3), parseFdListExact("21,34,55", &out));
+    try std.testing.expectEqual(@as(handoff.Fd, 55), out[2]);
+    try std.testing.expectEqual(@as(?usize, null), parseFdListExact("21,34,55,89", &out));
+    try std.testing.expectEqual(@as(?usize, null), parseFdListExact("21,,55", &out));
+    try std.testing.expectEqual(@as(?usize, null), parseFdListExact("21,-1", &out));
+    try std.testing.expectEqual(@as(?usize, null), parseFdListExact("21,34,21", &out));
+    try std.testing.expectEqual(@as(?usize, null), parseFdListExact("", &out));
+}
+
+test "resume env records valid and malformed authoritative manifests" {
+    const good = resumeFromEnvBlock(
+        "OROCHI_HELIX_ARENA_FD=5\x00OROCHI_HELIX_LISTEN_FD=6\x00OROCHI_HELIX_STATE_FDS=21,34,55\x00",
+    ).?;
+    try std.testing.expect(good.state_fd_manifest_present);
+    try std.testing.expect(good.state_fd_manifest_valid);
+    try std.testing.expectEqualSlices(handoff.Fd, &.{ 21, 34, 55 }, good.stateFds());
+
+    const bad = resumeFromEnvBlock(
+        "OROCHI_HELIX_ARENA_FD=5\x00OROCHI_HELIX_STATE_FDS=21,21\x00",
+    ).?;
+    try std.testing.expect(bad.state_fd_manifest_present);
+    try std.testing.expect(!bad.state_fd_manifest_valid);
+    try std.testing.expectEqual(@as(usize, 0), bad.state_fd_count);
+}
+
 test "findEnvValue locates the listener list in an environ block" {
     const block = "FOO=bar\x00OROCHI_HELIX_LISTEN_FDS=6,9\x00BAZ=qux\x00";
     try std.testing.expectEqualStrings("6,9", findEnvValue(block, env_listen_fds).?);
     try std.testing.expectEqual(@as(?[]const u8, null), findEnvValue("FOO=bar\x00", env_listen_fds));
+}
+
+test "findEnvValue locates the authoritative state fd list" {
+    const block = "FOO=bar\x00OROCHI_HELIX_STATE_FDS=21,34,55\x00BAZ=qux\x00";
+    try std.testing.expectEqualStrings("21,34,55", findEnvValue(block, env_state_fds).?);
 }
 
 test "listener-only exec plan carries just the listen fd" {

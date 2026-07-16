@@ -177,7 +177,10 @@ const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
 const suimyaku_media = @import("../substrate/suimyaku/media.zig");
 const simulcast_select = @import("../substrate/simulcast_select.zig");
+const helix_capsule = @import("helix/capsule.zig");
+const helix_handoff = @import("helix/handoff.zig");
 const helix_live = @import("helix/live.zig");
+const prop_checkpoint = @import("helix/prop_checkpoint.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const session_capsule = @import("helix/session_capsule.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
@@ -1669,6 +1672,13 @@ pub const Config = struct {
     /// Inherited Helix state-arena memfd (UPGRADE handoff); `adoptInheritedSessions`
     /// reads it after boot to re-attach carried-over client connections. null = none.
     resume_arena_fd: ?linux.fd_t = null,
+    /// Version-independent authoritative manifest of every client and S2S fd
+    /// carried by `resume_arena_fd`. It lets a successor close all inherited
+    /// sockets even when the arena is corrupt or uses an unsupported schema.
+    /// Empty means a legacy predecessor omitted the manifest.
+    inherited_state_fds: []const linux.fd_t = &.{},
+    inherited_state_fd_manifest_present: bool = false,
+    inherited_state_fd_manifest_valid: bool = false,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Max CQEs reaped per io_uring completion-drain. Larger values reduce
@@ -2199,7 +2209,22 @@ pub const ConnState = struct {
     send_buf: [default_reply_bytes]u8 = undefined,
     send_len: usize = 0,
     send_offset: usize = 0,
+    /// True exactly while io_uring owns `recv_buf` for this connection token.
+    /// A slot must not be freed or reused until the matching exact-generation
+    /// RECV completion clears this latch.
+    recv_armed: bool = false,
     send_armed: bool = false,
+    /// True exactly while io_uring owns `s2s_connect_addr` for an async connect.
+    /// Kept separate from `send_armed`/`recv_armed` so close can drain every
+    /// kernel reference before recycling the slab slot.
+    connect_armed: bool = false,
+    /// This fully-built slot is missing one or more required socket operations.
+    /// Helix adoption starts here intentionally; fresh accepts/connect completions
+    /// also enter it on SQ pressure. Partial activation leaves it true for retry.
+    io_activation_pending: bool = false,
+    /// The pending activation must acquire RECV before it may arm SEND. False for
+    /// intentional close-with-ERROR sockets, whose only required op is SEND.
+    activation_recv_required: bool = false,
     /// labeled-response capture: when non-null, plaintext replies destined for
     /// THIS connection are diverted into the buffer (BEFORE the WS/TLS framing
     /// seam) instead of the wire, so the dispatcher can reframe a labeled
@@ -2789,6 +2814,11 @@ const Reactor = struct {
     wake_armed: bool = false,
     wake_count: std.atomic.Value(u32) = .init(0),
 
+    /// Fair, generation-safe cursor for bounded post-Helix socket activation.
+    /// Only the slot index is retained across turns; every scan revalidates the
+    /// occupied slot and reads its current generation before arming anything.
+    activation_cursor: usize = 0,
+
     /// Fan-out wake coalescer, touched ONLY by this reactor's own thread while it
     /// runs a broadcast (`beginWakeBatch`/`endWakeBatch`). During a batch, each
     /// cross-shard delivery records its TARGET shard here instead of firing a wake
@@ -2799,8 +2829,11 @@ const Reactor = struct {
     /// Tear down the reactor's ring, connection table, wake fd, and listeners.
     /// The caller drains per-connection link/tls/multiline state first.
     fn deinit(self: *Reactor) void {
-        self.clients.deinit();
+        // io_uring may still own recv/send/connect storage embedded in a client
+        // slot. Tear the ring down first so the kernel releases those references
+        // before ClientTable frees/reuses its backing allocation.
         self.ring.deinit();
+        self.clients.deinit();
         if (self.wake) |*w| w.deinit();
         closeFd(self.listener_fd);
         if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
@@ -2820,32 +2853,7 @@ threadlocal var current_reactor: ?*Reactor = null;
 /// Sentinel for `upgrade_quiesce_shard`: no multi-shard UPGRADE seal in flight.
 const no_quiesce_shard: u32 = std.math.maxInt(u32);
 
-const ChannelPropClock = struct {
-    channel: []u8,
-    key: []u8,
-    owner: []u8,
-    hlc: u64,
-    present: bool,
-    /// The ORIGINAL author's node short id for this LWW fact (preserved verbatim
-    /// across re-broadcast/burst, NOT this relay's node). Used as the claimed
-    /// origin a receiver self-certifies the stored signature against.
-    origin_node: u64,
-    /// Stored self-contained multi-hop origin signature, owned here. Empty
-    /// (`&.{}`) on the legacy unsigned path. Re-emitted byte-for-byte on
-    /// re-broadcast/burst so every hop verifies the ORIGINAL author, never the
-    /// relay. Both empty or both at their exact Ed25519 widths.
-    origin_pubkey: []u8,
-    origin_sig: []u8,
-
-    fn deinit(self: *ChannelPropClock, allocator: std.mem.Allocator) void {
-        allocator.free(self.channel);
-        allocator.free(self.key);
-        allocator.free(self.owner);
-        allocator.free(self.origin_pubkey);
-        allocator.free(self.origin_sig);
-        self.* = undefined;
-    }
-};
+const ChannelPropClock = prop_checkpoint.ChannelClock;
 
 /// LWW clock for a user/member PROP fact (ENTITY_PROP). The non-channel
 /// counterpart of `ChannelPropClock`: `kind` distinguishes user vs member and
@@ -2853,26 +2861,7 @@ const ChannelPropClock = struct {
 /// here and freed in `deinit`; the multi-hop origin `(pubkey, sig)` is stored
 /// verbatim and re-emitted on re-broadcast/burst so every hop verifies the
 /// ORIGINAL author, never this relay. Empty (`&.{}`) on the legacy unsigned path.
-const EntityPropClock = struct {
-    kind: entity_prop_event.EntityKind,
-    entity: []u8,
-    key: []u8,
-    owner: []u8,
-    hlc: u64,
-    present: bool,
-    origin_node: u64,
-    origin_pubkey: []u8,
-    origin_sig: []u8,
-
-    fn deinit(self: *EntityPropClock, allocator: std.mem.Allocator) void {
-        allocator.free(self.entity);
-        allocator.free(self.key);
-        allocator.free(self.owner);
-        allocator.free(self.origin_pubkey);
-        allocator.free(self.origin_sig);
-        self.* = undefined;
-    }
-};
+const EntityPropClock = prop_checkpoint.EntityClock;
 
 const RuntimeFeatureConfig = struct {
     config: Config,
@@ -3149,6 +3138,11 @@ pub const LinuxServer = struct {
     /// reactor 0 at run time: the boot dial and the sweep re-dials run only on
     /// reactor 0's thread, the same reactor that owns the outbound ConnStates.
     mesh_dials: []MeshDial = &.{},
+    /// Post-UPGRADE hand-dial hints are decoded during arena adoption but are
+    /// not allowed to consume SQ entries there. Reactor 0 drains this queue only
+    /// after accept/wake/timer controls have been armed.
+    inherited_mesh_redials: std.ArrayListUnmanaged(posix.sockaddr.in6) = .empty,
+    inherited_mesh_redial_cursor: usize = 0,
     /// Decoded `[mesh].trust_roots` Ed25519 node signing keys. Empty preserves
     /// TOFU; non-empty requires secured peers to present one of these keys.
     mesh_trusted_node_keys: [][32]u8 = &.{},
@@ -3161,6 +3155,11 @@ pub const LinuxServer = struct {
     /// check confirms "this is reactor 0" before reading it, so no other shard
     /// ever touches the flag.
     mesh_dials_booted: bool = false,
+    /// Fair cursor shared by the bounded boot and periodic connect sweeps.
+    /// `mesh_boot_remaining` counts the boot cycle's not-yet-visited entries so
+    /// a fast-failing first peer cannot be retried forever ahead of later peers.
+    mesh_dial_cursor: usize = 0,
+    mesh_boot_remaining: usize = 0,
     /// Cross-shard outbound delivery fabric (per-shard mailbox + wake + shared
     /// pool). Null in the single-reactor configuration (no cross-shard handoff is
     /// ever needed); allocated by `runThreaded` when `reactors.len > 1`.
@@ -4638,10 +4637,7 @@ pub const LinuxServer = struct {
                         self.allocator.destroy(link);
                         slot.value.s2s_secured = null;
                     }
-                    if (slot.value.multiline) |ms| {
-                        self.allocator.destroy(ms);
-                        slot.value.multiline = null;
-                    }
+                    self.abortMultiline(&slot.value);
                     if (slot.value.tls) |t| {
                         t.deinit();
                         self.allocator.destroy(t);
@@ -4652,6 +4648,10 @@ pub const LinuxServer = struct {
                         slot.value.ws = null;
                     }
                     self.clearDeferredSessionMeshParts(&slot.value);
+                    if (slot.value.send_overflow.capacity > 0)
+                        slot.value.send_overflow.deinit(slot.value.overflow_allocator);
+                    if (slot.value.recv_overflow.capacity > 0)
+                        slot.value.recv_overflow.deinit(slot.value.overflow_allocator);
                     closeFd(slot.value.fd);
                 }
             }
@@ -4776,6 +4776,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| reactor.deinit();
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
+        self.inherited_mesh_redials.deinit(self.allocator);
         if (self.mesh_trusted_node_keys.len != 0) self.allocator.free(self.mesh_trusted_node_keys);
         if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
         if (self.mesh_admission_token.len != 0) self.allocator.free(self.mesh_admission_token);
@@ -5084,7 +5085,7 @@ pub const LinuxServer = struct {
         if (self.rx() == &self.reactors[0]) _ = self.access.pruneExpired();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
-        self.sweepMeshAutoConnect(false);
+        _ = self.sweepMeshAutoConnect(false, 1);
         // Publish the distinct-peer count for cross-shard LUSERS reads. Reactor 0
         // owns the peer links, so it is the only reactor that can compute this;
         // other shards read the published atomic. Converges within one tick of a
@@ -6032,20 +6033,20 @@ pub const LinuxServer = struct {
         // already bound its own shard before looping (so we never clobber it);
         // single-reactor callers and direct-test invocations bind shard 0 here.
         if (current_reactor == null) current_reactor = &self.reactors[0];
-        // Mesh auto-connect boot pass: once the loop is serving (listeners armed
-        // by this same iteration), reactor 0 dials every [mesh].connect peer.
-        // The reactor-0 check runs FIRST so only one thread ever reads or writes
-        // the latch; later link drops are re-dialed by the sweep timer.
-        if (self.rx() == &self.reactors[0] and !self.mesh_dials_booted) {
-            self.mesh_dials_booted = true;
-            for (self.mesh_dials) |dial| {
-                srvLog("orochi: mesh auto-connect -> {s}:{d}\n", .{ dial.host, dial.port });
-            }
-            self.sweepMeshAutoConnect(true);
-        }
+        // Control SQEs always win the turn. Helix activation and mesh connects
+        // are deliberately staged below them so a full inherited population can
+        // neither wedge accept/wake/timer nor drop quiet clients on SQ-full.
         try self.armAccept();
         self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
+        _ = try self.activatePendingSocketIo();
+        if (self.rx() == &self.reactors[0]) {
+            if (self.activateInheritedMeshRedials(1)) self.wakeReactor();
+            if (!self.mesh_dials_booted) {
+                self.mesh_dials_booted = self.sweepMeshAutoConnect(true, 1);
+                if (!self.mesh_dials_booted) self.wakeReactor();
+            }
+        }
         _ = try self.rx().ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
@@ -6302,8 +6303,28 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, out);
                 link.clearOutbound();
             }
-            try self.armSendIfNeeded(conn);
-            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            // Acquire RECV first. If the SQ has no room for the prekey SEND,
+            // retain the fully-built slot and let the fair activator queue only
+            // that missing op; never unwind a slot whose recv_buf the kernel owns.
+            self.armRecv(conn) catch |err| switch (err) {
+                error.SubmissionQueueFull => {
+                    conn.io_activation_pending = true;
+                    conn.activation_recv_required = true;
+                    self.wakeReactor();
+                    self.stats.onS2sAccept();
+                    self.traceLog(.info, .s2s, "s2s secured peer accepted (activation staged)");
+                    return;
+                },
+                else => return err,
+            };
+            self.armSendIfNeeded(conn) catch {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = true;
+                self.wakeReactor();
+                self.stats.onS2sAccept();
+                self.traceLog(.info, .s2s, "s2s secured peer accepted (send staged)");
+                return;
+            };
             self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s secured peer accepted");
             return;
@@ -6332,7 +6353,11 @@ pub const LinuxServer = struct {
             // Clear the dangling pointer before the slot is freed if submitRecv
             // fails, so deinit can never observe a freed link.
             errdefer conn.s2s = null;
-            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.armRecv(conn) catch {
+                self.stats.onS2sAccept();
+                self.traceLog(.info, .s2s, "s2s peer accepted (activation staged)");
+                return;
+            };
             self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
@@ -6347,7 +6372,10 @@ pub const LinuxServer = struct {
         if (self.shouldReadProxyHeader(conn)) {
             conn.accept_kind = kind;
             conn.proxy_pending = true;
-            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.armRecv(conn) catch {
+                self.traceLog(.info, .net, "trusted proxy accepted; receive activation staged");
+                return;
+            };
             self.traceLog(.info, .net, "trusted proxy accepted; waiting for PROXY header");
             return;
         }
@@ -6767,7 +6795,11 @@ pub const LinuxServer = struct {
         conn.tls = tls;
         conn.is_tls = true;
         self.injectSessionState(conn);
-        if (arm_recv) try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        if (arm_recv) self.armRecv(conn) catch {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = true;
+            self.wakeReactor();
+        };
         self.stats.onAccept();
         self.traceLog(.info, .net, "tls client accepted");
         return true;
@@ -6812,7 +6844,11 @@ pub const LinuxServer = struct {
             conn.tls = null;
         };
         self.injectSessionState(conn);
-        if (arm_recv) try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        if (arm_recv) self.armRecv(conn) catch {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = true;
+            self.wakeReactor();
+        };
         self.stats.onAccept();
         self.traceLog(.info, .net, "ws client accepted");
         return true;
@@ -6823,7 +6859,11 @@ pub const LinuxServer = struct {
             emitServerLine(conn, "ERROR :Server is draining; try again later");
             conn.close_reason = "Server draining";
             conn.closing = true;
-            self.armSendIfNeeded(conn) catch {};
+            self.armSendIfNeeded(conn) catch {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = false;
+                self.wakeReactor();
+            };
             self.stats.onAccept();
             return true;
         }
@@ -6834,7 +6874,11 @@ pub const LinuxServer = struct {
                     emitServerLine(conn, "ERROR :Connection refused (reputation)");
                     conn.close_reason = "Reputation";
                     conn.closing = true;
-                    self.armSendIfNeeded(conn) catch {};
+                    self.armSendIfNeeded(conn) catch {
+                        conn.io_activation_pending = true;
+                        conn.activation_recv_required = false;
+                        self.wakeReactor();
+                    };
                     self.stats.onAccept();
                     return true;
                 }
@@ -6850,7 +6894,11 @@ pub const LinuxServer = struct {
                     emitServerLine(conn, "ERROR :Too many connections from your host");
                     conn.close_reason = "Too many connections";
                     conn.closing = true;
-                    self.armSendIfNeeded(conn) catch {};
+                    self.armSendIfNeeded(conn) catch {
+                        conn.io_activation_pending = true;
+                        conn.activation_recv_required = false;
+                        self.wakeReactor();
+                    };
                     self.stats.onAccept();
                     return true;
                 },
@@ -6858,7 +6906,11 @@ pub const LinuxServer = struct {
             }
         }
         self.injectSessionState(conn);
-        if (arm_recv) try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        if (arm_recv) self.armRecv(conn) catch {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = true;
+            self.wakeReactor();
+        };
         self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
         return true;
@@ -7279,6 +7331,11 @@ pub const LinuxServer = struct {
     /// our side and start receiving; on failure tear the peer down.
     pub fn handleConnect(self: *LinuxServer, event: ringlane.ConnectEvent) !void {
         const conn = self.connForToken(event.token) catch return;
+        conn.connect_armed = false;
+        if (conn.closing) {
+            try self.closeConn(event.token, conn.close_reason);
+            return;
+        }
         if (event.res < 0) {
             try self.closeConn(event.token, "S2S connect failed");
             return;
@@ -7286,7 +7343,11 @@ pub const LinuxServer = struct {
         if (conn.s2s_secured) |_| {
             // Secured initiator: just listen — the responder sends its prekey
             // preamble first, which drives the handshake on recv.
-            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.armRecv(conn) catch {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = true;
+                self.wakeReactor();
+            };
             return;
         }
         const link = conn.s2s orelse return;
@@ -7303,8 +7364,19 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
-        try self.armSendIfNeeded(conn);
-        try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        // RECV first makes partial acquisition safe: a full SQ on the SEND leg
+        // leaves a live, owned slot that the bounded activator can finish.
+        self.armRecv(conn) catch {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = true;
+            self.wakeReactor();
+            return;
+        };
+        self.armSendIfNeeded(conn) catch {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = true;
+            self.wakeReactor();
+        };
     }
 
     fn driveClientBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !bool {
@@ -7536,6 +7608,16 @@ pub const LinuxServer = struct {
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
+        conn.recv_armed = false;
+
+        // A close requested by another completion/timer wins over any positive
+        // bytes that raced with shutdown. The CQE has released recv_buf; discard
+        // its payload and let the all-refs-clear finalizer decide whether the slot
+        // can now be recycled.
+        if (conn.closing) {
+            try self.closeConn(event.token, conn.close_reason);
+            return;
+        }
 
         // Check before kTLS control handling, liveness mutation, or IRC parsing.
         // A positive recv must never overwrite `closing` and execute commands
@@ -7552,7 +7634,7 @@ pub const LinuxServer = struct {
                 .survived => {
                     try self.armSendIfNeeded(conn);
                     if (!conn.closing) {
-                        try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+                        try self.armRecv(conn);
                     } else if (!conn.send_armed and conn.send_len == conn.send_offset) {
                         try self.closeConn(event.token, conn.close_reason);
                     }
@@ -7568,7 +7650,7 @@ pub const LinuxServer = struct {
             }
         }
 
-        conn.closing = event.res <= 0;
+        if (event.res <= 0) conn.closing = true;
         if (event.res > 0) {
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
             self.stats.onBytesIn(chunk.len);
@@ -7583,7 +7665,7 @@ pub const LinuxServer = struct {
             }
             try self.armSendIfNeeded(conn);
             if (!conn.closing) {
-                try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+                try self.armRecv(conn);
             }
         }
         if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
@@ -9202,11 +9284,134 @@ pub const LinuxServer = struct {
         _ = self.relayToPeers(msg, reforward);
     }
 
+    /// Acquire the connection's single RECV ownership reference. Every recv SQE
+    /// in this server passes through here so close/finalization has one exact
+    /// latch to consult.
+    fn armRecv(self: *LinuxServer, conn: *ConnState) !void {
+        if (conn.recv_armed or conn.closing) return;
+        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch |err| {
+            if (err == error.SubmissionQueueFull) {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = true;
+                self.wakeReactor();
+                return;
+            }
+            return err;
+        };
+        conn.recv_armed = true;
+    }
+
+    /// Acquire the connection's single CONNECT ownership reference. The address
+    /// lives inline in ConnState and therefore remains stable until the matching
+    /// exact-generation completion clears `connect_armed`.
+    fn armConnect(self: *LinuxServer, conn: *ConnState) !void {
+        if (conn.connect_armed or conn.closing) return;
+        try self.rx().ring.submitConnect(
+            conn.token,
+            conn.fd,
+            @ptrCast(&conn.s2s_connect_addr),
+            @sizeOf(posix.sockaddr.in6),
+        );
+        conn.connect_armed = true;
+    }
+
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
-        try self.rx().ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]);
+        // A staged activation that still owes RECV must acquire that ownership
+        // first. This keeps inherited secured-link replay/burst helpers inert
+        // even though they normally arm output as they append it.
+        if (!conn.closing and conn.io_activation_pending and conn.activation_recv_required and !conn.recv_armed) return;
+        self.rx().ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]) catch |err| {
+            if (err == error.SubmissionQueueFull) {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = conn.activation_recv_required or (!conn.recv_armed and !conn.closing);
+                self.wakeReactor();
+                return;
+            }
+            return err;
+        };
         conn.send_armed = true;
+    }
+
+    inline fn kernelOwnsConnStorage(conn: *const ConnState) bool {
+        return conn.recv_armed or conn.send_armed or conn.connect_armed;
+    }
+
+    fn hasPendingSocketActivation(self: *LinuxServer) bool {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (slot.occupied and slot.value.io_activation_pending) return true;
+        }
+        return false;
+    }
+
+    /// Fairly activate inert Helix-adopted sockets without starving the control
+    /// SQEs that make the loop progress. Partial activation is safe: each acquired
+    /// op has its ownership bit, and the slot remains pending until all required
+    /// ops are armed. A quiet remainder is nudged through the eventfd wake.
+    fn activatePendingSocketIo(self: *LinuxServer) !bool {
+        const slots = self.rx().clients.slots.items;
+        if (slots.len == 0) return false;
+
+        const budget = @max(@as(usize, 1), @min(@as(usize, 16), @as(usize, self.config.ring_entries) / 2));
+        var acquired: usize = 0;
+        var scanned: usize = 0;
+        var index = self.rx().activation_cursor % slots.len;
+        while (scanned < slots.len) : (scanned += 1) {
+            const slot = &slots[index];
+            if (slot.occupied and slot.value.io_activation_pending) {
+                const conn = &slot.value;
+                if (conn.closing and !conn.send_armed and conn.send_offset >= conn.send_len and
+                    !kernelOwnsConnStorage(conn))
+                {
+                    const token = conn.token;
+                    conn.io_activation_pending = false;
+                    conn.activation_recv_required = false;
+                    index = (index + 1) % slots.len;
+                    self.rx().activation_cursor = index;
+                    self.world.lockWrite();
+                    self.closeConn(token, conn.close_reason) catch {};
+                    self.world.unlockWrite();
+                    continue;
+                }
+                if (!conn.closing and conn.activation_recv_required and !conn.recv_armed) {
+                    try self.armRecv(conn);
+                    if (!conn.recv_armed) {
+                        self.rx().activation_cursor = index;
+                        self.wakeReactor();
+                        return true;
+                    }
+                    acquired += 1;
+                }
+                const recv_ready = conn.closing or !conn.activation_recv_required or conn.recv_armed;
+                if (recv_ready and
+                    conn.send_offset < conn.send_len and !conn.send_armed)
+                {
+                    try self.armSendIfNeeded(conn);
+                    if (!conn.send_armed) {
+                        self.rx().activation_cursor = index;
+                        self.wakeReactor();
+                        return true;
+                    }
+                    acquired += 1;
+                }
+                if (recv_ready and
+                    (conn.send_offset >= conn.send_len or conn.send_armed))
+                {
+                    conn.io_activation_pending = false;
+                    conn.activation_recv_required = false;
+                }
+            }
+
+            index = (index + 1) % slots.len;
+            self.rx().activation_cursor = index;
+            if (acquired >= budget) {
+                const more = self.hasPendingSocketActivation();
+                if (more) self.wakeReactor();
+                return more;
+            }
+        }
+        return self.hasPendingSocketActivation();
     }
 
     fn connForToken(self: *LinuxServer, token: RingFdToken) ServerError!*ConnState {
@@ -9268,6 +9473,22 @@ pub const LinuxServer = struct {
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
+            // Request-close and final teardown are deliberately separate. A CQE's
+            // generation check protects dispatch, but it cannot stop the kernel
+            // from touching inline slot storage. Retain the first reason, force a
+            // quiet recv/connect to complete, and recycle only after every exact
+            // ownership latch has been cleared by its matching handler.
+            if (kernelOwnsConnStorage(conn)) {
+                if (conn.closing)
+                    retainCloseReason(conn, conn.close_reason)
+                else
+                    retainCloseReason(conn, reason);
+                conn.closing = true;
+                conn.io_activation_pending = false;
+                conn.activation_recv_required = false;
+                _ = linux.shutdown(conn.fd, linux.SHUT.RDWR);
+                return;
+            }
             // This is the only fallible phase allowed to precede teardown for a
             // normal client. If a live exact-token sibling exists but staging
             // its World handoff hits allocation pressure, retain the slot and
@@ -10726,13 +10947,24 @@ pub const LinuxServer = struct {
         return self.nextMeshHlc();
     }
 
+    /// Admit a remote property fact into the process causal high-water mark
+    /// before mutating either the raw store or its LWW clock. This prevents a
+    /// peer from pinning property state at `maxInt` (or far-future wall time),
+    /// and guarantees the next locally-authored fact is strictly newer than
+    /// every accepted remote channel/entity property fact.
+    fn observeRemotePropertyHlc(self: *LinuxServer, remote_hlc: u64) bool {
+        lockSpin(&self.mesh_clock_lock);
+        defer self.mesh_clock_lock.unlock();
+        self.mesh_clock.observeChecked(
+            remote_hlc,
+            self.meshWallMs(),
+            mesh_clock_mod.default_max_future_skew_ms,
+        ) catch return false;
+        return true;
+    }
+
     fn writeChannelPropClockKey(out: []u8, channel: []const u8, key: []const u8) ?[]const u8 {
-        const need = channel.len + 1 + key.len;
-        if (out.len < need) return null;
-        for (channel, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
-        out[channel.len] = 0x1f;
-        for (key, 0..) |byte, i| out[channel.len + 1 + i] = std.ascii.toLower(byte);
-        return out[0..need];
+        return prop_checkpoint.writeChannelClockKey(out, channel, key);
     }
 
     fn channelPropClock(self: *LinuxServer, channel: []const u8, key: []const u8) ?*ChannelPropClock {
@@ -10887,13 +11119,7 @@ pub const LinuxServer = struct {
     // distinct from channel clocks which live in their own map).
 
     fn writeEntityPropClockKey(out: []u8, kind: entity_prop_event.EntityKind, entity: []const u8, key: []const u8) ?[]const u8 {
-        const need = 1 + entity.len + 1 + key.len;
-        if (out.len < need) return null;
-        out[0] = @intFromEnum(kind);
-        for (entity, 0..) |byte, i| out[1 + i] = std.ascii.toLower(byte);
-        out[1 + entity.len] = 0x1f;
-        for (key, 0..) |byte, i| out[1 + entity.len + 1 + i] = std.ascii.toLower(byte);
-        return out[0..need];
+        return prop_checkpoint.writeEntityClockKey(out, kind, entity, key);
     }
 
     fn entityPropClock(self: *LinuxServer, kind: entity_prop_event.EntityKind, entity: []const u8, key: []const u8) ?*EntityPropClock {
@@ -11185,10 +11411,10 @@ pub const LinuxServer = struct {
     /// gate runs BEFORE the LWW check, so the genuine home's later key (a different
     /// origin) is rejected at every hlc and anti-entropy re-delivery cannot displace
     /// it. Recovery is only a LOCAL write on that node (the victim SASL-logs-in
-    /// there — that bypasses this gate) or an operator clear, and the window
-    /// RE-ARMS on every USR2 (the `entity_prop_clocks` are not carried across the
-    /// upgrade, so they rebuild from bursts). This is the compromised-relink-source
-    /// class the blueprint defers (R2/R3); the fully-sound remote anchor
+    /// there — that bypasses this gate) or an operator clear. Helix now carries
+    /// the exact entity clocks, so USR2 does not re-arm the window; a genuinely
+    /// cold node still has the first-observation race. This is the compromised-
+    /// relink-source class the blueprint defers (R2/R3); the fully-sound remote anchor
     /// (SASL-home-authenticated identity replication) is the larger mesh-security
     /// design. Home and already-converged (warm) nodes are NOT exposed.
     fn accountIdentityPropAuthorized(
@@ -11240,9 +11466,20 @@ pub const LinuxServer = struct {
         if (self.entityPropClock(ch.kind, ch.entity, ch.key)) |existing| {
             if (ch.hlc <= existing.hlc) return false;
         }
-
         const entity = ircx_prop_store.Entity{ .kind = ch.kind.toStoreKind(), .id = ch.entity };
+        // A missing valid row is exactly what a tombstone describes, but an
+        // invalid entity/key must not become a durable clock-only poison row.
+        // Validate the lookup shape without mutating before observing its HLC.
+        _ = self.props.getPropRaw(entity, ch.key) catch |err| switch (err) {
+            error.PropMissing => {},
+            else => return false,
+        };
         const owner = if (ch.owner.len != 0) ch.owner else "remote";
+        if (ch.present) {
+            self.props.preflightSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch
+                return false;
+        }
+        if (!self.observeRemotePropertyHlc(ch.hlc)) return false;
         if (ch.present) {
             _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
         } else {
@@ -12571,9 +12808,19 @@ pub const LinuxServer = struct {
         if (self.channelPropClock(ch.channel, ch.key)) |entry| {
             if (ch.hlc <= entry.hlc) return false;
         }
-
         const entity = ircx_prop_store.Entity{ .kind = .channel, .id = ch.channel };
+        // Preserve a valid clock-only tombstone for a missing property, but
+        // reject malformed entity/key bytes before they touch the causal clock.
+        _ = self.props.getPropRaw(entity, ch.key) catch |err| switch (err) {
+            error.PropMissing => {},
+            else => return false,
+        };
         const owner = if (ch.owner.len != 0) ch.owner else "remote";
+        if (ch.present) {
+            self.props.preflightSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch
+                return false;
+        }
+        if (!self.observeRemotePropertyHlc(ch.hlc)) return false;
         if (ch.present) {
             _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
         } else {
@@ -12850,8 +13097,9 @@ pub const LinuxServer = struct {
     /// (`route_table.zig` same-node `.keep`). The bounded residual is a COLD node
     /// that relinks through a Byzantine burst source before converging with an
     /// honest peer: see `accountIdentityPropAuthorized` — that fail-open is STICKY
-    /// (not self-healing) and re-arms on USR2. It is the deferred R2/R3 class; the
-    /// fully-sound cold-node anchor is the larger mesh-security design.
+    /// (not self-healing) on a genuinely cold process. Exact entity clocks now
+    /// survive USR2, so a hot upgrade does not re-arm this window; the fully-sound
+    /// cold-node anchor is the larger mesh-security design.
     /// Owner: orochi-mesh / stack-architect.
     fn accountKeyAuthorityGateAvailable() bool {
         return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
@@ -19153,7 +19401,11 @@ pub const LinuxServer = struct {
             // A refusal, not a failure: the oper already got the NOTICE
             // explaining why; swallowing it here keeps the connection alive
             // (a propagated handler error would tear it down).
-            error.ShardQuiesceFailed, error.SessionReplicaConverging => {},
+            error.ShardQuiesceFailed,
+            error.SessionReplicaConverging,
+            error.PropertyStateConverging,
+            error.UpgradeTargetIncompatible,
+            => {},
             else => e,
         };
     }
@@ -19238,6 +19490,29 @@ pub const LinuxServer = struct {
         } else {
             srvLog("orochi: {s}\n", .{msg});
         }
+    }
+
+    /// Open the target image once, execute that exact open file through
+    /// `/proc/self/fd/<n>` in side-effect-free capability mode, and retain
+    /// the descriptor for the final `execveat`. This both refuses incompatible
+    /// rollbacks before any live fd becomes inheritable and prevents a deploy
+    /// rename between probe and exec from changing the selected image.
+    fn openCompatibleUpgradeTarget(
+        self: *LinuxServer,
+        binary_path: []const u8,
+    ) anyerror!linux.fd_t {
+        if (comptime builtin.os.tag != .linux) return error.Unsupported;
+        const zpath = try self.allocator.dupeSentinel(u8, binary_path, 0);
+        defer self.allocator.free(zpath);
+        const open_rc = linux.open(zpath.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (posix.errno(open_rc) != .SUCCESS) return error.UpgradeTargetOpenFailed;
+        const executable_fd: linux.fd_t = @intCast(open_rc);
+        errdefer closeFd(executable_fd);
+
+        const io = self.config.crypto_io orelse return error.UpgradeProbeUnavailable;
+        if (!try helix_live.probeUpgradeExecutableFd(self.allocator, io, executable_fd))
+            return error.UpgradeTargetIncompatible;
+        return executable_fd;
     }
 
     /// Core Helix UPGRADE: serialize every carried session into a sealed memfd
@@ -19453,6 +19728,56 @@ pub const LinuxServer = struct {
             .min_supported = 2,
         }) catch return null;
         return .{ .entries = pm.count(), .consumed = pm.consumedCount() };
+    }
+
+    /// Build the process HLC image that a successor must inherit after folding
+    /// in every retained PROP clock/tombstone. The predecessor is deliberately
+    /// left untouched: any later allocation, seal, or exec failure keeps its
+    /// causal state byte-exact. Future-skewed or exhausted retained clocks
+    /// refuse the hot upgrade rather than reappearing with an older writer.
+    fn preparePropertyUpgradeClockBoundary(self: *LinuxServer) ?mesh_clock_mod.MeshClock {
+        const maximum = prop_checkpoint.maxClockHlc(
+            &self.channel_prop_clocks,
+            &self.entity_prop_clocks,
+        ) catch return null;
+        lockSpin(&self.mesh_clock_lock);
+        defer self.mesh_clock_lock.unlock();
+        var candidate = self.mesh_clock;
+        candidate.observeChecked(
+            maximum,
+            self.meshWallMs(),
+            mesh_clock_mod.default_max_future_skew_ms,
+        ) catch return null;
+        return candidate;
+    }
+
+    /// Seal the raw property store and both clock/tombstone maps as one exact
+    /// v2-required mesh checkpoint. Even the completely empty image is emitted:
+    /// absence is reserved for a genuinely legacy predecessor.
+    fn sealPropertyUpgradeCheckpoint(
+        self: *LinuxServer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) bool {
+        const buf = prop_checkpoint.encode(
+            self.allocator,
+            &self.props,
+            &self.channel_prop_clocks,
+            &self.entity_prop_clocks,
+        ) catch return false;
+        blobs.append(self.allocator, buf) catch {
+            self.allocator.free(buf);
+            return false;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = buf,
+            // Losing this piece would restore the property rows without their
+            // LWW/tombstone authority (or vice versa). No v1 successor may
+            // accept that partial world; cold restart is the downgrade path.
+            .min_supported = 2,
+        }) catch return false;
+        return true;
     }
 
     /// Successor side of `sealPendingMigrations`: decode one carried
@@ -19836,6 +20161,21 @@ pub const LinuxServer = struct {
             self.upgradeNotice(requester, "UPGRADE is Linux-only");
             return;
         }
+        const exe_target = self.config.exe_path orelse "/proc/self/exe";
+        const executable_fd = self.openCompatibleUpgradeTarget(exe_target) catch |e| {
+            var eb: [160]u8 = undefined;
+            self.upgradeNotice(
+                requester,
+                std.fmt.bufPrint(
+                    &eb,
+                    "UPGRADE refused: target binary cannot accept the exact Helix handoff ({s})",
+                    .{@errorName(e)},
+                ) catch "UPGRADE refused: target binary is Helix-incompatible",
+            );
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: target binary failed exact Helix capability probe") catch {};
+            return error.UpgradeTargetIncompatible;
+        };
+        defer closeFd(executable_fd);
         var nbuf: [128]u8 = undefined;
         const requested_by = if (requester) |c| c.session.displayName() else "SIGUSR2";
         const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
@@ -19881,6 +20221,11 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .warn, "UPGRADE refused: session replica authority is still converging") catch {};
             return error.SessionReplicaConverging;
         }
+        const upgrade_mesh_clock = self.preparePropertyUpgradeClockBoundary() orelse {
+            self.upgradeNotice(requester, "UPGRADE refused: retained property clocks cannot advance safely; reject future-skewed state or cold-restart");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: property clock high-water mark is unsafe") catch {};
+            return error.PropertyStateConverging;
+        };
 
         // Serialize every registered session into encoded snapshot pieces.
         var blobs: std.ArrayList([]u8) = .empty;
@@ -19893,15 +20238,18 @@ pub const LinuxServer = struct {
         // Preserve the process-global HLC high-water mark before any state
         // capsules. A successor that reset it could reuse or regress event ids
         // immediately after execve, breaking deduplication and LWW ordering.
-        lockSpin(&self.mesh_clock_lock);
-        const mesh_clock_wire = mesh_clock_snapshot.encode(self.mesh_clock);
-        self.mesh_clock_lock.unlock();
+        const mesh_clock_wire = mesh_clock_snapshot.encode(upgrade_mesh_clock);
         // Reuse the generic v1 mesh-checkpoint capsule family. Its inner payload
         // is magic-discriminated (`MHLC` versus the existing `MRED` re-dial
         // hint), so an older rollback binary accepts the outer capsule and
         // harmlessly skips this unfamiliar payload instead of rejecting the
         // complete arena because of an unknown capsule kind.
         try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = &mesh_clock_wire });
+        if (!self.sealPropertyUpgradeCheckpoint(&pieces, &blobs)) {
+            self.upgradeNotice(requester, "UPGRADE refused: exact property and tombstone state could not be sealed completely");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete property-state checkpoint") catch {};
+            return error.PropertyStateConverging;
+        }
         // Carry the process-global TLS session-ticket key(s) so tickets issued
         // before the swap still open under the successor (which otherwise boots a
         // fresh random key, killing every outstanding ticket). Emitted once, ahead
@@ -19979,6 +20327,12 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete registered-client seal") catch {};
             return error.SessionReplicaConverging;
         }
+        if (carried_fd_count > helix_live.max_inherited_state_fds) {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            self.upgradeNotice(requester, "UPGRADE refused: carried state exceeds the authoritative fd-manifest limit");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: carried state fd manifest exceeds hard limit") catch {};
+            return error.SessionReplicaConverging;
+        }
 
         // Seal the state arena. On failure, fall back to a listener-only upgrade
         // so UPGRADE still works (just without state carry-over).
@@ -20039,8 +20393,14 @@ pub const LinuxServer = struct {
         // Exec the on-disk launch path (the swapped-in new binary) when known,
         // not /proc/self/exe (which re-runs the current, old image). Carry the
         // config path so the successor boots with the real config.
-        const exe_target = self.config.exe_path orelse "/proc/self/exe";
-        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, listener_fds, self.config.config_path) catch |e| {
+        var plan = helix_live.buildArenaListenerExecPlan(
+            self.allocator,
+            exe_target,
+            arena.fd,
+            listener_fds,
+            carried_fds[0..carried_fd_count],
+            self.config.config_path,
+        ) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             restoreCloexec(listener_fds);
             _ = setCloexec(arena.fd, true);
@@ -20049,7 +20409,7 @@ pub const LinuxServer = struct {
             return;
         };
         defer plan.deinit(self.allocator);
-        plan.commit(self.allocator) catch |e| {
+        plan.commitExecutableFd(self.allocator, executable_fd) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             restoreCloexec(listener_fds);
             _ = setCloexec(arena.fd, true);
@@ -20063,31 +20423,188 @@ pub const LinuxServer = struct {
     /// every carried-over client connection (inherited socket fd + restored
     /// session, plus its live TLS engine when one was carried) into the client
     /// table + io_uring recv, then immediately re-dial any carried mesh peers.
-    /// Called once after boot. Best-effort: a client that can't be re-attached
-    /// is dropped, not fatal — the successor must never crash on bad state.
-    fn abandonInheritedSessionState(self: *LinuxServer, caps: anytype, arena_fd: linux.fd_t, reason: []const u8) void {
-        for (caps) |c| switch (c.header.kind) {
-            .clients => if (c.fields.len != 0) {
-                if (session_snapshot.peekFd(c.fields[0].bytes)) |fd| if (fd >= 0) closeFd(fd);
-            },
-            .s2s_link => if (c.fields.len != 0) {
-                if (s2s_snapshot.peekFd(c.fields[0].bytes)) |fd| if (fd >= 0) closeFd(fd);
-            },
-            else => {},
+    /// Called once after boot. Individual decodable capsules remain best-effort,
+    /// but ambiguity in the authoritative inherited-fd ownership contract is
+    /// startup-fatal: guessing could leave a live socket unserved.
+    fn clearInheritedStateFdManifest(self: *LinuxServer) void {
+        self.config.inherited_state_fds = &.{};
+        self.config.inherited_state_fd_manifest_present = false;
+        self.config.inherited_state_fd_manifest_valid = false;
+    }
+
+    const InheritedStateFdClaims = struct {
+        fds: []const linux.fd_t,
+        claimed: []bool,
+
+        /// Claim one ownership-bearing client/S2S capsule fd exactly once.
+        /// TLS/WS and per-client sidecars only reference a socket and therefore
+        /// never call this method.
+        fn claim(self: *InheritedStateFdClaims, fd: linux.fd_t) bool {
+            for (self.fds, 0..) |candidate, index| {
+                if (candidate != fd) continue;
+                if (self.claimed[index]) return false;
+                self.claimed[index] = true;
+                return true;
+            }
+            return false;
+        }
+
+        fn allClaimed(self: *const InheritedStateFdClaims) bool {
+            for (self.claimed) |claimed| if (!claimed) return false;
+            return true;
+        }
+    };
+
+    /// Trust the version-independent manifest only when it is a bounded set of
+    /// state sockets disjoint from the arena and every inherited/live listener.
+    /// A malformed environment must never trick cleanup into closing the port.
+    fn inheritedStateFdIsConnectedStreamSocket(fd: linux.fd_t) bool {
+        if (fd < 0 or linux.errno(linux.fcntl(fd, posix.F.GETFD, 0)) != .SUCCESS)
+            return false;
+
+        var socket_type: u32 = 0;
+        var socket_type_len: posix.socklen_t = @sizeOf(@TypeOf(socket_type));
+        const type_rc = linux.getsockopt(
+            fd,
+            posix.SOL.SOCKET,
+            posix.SO.TYPE,
+            @ptrCast(&socket_type),
+            &socket_type_len,
+        );
+        if (linux.errno(type_rc) != .SUCCESS or
+            socket_type_len != @sizeOf(@TypeOf(socket_type)) or
+            socket_type != posix.SOCK.STREAM)
+            return false;
+
+        // A listener or merely-created stream socket has the right SO_TYPE but
+        // no peer. Only an accepted/connected endpoint is valid carried state.
+        var peer: posix.sockaddr.storage = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        return linux.errno(linux.getpeername(fd, @ptrCast(&peer), &peer_len)) == .SUCCESS;
+    }
+
+    fn inheritedStateFdManifestTrusted(self: *LinuxServer, arena_fd: linux.fd_t) bool {
+        if (!self.config.inherited_state_fd_manifest_present or
+            !self.config.inherited_state_fd_manifest_valid or
+            self.config.inherited_state_fds.len == 0 or
+            self.config.inherited_state_fds.len > helix_live.max_inherited_state_fds)
+            return false;
+
+        // The arena is itself inherited and untrusted. Reject an alias to any
+        // service listener before readArena's failure cleanup can close the port.
+        if (arena_fd >= 0) {
+            if (self.config.inherited_listener_fd) |listener_fd| {
+                if (arena_fd == listener_fd) return false;
+            }
+            for (self.config.inherited_listener_fds) |listener_fd| {
+                if (arena_fd == listener_fd) return false;
+            }
+            for (self.reactors) |*r| {
+                if (arena_fd == r.listener_fd or
+                    (r.s2s_listener_fd >= 0 and arena_fd == r.s2s_listener_fd) or
+                    (r.tls_listener_fd >= 0 and arena_fd == r.tls_listener_fd) or
+                    (r.ws_listener_fd >= 0 and arena_fd == r.ws_listener_fd))
+                    return false;
+            }
+        }
+
+        for (self.config.inherited_state_fds, 0..) |fd, i| {
+            if (fd == arena_fd or !inheritedStateFdIsConnectedStreamSocket(fd)) return false;
+            if (self.config.inherited_listener_fd) |listener_fd| {
+                if (fd == listener_fd) return false;
+            }
+            for (self.config.inherited_listener_fds) |listener_fd| {
+                if (fd == listener_fd) return false;
+            }
+            for (self.reactors) |*r| {
+                if (fd == r.listener_fd or
+                    (r.s2s_listener_fd >= 0 and fd == r.s2s_listener_fd) or
+                    (r.tls_listener_fd >= 0 and fd == r.tls_listener_fd) or
+                    (r.ws_listener_fd >= 0 and fd == r.ws_listener_fd))
+                    return false;
+            }
+            for (self.config.inherited_state_fds[0..i]) |prior| {
+                if (fd == prior) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Close the exact authoritative state-fd set when it is trustworthy, then
+    /// clear the borrowed config slice before any caller can attempt cleanup a
+    /// second time. Returns false for legacy/malformed manifests.
+    fn closeInheritedStateFdManifest(self: *LinuxServer, arena_fd: linux.fd_t) bool {
+        if (!self.inheritedStateFdManifestTrusted(arena_fd)) {
+            self.clearInheritedStateFdManifest();
+            return false;
+        }
+        const state_fds = self.config.inherited_state_fds;
+        self.clearInheritedStateFdManifest();
+        for (state_fds) |fd| closeFd(fd);
+        return true;
+    }
+
+    fn inheritedOwningCapsuleFd(c: helix_capsule.Capsule) ?linux.fd_t {
+        if (c.fields.len == 0) return null;
+        return switch (c.header.kind) {
+            .clients => session_snapshot.peekFd(c.fields[0].bytes),
+            .s2s_link => s2s_snapshot.peekFd(c.fields[0].bytes),
+            else => null,
         };
+    }
+
+    fn inheritedOwningFdSeenBefore(caps: []const helix_capsule.Capsule, index: usize, fd: linux.fd_t) bool {
+        for (caps[0..index]) |prior| {
+            if (inheritedOwningCapsuleFd(prior)) |prior_fd| {
+                if (prior_fd == fd) return true;
+            }
+        }
+        return false;
+    }
+
+    fn abandonInheritedSessionState(self: *LinuxServer, caps: anytype, arena_fd: linux.fd_t, reason: []const u8) void {
+        // New predecessors provide a version-independent exact fd set, so even
+        // an unfamiliar capsule schema cannot strand sockets. Legacy or invalid
+        // manifests fall back to the structurally decoded fixed fd prefixes.
+        if (!self.closeInheritedStateFdManifest(arena_fd)) {
+            for (caps, 0..) |c, index| {
+                const fd = inheritedOwningCapsuleFd(c) orelse continue;
+                if (fd >= 0 and !inheritedOwningFdSeenBefore(caps, index, fd)) closeFd(fd);
+            }
+        }
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog("orochi: UPGRADE resume refused inherited state: {s}\n", .{reason});
     }
 
-    pub fn adoptInheritedSessions(self: *LinuxServer) void {
+    pub fn adoptInheritedSessions(self: *LinuxServer) error{InvalidInheritedHandoff}!void {
         if (comptime builtin.os.tag != .linux) return;
-        const arena_fd = self.config.resume_arena_fd orelse return;
+        const arena_fd = self.config.resume_arena_fd orelse {
+            // A state-fd manifest without its arena is an incomplete handoff.
+            // Close a trustworthy exact set. A malformed/colliding list is
+            // startup-fatal because guessing at numeric fds is unsafe.
+            if (self.config.inherited_state_fd_manifest_present) {
+                if (!self.inheritedStateFdManifestTrusted(-1))
+                    return error.InvalidInheritedHandoff;
+                _ = self.closeInheritedStateFdManifest(-1);
+            }
+            return;
+        };
+        // A present malformed/colliding manifest is a startup-fatal handoff,
+        // not legacy absence. Do not guess which numeric descriptors are safe
+        // to close: returning the error makes main unwind/exit and lets the
+        // kernel close the inherited table atomically before a cold restart.
+        if (self.config.inherited_state_fd_manifest_present and
+            !self.inheritedStateFdManifestTrusted(arena_fd))
+            return error.InvalidInheritedHandoff;
         // Boot-time only (before the reactor loop): bind this thread to reactor
         // 0, the reactor that owns the inherited listener and every connection
         // adopted below.
         current_reactor = &self.reactors[0];
         const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
+            _ = self.closeInheritedStateFdManifest(arena_fd);
+            closeFd(arena_fd);
+            self.config.resume_arena_fd = null;
             srvLog("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return;
         };
@@ -20096,58 +20613,140 @@ pub const LinuxServer = struct {
             self.allocator.free(caps);
         }
 
-        // Restore the mesh event clock before adopting clients or links. A
-        // missing/malformed singleton is tolerated for rolling upgrades, but a
-        // valid one is authoritative for this process's next outbound stamp.
+        // Before publishing ANY restored state, bind every ownership-bearing
+        // client/S2S capsule to the exact version-independent descriptor set.
+        // This rejects an unauthorized or duplicate fd before it can be adopted
+        // twice, while leaving sidecar TLS/WS/session capsules free to reference
+        // the same socket as their one owning capsule.
+        var state_fd_claim_bits: ?[]bool = null;
+        defer if (state_fd_claim_bits) |bits| self.allocator.free(bits);
+        var state_fd_claims: ?InheritedStateFdClaims = null;
+        if (self.config.inherited_state_fd_manifest_present) {
+            const bits = self.allocator.alloc(bool, self.config.inherited_state_fds.len) catch {
+                return error.InvalidInheritedHandoff;
+            };
+            @memset(bits, false);
+            state_fd_claim_bits = bits;
+            state_fd_claims = .{ .fds = self.config.inherited_state_fds, .claimed = bits };
+            for (caps) |c| {
+                if (c.header.kind != .clients and c.header.kind != .s2s_link) continue;
+                if (c.fields.len != 1 or c.fields[0].ordinal != 1)
+                    return error.InvalidInheritedHandoff;
+                const maybe_fd = switch (c.header.kind) {
+                    .clients => session_snapshot.peekFd(c.fields[0].bytes),
+                    .s2s_link => s2s_snapshot.peekFd(c.fields[0].bytes),
+                    else => unreachable,
+                };
+                const fd = maybe_fd orelse return error.InvalidInheritedHandoff;
+                if (fd < 0 or !state_fd_claims.?.claim(fd)) return error.InvalidInheritedHandoff;
+            }
+            if (!state_fd_claims.?.allClaimed()) return error.InvalidInheritedHandoff;
+        } else {
+            // Pre-manifest predecessors are still accepted, but their owner
+            // capsules must not alias one descriptor. Otherwise two ConnState
+            // slots (and two io_uring operations) would own the same socket; a
+            // later rejection could also close the numeric fd twice. Validate
+            // before publishing any restored state, without allocating.
+            for (caps, 0..) |c, index| {
+                const fd = inheritedOwningCapsuleFd(c) orelse continue;
+                if (fd < 0) continue;
+                if (inheritedOwningFdSeenBefore(caps, index, fd)) {
+                    self.abandonInheritedSessionState(caps, arena_fd, "duplicate legacy inherited socket ownership");
+                    return;
+                }
+            }
+        }
+
+        // Stage the mesh clock alongside every exact singleton below. Nothing is
+        // published until PROP, SESSION_REPLICA, and PMST have all decoded and
+        // validated successfully; a late corrupt singleton must leave the whole
+        // successor image untouched.
+        lockSpin(&self.mesh_clock_lock);
+        var staged_mesh_clock = self.mesh_clock;
+        self.mesh_clock_lock.unlock();
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
             if (c.fields.len == 0) continue;
             const restored = mesh_clock_snapshot.decode(c.fields[0].bytes) catch continue;
-            lockSpin(&self.mesh_clock_lock);
-            if (restored.last_stamp > self.mesh_clock.last_stamp) self.mesh_clock = restored;
-            self.mesh_clock_lock.unlock();
+            if (restored.last_stamp > staged_mesh_clock.last_stamp) staged_mesh_clock = restored;
             break;
         }
 
-        // Restore signed exact-token authority before clients or mesh links.
-        // This includes REVOKE replay protection and both conflict-quarantine
-        // witnesses, so no inherited/replayed sidecar can exploit an empty Store
-        // window after execve.
+        // Restore raw PROP rows and both LWW/tombstone maps as one mandatory-v2
+        // image before any replica/client/link can observe the successor. The
+        // outer min=2 marker is authoritative even when inner magic is corrupt;
+        // conversely, recognizable property bytes under min=1 are a downgrade
+        // attempt. Either mismatch abandons the complete inherited fd set.
+        var property_checkpoint_bytes: ?[]const u8 = null;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            const required = c.header.min_supported >= 2;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (prop_checkpoint.isUpgradeCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!required and !recognized) continue;
+            if (!required or !recognized or
+                c.header.version != 2 or c.header.min_supported != 2 or c.header.max_supported != 2 or
+                c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                !prop_checkpoint.isUpgradeCheckpoint(c.fields[0].bytes) or
+                property_checkpoint_bytes != null)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, downgraded, unknown, or duplicate property-state checkpoint");
+                return;
+            }
+            property_checkpoint_bytes = c.fields[0].bytes;
+        }
+        // Select the signed exact-token authority singleton without publishing it.
+        // Recognizable Store bytes in any non-canonical field are a malformed
+        // wrapper, not an ignorable ordinary mesh checkpoint.
         const replica_now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         var replica_checkpoint: ?[]const u8 = null;
         for (caps) |c| {
-            if (c.header.kind != .mesh_checkpoint or c.fields.len == 0) continue;
-            if (!session_replica_v2.Store.isUpgradeCheckpoint(c.fields[0].bytes)) continue;
-            if (replica_checkpoint != null) {
-                self.abandonInheritedSessionState(caps, arena_fd, "duplicate SESSION_REPLICA Store checkpoint");
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (session_replica_v2.Store.isUpgradeCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            // SRST's inner wire did not change when the generic mesh-checkpoint
+            // family advanced from v1 to v2.  The immediately previous Orochi
+            // release therefore emits this exact payload under the canonical
+            // v1/1..1 outer header, while current predecessors emit v2/1..2.
+            // Accept those two complete generations only; accepting a hybrid
+            // range would make a malformed arena look like a rolling upgrade.
+            const canonical_outer =
+                (c.header.version == 1 and c.header.min_supported == 1 and c.header.max_supported == 1) or
+                (c.header.version == 2 and c.header.min_supported == 1 and c.header.max_supported == 2);
+            if (!canonical_outer or
+                c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                !session_replica_v2.Store.isUpgradeCheckpoint(c.fields[0].bytes) or
+                replica_checkpoint != null)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate SESSION_REPLICA Store checkpoint");
                 return;
             }
             replica_checkpoint = c.fields[0].bytes;
         }
-        if (replica_checkpoint) |checkpoint| {
-            self.session_replica_store.replaceFromUpgradeCheckpoint(checkpoint, replica_now_wall) catch {
-                self.abandonInheritedSessionState(caps, arena_fd, "invalid SESSION_REPLICA Store checkpoint");
-                return;
-            };
-            if (self.session_replica_store.maxAuthorityRevision()) |revision|
-                self.observeSessionReplicaRevision(revision);
-            self.session_replica_store_generation +%= 1;
-        }
-        const replica_objects_restored = self.session_replica_store.entryCount() +
-            self.session_replica_store.attachmentLeaseCount() +
-            self.session_replica_store.tombstoneCount() + self.session_replica_store.quarantineCount();
 
-        // Restore the complete pending-migration holding area before clients can
-        // reclaim anything. Helix schema v2 is exactly one PMST checkpoint;
-        // mixing it with legacy v1 per-entry/tombstone capsules is ambiguous and
-        // therefore refuses inherited state instead of exposing a torn replay set.
+        // Select the complete pending-migration holding area without publishing
+        // it. Helix schema v2 is exactly one min=2/max=2 PMST checkpoint; mixing
+        // it with legacy per-entry/tombstone capsules is ambiguous.
         var pending_checkpoint: ?[]const u8 = null;
         var has_legacy_pending = false;
         var has_legacy_consumed = false;
         for (caps) |c| switch (c.header.kind) {
             .pending_migration => {
                 if (c.header.version == 2) {
-                    if (c.fields.len != 1 or c.fields[0].ordinal != 1 or pending_checkpoint != null) {
+                    if (c.header.min_supported != 2 or c.header.max_supported != 2 or
+                        c.fields.len != 1 or c.fields[0].ordinal != 1 or pending_checkpoint != null)
+                    {
                         self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate pending-migration checkpoint");
                         return;
                     }
@@ -20166,16 +20765,64 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, "mixed exact and legacy pending-migration state");
             return;
         }
-        var migrations_staged: usize = 0;
-        var tombstones_staged: usize = 0;
+
+        // Decode every exact singleton into an independently-owned replacement.
+        // Each defer destroys either an unpublished candidate on failure or the
+        // displaced old live image after the no-fail commit below.
+        var property_replacement: ?prop_checkpoint.Restored = null;
+        defer if (property_replacement) |*replacement| replacement.deinit();
+        if (property_checkpoint_bytes) |checkpoint| {
+            property_replacement = prop_checkpoint.decode(self.allocator, checkpoint) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid property-state checkpoint");
+                return;
+            };
+            staged_mesh_clock.observeChecked(
+                property_replacement.?.max_hlc,
+                self.meshWallMs(),
+                mesh_clock_mod.default_max_future_skew_ms,
+            ) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "property-state HLC is future-skewed or exhausted");
+                return;
+            };
+        }
+
+        var replica_replacement: ?session_replica_v2.Store = null;
+        defer if (replica_replacement) |*replacement| replacement.deinit();
+        if (replica_checkpoint) |checkpoint| {
+            replica_replacement = session_replica_v2.Store.restoreUpgradeCheckpoint(
+                self.allocator,
+                self.session_replica_store.cfg,
+                checkpoint,
+                replica_now_wall,
+            ) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid SESSION_REPLICA Store checkpoint");
+                return;
+            };
+            if (replica_replacement.?.maxAuthorityRevision()) |revision| {
+                staged_mesh_clock.observeChecked(
+                    revision.sequence,
+                    self.meshWallMs(),
+                    session_replica_v2.default_max_future_skew_ms,
+                ) catch {
+                    self.abandonInheritedSessionState(caps, arena_fd, "SESSION_REPLICA Store clock is future-skewed or exhausted");
+                    return;
+                };
+            }
+        }
+
+        var pending_replacement: ?session_migrate.PendingMigrations = null;
+        defer if (pending_replacement) |*replacement| replacement.deinit();
         if (pending_checkpoint) |checkpoint| {
-            if (self.pending_migrations == null) {
-                self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
+            const pending_cfg: session_migrate.PendingMigrations.Config = if (self.pending_migrations) |pending|
+                pending.cfg
+            else
+                .{
                     .max_entries = self.config.session_max_pending_migrations,
                     .max_per_account = self.config.session_max_per_account,
-                });
-            }
-            self.pending_migrations.?.replaceFromUpgradeCheckpoint(
+                };
+            pending_replacement = session_migrate.PendingMigrations.restoreUpgradeCheckpoint(
+                self.allocator,
+                pending_cfg,
                 checkpoint,
                 @max(@as(i64, 0), self.nowMs()),
                 mesh_reclaim_ttl_ms,
@@ -20183,6 +20830,44 @@ pub const LinuxServer = struct {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid pending-migration checkpoint");
                 return;
             };
+        }
+
+        // Boot-exclusive atomic publication boundary. Every operation here is a
+        // no-fail swap/assignment, and the reactor loop has not started, so no
+        // client or mesh peer can observe an intermediate combination.
+        lockSpin(&self.mesh_clock_lock);
+        if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
+            self.mesh_clock = staged_mesh_clock;
+        self.mesh_clock_lock.unlock();
+
+        var property_entities_restored: usize = 0;
+        var property_clocks_restored: usize = 0;
+        if (property_replacement) |*replacement| {
+            replacement.swapInto(
+                &self.props,
+                &self.channel_prop_clocks,
+                &self.entity_prop_clocks,
+            );
+            property_entities_restored = self.props.entity_count;
+            property_clocks_restored = self.channel_prop_clocks.count() + self.entity_prop_clocks.count();
+        }
+
+        const replica_checkpoint_restored = replica_replacement != null;
+        if (replica_replacement) |*replacement|
+            std.mem.swap(session_replica_v2.Store, &self.session_replica_store, replacement);
+        if (pending_replacement != null)
+            std.mem.swap(?session_migrate.PendingMigrations, &self.pending_migrations, &pending_replacement);
+
+        if (replica_checkpoint_restored) {
+            self.session_replica_store_generation +%= 1;
+        }
+        const replica_objects_restored = self.session_replica_store.entryCount() +
+            self.session_replica_store.attachmentLeaseCount() +
+            self.session_replica_store.tombstoneCount() + self.session_replica_store.quarantineCount();
+
+        var migrations_staged: usize = 0;
+        var tombstones_staged: usize = 0;
+        if (pending_checkpoint != null) {
             migrations_staged = self.pending_migrations.?.count();
             tombstones_staged = self.pending_migrations.?.consumedCount();
             _ = self.prunePendingReplicasWithoutStoreAuthority(replica_now_wall);
@@ -20365,10 +21050,10 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Pass 3: re-dial carried mesh peers NOW (not on the sweep timer), so a
-        // hand-opened S2S link is re-established within one connect+handshake
-        // round-trip of the swap. Config-managed [mesh].connect peers are not in
-        // the arena — the mesh boot pass dials those in the first loop iteration.
+        // Pass 3: decode carried hand-dial hints now, but leave their CONNECT
+        // SQEs staged. The first reactor turn must reserve SQ space for
+        // accept/wake/timer and inherited client activation before any redial.
+        // Config-managed [mesh].connect peers are likewise staged by runOnce.
         var redialed: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
@@ -20380,8 +21065,8 @@ pub const LinuxServer = struct {
                 .addr = peer.addr,
                 .scope_id = 0,
             };
-            _ = self.initiateS2sConnectToAddr(addr) catch |e| {
-                srvLog("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(e)});
+            self.inherited_mesh_redials.append(self.allocator, addr) catch |e| {
+                srvLog("orochi: UPGRADE resume — could not stage mesh re-dial ({s})\n", .{@errorName(e)});
                 continue;
             };
             redialed += 1;
@@ -20413,9 +21098,12 @@ pub const LinuxServer = struct {
         // The arena is fully consumed; close the inherited memfd.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
+        // Every carried descriptor is now either reactor-owned or was closed by
+        // an individual failed adoption. Drop the manifest without closing it.
+        self.clearInheritedStateFdManifest();
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, replica_objects_restored, migrations_staged, tombstones_staged, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — restored {d} property entity(s)/{d} clock(s), re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ property_entities_restored, property_clocks_restored, adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, replica_objects_restored, migrations_staged, tombstones_staged, s2s_resumed, redialed },
         );
     }
 
@@ -20576,6 +21264,25 @@ pub const LinuxServer = struct {
         closeFd(fd);
     }
 
+    /// Tear down a carried secured link only while it is still inert. Callers
+    /// must never use this after either a RECV or SEND SQE has been registered:
+    /// both operations borrow storage inside the slab slot until completion.
+    fn rollbackInheritedS2sBeforeIo(self: *LinuxServer, id: client_model.ClientId, fd: linux.fd_t) void {
+        const conn = self.rx().clients.get(id) orelse {
+            closeFd(fd);
+            return;
+        };
+        if (conn.s2s_secured) |link| {
+            link.deinit();
+            self.allocator.destroy(link);
+            conn.s2s_secured = null;
+        }
+        conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+        conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        _ = self.rx().clients.free(id);
+        closeFd(fd);
+    }
+
     fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot) bool {
         // Per-SHARD cap (rx() is the fd-derived target shard): matches the
         // accept path, whose cap is also per-shard — each reactor's table is
@@ -20605,10 +21312,6 @@ pub const LinuxServer = struct {
         conn.connected_at_ms = if (snap.connected_at_ms != 0) snap.connected_at_ms else now;
         conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
         conn.last_activity_ms = now;
-        // A carried-over session is, by definition, live across the USR2. Stamp a
-        // FRESH mesh-claim HLC so that on relink it out-ranks any stale same-account
-        // ghost a peer may still hold, and is never itself mistaken for the ghost.
-        conn.mesh_nick_hlc = self.nextMeshHlc();
         conn.session.restore(snap);
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
@@ -20617,8 +21320,7 @@ pub const LinuxServer = struct {
         // a TLS connection must never be adopted as plaintext.
         if (tls_state) |ts| {
             if (!self.adoptTlsState(conn, ts)) {
-                _ = self.rx().clients.free(id);
-                closeFd(snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
                 return false;
             }
         }
@@ -20652,14 +21354,7 @@ pub const LinuxServer = struct {
                     break :blk true;
                 };
                 if (!ws_ok) {
-                    if (conn.tls) |t| {
-                        t.deinit();
-                        self.allocator.destroy(t);
-                        conn.tls = null;
-                        conn.is_tls = false;
-                    }
-                    _ = self.rx().clients.free(id);
-                    closeFd(snap.fd);
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd);
                     return false;
                 }
             }
@@ -20675,18 +21370,7 @@ pub const LinuxServer = struct {
                 conn.line_len = snap.pending_in.len;
             } else {
                 conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch {
-                    if (conn.tls) |t| {
-                        t.deinit();
-                        self.allocator.destroy(t);
-                        conn.tls = null;
-                        conn.is_tls = false;
-                    }
-                    if (conn.ws) |w| {
-                        self.allocator.destroy(w);
-                        conn.ws = null;
-                    }
-                    _ = self.rx().clients.free(id);
-                    closeFd(snap.fd);
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd);
                     return false;
                 };
             }
@@ -20698,17 +21382,9 @@ pub const LinuxServer = struct {
         if (snap.pending_out.len != 0 and tls_state == null) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
             rawAppendToConn(conn, snap.pending_out) catch {
-                conn.recv_overflow.clearAndFree(conn.overflow_allocator);
-                conn.send_overflow.clearAndFree(conn.overflow_allocator);
-                if (conn.ws) |w| {
-                    self.allocator.destroy(w);
-                    conn.ws = null;
-                }
-                _ = self.rx().clients.free(id);
-                closeFd(snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
                 return false;
             };
-            self.armSendIfNeeded(conn) catch {};
         }
         // Re-track before the socket becomes live in io_uring. A carried
         // account session without its exact SessionStore row is not a usable
@@ -20729,19 +21405,7 @@ pub const LinuxServer = struct {
                 token,
                 conn.connected_at_ms,
             ) catch {
-                conn.recv_overflow.clearAndFree(conn.overflow_allocator);
-                conn.send_overflow.clearAndFree(conn.overflow_allocator);
-                if (conn.tls) |t| {
-                    t.deinit();
-                    self.allocator.destroy(t);
-                    conn.tls = null;
-                }
-                if (conn.ws) |w| {
-                    self.allocator.destroy(w);
-                    conn.ws = null;
-                }
-                _ = self.rx().clients.free(id);
-                closeFd(snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
                 return false;
             };
             self.finalizeAttachEviction(outcome);
@@ -20776,10 +21440,14 @@ pub const LinuxServer = struct {
                 return false;
             };
         }
-        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
-            self.rollbackInheritedClientBeforeRecv(id, snap.fd);
-            return false;
-        };
+        // Nothing below this point can reject the adoption. Stamp the fresh
+        // mesh claim only after every allocation/world/session mutation, so a
+        // rolled-back client cannot leave a phantom causal advance behind.
+        conn.mesh_nick_hlc = self.nextMeshHlc();
+        // Carried outbound bytes remain inert too. runOnce fairly arms RECV and
+        // any required SEND after control SQEs, retaining this slot on SQ-full.
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = true;
         // Restore exec hygiene: the fd survived ONE execve on purpose; re-arm
         // CLOEXEC so it never leaks into any other child. The next UPGRADE
         // clears it again for exactly the connections it carries.
@@ -20842,7 +21510,6 @@ pub const LinuxServer = struct {
                 conn.is_tls = false;
                 return false;
             };
-            self.armSendIfNeeded(conn) catch {};
         }
         return true;
     }
@@ -20982,73 +21649,53 @@ pub const LinuxServer = struct {
         if (snap.pending_out.len != 0) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
             appendToConn(conn, snap.pending_out) catch {
-                link.deinit();
-                self.allocator.destroy(link);
-                conn.s2s_secured = null;
-                conn.send_overflow.deinit(self.allocator); // freed slot won't; may have grown
-                _ = self.rx().clients.free(id);
-                closeFd(snap.fd);
+                self.rollbackInheritedS2sBeforeIo(id, snap.fd);
                 return false;
             };
         }
-        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
-            link.deinit();
-            self.allocator.destroy(link);
-            conn.s2s_secured = null;
-            conn.send_overflow.deinit(self.allocator); // a large pending_out may have spilled here
-            _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
-            return false;
-        };
-        // The fd survived ONE execve on purpose; re-arm CLOEXEC so it never leaks.
-        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
 
         // Reconverge over the preserved encrypted stream: ask the peer to re-burst
         // its full state (RESYNC) and re-burst ours. The record counters continue
         // from the capsule, so the peer accepts these seamlessly — no netsplit.
+        // Stage the mandatory record without arming SEND. Until submitRecv below,
+        // every failure can still destroy the slab slot safely; afterward no path
+        // rejects adoption or frees storage borrowed by io_uring.
         link.sendResync() catch {
-            link.deinit();
-            self.allocator.destroy(link);
-            conn.s2s_secured = null;
-            if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
-            _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd);
             return false;
         };
-        self.flushS2sOutbound(conn, link.outbound()) catch {
-            link.deinit();
-            self.allocator.destroy(link);
-            conn.s2s_secured = null;
-            if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
-            _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
+        appendToConn(conn, link.outbound()) catch {
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd);
             return false;
         };
         link.clearOutbound();
-        // Replay the complete retained Store before the token-less roster burst.
-        // This can span maintenance turns under SendQ pressure; the pending
-        // RESYNC burst is released by the same gate as a fresh establishment.
-        conn.session_replica_resync_burst_pending = true;
-        // Refresh live/detached local snapshots before fixing the replay
-        // generation/cursor. Legacy capsules may be queued here, but no
-        // token-less roster frame is allowed through the gate.
+
+        // Legacy session-migration sidecars are part of adoption preparation too.
+        // Stage them while the slot is still inert so SendQ exhaustion can roll
+        // back without leaving a closing link behind an already-queued RECV.
         if (!link.supportsSessionReplicaV2()) {
             self.syncPortableSessions(link);
-            self.flushS2sOutbound(conn, link.outbound()) catch {
-                link.deinit();
-                self.allocator.destroy(link);
-                conn.s2s_secured = null;
-                if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
-                _ = self.rx().clients.free(id);
-                closeFd(snap.fd);
+            appendToConn(conn, link.outbound()) catch {
+                self.rollbackInheritedS2sBeforeIo(id, snap.fd);
                 return false;
             };
             link.clearOutbound();
         }
+
+        // The fd survived ONE execve on purpose; re-arm CLOEXEC so it never leaks.
+        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
+
+        // Replay the complete retained Store before the token-less roster burst.
+        // This can span maintenance turns under SendQ pressure; the pending
+        // RESYNC burst is released by the same gate as a fresh establishment.
+        conn.session_replica_resync_burst_pending = true;
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = true;
+        // Refresh live/detached local snapshots before fixing the replay
+        // generation/cursor, but do not replay here: replay/burst helpers normally
+        // arm SEND. The maintenance driver resumes them only after activation has
+        // armed the initial RESYNC, preserving authority-before-roster ordering.
         self.scheduleSessionReplicaReplay(conn);
-        self.replaySessionReplicaStoreTo(conn, link);
-        self.releaseMeshBurstAfterSessionReplicaReplay(conn, link);
-        self.armSendIfNeeded(conn) catch {};
         // Re-register the operational surfaces the fresh-establishment hook would
         // have: the link resumes ALREADY established, so driveS2sSecured's
         // `!was and established` block never fires for it. Without this the
@@ -21302,7 +21949,7 @@ pub const LinuxServer = struct {
             }
             peer.s2s_secured = link;
             errdefer peer.s2s_secured = null;
-            try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in6));
+            try self.armConnect(peer);
             return peer.token;
         }
 
@@ -21324,7 +21971,7 @@ pub const LinuxServer = struct {
         peer.s2s = link;
         errdefer peer.s2s = null;
 
-        try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in6));
+        try self.armConnect(peer);
         return peer.token;
     }
 
@@ -21335,38 +21982,115 @@ pub const LinuxServer = struct {
     /// A peer with a live dial (connect in flight or link established) is
     /// skipped, so attempts never pile up; a failed/closed dial frees its slot
     /// (generation mismatch on the saved token) and re-arms here.
-    fn sweepMeshAutoConnect(self: *LinuxServer, force: bool) void {
-        if (self.mesh_dials.len == 0) return;
-        if (self.rx() != &self.reactors[0]) return;
-        const now = self.nowMs();
-        for (self.mesh_dials) |*dial| {
-            if (dial.token) |tok| {
-                if (self.rx().clients.get(idFromToken(tok))) |peer| {
-                    // Same slot AND same generation: our dial still owns it.
-                    if (peer.token.slot == tok.slot and peer.token.gen == tok.gen and !peer.closing) continue;
-                }
-                dial.token = null; // dial's connection is gone — eligible again
-            }
-            // Already linked to this peer via the surviving (possibly inbound)
-            // link? Don't dial a duplicate — that just loops collapse→redial.
-            if (self.meshPeerLinkedByDial(dial)) {
-                dial.token = null;
-                continue;
-            }
-            if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) continue;
-            dial.last_attempt_ms = now;
-            const addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
-                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
-                continue;
-            };
-            dial.addr = addr;
-            if (self.initiateS2sConnectToAddr(addr)) |tok| {
-                dial.token = tok;
-                srvLog("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
-            } else |err| {
-                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+    /// Drain a bounded number of post-UPGRADE hand-dial hints after this turn's
+    /// control and inherited-socket SQEs. Returns true while work remains.
+    fn activateInheritedMeshRedials(self: *LinuxServer, budget: usize) bool {
+        if (self.rx() != &self.reactors[0] or budget == 0) return false;
+        var attempted: usize = 0;
+        while (self.inherited_mesh_redial_cursor < self.inherited_mesh_redials.items.len and attempted < budget) {
+            const addr = self.inherited_mesh_redials.items[self.inherited_mesh_redial_cursor];
+            if (self.initiateS2sConnectToAddr(addr)) |_| {
+                self.inherited_mesh_redial_cursor += 1;
+                attempted += 1;
+            } else |err| switch (err) {
+                error.SubmissionQueueFull => return true,
+                else => {
+                    srvLog("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(err)});
+                    self.inherited_mesh_redial_cursor += 1;
+                    attempted += 1;
+                },
             }
         }
+        if (self.inherited_mesh_redial_cursor == self.inherited_mesh_redials.items.len) {
+            self.inherited_mesh_redials.clearRetainingCapacity();
+            self.inherited_mesh_redial_cursor = 0;
+            return false;
+        }
+        return true;
+    }
+
+    const MeshDialAttempt = enum { skipped, attempted, sq_full };
+
+    fn tryMeshAutoDial(self: *LinuxServer, dial: *MeshDial, force: bool, now: i64) MeshDialAttempt {
+        if (dial.token) |tok| {
+            if (self.rx().clients.get(idFromToken(tok))) |peer| {
+                // Same slot AND same generation: our dial still owns it.
+                if (peer.token.slot == tok.slot and peer.token.gen == tok.gen and !peer.closing) return .skipped;
+            }
+            dial.token = null; // dial's connection is gone — eligible again
+        }
+        // Already linked to this peer via the surviving (possibly inbound)
+        // link? Don't dial a duplicate — that just loops collapse→redial.
+        if (self.meshPeerLinkedByDial(dial)) {
+            dial.token = null;
+            return .skipped;
+        }
+        if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) return .skipped;
+
+        const prior_attempt_ms = dial.last_attempt_ms;
+        dial.last_attempt_ms = now;
+        const addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
+            srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+            return .attempted;
+        };
+        dial.addr = addr;
+        if (self.initiateS2sConnectToAddr(addr)) |tok| {
+            dial.token = tok;
+            srvLog("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
+            return .attempted;
+        } else |err| switch (err) {
+            error.SubmissionQueueFull => {
+                dial.last_attempt_ms = prior_attempt_ms;
+                return .sq_full;
+            },
+            else => {
+                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                return .attempted;
+            },
+        }
+    }
+
+    fn sweepMeshAutoConnect(self: *LinuxServer, force: bool, budget: usize) bool {
+        if (self.mesh_dials.len == 0) return true;
+        if (self.rx() != &self.reactors[0]) return true;
+        if (budget == 0) return false;
+        const now = self.nowMs();
+
+        if (force) {
+            if (self.mesh_boot_remaining == 0) self.mesh_boot_remaining = self.mesh_dials.len;
+            var attempted: usize = 0;
+            while (self.mesh_boot_remaining != 0) {
+                const index = self.mesh_dial_cursor % self.mesh_dials.len;
+                switch (self.tryMeshAutoDial(&self.mesh_dials[index], true, now)) {
+                    .sq_full => return false, // retain cursor/current entry for retry
+                    .skipped => {},
+                    .attempted => attempted += 1,
+                }
+                self.mesh_dial_cursor = (index + 1) % self.mesh_dials.len;
+                self.mesh_boot_remaining -= 1;
+                if (attempted >= budget and self.mesh_boot_remaining != 0) return false;
+            }
+            return true;
+        }
+
+        // Periodic reconnects use the same rotating cursor, so one fast-failing
+        // peer cannot monopolize the bounded maintenance budget either.
+        const cursor_start = self.mesh_dial_cursor % self.mesh_dials.len;
+        for (0..self.mesh_dials.len) |offset| {
+            const index = (cursor_start + offset) % self.mesh_dials.len;
+            switch (self.tryMeshAutoDial(&self.mesh_dials[index], false, now)) {
+                .skipped => continue,
+                .sq_full => {
+                    self.mesh_dial_cursor = index;
+                    return false;
+                },
+                .attempted => {
+                    self.mesh_dial_cursor = (index + 1) % self.mesh_dials.len;
+                    return false; // budget is currently one; preserve boundedness
+                },
+            }
+        }
+        return true;
     }
 
     /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
@@ -39803,6 +40527,96 @@ test "maximum legal session replica fits the clamped server-link SendQ and progr
     try std.testing.expectEqualSlices(u8, snapshot, signed.offer.snapshot);
 }
 
+test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "adopt-store.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "adopt-store-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const replica_token: session_migrate.Token = @splat(0x74);
+    _ = server.publishSessionReplicaUpsert(replica_token, "alice", "Alice", "authority-snapshot", false);
+    try std.testing.expectEqual(@as(usize, 1), server.session_replica_store.retainedCount(server.nowMs()));
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+
+    const outer = pair.a.exportOuter();
+    const inner = pair.a.snapshotInner() orelse return error.TestUnexpectedResult;
+    var caps: u8 = 0;
+    if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
+    if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
+    if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
+    if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
+    if (inner.peer_supports_session_replica_v2) caps |= s2s_snapshot.cap_session_replica_v2;
+    if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
+    var snap = s2s_snapshot.Snapshot{
+        .fd = sockets[0],
+        .role = @intFromEnum(outer.role),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .pl_local_epoch_ms = inner.link.local_epoch_ms,
+        .pl_remote_epoch_ms = inner.link.remote_epoch_ms,
+        .pl_send_credit = inner.link.send_credit,
+        .pl_pending_credit = inner.link.pending_credit,
+        .pl_next_out_seq = inner.link.next_out_seq,
+        .pl_next_in_seq = inner.link.next_in_seq,
+        .pl_last_acked = inner.link.last_acked_by_remote,
+        .remote_node_id = inner.remote_node_id,
+        .remote_epoch_ms = inner.remote_epoch_ms,
+        .caps = caps,
+        .remote_name = pair.a.snapshotInnerRemoteName(),
+        .rec_inbuf = outer.rec_inbuf,
+    };
+    outer.established.serialize(&snap.established);
+
+    const sq_before = server.rx().ring.inner.sq_ready();
+    try std.testing.expect(server.adoptInheritedS2sLink(snap));
+    try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+    var it = server.rx().clients.iterator();
+    const conn = (it.next() orelse return error.TestExpectedEqual).value;
+    try std.testing.expect(conn.io_activation_pending);
+    try std.testing.expect(conn.activation_recv_required);
+    try std.testing.expect(!conn.recv_armed and !conn.send_armed);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
+
+    _ = try server.activatePendingSocketIo();
+    try std.testing.expect(conn.recv_armed and conn.send_armed);
+    try std.testing.expect(!conn.io_activation_pending);
+    try std.testing.expectEqual(sq_before + 2, server.rx().ring.inner.sq_ready());
+    // Activation sends only the mandatory RESYNC. Retained authority is still
+    // pending and the roster burst remains gated behind it.
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    server.replaySessionReplicaStoreTo(conn, conn.s2s_secured.?);
+    try std.testing.expect(!conn.session_replica_replay_pending);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    server.releaseMeshBurstAfterSessionReplicaReplay(conn, conn.s2s_secured.?);
+    try std.testing.expect(!conn.session_replica_resync_burst_pending);
+}
+
 test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried SendQ" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -39868,10 +40682,314 @@ test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried 
     outer.established.serialize(&snap.established);
 
     const clients_before = server.reactors[0].clients.len();
+    const sqes_before = server.reactors[0].ring.inner.sq_ready();
     try std.testing.expect(!server.adoptInheritedS2sLink(snap));
     try std.testing.expectEqual(clients_before, server.reactors[0].clients.len());
+    // A rejected adoption is still inert: no RECV/SEND SQE may borrow the
+    // freed slab slot or its inline buffers.
+    try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
     const fd_state = linux.fcntl(sockets[0], posix.F.GETFD, 0);
     try std.testing.expectEqual(linux.E.BADF, linux.errno(fd_state));
+}
+
+test "legacy hot-adopt stages migration before consuming the final SQ entry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    // Measure one mandatory record, then export after advancing the counter; the
+    // next RESYNC has the same wire length and remains cryptographically valid.
+    try pair.a.sendResync();
+    const resync_len = pair.a.outbound().len;
+    try std.testing.expect(resync_len > 0 and resync_len < min_s2s_sendq_cap);
+    pair.a.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ring_entries = 2,
+        .node_id = pair.ida.shortId(),
+        .server_name = "replay-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+        .session_migrate_on_detach = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Give the legacy peer a real portable sidecar to stage after RESYNC.
+    const token: session_migrate.Token = @splat(0x5c);
+    _ = try server.sessions.attach("legacy-account", 77, token, 1);
+    try std.testing.expect(server.sessions.markPortableResumeIssued("legacy-account", 77));
+    const migration_snapshot = try (migration_relay.Snapshot{
+        .nick = "legacy-device",
+        .umodes = "+i",
+        .channels = &.{"#legacy"},
+        .channel_modes = &.{0},
+        .account = "legacy-account",
+    }).encode(allocator);
+    defer allocator.free(migration_snapshot);
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot("legacy-account", 77, migration_snapshot));
+
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+
+    // Leave exactly one SQ entry. A pre-fix adoption consumed it with RECV,
+    // discovered the legacy SendQ failure afterward, and could not arm the send
+    // that would drive closing-link teardown.
+    var dummy_timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
+    try server.reactors[0].ring.submitTimeout(timer_token, &dummy_timeout);
+    const sqes_before = server.reactors[0].ring.inner.sq_ready();
+    try std.testing.expectEqual(@as(u32, 1), sqes_before);
+
+    const carried = try allocator.alloc(u8, min_s2s_sendq_cap - resync_len);
+    defer allocator.free(carried);
+    @memset(carried, 0xa5);
+    const outer = pair.a.exportOuter();
+    const inner = pair.a.snapshotInner() orelse return error.TestUnexpectedResult;
+    var caps: u8 = 0;
+    if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
+    if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
+    if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
+    if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
+    // Deliberately omit SESSION_REPLICA v2: this forces the legacy migration
+    // staging path whose output cannot fit after carried bytes + RESYNC.
+    var snap = s2s_snapshot.Snapshot{
+        .fd = sockets[0],
+        .role = @intFromEnum(outer.role),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .pl_local_epoch_ms = inner.link.local_epoch_ms,
+        .pl_remote_epoch_ms = inner.link.remote_epoch_ms,
+        .pl_send_credit = inner.link.send_credit,
+        .pl_pending_credit = inner.link.pending_credit,
+        .pl_next_out_seq = inner.link.next_out_seq,
+        .pl_next_in_seq = inner.link.next_in_seq,
+        .pl_last_acked = inner.link.last_acked_by_remote,
+        .remote_node_id = inner.remote_node_id,
+        .remote_epoch_ms = inner.remote_epoch_ms,
+        .caps = caps,
+        .remote_name = pair.a.snapshotInnerRemoteName(),
+        .rec_inbuf = outer.rec_inbuf,
+        .pending_out = carried,
+    };
+    outer.established.serialize(&snap.established);
+
+    const clients_before = server.reactors[0].clients.len();
+    try std.testing.expect(!server.adoptInheritedS2sLink(snap));
+    try std.testing.expectEqual(clients_before, server.reactors[0].clients.len());
+    try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+}
+
+test "UPGRADE restored property checkpoint bursts after preserved-link activation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "replay-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const channel_entity = try ircx_prop_store.Entity.fromId("#restored");
+    const user_entity = try ircx_prop_store.Entity.fromId("RestoredUser");
+    _ = try server.props.setProp(channel_entity, "CUSTOM", "channel-value", .{ .id = "channel-owner", .access = .host });
+    _ = try server.props.setProp(user_entity, "STATUS", "entity-value", .{ .id = "entity-owner", .access = .user });
+    var channel_pk: [channel_prop_event.pubkey_len]u8 = undefined;
+    var channel_sig: [channel_prop_event.sig_len]u8 = undefined;
+    const channel_origin = server.signLocalChannelProp(
+        true,
+        "#restored",
+        "CUSTOM",
+        "channel-value",
+        "channel-owner",
+        101,
+        &channel_pk,
+        &channel_sig,
+    );
+    var entity_pk: [entity_prop_event.pubkey_len]u8 = undefined;
+    var entity_sig: [entity_prop_event.sig_len]u8 = undefined;
+    const entity_origin = server.signLocalEntityProp(
+        true,
+        .user,
+        "RestoredUser",
+        "STATUS",
+        "entity-value",
+        "entity-owner",
+        102,
+        &entity_pk,
+        &entity_sig,
+    );
+    try std.testing.expect(server.recordChannelPropClock("#restored", "CUSTOM", "channel-owner", 101, true, channel_origin.node, channel_origin.pubkey, channel_origin.sig));
+    try std.testing.expect(server.recordEntityPropClock(.user, "RestoredUser", "STATUS", "entity-owner", 102, true, entity_origin.node, entity_origin.pubkey, entity_origin.sig));
+    const checkpoint = try prop_checkpoint.encode(
+        allocator,
+        &server.props,
+        &server.channel_prop_clocks,
+        &server.entity_prop_clocks,
+    );
+    defer allocator.free(checkpoint);
+    // Make the fresh successor image observably different. Adoption must replace
+    // these rows before Pass4, and the encrypted burst must carry checkpoint data.
+    _ = try server.props.setProp(channel_entity, "CUSTOM", "successor-stale", .{ .id = "stale-owner", .access = .host });
+    _ = try server.props.setProp(user_entity, "STATUS", "successor-stale", .{ .id = "stale-owner", .access = .user });
+    server.channelPropClock("#restored", "CUSTOM").?.hlc = 901;
+    server.channelPropClock("#restored", "CUSTOM").?.origin_node = 901;
+    server.entityPropClock(.user, "RestoredUser", "STATUS").?.hlc = 902;
+    server.entityPropClock(.user, "RestoredUser", "STATUS").?.origin_node = 902;
+
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var socket_transferred = false;
+    defer if (!socket_transferred) closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    const outer = pair.a.exportOuter();
+    const inner = pair.a.snapshotInner() orelse return error.TestUnexpectedResult;
+    var caps: u8 = 0;
+    if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
+    if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
+    if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
+    if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
+    if (inner.peer_supports_session_replica_v2) caps |= s2s_snapshot.cap_session_replica_v2;
+    if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
+    var snap = s2s_snapshot.Snapshot{
+        .fd = sockets[0],
+        .role = @intFromEnum(outer.role),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .pl_local_epoch_ms = inner.link.local_epoch_ms,
+        .pl_remote_epoch_ms = inner.link.remote_epoch_ms,
+        .pl_send_credit = inner.link.send_credit,
+        .pl_pending_credit = inner.link.pending_credit,
+        .pl_next_out_seq = inner.link.next_out_seq,
+        .pl_next_in_seq = inner.link.next_in_seq,
+        .pl_last_acked = inner.link.last_acked_by_remote,
+        .remote_node_id = inner.remote_node_id,
+        .remote_epoch_ms = inner.remote_epoch_ms,
+        .caps = caps,
+        .remote_name = pair.a.snapshotInnerRemoteName(),
+        .rec_inbuf = outer.rec_inbuf,
+    };
+    outer.established.serialize(&snap.established);
+    const s2s_blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(s2s_blob);
+
+    const pieces = [_]helix_live.StatePiece{
+        .{ .kind = .mesh_checkpoint, .bytes = checkpoint, .min_supported = 2 },
+        .{ .kind = .s2s_link, .bytes = s2s_blob },
+    };
+    var prepared = try helix_live.prepare(allocator, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-pass4-restored-properties",
+        .pieces = &pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_dup_owned = true;
+    defer if (arena_dup_owned) closeFd(arena_dup);
+    server.config.resume_arena_fd = arena_dup;
+    var state_fds = [_]linux.fd_t{sockets[0]};
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try server.adoptInheritedSessions();
+    arena_dup_owned = false;
+    socket_transferred = true;
+    current_reactor = null;
+
+    try std.testing.expectEqualStrings("channel-value", (try server.props.getPropRaw(channel_entity, "CUSTOM")).value);
+    try std.testing.expectEqualStrings("entity-value", (try server.props.getPropRaw(user_entity, "STATUS")).value);
+    try std.testing.expectEqual(@as(u64, 101), server.channelPropClock("#restored", "CUSTOM").?.hlc);
+    try std.testing.expectEqual(@as(u64, 102), server.entityPropClock(.user, "RestoredUser", "STATUS").?.hlc);
+    try std.testing.expectEqual(@as(usize, 0), server.config.inherited_state_fds.len);
+    try std.testing.expect(!server.config.inherited_state_fd_manifest_present);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+
+    var adopted: ?*ConnState = null;
+    var adopted_count: usize = 0;
+    var clients = server.reactors[0].clients.iterator();
+    while (clients.next()) |entry| {
+        if (entry.value.fd != sockets[0] or entry.value.s2s_secured == null) continue;
+        adopted = entry.value;
+        adopted_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), adopted_count);
+    try std.testing.expect(adopted.?.io_activation_pending);
+    try std.testing.expect(adopted.?.activation_recv_required);
+    try std.testing.expect(adopted.?.session_replica_replay_pending);
+    try std.testing.expect(adopted.?.session_replica_resync_burst_pending);
+    _ = try server.activatePendingSocketIo();
+    server.resumeSessionReplicaReplays();
+    try std.testing.expect(!adopted.?.session_replica_replay_pending);
+    try std.testing.expect(!adopted.?.session_replica_resync_burst_pending);
+    const wire = try copyTestSendQ(allocator, adopted orelse return error.TestUnexpectedResult);
+    defer allocator.free(wire);
+    try std.testing.expect(wire.len != 0);
+    try pair.b.feed(wire, 300);
+
+    const channel_changes = try pair.b.takeChannelPropChanges();
+    defer {
+        for (channel_changes) |*change| change.deinit(allocator);
+        allocator.free(channel_changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), channel_changes.len);
+    try std.testing.expectEqualStrings("#restored", channel_changes[0].channel);
+    try std.testing.expectEqualStrings("CUSTOM", channel_changes[0].key);
+    try std.testing.expect(channel_changes[0].present);
+    try std.testing.expectEqualStrings("channel-value", channel_changes[0].value);
+    try std.testing.expectEqualStrings("channel-owner", channel_changes[0].owner);
+    try std.testing.expectEqual(@as(u64, 101), channel_changes[0].hlc);
+    try std.testing.expectEqual(channel_origin.node, channel_changes[0].origin_node);
+    try std.testing.expectEqualSlices(u8, channel_origin.pubkey, channel_changes[0].origin_pubkey);
+    try std.testing.expectEqualSlices(u8, channel_origin.sig, channel_changes[0].origin_sig);
+
+    const entity_changes = try pair.b.takeEntityPropChanges();
+    defer {
+        for (entity_changes) |*change| change.deinit(allocator);
+        allocator.free(entity_changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entity_changes.len);
+    try std.testing.expectEqual(entity_prop_event.EntityKind.user, entity_changes[0].kind);
+    try std.testing.expectEqualStrings("RestoredUser", entity_changes[0].entity);
+    try std.testing.expectEqualStrings("STATUS", entity_changes[0].key);
+    try std.testing.expect(entity_changes[0].present);
+    try std.testing.expectEqualStrings("entity-value", entity_changes[0].value);
+    try std.testing.expectEqualStrings("entity-owner", entity_changes[0].owner);
+    try std.testing.expectEqual(@as(u64, 102), entity_changes[0].hlc);
+    try std.testing.expectEqual(entity_origin.node, entity_changes[0].origin_node);
+    try std.testing.expectEqualSlices(u8, entity_origin.pubkey, entity_changes[0].origin_pubkey);
+    try std.testing.expectEqualSlices(u8, entity_origin.sig, entity_changes[0].origin_sig);
+    try std.testing.expectEqual(@as(u64, 0), pair.b.takeRejectedOriginFrames());
 }
 
 test "RecvQ: inline fast path, CRLF dispatch, and per-class cap drop" {
@@ -41401,8 +42519,19 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     defer server.deinit();
     try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
     server.config.resume_arena_fd = arena_dup;
-    server.adoptInheritedSessions();
+    var state_fds = [_]linux.fd_t{ carried_a, carried_b };
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try server.adoptInheritedSessions();
     current_reactor = null;
+
+    // Successful adoption transfers both descriptors to their reactors and
+    // clears the authoritative manifest without closing the live sockets.
+    try std.testing.expectEqual(@as(usize, 0), server.config.inherited_state_fds.len);
+    try std.testing.expect(!server.config.inherited_state_fd_manifest_present);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(carried_a, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(carried_b, posix.F.GETFD, 0)));
 
     // Each client re-pinned to its fd-derived shard — including the NON-ZERO
     // shard the pre-fix upgrade dropped entirely.
@@ -47750,6 +48879,126 @@ fn buildSignedEntityProp(
     };
 }
 
+test "remote property admission advances HLC only for accepted channel and entity facts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const baseline = server.nextMeshHlc();
+    const baseline_clock = server.mesh_clock;
+    const invalid_channel_facts = [_]TestPropFact{
+        .{ .channel = "#mesh", .key = "BADVALUE", .value = "line\nbreak", .owner = "remote", .hlc = baseline + 10, .present = true, .origin_node = 9 },
+        .{ .channel = "#mesh", .key = "BADOWNER", .value = "safe", .owner = "bad:owner", .hlc = baseline + 11, .present = true, .origin_node = 9 },
+        .{ .channel = "#mesh", .key = "OID", .value = "read-only", .owner = "remote", .hlc = baseline + 12, .present = true, .origin_node = 9 },
+    };
+    for (invalid_channel_facts) |fact| {
+        try std.testing.expect(!server.applyRemoteChannelProp(fact));
+        try std.testing.expect(server.channelPropClock(fact.channel, fact.key) == null);
+        try std.testing.expectError(
+            error.PropMissing,
+            server.props.getPropRaw(.{ .kind = .channel, .id = fact.channel }, fact.key),
+        );
+        try std.testing.expectEqual(baseline_clock.last_physical, server.mesh_clock.last_physical);
+        try std.testing.expectEqual(baseline_clock.last_stamp, server.mesh_clock.last_stamp);
+    }
+
+    const invalid_entity_facts = [_]TestEntityPropFact{
+        .{ .kind = .user, .entity = "alice", .key = "BADVALUE", .value = "line\nbreak", .owner = "alice", .hlc = baseline + 13, .present = true, .origin_node = 9 },
+        .{ .kind = .member, .entity = "#mesh:alice", .key = "BADOWNER", .value = "safe", .owner = "bad owner", .hlc = baseline + 14, .present = true, .origin_node = 9 },
+    };
+    for (invalid_entity_facts) |fact| {
+        try std.testing.expect(!server.applyRemoteEntityProp(fact));
+        try std.testing.expect(server.entityPropClock(fact.kind, fact.entity, fact.key) == null);
+        try std.testing.expectError(
+            error.PropMissing,
+            server.props.getPropRaw(.{ .kind = fact.kind.toStoreKind(), .id = fact.entity }, fact.key),
+        );
+        try std.testing.expectEqual(baseline_clock.last_physical, server.mesh_clock.last_physical);
+        try std.testing.expectEqual(baseline_clock.last_stamp, server.mesh_clock.last_stamp);
+    }
+
+    const channel_hlc = baseline + 100;
+    const accepted_channel = TestPropFact{
+        .channel = "#mesh",
+        .key = "CUSTOM",
+        .value = "committed",
+        .owner = "remote",
+        .hlc = channel_hlc,
+        .present = true,
+        .origin_node = 9,
+    };
+    try std.testing.expect(server.applyRemoteChannelProp(accepted_channel));
+    try std.testing.expectEqual(channel_hlc, server.mesh_clock.last_stamp);
+    try std.testing.expectEqualStrings(
+        "committed",
+        (try server.props.getPropRaw(.{ .kind = .channel, .id = "#mesh" }, "CUSTOM")).value,
+    );
+    try std.testing.expect(server.nextMeshHlc() > channel_hlc);
+
+    const after_channel = server.mesh_clock;
+    var stale_channel = accepted_channel;
+    stale_channel.hlc = channel_hlc - 1;
+    stale_channel.value = "stale";
+    try std.testing.expect(!server.applyRemoteChannelProp(stale_channel));
+    try std.testing.expectEqual(after_channel.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(after_channel.last_stamp, server.mesh_clock.last_stamp);
+
+    var signer = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x4d)));
+    defer signer.deinit();
+    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+    var forged = try buildSignedProp(
+        &signer,
+        "#mesh",
+        "SIGNED",
+        "authored",
+        "remote",
+        after_channel.last_stamp + 100,
+        true,
+        &pk_buf,
+        &sig_buf,
+    );
+    forged.value = "tampered";
+    try std.testing.expect(!server.applyRemoteChannelProp(forged));
+    try std.testing.expectEqual(after_channel.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(after_channel.last_stamp, server.mesh_clock.last_stamp);
+
+    const future_physical = server.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000;
+    const future_hlc = (future_physical << mesh_clock_mod.seq_bits) | 1;
+    const rejected_clock = server.mesh_clock;
+    var future = accepted_channel;
+    future.key = "FUTURE";
+    future.hlc = future_hlc;
+    try std.testing.expect(!server.applyRemoteChannelProp(future));
+    future.key = "EXHAUSTED";
+    future.hlc = std.math.maxInt(u64);
+    try std.testing.expect(!server.applyRemoteChannelProp(future));
+    try std.testing.expectEqual(rejected_clock.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(rejected_clock.last_stamp, server.mesh_clock.last_stamp);
+
+    const entity_hlc = server.mesh_clock.last_stamp + 100;
+    const accepted_entity = TestEntityPropFact{
+        .kind = .user,
+        .entity = "alice",
+        .key = "STATUS",
+        .value = "online",
+        .owner = "alice",
+        .hlc = entity_hlc,
+        .present = true,
+        .origin_node = 9,
+    };
+    try std.testing.expect(server.applyRemoteEntityProp(accepted_entity));
+    try std.testing.expectEqual(entity_hlc, server.mesh_clock.last_stamp);
+    try std.testing.expectEqualStrings(
+        "online",
+        (try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "STATUS")).value,
+    );
+    try std.testing.expect(server.nextMeshHlc() > entity_hlc);
+}
+
 test "entity prop: a local user prop and member prop are signed and verify against their origin" {
     if (comptime builtin.os.tag == .linux) {
         var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
@@ -49819,7 +51068,7 @@ test "atomic RESUME refuses pending token A and an attached old token group" {
     ));
 }
 
-test "atomic RESUME claimant-only PART preserves a target sibling" {
+test "atomic RESUME rendered PART preserves target and old-identity siblings" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -49841,6 +51090,12 @@ test "atomic RESUME claimant-only PART preserves a target sibling" {
     const observer = server.connFor(observer_id).?;
     server.world.unregisterNick(worldIdFromClient(foreign_id));
     try foreign.session.setNick("Before");
+    // Model a real surviving old identity: one sibling owns the shared lookup
+    // nick while the claimant is only another rendered attachment. Leaving the
+    // claimant as registry owner would intentionally trigger the cross-group
+    // orphan guard and is not a valid claimant-only PART fixture.
+    server.world.unregisterNick(worldIdFromClient(claimant_id));
+    try server.world.registerNick("Before", worldIdFromClient(foreign_id));
     const target_token = server.sessions.resumeHandleForClient("part-acct", monitorIdFromClient(target_id)).?.token;
     try server.world.restoreMember("#target-retains", worldIdFromClient(claimant_id), world_model.MemberModes.empty());
     try server.world.restoreMember("#target-retains", worldIdFromClient(target_id), world_model.MemberModes.empty());
@@ -49873,11 +51128,19 @@ test "atomic RESUME claimant-only PART preserves a target sibling" {
     try std.testing.expect(server.world.isMember("#foreign-retains", worldIdFromClient(foreign_id)));
     try expectContains(claimant.send_buf[0..claimant.send_len], " PART #target-retains");
     try expectContains(claimant.send_buf[0..claimant.send_len], " PART #foreign-retains");
-    try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], " PART #target-retains") == null);
-    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " PART #target-retains") == null);
+    // No old `Before` identity survives this channel, so its real departure is
+    // visible even though the independent restored-nick sibling stays seated.
+    try expectContains(target.send_buf[0..target.send_len], " PART #target-retains");
+    try expectContains(observer.send_buf[0..observer.send_len], " PART #target-retains");
+    // The old identity does survive #foreign-retains, so that attachment-only
+    // removal remains private to the claimant and cannot evict the survivor.
     try std.testing.expect(std.mem.indexOf(u8, foreign.send_buf[0..foreign.send_len], " PART #foreign-retains") == null);
     try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " PART #foreign-retains") == null);
-    try std.testing.expectEqual(@as(usize, 0), claimant.session_mesh_announce_parts.len);
+    try std.testing.expectEqual(@as(usize, 1), claimant.session_mesh_announce_parts.len);
+    try std.testing.expectEqualStrings(
+        "#target-retains",
+        claimant.session_mesh_announce_parts[0].channel(),
+    );
 }
 
 test "threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens" {
@@ -62260,6 +63523,224 @@ test "parseHostPort: host:port split, bad port rejected, IPv6 brackets" {
     try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[::1]"));
 }
 
+test "tiny ring fairly activates more than 64 quiet inherited sockets with pending output" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ring_entries = 8,
+        .max_clients = 128,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var peers: [65]linux.fd_t = @splat(-1);
+    defer for (peers) |fd| if (fd >= 0) closeFd(fd);
+    for (0..peers.len) |i| {
+        var sockets: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+            return error.SkipZigTest;
+        peers[i] = sockets[1];
+        const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+        const conn = server.reactors[0].clients.get(id).?;
+        conn.overflow_allocator = std.testing.allocator;
+        conn.token = try tokenFromId(id);
+        try rawAppendToConn(conn, "x");
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = true;
+    }
+
+    current_reactor = &server.reactors[0];
+    // These three controls claim SQ space before socket activation. With eight
+    // entries, the old eager-adoption ordering filled the SQ first and made the
+    // next accept arm fail forever without ever submitting the queued work.
+    try server.armAccept();
+    server.armWake() catch {};
+    server.armTimer() catch {};
+    try std.testing.expect(server.reactors[0].ring.inner.sq_ready() >= 1);
+
+    var turns: usize = 0;
+    while (server.hasPendingSocketActivation()) : (turns += 1) {
+        try std.testing.expect(turns < 128);
+        _ = try server.activatePendingSocketIo();
+        try std.testing.expect(server.reactors[0].ring.inner.sq_ready() <= 8);
+        _ = try server.reactors[0].ring.submit();
+    }
+    try std.testing.expect(turns > 1); // activation was bounded, not one giant scan
+    try std.testing.expectEqual(@as(usize, 65), server.reactors[0].clients.len());
+    var it = server.reactors[0].clients.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expect(entry.value.recv_armed);
+        try std.testing.expect(entry.value.send_armed);
+        try std.testing.expect(!entry.value.io_activation_pending);
+    }
+}
+
+test "send error waits for quiet recv CQE and stale generation cannot free reuse" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+
+    const old_id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const old = server.rx().clients.get(old_id).?;
+    old.overflow_allocator = std.testing.allocator;
+    old.token = try tokenFromId(old_id);
+    const old_token = old.token;
+    old.recv_armed = true;
+    old.send_armed = true;
+
+    try server.handleSend(.{
+        .token = old_token,
+        .res = -@as(i32, @intFromEnum(linux.E.PIPE)),
+        .more = false,
+        .notif = false,
+    });
+    try std.testing.expect(old.closing);
+    try std.testing.expect(old.recv_armed);
+    try std.testing.expect(!old.send_armed);
+    try std.testing.expect(server.rx().clients.get(old_id) != null);
+
+    // The retained recv-owned slot cannot be selected for a new connection.
+    const neighbor_id = try server.rx().clients.alloc(ConnState.init(-1));
+    try std.testing.expect(neighbor_id.slot != old_id.slot);
+
+    // Only the exact old RECV CQE releases recv_buf and permits final teardown.
+    try server.handleRecv(.{
+        .token = old_token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .more = false,
+    });
+    try std.testing.expect(server.rx().clients.get(old_id) == null);
+
+    const reused_id = try server.rx().clients.alloc(ConnState.init(-1));
+    try std.testing.expectEqual(old_id.slot, reused_id.slot);
+    try std.testing.expect(reused_id.gen != old_id.gen);
+    try std.testing.expectError(error.ClientNotFound, server.handleRecv(.{
+        .token = old_token,
+        .res = 1,
+        .more = false,
+    }));
+    try std.testing.expect(server.rx().clients.get(reused_id) != null);
+
+    // The delivery-gap abort path follows the same ownership barrier: it may
+    // latch close immediately, but cannot recycle recv_buf before its CQE.
+    const gap_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const gap = server.rx().clients.get(gap_id).?;
+    gap.overflow_allocator = std.testing.allocator;
+    gap.token = try tokenFromId(gap_id);
+    gap.recv_armed = true;
+    gap.delivery_gap.store(true, .release);
+    try std.testing.expect(server.abortDeliveryGapFor(gap_id, gap));
+    try std.testing.expect(gap.closing);
+    try std.testing.expect(server.rx().clients.get(gap_id) != null);
+    try server.handleRecv(.{
+        .token = gap.token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .more = false,
+    });
+    try std.testing.expect(server.rx().clients.get(gap_id) == null);
+}
+
+test "secured accept using final SQ slot retains partial I/O ownership" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ring_entries = 8,
+        .node_id = pair.ida.shortId(),
+        .server_name = "accept-final-slot.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "accept-final-slot-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var timeouts: [7]linux.kernel_timespec = undefined;
+    for (&timeouts) |*ts| {
+        ts.* = .{ .sec = 60, .nsec = 0 };
+        try server.rx().ring.submitTimeout(timer_token, ts);
+    }
+    try std.testing.expectEqual(@as(u32, 7), server.rx().ring.inner.sq_ready());
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    try server.handleAccept(.{ .token = s2s_listener_token, .res = sockets[0], .more = false });
+
+    try std.testing.expectEqual(@as(usize, 1), server.rx().clients.len());
+    var it = server.rx().clients.iterator();
+    const accepted = (it.next() orelse return error.TestExpectedEqual).value;
+    try std.testing.expect(accepted.s2s_secured != null);
+    try std.testing.expect(accepted.recv_armed); // acquired the final slot first
+    try std.testing.expect(!accepted.send_armed);
+    try std.testing.expect(accepted.io_activation_pending);
+    try std.testing.expect(!accepted.activation_recv_required); // only SEND remains
+    try std.testing.expectEqual(@as(u32, 8), server.rx().ring.inner.sq_ready());
+}
+
+test "configured boot dial cursor reaches three peers behind a fast failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const specs = [_][]const u8{
+        "127.0.0.1:65001",
+        "127.0.0.1:65002",
+        "127.0.0.1:65003",
+    };
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expectEqual(@as(usize, 3), server.mesh_dials.len);
+
+    // Make every attempt fail synchronously before socket/SQE allocation. A
+    // restart-from-zero budgeted loop retries entry 0 forever; the fair cursor
+    // must visit entries 1 and 2 on the next two turns and complete the boot.
+    server.config.max_clients = 0;
+    const sq_before = server.rx().ring.inner.sq_ready();
+    try std.testing.expect(!server.sweepMeshAutoConnect(true, 1));
+    try std.testing.expectEqual(@as(usize, 1), server.mesh_dial_cursor);
+    try std.testing.expectEqual(@as(usize, 2), server.mesh_boot_remaining);
+    try std.testing.expect(!server.sweepMeshAutoConnect(true, 1));
+    try std.testing.expectEqual(@as(usize, 2), server.mesh_dial_cursor);
+    try std.testing.expectEqual(@as(usize, 1), server.mesh_boot_remaining);
+    try std.testing.expect(server.sweepMeshAutoConnect(true, 1));
+    try std.testing.expectEqual(@as(usize, 0), server.mesh_dial_cursor);
+    try std.testing.expectEqual(@as(usize, 0), server.mesh_boot_remaining);
+    for (server.mesh_dials) |dial| try std.testing.expect(dial.last_attempt_ms != 0);
+    try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+}
+
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
     if (comptime builtin.os.tag == .linux) {
         // Deterministic, execve-safe: drive the handler directly (it only stores the
@@ -62274,6 +63755,171 @@ test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-sh
         // A second consume sees nothing — exactly one upgrade per signal.
         try std.testing.expect(!upgrade_signal_requested.swap(false, .seq_cst));
     } else return error.SkipZigTest;
+}
+
+test "UPGRADE refuses an incompatible target before listener or client CLOEXEC mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var client_fd_owned = true;
+    defer if (client_fd_owned) closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    // /bin/true opens and executes successfully but does not advertise the
+    // exact Helix handoff contract. This exercises capability incompatibility,
+    // rather than merely a missing launch path.
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .exe_path = "/bin/true",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "UpgradePinned", null);
+    const conn = server.rx().clients.get(id) orelse return error.TestUnexpectedResult;
+    conn.fd = sockets[0];
+    conn.session.registration.registered = true;
+    client_fd_owned = false;
+
+    const listener_fd = server.reactors[0].listener_fd;
+    try std.testing.expect(setCloexec(listener_fd, true));
+    try std.testing.expect(setCloexec(conn.fd, true));
+    try std.testing.expectError(error.UpgradeTargetIncompatible, server.performUpgrade(null));
+
+    const listener_flags = linux.fcntl(listener_fd, posix.F.GETFD, 0);
+    const client_flags = linux.fcntl(conn.fd, posix.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(listener_flags));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(client_flags));
+    try std.testing.expect((listener_flags & posix.FD_CLOEXEC) != 0);
+    try std.testing.expect((client_flags & posix.FD_CLOEXEC) != 0);
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[0].clients.len());
+}
+
+test "failed inherited client adoption does not advance HLC or queue carried output" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var server = Server.init(failing.allocator(), .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // Server teardown allocates no new state, but it must be allowed to free
+    // everything even if an assertion below exits the test early.
+    defer failing.fail_index = std.math.maxInt(usize);
+
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var inherited_fd_unconsumed = true;
+    defer if (inherited_fd_unconsumed) closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    const clock_before = server.mesh_clock;
+    const msg_seq_before = server.msg_seq;
+    const sqes_before = server.reactors[0].ring.inner.sq_ready();
+    // ConnState allocation is capacity-reserved and the carried SendQ fits
+    // inline. Fail the next heap request, which is world nick publication,
+    // after the old ordering had already stamped HLC and queued SEND.
+    failing.fail_index = failing.alloc_index;
+    const adopted = server.adoptInheritedClient(.{
+        .fd = sockets[0],
+        .nick = "Rollback",
+        .realname = "Rollback",
+        .pending_out = ":orochi NOTICE Rollback :carried\r\n",
+    }, null, null);
+    failing.fail_index = std.math.maxInt(usize);
+    inherited_fd_unconsumed = false; // adoption either owns it or closed it
+
+    try std.testing.expect(!adopted);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(clock_before.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(clock_before.last_stamp, server.mesh_clock.last_stamp);
+    try std.testing.expectEqual(msg_seq_before, server.msg_seq);
+    try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
+    try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
+}
+
+test "failed inherited TLS plus WebSocket adoption frees carried SendQ overflow" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    defer current_reactor = null;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7a)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "rollback.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x7a, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"rollback.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = kp,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var inherited_fd_unconsumed = true;
+    defer if (inherited_fd_unconsumed) closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    // One byte beyond the inline buffer guarantees adoptTlsState owns a heap
+    // SendQ overflow before WebSocket restoration rejects the oversized
+    // partial line. Pool.free alone does not deinit that stale slot value.
+    const carried = try alloc.alloc(u8, default_reply_bytes + 1);
+    defer alloc.free(carried);
+    @memset(carried, 0xa5);
+    const oversized_ws_tail = try alloc.alloc(u8, WsState.max_frame + 1);
+    defer alloc.free(oversized_ws_tail);
+
+    const adopted = server.adoptInheritedClient(.{
+        .fd = sockets[0],
+        .nick = "RollbackWss",
+        .realname = "Rollback WSS",
+        .was_secured = true,
+    }, .{
+        .fd = sockets[0],
+        .state = .{ .engine = .{ .tls13 = .{
+            .suite = 0x1301,
+            .client_app_secret = @splat(0x11),
+            .server_app_secret = @splat(0x22),
+            .app_read_seq = 7,
+            .app_write_seq = 9,
+        } } },
+        .pending_out = carried,
+    }, .{
+        .fd = sockets[0],
+        .phase_open = true,
+        .tx = oversized_ws_tail,
+    });
+    inherited_fd_unconsumed = false;
+
+    try std.testing.expect(!adopted);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
 }
 
 test "threaded server: [mesh].connect auto-links two nodes without an oper" {
@@ -64242,7 +65888,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
-    server.adoptInheritedSessions();
+    try server.adoptInheritedSessions();
     // adopt binds this thread to the server's reactor; unbind so later
     // main-thread calls (and the teardown defers) resolve per-instance.
     current_reactor = null;
@@ -64328,7 +65974,7 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
-    server.adoptInheritedSessions();
+    try server.adoptInheritedSessions();
     current_reactor = null;
 
     try std.testing.expectEqual(predecessor_stamp, server.mesh_clock.last_stamp);
@@ -64336,6 +65982,319 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
     // synthetic predecessor wall time is deliberately ahead of the test host.
     // Only the restored high-water mark can make this next stamp advance.
     try std.testing.expect(server.nextMeshHlc() > predecessor_stamp);
+}
+
+test "UPGRADE property clock boundary prepares successor HLC without mutating predecessor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    _ = server.nextMeshHlc();
+    const predecessor = server.mesh_clock;
+    const empty_candidate = server.preparePropertyUpgradeClockBoundary() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(predecessor.last_physical, empty_candidate.last_physical);
+    try std.testing.expectEqual(predecessor.last_stamp, empty_candidate.last_stamp);
+    try std.testing.expectEqual(predecessor.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(predecessor.last_stamp, server.mesh_clock.last_stamp);
+
+    const retained = ((server.meshWallMs() + 60_000) << mesh_clock_mod.seq_bits) | 77;
+    try std.testing.expect(server.recordChannelPropClock("#upgrade", "CLOCK", "remote", retained, false, 7, "", ""));
+    const candidate = server.preparePropertyUpgradeClockBoundary() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(retained, candidate.last_stamp);
+    try std.testing.expectEqual(mesh_clock_mod.MeshClock.physicalOf(retained), candidate.last_physical);
+    try std.testing.expectEqual(predecessor.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(predecessor.last_stamp, server.mesh_clock.last_stamp);
+    const candidate_wire = mesh_clock_snapshot.encode(candidate);
+    var successor_clock = try mesh_clock_snapshot.decode(&candidate_wire);
+    try std.testing.expect(successor_clock.stamp(server.meshWallMs(), 1) > retained);
+
+    const clock = server.channelPropClock("#upgrade", "CLOCK") orelse
+        return error.TestUnexpectedResult;
+    clock.hlc = std.math.maxInt(u64);
+    try std.testing.expect(server.preparePropertyUpgradeClockBoundary() == null);
+    try std.testing.expectEqual(predecessor.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(predecessor.last_stamp, server.mesh_clock.last_stamp);
+
+    clock.hlc = ((server.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000) << mesh_clock_mod.seq_bits) | 1;
+    try std.testing.expect(server.preparePropertyUpgradeClockBoundary() == null);
+    try std.testing.expectEqual(predecessor.last_physical, server.mesh_clock.last_physical);
+    try std.testing.expectEqual(predecessor.last_stamp, server.mesh_clock.last_stamp);
+}
+
+test "UPGRADE resume atomically restores exact property rows clocks and tombstones" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var predecessor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer predecessor.deinit();
+    const channel = try ircx_prop_store.Entity.fromId("#CaseRoom");
+    const user = try ircx_prop_store.Entity.fromId("CaseUser");
+    const member = try ircx_prop_store.Entity.fromId("#CaseRoom:Alice");
+    _ = try predecessor.props.setProp(channel, "TOPIC", "exact topic", .{ .id = "host", .access = .host });
+    _ = try predecessor.props.setProp(channel, "HOSTKEY", "exact secret", .{ .id = "owner", .access = .owner });
+    _ = try predecessor.props.setProp(channel, "STALE", "row survives tombstone divergence", .{ .id = "host", .access = .host });
+    _ = try predecessor.props.setProp(user, "BIO", "user row", .{ .id = "CaseUser", .access = .user });
+    _ = try predecessor.props.setProp(member, "ROLE", "operator", .{ .id = "Alice", .access = .member });
+
+    const pubkey: [channel_prop_event.pubkey_len]u8 = @splat(0x31);
+    const signature: [channel_prop_event.sig_len]u8 = @splat(0x52);
+    const high_hlc = ((predecessor.meshWallMs() + 60_000) << mesh_clock_mod.seq_bits) | 104;
+    try std.testing.expect(predecessor.recordChannelPropClock("#CaseRoom", "TOPIC", "host", 100, true, 7, "", ""));
+    // Clock-only PRESENT and row-plus-TOMBSTONE deliberately disagree with the
+    // raw store. Migration must preserve both images, never reconcile them.
+    try std.testing.expect(predecessor.recordChannelPropClock("#CaseRoom", "CLOCKONLY", "remote", 101, true, 8, &pubkey, &signature));
+    try std.testing.expect(predecessor.recordChannelPropClock("#CaseRoom", "STALE", "remote", 102, false, 8, &pubkey, &signature));
+    try std.testing.expect(predecessor.recordEntityPropClock(.user, "CaseUser", "BIO", "CaseUser", 103, true, 7, "", ""));
+    try std.testing.expect(predecessor.recordEntityPropClock(.member, "#CaseRoom:Ghost", "ROLE", "Ghost", high_hlc, false, 8, &pubkey, &signature));
+
+    const checkpoint = try prop_checkpoint.encode(
+        alloc,
+        &predecessor.props,
+        &predecessor.channel_prop_clocks,
+        &predecessor.entity_prop_clocks,
+    );
+    defer alloc.free(checkpoint);
+    const pieces = [_]helix_live.StatePiece{.{
+        .kind = .mesh_checkpoint,
+        .bytes = checkpoint,
+        .min_supported = 2,
+    }};
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-property-state-adopt",
+        .pieces = &pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    const sentinel = try ircx_prop_store.Entity.fromId("Sentinel");
+    _ = try successor.props.setProp(sentinel, "CUSTOM", "old triplet", .{ .id = "Sentinel", .access = .user });
+    try std.testing.expect(successor.recordChannelPropClock("#Sentinel", "OLD", "old", 1, false, 1, "", ""));
+    try std.testing.expect(successor.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 1, false, 1, "", ""));
+    successor.config.resume_arena_fd = arena_dup;
+    try successor.adoptInheritedSessions();
+    current_reactor = null;
+
+    try std.testing.expect(successor.config.resume_arena_fd == null);
+    try std.testing.expectError(error.PropMissing, successor.props.getPropRaw(sentinel, "CUSTOM"));
+    try std.testing.expectEqual(@as(usize, 3), successor.props.entity_count);
+    try std.testing.expectEqual(@as(usize, 3), successor.channel_prop_clocks.count());
+    try std.testing.expectEqual(@as(usize, 2), successor.entity_prop_clocks.count());
+    try std.testing.expectEqualStrings("exact topic", (try successor.props.getPropRaw(channel, "TOPIC")).value);
+    try std.testing.expectEqualStrings("exact secret", (try successor.props.getPropRaw(channel, "HOSTKEY")).value);
+    try std.testing.expectEqualStrings("row survives tombstone divergence", (try successor.props.getPropRaw(channel, "STALE")).value);
+    try std.testing.expectEqualStrings("user row", (try successor.props.getPropRaw(user, "BIO")).value);
+    try std.testing.expectEqualStrings("operator", (try successor.props.getPropRaw(member, "ROLE")).value);
+    try std.testing.expect(successor.channelPropClock("#Sentinel", "OLD") == null);
+    try std.testing.expect(successor.entityPropClock(.user, "Sentinel", "OLD") == null);
+    try std.testing.expect(successor.channelPropClock("#CaseRoom", "HOSTKEY") == null);
+    try std.testing.expect(successor.entityPropClock(.member, "#CaseRoom:Alice", "ROLE") == null);
+    const clock_only = successor.channelPropClock("#caseroom", "clockonly") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("#CaseRoom", clock_only.channel);
+    try std.testing.expectEqualStrings("CLOCKONLY", clock_only.key);
+    try std.testing.expectEqualStrings("remote", clock_only.owner);
+    try std.testing.expect(clock_only.present);
+    try std.testing.expectEqual(@as(u64, 101), clock_only.hlc);
+    try std.testing.expectEqual(@as(u64, 8), clock_only.origin_node);
+    try std.testing.expectEqualSlices(u8, &pubkey, clock_only.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, &signature, clock_only.origin_sig);
+    try std.testing.expectError(error.PropMissing, successor.props.getPropRaw(channel, "CLOCKONLY"));
+    const stale = successor.channelPropClock("#CaseRoom", "STALE") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("#CaseRoom", stale.channel);
+    try std.testing.expectEqualStrings("STALE", stale.key);
+    try std.testing.expectEqualStrings("remote", stale.owner);
+    try std.testing.expect(!stale.present);
+    try std.testing.expectEqual(@as(u64, 102), stale.hlc);
+    const member_tombstone = successor.entityPropClock(.member, "#caseroom:ghost", "role") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(entity_prop_event.EntityKind.member, member_tombstone.kind);
+    try std.testing.expectEqualStrings("#CaseRoom:Ghost", member_tombstone.entity);
+    try std.testing.expectEqualStrings("ROLE", member_tombstone.key);
+    try std.testing.expectEqualStrings("Ghost", member_tombstone.owner);
+    try std.testing.expect(!member_tombstone.present);
+    try std.testing.expectEqual(high_hlc, member_tombstone.hlc);
+    try std.testing.expectEqual(@as(u64, 8), member_tombstone.origin_node);
+    try std.testing.expectEqualSlices(u8, &pubkey, member_tombstone.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, &signature, member_tombstone.origin_sig);
+    // The restored max is causally observed before publication, so a fresh
+    // process-local sequence still mints a strictly newer event immediately.
+    try std.testing.expectEqual(high_hlc, successor.mesh_clock.last_stamp);
+    try std.testing.expect(successor.nextMeshHlc() > high_hlc);
+}
+
+test "UPGRADE property checkpoint selection fails closed without tearing the live triplet" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var empty_props = ircx_prop_store.DefaultStore.init(alloc);
+    defer empty_props.deinit();
+    var empty_channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+    defer empty_channel_clocks.deinit(alloc);
+    var empty_entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+    defer empty_entity_clocks.deinit(alloc);
+    const valid = try prop_checkpoint.encode(alloc, &empty_props, &empty_channel_clocks, &empty_entity_clocks);
+    defer alloc.free(valid);
+    const corrupt = try alloc.dupe(u8, valid);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+
+    const Scenario = enum { corrupt_required, duplicate_required, downgraded_wrapper, unknown_required };
+    for ([_]Scenario{ .corrupt_required, .duplicate_required, .downgraded_wrapper, .unknown_required }) |scenario| {
+        var piece_buf: [2]helix_live.StatePiece = undefined;
+        const pieces: []const helix_live.StatePiece = switch (scenario) {
+            .corrupt_required => blk: {
+                piece_buf[0] = .{ .kind = .mesh_checkpoint, .bytes = corrupt, .min_supported = 2 };
+                break :blk piece_buf[0..1];
+            },
+            .duplicate_required => blk: {
+                piece_buf[0] = .{ .kind = .mesh_checkpoint, .bytes = valid, .min_supported = 2 };
+                piece_buf[1] = .{ .kind = .mesh_checkpoint, .bytes = valid, .min_supported = 2 };
+                break :blk piece_buf[0..2];
+            },
+            .downgraded_wrapper => blk: {
+                piece_buf[0] = .{ .kind = .mesh_checkpoint, .bytes = valid };
+                break :blk piece_buf[0..1];
+            },
+            .unknown_required => blk: {
+                piece_buf[0] = .{ .kind = .mesh_checkpoint, .bytes = "UNKNOWN-REQUIRED", .min_supported = 2 };
+                break :blk piece_buf[0..1];
+            },
+        };
+        var prepared = try helix_live.prepare(alloc, .{
+            .epoch = 1,
+            .now_ms = 1,
+            .timeout_ms = 1000,
+            .arena_name = "orochi-test-property-state-select",
+            .pieces = pieces,
+            .fds = &.{},
+        });
+        defer prepared.deinit();
+        const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+        const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+        var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        const sentinel = try ircx_prop_store.Entity.fromId("Sentinel");
+        _ = try successor.props.setProp(sentinel, "CUSTOM", "old triplet", .{ .id = "Sentinel", .access = .user });
+        try std.testing.expect(successor.recordChannelPropClock("#Sentinel", "OLD", "old", 1, false, 1, "", ""));
+        try std.testing.expect(successor.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 1, false, 1, "", ""));
+        const listener_fd = successor.reactors[0].listener_fd;
+        successor.config.resume_arena_fd = arena_dup;
+        try successor.adoptInheritedSessions();
+        current_reactor = null;
+
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expectEqualStrings("old triplet", (try successor.props.getPropRaw(sentinel, "CUSTOM")).value);
+        try std.testing.expect(successor.channelPropClock("#Sentinel", "OLD") != null);
+        try std.testing.expect(successor.entityPropClock(.user, "Sentinel", "OLD") != null);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    }
+}
+
+test "UPGRADE property checkpoint rejects malformed required outer capsule shapes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var props = ircx_prop_store.DefaultStore.init(alloc);
+    defer props.deinit();
+    var channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+    defer channel_clocks.deinit(alloc);
+    var entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+    defer entity_clocks.deinit(alloc);
+    const valid = try prop_checkpoint.encode(alloc, &props, &channel_clocks, &entity_clocks);
+    defer alloc.free(valid);
+
+    const Scenario = enum { empty_fields, wrong_ordinal, extra_field, future_outer_version };
+    for ([_]Scenario{ .empty_fields, .wrong_ordinal, .extra_field, .future_outer_version }) |scenario| {
+        var field_buf: [2]helix_capsule.Field = undefined;
+        const fields: []helix_capsule.Field = switch (scenario) {
+            .empty_fields => field_buf[0..0],
+            .wrong_ordinal => blk: {
+                field_buf[0] = .{ .ordinal = 2, .bytes = valid };
+                break :blk field_buf[0..1];
+            },
+            .extra_field => blk: {
+                field_buf[0] = .{ .ordinal = 1, .bytes = valid };
+                field_buf[1] = .{ .ordinal = 2, .bytes = "" };
+                break :blk field_buf[0..2];
+            },
+            .future_outer_version => blk: {
+                field_buf[0] = .{ .ordinal = 1, .bytes = valid };
+                break :blk field_buf[0..1];
+            },
+        };
+        var cap = helix_capsule.make(.mesh_checkpoint, fields);
+        cap.header.min_supported = 2;
+        if (scenario == .future_outer_version) {
+            cap.header.version = 3;
+            cap.header.max_supported = 3;
+        } else {
+            cap.header.max_supported = 2;
+        }
+        const encoded = try helix_capsule.encode(alloc, cap);
+        defer alloc.free(encoded);
+        // The generic decoder intentionally accepts these evolvable shapes;
+        // the property selector is the layer that requires exact v2/ordinal-1.
+        var generic = try helix_capsule.decode(alloc, encoded);
+        generic.deinit(alloc);
+
+        var arena = try helix_handoff.Arena.create("orochi-test-property-outer-shape");
+        defer arena.close();
+        try arena.writeAll(encoded);
+        try arena.seal();
+        const dup_rc = linux.dup(arena.fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+        const arena_dup: linux.fd_t = @intCast(dup_rc);
+        var arena_dup_owned = true;
+        defer if (arena_dup_owned) closeFd(arena_dup);
+
+        var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        const sentinel = try ircx_prop_store.Entity.fromId("Sentinel");
+        _ = try successor.props.setProp(sentinel, "CUSTOM", "old triplet", .{ .id = "Sentinel", .access = .user });
+        try std.testing.expect(successor.recordChannelPropClock("#Sentinel", "OLD", "old", 1, false, 1, "", ""));
+        try std.testing.expect(successor.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 1, false, 1, "", ""));
+        const listener_fd = successor.reactors[0].listener_fd;
+        successor.config.resume_arena_fd = arena_dup;
+        try successor.adoptInheritedSessions();
+        arena_dup_owned = false;
+        current_reactor = null;
+
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expectEqualStrings("old triplet", (try successor.props.getPropRaw(sentinel, "CUSTOM")).value);
+        try std.testing.expect(successor.channelPropClock("#Sentinel", "OLD") != null);
+        try std.testing.expect(successor.entityPropClock(.user, "Sentinel", "OLD") != null);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    }
 }
 
 test "UPGRADE resume arena restores the multi-session registry (re-track + snapshot)" {
@@ -64400,7 +66359,7 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
-    server.adoptInheritedSessions();
+    try server.adoptInheritedSessions();
     current_reactor = null;
 
     // (1) The attached session re-tracked against the adopted connection with
@@ -64500,7 +66459,7 @@ test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
-    server.adoptInheritedSessions();
+    try server.adoptInheritedSessions();
     current_reactor = null;
 
     // The healthy account restored completely.
@@ -64610,7 +66569,7 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     };
     defer succ.deinit();
     succ.config.resume_arena_fd = arena_dup;
-    succ.adoptInheritedSessions();
+    try succ.adoptInheritedSessions();
     current_reactor = null;
 
     const pm = &succ.pending_migrations.?;
@@ -64624,27 +66583,346 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     try std.testing.expectError(error.AlreadyConsumed, pm.put(.{ .token = consumed_token, .account = "kain", .snapshot = "late" }, 3));
 }
 
-test "UPGRADE resume rejects a corrupt v2 pending-migration checkpoint atomically" {
+test "UPGRADE arena read failure closes exact carried fd manifest but preserves listeners" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
-    var source = session_migrate.PendingMigrations.init(alloc);
-    defer source.deinit();
-    const captured_at = @max(@as(i64, 0), platform.monotonicMillis());
-    const checkpoint = try source.encodeUpgradeCheckpoint(alloc, captured_at);
-    defer alloc.free(checkpoint);
-    checkpoint[checkpoint.len - 1] ^= 0x01;
-    const pieces = [_]helix_live.StatePiece{.{
-        .kind = .pending_migration,
-        .bytes = checkpoint,
-        .min_supported = 2,
-    }};
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var client_pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &client_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(client_pair[1]);
+    var link_pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &link_pair)) != .SUCCESS) {
+        closeFd(client_pair[0]);
+        return error.SkipZigTest;
+    }
+    defer closeFd(link_pair[1]);
+
+    // A manifest that names any service listener is never trusted for cleanup.
+    var collision = [_]linux.fd_t{server.reactors[0].listener_fd};
+    server.config.inherited_state_fds = &collision;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try std.testing.expect(!server.inheritedStateFdManifestTrusted(-1));
+    server.clearInheritedStateFdManifest();
+
+    // Use a closed duplicate as the inherited arena so readArena takes its
+    // earliest failure path, where no capsule bytes are available to scan.
+    const arena_pieces = [_]helix_live.StatePiece{.{ .kind = .channels, .bytes = "unused" }};
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
-        .now_ms = captured_at,
-        .timeout_ms = 1_000,
-        .arena_name = "orochi-test-pm-corrupt",
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-state-fd-cleanup",
+        .pieces = &arena_pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const dead_arena_fd: linux.fd_t = @intCast(dup_rc);
+    closeFd(dead_arena_fd);
+
+    var state_fds = [_]linux.fd_t{ client_pair[0], link_pair[0] };
+    server.config.resume_arena_fd = dead_arena_fd;
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try server.adoptInheritedSessions();
+    current_reactor = null;
+
+    try std.testing.expect(server.config.resume_arena_fd == null);
+    try std.testing.expectEqual(@as(usize, 0), server.config.inherited_state_fds.len);
+    try std.testing.expect(!server.config.inherited_state_fd_manifest_present);
+    try std.testing.expect(!server.config.inherited_state_fd_manifest_valid);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(client_pair[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(link_pair[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(client_pair[1], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(link_pair[1], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(server.reactors[0].listener_fd, posix.F.GETFD, 0)));
+}
+
+test "UPGRADE authoritative manifest rejects an arena fd aliased to a listener" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var state_pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &state_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer for (state_pair) |fd| closeFd(fd);
+
+    const listener_fd = server.reactors[0].listener_fd;
+    var state_fds = [_]linux.fd_t{state_pair[0]};
+    server.config.resume_arena_fd = listener_fd;
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+
+    try std.testing.expect(!server.inheritedStateFdManifestTrusted(listener_fd));
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+    current_reactor = null;
+
+    // Startup-fatal rejection leaves every descriptor untouched for process
+    // unwind; in particular it never enters readArena's close(arena_fd) path.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(state_pair[0], posix.F.GETFD, 0)));
+    try std.testing.expect(server.config.resume_arena_fd != null);
+    try std.testing.expect(server.config.inherited_state_fd_manifest_present);
+}
+
+test "UPGRADE authoritative manifest accepts only open connected stream sockets" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const pieces = [_]helix_live.StatePiece{.{ .kind = .channels, .bytes = "unused" }};
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-state-fd-socket-kind",
+        .pieces = &pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const arena_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(arena_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(arena_rc);
+    defer closeFd(arena_dup);
+
+    var connected: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &connected)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer for (connected) |fd| closeFd(fd);
+
+    // A distinct duplicate of the sealed memfd is an open regular file, not a
+    // socket. Keeping it distinct from arena_dup proves this is a type check,
+    // not merely the numeric arena-collision guard.
+    const regular_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(regular_rc) != .SUCCESS) return error.SkipZigTest;
+    const regular_fd: linux.fd_t = @intCast(regular_rc);
+    defer closeFd(regular_fd);
+
+    const event_rc = linux.eventfd(0, 0);
+    if (linux.errno(event_rc) != .SUCCESS) return error.SkipZigTest;
+    const event_fd: linux.fd_t = @intCast(event_rc);
+    defer closeFd(event_fd);
+
+    var pipe_fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe(&pipe_fds)) != .SUCCESS) return error.SkipZigTest;
+    defer for (pipe_fds) |fd| closeFd(fd);
+
+    const rogue_listener = createListener("127.0.0.1", 0, 1) catch return error.SkipZigTest;
+    defer closeFd(rogue_listener);
+
+    // Allocate and close this last so its numeric slot cannot be reused by a
+    // later setup syscall before the rejection is exercised.
+    const closed_rc = linux.dup(connected[0]);
+    if (linux.errno(closed_rc) != .SUCCESS) return error.SkipZigTest;
+    const closed_fd: linux.fd_t = @intCast(closed_rc);
+    closeFd(closed_fd);
+
+    const invalid_fds = [_]linux.fd_t{
+        closed_fd,
+        regular_fd,
+        event_fd,
+        pipe_fds[0],
+        rogue_listener,
+    };
+    for (invalid_fds) |invalid_fd| {
+        var manifest = [_]linux.fd_t{invalid_fd};
+        server.config.resume_arena_fd = arena_dup;
+        server.config.inherited_state_fds = &manifest;
+        server.config.inherited_state_fd_manifest_present = true;
+        server.config.inherited_state_fd_manifest_valid = true;
+
+        try std.testing.expect(!server.inheritedStateFdManifestTrusted(arena_dup));
+        try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+        current_reactor = null;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(server.reactors[0].listener_fd, posix.F.GETFD, 0)));
+        if (invalid_fd == closed_fd) {
+            try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(invalid_fd, posix.F.GETFD, 0)));
+        } else {
+            // Fatal rejection never guesses at or closes the invalid descriptor.
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(invalid_fd, posix.F.GETFD, 0)));
+        }
+    }
+
+    var valid_manifest = [_]linux.fd_t{connected[0]};
+    server.config.inherited_state_fds = &valid_manifest;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try std.testing.expect(server.inheritedStateFdManifestTrusted(arena_dup));
+}
+
+test "UPGRADE authoritative state fd manifest requires an exact capsule bijection before restore" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const Scenario = enum { extra_manifest_fd, capsule_fd_absent, duplicate_capsule_fd, unreadable_owner_capsule };
+    for ([_]Scenario{ .extra_manifest_fd, .capsule_fd_absent, .duplicate_capsule_fd, .unreadable_owner_capsule }) |scenario| {
+        var owned_pair: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &owned_pair)) != .SUCCESS)
+            return error.SkipZigTest;
+        defer for (owned_pair) |fd| closeFd(fd);
+        var other_pair: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &other_pair)) != .SUCCESS)
+            return error.SkipZigTest;
+        defer for (other_pair) |fd| closeFd(fd);
+
+        const client_blob = try session_snapshot.encode(alloc, .{
+            .nick = "manifest-user",
+            .realname = "Manifest",
+            .fd = owned_pair[0],
+        });
+        defer alloc.free(client_blob);
+        var piece_buf: [2]helix_live.StatePiece = undefined;
+        const pieces: []const helix_live.StatePiece = switch (scenario) {
+            .duplicate_capsule_fd => blk: {
+                piece_buf[0] = .{ .kind = .clients, .bytes = client_blob };
+                piece_buf[1] = .{ .kind = .clients, .bytes = client_blob };
+                break :blk piece_buf[0..2];
+            },
+            .unreadable_owner_capsule => blk: {
+                piece_buf[0] = .{ .kind = .clients, .bytes = "short" };
+                break :blk piece_buf[0..1];
+            },
+            else => blk: {
+                piece_buf[0] = .{ .kind = .clients, .bytes = client_blob };
+                break :blk piece_buf[0..1];
+            },
+        };
+        var prepared = try helix_live.prepare(alloc, .{
+            .epoch = 1,
+            .now_ms = 1,
+            .timeout_ms = 1000,
+            .arena_name = "orochi-test-state-fd-bijection",
+            .pieces = pieces,
+            .fds = &.{},
+        });
+        defer prepared.deinit();
+        const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+        const arena_dup: linux.fd_t = @intCast(dup_rc);
+        defer closeFd(arena_dup);
+
+        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const listener_fd = server.reactors[0].listener_fd;
+        var manifest_buf: [2]linux.fd_t = undefined;
+        const manifest: []linux.fd_t = switch (scenario) {
+            .extra_manifest_fd => blk: {
+                manifest_buf = .{ owned_pair[0], other_pair[0] };
+                break :blk manifest_buf[0..2];
+            },
+            .capsule_fd_absent => blk: {
+                manifest_buf[0] = other_pair[0];
+                break :blk manifest_buf[0..1];
+            },
+            else => blk: {
+                manifest_buf[0] = owned_pair[0];
+                break :blk manifest_buf[0..1];
+            },
+        };
+        server.config.resume_arena_fd = arena_dup;
+        server.config.inherited_state_fds = manifest;
+        server.config.inherited_state_fd_manifest_present = true;
+        server.config.inherited_state_fd_manifest_valid = true;
+        try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+        current_reactor = null;
+
+        // Startup-fatal production semantics deliberately leave every numeric
+        // descriptor untouched; main exits and the kernel closes them. Catching
+        // the error in-process here proves no rogue/colliding fd was guessed.
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(owned_pair[0], posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(other_pair[0], posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+        try std.testing.expect(server.config.resume_arena_fd != null);
+        try std.testing.expect(server.config.inherited_state_fd_manifest_present);
+    }
+
+    var no_arena_server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer no_arena_server.deinit();
+    no_arena_server.config.inherited_state_fd_manifest_present = true;
+    no_arena_server.config.inherited_state_fd_manifest_valid = false;
+    try std.testing.expectError(error.InvalidInheritedHandoff, no_arena_server.adoptInheritedSessions());
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fcntl(no_arena_server.reactors[0].listener_fd, posix.F.GETFD, 0)),
+    );
+
+    var orphan_pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &orphan_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    var orphan_owner_closed = false;
+    defer if (!orphan_owner_closed) closeFd(orphan_pair[0]);
+    defer closeFd(orphan_pair[1]);
+    var orphan_manifest = [_]linux.fd_t{orphan_pair[0]};
+    no_arena_server.config.inherited_state_fds = &orphan_manifest;
+    no_arena_server.config.inherited_state_fd_manifest_present = true;
+    no_arena_server.config.inherited_state_fd_manifest_valid = true;
+    try no_arena_server.adoptInheritedSessions();
+    orphan_owner_closed = true;
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(orphan_pair[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(orphan_pair[1], posix.F.GETFD, 0)));
+}
+
+test "UPGRADE legacy duplicate owner capsules are rejected before fd or io_uring adoption" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var owner_pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &owner_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    var owner_fd_open = true;
+    defer if (owner_fd_open) closeFd(owner_pair[0]);
+    defer closeFd(owner_pair[1]);
+
+    const client_blob = try session_snapshot.encode(alloc, .{
+        .nick = "legacy-duplicate",
+        .realname = "Legacy duplicate",
+        .fd = owner_pair[0],
+    });
+    defer alloc.free(client_blob);
+    const pieces = [_]helix_live.StatePiece{
+        .{ .kind = .clients, .bytes = client_blob },
+        .{ .kind = .clients, .bytes = client_blob },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-legacy-owner-dedup",
         .pieces = &pieces,
         .fds = &.{},
     });
@@ -64652,28 +66930,384 @@ test "UPGRADE resume rejects a corrupt v2 pending-migration checkpoint atomicall
     const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
     if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
     const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_open = true;
+    defer if (arena_open) closeFd(arena_dup);
 
-    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const sqes_before = server.reactors[0].ring.inner.sq_ready();
+    server.config.resume_arena_fd = arena_dup;
+    // Deliberately omit the authoritative state-fd manifest: this is the
+    // compatibility path for a pre-manifest predecessor.
+    try server.adoptInheritedSessions();
+    current_reactor = null;
+    arena_open = false;
+    owner_fd_open = false;
+
+    try std.testing.expect(server.config.resume_arena_fd == null);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(owner_pair[0], posix.F.GETFD, 0)));
+    try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
+    try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(server.reactors[0].listener_fd, posix.F.GETFD, 0)));
+}
+
+const upgrade_atomic_sentinel_token: session_migrate.Token = @splat(0xD4);
+const upgrade_atomic_pending_token: session_migrate.Token = @splat(0xE5);
+
+fn seedUpgradeAtomicPublicationSentinels(server: *LinuxServer) !void {
+    const sentinel = try ircx_prop_store.Entity.fromId("Sentinel");
+    _ = try server.props.setProp(sentinel, "CUSTOM", "old triplet", .{ .id = "Sentinel", .access = .user });
+    try std.testing.expect(server.recordChannelPropClock("#Sentinel", "OLD", "old", 11, false, 1, "", ""));
+    try std.testing.expect(server.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 12, false, 1, "", ""));
+
+    var remote = try sign_mod.KeyPair.fromSeed(@as(sign_mod.Seed, @splat(0xA6)));
+    defer remote.deinit();
+    try applyTestRemoteSessionReplica(
+        server,
+        &remote,
+        upgrade_atomic_sentinel_token,
+        "sentinel-account",
+        "SentinelReplica",
+        1,
+    );
+
+    server.pending_migrations = session_migrate.PendingMigrations.init(server.allocator);
+    try server.pending_migrations.?.put(.{
+        .token = upgrade_atomic_pending_token,
+        .account = "sentinel-account",
+        .snapshot = "old pending snapshot",
+    }, @max(@as(i64, 0), server.nowMs()));
+
+    server.mesh_clock = .{ .last_physical = 0, .last_stamp = 100 };
+}
+
+fn expectUpgradeAtomicPublicationSentinels(server: *LinuxServer, generation: u64) !void {
+    const sentinel = try ircx_prop_store.Entity.fromId("Sentinel");
+    const staged = try ircx_prop_store.Entity.fromId("Staged");
+    try std.testing.expectEqualStrings("old triplet", (try server.props.getPropRaw(sentinel, "CUSTOM")).value);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(staged, "CUSTOM"));
+    try std.testing.expect(server.channelPropClock("#Sentinel", "OLD") != null);
+    try std.testing.expect(server.entityPropClock(.user, "Sentinel", "OLD") != null);
+    try std.testing.expectEqual(@as(u64, 100), server.mesh_clock.last_stamp);
+    try std.testing.expectEqual(@as(usize, 1), server.session_replica_store.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), server.session_replica_store.attachmentLeaseCount());
+    try std.testing.expectEqual(generation, server.session_replica_store_generation);
+    try std.testing.expectEqual(@as(usize, 1), server.pending_migrations.?.count());
+    const pending = server.pending_migrations.?.get(upgrade_atomic_pending_token) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sentinel-account", pending.account);
+    try std.testing.expectEqualStrings("old pending snapshot", pending.snapshot);
+}
+
+test "UPGRADE exact Store and PMST singletons reject malformed outer shapes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var store = session_replica_v2.Store.init(alloc);
+    defer store.deinit();
+    const store_checkpoint = try store.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(store_checkpoint);
+    var pending = session_migrate.PendingMigrations.init(alloc);
+    defer pending.deinit();
+    const pending_checkpoint = try pending.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(pending_checkpoint);
+
+    const Scenario = enum {
+        store_wrong_ordinal,
+        store_extra_field,
+        store_duplicate,
+        store_legacy_hybrid_range,
+        store_current_hybrid_range,
+        pending_wrong_ordinal,
+        pending_extra_field,
+        pending_duplicate,
+    };
+    for ([_]Scenario{
+        .store_wrong_ordinal,
+        .store_extra_field,
+        .store_duplicate,
+        .store_legacy_hybrid_range,
+        .store_current_hybrid_range,
+        .pending_wrong_ordinal,
+        .pending_extra_field,
+        .pending_duplicate,
+    }) |scenario| {
+        const is_pending = switch (scenario) {
+            .pending_wrong_ordinal, .pending_extra_field, .pending_duplicate => true,
+            else => false,
+        };
+        const checkpoint = if (is_pending) pending_checkpoint else store_checkpoint;
+        var field_buf: [2]helix_capsule.Field = undefined;
+        const fields: []helix_capsule.Field = switch (scenario) {
+            .store_wrong_ordinal, .pending_wrong_ordinal => blk: {
+                field_buf[0] = .{ .ordinal = 2, .bytes = checkpoint };
+                break :blk field_buf[0..1];
+            },
+            .store_extra_field, .pending_extra_field => blk: {
+                field_buf[0] = .{ .ordinal = 1, .bytes = checkpoint };
+                field_buf[1] = .{ .ordinal = 2, .bytes = "extra" };
+                break :blk field_buf[0..2];
+            },
+            .store_duplicate,
+            .store_legacy_hybrid_range,
+            .store_current_hybrid_range,
+            .pending_duplicate,
+            => blk: {
+                field_buf[0] = .{ .ordinal = 1, .bytes = checkpoint };
+                break :blk field_buf[0..1];
+            },
+        };
+        var cap = helix_capsule.make(if (is_pending) .pending_migration else .mesh_checkpoint, fields);
+        if (is_pending) {
+            cap.header.min_supported = 2;
+        } else {
+            switch (scenario) {
+                // Both ranges overlap the local 1..2 descriptor and are therefore
+                // structurally decodable, but neither is a header an honest SRST
+                // predecessor ever emitted.
+                .store_legacy_hybrid_range => {
+                    cap.header.version = 1;
+                    cap.header.min_supported = 1;
+                    cap.header.max_supported = 2;
+                },
+                .store_current_hybrid_range => {
+                    cap.header.version = 2;
+                    cap.header.min_supported = 2;
+                    cap.header.max_supported = 2;
+                },
+                else => {},
+            }
+        }
+        const encoded = try helix_capsule.encode(alloc, cap);
+        defer alloc.free(encoded);
+
+        var arena = try helix_handoff.Arena.create("orochi-test-exact-singleton-shape");
+        defer arena.close();
+        try arena.writeAll(encoded);
+        switch (scenario) {
+            .store_duplicate, .pending_duplicate => try arena.writeAll(encoded),
+            else => {},
+        }
+        try arena.seal();
+        const dup_rc = linux.dup(arena.fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+        const arena_dup: linux.fd_t = @intCast(dup_rc);
+        var arena_dup_owned = true;
+        defer if (arena_dup_owned) closeFd(arena_dup);
+
+        var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        try seedUpgradeAtomicPublicationSentinels(&successor);
+        const generation = successor.session_replica_store_generation;
+        const listener_fd = successor.reactors[0].listener_fd;
+        successor.config.resume_arena_fd = arena_dup;
+        try successor.adoptInheritedSessions();
+        arena_dup_owned = false;
+        current_reactor = null;
+
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try expectUpgradeAtomicPublicationSentinels(&successor, generation);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    }
+}
+
+test "UPGRADE accepts SESSION_REPLICA Store from canonical mesh-checkpoint v1 predecessor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // HEAD before the mesh-checkpoint descriptor bump already sealed SRST, but
+    // necessarily wrapped it in this v1/1..1 header.  Exercise the complete
+    // adoption path rather than only the header predicate so rolling upgrades
+    // cannot silently regress into abandoning every carried client.
+    var predecessor_store = session_replica_v2.Store.init(alloc);
+    defer predecessor_store.deinit();
+    const checkpoint = try predecessor_store.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(checkpoint);
+    var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = checkpoint }};
+    var cap = helix_capsule.make(.mesh_checkpoint, &fields);
+    cap.header.version = 1;
+    cap.header.min_supported = 1;
+    cap.header.max_supported = 1;
+    const encoded = try helix_capsule.encode(alloc, cap);
+    defer alloc.free(encoded);
+
+    var arena = try helix_handoff.Arena.create("orochi-test-legacy-srst-outer");
+    defer arena.close();
+    try arena.writeAll(encoded);
+    try arena.seal();
+    const dup_rc = linux.dup(arena.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_dup_owned = true;
+    defer if (arena_dup_owned) closeFd(arena_dup);
+
+    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer successor.deinit();
-    successor.pending_migrations = session_migrate.PendingMigrations.init(alloc);
-    const sentinel: session_migrate.Token = @splat(0xEE);
-    try successor.pending_migrations.?.put(.{
-        .token = sentinel,
-        .account = "sentinel",
-        .snapshot = "untouched",
-    }, successor.nowMs());
+    try seedUpgradeAtomicPublicationSentinels(&successor);
+    const generation = successor.session_replica_store_generation;
     successor.config.resume_arena_fd = arena_dup;
-    successor.adoptInheritedSessions();
+    try successor.adoptInheritedSessions();
+    arena_dup_owned = false;
     current_reactor = null;
 
     try std.testing.expect(successor.config.resume_arena_fd == null);
-    try std.testing.expect(successor.pending_migrations.?.has(sentinel));
-    try std.testing.expectEqual(@as(usize, 1), successor.pending_migrations.?.count());
-    const fd_probe = linux.fcntl(arena_dup, posix.F.GETFD, 0);
-    try std.testing.expectEqual(linux.E.BADF, linux.errno(fd_probe));
+    try std.testing.expectEqual(@as(usize, 0), successor.session_replica_store.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), successor.session_replica_store.attachmentLeaseCount());
+    try std.testing.expectEqual(generation +% 1, successor.session_replica_store_generation);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(successor.reactors[0].listener_fd, posix.F.GETFD, 0)));
+}
+
+test "UPGRADE late corrupt Store leaves valid property and all live sentinels unpublished" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var replacement_props = ircx_prop_store.DefaultStore.init(alloc);
+    defer replacement_props.deinit();
+    const staged = try ircx_prop_store.Entity.fromId("Staged");
+    _ = try replacement_props.setProp(staged, "CUSTOM", "new triplet", .{ .id = "Staged", .access = .user });
+    var replacement_channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+    defer replacement_channel_clocks.deinit(alloc);
+    var replacement_entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+    defer replacement_entity_clocks.deinit(alloc);
+    const property_checkpoint = try prop_checkpoint.encode(
+        alloc,
+        &replacement_props,
+        &replacement_channel_clocks,
+        &replacement_entity_clocks,
+    );
+    defer alloc.free(property_checkpoint);
+
+    var replacement_store = session_replica_v2.Store.init(alloc);
+    defer replacement_store.deinit();
+    const corrupt_store_checkpoint = try replacement_store.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(corrupt_store_checkpoint);
+    corrupt_store_checkpoint[corrupt_store_checkpoint.len - 1] ^= 1;
+
+    const mesh_checkpoint = mesh_clock_snapshot.encode(.{ .last_stamp = 200 });
+    const pieces = [_]helix_live.StatePiece{
+        .{ .kind = .mesh_checkpoint, .bytes = &mesh_checkpoint },
+        .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 },
+        .{ .kind = .mesh_checkpoint, .bytes = corrupt_store_checkpoint },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1_000,
+        .arena_name = "orochi-test-atomic-bad-store",
+        .pieces = &pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_dup_owned = true;
+    defer if (arena_dup_owned) closeFd(arena_dup);
+
+    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    try seedUpgradeAtomicPublicationSentinels(&successor);
+    const generation = successor.session_replica_store_generation;
+    const listener_fd = successor.reactors[0].listener_fd;
+    successor.config.resume_arena_fd = arena_dup;
+    try successor.adoptInheritedSessions();
+    arena_dup_owned = false;
+    current_reactor = null;
+
+    try std.testing.expect(successor.config.resume_arena_fd == null);
+    try expectUpgradeAtomicPublicationSentinels(&successor, generation);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+}
+
+test "UPGRADE late corrupt PMST leaves valid property Store and all live sentinels unpublished" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var replacement_props = ircx_prop_store.DefaultStore.init(alloc);
+    defer replacement_props.deinit();
+    const staged = try ircx_prop_store.Entity.fromId("Staged");
+    _ = try replacement_props.setProp(staged, "CUSTOM", "new triplet", .{ .id = "Staged", .access = .user });
+    var replacement_channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+    defer replacement_channel_clocks.deinit(alloc);
+    var replacement_entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+    defer replacement_entity_clocks.deinit(alloc);
+    const property_checkpoint = try prop_checkpoint.encode(
+        alloc,
+        &replacement_props,
+        &replacement_channel_clocks,
+        &replacement_entity_clocks,
+    );
+    defer alloc.free(property_checkpoint);
+
+    var replacement_store = session_replica_v2.Store.init(alloc);
+    defer replacement_store.deinit();
+    const store_checkpoint = try replacement_store.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(store_checkpoint);
+
+    var replacement_pending = session_migrate.PendingMigrations.init(alloc);
+    defer replacement_pending.deinit();
+    const corrupt_pending_checkpoint = try replacement_pending.encodeUpgradeCheckpoint(alloc, 0);
+    defer alloc.free(corrupt_pending_checkpoint);
+    corrupt_pending_checkpoint[corrupt_pending_checkpoint.len - 1] ^= 1;
+
+    const mesh_checkpoint = mesh_clock_snapshot.encode(.{ .last_stamp = 200 });
+    const pieces = [_]helix_live.StatePiece{
+        .{ .kind = .mesh_checkpoint, .bytes = &mesh_checkpoint },
+        .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 },
+        .{ .kind = .mesh_checkpoint, .bytes = store_checkpoint },
+        .{ .kind = .pending_migration, .bytes = corrupt_pending_checkpoint, .min_supported = 2 },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1_000,
+        .arena_name = "orochi-test-atomic-bad-pmst",
+        .pieces = &pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_dup_owned = true;
+    defer if (arena_dup_owned) closeFd(arena_dup);
+
+    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    try seedUpgradeAtomicPublicationSentinels(&successor);
+    const generation = successor.session_replica_store_generation;
+    const listener_fd = successor.reactors[0].listener_fd;
+    successor.config.resume_arena_fd = arena_dup;
+    try successor.adoptInheritedSessions();
+    arena_dup_owned = false;
+    current_reactor = null;
+
+    try std.testing.expect(successor.config.resume_arena_fd == null);
+    try expectUpgradeAtomicPublicationSentinels(&successor, generation);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
 }
 
 test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
@@ -64743,7 +67377,7 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
     };
     defer node1.deinit();
     node1.config.resume_arena_fd = arena_dup;
-    node1.adoptInheritedSessions();
+    try node1.adoptInheritedSessions();
     // adopt binds this thread to node1's reactor; unbind so the main-thread
     // teardown pokes (node2.boundPort etc.) resolve against the right server.
     current_reactor = null;
@@ -65368,6 +68002,15 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
 
     const claimant_token = claimant.token;
     try server.closeConn(claimant_token, "transport lost");
+    const retained_claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retained_claimant.closing);
+    try std.testing.expect(retained_claimant.send_armed);
+    try server.handleSend(.{
+        .token = claimant_token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .more = false,
+        .notif = false,
+    });
     try std.testing.expect(server.connFor(claimant_id) == null);
     try std.testing.expectEqual(
         @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
@@ -65700,13 +68343,28 @@ test "atomic session restore and token bind preserve every component on allocati
             try std.testing.expect(claimant.session_mesh_announce_token_bound);
             try std.testing.expect(claimant.session_mesh_announce_requires_authority);
             try std.testing.expectEqualSlices(u8, &target_handle.token, &claimant.session_mesh_announce_token);
-            try std.testing.expect(claimant.session_mesh_announce_nick_change);
+            // The target sibling already owns the restored nick. This is a
+            // non-exclusive attachment transition, so the claimant must not
+            // publish a tokenless NICK that could rename the shared identity.
+            try std.testing.expect(!claimant.session_mesh_announce_nick_change);
             try std.testing.expectEqualStrings(
                 "DeviceB",
                 claimant.session_mesh_announce_old_nick[0..claimant.session_mesh_announce_old_nick_len],
             );
-            try std.testing.expectEqual(@as(usize, 1), claimant.session_mesh_announce_parts.len);
-            try std.testing.expectEqualStrings("#old", claimant.session_mesh_announce_parts[0].channel());
+            // DeviceB's rendered identity leaves both its old-only channel and
+            // the common channel before this transport attaches to Restored's
+            // already-live identity. Preserve both mesh negatives; suppressing
+            // #common merely because the target sibling remains would strand a
+            // stale DeviceB membership on peers.
+            try std.testing.expectEqual(@as(usize, 2), claimant.session_mesh_announce_parts.len);
+            var saw_old = false;
+            var saw_common = false;
+            for (claimant.session_mesh_announce_parts) |part| {
+                saw_old = saw_old or std.ascii.eqlIgnoreCase(part.channel(), "#old");
+                saw_common = saw_common or std.ascii.eqlIgnoreCase(part.channel(), "#common");
+            }
+            try std.testing.expect(saw_old);
+            try std.testing.expect(saw_common);
             try std.testing.expect(claimant.send_len > claimant_send_len);
             try std.testing.expect(sibling.send_len > sibling_send_len);
             break :blk true;

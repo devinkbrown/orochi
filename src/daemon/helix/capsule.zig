@@ -108,7 +108,13 @@ pub const registry = [_]Descriptor{
     .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 3, .min_supported = 1, .max_supported = 3 },
     .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tsumugi_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
-    .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07) introduces exact property-state checkpoints. Ordinary
+    // magic-discriminated mesh payloads retain the full 1..2 range so a v1
+    // successor can still consume/skip them. A state piece whose loss would be
+    // unsafe overrides its individual header to min_supported=2, yielding a
+    // 2..2 range that an older successor must reject instead of silently
+    // adopting a partial arena.
+    .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .send_queue, .schema_id = 0x4853_4551, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07): `Established.serialize` gained a trailing `admitted_frame_families`
     // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
@@ -417,6 +423,43 @@ test "negotiation is per capsule schema range" {
     local.current_version = 2;
 
     try std.testing.expectEqual(@as(u16, 2), try negotiate(local, header));
+}
+
+test "mesh checkpoint v2 keeps ordinary pieces compatible and exact pieces fail closed" {
+    const current = descriptor(.mesh_checkpoint);
+    try std.testing.expectEqual(@as(u16, 2), current.current_version);
+    try std.testing.expectEqual(@as(u16, 1), current.min_supported);
+    try std.testing.expectEqual(@as(u16, 2), current.max_supported);
+
+    // An ordinary v2 mesh payload advertises overlap with both generations.
+    const ordinary = Header.init(.mesh_checkpoint);
+    try std.testing.expectEqual(@as(u16, 2), ordinary.version);
+    try std.testing.expectEqual(@as(u16, 1), ordinary.min_supported);
+    try std.testing.expectEqual(@as(u16, 2), ordinary.max_supported);
+    var legacy = current;
+    legacy.current_version = 1;
+    legacy.min_supported = 1;
+    legacy.max_supported = 1;
+    try std.testing.expectEqual(@as(u16, 1), try negotiate(legacy, ordinary));
+
+    // A legacy v1 predecessor remains consumable by the current successor.
+    var legacy_header = ordinary;
+    legacy_header.version = 1;
+    legacy_header.min_supported = 1;
+    legacy_header.max_supported = 1;
+    try std.testing.expectEqual(@as(u16, 1), try negotiate(current, legacy_header));
+
+    // Exact property state raises only its own minimum. The current successor
+    // accepts it, while a v1 rollback has no overlap and must refuse it.
+    var exact = ordinary;
+    exact.min_supported = 2;
+    try std.testing.expectEqual(@as(u16, 2), try negotiate(current, exact));
+    try std.testing.expectError(error.VersionUnsupported, negotiate(legacy, exact));
+
+    var field = [_]Field{.{ .ordinal = 1, .bytes = "property-state" }};
+    const exact_capsule = Capsule{ .header = exact, .fields = field[0..] };
+    try validate(exact_capsule);
+    try std.testing.expectEqual(@as(u32, 1), exact_capsule.fields[0].ordinal);
 }
 
 test "duplicate and reordered ordinals are rejected" {

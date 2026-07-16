@@ -29,6 +29,7 @@ pub const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
 pub const session_replica = @import("session_replica.zig");
 pub const migration_relay = @import("migration_relay.zig");
+pub const prop_checkpoint = @import("prop_checkpoint.zig");
 // S2S migration support modules (fsm + signed token + journal + policy + metrics).
 pub const migration_fsm = @import("migration_fsm.zig");
 pub const migration_token = @import("migration_token.zig");

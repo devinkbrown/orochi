@@ -132,7 +132,13 @@ pub fn main(init: std.process.Init) !void {
     // Helix handoff). Lives on main's frame so the slice stored on the config
     // stays valid for the whole boot.
     var inherited_listeners: [orochi.daemon.helix.live.max_inherited_listeners]i32 = undefined;
-    if (comptime builtin.os.tag != .linux) _ = &inherited_listeners;
+    // Authoritative version-independent manifest of every client/S2S fd carried
+    // in the state arena. This must outlive config parsing and server adoption.
+    var inherited_state_fds: [orochi.daemon.helix.live.max_inherited_state_fds]i32 = undefined;
+    if (comptime builtin.os.tag != .linux) {
+        _ = &inherited_listeners;
+        _ = &inherited_state_fds;
+    }
 
     var args = try std.process.Args.iterateAllocator(init.minimal.args, allocator);
     defer args.deinit(); // no-op on POSIX, frees the arg buffer on Windows/WASI
@@ -142,6 +148,14 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |exe| srv_cfg.exe_path = exe;
     var config_path_arg: ?[]const u8 = null;
     if (args.next()) |first| {
+        // Private, side-effect-free Helix compatibility handshake. The running
+        // predecessor executes the exact already-open target image with this
+        // flag and refuses a hot handoff unless the complete token matches.
+        // This branch must stay ahead of all config, socket, and daemon setup.
+        if (std.mem.eql(u8, first, orochi.daemon.helix.live.upgrade_capability_arg)) {
+            std.debug.print("{s}\n", .{orochi.daemon.helix.live.upgrade_capability_token});
+            return;
+        } else
         // `orochi --supervisor` is the Helix in-process-upgrade successor mode:
         // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
         // present we resume from them (listener + client fds + sessions + live TLS
@@ -170,6 +184,13 @@ pub fn main(init: std.process.Init) !void {
                     // Hand the inherited state arena to the server, which reads it
                     // after boot and re-attaches the carried-over client connections.
                     if (r.arena_fd) |afd| srv_cfg.resume_arena_fd = afd;
+                    srv_cfg.inherited_state_fd_manifest_present = r.state_fd_manifest_present;
+                    srv_cfg.inherited_state_fd_manifest_valid = r.state_fd_manifest_valid;
+                    if (r.state_fd_count != 0) {
+                        inherited_state_fds = r.state_fds;
+                        srv_cfg.inherited_state_fds = inherited_state_fds[0..r.state_fd_count];
+                        std.debug.print("orochi: Helix resume — tracking {d} carried state fds\n", .{r.state_fd_count});
+                    }
                 } else {
                     std.debug.print("orochi: --supervisor with no Helix handoff env; normal boot\n", .{});
                 }
@@ -308,11 +329,17 @@ pub fn main(init: std.process.Init) !void {
                 const carried_resume = srv_cfg.resume_arena_fd;
                 const carried_listen = srv_cfg.inherited_listener_fd;
                 const carried_listen_list = srv_cfg.inherited_listener_fds;
+                const carried_state_fds = srv_cfg.inherited_state_fds;
+                const carried_state_manifest_present = srv_cfg.inherited_state_fd_manifest_present;
+                const carried_state_manifest_valid = srv_cfg.inherited_state_fd_manifest_valid;
                 srv_cfg = loaded.config;
                 srv_cfg.exe_path = carried_exe;
                 srv_cfg.resume_arena_fd = carried_resume;
                 srv_cfg.inherited_listener_fd = carried_listen;
                 srv_cfg.inherited_listener_fds = carried_listen_list;
+                srv_cfg.inherited_state_fds = carried_state_fds;
+                srv_cfg.inherited_state_fd_manifest_present = carried_state_manifest_present;
+                srv_cfg.inherited_state_fd_manifest_valid = carried_state_manifest_valid;
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
@@ -995,7 +1022,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Helix UPGRADE successor: re-attach the carried-over client connections
     // (inherited socket fds + restored sessions) now that the ring exists.
-    if (comptime builtin.os.tag == .linux) srv.adoptInheritedSessions();
+    if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
 
     // SIGUSR2 → connection-preserving Helix UPGRADE: lets a shell-driven deploy
     // (`systemctl kill -s USR2 orochi`, after staging the new binary) hot-swap
