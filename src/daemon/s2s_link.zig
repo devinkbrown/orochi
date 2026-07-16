@@ -603,6 +603,10 @@ pub const S2sLink = struct {
         return self.peer.supportsSessionReplicaV2();
     }
 
+    pub fn supportsSessionAttachmentLeaseV2(self: *const S2sLink) bool {
+        return self.peer.supportsSessionAttachmentLeaseV2();
+    }
+
     pub fn sendSessionReplica(self: *S2sLink, kind: SessionReplicaKind, signed_payload: []const u8) !void {
         try self.peer.sendSessionReplica(self.sink(), kind, signed_payload);
     }
@@ -617,6 +621,10 @@ pub const S2sLink = struct {
 
     pub fn sendSessionReplicaRevoke(self: *S2sLink, signed_revoke: []const u8) !void {
         try self.peer.sendSessionReplicaRevoke(self.sink(), signed_revoke);
+    }
+
+    pub fn sendSessionAttachmentLease(self: *S2sLink, signed_lease: []const u8) !void {
+        try self.peer.sendSessionAttachmentLease(self.sink(), signed_lease);
     }
 
     /// Caller owns the slice and must deinit every item. Each item includes the

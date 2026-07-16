@@ -4,8 +4,8 @@
 //! SESSION_REPLICA v2 convergence core.
 //!
 //! This module deliberately owns no sockets. It defines the signed,
-//! self-certifying OFFER/ACK wire objects and the bounded in-memory convergence
-//! store driven by the daemon's live S2S capability. The safety rules are
+//! self-certifying OFFER/ACK/attachment-lease wire objects and the bounded
+//! in-memory convergence store driven by the daemon's live S2S capability. The safety rules are
 //! intentionally strict:
 //!
 //!   * authority is keyed by `(token, origin_node)` so simultaneous attachments
@@ -22,9 +22,10 @@
 //!
 //! OFFER carries either a complete replica upsert (account, nick, snapshot) or
 //! a removal tombstone. ACK carries the receiver's disposition and observed
-//! revision. Both objects embed the signing public key, bind every semantic
-//! field under a distinct Ed25519 domain, and require the claimed node id to be
-//! the self-certified short id of that key. They are safe to forward unchanged
+//! revision. An attachment lease is short-lived positive liveness evidence.
+//! All objects embed the signing public key, bind every semantic field under a
+//! distinct Ed25519 domain, and require the claimed node id to be the
+//! self-certified short id of that key. They are safe to forward unchanged
 //! across multiple hops.
 
 const std = @import("std");
@@ -40,8 +41,10 @@ pub const Digest = [std.crypto.hash.Blake3.digest_length]u8;
 
 pub const offer_magic = [_]u8{ 'S', 'R', 'O', '2' };
 pub const ack_magic = [_]u8{ 'S', 'R', 'A', '2' };
+pub const attachment_lease_magic = [_]u8{ 'S', 'R', 'L', '2' };
 pub const offer_sign_domain = "orochi-session-replica-offer-v2";
 pub const ack_sign_domain = "orochi-session-replica-ack-v2";
+pub const attachment_lease_sign_domain = "orochi-session-replica-attachment-lease-v2";
 
 pub const max_account_len: usize = 128;
 pub const max_nick_len: usize = 64;
@@ -51,6 +54,7 @@ const revision_wire_len: usize = 8 + 8 + 8;
 const signature_wire_len: usize = sign.public_key_len + sign.signature_len;
 const offer_fixed_len: usize = offer_magic.len + 1 + @sizeOf(Token) + revision_wire_len + 8 + 8 + 2 + 2 + 4;
 const ack_fixed_len: usize = ack_magic.len + 1 + @sizeOf(Token) + revision_wire_len + revision_wire_len + 8 + 8 + 8;
+const attachment_lease_fixed_len: usize = attachment_lease_magic.len + @sizeOf(Token) + revision_wire_len + 8 + 8;
 /// Largest snapshot for which every legal max-length account/nick OFFER still
 /// fits the secured SESSION_REPLICA transport envelope exactly.
 pub const max_snapshot_len: usize = session_replica_transport.max_signed_payload_len -
@@ -142,9 +146,28 @@ pub const SignedAck = struct {
     transcript: []const u8,
 };
 
+/// Positive, short-lived proof that one origin currently has at least one live
+/// attachment for this exact token. Retained OFFERs deliberately outlive live
+/// sockets, so they cannot serve as presence evidence. A lease is effective
+/// only while it is newer than that origin's current OFFER revision.
+pub const AttachmentLease = struct {
+    token: Token,
+    revision: Revision,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+};
+
+pub const SignedAttachmentLease = struct {
+    lease: AttachmentLease,
+    signer: sign.PublicKey,
+    signature: sign.Signature,
+    transcript: []const u8,
+};
+
 pub const EncodeError = error{
     InvalidOffer,
     InvalidAck,
+    InvalidAttachmentLease,
     OriginMismatch,
     TooLong,
 } || std.mem.Allocator.Error || sign.SignError;
@@ -153,6 +176,7 @@ pub const DecodeError = error{
     BadMagic,
     InvalidOffer,
     InvalidAck,
+    InvalidAttachmentLease,
     TooLong,
     TrailingBytes,
     Truncated,
@@ -337,6 +361,73 @@ pub fn verifyAck(signed: SignedAck) VerifyError!void {
     if (!valid) return error.BadSignature;
 }
 
+/// Encode and sign one canonical positive attachment lease.
+pub fn encodeAttachmentLease(
+    allocator: std.mem.Allocator,
+    lease: AttachmentLease,
+    kp: *const sign.KeyPair,
+) EncodeError![]u8 {
+    try validateAttachmentLeaseShape(lease);
+    if (signed_frame.originShortId(kp.public_key) != lease.revision.origin_node) return error.OriginMismatch;
+
+    var out = try allocator.alloc(u8, attachment_lease_fixed_len + signature_wire_len);
+    errdefer allocator.free(out);
+    var writer = Writer{ .bytes = out };
+    writer.writeBytes(&attachment_lease_magic);
+    writer.writeBytes(&lease.token);
+    writer.writeRevision(lease.revision);
+    writer.writeI64(lease.issued_at_ms);
+    writer.writeI64(lease.expires_at_ms);
+    std.debug.assert(writer.pos == attachment_lease_fixed_len);
+    const signature = try kp.signCtx(attachment_lease_sign_domain, out[0..attachment_lease_fixed_len]);
+    writer.writeBytes(&kp.public_key);
+    writer.writeBytes(&signature);
+    std.debug.assert(writer.pos == out.len);
+    return out;
+}
+
+pub fn decodeAttachmentLease(bytes: []const u8) DecodeError!SignedAttachmentLease {
+    var reader = Reader{ .bytes = bytes };
+    const lease = try readAttachmentLease(&reader);
+    const transcript_end = reader.pos;
+    const signer = (try reader.take(sign.public_key_len))[0..sign.public_key_len].*;
+    const signature = (try reader.take(sign.signature_len))[0..sign.signature_len].*;
+    if (reader.pos != bytes.len) return error.TrailingBytes;
+    return .{
+        .lease = lease,
+        .signer = signer,
+        .signature = signature,
+        .transcript = bytes[0..transcript_end],
+    };
+}
+
+fn readAttachmentLease(reader: *Reader) DecodeError!AttachmentLease {
+    if (!std.mem.eql(u8, try reader.take(attachment_lease_magic.len), &attachment_lease_magic)) return error.BadMagic;
+    const lease = AttachmentLease{
+        .token = (try reader.take(@sizeOf(Token)))[0..@sizeOf(Token)].*,
+        .revision = try reader.readRevision(),
+        .issued_at_ms = try reader.readI64(),
+        .expires_at_ms = try reader.readI64(),
+    };
+    validateAttachmentLeaseShape(lease) catch return error.InvalidAttachmentLease;
+    return lease;
+}
+
+pub fn verifyAttachmentLease(signed: SignedAttachmentLease) VerifyError!void {
+    var reader = Reader{ .bytes = signed.transcript };
+    const projected = readAttachmentLease(&reader) catch return error.TranscriptMismatch;
+    if (reader.pos != signed.transcript.len or !attachmentLeaseEql(projected, signed.lease))
+        return error.TranscriptMismatch;
+    if (signed_frame.originShortId(signed.signer) != signed.lease.revision.origin_node) return error.OriginMismatch;
+    const valid = sign.verifyCtx(
+        attachment_lease_sign_domain,
+        signed.transcript,
+        signed.signature,
+        signed.signer,
+    ) catch false;
+    if (!valid) return error.BadSignature;
+}
+
 fn validateOfferShape(offer: Offer) error{ InvalidOffer, TooLong }!void {
     if (offer.revision.origin_node == 0 or !offer.revision.isCanonical()) return error.InvalidOffer;
     if (offer.issued_at_ms < 0 or offer.expires_at_ms < offer.issued_at_ms) return error.InvalidOffer;
@@ -356,6 +447,11 @@ fn validateAckShape(ack: Ack) error{InvalidAck}!void {
     if (ack.offered_revision.origin_node != ack.observed_revision.origin_node) return error.InvalidAck;
     if (!ack.offered_revision.isCanonical() or !ack.observed_revision.isCanonical()) return error.InvalidAck;
     if (ack.issued_at_ms < 0 or ack.expires_at_ms < ack.issued_at_ms) return error.InvalidAck;
+}
+
+fn validateAttachmentLeaseShape(lease: AttachmentLease) error{InvalidAttachmentLease}!void {
+    if (lease.revision.origin_node == 0 or !lease.revision.isCanonical()) return error.InvalidAttachmentLease;
+    if (lease.issued_at_ms < 0 or lease.expires_at_ms < lease.issued_at_ms) return error.InvalidAttachmentLease;
 }
 
 pub const ApplyDisposition = enum {
@@ -418,13 +514,30 @@ pub const AckApplyError = VerifyError || error{
     InvalidLifetime,
 };
 
+pub const AttachmentLeaseDisposition = enum {
+    inserted,
+    duplicate,
+    conflict,
+    stale,
+    superseded,
+};
+
+pub const AttachmentLeaseApplyError = VerifyError || error{
+    AttachmentLeaseFull,
+    Expired,
+    InvalidAttachmentLease,
+    InvalidLifetime,
+} || std.mem.Allocator.Error;
+
 /// Complete restart checkpoint for the authoritative SESSION_REPLICA v2
 /// Store. This is carried inside Helix's backwards-compatible mesh-checkpoint
 /// capsule family, so the inner magic must remain independently recognizable.
 pub const upgrade_checkpoint_magic = [_]u8{ 'S', 'R', 'S', 'T' };
-pub const upgrade_checkpoint_version: u8 = 1;
+pub const upgrade_checkpoint_version: u8 = 2;
+const upgrade_checkpoint_v1_version: u8 = 1;
 const upgrade_checkpoint_checksum_len = 32;
-const upgrade_checkpoint_header_len = upgrade_checkpoint_magic.len + 1 + 8 + 4 + 4 + 4;
+const upgrade_checkpoint_v1_header_len = upgrade_checkpoint_magic.len + 1 + 8 + 4 + 4 + 4;
+const upgrade_checkpoint_header_len = upgrade_checkpoint_v1_header_len + 4;
 
 pub const UpgradeCheckpointError = error{
     BadMagic,
@@ -443,16 +556,19 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     entries: std.AutoHashMapUnmanaged(OriginKey, Entry) = .empty,
+    attachment_leases: std.AutoHashMapUnmanaged(OriginKey, AttachmentLeaseEntry) = .empty,
     routes: std.AutoHashMapUnmanaged(RouteKey, RouteValue) = .empty,
     tombstones: std.AutoHashMapUnmanaged(OriginKey, Tombstone) = .empty,
     quarantines: std.AutoHashMapUnmanaged(Token, Quarantine) = .empty,
 
     pub const Config = struct {
         max_entries: usize = 4096,
+        max_attachment_leases: usize = 4096,
         max_routes: usize = 16_384,
         max_tombstones: usize = 4096,
         max_quarantines: usize = 1024,
         max_offer_lifetime_ms: u64 = 24 * 60 * 60 * 1000,
+        max_attachment_lease_lifetime_ms: u64 = 5 * 60 * 1000,
         max_future_skew_ms: u64 = default_max_future_skew_ms,
         route_ttl_ms: u64 = 15 * 60 * 1000,
         tombstone_ttl_ms: u64 = 24 * 60 * 60 * 1000,
@@ -479,6 +595,26 @@ pub const Store = struct {
         /// Allocation-free deny marker used if full quarantine evidence cannot
         /// be installed under allocator or quarantine-capacity pressure.
         quarantine_until_ms: ?i64,
+    };
+
+    pub const AttachmentLeaseEntry = struct {
+        wire: []const u8,
+        revision: Revision,
+        issued_at_ms: i64,
+        expires_at_ms: i64,
+        /// Retain the greatest accepted revision/conflict marker after positive
+        /// liveness expires. Past this horizon every same-or-older legal lease
+        /// is necessarily expired, so the bounded replay floor may be removed.
+        replay_until_ms: i64,
+        signer: sign.PublicKey,
+        digest: Digest,
+        /// Equal-revision transcript disagreement fails closed until a strictly
+        /// newer, valid lease supersedes both observations.
+        conflicted: bool,
+        /// Second exact signed transcript proving the disagreement to replaying
+        /// peers. Null with `conflicted=true` is an allocation-fallback deny
+        /// marker; a later repeat retries witness capture.
+        conflict_wire: ?[]const u8,
     };
 
     /// The authority scope for one attachment. One bearer token may have
@@ -533,6 +669,7 @@ pub const Store = struct {
     pub const RetainedKind = enum {
         offer,
         revoke,
+        attachment_lease,
     };
 
     /// Borrowed retransmission view. `wire` stays valid until the corresponding
@@ -548,6 +685,7 @@ pub const Store = struct {
 
     pub const SweepResult = struct {
         entries: usize = 0,
+        attachment_leases: usize = 0,
         routes: usize = 0,
         tombstones: usize = 0,
         quarantines: usize = 0,
@@ -564,11 +702,14 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         var it = self.entries.valueIterator();
         while (it.next()) |entry| freeEntry(self.allocator, entry.*);
+        var lease_it = self.attachment_leases.valueIterator();
+        while (lease_it.next()) |lease| freeAttachmentLease(self.allocator, lease.*);
         var tombstone_it = self.tombstones.valueIterator();
         while (tombstone_it.next()) |tombstone| freeTombstone(self.allocator, tombstone.*);
         var quarantine_it = self.quarantines.valueIterator();
         while (quarantine_it.next()) |quarantine| freeQuarantine(self.allocator, quarantine.*);
         self.entries.deinit(self.allocator);
+        self.attachment_leases.deinit(self.allocator);
         self.routes.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
         self.quarantines.deinit(self.allocator);
@@ -592,6 +733,7 @@ pub const Store = struct {
     ) UpgradeCheckpointError![]u8 {
         if (captured_at_ms < 0) return error.InvalidMetadata;
         if (self.entries.count() > std.math.maxInt(u32) or
+            self.attachment_leases.count() > std.math.maxInt(u32) or
             self.tombstones.count() > std.math.maxInt(u32) or
             self.quarantines.count() > std.math.maxInt(u32)) return error.TooLarge;
 
@@ -619,6 +761,16 @@ pub const Store = struct {
             try checkpointAddLen(&total_len, quarantine.second_wire.len);
             try checkpointAddLen(&total_len, 8 + 8);
         }
+        var attachment_lease_it = @constCast(&self.attachment_leases).valueIterator();
+        while (attachment_lease_it.next()) |lease| {
+            try checkpointAddLen(&total_len, 4);
+            try checkpointAddLen(&total_len, lease.wire.len);
+            try checkpointAddLen(&total_len, 1);
+            if (lease.conflict_wire) |wire| {
+                try checkpointAddLen(&total_len, 4);
+                try checkpointAddLen(&total_len, wire.len);
+            }
+        }
         try checkpointAddLen(&total_len, upgrade_checkpoint_checksum_len);
 
         var out = try allocator.alloc(u8, total_len);
@@ -630,6 +782,7 @@ pub const Store = struct {
         writer.writeU32(@intCast(self.entries.count()));
         writer.writeU32(@intCast(self.tombstones.count()));
         writer.writeU32(@intCast(self.quarantines.count()));
+        writer.writeU32(@intCast(self.attachment_leases.count()));
 
         entry_it = @constCast(&self.entries).valueIterator();
         while (entry_it.next()) |entry| {
@@ -654,6 +807,12 @@ pub const Store = struct {
             writer.writeI64(quarantine.expires_at_ms);
             writer.writeI64(quarantine.detected_at_ms);
         }
+        attachment_lease_it = @constCast(&self.attachment_leases).valueIterator();
+        while (attachment_lease_it.next()) |lease| {
+            try checkpointWriteWire(&writer, lease.wire);
+            writer.writeByte(if (!lease.conflicted) 0 else if (lease.conflict_wire != null) 1 else 2);
+            if (lease.conflict_wire) |wire| try checkpointWriteWire(&writer, wire);
+        }
 
         std.debug.assert(writer.pos + upgrade_checkpoint_checksum_len == out.len);
         const checksum = digestBytes(out[0..writer.pos]);
@@ -672,7 +831,7 @@ pub const Store = struct {
         bytes: []const u8,
         restore_now_ms: i64,
     ) UpgradeCheckpointError!Store {
-        if (bytes.len < upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len) return error.Truncated;
+        if (bytes.len < upgrade_checkpoint_v1_header_len + upgrade_checkpoint_checksum_len) return error.Truncated;
         if (!Store.isUpgradeCheckpoint(bytes)) return error.BadMagic;
 
         const body_end = bytes.len - upgrade_checkpoint_checksum_len;
@@ -682,13 +841,22 @@ pub const Store = struct {
 
         var reader = UpgradeCheckpointReader{ .bytes = bytes[0..body_end] };
         _ = try reader.take(upgrade_checkpoint_magic.len);
-        if (try reader.readByte() != upgrade_checkpoint_version) return error.UnsupportedVersion;
+        const version = try reader.readByte();
+        if (version != upgrade_checkpoint_v1_version and version != upgrade_checkpoint_version)
+            return error.UnsupportedVersion;
         const captured_at_ms = try reader.readI64();
         if (captured_at_ms < 0) return error.InvalidMetadata;
         const entry_count: usize = try reader.readU32();
         const tombstone_count: usize = try reader.readU32();
         const quarantine_count: usize = try reader.readU32();
-        if (entry_count > cfg.max_entries or tombstone_count > cfg.max_tombstones or quarantine_count > cfg.max_quarantines)
+        const attachment_lease_count: usize = if (version >= upgrade_checkpoint_version)
+            try reader.readU32()
+        else
+            0;
+        if (entry_count > cfg.max_entries or
+            tombstone_count > cfg.max_tombstones or
+            quarantine_count > cfg.max_quarantines or
+            attachment_lease_count > cfg.max_attachment_leases)
             return error.CapacityExceeded;
 
         // Reject impossible record counts before reserving any map storage.
@@ -698,11 +866,13 @@ pub const Store = struct {
         try checkpointAddProduct(&minimum_record_bytes, entry_count, 4 + 1 + 8 + 1);
         try checkpointAddProduct(&minimum_record_bytes, tombstone_count, 4 + 1 + 8 + 1 + 1);
         try checkpointAddProduct(&minimum_record_bytes, quarantine_count, 4 + 1 + 4 + 1 + 8 + 8);
+        try checkpointAddProduct(&minimum_record_bytes, attachment_lease_count, 4 + 1 + 1);
         if (minimum_record_bytes > reader.bytes.len - reader.pos) return error.Truncated;
 
         var restored = initWithConfig(allocator, cfg);
         errdefer restored.deinit();
         try restored.entries.ensureTotalCapacity(allocator, @intCast(entry_count));
+        try restored.attachment_leases.ensureTotalCapacity(allocator, @intCast(attachment_lease_count));
         try restored.tombstones.ensureTotalCapacity(allocator, @intCast(tombstone_count));
         try restored.quarantines.ensureTotalCapacity(allocator, @intCast(quarantine_count));
 
@@ -725,6 +895,16 @@ pub const Store = struct {
             const expires_at_ms = try reader.readI64();
             const detected_at_ms = try reader.readI64();
             try restored.restoreCheckpointQuarantine(first_wire, second_wire, expires_at_ms, detected_at_ms, captured_at_ms);
+        }
+        for (0..attachment_lease_count) |_| {
+            const wire = try checkpointReadWire(&reader);
+            const conflict_tag = try reader.readByte();
+            const conflict_wire: ?[]const u8 = switch (conflict_tag) {
+                0, 2 => null,
+                1 => try checkpointReadWire(&reader),
+                else => return error.InvalidMetadata,
+            };
+            try restored.restoreCheckpointAttachmentLease(wire, conflict_tag != 0, conflict_wire, captured_at_ms);
         }
         if (reader.pos != reader.bytes.len) return error.TrailingBytes;
 
@@ -780,11 +960,87 @@ pub const Store = struct {
         return .accepted;
     }
 
+    /// Converge a positive short-lived attachment lease independently of OFFER
+    /// arrival order. It remains inert until a matching signed OFFER exists and
+    /// its revision is strictly older than the lease.
+    pub fn applySignedAttachmentLease(
+        self: *Store,
+        signed: SignedAttachmentLease,
+        now_ms: i64,
+    ) AttachmentLeaseApplyError!AttachmentLeaseDisposition {
+        try verifyAttachmentLease(signed);
+        const lease = signed.lease;
+        validateAttachmentLeaseShape(lease) catch return error.InvalidAttachmentLease;
+        validateLifetime(
+            lease.issued_at_ms,
+            lease.expires_at_ms,
+            now_ms,
+            self.cfg.max_attachment_lease_lifetime_ms,
+            self.cfg.max_future_skew_ms,
+        ) catch |err| switch (err) {
+            // Expired signed leases remain admissible only as inert bounded
+            // replay/conflict floors. This lets late peers consume both sides of
+            // unequal-expiry equivocation without ever reviving liveness.
+            error.Expired => if (now_ms > attachmentLeaseReplayUntil(
+                lease,
+                self.cfg.max_attachment_lease_lifetime_ms,
+            )) return error.Expired,
+            else => return err,
+        };
+        try validateRevisionAt(lease.revision, now_ms, self.cfg.max_future_skew_ms);
+        // Binding issue time to the revision's physical component gives an
+        // accepted revision a finite replay horizon. Without it, a signer could
+        // continually reissue an older revision with a fresh future expiry.
+        if (@as(i128, lease.issued_at_ms) > @as(i128, lease.revision.epoch))
+            return error.InvalidLifetime;
+
+        const digest = digestBytes(signed.transcript);
+        if (self.getAttachmentLeaseMutable(lease.token, lease.revision.origin_node)) |current| {
+            switch (lease.revision.compare(current.revision)) {
+                .lt => return .stale,
+                .eq => {
+                    if (std.crypto.timing_safe.eql(Digest, current.digest, digest)) return .duplicate;
+                    if (current.conflict_wire) |wire| {
+                        const witness = decodeAttachmentLease(wire) catch unreachable;
+                        if (std.crypto.timing_safe.eql(Digest, digestBytes(witness.transcript), digest))
+                            return .duplicate;
+                        // Two authenticated unequal transcripts are sufficient
+                        // portable evidence. Further variants remain denied but
+                        // cannot grow retained state.
+                        return .conflict;
+                    }
+                    current.conflicted = true;
+                    current.conflict_wire = ownSignedAttachmentLease(self.allocator, signed) catch |err| return err;
+                    return .conflict;
+                },
+                .gt => {
+                    try self.installAttachmentLease(signed, digest, true);
+                    return .superseded;
+                },
+            }
+        }
+        if (self.attachment_leases.count() >= self.cfg.max_attachment_leases) return error.AttachmentLeaseFull;
+        try self.installAttachmentLease(signed, digest, false);
+        return .inserted;
+    }
+
     /// Return the live fact asserted by exactly one origin. Token comparison is
     /// constant-time; the public lookup deliberately does not use hash equality.
     pub fn getOrigin(self: *const Store, token: Token, origin_node: NodeId) ?*const Entry {
         if (self.isQuarantined(token)) return null;
         var it = @constCast(&self.entries).iterator();
+        while (it.next()) |slot| {
+            if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
+        }
+        return null;
+    }
+
+    pub fn getAttachmentLease(
+        self: *const Store,
+        token: Token,
+        origin_node: NodeId,
+    ) ?*const AttachmentLeaseEntry {
+        var it = @constCast(&self.attachment_leases).iterator();
         while (it.next()) |slot| {
             if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
         }
@@ -874,6 +1130,11 @@ pub const Store = struct {
                 if (now_ms > slot.value_ptr.expires_at_ms) continue;
                 considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
             }
+            var lease_it = @constCast(&self.attachment_leases).iterator();
+            while (lease_it.next()) |slot| {
+                if (slot.value_ptr.conflicted or now_ms > slot.value_ptr.expires_at_ms) continue;
+                considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
+            }
             var tombstone_it = @constCast(&self.tombstones).iterator();
             while (tombstone_it.next()) |slot| {
                 if (now_ms > slot.value_ptr.offer_expires_at_ms) continue;
@@ -902,6 +1163,8 @@ pub const Store = struct {
             while (quarantine_it.next()) |token| considerOrderedToken(token.*, lower_bound, &candidate);
             var entry_it = @constCast(&self.entries).keyIterator();
             while (entry_it.next()) |key| considerOrderedToken(key.token, lower_bound, &candidate);
+            var lease_it = @constCast(&self.attachment_leases).keyIterator();
+            while (lease_it.next()) |key| considerOrderedToken(key.token, lower_bound, &candidate);
             var tombstone_it = @constCast(&self.tombstones).keyIterator();
             while (tombstone_it.next()) |key| considerOrderedToken(key.token, lower_bound, &candidate);
             const token = candidate orelse break;
@@ -1108,6 +1371,10 @@ pub const Store = struct {
         return self.entries.count();
     }
 
+    pub fn attachmentLeaseCount(self: *const Store) usize {
+        return self.attachment_leases.count();
+    }
+
     pub fn routeCount(self: *const Store) usize {
         return self.routes.count();
     }
@@ -1129,6 +1396,8 @@ pub const Store = struct {
         var maximum: ?Revision = null;
         var entry_it = @constCast(&self.entries).valueIterator();
         while (entry_it.next()) |entry| checkpointRaiseRevision(&maximum, entry.revision);
+        var lease_it = @constCast(&self.attachment_leases).valueIterator();
+        while (lease_it.next()) |lease| checkpointRaiseRevision(&maximum, lease.revision);
         var tombstone_it = @constCast(&self.tombstones).valueIterator();
         while (tombstone_it.next()) |tombstone| checkpointRaiseRevision(&maximum, tombstone.revision);
         var quarantine_it = @constCast(&self.quarantines).valueIterator();
@@ -1173,6 +1442,12 @@ pub const Store = struct {
         var tombstone_it = @constCast(&self.tombstones).valueIterator();
         while (tombstone_it.next()) |tombstone| {
             if (tombstone.quarantine_until_ms == null and now_ms <= tombstone.offer_expires_at_ms) count += 1;
+        }
+        var lease_it = @constCast(&self.attachment_leases).valueIterator();
+        while (lease_it.next()) |lease| {
+            if (now_ms > lease.replay_until_ms) continue;
+            if (lease.conflicted and lease.conflict_wire == null) continue;
+            count += 1 + @as(usize, @intFromBool(lease.conflict_wire != null));
         }
         return count;
     }
@@ -1222,6 +1497,22 @@ pub const Store = struct {
             };
             count += 1;
         }
+        var lease_it = @constCast(&self.attachment_leases).iterator();
+        while (lease_it.next()) |slot| {
+            const lease = slot.value_ptr;
+            if (now_ms > lease.replay_until_ms or (lease.conflicted and lease.conflict_wire == null)) continue;
+            const wires = [_]?[]const u8{ lease.wire, lease.conflict_wire };
+            for (wires) |wire_opt| {
+                const wire = wire_opt orelse continue;
+                if (seen < skip) {
+                    seen += 1;
+                    continue;
+                }
+                if (count == out.len) return count;
+                out[count] = retainedAttachmentLeaseObjectFromWire(wire);
+                count += 1;
+            }
+        }
         var tombstone_it = @constCast(&self.tombstones).iterator();
         while (tombstone_it.next()) |slot| {
             if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.offer_expires_at_ms) continue;
@@ -1261,6 +1552,33 @@ pub const Store = struct {
         while (it.next()) |slot| {
             if (!tokenEql(slot.key_ptr.token, token) or slot.key_ptr.origin_node == excluded_origin) continue;
             if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Positive liveness proof for teardown. A retained OFFER alone is never
+    /// sufficient: the matching origin must also hold a nonconflicted,
+    /// nonexpired lease from the same signing key whose revision is newer than
+    /// the current OFFER. Publishing a newer detached OFFER therefore
+    /// invalidates every older live lease without a separate negative object.
+    pub fn hasAttachedOriginOtherThan(
+        self: *const Store,
+        token: Token,
+        excluded_origin: NodeId,
+        now_ms: i64,
+    ) bool {
+        if (self.isQuarantined(token)) return false;
+        var it = @constCast(&self.attachment_leases).iterator();
+        while (it.next()) |slot| {
+            if (!tokenEql(slot.key_ptr.token, token) or slot.key_ptr.origin_node == excluded_origin) continue;
+            const lease = slot.value_ptr;
+            if (lease.conflicted or now_ms > lease.expires_at_ms) continue;
+            const offer = self.getOrigin(token, slot.key_ptr.origin_node) orelse continue;
+            if (offer.quarantine_until_ms != null or now_ms > offer.expires_at_ms) continue;
+            if (lease.revision.compare(offer.revision) != .gt) continue;
+            const signed_offer = decodeOffer(offer.wire) catch continue;
+            if (!std.crypto.timing_safe.eql(sign.PublicKey, signed_offer.signer, lease.signer)) continue;
             return true;
         }
         return false;
@@ -1395,6 +1713,22 @@ pub const Store = struct {
                 freeEntry(self.allocator, removed.value);
                 result.entries += 1;
                 result.routes += self.removeRoutesForOrigin(key.token, key.origin_node);
+            }
+        }
+
+        while (true) {
+            var victim: ?OriginKey = null;
+            var it = self.attachment_leases.iterator();
+            while (it.next()) |slot| {
+                if (now_ms > slot.value_ptr.replay_until_ms) {
+                    victim = slot.key_ptr.*;
+                    break;
+                }
+            }
+            const key = victim orelse break;
+            if (self.attachment_leases.fetchRemove(key)) |removed| {
+                freeAttachmentLease(self.allocator, removed.value);
+                result.attachment_leases += 1;
             }
         }
 
@@ -1609,6 +1943,39 @@ pub const Store = struct {
         }
     }
 
+    fn installAttachmentLease(
+        self: *Store,
+        signed: SignedAttachmentLease,
+        digest: Digest,
+        replacing: bool,
+    ) std.mem.Allocator.Error!void {
+        const lease = signed.lease;
+        const key = OriginKey{ .token = lease.token, .origin_node = lease.revision.origin_node };
+        const wire = try ownSignedAttachmentLease(self.allocator, signed);
+        errdefer self.allocator.free(wire);
+        if (!replacing) try self.attachment_leases.ensureUnusedCapacity(self.allocator, 1);
+        const value = AttachmentLeaseEntry{
+            .wire = wire,
+            .revision = lease.revision,
+            .issued_at_ms = lease.issued_at_ms,
+            .expires_at_ms = lease.expires_at_ms,
+            .replay_until_ms = attachmentLeaseReplayUntil(
+                lease,
+                self.cfg.max_attachment_lease_lifetime_ms,
+            ),
+            .signer = signed.signer,
+            .digest = digest,
+            .conflicted = false,
+            .conflict_wire = null,
+        };
+        if (self.getAttachmentLeaseMutable(lease.token, lease.revision.origin_node)) |old| {
+            freeAttachmentLease(self.allocator, old.*);
+            old.* = value;
+        } else {
+            self.attachment_leases.putAssumeCapacityNoClobber(key, value);
+        }
+    }
+
     fn recordRoute(self: *Store, token: Token, destination: NodeId, next_hop: NodeId, revision: Revision, now_ms: i64) (error{RouteFull} || std.mem.Allocator.Error)!RouteDisposition {
         const current = self.getOrigin(token, revision.origin_node) orelse return .stale;
         if (!current.revision.eql(revision)) return .stale;
@@ -1652,6 +2019,14 @@ pub const Store = struct {
 
     fn getOriginMutable(self: *Store, token: Token, origin_node: NodeId) ?*Entry {
         var it = self.entries.iterator();
+        while (it.next()) |slot| {
+            if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
+        }
+        return null;
+    }
+
+    fn getAttachmentLeaseMutable(self: *Store, token: Token, origin_node: NodeId) ?*AttachmentLeaseEntry {
+        var it = self.attachment_leases.iterator();
         while (it.next()) |slot| {
             if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
         }
@@ -1921,6 +2296,72 @@ pub const Store = struct {
         });
     }
 
+    fn restoreCheckpointAttachmentLease(
+        self: *Store,
+        borrowed_wire: []const u8,
+        conflicted: bool,
+        borrowed_conflict_wire: ?[]const u8,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError!void {
+        const signed = decodeAttachmentLease(borrowed_wire) catch return error.InvalidSignedObject;
+        verifyAttachmentLease(signed) catch return error.InvalidSignedObject;
+        const lease = signed.lease;
+        const lifetime: i128 = @as(i128, lease.expires_at_ms) - @as(i128, lease.issued_at_ms);
+        const latest: i128 = @as(i128, captured_at_ms) + @as(i128, self.cfg.max_future_skew_ms);
+        if (lease.issued_at_ms < 0 or
+            lifetime < 0 or
+            lifetime > self.cfg.max_attachment_lease_lifetime_ms or
+            @as(i128, lease.issued_at_ms) > @as(i128, lease.revision.epoch) or
+            @as(i128, lease.issued_at_ms) > latest or
+            @as(i128, lease.revision.epoch) > latest)
+            return error.InvalidMetadata;
+        const conflict_signed: ?SignedAttachmentLease = if (borrowed_conflict_wire) |conflict_wire| blk: {
+            if (!conflicted) return error.InvalidMetadata;
+            const candidate = decodeAttachmentLease(conflict_wire) catch return error.InvalidSignedObject;
+            verifyAttachmentLease(candidate) catch return error.InvalidSignedObject;
+            const conflict_lease = candidate.lease;
+            const conflict_lifetime: i128 = @as(i128, conflict_lease.expires_at_ms) - @as(i128, conflict_lease.issued_at_ms);
+            if (!tokenEql(lease.token, conflict_lease.token) or
+                !lease.revision.eql(conflict_lease.revision) or
+                std.crypto.timing_safe.eql(Digest, digestBytes(signed.transcript), digestBytes(candidate.transcript)) or
+                conflict_lease.issued_at_ms < 0 or
+                conflict_lifetime < 0 or
+                conflict_lifetime > self.cfg.max_attachment_lease_lifetime_ms or
+                @as(i128, conflict_lease.issued_at_ms) > @as(i128, conflict_lease.revision.epoch) or
+                @as(i128, conflict_lease.issued_at_ms) > latest or
+                @as(i128, conflict_lease.revision.epoch) > latest)
+                return error.InvalidMetadata;
+            break :blk candidate;
+        } else null;
+
+        const key = OriginKey{ .token = lease.token, .origin_node = lease.revision.origin_node };
+        if (self.attachment_leases.contains(key)) return error.DuplicateState;
+
+        const wire = try self.allocator.dupe(u8, borrowed_wire);
+        errdefer self.allocator.free(wire);
+        const conflict_wire = if (borrowed_conflict_wire) |borrowed|
+            try self.allocator.dupe(u8, borrowed)
+        else
+            null;
+        errdefer if (conflict_wire) |owned_conflict| self.allocator.free(owned_conflict);
+        const owned = decodeAttachmentLease(wire) catch unreachable;
+        self.attachment_leases.putAssumeCapacityNoClobber(key, .{
+            .wire = wire,
+            .revision = owned.lease.revision,
+            .issued_at_ms = owned.lease.issued_at_ms,
+            .expires_at_ms = owned.lease.expires_at_ms,
+            .replay_until_ms = attachmentLeaseReplayUntil(
+                owned.lease,
+                self.cfg.max_attachment_lease_lifetime_ms,
+            ),
+            .signer = owned.signer,
+            .digest = digestBytes(owned.transcript),
+            .conflicted = conflicted,
+            .conflict_wire = conflict_wire,
+        });
+        _ = conflict_signed;
+    }
+
     fn validateCheckpointSignedOffer(
         self: *const Store,
         wire: []const u8,
@@ -1997,6 +2438,15 @@ fn validateLifetime(issued_at_ms: i64, expires_at_ms: i64, now_ms: i64, max_life
     if (now_ms > expires_at_ms) return error.Expired;
 }
 
+fn attachmentLeaseReplayUntil(lease: AttachmentLease, max_lifetime_ms: u64) i64 {
+    const revision_horizon: i128 = @as(i128, lease.revision.epoch) + @as(i128, max_lifetime_ms);
+    const bounded_horizon: i64 = if (revision_horizon > std.math.maxInt(i64))
+        std.math.maxInt(i64)
+    else
+        @intCast(revision_horizon);
+    return @max(lease.expires_at_ms, bounded_horizon);
+}
+
 /// A revision participates in the same wall-clock domain as its signed
 /// lifetime. Canonical shape is checked at encode/decode; the Store adds this
 /// apply-time bound so an otherwise-authentic peer cannot advance the
@@ -2010,6 +2460,11 @@ fn validateRevisionAt(revision: Revision, now_ms: i64, max_future_skew_ms: u64) 
 
 fn freeEntry(allocator: std.mem.Allocator, entry: Store.Entry) void {
     allocator.free(entry.wire);
+}
+
+fn freeAttachmentLease(allocator: std.mem.Allocator, lease: Store.AttachmentLeaseEntry) void {
+    allocator.free(lease.wire);
+    if (lease.conflict_wire) |wire| allocator.free(wire);
 }
 
 fn freeTombstone(allocator: std.mem.Allocator, tombstone: Store.Tombstone) void {
@@ -2029,6 +2484,17 @@ fn ownSignedOffer(allocator: std.mem.Allocator, signed: SignedOffer) std.mem.All
     return wire;
 }
 
+fn ownSignedAttachmentLease(
+    allocator: std.mem.Allocator,
+    signed: SignedAttachmentLease,
+) std.mem.Allocator.Error![]u8 {
+    const wire = try allocator.alloc(u8, signed.transcript.len + signature_wire_len);
+    @memcpy(wire[0..signed.transcript.len], signed.transcript);
+    @memcpy(wire[signed.transcript.len..][0..sign.public_key_len], &signed.signer);
+    @memcpy(wire[signed.transcript.len + sign.public_key_len ..], &signed.signature);
+    return wire;
+}
+
 fn retainedObjectFromWire(wire: []const u8) Store.RetainedObject {
     const signed = decodeOffer(wire) catch unreachable;
     return .{
@@ -2037,6 +2503,18 @@ fn retainedObjectFromWire(wire: []const u8) Store.RetainedObject {
         .origin_node = signed.offer.revision.origin_node,
         .revision = signed.offer.revision,
         .expires_at_ms = signed.offer.expires_at_ms,
+        .wire = wire,
+    };
+}
+
+fn retainedAttachmentLeaseObjectFromWire(wire: []const u8) Store.RetainedObject {
+    const signed = decodeAttachmentLease(wire) catch unreachable;
+    return .{
+        .kind = .attachment_lease,
+        .token = signed.lease.token,
+        .origin_node = signed.lease.revision.origin_node,
+        .revision = signed.lease.revision,
+        .expires_at_ms = signed.lease.expires_at_ms,
         .wire = wire,
     };
 }
@@ -2071,6 +2549,13 @@ fn ackEql(a: Ack, b: Ack) bool {
         a.offered_revision.eql(b.offered_revision) and
         a.observed_revision.eql(b.observed_revision) and
         a.ack_node == b.ack_node and
+        a.issued_at_ms == b.issued_at_ms and
+        a.expires_at_ms == b.expires_at_ms;
+}
+
+fn attachmentLeaseEql(a: AttachmentLease, b: AttachmentLease) bool {
+    return tokenEql(a.token, b.token) and
+        a.revision.eql(b.revision) and
         a.issued_at_ms == b.issued_at_ms and
         a.expires_at_ms == b.expires_at_ms;
 }
@@ -2121,6 +2606,14 @@ fn checkpointReadOptionalDigest(reader: *UpgradeCheckpointReader) UpgradeCheckpo
     return switch (try reader.readByte()) {
         0 => null,
         1 => (try reader.take(@sizeOf(Digest)))[0..@sizeOf(Digest)].*,
+        else => error.InvalidMetadata,
+    };
+}
+
+fn checkpointReadBool(reader: *UpgradeCheckpointReader) UpgradeCheckpointError!bool {
+    return switch (try reader.readByte()) {
+        0 => false,
+        1 => true,
         else => error.InvalidMetadata,
     };
 }
@@ -2301,11 +2794,32 @@ fn signedOffer(allocator: std.mem.Allocator, offer: Offer, kp: *const sign.KeyPa
     return .{ .wire = wire, .decoded = try decodeOffer(wire) };
 }
 
+fn signedAttachmentLease(
+    allocator: std.mem.Allocator,
+    lease: AttachmentLease,
+    kp: *const sign.KeyPair,
+) !struct { wire: []u8, decoded: SignedAttachmentLease } {
+    const wire = try encodeAttachmentLease(allocator, lease, kp);
+    return .{ .wire = wire, .decoded = try decodeAttachmentLease(wire) };
+}
+
 fn rewriteUpgradeCheckpointChecksum(bytes: []u8) void {
     std.debug.assert(bytes.len >= upgrade_checkpoint_checksum_len);
     const body_end = bytes.len - upgrade_checkpoint_checksum_len;
     const checksum = digestBytes(bytes[0..body_end]);
     @memcpy(bytes[body_end..], &checksum);
+}
+
+fn testDowngradeEmptyLeaseCheckpointToV1(allocator: std.mem.Allocator, v2: []const u8) ![]u8 {
+    std.debug.assert(v2.len >= upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len);
+    const lease_count_offset = upgrade_checkpoint_v1_header_len;
+    std.debug.assert(std.mem.readInt(u32, v2[lease_count_offset..][0..4], .big) == 0);
+    var v1 = try allocator.alloc(u8, v2.len - 4);
+    @memcpy(v1[0..lease_count_offset], v2[0..lease_count_offset]);
+    v1[upgrade_checkpoint_magic.len] = upgrade_checkpoint_v1_version;
+    @memcpy(v1[lease_count_offset..], v2[upgrade_checkpoint_header_len..]);
+    rewriteUpgradeCheckpointChecksum(v1);
+    return v1;
 }
 
 fn expectUpgradeCheckpointRejected(cfg: Store.Config, bytes: []const u8, now_ms: i64) !void {
@@ -2353,6 +2867,352 @@ test "session replica revision comparison is a deterministic total order" {
     for (values, 0..) |a, i| for (values, 0..) |_, j| for (values, 0..) |c, k| {
         if (i < j and j < k) try testing.expect(a.compare(c) == .lt);
     };
+}
+
+test "session replica attachment lease round-trips and tampering fails closed" {
+    var kp = try testKey(0x0a);
+    defer kp.deinit();
+    const lease = AttachmentLease{
+        .token = testToken(0xa1),
+        .revision = revisionFor(&kp, 200, 2),
+        .issued_at_ms = 100,
+        .expires_at_ms = 250,
+    };
+    const wire = try encodeAttachmentLease(testing.allocator, lease, &kp);
+    defer testing.allocator.free(wire);
+    const decoded = try decodeAttachmentLease(wire);
+    try verifyAttachmentLease(decoded);
+    try testing.expect(attachmentLeaseEql(lease, decoded.lease));
+
+    var projected = decoded;
+    projected.lease.expires_at_ms += 1;
+    try testing.expectError(error.TranscriptMismatch, verifyAttachmentLease(projected));
+
+    var tampered = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(tampered);
+    tampered[attachment_lease_magic.len] ^= 1;
+    try testing.expectError(error.BadSignature, verifyAttachmentLease(try decodeAttachmentLease(tampered)));
+    try testing.expectError(error.Truncated, decodeAttachmentLease(wire[0 .. wire.len - 1]));
+    const trailing = try std.mem.concat(testing.allocator, u8, &.{ wire, "x" });
+    defer testing.allocator.free(trailing);
+    try testing.expectError(error.TrailingBytes, decodeAttachmentLease(trailing));
+}
+
+test "session replica attachment lease makes retained OFFER liveness explicit and ordered" {
+    var origin = try testKey(0x0b);
+    defer origin.deinit();
+    const token = testToken(0xb1);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const offer_1 = try signedOffer(testing.allocator, upsertOffer(&origin, token, 200, 1, "one"), &origin);
+    defer testing.allocator.free(offer_1.wire);
+    const lease_1 = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 300,
+    }, &origin);
+    defer testing.allocator.free(lease_1.wire);
+
+    // Reordering is conservative: a positive lease without its OFFER is inert.
+    try testing.expectEqual(AttachmentLeaseDisposition.inserted, try store.applySignedAttachmentLease(lease_1.decoded, 150));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 150));
+    _ = try store.applySignedOffer(offer_1.decoded, 7, 150);
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 150));
+
+    // A newer retained/detached snapshot invalidates the old live lease.
+    const offer_2 = try signedOffer(testing.allocator, upsertOffer(&origin, token, 202, 1, "detached"), &origin);
+    defer testing.allocator.free(offer_2.wire);
+    _ = try store.applySignedOffer(offer_2.decoded, 7, 160);
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 160));
+    try testing.expectEqual(AttachmentLeaseDisposition.duplicate, try store.applySignedAttachmentLease(lease_1.decoded, 160));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 160));
+
+    const lease_2 = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 203, 1),
+        .issued_at_ms = 160,
+        .expires_at_ms = 260,
+    }, &origin);
+    defer testing.allocator.free(lease_2.wire);
+    try testing.expectEqual(AttachmentLeaseDisposition.superseded, try store.applySignedAttachmentLease(lease_2.decoded, 170));
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 170));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, signed_frame.originShortId(origin.public_key), 170));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 261));
+
+    const reissued_old_clock = try signedAttachmentLease(testing.allocator, .{
+        .token = testToken(0xb2),
+        .revision = revisionFor(&origin, 200, 2),
+        .issued_at_ms = 201,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(reissued_old_clock.wire);
+    try testing.expectError(
+        error.InvalidLifetime,
+        store.applySignedAttachmentLease(reissued_old_clock.decoded, 201),
+    );
+}
+
+test "session replica attachment lease conflict and allocation failure stay fail closed" {
+    var origin = try testKey(0x0c);
+    defer origin.deinit();
+    const token = testToken(0xc1);
+    const offer = try signedOffer(testing.allocator, upsertOffer(&origin, token, 200, 1, "state"), &origin);
+    defer testing.allocator.free(offer.wire);
+    const first = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(first.wire);
+    const conflict = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 101,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(conflict.wire);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(offer.decoded, 0, 150);
+    _ = try store.applySignedAttachmentLease(first.decoded, 150);
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 150));
+    try testing.expectEqual(AttachmentLeaseDisposition.conflict, try store.applySignedAttachmentLease(conflict.decoded, 150));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 150));
+
+    const newer = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 202, 2),
+        .issued_at_ms = 150,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(newer.wire);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    store.allocator = failing.allocator();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, store.applySignedAttachmentLease(newer.decoded, 160));
+    try testing.expect(store.getAttachmentLease(token, signed_frame.originShortId(origin.public_key)).?.conflicted);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(AttachmentLeaseDisposition.superseded, try store.applySignedAttachmentLease(newer.decoded, 160));
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 160));
+    _ = store.sweep(251);
+    try testing.expectEqual(@as(usize, 1), store.attachmentLeaseCount());
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 251));
+    _ = store.sweep(300_203);
+    try testing.expectEqual(@as(usize, 0), store.attachmentLeaseCount());
+}
+
+test "session replica attachment lease replay floor rejects older live lease after newer expiry" {
+    var origin = try testKey(0x0d);
+    defer origin.deinit();
+    const token = testToken(0xd1);
+    const offer = try signedOffer(testing.allocator, upsertOffer(&origin, token, 100, 1, "state"), &origin);
+    defer testing.allocator.free(offer.wire);
+    const older_long = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 101, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 300,
+    }, &origin);
+    defer testing.allocator.free(older_long.wire);
+    const newer_short = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 102, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 200,
+    }, &origin);
+    defer testing.allocator.free(newer_short.wire);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(offer.decoded, 0, 150);
+    _ = try store.applySignedAttachmentLease(older_long.decoded, 150);
+    _ = try store.applySignedAttachmentLease(newer_short.decoded, 150);
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 150));
+    _ = store.sweep(201);
+    try testing.expectEqual(@as(usize, 1), store.attachmentLeaseCount());
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 201));
+    try testing.expectEqual(AttachmentLeaseDisposition.stale, try store.applySignedAttachmentLease(older_long.decoded, 201));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 201));
+}
+
+test "session replica attachment lease conflict floor survives unequal expiry replay" {
+    var origin = try testKey(0x0e);
+    defer origin.deinit();
+    const token = testToken(0xe1);
+    const offer = try signedOffer(testing.allocator, upsertOffer(&origin, token, 100, 1, "state"), &origin);
+    defer testing.allocator.free(offer.wire);
+    const short = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 101, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 200,
+    }, &origin);
+    defer testing.allocator.free(short.wire);
+    const long_conflict = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 101, 1),
+        .issued_at_ms = 99,
+        .expires_at_ms = 300,
+    }, &origin);
+    defer testing.allocator.free(long_conflict.wire);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(offer.decoded, 0, 150);
+    _ = try store.applySignedAttachmentLease(short.decoded, 150);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try store.applySignedAttachmentLease(long_conflict.decoded, 150),
+    );
+    _ = store.sweep(201);
+    try testing.expect(store.getAttachmentLease(token, offer.decoded.offer.revision.origin_node).?.conflicted);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.duplicate,
+        try store.applySignedAttachmentLease(long_conflict.decoded, 201),
+    );
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 201));
+}
+
+test "session replica attachment lease conflict witnesses replay fail closed to a fresh store" {
+    var origin = try testKey(0x0f);
+    defer origin.deinit();
+    const token = testToken(0xf1);
+    const offer = try signedOffer(testing.allocator, upsertOffer(&origin, token, 100, 1, "state"), &origin);
+    defer testing.allocator.free(offer.wire);
+    const short = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 101, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 200,
+    }, &origin);
+    defer testing.allocator.free(short.wire);
+    const long_conflict = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 101, 1),
+        .issued_at_ms = 99,
+        .expires_at_ms = 300,
+    }, &origin);
+    defer testing.allocator.free(long_conflict.wire);
+
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedOffer(offer.decoded, 0, 150);
+    _ = try source.applySignedAttachmentLease(short.decoded, 150);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try source.applySignedAttachmentLease(long_conflict.decoded, 150),
+    );
+
+    // The positive lifetime of the first witness has elapsed, but its bounded
+    // replay floor and the still-live conflicting witness must travel together.
+    try testing.expectEqual(@as(usize, 3), source.retainedCount(201));
+    var retained: [3]Store.RetainedObject = undefined;
+    try testing.expectEqual(@as(usize, 3), source.retainedObjectsInto(201, &retained));
+    try testing.expectEqual(Store.RetainedKind.offer, retained[0].kind);
+    try testing.expectEqual(Store.RetainedKind.attachment_lease, retained[1].kind);
+    try testing.expectEqual(Store.RetainedKind.attachment_lease, retained[2].kind);
+
+    var fresh = Store.init(testing.allocator);
+    defer fresh.deinit();
+    _ = try fresh.applySignedOffer(try decodeOffer(retained[0].wire), 7, 201);
+    _ = try fresh.applySignedAttachmentLease(try decodeAttachmentLease(retained[1].wire), 201);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try fresh.applySignedAttachmentLease(try decodeAttachmentLease(retained[2].wire), 201),
+    );
+    const restored = fresh.getAttachmentLease(token, offer.decoded.offer.revision.origin_node).?;
+    try testing.expect(restored.conflicted);
+    try testing.expect(restored.conflict_wire != null);
+    try testing.expect(!fresh.hasAttachedOriginOtherThan(token, 999, 201));
+
+    // Arrival order cannot change the denial: a peer may learn the still-live
+    // witness before the expired-but-retained first transcript.
+    var reverse = Store.init(testing.allocator);
+    defer reverse.deinit();
+    _ = try reverse.applySignedOffer(try decodeOffer(retained[0].wire), 8, 201);
+    _ = try reverse.applySignedAttachmentLease(try decodeAttachmentLease(retained[2].wire), 201);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try reverse.applySignedAttachmentLease(try decodeAttachmentLease(retained[1].wire), 201),
+    );
+    try testing.expect(reverse.getAttachmentLease(token, offer.decoded.offer.revision.origin_node).?.conflicted);
+    try testing.expect(!reverse.hasAttachedOriginOtherThan(token, 999, 201));
+}
+
+test "session replica attachment lease conflict OOM checkpoint remains denied and recovers witness" {
+    var origin = try testKey(0x10);
+    defer origin.deinit();
+    const token = testToken(0x10);
+    const first = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(first.wire);
+    const conflict = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 101,
+        .expires_at_ms = 250,
+    }, &origin);
+    defer testing.allocator.free(conflict.wire);
+
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedAttachmentLease(first.decoded, 150);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    source.allocator = failing.allocator();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, source.applySignedAttachmentLease(conflict.decoded, 150));
+    source.allocator = testing.allocator;
+    const denied = source.getAttachmentLease(token, signed_frame.originShortId(origin.public_key)).?;
+    try testing.expect(denied.conflicted);
+    try testing.expect(denied.conflict_wire == null);
+    try testing.expectEqual(@as(usize, 0), source.retainedCount(150));
+
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 150);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 150);
+    defer restored.deinit();
+    const restored_denied = restored.getAttachmentLease(token, signed_frame.originShortId(origin.public_key)).?;
+    try testing.expect(restored_denied.conflicted);
+    try testing.expect(restored_denied.conflict_wire == null);
+    try testing.expectEqual(@as(usize, 0), restored.retainedCount(150));
+
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try restored.applySignedAttachmentLease(conflict.decoded, 150),
+    );
+    try testing.expect(restored.getAttachmentLease(token, signed_frame.originShortId(origin.public_key)).?.conflict_wire != null);
+    try testing.expectEqual(@as(usize, 2), restored.retainedCount(150));
+
+    // A checkpoint must never accept a duplicated primary wire as the second
+    // equivocation witness, even when the outer checksum is recomputed.
+    const witnessed_checkpoint = try restored.encodeUpgradeCheckpoint(testing.allocator, 150);
+    defer testing.allocator.free(witnessed_checkpoint);
+    var duplicated = try testing.allocator.dupe(u8, witnessed_checkpoint);
+    defer testing.allocator.free(duplicated);
+    const primary_record = upgrade_checkpoint_header_len;
+    const primary_len: usize = std.mem.readInt(u32, duplicated[primary_record..][0..4], .big);
+    const conflict_tag = primary_record + 4 + primary_len;
+    try testing.expectEqual(@as(u8, 1), duplicated[conflict_tag]);
+    const witness_record = conflict_tag + 1;
+    const witness_len: usize = std.mem.readInt(u32, duplicated[witness_record..][0..4], .big);
+    try testing.expectEqual(primary_len, witness_len);
+    @memcpy(
+        duplicated[witness_record + 4 ..][0..witness_len],
+        duplicated[primary_record + 4 ..][0..primary_len],
+    );
+    rewriteUpgradeCheckpointChecksum(duplicated);
+    try testing.expectError(
+        error.InvalidMetadata,
+        Store.restoreUpgradeCheckpoint(testing.allocator, restored.cfg, duplicated, 150),
+    );
 }
 
 test "session replica signed OFFER upsert round-trips and verifies" {
@@ -3974,6 +4834,100 @@ test "session replica upgrade checkpoint preserves exact authority and deny stat
     try testing.expectEqual(ApplyDisposition.quarantined, (try restored.applySignedOffer(quarantined_alice.decoded, 603, 501)).disposition);
 }
 
+test "session replica upgrade checkpoint v2 preserves attachment leases and accepts v1" {
+    var origin = try testKey(0xa4);
+    defer origin.deinit();
+    const live_token = testToken(0xa4);
+    const conflicted_token = testToken(0xa5);
+
+    const live_offer = try signedOffer(testing.allocator, upsertOffer(&origin, live_token, 200, 1, "live"), &origin);
+    defer testing.allocator.free(live_offer.wire);
+    const conflicted_offer = try signedOffer(testing.allocator, upsertOffer(&origin, conflicted_token, 210, 1, "conflicted"), &origin);
+    defer testing.allocator.free(conflicted_offer.wire);
+    const live_lease = try signedAttachmentLease(testing.allocator, .{
+        .token = live_token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 150,
+        .expires_at_ms = 350,
+    }, &origin);
+    defer testing.allocator.free(live_lease.wire);
+    const conflict_first = try signedAttachmentLease(testing.allocator, .{
+        .token = conflicted_token,
+        .revision = revisionFor(&origin, 211, 1),
+        .issued_at_ms = 150,
+        .expires_at_ms = 350,
+    }, &origin);
+    defer testing.allocator.free(conflict_first.wire);
+    const conflict_second = try signedAttachmentLease(testing.allocator, .{
+        .token = conflicted_token,
+        .revision = revisionFor(&origin, 211, 1),
+        .issued_at_ms = 151,
+        .expires_at_ms = 350,
+    }, &origin);
+    defer testing.allocator.free(conflict_second.wire);
+
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedOffer(live_offer.decoded, 0, 200);
+    _ = try source.applySignedOffer(conflicted_offer.decoded, 0, 220);
+    _ = try source.applySignedAttachmentLease(live_lease.decoded, 200);
+    _ = try source.applySignedAttachmentLease(conflict_first.decoded, 220);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try source.applySignedAttachmentLease(conflict_second.decoded, 220),
+    );
+
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 250);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 250);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 2), restored.attachmentLeaseCount());
+    try testing.expect(restored.hasAttachedOriginOtherThan(live_token, 999, 250));
+    try testing.expect(!restored.hasAttachedOriginOtherThan(conflicted_token, 999, 250));
+    try testing.expectEqualSlices(
+        u8,
+        live_lease.wire,
+        restored.getAttachmentLease(live_token, live_offer.decoded.offer.revision.origin_node).?.wire,
+    );
+    try testing.expect(restored.getAttachmentLease(
+        conflicted_token,
+        conflicted_offer.decoded.offer.revision.origin_node,
+    ).?.conflicted);
+    try testing.expectEqualSlices(
+        u8,
+        conflict_second.wire,
+        restored.getAttachmentLease(
+            conflicted_token,
+            conflicted_offer.decoded.offer.revision.origin_node,
+        ).?.conflict_wire.?,
+    );
+    try testing.expect(restored.maxAuthorityRevision().?.eql(conflict_first.decoded.lease.revision));
+
+    try testing.expectError(
+        error.CapacityExceeded,
+        Store.restoreUpgradeCheckpoint(testing.allocator, .{ .max_attachment_leases = 1 }, checkpoint, 250),
+    );
+    var expired = try Store.restoreUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 351);
+    defer expired.deinit();
+    try testing.expectEqual(@as(usize, 2), expired.attachmentLeaseCount());
+    try testing.expect(!expired.hasAttachedOriginOtherThan(live_token, 999, 351));
+    try testing.expect(!expired.hasAttachedOriginOtherThan(conflicted_token, 999, 351));
+    try testing.expectEqual(@as(usize, 2), expired.entryCount());
+
+    var legacy_source = Store.init(testing.allocator);
+    defer legacy_source.deinit();
+    _ = try legacy_source.applySignedOffer(live_offer.decoded, 0, 200);
+    const v2_without_leases = try legacy_source.encodeUpgradeCheckpoint(testing.allocator, 250);
+    defer testing.allocator.free(v2_without_leases);
+    const v1 = try testDowngradeEmptyLeaseCheckpointToV1(testing.allocator, v2_without_leases);
+    defer testing.allocator.free(v1);
+    var legacy = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, v1, 250);
+    defer legacy.deinit();
+    try testing.expectEqual(@as(usize, 1), legacy.entryCount());
+    try testing.expectEqual(@as(usize, 0), legacy.attachmentLeaseCount());
+    try testing.expect(!legacy.hasAttachedOriginOtherThan(live_token, 999, 250));
+}
+
 test "session replica upgrade checkpoint strictly rejects truncation corruption duplicates and excess capacity" {
     var first_key = try testKey(0xb1);
     defer first_key.deinit();
@@ -3983,11 +4937,27 @@ test "session replica upgrade checkpoint strictly rejects truncation corruption 
     defer testing.allocator.free(first.wire);
     const second = try signedOffer(testing.allocator, upsertOffer(&second_key, testToken(0xb2), 2, 1, "same-size"), &second_key);
     defer testing.allocator.free(second.wire);
+    const first_lease = try signedAttachmentLease(testing.allocator, .{
+        .token = first.decoded.offer.token,
+        .revision = revisionFor(&first_key, 103, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 400,
+    }, &first_key);
+    defer testing.allocator.free(first_lease.wire);
+    const second_lease = try signedAttachmentLease(testing.allocator, .{
+        .token = second.decoded.offer.token,
+        .revision = revisionFor(&second_key, 104, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 400,
+    }, &second_key);
+    defer testing.allocator.free(second_lease.wire);
 
     var source = Store.init(testing.allocator);
     defer source.deinit();
     _ = try source.applySignedOffer(first.decoded, 701, 200);
     _ = try source.applySignedOffer(second.decoded, 702, 201);
+    _ = try source.applySignedAttachmentLease(first_lease.decoded, 200);
+    _ = try source.applySignedAttachmentLease(second_lease.decoded, 201);
     const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
     defer testing.allocator.free(checkpoint);
 
@@ -4055,9 +5025,38 @@ test "session replica upgrade checkpoint strictly rejects truncation corruption 
     rewriteUpgradeCheckpointChecksum(damaged);
     try testing.expectError(error.DuplicateState, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
 
+    const first_lease_record = second_record + 4 + second_wire_len + 8 + 1;
+    const first_lease_wire_len: usize = std.mem.readInt(u32, checkpoint[first_lease_record..][0..4], .big);
+    const first_lease_conflicted = first_lease_record + 4 + first_lease_wire_len;
+
+    @memcpy(damaged, checkpoint);
+    damaged[first_lease_conflicted] = 3;
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.InvalidMetadata, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    @memcpy(damaged, checkpoint);
+    damaged[first_lease_record + 4 + first_lease_wire_len - 1] ^= 1;
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.InvalidSignedObject, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    const second_lease_record = first_lease_conflicted + 1;
+    const second_lease_wire_len: usize = std.mem.readInt(u32, checkpoint[second_lease_record..][0..4], .big);
+    try testing.expectEqual(first_lease_wire_len, second_lease_wire_len);
+    @memcpy(damaged, checkpoint);
+    @memcpy(
+        damaged[second_lease_record + 4 ..][0..second_lease_wire_len],
+        checkpoint[first_lease_record + 4 ..][0..first_lease_wire_len],
+    );
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.DuplicateState, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
     try testing.expectError(
         error.CapacityExceeded,
         Store.restoreUpgradeCheckpoint(testing.allocator, .{ .max_entries = 1 }, checkpoint, 300),
+    );
+    try testing.expectError(
+        error.CapacityExceeded,
+        Store.restoreUpgradeCheckpoint(testing.allocator, .{ .max_attachment_leases = 1 }, checkpoint, 300),
     );
 }
 
@@ -4172,9 +5171,17 @@ test "session replica upgrade checkpoint restore is leak-free at every allocatio
     defer key.deinit();
     const offer = try signedOffer(testing.allocator, upsertOffer(&key, testToken(0xe1), 1, 1, "allocation-sweep"), &key);
     defer testing.allocator.free(offer.wire);
+    const lease = try signedAttachmentLease(testing.allocator, .{
+        .token = offer.decoded.offer.token,
+        .revision = revisionFor(&key, 102, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 500,
+    }, &key);
+    defer testing.allocator.free(lease.wire);
     var source = Store.init(testing.allocator);
     defer source.deinit();
     _ = try source.applySignedOffer(offer.decoded, 1_001, 200);
+    _ = try source.applySignedAttachmentLease(lease.decoded, 200);
     const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
     defer testing.allocator.free(checkpoint);
 
@@ -4183,7 +5190,9 @@ test "session replica upgrade checkpoint restore is leak-free at every allocatio
             var restored = try Store.restoreUpgradeCheckpoint(allocator, .{}, bytes, 300);
             defer restored.deinit();
             try testing.expectEqual(@as(usize, 1), restored.entryCount());
+            try testing.expectEqual(@as(usize, 1), restored.attachmentLeaseCount());
             try testing.expectEqualStrings("allocation-sweep", restored.get(testToken(0xe1)).?.snapshot);
+            try testing.expect(restored.hasAttachedOriginOtherThan(testToken(0xe1), 999, 300));
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{checkpoint});

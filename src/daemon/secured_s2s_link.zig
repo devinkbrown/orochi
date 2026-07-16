@@ -799,6 +799,15 @@ pub const SecuredLink = struct {
         try self.sendSessionReplica(.revoke, signed_revoke);
     }
 
+    pub fn supportsSessionAttachmentLeaseV2(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsSessionAttachmentLeaseV2();
+    }
+
+    pub fn sendSessionAttachmentLease(self: *SecuredLink, signed_lease: []const u8) anyerror!void {
+        try self.sendSessionReplica(.attachment_lease, signed_lease);
+    }
+
     /// Caller owns the slice and must deinit each item. `via_peer` is preserved
     /// from the authenticated inner link for future multipath Store application.
     pub fn takeSessionReplicaFrames(self: *SecuredLink) anyerror![]s2s_link.InboundSessionReplica {
@@ -1389,6 +1398,8 @@ test "session replica v2 activates only inside established Tsumugi SecuredLink" 
     defer p.deinit();
     try testing.expect(p.a.supportsSessionReplicaV2());
     try testing.expect(p.b.supportsSessionReplicaV2());
+    try testing.expect(p.a.supportsSessionAttachmentLeaseV2());
+    try testing.expect(p.b.supportsSessionAttachmentLeaseV2());
     p.a.clearOutbound();
     p.b.clearOutbound();
 
@@ -1428,10 +1439,18 @@ test "session replica v2 activates only inside established Tsumugi SecuredLink" 
         .expires_at_ms = 10_000,
     }, &p.ida.sign_kp);
     defer testing.allocator.free(revoke);
+    const lease = try session_replica.encodeAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = .{ .epoch = 103, .sequence = (103 << 16) | 1, .origin_node = p.ida.shortId() },
+        .issued_at_ms = 103,
+        .expires_at_ms = 10_000,
+    }, &p.ida.sign_kp);
+    defer testing.allocator.free(lease);
 
     try p.a.sendSessionReplicaOffer(offer);
     try p.a.sendSessionReplicaAck(ack);
     try p.a.sendSessionReplicaRevoke(revoke);
+    try p.a.sendSessionAttachmentLease(lease);
     // The transport object is inside an authenticated encrypted record; neither
     // its inner magic nor plaintext payload is exposed on the TCP wire.
     try testing.expect(p.a.outbound().len != 0);
@@ -1444,10 +1463,11 @@ test "session replica v2 activates only inside established Tsumugi SecuredLink" 
         for (frames) |*frame| frame.deinit(testing.allocator);
         testing.allocator.free(frames);
     }
-    try testing.expectEqual(@as(usize, 3), frames.len);
+    try testing.expectEqual(@as(usize, 4), frames.len);
     try testing.expectEqual(s2s_link.SessionReplicaKind.offer, frames[0].kind);
     try testing.expectEqual(s2s_link.SessionReplicaKind.ack, frames[1].kind);
     try testing.expectEqual(s2s_link.SessionReplicaKind.revoke, frames[2].kind);
+    try testing.expectEqual(s2s_link.SessionReplicaKind.attachment_lease, frames[3].kind);
     for (frames) |frame| try testing.expectEqual(p.ida.shortId(), frame.via_peer);
 
     const decoded_offer = try session_replica.decodeOffer(frames[0].signed_payload);

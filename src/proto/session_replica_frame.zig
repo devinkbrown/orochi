@@ -12,12 +12,13 @@
 //! Wire format:
 //!   magic[4] = "SRTF"
 //!   version u8 = 2
-//!   kind u8 = OFFER(1) | ACK(2) | REVOKE(3)
+//!   kind u8 = OFFER(1) | ACK(2) | REVOKE(3) | ATTACHMENT_LEASE(4)
 //!   signed_payload_len u32 (big endian)
 //!   signed_payload bytes
 //!
 //! OFFER and REVOKE both carry the Helix `SRO2` signed object, but the operation
-//! byte must respectively be upsert(1) or remove(2). ACK carries `SRA2`. This
+//! byte must respectively be upsert(1) or remove(2). ACK carries `SRA2`; a
+//! positive attachment lease carries fixed-size `SRL2`. This
 //! redundant kind binding prevents a valid object being reclassified merely by
 //! changing the outer S2S frame tag. Cryptographic verification remains the
 //! daemon callback's responsibility.
@@ -42,10 +43,12 @@ pub const max_signed_payload_len: usize = s2s_frame.default_max_frame_size -
 
 const offer_magic = [_]u8{ 'S', 'R', 'O', '2' };
 const ack_magic = [_]u8{ 'S', 'R', 'A', '2' };
+const attachment_lease_magic = [_]u8{ 'S', 'R', 'L', '2' };
 const offer_fixed_len: usize = 4 + 1 + 16 + 24 + 8 + 8 + 2 + 2 + 4;
 const ack_transcript_len: usize = 4 + 1 + 16 + 24 + 24 + 8 + 8 + 8;
 const inner_signature_len: usize = 32 + 64;
 const ack_signed_len: usize = ack_transcript_len + inner_signature_len;
+const attachment_lease_signed_len: usize = 4 + 16 + 24 + 8 + 8 + inner_signature_len;
 const account_len_offset: usize = 4 + 1 + 16 + 24 + 8 + 8;
 const max_account_len: usize = 128;
 const max_nick_len: usize = 64;
@@ -55,12 +58,14 @@ pub const Kind = enum(u8) {
     offer = 1,
     ack = 2,
     revoke = 3,
+    attachment_lease = 4,
 
     pub fn fromByte(value: u8) ?Kind {
         return switch (value) {
             1 => .offer,
             2 => .ack,
             3 => .revoke,
+            4 => .attachment_lease,
             else => null,
         };
     }
@@ -139,6 +144,11 @@ fn validatePayload(kind: Kind, payload: []const u8) EncodeError!void {
             if (payload.len != ack_signed_len) return error.InvalidPayload;
             if (!std.mem.eql(u8, payload[0..ack_magic.len], &ack_magic)) return error.InvalidPayload;
         },
+        .attachment_lease => {
+            if (payload.len != attachment_lease_signed_len) return error.InvalidPayload;
+            if (!std.mem.eql(u8, payload[0..attachment_lease_magic.len], &attachment_lease_magic))
+                return error.InvalidPayload;
+        },
     }
 }
 
@@ -190,17 +200,25 @@ fn fakeAck() [ack_signed_len]u8 {
     return out;
 }
 
-test "session replica transport OFFER ACK and REVOKE round-trip" {
+fn fakeAttachmentLease() [attachment_lease_signed_len]u8 {
+    var out: [attachment_lease_signed_len]u8 = @splat(0);
+    @memcpy(out[0..attachment_lease_magic.len], &attachment_lease_magic);
+    return out;
+}
+
+test "session replica transport OFFER ACK REVOKE and attachment lease round-trip" {
     const offer = try fakeOffer(testing.allocator, .offer);
     defer testing.allocator.free(offer);
     const revoke = try fakeOffer(testing.allocator, .revoke);
     defer testing.allocator.free(revoke);
     const ack = fakeAck();
+    const lease = fakeAttachmentLease();
 
     const cases = [_]struct { kind: Kind, payload: []const u8 }{
         .{ .kind = .offer, .payload = offer },
         .{ .kind = .ack, .payload = &ack },
         .{ .kind = .revoke, .payload = revoke },
+        .{ .kind = .attachment_lease, .payload = &lease },
     };
     for (cases) |case| {
         const out = try testing.allocator.alloc(u8, header_len + case.payload.len);
@@ -218,11 +236,13 @@ test "session replica transport binds inner object to outer kind" {
     const revoke = try fakeOffer(testing.allocator, .revoke);
     defer testing.allocator.free(revoke);
     const ack = fakeAck();
+    const lease = fakeAttachmentLease();
     var out: [header_len + ack_signed_len]u8 = undefined;
 
     try testing.expectError(error.InvalidPayload, encode(.revoke, offer, &out));
     try testing.expectError(error.InvalidPayload, encode(.offer, revoke, &out));
     try testing.expectError(error.InvalidPayload, encode(.offer, &ack, &out));
+    try testing.expectError(error.InvalidPayload, encode(.ack, &lease, &out));
     const ack_wire = try encode(.ack, &ack, &out);
     try testing.expectError(error.WrongKind, decode(.offer, ack_wire));
 }

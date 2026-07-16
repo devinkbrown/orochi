@@ -19,13 +19,82 @@ const rwlock = @import("../substrate/rwlock.zig");
 
 pub const ClientId = u64;
 pub const Token = [16]u8;
-pub const snapshot_capacity: usize = 64;
 
-pub const Error = std.mem.Allocator.Error || error{ TooManyAccounts, TooManySessions };
+/// The all-zero value records a locally tracked session when no CSPRNG was
+/// available. It is deliberately not a reclaim credential and therefore must
+/// never acquire global token-group or cross-account capability semantics.
+fn tokenIsSentinel(token: Token) bool {
+    return std.mem.allEqual(u8, &token, 0);
+}
+
+pub const snapshot_capacity: usize = 64;
+/// The configuration parser caps CHANNELLEN at 200 bytes. Keeping each complete
+/// name inline makes replacement/read/clear allocation-free once a row journal
+/// exists; first-arm allocation is staged before any generation or row changes.
+pub const local_channel_name_capacity: usize = 200;
+/// Capacity is the number of concurrently unresolved channel mutations, not a
+/// joined-channel limit. The command boundary must arm before mutating World;
+/// a ninth distinct pending channel therefore fails closed and can be retried
+/// after the projector clears a slot. Re-arming a pending case-insensitive
+/// channel replaces it even while all eight slots are occupied.
+pub const local_channel_projection_capacity: usize = 8;
+
+pub const Error = std.mem.Allocator.Error || error{
+    TooManyAccounts,
+    TooManySessions,
+    TokenAccountMismatch,
+};
 
 pub const Config = struct {
     max_accounts: usize = 65536,
     max_sessions_per_account: usize = snapshot_capacity,
+};
+
+/// One durable desired channel image within an exact reusable-token group.
+///
+/// Every local row bearing the token carries the same bounded set. That
+/// deliberate duplication lets any sibling detach or disappear without taking
+/// the retry source with it. A newer same-channel arm receives a generation, so
+/// an older in-flight retry cannot clear the replacement.
+pub const LocalChannelProjection = struct {
+    generation: u64 = 0,
+    channel_len: u8 = 0,
+    channel_bytes: [local_channel_name_capacity]u8 = @splat(0),
+    present: bool = false,
+    member_mode_bits: u8 = 0,
+
+    pub fn channel(self: *const LocalChannelProjection) []const u8 {
+        return self.channel_bytes[0..self.channel_len];
+    }
+};
+
+/// Canonically sorted, fixed-capacity pending work for one exact token group.
+/// Rows acquire an owned copy lazily on the first pending mutation. Arm stages
+/// every missing allocation before publishing any pointer, generation, or count;
+/// read/retry/CAS-clear remain allocation-free.
+const LocalChannelProjectionSet = struct {
+    revision: u64 = 0,
+    len: u8 = 0,
+    items: [local_channel_projection_capacity]LocalChannelProjection = @splat(.{}),
+
+    fn slice(self: *const LocalChannelProjectionSet) []const LocalChannelProjection {
+        return self.items[0..self.len];
+    }
+
+    fn isEmpty(self: *const LocalChannelProjectionSet) bool {
+        return self.len == 0;
+    }
+};
+
+pub const LocalChannelProjectionWork = struct {
+    token: Token,
+    projection: LocalChannelProjection,
+};
+
+pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
+    InvalidChannel,
+    NoSuchToken,
+    TooManyPendingChannels,
 };
 
 pub const Session = struct {
@@ -49,6 +118,9 @@ pub const Session = struct {
     /// local attachment's live state. This receive-side retry lane is separate
     /// from `replica_dirty` so projection never mints or republishes a replica.
     replica_projection_dirty: bool = false,
+    /// Lazily allocated retry journal. Each row owns a complete copy so sibling
+    /// removal cannot erase pending work; null means no channel is pending.
+    local_channel_projections: ?*LocalChannelProjectionSet = null,
 };
 
 pub const ResumeHandle = struct {
@@ -86,7 +158,7 @@ const SessionList = struct {
     items: std.ArrayListUnmanaged(Session) = .empty,
 
     fn deinit(self: *SessionList, allocator: std.mem.Allocator) void {
-        for (self.items.items) |*session| freeSnapshot(allocator, session);
+        for (self.items.items) |*session| freeSessionOwned(allocator, session);
         self.items.deinit(allocator);
     }
 
@@ -122,6 +194,10 @@ pub const PreparedTokenBind = struct {
     const State = enum { prepared, committed, aborted, finished };
 
     store: *SessionStore,
+    /// Store-owned account key for the claimant. The exclusive lock keeps this
+    /// slice alive through commit/abort, so defensive commit revalidation can
+    /// enforce the same folded-account token boundary as preparation.
+    account: []const u8,
     list: *SessionList,
     index: usize,
     client: ClientId,
@@ -129,11 +205,17 @@ pub const PreparedTokenBind = struct {
     expected_portable: bool,
     expected_dirty: bool,
     expected_projection_dirty: bool,
+    expected_local_projection_revision: u64,
     target_token: Token,
     kind: TokenBindKind,
     target_portable: bool,
     target_dirty: bool,
     target_projection_dirty: bool,
+    target_local_projection_revision: u64,
+    merged_local_projections: LocalChannelProjectionSet,
+    /// Missing per-row journals allocated during preparation. They remain
+    /// detached from store state until commit and are destroyed on abort.
+    staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null,
     result_portable: bool,
     state: State = .prepared,
 
@@ -151,28 +233,51 @@ pub const PreparedTokenBind = struct {
             !std.crypto.timing_safe.eql(Token, claimant.token, self.expected_token) or
             claimant.portable_resume != self.expected_portable or
             claimant.replica_dirty != self.expected_dirty or
-            claimant.replica_projection_dirty != self.expected_projection_dirty)
+            claimant.replica_projection_dirty != self.expected_projection_dirty or
+            localProjectionSetRevision(claimant.local_channel_projections) != self.expected_local_projection_revision)
         {
             return false;
         }
 
-        var current_target_portable = false;
-        var target_in_account = false;
-        for (self.list.items.items) |session| {
-            if (!std.crypto.timing_safe.eql(Token, session.token, self.target_token)) continue;
-            target_in_account = true;
-            current_target_portable = current_target_portable or session.portable_resume;
-        }
+        const current_target_account = self.store.tokenGroupStateForAccountLocked(
+            self.account,
+            self.target_token,
+        ) orelse return false;
         if (self.kind == .join_existing and
-            (!target_in_account or current_target_portable != self.target_portable))
+            (!current_target_account.found or current_target_account.portable != self.target_portable))
         {
             return false;
         }
         const current_target = self.store.tokenGroupStateLocked(self.target_token);
         if (current_target.dirty != self.target_dirty or
-            current_target.projection_dirty != self.target_projection_dirty)
+            current_target.projection_dirty != self.target_projection_dirty or
+            current_target.local_projections.revision != self.target_local_projection_revision)
         {
             return false;
+        }
+
+        var staged_index: usize = 0;
+        if (!self.merged_local_projections.isEmpty()) {
+            var accounts = self.store.accounts.iterator();
+            while (accounts.next()) |entry| {
+                for (entry.value_ptr.items.items) |*session| {
+                    if (!std.crypto.timing_safe.eql(Token, session.token, self.target_token)) continue;
+                    if (session.local_channel_projections != null) continue;
+                    session.local_channel_projections = self.staged_local_projection_sets.?[staged_index];
+                    staged_index += 1;
+                }
+            }
+            if (!std.crypto.timing_safe.eql(Token, claimant.token, self.target_token) and
+                claimant.local_channel_projections == null)
+            {
+                claimant.local_channel_projections = self.staged_local_projection_sets.?[staged_index];
+                staged_index += 1;
+            }
+        }
+        if (self.staged_local_projection_sets) |staged| {
+            std.debug.assert(staged_index == staged.len);
+            self.store.allocator.free(staged);
+            self.staged_local_projection_sets = null;
         }
 
         claimant.token = self.target_token;
@@ -184,6 +289,15 @@ pub const PreparedTokenBind = struct {
         self.store.setTokenGroupProjectionDirtyLocked(
             self.target_token,
             self.expected_projection_dirty or self.target_projection_dirty,
+        );
+        // A token bind merges both bounded channel sets. Distinct channels are
+        // retained; a case-insensitive collision keeps the newer generation.
+        // Preparation already proved the union fits, so commit cannot fail.
+        if (!self.merged_local_projections.isEmpty())
+            self.merged_local_projections.revision = self.store.nextLocalProjectionGenerationLocked();
+        self.store.setTokenGroupLocalProjectionsLocked(
+            self.target_token,
+            &self.merged_local_projections,
         );
         self.state = .committed;
         return true;
@@ -205,6 +319,7 @@ pub const PreparedTokenBind = struct {
         if (self.state == .aborted or self.state == .finished) return;
         std.debug.assert(self.state == .prepared);
         if (self.state != .prepared) return;
+        self.destroyStagedLocalProjectionSets();
         self.state = .aborted;
         self.store.lock.unlockExclusive();
     }
@@ -222,6 +337,13 @@ pub const PreparedTokenBind = struct {
             },
             .aborted, .finished => {},
         }
+    }
+
+    fn destroyStagedLocalProjectionSets(self: *PreparedTokenBind) void {
+        const staged = self.staged_local_projection_sets orelse return;
+        for (staged) |set| self.store.allocator.destroy(set);
+        self.store.allocator.free(staged);
+        self.staged_local_projection_sets = null;
     }
 };
 
@@ -243,6 +365,18 @@ pub const SessionStore = struct {
     /// independently; a blocked local projection cannot perturb publish order.
     dirty_projection_rows: usize = 0,
     projection_scan_cursor: ?Token = null,
+    /// Local exact-token channel projection is a third, independent retry lane.
+    /// It is row-backed so removing one sibling cannot erase pending work while
+    /// another exact attachment remains.
+    dirty_local_projection_rows: usize = 0,
+    /// Value cursor for the last returned (token, folded channel) work item.
+    /// Keeping the full owned channel makes removal and re-arm safe without a
+    /// pointer into the account map.
+    local_projection_scan_cursor: ?LocalChannelProjectionWork = null,
+    /// Generation zero is reserved for "never armed". Wrap is practically
+    /// unreachable, but skipping zero keeps the invariant total even under a
+    /// synthetic overflow test.
+    next_local_projection_generation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
         return initWithConfig(allocator, .{});
@@ -280,11 +414,30 @@ pub const SessionStore = struct {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
+        // An exact reusable token is a global capability. Bind it to exactly one
+        // ASCII-casefolded account before ensureAccount can allocate/publish an
+        // empty map entry or replacement can merge dirty/journal state.
+        const inherited = self.tokenGroupStateForAccountLocked(account, token) orelse
+            return error.TokenAccountMismatch;
         const list = try self.ensureAccount(account);
         if (list.indexOfClient(client)) |idx| {
             const displaced = list.items.items[idx];
-            const inherited = self.tokenGroupStateLocked(token);
+            const old_projection_storage = list.items.items[idx].local_channel_projections;
+            var projection_storage = old_projection_storage;
+            if (!inherited.local_projections.isEmpty() and projection_storage == null) {
+                projection_storage = try self.allocator.create(LocalChannelProjectionSet);
+            }
+            if (projection_storage) |storage| {
+                if (inherited.local_projections.isEmpty()) {
+                    projection_storage = null;
+                } else {
+                    storage.* = inherited.local_projections;
+                }
+            }
             self.removeDirtyRowLocked(&list.items.items[idx]);
+            if (projection_storage == null) {
+                if (old_projection_storage) |storage| self.allocator.destroy(storage);
+            }
             freeSnapshot(self.allocator, &list.items.items[idx]);
             list.items.items[idx] = .{
                 .client = client,
@@ -293,11 +446,14 @@ pub const SessionStore = struct {
                 .attached = true,
                 .replica_dirty = inherited.dirty,
                 .replica_projection_dirty = inherited.projection_dirty,
+                .local_channel_projections = projection_storage,
             };
             if (inherited.dirty) self.dirty_replica_rows += 1;
             if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+            if (projection_storage != null) self.dirty_local_projection_rows += 1;
             self.setTokenGroupDirtyLocked(token, inherited.dirty);
             self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
+            self.setTokenGroupLocalProjectionsLocked(token, &inherited.local_projections);
             return .{
                 .session = list.items.items[idx],
                 .evicted = .{ .token = displaced.token, .portable = displaced.portable_resume },
@@ -306,7 +462,12 @@ pub const SessionStore = struct {
         // Capture destination retry state before capacity eviction: if the new
         // attachment replaces the only detached row of this same exact token,
         // its pending publish/projection work must move with the logical group.
-        const inherited = self.tokenGroupStateLocked(token);
+        const projection_storage = if (!inherited.local_projections.isEmpty()) blk: {
+            const storage = try self.allocator.create(LocalChannelProjectionSet);
+            storage.* = inherited.local_projections;
+            break :blk storage;
+        } else null;
+        errdefer if (projection_storage) |storage| self.allocator.destroy(storage);
         var evicted: ?ResumeHandle = null;
         if (list.items.items.len >= self.cfg.max_sessions_per_account) {
             // At cap: evict the oldest *detached* ghost to make room for the live
@@ -315,7 +476,7 @@ pub const SessionStore = struct {
                 const displaced = list.items.items[evict];
                 evicted = .{ .token = displaced.token, .portable = displaced.portable_resume };
                 self.removeDirtyRowLocked(&list.items.items[evict]);
-                freeSnapshot(self.allocator, &list.items.items[evict]);
+                freeSessionOwned(self.allocator, &list.items.items[evict]);
                 _ = list.items.swapRemove(evict);
             } else return error.TooManySessions;
         }
@@ -326,12 +487,15 @@ pub const SessionStore = struct {
             .attached = true,
             .replica_dirty = inherited.dirty,
             .replica_projection_dirty = inherited.projection_dirty,
+            .local_channel_projections = projection_storage,
         };
         try list.items.append(self.allocator, session);
         if (inherited.dirty) self.dirty_replica_rows += 1;
         if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+        if (projection_storage != null) self.dirty_local_projection_rows += 1;
         self.setTokenGroupDirtyLocked(token, inherited.dirty);
         self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
+        self.setTokenGroupLocalProjectionsLocked(token, &inherited.local_projections);
         return .{ .session = session, .evicted = evicted };
     }
 
@@ -398,6 +562,7 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
+        if (tokenIsSentinel(list.items.items[idx].token)) return false;
         list.items.items[idx].portable_resume = true;
         return true;
     }
@@ -411,6 +576,10 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
+        if (tokenIsSentinel(list.items.items[idx].token)) {
+            list.items.items[idx].portable_resume = false;
+            return !issued;
+        }
         list.items.items[idx].portable_resume = issued;
         return true;
     }
@@ -424,7 +593,13 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return null;
         const idx = list.indexOfClient(client) orelse return null;
         const session = list.items.items[idx];
-        return .{ .token = session.token, .portable = session.portable_resume };
+        // Issuance remains an exact-row audit fact, but the credential authorizes
+        // the whole reusable token group. A sibling must therefore stay portable
+        // after the issuing attachment detaches or disappears.
+        return .{
+            .token = session.token,
+            .portable = self.tokenGroupStateLocked(session.token).portable,
+        };
     }
 
     /// Join `client` to the logical session identified by `token`. The client
@@ -460,10 +635,10 @@ pub const SessionStore = struct {
     }
 
     /// Prepare an exact account/client/token bind and retain the exclusive lock
-    /// through its later commit/abort boundary. This is deliberately allocation-
-    /// free: a daemon restore transaction may stage every fallible World change
-    /// first, prepare this ticket last, then commit all authority with no error
-    /// path remaining.
+    /// through its later commit/abort boundary. Missing destination journals are
+    /// staged here and freed on abort, so `commit` remains allocation-free. A
+    /// daemon restore transaction can prepare fallible World changes first,
+    /// prepare this ticket last, then commit with no error path remaining.
     pub fn prepareTokenBind(
         self: *SessionStore,
         account: []const u8,
@@ -475,27 +650,61 @@ pub const SessionStore = struct {
         var keep_locked = false;
         defer if (!keep_locked) self.lock.unlockExclusive();
 
-        const list = self.accounts.getPtr(account) orelse return null;
+        const account_entry = self.accounts.getEntry(account) orelse return null;
+        const account_key = account_entry.key_ptr.*;
+        const list = account_entry.value_ptr;
         const index = list.indexOfClient(client) orelse return null;
         const claimant = list.items.items[index];
+        if (tokenIsSentinel(token)) return null;
 
-        var target_portable = false;
-        var target_in_account = false;
-        for (list.items.items) |session| {
-            if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-            target_in_account = true;
-            target_portable = target_portable or session.portable_resume;
+        // `adopt_verified` proves possession, not permission to relabel another
+        // account's exact capability. Case variants remain one account, and
+        // join_existing may therefore find its target in an equivalent key.
+        const target = self.tokenGroupStateForAccountLocked(account_key, token) orelse return null;
+        if (kind == .join_existing and !target.found) return null;
+        const claimant_set = if (claimant.local_channel_projections) |set| set.* else LocalChannelProjectionSet{};
+        const target_set = target.local_projections;
+        var merged_local_projections: LocalChannelProjectionSet = .{};
+        // A bind that would exceed the fixed retry budget is refused before the
+        // caller stages World changes. No pending channel may be discarded.
+        if (!mergeLocalProjectionSets(&merged_local_projections, &claimant_set, &target_set)) return null;
+        var staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null;
+        if (!merged_local_projections.isEmpty()) {
+            var missing: usize = 0;
+            var accounts = self.accounts.iterator();
+            while (accounts.next()) |entry| {
+                for (entry.value_ptr.items.items) |session| {
+                    if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                    if (session.local_channel_projections == null) missing += 1;
+                }
+            }
+            if (!std.crypto.timing_safe.eql(Token, claimant.token, token) and
+                claimant.local_channel_projections == null)
+            {
+                missing += 1;
+            }
+            if (missing != 0) {
+                const staged = self.allocator.alloc(*LocalChannelProjectionSet, missing) catch return null;
+                var created: usize = 0;
+                while (created < missing) : (created += 1) {
+                    staged[created] = self.allocator.create(LocalChannelProjectionSet) catch {
+                        for (staged[0..created]) |set| self.allocator.destroy(set);
+                        self.allocator.free(staged);
+                        return null;
+                    };
+                    staged[created].* = .{};
+                }
+                staged_local_projection_sets = staged;
+            }
         }
-        if (kind == .join_existing and !target_in_account) return null;
-
-        const target = self.tokenGroupStateLocked(token);
         const result_portable = switch (kind) {
-            .join_existing => claimant.portable_resume or target_portable,
+            .join_existing => claimant.portable_resume or target.portable,
             .adopt_verified => |portable| portable,
         };
         keep_locked = true;
         return .{
             .store = self,
+            .account = account_key,
             .list = list,
             .index = index,
             .client = client,
@@ -503,11 +712,15 @@ pub const SessionStore = struct {
             .expected_portable = claimant.portable_resume,
             .expected_dirty = claimant.replica_dirty,
             .expected_projection_dirty = claimant.replica_projection_dirty,
+            .expected_local_projection_revision = claimant_set.revision,
             .target_token = token,
             .kind = kind,
-            .target_portable = target_portable,
+            .target_portable = target.portable,
             .target_dirty = target.dirty,
             .target_projection_dirty = target.projection_dirty,
+            .target_local_projection_revision = target_set.revision,
+            .merged_local_projections = merged_local_projections,
+            .staged_local_projection_sets = staged_local_projection_sets,
             .result_portable = result_portable,
         };
     }
@@ -602,6 +815,191 @@ pub const SessionStore = struct {
         return self.dirtyTokensIntoLocked(out, .projection);
     }
 
+    /// Arm or replace one desired local channel image for every row bearing
+    /// `token`. This accepts non-portable groups: same-node multi-client
+    /// convergence must not depend on a mesh-sealed credential.
+    ///
+    /// Missing per-row journals are allocated transactionally. Invalid input,
+    /// OOM, or a ninth distinct unresolved channel leaves every row, generation,
+    /// and counter unchanged. A case-insensitive replacement always succeeds at
+    /// capacity once the journals exist.
+    pub fn armTokenLocalChannelProjection(
+        self: *SessionStore,
+        token: Token,
+        channel: []const u8,
+        present: bool,
+        member_mode_bits: u8,
+    ) LocalProjectionArmError!LocalChannelProjection {
+        if (channel.len == 0 or channel.len > local_channel_name_capacity)
+            return error.InvalidChannel;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found) return error.NoSuchToken;
+        var next = state.local_projections;
+        const existing_index = localProjectionIndex(&next, channel);
+        if (existing_index == null and next.len == local_channel_projection_capacity)
+            return error.TooManyPendingChannels;
+
+        var missing: usize = 0;
+        var accounts = self.accounts.iterator();
+        while (accounts.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                if (std.crypto.timing_safe.eql(Token, session.token, token) and
+                    session.local_channel_projections == null)
+                {
+                    missing += 1;
+                }
+            }
+        }
+
+        var staged: ?[]*LocalChannelProjectionSet = null;
+        var staged_transferred = false;
+        defer if (staged) |sets| {
+            if (!staged_transferred) for (sets) |set| self.allocator.destroy(set);
+            self.allocator.free(sets);
+        };
+        if (missing != 0) {
+            const sets = try self.allocator.alloc(*LocalChannelProjectionSet, missing);
+            errdefer self.allocator.free(sets);
+            var created: usize = 0;
+            errdefer for (sets[0..created]) |set| self.allocator.destroy(set);
+            while (created < missing) : (created += 1) {
+                sets[created] = try self.allocator.create(LocalChannelProjectionSet);
+                sets[created].* = .{};
+            }
+            staged = sets;
+        }
+
+        const generation = self.nextLocalProjectionGenerationLocked();
+        var intent = LocalChannelProjection{
+            .generation = generation,
+            .channel_len = @intCast(channel.len),
+            .channel_bytes = @splat(0),
+            .present = present,
+            .member_mode_bits = member_mode_bits,
+        };
+        @memcpy(intent.channel_bytes[0..channel.len], channel);
+        localProjectionUpsert(&next, intent) catch unreachable;
+        next.revision = generation;
+
+        if (staged) |sets| {
+            var staged_index: usize = 0;
+            accounts = self.accounts.iterator();
+            while (accounts.next()) |entry| {
+                for (entry.value_ptr.items.items) |*session| {
+                    if (!std.crypto.timing_safe.eql(Token, session.token, token) or
+                        session.local_channel_projections != null) continue;
+                    session.local_channel_projections = sets[staged_index];
+                    staged_index += 1;
+                }
+            }
+            std.debug.assert(staged_index == sets.len);
+            staged_transferred = true;
+        }
+        self.setTokenGroupLocalProjectionsLocked(token, &next);
+        return intent;
+    }
+
+    /// Copy one pending channel image. Matching uses the daemon's current ASCII
+    /// case-insensitive channel semantics; the returned value owns its bytes.
+    pub fn tokenLocalChannelProjection(
+        self: *const SessionStore,
+        token: Token,
+        channel: []const u8,
+    ) ?LocalChannelProjection {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        const set = self.tokenGroupStateLocked(token).local_projections;
+        const index = localProjectionIndex(&set, channel) orelse return null;
+        return set.items[index];
+    }
+
+    /// Copy every pending image for one token into caller-owned storage.
+    pub fn tokenLocalChannelProjectionsInto(
+        self: *const SessionStore,
+        token: Token,
+        out: []LocalChannelProjection,
+    ) []const LocalChannelProjection {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        const set = self.tokenGroupStateLocked(token).local_projections;
+        const count = @min(out.len, set.len);
+        @memcpy(out[0..count], set.items[0..count]);
+        return out[0..count];
+    }
+
+    /// Compare-and-clear a completed local projection. A stale retry cannot
+    /// erase a newer replacement or another channel's pending intent.
+    pub fn clearTokenLocalChannelProjection(
+        self: *SessionStore,
+        token: Token,
+        channel: []const u8,
+        generation: u64,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var next = self.tokenGroupStateLocked(token).local_projections;
+        const index = localProjectionIndex(&next, channel) orelse return false;
+        if (next.items[index].generation != generation) return false;
+        localProjectionRemoveAt(&next, index);
+        next.revision = self.nextLocalProjectionGenerationLocked();
+        self.setTokenGroupLocalProjectionsLocked(token, &next);
+        return true;
+    }
+
+    /// Fair, bounded, allocation-free collection of exact (token, channel)
+    /// work. Its value cursor is independent from both signed-replica lanes.
+    pub fn dirtyLocalProjectionsInto(
+        self: *SessionStore,
+        out: []LocalChannelProjectionWork,
+    ) []const LocalChannelProjectionWork {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (self.dirty_local_projection_rows == 0 or out.len == 0) return out[0..0];
+
+        var n: usize = 0;
+        const original_cursor = self.local_projection_scan_cursor;
+        var wrapped = original_cursor == null;
+        var lower_bound = original_cursor;
+        while (n < out.len) {
+            var candidate: ?LocalChannelProjectionWork = null;
+            var accounts = self.accounts.iterator();
+            while (accounts.next()) |entry| {
+                for (entry.value_ptr.items.items) |session| {
+                    const set = session.local_channel_projections orelse continue;
+                    for (set.slice()) |projection| {
+                        const work = LocalChannelProjectionWork{ .token = session.token, .projection = projection };
+                        if (localWorkInSlice(out[0..n], work)) continue;
+                        if (lower_bound) |lower| {
+                            if (localWorkOrder(work, lower) != .gt) continue;
+                        }
+                        if (wrapped) {
+                            if (original_cursor) |upper| {
+                                if (localWorkOrder(work, upper) == .gt) continue;
+                            }
+                        }
+                        if (candidate == null or localWorkOrder(work, candidate.?) == .lt)
+                            candidate = work;
+                    }
+                }
+            }
+            if (candidate) |work| {
+                out[n] = work;
+                n += 1;
+                lower_bound = work;
+                continue;
+            }
+            if (wrapped) break;
+            wrapped = true;
+            lower_bound = null;
+        }
+        if (n != 0) self.local_projection_scan_cursor = out[n - 1];
+        return out[0..n];
+    }
+
     const DirtyKind = enum { publish, projection };
 
     fn dirtyTokensIntoLocked(self: *SessionStore, out: []Token, kind: DirtyKind) []const Token {
@@ -687,6 +1085,12 @@ pub const SessionStore = struct {
         return self.dirty_projection_rows;
     }
 
+    pub fn dirtyLocalProjectionRowCount(self: *const SessionStore) usize {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.dirty_local_projection_rows;
+    }
+
     /// Whether this exact attached client already belongs to `token`'s logical
     /// session. Kept separate from token lookup because duplicate tokens across
     /// live attachments are intentional.
@@ -697,6 +1101,44 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
         return std.crypto.timing_safe.eql(Token, list.items.items[idx].token, token);
+    }
+
+    /// Whether any live attachment currently holds this exact logical token.
+    /// Positive mesh attachment leases must cross this allocation-free boundary
+    /// instead of trusting a caller that may already have detached its row.
+    pub fn tokenHasAttachedPortable(self: *const SessionStore, token: Token) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        var has_attached = false;
+        var has_portable = false;
+        var it = self.accounts.valueIterator();
+        while (it.next()) |list| {
+            for (list.items.items) |session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                has_attached = has_attached or session.attached;
+                has_portable = has_portable or session.portable_resume;
+                if (has_attached and has_portable) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether any attached or detached row still owns this exact token.
+    /// The daemon uses this allocation-free probe to retry a local-origin REVOKE
+    /// after the final row has already been deleted and can no longer carry a
+    /// row-backed dirty bit.
+    pub fn containsToken(self: *const SessionStore, token: Token) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        var it = self.accounts.valueIterator();
+        while (it.next()) |list| {
+            for (list.items.items) |session| {
+                if (std.crypto.timing_safe.eql(Token, session.token, token)) return true;
+            }
+        }
+        return false;
     }
 
     /// Exact client membership probe that does not truncate at the public list
@@ -719,7 +1161,7 @@ pub const SessionStore = struct {
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
         self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
-        freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
+        freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
         _ = entry.value_ptr.items.swapRemove(idx);
         if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
         return true;
@@ -735,7 +1177,7 @@ pub const SessionStore = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
                 self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
-                freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
+                freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
                 _ = entry.value_ptr.items.swapRemove(idx);
                 if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
                 return 1;
@@ -920,36 +1362,66 @@ pub const SessionStore = struct {
         };
     }
 
-    /// Deep-copy every detached snapshot whose portable credential was issued.
+    /// Deep-copy one canonical detached snapshot per portable exact-token group.
     /// Used when a secured peer (re)establishes after missing the detach-time
-    /// broadcast. The returned records and outer slice are caller-owned.
+    /// broadcast. Group portability is the OR of per-row issuance; selection is
+    /// newest signon, then highest client id, so insertion/hash iteration order
+    /// cannot make anti-entropy sign an arbitrary older ghost. The returned
+    /// records and outer slice are caller-owned.
     pub fn copyPortableDetachedSnapshots(self: *const SessionStore, allocator: std.mem.Allocator) std.mem.Allocator.Error![]PortableDetachedSnapshot {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
-        var count: usize = 0;
-        var count_it = self.accounts.iterator();
-        while (count_it.next()) |entry| {
-            for (entry.value_ptr.items.items) |session| {
-                if (!session.attached and session.portable_resume and session.snapshot != null) count += 1;
+        const Selection = struct {
+            account: []const u8,
+            session: ?*const Session = null,
+            portable: bool = false,
+        };
+        var selections: std.AutoHashMapUnmanaged(Token, Selection) = .empty;
+        defer selections.deinit(allocator);
+        var row_count: usize = 0;
+        var count_it = self.accounts.valueIterator();
+        while (count_it.next()) |list| row_count += list.items.items.len;
+        const selection_capacity = std.math.cast(u32, row_count) orelse return error.OutOfMemory;
+        try selections.ensureTotalCapacity(allocator, selection_capacity);
+
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |*session| {
+                const selected = selections.getOrPutAssumeCapacity(session.token);
+                if (!selected.found_existing) selected.value_ptr.* = .{ .account = entry.key_ptr.* };
+                selected.value_ptr.portable = selected.value_ptr.portable or session.portable_resume;
+                if (session.attached or session.snapshot == null) continue;
+                const current = selected.value_ptr.session;
+                if (current == null or session.signon_ms > current.?.signon_ms or
+                    (session.signon_ms == current.?.signon_ms and session.client > current.?.client))
+                {
+                    selected.value_ptr.account = entry.key_ptr.*;
+                    selected.value_ptr.session = session;
+                }
             }
+        }
+
+        var count: usize = 0;
+        var selected_count = selections.valueIterator();
+        while (selected_count.next()) |selection| {
+            if (selection.portable and selection.session != null) count += 1;
         }
 
         const out = try allocator.alloc(PortableDetachedSnapshot, count);
         errdefer allocator.free(out);
         var n: usize = 0;
         errdefer for (out[0..n]) |*record| record.deinit(allocator);
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |session| {
-                if (session.attached or !session.portable_resume) continue;
-                const snapshot = session.snapshot orelse continue;
-                const account = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(account);
-                const copied = try allocator.dupe(u8, snapshot);
-                out[n] = .{ .account = account, .token = session.token, .snapshot = copied };
-                n += 1;
-            }
+        var selected_it = selections.iterator();
+        while (selected_it.next()) |entry| {
+            const selection = entry.value_ptr;
+            if (!selection.portable) continue;
+            const session = selection.session orelse continue;
+            const account = try allocator.dupe(u8, selection.account);
+            errdefer allocator.free(account);
+            const copied = try allocator.dupe(u8, session.snapshot.?);
+            out[n] = .{ .account = account, .token = entry.key_ptr.*, .snapshot = copied };
+            n += 1;
         }
         return out;
     }
@@ -968,11 +1440,13 @@ pub const SessionStore = struct {
         portable: bool = false,
         dirty: bool = false,
         projection_dirty: bool = false,
+        local_projections: LocalChannelProjectionSet = .{},
     };
 
     /// Caller holds `lock` exclusively or shared for the duration of the scan.
     fn tokenGroupStateLocked(self: *const SessionStore, token: Token) TokenGroupState {
         var state: TokenGroupState = .{};
+        if (tokenIsSentinel(token)) return state;
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |session| {
@@ -981,6 +1455,43 @@ pub const SessionStore = struct {
                 state.portable = state.portable or session.portable_resume;
                 state.dirty = state.dirty or session.replica_dirty;
                 state.projection_dirty = state.projection_dirty or session.replica_projection_dirty;
+                if (session.local_channel_projections) |set| {
+                    if (set.revision >= state.local_projections.revision)
+                        state.local_projections = set.*;
+                }
+            }
+        }
+        return state;
+    }
+
+    /// Return exact-token group state only when every matching row belongs to
+    /// `account` under ASCII case-folding. `null` is a fail-closed ownership
+    /// conflict; an empty non-null state means the token is currently rowless.
+    /// Caller holds the store lock for the complete scan.
+    fn tokenGroupStateForAccountLocked(
+        self: *const SessionStore,
+        account: []const u8,
+        token: Token,
+    ) ?TokenGroupState {
+        var state: TokenGroupState = .{};
+        // The sentinel is a per-row absence marker, not a bearer capability.
+        // Returning an empty non-conflicting state lets independent accounts be
+        // tracked without merging their retry/portable state or authorizing a
+        // later token-group bind.
+        if (tokenIsSentinel(token)) return state;
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) return null;
+                state.found = true;
+                state.portable = state.portable or session.portable_resume;
+                state.dirty = state.dirty or session.replica_dirty;
+                state.projection_dirty = state.projection_dirty or session.replica_projection_dirty;
+                if (session.local_channel_projections) |set| {
+                    if (set.revision >= state.local_projections.revision)
+                        state.local_projections = set.*;
+                }
             }
         }
         return state;
@@ -990,6 +1501,7 @@ pub const SessionStore = struct {
     /// holds `lock` exclusively. Portability remains a per-row issuance fact;
     /// token-group eligibility is computed by OR in `tokenGroupStateLocked`.
     fn setTokenGroupDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
+        if (tokenIsSentinel(token)) return;
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |*session| {
@@ -1000,6 +1512,7 @@ pub const SessionStore = struct {
     }
 
     fn setTokenGroupProjectionDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
+        if (tokenIsSentinel(token)) return;
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |*session| {
@@ -1007,6 +1520,28 @@ pub const SessionStore = struct {
                 self.setReplicaProjectionDirtyLocked(session, dirty);
             }
         }
+    }
+
+    fn setTokenGroupLocalProjectionsLocked(
+        self: *SessionStore,
+        token: Token,
+        projections: *const LocalChannelProjectionSet,
+    ) void {
+        if (tokenIsSentinel(token)) return;
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |*session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                self.setLocalProjectionsLocked(session, projections);
+            }
+        }
+    }
+
+    fn nextLocalProjectionGenerationLocked(self: *SessionStore) u64 {
+        self.next_local_projection_generation +%= 1;
+        if (self.next_local_projection_generation == 0)
+            self.next_local_projection_generation = 1;
+        return self.next_local_projection_generation;
     }
 
     fn setReplicaDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
@@ -1029,6 +1564,11 @@ pub const SessionStore = struct {
             std.debug.assert(self.dirty_projection_rows != 0);
             self.dirty_projection_rows -= 1;
         }
+        if (session.local_channel_projections) |set| {
+            if (set.isEmpty()) return;
+            std.debug.assert(self.dirty_local_projection_rows != 0);
+            self.dirty_local_projection_rows -= 1;
+        }
     }
 
     fn setReplicaProjectionDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
@@ -1042,6 +1582,29 @@ pub const SessionStore = struct {
         }
     }
 
+    fn setLocalProjectionsLocked(
+        self: *SessionStore,
+        session: *Session,
+        projections: *const LocalChannelProjectionSet,
+    ) void {
+        const was_dirty = if (session.local_channel_projections) |set| !set.isEmpty() else false;
+        const now_dirty = !projections.isEmpty();
+        if (now_dirty) {
+            const storage = session.local_channel_projections orelse unreachable;
+            storage.* = projections.*;
+        } else if (session.local_channel_projections) |storage| {
+            self.allocator.destroy(storage);
+            session.local_channel_projections = null;
+        }
+        if (was_dirty == now_dirty) return;
+        if (now_dirty) {
+            self.dirty_local_projection_rows += 1;
+        } else {
+            std.debug.assert(self.dirty_local_projection_rows != 0);
+            self.dirty_local_projection_rows -= 1;
+        }
+    }
+
     fn dropAccount(self: *SessionStore, entry: std.StringHashMap(SessionList).Entry) void {
         const owned_key = entry.key_ptr.*;
         for (entry.value_ptr.items.items) |session| self.removeDirtyRowLocked(&session);
@@ -1051,9 +1614,109 @@ pub const SessionStore = struct {
     }
 };
 
+fn localProjectionSetRevision(set: ?*const LocalChannelProjectionSet) u64 {
+    return if (set) |value| value.revision else 0;
+}
+
+fn localChannelOrder(a: []const u8, b: []const u8) std.math.Order {
+    const shared = @min(a.len, b.len);
+    for (a[0..shared], b[0..shared]) |a_byte, b_byte| {
+        const a_folded = std.ascii.toLower(a_byte);
+        const b_folded = std.ascii.toLower(b_byte);
+        if (a_folded < b_folded) return .lt;
+        if (a_folded > b_folded) return .gt;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+fn localProjectionIndex(set: *const LocalChannelProjectionSet, channel: []const u8) ?usize {
+    for (set.slice(), 0..) |projection, index| {
+        if (std.ascii.eqlIgnoreCase(projection.channel(), channel)) return index;
+    }
+    return null;
+}
+
+fn localProjectionUpsert(
+    set: *LocalChannelProjectionSet,
+    projection: LocalChannelProjection,
+) error{TooManyPendingChannels}!void {
+    if (localProjectionIndex(set, projection.channel())) |index| {
+        set.items[index] = projection;
+        return;
+    }
+    if (set.len == local_channel_projection_capacity) return error.TooManyPendingChannels;
+
+    var insert_at: usize = 0;
+    while (insert_at < set.len and
+        localChannelOrder(set.items[insert_at].channel(), projection.channel()) == .lt)
+    {
+        insert_at += 1;
+    }
+    var cursor: usize = set.len;
+    while (cursor > insert_at) : (cursor -= 1)
+        set.items[cursor] = set.items[cursor - 1];
+    set.items[insert_at] = projection;
+    set.len += 1;
+}
+
+fn localProjectionRemoveAt(set: *LocalChannelProjectionSet, index: usize) void {
+    std.debug.assert(index < set.len);
+    var cursor = index;
+    while (cursor + 1 < set.len) : (cursor += 1)
+        set.items[cursor] = set.items[cursor + 1];
+    set.len -= 1;
+    set.items[set.len] = .{};
+}
+
+fn mergeLocalProjectionSets(
+    out: *LocalChannelProjectionSet,
+    a: *const LocalChannelProjectionSet,
+    b: *const LocalChannelProjectionSet,
+) bool {
+    out.* = .{};
+    for (a.slice()) |projection|
+        localProjectionUpsert(out, projection) catch return false;
+    for (b.slice()) |projection| {
+        if (localProjectionIndex(out, projection.channel())) |index| {
+            if (projection.generation > out.items[index].generation)
+                out.items[index] = projection;
+            continue;
+        }
+        localProjectionUpsert(out, projection) catch return false;
+    }
+    out.revision = @max(a.revision, b.revision);
+    return true;
+}
+
+fn localWorkOrder(a: LocalChannelProjectionWork, b: LocalChannelProjectionWork) std.math.Order {
+    const token_order = std.mem.order(u8, &a.token, &b.token);
+    if (token_order != .eq) return token_order;
+    return localChannelOrder(a.projection.channel(), b.projection.channel());
+}
+
+fn localWorkInSlice(
+    work: []const LocalChannelProjectionWork,
+    needle: LocalChannelProjectionWork,
+) bool {
+    for (work) |candidate| {
+        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
+            std.ascii.eqlIgnoreCase(candidate.projection.channel(), needle.projection.channel()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn freeSnapshot(allocator: std.mem.Allocator, session: *Session) void {
     if (session.snapshot) |bytes| allocator.free(bytes);
     session.snapshot = null;
+}
+
+fn freeSessionOwned(allocator: std.mem.Allocator, session: *Session) void {
+    freeSnapshot(allocator, session);
+    if (session.local_channel_projections) |set| allocator.destroy(set);
+    session.local_channel_projections = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1727,281 @@ const testing = std.testing;
 
 fn tok(b: u8) Token {
     return @as([16]u8, @splat(b));
+}
+
+test "local channel projection journals overlapping channels and CAS clears independently" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x31);
+    const too_long: [local_channel_name_capacity + 1]u8 = @splat('x');
+    try testing.expectError(error.InvalidChannel, s.armTokenLocalChannelProjection(token, &too_long, true, 0));
+    try testing.expectError(error.NoSuchToken, s.armTokenLocalChannelProjection(token, "#missing", true, 0));
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+    const a = try s.armTokenLocalChannelProjection(token, "#a", true, 0x0D);
+    const b = try s.armTokenLocalChannelProjection(token, "#b", false, 0x02);
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+    try testing.expectEqual(a.generation, s.tokenLocalChannelProjection(token, "#A").?.generation);
+    try testing.expectEqual(b.generation, s.tokenLocalChannelProjection(token, "#b").?.generation);
+
+    var all: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    try testing.expectEqual(@as(usize, 2), s.tokenLocalChannelProjectionsInto(token, &all).len);
+    try testing.expect(!s.clearTokenLocalChannelProjection(token, "#a", b.generation));
+    try testing.expect(s.clearTokenLocalChannelProjection(token, "#A", a.generation));
+    try testing.expect(s.tokenLocalChannelProjection(token, "#a") == null);
+    try testing.expect(s.tokenLocalChannelProjection(token, "#b") != null);
+    try testing.expect(s.clearTokenLocalChannelProjection(token, "#b", b.generation));
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+}
+
+test "local channel projection arm OOM is transactional and retryable" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const token = tok(0x32);
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+    const generation_before = s.next_local_projection_generation;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, s.armTokenLocalChannelProjection(token, "#oom", true, 1));
+    try testing.expectEqual(generation_before, s.next_local_projection_generation);
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+    try testing.expect(s.tokenLocalChannelProjection(token, "#oom") == null);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const armed = try s.armTokenLocalChannelProjection(token, "#oom", true, 1);
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+    // Once journals exist, same-channel replacement/read/scan/clear allocate nothing.
+    failing.has_induced_failure = false;
+    failing.fail_index = failing.alloc_index;
+    const replaced = try s.armTokenLocalChannelProjection(token, "#OOM", false, 3);
+    try testing.expect(replaced.generation > armed.generation);
+    var work_buf: [2]LocalChannelProjectionWork = undefined;
+    try testing.expectEqual(@as(usize, 1), s.dirtyLocalProjectionsInto(&work_buf).len);
+    try testing.expect(s.clearTokenLocalChannelProjection(token, "#oom", replaced.generation));
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "local channel projection capacity fails closed and full same-channel arm coalesces" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+    const token = tok(0x33);
+    _ = try s.attach("alice", 1, token, 1);
+
+    var first_generation: u64 = 0;
+    for (0..local_channel_projection_capacity) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#c{d}", .{index});
+        const intent = try s.armTokenLocalChannelProjection(token, channel, true, @intCast(index));
+        if (index == 0) first_generation = intent.generation;
+    }
+    const generation_before = s.next_local_projection_generation;
+    try testing.expectError(
+        error.TooManyPendingChannels,
+        s.armTokenLocalChannelProjection(token, "#overflow", true, 0),
+    );
+    try testing.expectEqual(generation_before, s.next_local_projection_generation);
+
+    failing.fail_index = failing.alloc_index;
+    const replacement = try s.armTokenLocalChannelProjection(token, "#C0", false, 7);
+    try testing.expect(replacement.generation > first_generation);
+    try testing.expect(!s.tokenLocalChannelProjection(token, "#c0").?.present);
+    try testing.expect(!failing.has_induced_failure);
+    var all: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    try testing.expectEqual(local_channel_projection_capacity, s.tokenLocalChannelProjectionsInto(token, &all).len);
+}
+
+test "local channel projection survives detach and sibling removal until final row" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const token = tok(0x34);
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+    const intent = try s.armTokenLocalChannelProjection(token, "#durable", true, 3);
+    try testing.expect(s.markDetached("alice", 1));
+    try testing.expect(s.remove("alice", 1));
+    try testing.expectEqual(intent.generation, s.tokenLocalChannelProjection(token, "#durable").?.generation);
+    try testing.expectEqual(@as(usize, 1), s.dirtyLocalProjectionRowCount());
+    try testing.expectEqual(@as(usize, 1), s.removeClient(2));
+    try testing.expect(s.tokenLocalChannelProjection(token, "#durable") == null);
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+}
+
+test "attach inheritance stages lazy journals before append or replacement mutation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+    const target = tok(0x35);
+    const clean = tok(0x36);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, clean, 2);
+    const intent = try s.armTokenLocalChannelProjection(target, "#inherit", true, 1);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, s.attach("alice", 3, target, 3));
+    try testing.expect(!s.containsClient("alice", 3));
+    try testing.expectEqual(@as(usize, 1), s.dirtyLocalProjectionRowCount());
+
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try s.attach("alice", 3, target, 3);
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+    try testing.expectEqual(intent.generation, s.tokenLocalChannelProjection(target, "#inherit").?.generation);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, s.attach("alice", 2, target, 4));
+    try testing.expect(s.clientHasToken("alice", 2, clean));
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared token bind preserves channel union and newest case-insensitive collision" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x41);
+    const source = tok(0x42);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, source, 2);
+    _ = try s.attach("alice", 3, source, 3);
+    _ = try s.armTokenLocalChannelProjection(target, "#a", true, 1);
+    _ = try s.armTokenLocalChannelProjection(target, "#same", true, 1);
+    _ = try s.armTokenLocalChannelProjection(source, "#b", false, 2);
+    const newest = try s.armTokenLocalChannelProjection(source, "#SAME", false, 7);
+
+    var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expect(prepared.commit());
+    prepared.finish();
+    try testing.expect(s.tokenLocalChannelProjection(target, "#a") != null);
+    try testing.expect(s.tokenLocalChannelProjection(target, "#b") != null);
+    try testing.expectEqual(newest.generation, s.tokenLocalChannelProjection(target, "#same").?.generation);
+    // The surviving source sibling retains its source-token journal only.
+    try testing.expect(s.tokenLocalChannelProjection(source, "#a") == null);
+    try testing.expect(s.tokenLocalChannelProjection(source, "#b") != null);
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared token adopt carries the journal and abort frees staged rows" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x45);
+    const source = tok(0x46);
+    _ = try s.attach("alice", 1, source, 1);
+    _ = try s.attach("alice", 2, source, 2);
+    const a = try s.armTokenLocalChannelProjection(source, "#a", true, 1);
+    const b = try s.armTokenLocalChannelProjection(source, "#b", false, 2);
+
+    var adopt = s.prepareTokenBind("alice", 1, target, .{ .adopt_verified = false }) orelse
+        return error.TestUnexpectedResult;
+    defer adopt.deinit();
+    try testing.expect(adopt.commit());
+    adopt.finish();
+    try testing.expectEqual(a.generation, s.tokenLocalChannelProjection(target, "#a").?.generation);
+    try testing.expectEqual(b.generation, s.tokenLocalChannelProjection(target, "#b").?.generation);
+    try testing.expectEqual(a.generation, s.tokenLocalChannelProjection(source, "#a").?.generation);
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+
+    // A clean claimant joining the dirty target requires a staged journal. An
+    // abort must destroy it and leave the claimant/token/count untouched.
+    const clean = tok(0x47);
+    _ = try s.attach("alice", 3, clean, 3);
+    var aborted = s.prepareTokenBind("alice", 3, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    aborted.abort();
+    aborted.deinit();
+    try testing.expect(s.clientHasToken("alice", 3, clean));
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared token bind rejects an over-capacity union without mutation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x43);
+    const source = tok(0x44);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, source, 2);
+    for (0..5) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#t{d}", .{index});
+        _ = try s.armTokenLocalChannelProjection(target, channel, true, 0);
+    }
+    for (0..4) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#s{d}", .{index});
+        _ = try s.armTokenLocalChannelProjection(source, channel, true, 0);
+    }
+    try testing.expect(s.prepareTokenBind("alice", 2, target, .join_existing) == null);
+    try testing.expect(s.clientHasToken("alice", 2, source));
+    try testing.expect(s.tokenLocalChannelProjection(target, "#t0") != null);
+    try testing.expect(s.tokenLocalChannelProjection(source, "#s0") != null);
+}
+
+test "bounded local projection work scan rotates across channels and tokens" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const a = tok(0x50);
+    const b = tok(0x51);
+    _ = try s.attach("a", 1, a, 1);
+    _ = try s.attach("b", 2, b, 2);
+    _ = try s.armTokenLocalChannelProjection(a, "#a", true, 0);
+    _ = try s.armTokenLocalChannelProjection(a, "#b", true, 0);
+    _ = try s.armTokenLocalChannelProjection(b, "#a", true, 0);
+
+    var first_buf: [2]LocalChannelProjectionWork = undefined;
+    const first = s.dirtyLocalProjectionsInto(&first_buf);
+    try testing.expectEqual(@as(usize, 2), first.len);
+    var second_buf: [2]LocalChannelProjectionWork = undefined;
+    const second = s.dirtyLocalProjectionsInto(&second_buf);
+    try testing.expectEqual(@as(usize, 2), second.len);
+    try testing.expect(!localWorkInSlice(first, second[0]));
+    try testing.expect(localWorkInSlice(first, second[1])); // wrapped fairly
+}
+
+test "local projection arm and prepared bind allocation failures are leak-clean" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+            const target = tok(0x71);
+            _ = try s.attach("sweep", 1, target, 1);
+            _ = try s.attach("sweep", 2, tok(0x72), 2);
+            const intent = try s.armTokenLocalChannelProjection(target, "#sweep", true, 0x0F);
+            var prepared = s.prepareTokenBind("sweep", 2, target, .join_existing) orelse
+                return error.OutOfMemory;
+            defer prepared.deinit();
+            try testing.expect(prepared.commit());
+            prepared.finish();
+            try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+            try testing.expect(s.clearTokenLocalChannelProjection(target, "#sweep", intent.generation));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
+
+test "local projection arm rolls back every lazy journal allocation boundary" {
+    for (0..3) |failure_offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.init(failing.allocator());
+        defer s.deinit();
+        const token = tok(@intCast(0x78 + failure_offset));
+        _ = try s.attach("rollback", 1, token, 1);
+        _ = try s.attach("rollback", 2, token, 2);
+
+        failing.fail_index = failing.alloc_index + failure_offset;
+        try testing.expectError(
+            error.OutOfMemory,
+            s.armTokenLocalChannelProjection(token, "#rollback", true, 1),
+        );
+        try testing.expectEqual(@as(u64, 0), s.next_local_projection_generation);
+        try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+        try testing.expect(s.tokenLocalChannelProjection(token, "#rollback") == null);
+
+        failing.fail_index = std.math.maxInt(usize);
+        _ = try s.armTokenLocalChannelProjection(token, "#rollback", true, 1);
+        try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+    }
 }
 
 test "attach lists a multi-device account; idempotent re-attach" {
@@ -1191,6 +2129,60 @@ test "portable detached anti-entropy copies only opted-in snapshots" {
     try testing.expectEqualSlices(u8, &tok(1), &copies[0].token);
 }
 
+test "portable detached anti-entropy selects one newest snapshot independent of insertion order" {
+    const token = tok(0x2a);
+    var stores = [_]SessionStore{
+        SessionStore.init(testing.allocator),
+        SessionStore.init(testing.allocator),
+    };
+    defer for (&stores) |*store| store.deinit();
+
+    // Same logical rows, reversed insertion order. Only the older row receives
+    // the credential, proving portability is group-wide while snapshot choice
+    // remains newest signon rather than "portable row" or hash order.
+    _ = try stores[0].attach("Alice", 10, token, 100);
+    _ = try stores[0].attach("aLiCe", 20, token, 200);
+    _ = try stores[1].attach("aLiCe", 20, token, 200);
+    _ = try stores[1].attach("Alice", 10, token, 100);
+    for (&stores) |*store| {
+        try testing.expect(store.markPortableResumeIssued("Alice", 10));
+        try testing.expect(store.markDetachedWithSnapshot("Alice", 10, "older"));
+        try testing.expect(store.markDetachedWithSnapshot("aLiCe", 20, "newest"));
+        const copies = try store.copyPortableDetachedSnapshots(testing.allocator);
+        defer {
+            for (copies) |*copy| copy.deinit(testing.allocator);
+            testing.allocator.free(copies);
+        }
+        try testing.expectEqual(@as(usize, 1), copies.len);
+        try testing.expectEqualSlices(u8, &token, &copies[0].token);
+        try testing.expectEqualStrings("aLiCe", copies[0].account);
+        try testing.expectEqualStrings("newest", copies[0].snapshot);
+    }
+}
+
+test "portable detached canonical copy is leak-clean at every allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+            const token = tok(0x2b);
+            _ = try s.attach("alice", 1, token, 10);
+            _ = try s.attach("alice", 2, token, 20);
+            try testing.expect(s.markPortableResumeIssued("alice", 1));
+            if (!s.markDetachedWithSnapshot("alice", 1, "old")) return error.OutOfMemory;
+            if (!s.markDetachedWithSnapshot("alice", 2, "new")) return error.OutOfMemory;
+            const copies = try s.copyPortableDetachedSnapshots(allocator);
+            defer {
+                for (copies) |*copy| copy.deinit(allocator);
+                allocator.free(copies);
+            }
+            try testing.expectEqual(@as(usize, 1), copies.len);
+            try testing.expectEqualStrings("new", copies[0].snapshot);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
+
 test "copyNewestDetachedSnapshotInAccount ignores current client and returns newest ghost" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
@@ -1224,6 +2216,28 @@ test "findByTokenInto locates a session for reclaim" {
     try testing.expectEqualStrings("carol", m.account);
     try testing.expectEqual(@as(ClientId, 2), m.client);
     try testing.expect(s.findByTokenInto(tok(0xEE), &account_buf) == null);
+}
+
+test "tokenHasAttachedPortable distinguishes live siblings from final detached token" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("alice", 1, tok(0x21), 1);
+    _ = try s.attach("alice", 2, tok(0x21), 2);
+    _ = try s.attach("bob", 3, tok(0x22), 3);
+    try testing.expect(!s.tokenHasAttachedPortable(tok(0x21)));
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markPortableResumeIssued("alice", 2));
+    try testing.expect(s.markPortableResumeIssued("bob", 3));
+    try testing.expect(s.tokenHasAttachedPortable(tok(0x21)));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "one"));
+    try testing.expect(s.tokenHasAttachedPortable(tok(0x21)));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "two"));
+    try testing.expect(!s.tokenHasAttachedPortable(tok(0x21)));
+    try testing.expect(s.tokenHasAttachedPortable(tok(0x22)));
+    try testing.expect(!s.tokenHasAttachedPortable(tok(0xff)));
+    try testing.expect(s.containsToken(tok(0x21)));
+    try testing.expect(s.containsToken(tok(0x22)));
+    try testing.expect(!s.containsToken(tok(0xff)));
 }
 
 test "removeClient drops a client without knowing its account" {
@@ -1307,6 +2321,37 @@ test "multiple live clients join one reusable token group" {
     try testing.expectEqualStrings("shared-state", copied);
 }
 
+test "token group stays portable when issuing sibling detaches" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0xac);
+    _ = try s.attach("alice", 1, token, 10);
+    _ = try s.attach("alice", 2, token, 20);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markDetached("alice", 1));
+
+    // Per-row issuance remains exact for checkpoint/audit purposes.
+    var rows: [2]Session = undefined;
+    const sessions = s.sessionsInto("alice", &rows);
+    try testing.expectEqual(@as(usize, 2), sessions.len);
+    for (sessions) |session| {
+        try testing.expectEqual(session.client == 1, session.portable_resume);
+    }
+
+    // Group-facing APIs combine "any portable" with "any attached". Client B
+    // can therefore renew the lease and detach into mesh resume state even
+    // though client A was the attachment that received the credential.
+    const b = s.resumeHandleForClient("alice", 2) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &token, &b.token);
+    try testing.expect(b.portable);
+    try testing.expect(s.tokenHasAttachedPortable(token));
+
+    try testing.expect(s.markDetached("alice", 2));
+    try testing.expect(!s.tokenHasAttachedPortable(token));
+    try testing.expect(s.resumeHandleForClient("alice", 2).?.portable);
+}
+
 test "prepared token join aborts cleanly then commits without allocation" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var s = SessionStore.init(failing.allocator());
@@ -1358,20 +2403,24 @@ test "prepared token join aborts cleanly then commits without allocation" {
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
 }
 
-test "prepared verified adopt is exact-account and preserves retry state" {
+test "prepared verified adopt rejects cross-account tokens and preserves rowless retry state" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
 
     const generated = tok(0x11);
-    const verified = tok(0x99);
+    const foreign = tok(0x99);
+    const verified = tok(0x98);
     _ = try s.attach("alice", 1, generated, 10);
-    _ = try s.attach("bob", 2, verified, 20);
+    _ = try s.attach("bob", 2, foreign, 20);
     try testing.expect(s.markPortableResumeIssued("alice", 1));
     try testing.expect(s.markTokenReplicaDirty(generated));
     try testing.expect(s.markTokenReplicaProjectionDirty(generated));
 
     // A row in another account never authorizes join_existing.
-    try testing.expect(s.prepareTokenBind("alice", 1, verified, .join_existing) == null);
+    try testing.expect(s.prepareTokenBind("alice", 1, foreign, .join_existing) == null);
+    // External verification cannot relabel a token already owned by a different
+    // account either. The chosen token must remain globally account-bound.
+    try testing.expect(s.prepareTokenBind("alice", 1, foreign, .{ .adopt_verified = false }) == null);
     try testing.expect(s.clientHasToken("alice", 1, generated));
 
     // Verified mesh authority may adopt a rowless token. Its explicit portable
@@ -1389,8 +2438,140 @@ test "prepared verified adopt is exact-account and preserves retry state" {
     try testing.expect(!adopted.portable);
     try testing.expect(s.tokenReplicaDirty(verified));
     try testing.expect(s.tokenReplicaProjectionDirty(verified));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+}
+
+test "attach rejects cross-account token collision before dirty journal mutation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const target = tok(0x9a);
+    const source = tok(0x9b);
+    _ = try s.attach("Alice", 1, target, 10);
+    _ = try s.attach("bob", 2, source, 20);
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(target));
+    try testing.expect(s.markTokenReplicaProjectionDirty(target));
+    const target_intent = try s.armTokenLocalChannelProjection(target, "#target", true, 3);
+    const source_intent = try s.armTokenLocalChannelProjection(source, "#source", false, 7);
+    const dirty_rows = s.dirtyReplicaRowCount();
+    const projection_rows = s.dirtyReplicaProjectionRowCount();
+    const local_rows = s.dirtyLocalProjectionRowCount();
+
+    // Collision detection is allocation-free and precedes replacement, dirty
+    // propagation, and journal union. Even an allocator armed to fail remains
+    // untouched because the chosen token already belongs to another account.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.TokenAccountMismatch, s.attach("bob", 2, target, 30));
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(s.clientHasToken("bob", 2, source));
+    try testing.expect(!s.clientHasToken("bob", 2, target));
+    try testing.expectEqual(dirty_rows, s.dirtyReplicaRowCount());
+    try testing.expectEqual(projection_rows, s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(local_rows, s.dirtyLocalProjectionRowCount());
+    try testing.expectEqual(target_intent.generation, s.tokenLocalChannelProjection(target, "#target").?.generation);
+    try testing.expect(s.tokenLocalChannelProjection(target, "#source") == null);
+    try testing.expectEqual(source_intent.generation, s.tokenLocalChannelProjection(source, "#source").?.generation);
+    try testing.expect(s.tokenLocalChannelProjection(source, "#target") == null);
+
+    // ASCII case variants are the same account boundary and may share the
+    // exact token. The new row inherits the target group's durable retry state.
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try s.attach("aLiCe", 3, target, 40);
+    try testing.expect(s.clientHasToken("aLiCe", 3, target));
+    try testing.expect(s.tokenReplicaDirty(target));
+    try testing.expect(s.tokenReplicaProjectionDirty(target));
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+}
+
+test "sentinel tracks independent accounts without becoming a token group" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const sentinel: Token = @splat(0);
+    _ = try s.attach("alice", 1, sentinel, 10);
+    _ = try s.attach("bob", 2, sentinel, 20);
+    _ = try s.attach("alice", 3, sentinel, 30);
+
+    const alice = s.resumeHandleForClient("alice", 1) orelse
+        return error.TestUnexpectedResult;
+    const bob = s.resumeHandleForClient("bob", 2) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(sentinel, alice.token);
+    try testing.expectEqual(sentinel, bob.token);
+    try testing.expect(!alice.portable);
+    try testing.expect(!bob.portable);
+
+    // The absence marker cannot be issued, joined, adopted, dirtied, or given
+    // a channel-projection journal as though it were a reusable credential.
+    try testing.expect(!s.markPortableResumeIssued("alice", 1));
+    try testing.expect(!s.restorePortableResumeIssued("bob", 2, true));
+    try testing.expect(s.prepareTokenBind("alice", 3, sentinel, .join_existing) == null);
+    try testing.expect(s.prepareTokenBind("alice", 3, sentinel, .{ .adopt_verified = true }) == null);
+    try testing.expect(!s.markTokenReplicaDirty(sentinel));
+    try testing.expectError(
+        error.NoSuchToken,
+        s.armTokenLocalChannelProjection(sentinel, "#sentinel", true, 0),
+    );
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared bind enforces folded token account and rolls back staged case-variant journal OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const target = tok(0xa8);
+    const same_account_source = tok(0xa9);
+    const foreign_source = tok(0xaa);
+    _ = try s.attach("Alice", 1, target, 10);
+    _ = try s.attach("ALICE", 2, same_account_source, 20);
+    _ = try s.attach("bob", 3, foreign_source, 30);
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(target));
+    try testing.expect(s.markTokenReplicaProjectionDirty(target));
+    const target_intent = try s.armTokenLocalChannelProjection(target, "#target", true, 1);
+    const foreign_intent = try s.armTokenLocalChannelProjection(foreign_source, "#foreign", false, 2);
+
+    // Both join and externally verified adoption reject a chosen token already
+    // owned by a non-equivalent account, without merging either retry journal.
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(s.prepareTokenBind("bob", 3, target, .join_existing) == null);
+    try testing.expect(s.prepareTokenBind("bob", 3, target, .{ .adopt_verified = true }) == null);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(s.clientHasToken("bob", 3, foreign_source));
+    try testing.expectEqual(target_intent.generation, s.tokenLocalChannelProjection(target, "#target").?.generation);
+    try testing.expect(s.tokenLocalChannelProjection(target, "#foreign") == null);
+    try testing.expectEqual(foreign_intent.generation, s.tokenLocalChannelProjection(foreign_source, "#foreign").?.generation);
+    try testing.expect(s.tokenLocalChannelProjection(foreign_source, "#target") == null);
+
+    // Joining through a case-variant account is valid, but the clean claimant
+    // needs a staged journal allocation. Injected OOM aborts before mutation.
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(s.prepareTokenBind("ALICE", 2, target, .join_existing) == null);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(s.clientHasToken("ALICE", 2, same_account_source));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+
+    failing.fail_index = std.math.maxInt(usize);
+    var prepared = s.prepareTokenBind("ALICE", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expect(prepared.commit());
+    prepared.finish();
+    try testing.expect(s.clientHasToken("ALICE", 2, target));
+    try testing.expect(s.tokenReplicaDirty(target));
+    try testing.expect(s.tokenReplicaProjectionDirty(target));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
 }
 
 test "prepared token bind rejects invalid and stale preconditions without mutation" {
@@ -1809,6 +2990,14 @@ const SessionMtCtx = struct {
         return @intCast(10000 + writer_id * 100 + i);
     }
 
+    fn token(writer_id: usize, i: usize, lane: u8) Token {
+        var value: Token = @splat(0);
+        value[0] = @intCast(writer_id + 1);
+        value[1] = @intCast(i);
+        value[2] = lane;
+        return value;
+    }
+
     fn writer(ctx: *SessionMtCtx) void {
         var acct_buf: [16]u8 = undefined;
         var tmp_buf: [24]u8 = undefined;
@@ -1816,7 +3005,7 @@ const SessionMtCtx = struct {
         var i: usize = 0;
         while (i < ctx.iters) : (i += 1) {
             const cid = client(ctx.writer_id, i);
-            _ = ctx.store.attach(acct, cid, tok(@intCast(i + 2)), @intCast(i)) catch {
+            _ = ctx.store.attach(acct, cid, token(ctx.writer_id, i, 1), @intCast(i)) catch {
                 _ = ctx.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -1825,7 +3014,7 @@ const SessionMtCtx = struct {
                     _ = ctx.failures.fetchAdd(1, .monotonic);
                     return;
                 }
-                _ = ctx.store.attach(acct, cid, tok(@intCast(i + 3)), @intCast(i + 1000)) catch {
+                _ = ctx.store.attach(acct, cid, token(ctx.writer_id, i, 2), @intCast(i + 1000)) catch {
                     _ = ctx.failures.fetchAdd(1, .monotonic);
                     return;
                 };
@@ -1833,7 +3022,7 @@ const SessionMtCtx = struct {
 
             const tmp = tempAccount(&tmp_buf, ctx.writer_id, i);
             const tmp_cid = tempClient(ctx.writer_id, i);
-            _ = ctx.store.attach(tmp, tmp_cid, tok(@intCast(i + 4)), @intCast(i)) catch {
+            _ = ctx.store.attach(tmp, tmp_cid, token(ctx.writer_id, i, 3), @intCast(i)) catch {
                 _ = ctx.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -1900,6 +3089,9 @@ test "SessionStore concurrent writers and readers preserve sessions" {
         spawned += 1;
     }
     for (threads[0..spawned]) |t| t.join();
+    // Prevent the error cleanup from joining already-consumed thread handles if
+    // a post-join invariant fails; double-join obscures the actual assertion.
+    spawned = 0;
 
     try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
     var seed_out: [64]Session = undefined;

@@ -326,6 +326,179 @@ fn StringKeyedRegistry(comptime V: type) type {
             self.retireKeyReserved(&reservation, retired_key);
         }
 
+        /// Prepared case-insensitive key removal. The registry writer lock is
+        /// held until commit or abort and every allocation happens before the
+        /// release-store, allowing World to combine an existence removal with
+        /// other RCU publications under one retire reservation.
+        pub const StagedRemove = struct {
+            registry: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            old_box: *Published,
+            new_box: *Published,
+            retired_key: *RetiredKey,
+            active: bool = true,
+
+            pub fn commit(self: *StagedRemove) void {
+                std.debug.assert(self.active);
+                self.registry.published.store(self.new_box, .release);
+                self.registry.retireBoxReserved(self.reservation, self.old_box);
+                self.registry.retireKeyReserved(self.reservation, self.retired_key);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+
+            pub fn abort(self: *StagedRemove) void {
+                std.debug.assert(self.active);
+                self.new_box.map.release(self.registry.allocator);
+                self.registry.allocator.destroy(self.new_box);
+                // The old published map still owns the key bytes.
+                self.registry.allocator.destroy(self.retired_key);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+        };
+
+        /// Stage one key removal using a caller-owned retire reservation.
+        /// Returns null when the key is already absent. A returned stage must
+        /// be committed or aborted.
+        pub fn stageRemoveReserved(
+            self: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            key: []const u8,
+        ) !?StagedRemove {
+            self.writer_lock.lock();
+            const old_box = self.published.load(.acquire);
+            const displaced = findOwnedKey(old_box.map, key) orelse {
+                self.writer_lock.unlock();
+                return null;
+            };
+
+            std.debug.assert(reservation.active);
+            std.debug.assert(reservation.remaining >= 2);
+            const retired_key = self.allocator.create(RetiredKey) catch |err| {
+                self.writer_lock.unlock();
+                return err;
+            };
+            retired_key.* = .{ .bytes = displaced };
+            const new_map = old_box.map.remove(self.allocator, key) catch |err| {
+                self.allocator.destroy(retired_key);
+                self.writer_lock.unlock();
+                return err;
+            };
+            const new_box = self.allocator.create(Published) catch |err| {
+                new_map.release(self.allocator);
+                self.allocator.destroy(retired_key);
+                self.writer_lock.unlock();
+                return err;
+            };
+            new_box.* = .{ .map = new_map };
+            return .{
+                .registry = self,
+                .reservation = reservation,
+                .old_box = old_box,
+                .new_box = new_box,
+                .retired_key = retired_key,
+            };
+        }
+
+        /// One key/value insertion used by `stageInsertAbsentBatch`.
+        pub const Insert = struct {
+            key: []const u8,
+            value: V,
+        };
+
+        /// Prepared insertion of a batch of previously-absent keys. The
+        /// registry writer lock remains held until commit or abort. Commit is a
+        /// single release-store plus a pre-reserved retire and cannot allocate.
+        pub const StagedInsertAbsentBatch = struct {
+            registry: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            new_box: *Published,
+            owned_keys: [][]u8,
+            active: bool = true,
+
+            pub fn commit(self: *StagedInsertAbsentBatch) void {
+                std.debug.assert(self.active);
+                const old_box = self.registry.published.load(.acquire);
+                self.registry.published.store(self.new_box, .release);
+                self.registry.retireBoxReserved(self.reservation, old_box);
+                // The byte buffers are now owned by the live registry. Only
+                // the temporary slice-of-slices container remains ours.
+                self.registry.allocator.free(self.owned_keys);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+
+            pub fn abort(self: *StagedInsertAbsentBatch) void {
+                std.debug.assert(self.active);
+                self.new_box.map.release(self.registry.allocator);
+                self.registry.allocator.destroy(self.new_box);
+                for (self.owned_keys) |key| self.registry.allocator.free(key);
+                self.registry.allocator.free(self.owned_keys);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+        };
+
+        /// Build one immutable registry snapshot containing every insertion,
+        /// without publishing any of them. Returns null if any key already
+        /// exists or if two requested keys collide case-insensitively. The
+        /// caller must commit or abort the returned value.
+        pub fn stageInsertAbsentBatchReserved(
+            self: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            inserts: []const Insert,
+        ) !?StagedInsertAbsentBatch {
+            std.debug.assert(inserts.len != 0);
+            self.writer_lock.lock();
+            errdefer self.writer_lock.unlock();
+
+            const old_box = self.published.load(.acquire);
+            const ctx: CaseInsensitiveBytesContext = undefined;
+            for (inserts, 0..) |insert, i| {
+                if (old_box.map.get(insert.key) != null) {
+                    self.writer_lock.unlock();
+                    return null;
+                }
+                for (inserts[0..i]) |prior| {
+                    if (ctx.eql(prior.key, insert.key)) {
+                        self.writer_lock.unlock();
+                        return null;
+                    }
+                }
+            }
+
+            std.debug.assert(reservation.active);
+            std.debug.assert(reservation.remaining != 0);
+            const owned_keys = try self.allocator.alloc([]u8, inserts.len);
+            var owned_count: usize = 0;
+            errdefer {
+                for (owned_keys[0..owned_count]) |key| self.allocator.free(key);
+                self.allocator.free(owned_keys);
+            }
+
+            var new_map = old_box.map;
+            new_map.retain();
+            errdefer new_map.release(self.allocator);
+            for (inserts) |insert| {
+                const owned_key = try self.allocator.dupe(u8, insert.key);
+                owned_keys[owned_count] = owned_key;
+                owned_count += 1;
+                const next = try new_map.put(self.allocator, owned_key, insert.value);
+                new_map.release(self.allocator);
+                new_map = next;
+            }
+
+            const new_box = try self.allocator.create(Published);
+            new_box.* = .{ .map = new_map };
+            return .{
+                .registry = self,
+                .reservation = reservation,
+                .new_box = new_box,
+                .owned_keys = owned_keys,
+            };
+        }
+
         /// Prepared exact-value replacement. The registry writer lock remains
         /// held until commit or abort; commit is allocation-free.
         pub const StagedReplaceRemovingValues = struct {
@@ -446,6 +619,105 @@ fn StringKeyedRegistry(comptime V: type) type {
             var staged = (try self.stageReplaceRemovingValues(p, key, value, removed_values)) orelse return false;
             staged.commit();
             return true;
+        }
+
+        /// Prepared removal of every alias owned by `removed_values` while a
+        /// caller-authorized foreign `preserved_key`/`preserved_value` remains
+        /// untouched. Null means the preserved binding did not match exactly.
+        /// A valid no-alias case still returns a staged snapshot so validation
+        /// and publication remain one serialized transaction.
+        pub const StagedRemoveValuesPreservingKey = struct {
+            registry: *Self,
+            reservation: ebr.Participant.RetireReservation,
+            new_box: *Published,
+            removed_keys: [][]u8,
+            retired: *RetiredKeysBatch,
+            active: bool = true,
+
+            pub fn commit(self: *StagedRemoveValuesPreservingKey) void {
+                std.debug.assert(self.active);
+                self.registry.published.store(self.new_box, .release);
+                self.reservation.retireErased(
+                    @ptrCast(self.retired),
+                    RetiredKeysBatch.reclaim,
+                    self.registry.allocator,
+                );
+                self.reservation.finish();
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+
+            pub fn abort(self: *StagedRemoveValuesPreservingKey) void {
+                std.debug.assert(self.active);
+                self.new_box.map.release(self.registry.allocator);
+                self.registry.allocator.destroy(self.new_box);
+                self.registry.allocator.free(self.removed_keys);
+                self.registry.allocator.destroy(self.retired);
+                self.reservation.finish();
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+        };
+
+        pub fn stageRemoveValuesPreservingKey(
+            self: *Self,
+            p: *ebr.Participant,
+            preserved_key: []const u8,
+            preserved_value: V,
+            removed_values: []const V,
+        ) !?StagedRemoveValuesPreservingKey {
+            self.writer_lock.lock();
+            errdefer self.writer_lock.unlock();
+
+            const old_box = self.published.load(.acquire);
+            const current = old_box.map.get(preserved_key) orelse {
+                self.writer_lock.unlock();
+                return null;
+            };
+            if (!std.meta.eql(current, preserved_value) or valueInSet(current, removed_values)) {
+                self.writer_lock.unlock();
+                return null;
+            }
+
+            var removed_count: usize = 0;
+            var count_it = old_box.map.iterator();
+            while (count_it.next()) |entry| {
+                if (valueInSet(entry.value, removed_values)) removed_count += 1;
+            }
+            const removed_keys = try self.allocator.alloc([]u8, removed_count);
+            errdefer self.allocator.free(removed_keys);
+            var next_removed: usize = 0;
+            var key_it = old_box.map.iterator();
+            while (key_it.next()) |entry| {
+                if (!valueInSet(entry.value, removed_values)) continue;
+                removed_keys[next_removed] = @constCast(entry.key);
+                next_removed += 1;
+            }
+            std.debug.assert(next_removed == removed_count);
+
+            var reservation = try p.reserveRetireCapacity(1);
+            errdefer reservation.finish();
+            var new_map = old_box.map;
+            new_map.retain();
+            errdefer new_map.release(self.allocator);
+            for (removed_keys) |removed_key| {
+                const next = try new_map.remove(self.allocator, removed_key);
+                new_map.release(self.allocator);
+                new_map = next;
+            }
+            const new_box = try self.allocator.create(Published);
+            errdefer self.allocator.destroy(new_box);
+            new_box.* = .{ .map = new_map };
+            const retired = try self.allocator.create(RetiredKeysBatch);
+            errdefer self.allocator.destroy(retired);
+            retired.* = .{ .box = old_box, .keys = removed_keys };
+            return .{
+                .registry = self,
+                .reservation = reservation,
+                .new_box = new_box,
+                .removed_keys = removed_keys,
+                .retired = retired,
+            };
         }
 
         /// Atomically remove all aliases owned by `removed_values` while
@@ -617,6 +889,34 @@ pub const MembershipSet = struct {
         };
     }
 
+    /// Construct an unpublished membership set whose initial snapshot already
+    /// contains `id`. This is used for off-map channel preparation: no empty
+    /// snapshot is ever published or retired, and the resulting set can be
+    /// installed with an allocation-free pointer move.
+    pub fn initWithOne(allocator: Allocator, domain: *ebr.Domain, id: ClientId) !Self {
+        return initFromSlice(allocator, domain, &.{id});
+    }
+
+    /// Construct an unpublished membership set from a complete caller image.
+    /// No intermediate snapshot is published or retired, making this suitable
+    /// for rebuilding a missing RCU set from World's fallback membership map.
+    pub fn initFromSlice(allocator: Allocator, domain: *ebr.Domain, ids: []const ClientId) !Self {
+        var map = Map.empty();
+        errdefer map.release(allocator);
+        for (ids) |id| {
+            const next = try map.put(allocator, id, {});
+            map.release(allocator);
+            map = next;
+        }
+        const box = try allocator.create(Published);
+        box.* = .{ .map = map };
+        return .{
+            .domain = domain,
+            .allocator = allocator,
+            .published = std.atomic.Value(*Published).init(box),
+        };
+    }
+
     /// Tear down. Requires the EBR domain drained/quiesced.
     pub fn deinit(self: *Self) void {
         const box = self.published.load(.acquire);
@@ -693,6 +993,32 @@ pub const MembershipSet = struct {
         }
     };
 
+    /// Prepared membership removal. Like `StagedAdd`, this holds the writer
+    /// lock and publishes allocation-free through a caller-owned reservation.
+    pub const StagedRemove = struct {
+        set: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        old_box: *Published,
+        new_box: *Published,
+        active: bool = true,
+
+        pub fn commit(self: *StagedRemove) void {
+            std.debug.assert(self.active);
+            self.set.published.store(self.new_box, .release);
+            self.set.retireBoxReserved(self.reservation, self.old_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+
+        pub fn abort(self: *StagedRemove) void {
+            std.debug.assert(self.active);
+            self.new_box.map.release(self.set.allocator);
+            self.set.allocator.destroy(self.new_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+    };
+
     /// Stage one absent id without publishing it. Returns null when already
     /// present. The caller must commit or abort a returned value.
     pub fn stageAddReserved(
@@ -710,6 +1036,40 @@ pub const MembershipSet = struct {
         std.debug.assert(reservation.active);
         std.debug.assert(reservation.remaining != 0);
         const new_map = old_box.map.put(self.allocator, id, {}) catch |err| {
+            self.writer_lock.unlock();
+            return err;
+        };
+        const new_box = self.allocator.create(Published) catch |err| {
+            new_map.release(self.allocator);
+            self.writer_lock.unlock();
+            return err;
+        };
+        new_box.* = .{ .map = new_map };
+        return .{
+            .set = self,
+            .reservation = reservation,
+            .old_box = old_box,
+            .new_box = new_box,
+        };
+    }
+
+    /// Stage one present id for removal without publishing it. Returns null
+    /// when already absent. The caller must commit or abort a returned value.
+    pub fn stageRemoveReserved(
+        self: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        id: ClientId,
+    ) !?StagedRemove {
+        self.writer_lock.lock();
+        const old_box = self.published.load(.acquire);
+        if (old_box.map.get(id) == null) {
+            self.writer_lock.unlock();
+            return null;
+        }
+
+        std.debug.assert(reservation.active);
+        std.debug.assert(reservation.remaining != 0);
+        const new_map = old_box.map.remove(self.allocator, id) catch |err| {
             self.writer_lock.unlock();
             return err;
         };

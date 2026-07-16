@@ -181,6 +181,8 @@ const cap_repair_frames: u8 = s2s_frame.cap_repair_frames;
 const cap_session_replica_v2: u8 = s2s_frame.cap_session_replica_v2;
 /// The peer understands secured MESSAGE_V2 origin-signed flooding frames.
 const cap_secure_relay_v2: u8 = s2s_frame.cap_secure_relay_v2;
+/// The peer understands positive short-lived SESSION_REPLICA attachment leases.
+const cap_session_attachment_lease_v2: u8 = s2s_frame.cap_session_attachment_lease_v2;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const session_replica_frame = @import("../../proto/session_replica_frame.zig");
@@ -407,6 +409,9 @@ pub const S2sPeer = struct {
     /// SESSION_REPLICA v2 capability. Local key presence is checked separately,
     /// so plaintext links cannot activate the transport by forging capability bits.
     peer_supports_session_replica_v2: bool = false,
+    /// Remote advertised signing, SESSION_REPLICA v2, and the independently
+    /// rolling-upgrade-safe attachment-lease extension.
+    peer_supports_session_attachment_lease_v2: bool = false,
     /// Remote advertised frame signing plus the explicit secure-relay-v2 bit.
     peer_supports_secure_relay_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
@@ -582,6 +587,7 @@ pub const S2sPeer = struct {
         peer_supports_oper_info: bool,
         peer_supports_repair: bool,
         peer_supports_session_replica_v2: bool,
+        peer_supports_session_attachment_lease_v2: bool,
     };
 
     pub fn snapshotResume(self: *const S2sPeer) ResumeHeader {
@@ -594,6 +600,7 @@ pub const S2sPeer = struct {
             .peer_supports_oper_info = self.peer_supports_oper_info,
             .peer_supports_repair = self.peer_supports_repair,
             .peer_supports_session_replica_v2 = self.peer_supports_session_replica_v2,
+            .peer_supports_session_attachment_lease_v2 = self.peer_supports_session_attachment_lease_v2,
         };
     }
 
@@ -684,6 +691,9 @@ pub const S2sPeer = struct {
             .peer_supports_oper_info = hdr.peer_supports_oper_info,
             .peer_supports_repair = hdr.peer_supports_repair,
             .peer_supports_session_replica_v2 = hdr.peer_supports_signing and hdr.peer_supports_session_replica_v2,
+            .peer_supports_session_attachment_lease_v2 = hdr.peer_supports_signing and
+                hdr.peer_supports_session_replica_v2 and
+                hdr.peer_supports_session_attachment_lease_v2,
             .config = options.config,
             .signing_key = options.signing_key,
             .admitted_frame_families = options.admitted_frame_families,
@@ -785,6 +795,11 @@ pub const S2sPeer = struct {
     /// Ask the peer to re-send its full converged state (used right after a Helix
     /// resume). Unsigned control frame — carries no trusted state itself.
     pub fn sendResync(self: *S2sPeer, sink: ByteSink) !void {
+        // A preserved Helix link bypasses the ordinary handshake after exec, so
+        // refresh our current capability byte before asking for state replay.
+        // The receiver answers RESYNC with one HANDSHAKE of its own; unlike a
+        // HANDSHAKE-triggered reply this cannot ping-pong indefinitely.
+        try self.emitHandshake(sink);
         try emitFrame(self.allocator, sink, .RESYNC, "");
     }
 
@@ -960,12 +975,20 @@ pub const S2sPeer = struct {
             .SESSION_REPLICA_OFFER => self.recvSessionReplica(.offer, frame.payload),
             .SESSION_REPLICA_ACK => self.recvSessionReplica(.ack, frame.payload),
             .SESSION_REPLICA_REVOKE => self.recvSessionReplica(.revoke, frame.payload),
+            .SESSION_REPLICA_ATTACHMENT_LEASE => self.recvSessionReplica(.attachment_lease, frame.payload),
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
             .KILL => try self.recvKill(frame.payload),
             .WARD => try self.recvWard(frame.payload),
-            .RESYNC => self.resync_requested = true,
+            .RESYNC => {
+                self.resync_requested = true;
+                // RESYNC is also the one-shot capability-refresh request for a
+                // preserved established stream. Reply with HANDSHAKE, but never
+                // reply merely because a HANDSHAKE arrived: that would create an
+                // unbounded control-frame echo between two upgraded peers.
+                if (self.established) try self.emitHandshake(sink);
+            },
             .REPAIR_SUMMARY => try self.recvRepairSummary(frame.payload, sink),
             .REPAIR_REQUEST => try self.recvRepairRequest(frame.payload, sink),
             .REPAIR_RESPONSE => try self.recvRepairResponse(frame.payload),
@@ -1038,7 +1061,9 @@ pub const S2sPeer = struct {
     /// the future per-destination replica store. Malformed, unnegotiated, and
     /// over-capacity input is dropped without faulting the mesh link.
     fn recvSessionReplica(self: *S2sPeer, kind: session_replica_frame.Kind, frame_payload: []const u8) void {
-        if (!self.supportsSessionReplicaV2()) {
+        if (!self.supportsSessionReplicaV2() or
+            (kind == .attachment_lease and !self.supportsSessionAttachmentLeaseV2()))
+        {
             self.rejected_session_replica_frames +|= 1;
             return;
         }
@@ -1151,12 +1176,18 @@ pub const S2sPeer = struct {
         return self.established and self.session_replica_transport_enabled and self.signing_key != null and self.peer_supports_signing and self.peer_supports_session_replica_v2;
     }
 
+    pub fn supportsSessionAttachmentLeaseV2(self: *const S2sPeer) bool {
+        return self.supportsSessionReplicaV2() and self.peer_supports_session_attachment_lease_v2;
+    }
+
     /// Encode, capability-gate, outer-sign, and emit one opaque Helix object.
     /// This never falls back to plaintext or legacy SESSION_MIGRATE frames.
     pub fn sendSessionReplica(self: *S2sPeer, sink: ByteSink, kind: session_replica_frame.Kind, signed_payload: []const u8) !void {
         if (!self.established) return error.NotEstablished;
         if (!self.session_replica_transport_enabled or self.signing_key == null or !self.peer_supports_signing) return error.SecuredLinkRequired;
         if (!self.peer_supports_session_replica_v2) return error.CapabilityNotNegotiated;
+        if (kind == .attachment_lease and !self.peer_supports_session_attachment_lease_v2)
+            return error.CapabilityNotNegotiated;
 
         const len = try session_replica_frame.encodedLen(signed_payload.len);
         const framed_len = s2s_frame.header_len + signed_frame.header_len + len;
@@ -1177,6 +1208,10 @@ pub const S2sPeer = struct {
 
     pub fn sendSessionReplicaRevoke(self: *S2sPeer, sink: ByteSink, signed_revoke: []const u8) !void {
         try self.sendSessionReplica(sink, .revoke, signed_revoke);
+    }
+
+    pub fn sendSessionAttachmentLease(self: *S2sPeer, sink: ByteSink, signed_lease: []const u8) !void {
+        try self.sendSessionReplica(sink, .attachment_lease, signed_lease);
     }
 
     /// Queue an inbound CLONE_COUNT payload (raw `mesh_clones` counts bytes) for
@@ -2898,7 +2933,17 @@ pub const S2sPeer = struct {
         self.peer_supports_account = (hs.caps & cap_member_account) != 0;
         self.peer_supports_oper_info = (hs.caps & cap_member_oper_info) != 0;
         self.peer_supports_repair = (hs.caps & cap_repair_frames) != 0;
+        const had_attachment_lease_v2 = self.peer_supports_session_attachment_lease_v2;
         self.peer_supports_session_replica_v2 = self.peer_supports_signing and (hs.caps & cap_session_replica_v2) != 0;
+        self.peer_supports_session_attachment_lease_v2 = self.peer_supports_session_replica_v2 and
+            (hs.caps & cap_session_attachment_lease_v2) != 0;
+        // A preserved established stream can transition from the old negotiated
+        // capability set without receiving another RESYNC in this direction.
+        // Surface that false->true edge through the daemon's existing gated
+        // authority-before-membership replay path so retained leases converge
+        // immediately instead of waiting for their periodic renewal.
+        if (self.established and !had_attachment_lease_v2 and self.peer_supports_session_attachment_lease_v2)
+            self.resync_requested = true;
         self.peer_supports_secure_relay_v2 = self.peer_supports_signing and (hs.caps & cap_secure_relay_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
@@ -2948,7 +2993,8 @@ pub const S2sPeer = struct {
         // advertises — and thus never receives — them.
         if (self.signing_key != null) {
             caps |= cap_frame_signing | cap_member_oper_info;
-            if (self.session_replica_transport_enabled) caps |= cap_session_replica_v2;
+            if (self.session_replica_transport_enabled)
+                caps |= cap_session_replica_v2 | cap_session_attachment_lease_v2;
             if (self.secure_relay_transport_enabled) caps |= cap_secure_relay_v2;
         }
         const payload = try encodeHandshake(self.allocator, .{
@@ -3058,6 +3104,7 @@ fn replicaFrameType(kind: session_replica_frame.Kind) s2s_frame.FrameType {
         .offer => .SESSION_REPLICA_OFFER,
         .ack => .SESSION_REPLICA_ACK,
         .revoke => .SESSION_REPLICA_REVOKE,
+        .attachment_lease => .SESSION_REPLICA_ATTACHMENT_LEASE,
     };
 }
 
@@ -4237,10 +4284,16 @@ fn fakeSessionReplicaObject(allocator: Allocator, kind: session_replica_frame.Ki
             out[4] = 1;
             break :blk out;
         },
+        .attachment_lease => blk: {
+            const out = try allocator.alloc(u8, 156);
+            @memset(out, 0);
+            @memcpy(out[0..4], "SRL2");
+            break :blk out;
+        },
     };
 }
 
-test "session replica v2 enabled inner peer seam transports OFFER ACK and REVOKE with via peer" {
+test "session replica v2 inner peer transports offers acks revokes and attachment leases" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
@@ -4269,6 +4322,8 @@ test "session replica v2 enabled inner peer seam transports OFFER ACK and REVOKE
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5210);
     try std.testing.expect(a.supportsSessionReplicaV2());
     try std.testing.expect(b.supportsSessionReplicaV2());
+    try std.testing.expect(a.supportsSessionAttachmentLeaseV2());
+    try std.testing.expect(b.supportsSessionAttachmentLeaseV2());
 
     const offer = try fakeSessionReplicaObject(allocator, .offer);
     defer allocator.free(offer);
@@ -4276,9 +4331,12 @@ test "session replica v2 enabled inner peer seam transports OFFER ACK and REVOKE
     defer allocator.free(ack);
     const revoke = try fakeSessionReplicaObject(allocator, .revoke);
     defer allocator.free(revoke);
+    const lease = try fakeSessionReplicaObject(allocator, .attachment_lease);
+    defer allocator.free(lease);
     try a.sendSessionReplicaOffer(a_to_b.sink(), offer);
     try a.sendSessionReplicaAck(a_to_b.sink(), ack);
     try a.sendSessionReplicaRevoke(a_to_b.sink(), revoke);
+    try a.sendSessionAttachmentLease(a_to_b.sink(), lease);
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5211);
 
     const frames = try b.takeSessionReplicaFrames();
@@ -4286,9 +4344,9 @@ test "session replica v2 enabled inner peer seam transports OFFER ACK and REVOKE
         for (frames) |*frame| frame.deinit(allocator);
         allocator.free(frames);
     }
-    try std.testing.expectEqual(@as(usize, 3), frames.len);
-    const expected = [_]session_replica_frame.Kind{ .offer, .ack, .revoke };
-    const payloads = [_][]const u8{ offer, ack, revoke };
+    try std.testing.expectEqual(@as(usize, 4), frames.len);
+    const expected = [_]session_replica_frame.Kind{ .offer, .ack, .revoke, .attachment_lease };
+    const payloads = [_][]const u8{ offer, ack, revoke, lease };
     for (frames, 0..) |frame, i| {
         try std.testing.expectEqual(expected[i], frame.kind);
         try std.testing.expectEqual(a_short, frame.via_peer);
@@ -4337,6 +4395,15 @@ test "session replica v2 rolling old and plaintext peers stay inert" {
     defer allocator.free(offer);
     try std.testing.expectError(error.CapabilityNotNegotiated, peer.sendSessionReplicaOffer(response.sink(), offer));
 
+    // A rolling peer with base SESSION_REPLICA v2 but without the separately
+    // negotiated lease extension keeps ordinary objects active and leases inert.
+    peer.peer_supports_session_replica_v2 = true;
+    const lease = try fakeSessionReplicaObject(allocator, .attachment_lease);
+    defer allocator.free(lease);
+    try std.testing.expect(peer.supportsSessionReplicaV2());
+    try std.testing.expect(!peer.supportsSessionAttachmentLeaseV2());
+    try std.testing.expectError(error.CapabilityNotNegotiated, peer.sendSessionAttachmentLease(response.sink(), lease));
+
     // A plaintext driver cannot activate v2 even if a hostile handshake sets its
     // capability bit. No compatibility fallback emits the sensitive object.
     var plain_state = ChannelCrdt.init(allocator, 2);
@@ -4374,6 +4441,7 @@ test "session replica v2 hot resume preserves negotiated capability" {
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5230);
     try std.testing.expect(a.supportsSessionReplicaV2());
+    try std.testing.expect(a.supportsSessionAttachmentLeaseV2());
 
     // The peer does not re-handshake on a preserved socket, so its negotiated
     // capability must ride the resume header exactly like frame-signing/repair.
@@ -4396,10 +4464,116 @@ test "session replica v2 hot resume preserves negotiated capability" {
     }, hdr, a.remoteName(), tc.now_ms + 1, 0x5231);
     defer resumed.deinit();
     try std.testing.expect(resumed.supportsSessionReplicaV2());
+    try std.testing.expect(resumed.supportsSessionAttachmentLeaseV2());
     const offer = try fakeSessionReplicaObject(allocator, .offer);
     defer allocator.free(offer);
     try resumed.sendSessionReplicaOffer(a_to_b.sink(), offer);
     try std.testing.expect(a_to_b.bytes.items.len != 0);
+}
+
+test "session attachment lease capability refreshes across staggered preserved upgrades" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var old_a_state = ChannelCrdt.init(allocator, 1);
+    defer old_a_state.deinit();
+    var old_b_state = ChannelCrdt.init(allocator, 2);
+    defer old_b_state.deinit();
+    const kp_a = try signingKeyFor(0x99);
+    const kp_b = try signingKeyFor(0x9a);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var old_a = try newSigningPeer(allocator, &old_a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer old_a.deinit();
+    var old_b = try newSigningPeer(allocator, &old_b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer old_b.deinit();
+    old_a.session_replica_transport_enabled = true;
+    old_b.session_replica_transport_enabled = true;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try old_a.startHandshake(a_to_b.sink());
+    try old_b.startHandshake(b_to_a.sink());
+    try pump(&old_a, &old_b, &a_to_b, &b_to_a, tc.now_ms, 0x5240);
+
+    // Model a link negotiated by the pre-extension binaries: base replica v2
+    // survived in the resume header, but neither endpoint recorded the later
+    // attachment-lease bit.
+    var a_hdr = old_a.snapshotResume();
+    var b_hdr = old_b.snapshotResume();
+    a_hdr.peer_supports_session_attachment_lease_v2 = false;
+    b_hdr.peer_supports_session_attachment_lease_v2 = false;
+
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    const resumed_a_key = try signingKeyFor(0x99);
+    var a = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &a_state,
+        .clock = tc.clock(),
+        .local_node_id = a_short,
+        .remote_node_id = b_short,
+        .local_epoch_ms = 3000,
+        .server_name = "a.test",
+        .description = "test",
+        .config = old_a.config,
+        .signing_key = resumed_a_key,
+        .session_replica_transport_enabled = true,
+    }, a_hdr, old_a.remoteName(), tc.now_ms + 1, 0x5241);
+    defer a.deinit();
+    try std.testing.expect(a.supportsSessionReplicaV2());
+    try std.testing.expect(!a.supportsSessionAttachmentLeaseV2());
+
+    // A upgrades first and writes HANDSHAKE+RESYNC to the still-old endpoint.
+    // The old process consumes those frames without retaining the unknown bit;
+    // its later resume header therefore remains the captured false value.
+    try a.sendResync(a_to_b.sink());
+    try std.testing.expect(a_to_b.bytes.items.len != 0);
+    a_to_b.clear();
+    try std.testing.expect(!a.supportsSessionAttachmentLeaseV2());
+
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const resumed_b_key = try signingKeyFor(0x9a);
+    var b = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &b_state,
+        .clock = tc.clock(),
+        .local_node_id = b_short,
+        .remote_node_id = a_short,
+        .local_epoch_ms = 4000,
+        .server_name = "b.test",
+        .description = "test",
+        .config = old_b.config,
+        .signing_key = resumed_b_key,
+        .session_replica_transport_enabled = true,
+    }, b_hdr, old_b.remoteName(), tc.now_ms + 2, 0x5242);
+    defer b.deinit();
+    try std.testing.expect(b.supportsSessionReplicaV2());
+    try std.testing.expect(!b.supportsSessionAttachmentLeaseV2());
+
+    // When B upgrades later, its fresh HANDSHAKE updates A. The RESYNC response
+    // carries A's fresh HANDSHAKE back exactly once, updating B without an echo.
+    try b.sendResync(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms + 2, 0x5243);
+    try std.testing.expect(a.supportsSessionAttachmentLeaseV2());
+    try std.testing.expect(b.supportsSessionAttachmentLeaseV2());
+    try std.testing.expectEqual(@as(usize, 0), a_to_b.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+
+    const lease = try fakeSessionReplicaObject(allocator, .attachment_lease);
+    defer allocator.free(lease);
+    try a.sendSessionAttachmentLease(a_to_b.sink(), lease);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms + 3, 0x5244);
+    const frames = try b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expectEqual(session_replica_frame.Kind.attachment_lease, frames[0].kind);
+    try std.testing.expectEqualSlices(u8, lease, frames[0].signed_payload);
 }
 
 test "session replica v2 malformed cross-tag and bounded queue input fail closed" {
@@ -6194,13 +6368,13 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
 
     // Every wire frame type, including unknown/unmapped tags (skipped, not fatal).
     const frame_types = [_]s2s_frame.FrameType{
-        .HANDSHAKE,           .BURST,                  .DELTA,                    .GOSSIP,      .PING,
-        .PONG,                .QUIT,                   .MEMBERSHIP,               .MESSAGE,     .OPER_GRANT,
-        .CHANNEL_MODE_FLAGS,  .CHANNEL_LIST,           .CHANNEL_PROP,             .TOPIC,       .NICKCHANGE,
-        .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP, .CLONE_COUNT,
-        .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,        .RESYNC,
-        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .TEGAMI_PUSH, .SESSION_REPLICA_OFFER,
-        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,
+        .HANDSHAKE,           .BURST,                  .DELTA,                    .GOSSIP,                           .PING,
+        .PONG,                .QUIT,                   .MEMBERSHIP,               .MESSAGE,                          .OPER_GRANT,
+        .CHANNEL_MODE_FLAGS,  .CHANNEL_LIST,           .CHANNEL_PROP,             .TOPIC,                            .NICKCHANGE,
+        .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP,                      .CLONE_COUNT,
+        .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
+        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .TEGAMI_PUSH,                      .SESSION_REPLICA_OFFER,
+        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug
