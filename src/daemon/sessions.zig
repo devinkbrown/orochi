@@ -91,6 +91,14 @@ pub const LocalChannelProjectionWork = struct {
     projection: LocalChannelProjection,
 };
 
+/// One accepted arm plus the exact same-channel intent it replaced. Producers
+/// that can still reject before their first live mutation use this to restore
+/// older accepted work instead of accidentally erasing it.
+pub const LocalChannelProjectionArm = struct {
+    intent: LocalChannelProjection,
+    previous: ?LocalChannelProjection,
+};
+
 pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
     InvalidChannel,
     NoSuchToken,
@@ -218,6 +226,22 @@ pub const PreparedTokenBind = struct {
     staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null,
     result_portable: bool,
     state: State = .prepared,
+
+    /// Preview the exact bounded local-channel image that commit will install on
+    /// the target token. Callers use this while the ticket retains the exclusive
+    /// lock so World/output restore plans cannot be built from a stale detached
+    /// snapshot that the no-fail commit would immediately override.
+    pub fn mergedLocalChannelProjectionsInto(
+        self: *const PreparedTokenBind,
+        out: []LocalChannelProjection,
+    ) []const LocalChannelProjection {
+        std.debug.assert(self.state == .prepared);
+        const source = self.merged_local_projections.slice();
+        std.debug.assert(out.len >= source.len);
+        if (out.len < source.len) return out[0..0];
+        @memcpy(out[0..source.len], source);
+        return out[0..source.len];
+    }
 
     /// Commit the prepared bind without allocating or releasing the exclusive
     /// lock. Defensive revalidation rejects a stale/corrupted ticket without
@@ -637,8 +661,9 @@ pub const SessionStore = struct {
     /// Prepare an exact account/client/token bind and retain the exclusive lock
     /// through its later commit/abort boundary. Missing destination journals are
     /// staged here and freed on abort, so `commit` remains allocation-free. A
-    /// daemon restore transaction can prepare fallible World changes first,
-    /// prepare this ticket last, then commit with no error path remaining.
+    /// daemon restore transaction prepares this ticket first, previews the exact
+    /// merged local-channel image while its lock excludes stale snapshot races,
+    /// then prepares World/output and commits with no error path remaining.
     pub fn prepareTokenBind(
         self: *SessionStore,
         account: []const u8,
@@ -830,6 +855,23 @@ pub const SessionStore = struct {
         present: bool,
         member_mode_bits: u8,
     ) LocalProjectionArmError!LocalChannelProjection {
+        return (try self.armTokenLocalChannelProjectionWithPrevious(
+            token,
+            channel,
+            present,
+            member_mode_bits,
+        )).intent;
+    }
+
+    /// Arm exactly like `armTokenLocalChannelProjection`, atomically returning
+    /// the prior same-channel intent for allocation-free pre-mutation rollback.
+    pub fn armTokenLocalChannelProjectionWithPrevious(
+        self: *SessionStore,
+        token: Token,
+        channel: []const u8,
+        present: bool,
+        member_mode_bits: u8,
+    ) LocalProjectionArmError!LocalChannelProjectionArm {
         if (channel.len == 0 or channel.len > local_channel_name_capacity)
             return error.InvalidChannel;
         self.lock.lockExclusive();
@@ -839,6 +881,7 @@ pub const SessionStore = struct {
         if (!state.found) return error.NoSuchToken;
         var next = state.local_projections;
         const existing_index = localProjectionIndex(&next, channel);
+        const previous = if (existing_index) |index| next.items[index] else null;
         if (existing_index == null and next.len == local_channel_projection_capacity)
             return error.TooManyPendingChannels;
 
@@ -899,7 +942,7 @@ pub const SessionStore = struct {
             staged_transferred = true;
         }
         self.setTokenGroupLocalProjectionsLocked(token, &next);
-        return intent;
+        return .{ .intent = intent, .previous = previous };
     }
 
     /// Copy one pending channel image. Matching uses the daemon's current ASCII
@@ -945,6 +988,39 @@ pub const SessionStore = struct {
         const index = localProjectionIndex(&next, channel) orelse return false;
         if (next.items[index].generation != generation) return false;
         localProjectionRemoveAt(&next, index);
+        next.revision = self.nextLocalProjectionGenerationLocked();
+        self.setTokenGroupLocalProjectionsLocked(token, &next);
+        return true;
+    }
+
+    /// Undo one still-current arm before its producer mutates live state. The
+    /// generation CAS prevents a failed older producer from overwriting newer
+    /// accepted work. Arm already allocated every row journal, so restoring a
+    /// previous value (or removing a newly-added channel) cannot allocate.
+    pub fn rollbackTokenLocalChannelProjectionArm(
+        self: *SessionStore,
+        token: Token,
+        armed_generation: u64,
+        previous: ?LocalChannelProjection,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var next = self.tokenGroupStateLocked(token).local_projections;
+        const armed_channel = if (previous) |prior| prior.channel() else blk: {
+            for (next.slice()) |projection| {
+                if (projection.generation == armed_generation) break :blk projection.channel();
+            }
+            return false;
+        };
+        const index = localProjectionIndex(&next, armed_channel) orelse return false;
+        if (next.items[index].generation != armed_generation) return false;
+        if (previous) |prior| {
+            std.debug.assert(std.ascii.eqlIgnoreCase(prior.channel(), next.items[index].channel()));
+            next.items[index] = prior;
+        } else {
+            localProjectionRemoveAt(&next, index);
+        }
         next.revision = self.nextLocalProjectionGenerationLocked();
         self.setTokenGroupLocalProjectionsLocked(token, &next);
         return true;
@@ -1755,6 +1831,85 @@ test "local channel projection journals overlapping channels and CAS clears inde
     try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
 }
 
+test "local channel projection rejected arm restores prior intent without erasing newer work" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x30);
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+    _ = try s.attach("alice", 3, token, 3);
+    const prior = try s.armTokenLocalChannelProjection(token, "#keep", true, 0x0D);
+    const replacement = try s.armTokenLocalChannelProjectionWithPrevious(token, "#KEEP", false, 0);
+    try testing.expectEqual(prior.generation, replacement.previous.?.generation);
+    try testing.expect(s.rollbackTokenLocalChannelProjectionArm(
+        token,
+        replacement.intent.generation,
+        replacement.previous,
+    ));
+    const restored = s.tokenLocalChannelProjection(token, "#keep").?;
+    try testing.expectEqual(prior.generation, restored.generation);
+    try testing.expect(restored.present);
+    try testing.expectEqual(@as(u8, 0x0D), restored.member_mode_bits);
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+    var rows: [3]Session = undefined;
+    for (s.sessionsInto("alice", &rows)) |row| {
+        const set = row.local_channel_projections orelse return error.TestUnexpectedResult;
+        const index = localProjectionIndex(set, "#keep") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(prior.generation, set.items[index].generation);
+        try testing.expect(set.items[index].present);
+        try testing.expectEqual(@as(u8, 0x0D), set.items[index].member_mode_bits);
+    }
+
+    const prior_absent = try s.armTokenLocalChannelProjection(token, "#absent", false, 0x06);
+    const replacement_present = try s.armTokenLocalChannelProjectionWithPrevious(token, "#ABSENT", true, 0x03);
+    try testing.expectEqual(prior_absent.generation, replacement_present.previous.?.generation);
+    try testing.expect(s.rollbackTokenLocalChannelProjectionArm(
+        token,
+        replacement_present.intent.generation,
+        replacement_present.previous,
+    ));
+    const restored_absent = s.tokenLocalChannelProjection(token, "#absent").?;
+    try testing.expectEqual(prior_absent.generation, restored_absent.generation);
+    try testing.expect(!restored_absent.present);
+    try testing.expectEqual(@as(u8, 0x06), restored_absent.member_mode_bits);
+
+    const stale = try s.armTokenLocalChannelProjectionWithPrevious(token, "#keep", false, 0);
+    const newest = try s.armTokenLocalChannelProjection(token, "#keep", true, 0x03);
+    try testing.expect(!s.rollbackTokenLocalChannelProjectionArm(token, stale.intent.generation, stale.previous));
+    try testing.expectEqual(newest.generation, s.tokenLocalChannelProjection(token, "#keep").?.generation);
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+}
+
+test "local channel projection prior-null rollback removes every exact row and preserves CAS" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x2F);
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+    _ = try s.attach("alice", 3, token, 3);
+    const newly_added = try s.armTokenLocalChannelProjectionWithPrevious(token, "#new", true, 1);
+    try testing.expect(newly_added.previous == null);
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+    try testing.expect(s.rollbackTokenLocalChannelProjectionArm(token, newly_added.intent.generation, null));
+    try testing.expect(s.tokenLocalChannelProjection(token, "#new") == null);
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+    var rows: [3]Session = undefined;
+    for (s.sessionsInto("alice", &rows)) |row|
+        try testing.expect(row.local_channel_projections == null);
+    try testing.expect(!s.rollbackTokenLocalChannelProjectionArm(token, newly_added.intent.generation, null));
+
+    const stale = try s.armTokenLocalChannelProjectionWithPrevious(token, "#new", false, 2);
+    const newest = try s.armTokenLocalChannelProjection(token, "#NEW", true, 7);
+    try testing.expect(!s.rollbackTokenLocalChannelProjectionArm(token, stale.intent.generation, null));
+    const retained = s.tokenLocalChannelProjection(token, "#new").?;
+    try testing.expectEqual(newest.generation, retained.generation);
+    try testing.expect(retained.present);
+    try testing.expectEqual(@as(u8, 7), retained.member_mode_bits);
+    try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+}
+
 test "local channel projection arm OOM is transactional and retryable" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var s = SessionStore.init(failing.allocator());
@@ -1814,6 +1969,46 @@ test "local channel projection capacity fails closed and full same-channel arm c
     try testing.expectEqual(local_channel_projection_capacity, s.tokenLocalChannelProjectionsInto(token, &all).len);
 }
 
+test "local channel projection reversible replacement remains allocation-free at capacity" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+    const token = tok(0x2E);
+    _ = try s.attach("alice", 1, token, 1);
+    _ = try s.attach("alice", 2, token, 2);
+
+    var edge_generation: u64 = 0;
+    for (0..local_channel_projection_capacity) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#r{d}", .{index});
+        const intent = try s.armTokenLocalChannelProjection(token, channel, true, @intCast(index));
+        if (index == local_channel_projection_capacity - 1) edge_generation = intent.generation;
+    }
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+
+    failing.fail_index = failing.alloc_index;
+    const replacement = try s.armTokenLocalChannelProjectionWithPrevious(token, "#R7", false, 0x7F);
+    try testing.expectEqual(edge_generation, replacement.previous.?.generation);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(s.rollbackTokenLocalChannelProjectionArm(
+        token,
+        replacement.intent.generation,
+        replacement.previous,
+    ));
+    try testing.expect(!failing.has_induced_failure);
+    const restored = s.tokenLocalChannelProjection(token, "#r7").?;
+    try testing.expectEqual(edge_generation, restored.generation);
+    try testing.expect(restored.present);
+    try testing.expectEqual(@as(u8, 7), restored.member_mode_bits);
+    var all: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    try testing.expectEqual(local_channel_projection_capacity, s.tokenLocalChannelProjectionsInto(token, &all).len);
+    try testing.expectError(
+        error.TooManyPendingChannels,
+        s.armTokenLocalChannelProjectionWithPrevious(token, "#overflow", true, 0),
+    );
+    try testing.expect(!failing.has_induced_failure);
+}
+
 test "local channel projection survives detach and sibling removal until final row" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
@@ -1865,13 +2060,32 @@ test "prepared token bind preserves channel union and newest case-insensitive co
     _ = try s.attach("alice", 2, source, 2);
     _ = try s.attach("alice", 3, source, 3);
     _ = try s.armTokenLocalChannelProjection(target, "#a", true, 1);
-    _ = try s.armTokenLocalChannelProjection(target, "#same", true, 1);
+    const target_same = try s.armTokenLocalChannelProjection(target, "#same", true, 1);
     _ = try s.armTokenLocalChannelProjection(source, "#b", false, 2);
     const newest = try s.armTokenLocalChannelProjection(source, "#SAME", false, 7);
+
+    // Aborting a prepared merge must not rewrite either token group's source
+    // image or consume the staged target rows.
+    var aborted = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    aborted.abort();
+    aborted.deinit();
+    try testing.expectEqual(target_same.generation, s.tokenLocalChannelProjection(target, "#same").?.generation);
+    try testing.expectEqual(newest.generation, s.tokenLocalChannelProjection(source, "#same").?.generation);
+    try testing.expect(s.tokenLocalChannelProjection(target, "#b") == null);
+    try testing.expect(s.tokenLocalChannelProjection(source, "#a") == null);
 
     var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
         return error.TestUnexpectedResult;
     defer prepared.deinit();
+    var preview_buf: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    const preview = prepared.mergedLocalChannelProjectionsInto(&preview_buf);
+    try testing.expectEqual(@as(usize, 3), preview.len);
+    try testing.expect(std.ascii.eqlIgnoreCase(preview[0].channel(), "#a"));
+    try testing.expect(std.ascii.eqlIgnoreCase(preview[1].channel(), "#b"));
+    try testing.expect(std.ascii.eqlIgnoreCase(preview[2].channel(), "#same"));
+    try testing.expectEqual(newest.generation, preview[2].generation);
+    try testing.expect(!preview[2].present);
     try testing.expect(prepared.commit());
     prepared.finish();
     try testing.expect(s.tokenLocalChannelProjection(target, "#a") != null);
@@ -1881,6 +2095,60 @@ test "prepared token bind preserves channel union and newest case-insensitive co
     try testing.expect(s.tokenLocalChannelProjection(source, "#a") == null);
     try testing.expect(s.tokenLocalChannelProjection(source, "#b") != null);
     try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared token bind preview is complete at capacity and keeps newest target collision" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x3C);
+    const source = tok(0x3D);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, source, 2);
+
+    const older_collision = try s.armTokenLocalChannelProjection(source, "#case", false, 1);
+    for (0..3) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#s{d}", .{index});
+        _ = try s.armTokenLocalChannelProjection(source, channel, index % 2 == 0, @intCast(index));
+    }
+    const newer_collision = try s.armTokenLocalChannelProjection(target, "#CASE", true, 0x7F);
+    try testing.expect(newer_collision.generation > older_collision.generation);
+    for (0..4) |index| {
+        var channel_buf: [8]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "#t{d}", .{index});
+        _ = try s.armTokenLocalChannelProjection(target, channel, index % 2 != 0, @intCast(index + 8));
+    }
+
+    var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var preview_buf: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    const preview = prepared.mergedLocalChannelProjectionsInto(&preview_buf);
+    try testing.expectEqual(local_channel_projection_capacity, preview.len);
+    for (preview[1..], 1..) |projection, index|
+        try testing.expect(localChannelOrder(preview[index - 1].channel(), projection.channel()) == .lt);
+    var collision_count: usize = 0;
+    for (preview) |projection| {
+        if (!std.ascii.eqlIgnoreCase(projection.channel(), "#case")) continue;
+        collision_count += 1;
+        try testing.expectEqualStrings("#CASE", projection.channel());
+        try testing.expectEqual(newer_collision.generation, projection.generation);
+        try testing.expect(projection.present);
+        try testing.expectEqual(@as(u8, 0x7F), projection.member_mode_bits);
+    }
+    try testing.expectEqual(@as(usize, 1), collision_count);
+
+    try testing.expect(prepared.commit());
+    prepared.finish();
+    try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+    var rows: [2]Session = undefined;
+    for (s.sessionsInto("alice", &rows)) |row| {
+        try testing.expect(std.crypto.timing_safe.eql(Token, row.token, target));
+        const set = row.local_channel_projections orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(local_channel_projection_capacity, set.slice().len);
+        const index = localProjectionIndex(set, "#case") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(newer_collision.generation, set.items[index].generation);
+    }
 }
 
 test "prepared token adopt carries the journal and abort frees staged rows" {
@@ -1975,6 +2243,39 @@ test "local projection arm and prepared bind allocation failures are leak-clean"
             prepared.finish();
             try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
             try testing.expect(s.clearTokenLocalChannelProjection(target, "#sweep", intent.generation));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
+
+test "reversible local projection arm and rollback are leak-clean across every allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+            const token = tok(0x70);
+            _ = try s.attach("rollback-sweep", 1, token, 1);
+            _ = try s.attach("rollback-sweep", 2, token, 2);
+            _ = try s.attach("rollback-sweep", 3, token, 3);
+
+            const prior = try s.armTokenLocalChannelProjection(token, "#prior", false, 0x06);
+            const replacement = try s.armTokenLocalChannelProjectionWithPrevious(token, "#PRIOR", true, 0x03);
+            try testing.expectEqual(prior.generation, replacement.previous.?.generation);
+            try testing.expect(s.rollbackTokenLocalChannelProjectionArm(
+                token,
+                replacement.intent.generation,
+                replacement.previous,
+            ));
+            const restored = s.tokenLocalChannelProjection(token, "#prior").?;
+            try testing.expectEqual(prior.generation, restored.generation);
+            try testing.expect(!restored.present);
+            try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+
+            const added = try s.armTokenLocalChannelProjectionWithPrevious(token, "#new", true, 1);
+            try testing.expect(added.previous == null);
+            try testing.expect(s.rollbackTokenLocalChannelProjectionArm(token, added.intent.generation, null));
+            try testing.expect(s.tokenLocalChannelProjection(token, "#new") == null);
+            try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});

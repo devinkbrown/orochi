@@ -2499,6 +2499,83 @@ pub const World = struct {
         return out;
     }
 
+    pub const PreparedCloneTemplate = struct {
+        world: *World,
+        dst: []u8,
+        template: Channel,
+        active: bool = true,
+
+        pub fn abort(self: *PreparedCloneTemplate) void {
+            if (!self.active) return;
+            self.template.deinit();
+            self.world.allocator.free(self.dst);
+            self.active = false;
+        }
+
+        /// Seat the first member through World's existing failure-atomic JOIN,
+        /// then install every pre-owned template field without allocation. A JOIN
+        /// error leaves no destination entity; success has no later error path.
+        pub fn commitSeated(
+            self: *PreparedCloneTemplate,
+            client: ClientId,
+            modes: MemberModes,
+        ) WorldError!void {
+            std.debug.assert(self.active);
+            std.debug.assert(!self.world.channelExists(self.dst));
+            const newly_joined = try self.world.join(self.dst, client);
+            std.debug.assert(newly_joined);
+            const destination = self.world.channels.getPtr(self.dst) orelse unreachable;
+            const member_modes = destination.members.getPtr(client) orelse unreachable;
+            member_modes.* = modes;
+
+            const members = destination.members;
+            destination.members = MemberMap.init(self.world.allocator);
+            const oid = destination.oid;
+            const created_unix = destination.created_unix;
+            destination.deinit();
+            self.template.members.deinit();
+            self.template.members = members;
+            self.template.oid = oid;
+            self.template.created_unix = created_unix;
+            destination.* = self.template;
+            self.template = Channel.init(self.world.allocator);
+            self.world.allocator.free(self.dst);
+            self.active = false;
+        }
+    };
+
+    /// Own a complete clone template off-map. No destination existence or member
+    /// state is published until PreparedCloneTemplate.commitSeated succeeds.
+    pub fn prepareCloneTemplate(self: *World, src: []const u8, dst: []const u8) WorldError!?PreparedCloneTemplate {
+        if (self.channels.getPtr(src) == null) return error.NoSuchChannel;
+        if (self.channelExists(dst)) return null;
+
+        const owned_dst = try self.allocator.dupe(u8, dst);
+        errdefer self.allocator.free(owned_dst);
+        const tmpl = self.channels.getPtr(src).?;
+        var template = Channel.init(self.allocator);
+        errdefer template.deinit();
+        template.modes = tmpl.modes;
+        template.limit = tmpl.limit;
+        template.private = tmpl.private;
+        template.hidden = tmpl.hidden;
+        template.throttle_joins = tmpl.throttle_joins;
+        template.throttle_secs = tmpl.throttle_secs;
+        template.ext_modes = tmpl.ext_modes;
+        template.ext_modes.set(.clone);
+        template.ext_modes.clear(.cloneable);
+        template.key = if (tmpl.key) |key| try self.allocator.dupe(u8, key) else null;
+        template.forward = if (tmpl.forward) |forward| try self.allocator.dupe(u8, forward) else null;
+        template.topic = if (tmpl.topic) |topic_text| try self.allocator.dupe(u8, topic_text) else null;
+        template.topic_setter = if (tmpl.topic_setter) |setter| try self.allocator.dupe(u8, setter) else null;
+        template.topic_time = tmpl.topic_time;
+        template.bans = try self.cloneListEntries(tmpl.bans.items);
+        template.exempts = try self.cloneListEntries(tmpl.exempts.items);
+        template.invex = try self.cloneListEntries(tmpl.invex.items);
+        template.mutes = try self.cloneListEntries(tmpl.mutes.items);
+        return .{ .world = self, .dst = owned_dst, .template = template };
+    }
+
     /// IRCX CLONE: create `dst` as a portable room/template clone of `src`,
     /// copying channel-level modes, limit/key/forward/throttle configuration,
     /// topic metadata, list-mode masks, and ext flags, while marking the new
@@ -4626,6 +4703,249 @@ test "channels receive monotonic, stable, unique IRCX object ids" {
 
     // Unknown channel has no OID.
     try std.testing.expect(world.channelOid("#nope") == null);
+}
+
+const PreparedCloneTestFixture = struct {
+    fn owner() ClientId {
+        return testClient(101);
+    }
+
+    fn sourceMember() ClientId {
+        return testClient(102);
+    }
+
+    fn invited() ClientId {
+        return testClient(103);
+    }
+
+    fn seated() ClientId {
+        return testClient(104);
+    }
+
+    fn install(world: *World) !u32 {
+        world.clock_unix = 111;
+        try std.testing.expect(try world.join("#prepared-template", owner()));
+        try world.restoreMember(
+            "#prepared-template",
+            owner(),
+            MemberModes.fromModes(&.{ .founder, .op }),
+        );
+        try std.testing.expect(try world.join("#prepared-template", sourceMember()));
+        try world.restoreMember(
+            "#prepared-template",
+            sourceMember(),
+            MemberModes.fromModes(&.{.voice}),
+        );
+        try std.testing.expect(try world.setChannelFlag("#prepared-template", .invite_only, true));
+        try std.testing.expect(try world.setChannelFlag("#prepared-template", .moderated, true));
+        try std.testing.expect(try world.setChannelFlag("#prepared-template", .secret, true));
+        try std.testing.expect(try world.setPrivate("#prepared-template", true));
+        try std.testing.expect(try world.setHidden("#prepared-template", true));
+        try world.setChannelLimit("#prepared-template", 42);
+        try world.setChannelKey("#prepared-template", "sekret");
+        try world.setForward("#prepared-template", "#overflow");
+        try world.setThrottle("#prepared-template", 3, 10);
+        try world.setTopic("#prepared-template", "portable topic", "A!alice@localhost", 1234);
+        try std.testing.expect(try world.addBan("#prepared-template", "bad!*@*", "ban-setter", 1));
+        try std.testing.expect(try world.addExempt("#prepared-template", "bad!vip@*", "exempt-setter", 2));
+        try std.testing.expect(try world.addInvex("#prepared-template", "friend!*@*", "invex-setter", 3));
+        try std.testing.expect(try world.addMute("#prepared-template", "loud!*@*", "mute-setter", 4));
+        try std.testing.expect(try world.setChannelExtFlag("#prepared-template", .cloneable, true));
+        try std.testing.expect(try world.setChannelExtFlag("#prepared-template", .auditorium, true));
+        try world.addInvite("#prepared-template", invited());
+        return world.channelOid("#prepared-template") orelse error.TestUnexpectedResult;
+    }
+
+    fn expectSourceUnchanged(world: *World, oid: u32, expected_next_oid: u32) !void {
+        try std.testing.expect(world.channels.contains("#prepared-template"));
+        try std.testing.expect(world.channelExists("#PREPARED-TEMPLATE"));
+        try std.testing.expectEqual(@as(usize, 2), world.memberCount("#prepared-template"));
+        try std.testing.expect(world.isMember("#prepared-template", owner()));
+        try std.testing.expect(world.isMember("#prepared-template", sourceMember()));
+        try std.testing.expectEqual(
+            MemberModes.fromModes(&.{ .founder, .op }).bits,
+            world.memberModes("#prepared-template", owner()).?.bits,
+        );
+        try std.testing.expectEqual(
+            MemberModes.fromModes(&.{.voice}).bits,
+            world.memberModes("#prepared-template", sourceMember()).?.bits,
+        );
+        try std.testing.expect(world.channelHasFlag("#prepared-template", .invite_only));
+        try std.testing.expect(world.channelHasFlag("#prepared-template", .moderated));
+        try std.testing.expect(world.channelHasFlag("#prepared-template", .secret));
+        try std.testing.expect(world.isPrivate("#prepared-template"));
+        try std.testing.expect(world.isHidden("#prepared-template"));
+        try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#prepared-template"));
+        try std.testing.expectEqualStrings("sekret", world.channelKey("#prepared-template").?);
+        try std.testing.expectEqualStrings("#overflow", world.forwardOf("#prepared-template").?);
+        try std.testing.expectEqual(@as(u16, 3), world.throttleOf("#prepared-template").?.joins);
+        try std.testing.expectEqual(@as(u32, 10), world.throttleOf("#prepared-template").?.secs);
+        const topic = world.topicInfo("#prepared-template").?;
+        try std.testing.expectEqualStrings("portable topic", topic.text);
+        try std.testing.expectEqualStrings("A!alice@localhost", topic.setter);
+        try std.testing.expectEqual(@as(i64, 1234), topic.set_at);
+        try expectPreparedCloneLists(world, "#prepared-template");
+        try std.testing.expect(world.channelHasExtFlag("#prepared-template", .cloneable));
+        try std.testing.expect(!world.channelHasExtFlag("#prepared-template", .clone));
+        try std.testing.expect(world.channelHasExtFlag("#prepared-template", .auditorium));
+        try std.testing.expect(world.hasInvite("#prepared-template", invited()));
+        try std.testing.expectEqual(oid, world.channelOid("#prepared-template").?);
+        try std.testing.expectEqual(@as(i64, 111), world.channelCreatedUnix("#prepared-template").?);
+        try std.testing.expectEqual(expected_next_oid, world.next_oid);
+    }
+
+    fn expectCommittedDestination(world: *World, source_oid: u32) !void {
+        try std.testing.expect(world.channels.contains("#prepared-clone"));
+        try std.testing.expect(world.channelExists("#PREPARED-CLONE"));
+        try std.testing.expectEqual(@as(usize, 1), world.memberCount("#prepared-clone"));
+        try std.testing.expect(world.isMember("#prepared-clone", seated()));
+        try std.testing.expect(world.channels.getPtr("#prepared-clone").?.members.contains(seated()));
+        try std.testing.expect(!world.isMember("#prepared-clone", owner()));
+        try std.testing.expect(!world.isMember("#prepared-clone", sourceMember()));
+        try std.testing.expectEqual(
+            MemberModes.fromModes(&.{ .owner, .voice }).bits,
+            world.memberModes("#prepared-clone", seated()).?.bits,
+        );
+        try std.testing.expect(world.channelHasFlag("#prepared-clone", .invite_only));
+        try std.testing.expect(world.channelHasFlag("#prepared-clone", .moderated));
+        try std.testing.expect(world.channelHasFlag("#prepared-clone", .secret));
+        try std.testing.expect(world.isPrivate("#prepared-clone"));
+        try std.testing.expect(world.isHidden("#prepared-clone"));
+        try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#prepared-clone"));
+        try std.testing.expectEqualStrings("sekret", world.channelKey("#prepared-clone").?);
+        try std.testing.expectEqualStrings("#overflow", world.forwardOf("#prepared-clone").?);
+        try std.testing.expectEqual(@as(u16, 3), world.throttleOf("#prepared-clone").?.joins);
+        try std.testing.expectEqual(@as(u32, 10), world.throttleOf("#prepared-clone").?.secs);
+        const topic = world.topicInfo("#prepared-clone").?;
+        try std.testing.expectEqualStrings("portable topic", topic.text);
+        try std.testing.expectEqualStrings("A!alice@localhost", topic.setter);
+        try std.testing.expectEqual(@as(i64, 1234), topic.set_at);
+        try expectPreparedCloneLists(world, "#prepared-clone");
+        try std.testing.expect(world.channelHasExtFlag("#prepared-clone", .clone));
+        try std.testing.expect(!world.channelHasExtFlag("#prepared-clone", .cloneable));
+        try std.testing.expect(world.channelHasExtFlag("#prepared-clone", .auditorium));
+        try std.testing.expect(!world.hasInvite("#prepared-clone", invited()));
+        try std.testing.expect(world.channelOid("#prepared-clone").? != source_oid);
+        try std.testing.expectEqual(source_oid +% 1, world.channelOid("#prepared-clone").?);
+        try std.testing.expectEqual(@as(i64, 222), world.channelCreatedUnix("#prepared-clone").?);
+        try std.testing.expectEqual(source_oid +% 2, world.next_oid);
+    }
+};
+
+fn expectPreparedCloneLists(world: *World, channel: []const u8) !void {
+    const bans = world.bansOf(channel).?;
+    try std.testing.expectEqual(@as(usize, 1), bans.len);
+    try std.testing.expectEqualStrings("bad!*@*", bans[0].mask);
+    try std.testing.expectEqualStrings("ban-setter", bans[0].setter);
+    try std.testing.expectEqual(@as(i64, 1), bans[0].set_at);
+    const exempts = world.exemptsOf(channel).?;
+    try std.testing.expectEqual(@as(usize, 1), exempts.len);
+    try std.testing.expectEqualStrings("bad!vip@*", exempts[0].mask);
+    try std.testing.expectEqualStrings("exempt-setter", exempts[0].setter);
+    try std.testing.expectEqual(@as(i64, 2), exempts[0].set_at);
+    const invex = world.invexOf(channel).?;
+    try std.testing.expectEqual(@as(usize, 1), invex.len);
+    try std.testing.expectEqualStrings("friend!*@*", invex[0].mask);
+    try std.testing.expectEqualStrings("invex-setter", invex[0].setter);
+    try std.testing.expectEqual(@as(i64, 3), invex[0].set_at);
+    const mutes = world.mutesOf(channel).?;
+    try std.testing.expectEqual(@as(usize, 1), mutes.len);
+    try std.testing.expectEqualStrings("loud!*@*", mutes[0].mask);
+    try std.testing.expectEqualStrings("mute-setter", mutes[0].setter);
+    try std.testing.expectEqual(@as(i64, 4), mutes[0].set_at);
+}
+
+test "prepared clone abort is idempotent and publishes no destination" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const source_oid = try PreparedCloneTestFixture.install(&world);
+    var prepared = (try world.prepareCloneTemplate("#prepared-template", "#prepared-clone")) orelse
+        return error.TestUnexpectedResult;
+    prepared.abort();
+    prepared.abort();
+    try std.testing.expect(!world.channels.contains("#prepared-clone"));
+    try std.testing.expect(!world.channelExists("#PREPARED-CLONE"));
+    try std.testing.expectEqual(@as(usize, 1), world.channelCount());
+    try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 1);
+}
+
+test "prepared clone missing source and existing destination do not mutate world" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const source_oid = try PreparedCloneTestFixture.install(&world);
+    try std.testing.expectError(
+        error.NoSuchChannel,
+        world.prepareCloneTemplate("#missing", "#prepared-clone"),
+    );
+    try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 1);
+
+    const existing = testClient(105);
+    try std.testing.expect(try world.join("#prepared-clone", existing));
+    const existing_oid = world.channelOid("#prepared-clone").?;
+    try std.testing.expect((try world.prepareCloneTemplate("#prepared-template", "#PREPARED-CLONE")) == null);
+    try std.testing.expectEqual(existing_oid, world.channelOid("#prepared-clone").?);
+    try std.testing.expectEqual(@as(usize, 1), world.memberCount("#prepared-clone"));
+    try std.testing.expect(world.isMember("#prepared-clone", existing));
+    try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 2);
+}
+
+test "prepared clone prepare and seated commit are atomic on every allocation boundary" {
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        try std.testing.expect(fail_offset < 256);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        const source_oid = try PreparedCloneTestFixture.install(&world);
+        world.clock_unix = 222;
+
+        failing.fail_index = failing.alloc_index + fail_offset;
+        var prepared = (world.prepareCloneTemplate("#prepared-template", "#prepared-clone") catch |err| {
+            failing.fail_index = std.math.maxInt(usize);
+            switch (err) {
+                error.OutOfMemory => {
+                    try std.testing.expect(!world.channels.contains("#prepared-clone"));
+                    try std.testing.expect(!world.channelExists("#PREPARED-CLONE"));
+                    try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 1);
+                    world.deinit();
+                    continue;
+                },
+                else => {
+                    world.deinit();
+                    return err;
+                },
+            }
+        }) orelse {
+            world.deinit();
+            return error.TestUnexpectedResult;
+        };
+        prepared.commitSeated(
+            PreparedCloneTestFixture.seated(),
+            MemberModes.fromModes(&.{ .owner, .voice }),
+        ) catch |err| {
+            failing.fail_index = std.math.maxInt(usize);
+            prepared.abort();
+            switch (err) {
+                error.OutOfMemory => {
+                    try std.testing.expect(!world.channels.contains("#prepared-clone"));
+                    try std.testing.expect(!world.channelExists("#PREPARED-CLONE"));
+                    try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 1);
+                    world.deinit();
+                    continue;
+                },
+                else => {
+                    world.deinit();
+                    return err;
+                },
+            }
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        prepared.abort();
+        try PreparedCloneTestFixture.expectSourceUnchanged(&world, source_oid, source_oid +% 2);
+        try PreparedCloneTestFixture.expectCommittedDestination(&world, source_oid);
+        world.deinit();
+        break;
+    }
 }
 
 test "cloneChannel copies portable room template state and marks the clone +E with a fresh OID" {
