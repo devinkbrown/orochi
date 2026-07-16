@@ -250,6 +250,21 @@ fn StringKeyedRegistry(comptime V: type) type {
             return box.map.count();
         }
 
+        /// Visit one stable point-in-time registry image under a single EBR
+        /// guard. Key slices remain borrowed only for the callback duration.
+        pub fn iterate(
+            self: *Self,
+            p: *ebr.Participant,
+            ctx: anytype,
+            comptime func: fn (@TypeOf(ctx), []const u8, V) void,
+        ) void {
+            var guard = p.pin();
+            defer guard.unpin();
+            const box = self.published.load(.acquire);
+            var it = box.map.iterator();
+            while (it.next()) |entry| func(ctx, entry.key, entry.value);
+        }
+
         // ---- writes (serialized, CoW, publish, retire) ------------------
 
         /// Insert or overwrite `key` → `id`. Dupes the key into owned storage.
@@ -406,6 +421,146 @@ fn StringKeyedRegistry(comptime V: type) type {
             key: []const u8,
             value: V,
         };
+
+        /// One prepared channel-registry image that can both remove existing
+        /// keys and insert absent keys. A single writer snapshot is required:
+        /// independently staging removals and insertions would either deadlock
+        /// on this registry's non-reentrant writer lock or publish two snapshots
+        /// cloned from the same old root and lose one side of the edit.
+        pub const StagedEditBatch = struct {
+            registry: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            new_box: *Published,
+            owned_keys: [][]u8,
+            removed_keys: [][]u8,
+            retired: *RetiredKeysBatch,
+            active: bool = true,
+
+            pub fn commit(self: *StagedEditBatch) void {
+                std.debug.assert(self.active);
+                self.registry.published.store(self.new_box, .release);
+                // One deferred closure owns the old persistent root and every
+                // removed key buffer, so a mixed edit consumes one retire slot
+                // regardless of the number of channel names removed.
+                self.reservation.retireErased(
+                    @ptrCast(self.retired),
+                    RetiredKeysBatch.reclaim,
+                    self.registry.allocator,
+                );
+                // Inserted key bytes now belong to the live registry. Only the
+                // temporary slice container remains transaction-owned.
+                self.registry.allocator.free(self.owned_keys);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+
+            pub fn abort(self: *StagedEditBatch) void {
+                std.debug.assert(self.active);
+                self.new_box.map.release(self.registry.allocator);
+                self.registry.allocator.destroy(self.new_box);
+                for (self.owned_keys) |key| self.registry.allocator.free(key);
+                self.registry.allocator.free(self.owned_keys);
+                // The still-published old map continues to own the removed key
+                // bytes. Abort frees only the temporary pointer container.
+                self.registry.allocator.free(self.removed_keys);
+                self.registry.allocator.destroy(self.retired);
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+        };
+
+        /// Build one immutable mixed edit from existing `removals` and absent
+        /// `inserts`. Inputs must be unique case-insensitively and the two sets
+        /// must be disjoint. Null reports a stale/mismatched caller image.
+        pub fn stageEditBatchReserved(
+            self: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            removals: []const []const u8,
+            inserts: []const Insert,
+        ) !?StagedEditBatch {
+            std.debug.assert(removals.len != 0 or inserts.len != 0);
+            self.writer_lock.lock();
+            errdefer self.writer_lock.unlock();
+
+            const old_box = self.published.load(.acquire);
+            const ctx: CaseInsensitiveBytesContext = undefined;
+            for (removals, 0..) |key, i| {
+                if (old_box.map.get(key) == null) {
+                    self.writer_lock.unlock();
+                    return null;
+                }
+                for (removals[0..i]) |prior| {
+                    if (ctx.eql(prior, key)) {
+                        self.writer_lock.unlock();
+                        return null;
+                    }
+                }
+            }
+            for (inserts, 0..) |insert, i| {
+                if (old_box.map.get(insert.key) != null) {
+                    self.writer_lock.unlock();
+                    return null;
+                }
+                for (inserts[0..i]) |prior| {
+                    if (ctx.eql(prior.key, insert.key)) {
+                        self.writer_lock.unlock();
+                        return null;
+                    }
+                }
+                for (removals) |removed| {
+                    if (ctx.eql(removed, insert.key)) {
+                        self.writer_lock.unlock();
+                        return null;
+                    }
+                }
+            }
+
+            std.debug.assert(reservation.active);
+            std.debug.assert(reservation.remaining != 0);
+            const removed_keys = try self.allocator.alloc([]u8, removals.len);
+            errdefer self.allocator.free(removed_keys);
+            for (removals, removed_keys) |key, *owned| {
+                owned.* = findOwnedKey(old_box.map, key) orelse unreachable;
+            }
+
+            const owned_keys = try self.allocator.alloc([]u8, inserts.len);
+            var owned_count: usize = 0;
+            errdefer {
+                for (owned_keys[0..owned_count]) |key| self.allocator.free(key);
+                self.allocator.free(owned_keys);
+            }
+
+            var new_map = old_box.map;
+            new_map.retain();
+            errdefer new_map.release(self.allocator);
+            for (removals) |key| {
+                const next = try new_map.remove(self.allocator, key);
+                new_map.release(self.allocator);
+                new_map = next;
+            }
+            for (inserts) |insert| {
+                const owned_key = try self.allocator.dupe(u8, insert.key);
+                owned_keys[owned_count] = owned_key;
+                owned_count += 1;
+                const next = try new_map.put(self.allocator, owned_key, insert.value);
+                new_map.release(self.allocator);
+                new_map = next;
+            }
+
+            const new_box = try self.allocator.create(Published);
+            errdefer self.allocator.destroy(new_box);
+            new_box.* = .{ .map = new_map };
+            const retired = try self.allocator.create(RetiredKeysBatch);
+            retired.* = .{ .box = old_box, .keys = removed_keys };
+            return .{
+                .registry = self,
+                .reservation = reservation,
+                .new_box = new_box,
+                .owned_keys = owned_keys,
+                .removed_keys = removed_keys,
+                .retired = retired,
+            };
+        }
 
         /// Prepared insertion of a batch of previously-absent keys. The
         /// registry writer lock remains held until commit or abort. Commit is a
@@ -1236,6 +1391,75 @@ test "ChannelRegistry(*Dummy): set/lookup/remove with pointer value" {
     try reg.remove(p, "#GENERAL");
     try testing.expectEqual(@as(?*Dummy, null), reg.lookup(p, "#general"));
     try testing.expectEqual(@as(usize, 0), reg.count(p));
+}
+
+test "ChannelRegistry staged mixed edit commits and aborts one exact snapshot" {
+    const a = testing.allocator;
+    var domain = ebr.Domain.init(a);
+    defer domain.deinit();
+    const p = domain.register() catch unreachable;
+    defer p.unregister();
+    const reader = domain.register() catch unreachable;
+    defer reader.unregister();
+
+    var reg = try ChannelRegistry(u32).init(a, &domain);
+    defer {
+        reg.deinit();
+        quiesce(&domain);
+    }
+    try reg.set(p, "#Keep", 1);
+    try reg.set(p, "#Drop-A", 2);
+    try reg.set(p, "#drop-b", 3);
+
+    const removals = [_][]const u8{ "#DROP-a", "#Drop-B" };
+    const inserts = [_]ChannelRegistry(u32).Insert{
+        .{ .key = "#New-A", .value = 4 },
+        .{ .key = "#new-b", .value = 5 },
+    };
+
+    // A staged image is completely inert until commit and abort restores the
+    // old registry without taking ownership of its removed key buffers.
+    var abort_reservation = try p.reserveRetireCapacity(1);
+    defer if (abort_reservation.active) abort_reservation.finish();
+    var aborted = (try reg.stageEditBatchReserved(&abort_reservation, &removals, &inserts)).?;
+    try testing.expectEqual(@as(?u32, 2), reg.lookup(reader, "#drop-a"));
+    try testing.expectEqual(@as(?u32, null), reg.lookup(reader, "#new-a"));
+    aborted.abort();
+    abort_reservation.finish();
+
+    var commit_reservation = try p.reserveRetireCapacity(1);
+    defer if (commit_reservation.active) commit_reservation.finish();
+    var committed = (try reg.stageEditBatchReserved(&commit_reservation, &removals, &inserts)).?;
+    committed.commit();
+    commit_reservation.finish();
+    try testing.expectEqual(@as(?u32, 1), reg.lookup(reader, "#KEEP"));
+    try testing.expectEqual(@as(?u32, null), reg.lookup(reader, "#drop-a"));
+    try testing.expectEqual(@as(?u32, null), reg.lookup(reader, "#DROP-B"));
+    try testing.expectEqual(@as(?u32, 4), reg.lookup(reader, "#new-a"));
+    try testing.expectEqual(@as(?u32, 5), reg.lookup(reader, "#NEW-B"));
+    try testing.expectEqual(@as(usize, 3), reg.count(reader));
+
+    // Mismatched and case-colliding caller images fail closed and release the
+    // writer lock so a later valid registry write can still proceed.
+    var invalid_reservation = try p.reserveRetireCapacity(1);
+    defer if (invalid_reservation.active) invalid_reservation.finish();
+    try testing.expect((try reg.stageEditBatchReserved(
+        &invalid_reservation,
+        &.{"#missing"},
+        &.{},
+    )) == null);
+    const duplicate_inserts = [_]ChannelRegistry(u32).Insert{
+        .{ .key = "#Twin", .value = 6 },
+        .{ .key = "#twin", .value = 7 },
+    };
+    try testing.expect((try reg.stageEditBatchReserved(
+        &invalid_reservation,
+        &.{},
+        &duplicate_inserts,
+    )) == null);
+    invalid_reservation.finish();
+    try reg.set(p, "#After", 8);
+    try testing.expectEqual(@as(?u32, 8), reg.lookup(reader, "#after"));
 }
 
 const Collector = struct {

@@ -31473,27 +31473,6 @@ pub const LinuxServer = struct {
         else
             "";
 
-        // Privilege non-downgrade: reclaiming a detached ghost must never strip
-        // elevation the LIVE session already holds. The migration snapshot
-        // carries at most a bare `is_oper` bool — no privilege bits, class, or
-        // title — so restore() below either drops oper entirely (ghost detached
-        // pre-elevation) or re-grants a zero-privilege bare oper. SASL oper
-        // elevation runs BEFORE this restore on login, so a freshly-elevated
-        // session would 481 on its next privileged action. Snapshot the live
-        // grant into stack buffers (the getters return slices INTO session
-        // storage that restore() rewrites) and re-assert it afterwards.
-        const live_was_oper = conn.session.isOper();
-        const live_priv_bits = conn.session.oper_priv.toBits();
-        const live_had_override = conn.session.hasUmode(.override);
-        var live_class_buf: [64]u8 = undefined;
-        const live_class_src = conn.session.operClass();
-        const live_class_len = @min(live_class_src.len, live_class_buf.len);
-        @memcpy(live_class_buf[0..live_class_len], live_class_src[0..live_class_len]);
-        var live_title_buf: [64]u8 = undefined;
-        const live_title_src = conn.session.operTitle();
-        const live_title_len = @min(live_title_src.len, live_title_buf.len);
-        @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
-
         // Claim the migrated nick BEFORE mutating the live session. A collision
         // with the SAME authenticated account is an existing attachment of this
         // logical identity, not a restore failure: the current world owner stays
@@ -31510,43 +31489,13 @@ pub const LinuxServer = struct {
             };
         }
 
-        // Restore identity/account/away/oper through the SAME session restore the
-        // UPGRADE path uses, by projecting the migration snapshot onto a
-        // session_snapshot.Snapshot. The fd is irrelevant (the client is already
-        // connected here); restore() does not touch it.
-        conn.session.restore(.{
-            .nick = snap.nick,
-            .realname = snap.realname,
-            .account = if (snap.account.len != 0) snap.account else account,
-            .host = snap.host,
-            .away = snap.away,
-            .username = snap.username,
-            .logged_in = snap.account.len != 0,
-            .away_active = snap.away.len != 0,
-            .is_oper = snap.is_oper,
-        });
-        // Merge, never downgrade: if the live session was opered, re-assert its
-        // grant (union of privilege bits — the ghost contributes at most zero —
-        // plus the live class/title, and the +j override umode auto_override
-        // granted at elevation). A non-oper live session adopting an opered
-        // ghost keeps the existing bare-oper restore semantics unchanged.
-        if (live_was_oper) {
-            const merged_bits = live_priv_bits | conn.session.oper_priv.toBits();
-            conn.session.setOperGrant(
-                oper_mod.OperPrivileges.fromBits(merged_bits),
-                live_class_buf[0..live_class_len],
-                live_title_buf[0..live_title_len],
-            );
-            if (live_had_override and conn.session.hasPriv(.oper_override)) {
-                _ = conn.session.setUmode(.override, true);
-            }
-        }
+        // Prepare the migrated profile through a pure/no-audit value seam. A
+        // later failure-atomic RESUME composition can run this against a temporary
+        // ClientSession before committing World/token state; this wave deliberately
+        // keeps the existing call graph and applies it to the live value in place.
+        const profile = prepareMigratedSessionProfile(&conn.session, account, snap, conn.is_tls);
         self.injectSessionState(conn);
         conn.nick_claimed_at_ms = 0;
-
-        // Re-apply the migrated user modes (server source, so server-managed
-        // letters carry too). +o/+r are derived from is_oper/logged_in already.
-        self.applyMigratedUmodes(conn, snap.umodes);
 
         // Re-register the nick so the migrated client stays addressable, then
         // re-join every carried channel with its exact member modes — the exact
@@ -31618,25 +31567,132 @@ pub const LinuxServer = struct {
             conn.session_mesh_announce_old_nick_len = @intCast(old_nick.len);
             @memcpy(conn.session_mesh_announce_old_nick[0..old_nick.len], old_nick);
         }
+        if (profile.override_activated) {
+            self.auditOverrideUse(conn, "UMODE", conn.session.displayName(), "override restored via migration");
+        }
         return true;
     }
 
-    /// Apply a rendered umode string (e.g. "+iwx") to `conn`'s session as a
-    /// server-sourced change, skipping the derived `o`/`r` letters. Best-effort.
-    fn applyMigratedUmodes(self: *LinuxServer, conn: *ConnState, mode_str: []const u8) void {
-        for (mode_str) |letter| {
-            if (letter == '+' or letter == '-') continue;
-            if (letter == 'o' or letter == 'r') continue; // derived from is_oper/logged_in
-            const mode = usermode.modeFromLetter(letter) orelse continue;
-            if (mode == .override) {
-                if (!conn.session.hasPriv(.oper_override)) continue;
-                if (conn.session.setUmode(.override, true)) {
-                    self.auditOverrideUse(conn, "UMODE", conn.session.displayName(), "override restored via migration");
-                }
-                continue;
+    const MigratedProfileResult = struct {
+        /// A carried +j changed an authorized claimant from override-off to
+        /// override-on. The caller audits this only after the enclosing restore
+        /// commits; preparation itself performs no I/O or audit side effects.
+        override_activated: bool = false,
+    };
+
+    /// Project one authenticated migration snapshot onto a ClientSession value.
+    /// The authenticated account and current transport/grant are authoritative;
+    /// carried profile data may move visible identity but cannot rewrite the peer
+    /// address, CAP negotiation, transport proof, or derived privilege modes.
+    fn prepareMigratedSessionProfile(
+        session: *dispatch.ClientSession,
+        authenticated_account: []const u8,
+        snap: *const migration_relay.Snapshot,
+        transport_secure: bool,
+    ) MigratedProfileResult {
+        // restore() overwrites inline storage, so copy every live slice needed for
+        // re-derivation before entering it. Negotiated caps live outside the fields
+        // restore replaces and therefore survive this in-place value preparation.
+        var real_host_buf: [255]u8 = undefined;
+        const real_host_src = session.realHost();
+        const real_host_len = @min(real_host_src.len, real_host_buf.len);
+        @memcpy(real_host_buf[0..real_host_len], real_host_src[0..real_host_len]);
+        var account_buf: [64]u8 = undefined;
+        const account_len = @min(authenticated_account.len, account_buf.len);
+        @memcpy(account_buf[0..account_len], authenticated_account[0..account_len]);
+
+        const live_was_oper = session.isOper();
+        const live_priv_bits = session.oper_priv.toBits();
+        const live_had_override = session.hasUmode(.override);
+        const live_media_tx_denied = session.hasUmode(.media_tx_deny);
+        var live_class_buf: [64]u8 = undefined;
+        const live_class_src = session.operClass();
+        const live_class_len = @min(live_class_src.len, live_class_buf.len);
+        @memcpy(live_class_buf[0..live_class_len], live_class_src[0..live_class_len]);
+        var live_title_buf: [64]u8 = undefined;
+        const live_title_src = session.operTitle();
+        const live_title_len = @min(live_title_src.len, live_title_buf.len);
+        @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
+
+        // The HMAC-authenticated caller account is canonical even for rolling-old
+        // snapshots that omitted their account field. The current socket's real
+        // host remains local transport identity; only its visible host migrates.
+        session.restore(.{
+            .nick = snap.nick,
+            .realname = snap.realname,
+            .account = account_buf[0..account_len],
+            .real_host = real_host_buf[0..real_host_len],
+            .host = snap.host,
+            .away = snap.away,
+            .username = snap.username,
+            .logged_in = true,
+            .away_active = snap.away.len != 0,
+            // A carried oper bit is profile history, not current authority. RESUME
+            // runs after local authentication/elevation, so only the claimant's
+            // verified live grant may retain +o or derive +a/+j.
+            .is_oper = live_was_oper,
+        });
+
+        // Privilege non-downgrade: SASL elevation precedes RESUME. Preserve that
+        // complete current grant. Preserve an already-authorized +j until the
+        // carried directional mode string explicitly removes it.
+        if (live_was_oper) {
+            session.setOperGrant(
+                oper_mod.OperPrivileges.fromBits(live_priv_bits),
+                live_class_buf[0..live_class_len],
+                live_title_buf[0..live_title_len],
+            );
+            if (live_had_override and session.hasPriv(.oper_override)) {
+                _ = session.setUmode(.override, true);
             }
-            _ = conn.session.setUmode(mode, true);
         }
+
+        return applyMigratedUmodesToSession(
+            session,
+            snap.umodes,
+            transport_secure,
+            live_media_tx_denied,
+        );
+    }
+
+    /// Apply a rendered directional umode string to a ClientSession value without
+    /// audit or external mutation. Derived/transport/privileged letters are never
+    /// accepted from the snapshot: +r/+a come from login/grant, +z from the live
+    /// transport, and o/x are ignored. +j additionally requires oper_override.
+    fn applyMigratedUmodesToSession(
+        session: *dispatch.ClientSession,
+        mode_str: []const u8,
+        transport_secure: bool,
+        preserve_media_tx_deny: bool,
+    ) MigratedProfileResult {
+        const override_before = session.hasUmode(.override);
+        var adding: ?bool = null;
+        for (mode_str) |letter| switch (letter) {
+            '+' => adding = true,
+            '-' => adding = false,
+            'o' => {},
+            else => {
+                const on = adding orelse continue;
+                const mode = usermode.modeFromLetter(letter) orelse continue;
+                // Share the replica projector's fail-closed allowlist. A future
+                // server-managed catalog addition is non-portable by default.
+                if (!portableReplicaUmode(mode)) continue;
+                if (mode == .override and on and !session.hasPriv(.oper_override)) continue;
+                _ = session.setUmode(mode, on);
+            },
+        };
+
+        // Re-derive rather than merge these authority-bearing bits. In particular,
+        // a plaintext claimant cannot escalate by presenting a carried +z.
+        _ = session.setUmode(.secure_tls, transport_secure);
+        _ = session.setUmode(.registered, session.account() != null);
+        _ = session.setUmode(.admin, session.isAdmin());
+        if (preserve_media_tx_deny) _ = session.setUmode(.media_tx_deny, true);
+        if (!session.hasPriv(.oper_override)) _ = session.setUmode(.override, false);
+
+        return .{
+            .override_activated = !override_before and session.hasUmode(.override),
+        };
     }
 
     /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR | FORWARD <account>|OFF |
@@ -56534,26 +56590,143 @@ test "override user mode letter does not collide with advertised mode catalogs" 
     }
 }
 
-test "migrated override user mode is gated by oper_override privilege" {
-    if (comptime builtin.os.tag == .linux) {
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-            else => return err,
-        };
-        defer server.deinit();
+test "migrated profile uses authenticated account and preserves local transport identity and caps" {
+    var session = dispatch.ClientSession.init();
+    session.loginAs("alice");
+    session.setRealHost("203.0.113.41");
+    session.setVisibleHost("old-cloak.example");
+    session.addCap(.echo_message);
+    session.addCap(.orochi_session_sync);
 
-        var plain = ConnState.init(-1);
-        try plain.session.setNick("Plain");
-        server.applyMigratedUmodes(&plain, "+ij");
-        try std.testing.expect(plain.session.hasUmode(.invisible));
-        try std.testing.expect(!plain.session.hasUmode(.override));
+    const snap = migration_relay.Snapshot{
+        .nick = "AlicePhone",
+        .umodes = "+i",
+        .channels = &.{},
+        // Rolling-old migration snapshots may omit account. The already-
+        // authenticated caller remains logged in under its canonical account.
+        .account = "",
+        .host = "migrated-cloak.example",
+    };
+    const result = LinuxServer.prepareMigratedSessionProfile(&session, "alice", &snap, false);
 
-        var privileged = ConnState.init(-1);
-        try privileged.session.setNick("Priv");
-        privileged.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
-        server.applyMigratedUmodes(&privileged, "+j");
-        try std.testing.expect(privileged.session.hasUmode(.override));
-    } else return error.SkipZigTest;
+    try std.testing.expect(!result.override_activated);
+    try std.testing.expectEqualStrings("alice", session.account().?);
+    try std.testing.expect(session.hasUmode(.registered));
+    try std.testing.expectEqualStrings("203.0.113.41", session.realHost());
+    try std.testing.expectEqualStrings("migrated-cloak.example", session.host());
+    try std.testing.expect(session.hasCap(.echo_message));
+    try std.testing.expect(session.hasCap(.orochi_session_sync));
+}
+
+test "migrated profile honors mode direction and rederives transport account and admin modes" {
+    var tls_admin = dispatch.ClientSession.init();
+    tls_admin.loginAs("admin");
+    tls_admin.setOperGrant(
+        oper_mod.OperPrivileges.initMany(&.{.server_admin}),
+        "netadmin",
+        "Network Admin",
+    );
+    const tls_snap = migration_relay.Snapshot{
+        .nick = "AdminPhone",
+        // +B is portable, +i is then removed. Attempts to remove derived +r/+a
+        // and carried +z/+x cannot override current account/grant/transport.
+        .umodes = "+iBzxa-irza",
+        .channels = &.{},
+    };
+    _ = LinuxServer.prepareMigratedSessionProfile(&tls_admin, "admin", &tls_snap, true);
+    try std.testing.expect(!tls_admin.hasUmode(.invisible));
+    try std.testing.expect(tls_admin.hasUmode(.bot));
+    try std.testing.expect(tls_admin.hasUmode(.secure_tls));
+    try std.testing.expect(!tls_admin.hasUmode(.cloaked));
+    try std.testing.expect(tls_admin.hasUmode(.registered));
+    try std.testing.expect(tls_admin.hasUmode(.admin));
+    try std.testing.expect(tls_admin.isAdmin());
+
+    var plaintext = dispatch.ClientSession.init();
+    plaintext.loginAs("plain");
+    const plain_snap = migration_relay.Snapshot{
+        .nick = "PlainPhone",
+        .umodes = "+zaxo",
+        .channels = &.{},
+        // Stale profile history cannot recreate an oper grant revoked locally.
+        .is_oper = true,
+    };
+    _ = LinuxServer.prepareMigratedSessionProfile(&plaintext, "plain", &plain_snap, false);
+    try std.testing.expect(!plaintext.hasUmode(.secure_tls));
+    try std.testing.expect(!plaintext.hasUmode(.cloaked));
+    try std.testing.expect(!plaintext.hasUmode(.admin));
+    try std.testing.expect(!plaintext.isOper());
+    try std.testing.expect(plaintext.hasUmode(.registered));
+}
+
+test "migrated profile never relaxes a local media transmit deny" {
+    var removed = dispatch.ClientSession.init();
+    removed.loginAs("restricted");
+    _ = removed.setUmode(.media_tx_deny, true);
+    const remove_snap = migration_relay.Snapshot{
+        .nick = "RestrictedPhone",
+        .umodes = "-M",
+        .channels = &.{},
+    };
+    _ = LinuxServer.prepareMigratedSessionProfile(&removed, "restricted", &remove_snap, false);
+    try std.testing.expect(removed.hasUmode(.media_tx_deny));
+
+    var omitted = dispatch.ClientSession.init();
+    omitted.loginAs("restricted");
+    _ = omitted.setUmode(.media_tx_deny, true);
+    const omitted_snap = migration_relay.Snapshot{
+        .nick = "RestrictedTablet",
+        .umodes = "+i",
+        .channels = &.{},
+    };
+    _ = LinuxServer.prepareMigratedSessionProfile(&omitted, "restricted", &omitted_snap, false);
+    try std.testing.expect(omitted.hasUmode(.media_tx_deny));
+
+    // A carried deny may still tighten an unrestricted claimant.
+    var tightened = dispatch.ClientSession.init();
+    tightened.loginAs("restricted");
+    const add_snap = migration_relay.Snapshot{
+        .nick = "RestrictedLaptop",
+        .umodes = "+M",
+        .channels = &.{},
+    };
+    _ = LinuxServer.prepareMigratedSessionProfile(&tightened, "restricted", &add_snap, false);
+    try std.testing.expect(tightened.hasUmode(.media_tx_deny));
+}
+
+test "migrated override mode is directional privilege gated and reports activation" {
+    var plain = dispatch.ClientSession.init();
+    plain.loginAs("plain");
+    const plain_snap = migration_relay.Snapshot{
+        .nick = "Plain",
+        .umodes = "+ij",
+        .channels = &.{},
+    };
+    const denied = LinuxServer.prepareMigratedSessionProfile(&plain, "plain", &plain_snap, false);
+    try std.testing.expect(plain.hasUmode(.invisible));
+    try std.testing.expect(!plain.hasUmode(.override));
+    try std.testing.expect(!denied.override_activated);
+
+    var privileged = dispatch.ClientSession.init();
+    privileged.loginAs("priv");
+    privileged.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    const add_snap = migration_relay.Snapshot{
+        .nick = "Priv",
+        .umodes = "+j",
+        .channels = &.{},
+    };
+    const activated = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &add_snap, false);
+    try std.testing.expect(privileged.hasUmode(.override));
+    try std.testing.expect(activated.override_activated);
+
+    const remove_snap = migration_relay.Snapshot{
+        .nick = "Priv",
+        .umodes = "-j",
+        .channels = &.{},
+    };
+    const removed = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &remove_snap, false);
+    try std.testing.expect(!privileged.hasUmode(.override));
+    try std.testing.expect(!removed.override_activated);
 }
 
 test "threaded server: narrowing live GRANT clears armed override" {
