@@ -74,7 +74,9 @@ pub const Entity = struct {
 
     pub fn fromId(id: []const u8) PropError!Entity {
         if (id.len == 0) return error.InvalidEntity;
-        const kind: EntityKind = if (isChannelEntityId(id)) .channel else if (std.mem.indexOfScalar(u8, id, ':') != null) .member else .user;
+        // Member entities use `<channel>:<nick>` and therefore also begin with
+        // a channel sigil. Classify the delimiter before the leading sigil.
+        const kind: EntityKind = if (std.mem.indexOfScalar(u8, id, ':') != null) .member else if (isChannelEntityId(id)) .channel else .user;
         const entity = Entity{ .kind = kind, .id = id };
         try validateEntity(entity, default_max_entity_id);
         return entity;
@@ -341,6 +343,112 @@ pub fn PropStore(comptime params: Params) type {
             }
         };
 
+        /// Stable, ticket-owned fact preview used by the daemon to prepare the
+        /// matching mesh-clock transaction from the exact store image that will
+        /// commit. Every slice owns independent bytes; none aliases the live
+        /// store, the detached replacement state, or another fact.
+        pub const PreparedPropFact = struct {
+            entity: Entity,
+            key: []const u8,
+            value: []const u8,
+            owner: []const u8,
+            access: AccessLevel,
+
+            fn deinit(self: *PreparedPropFact, allocator: std.mem.Allocator) void {
+                allocator.free(@constCast(self.entity.id));
+                allocator.free(@constCast(self.key));
+                allocator.free(@constCast(self.value));
+                allocator.free(@constCast(self.owner));
+                self.* = undefined;
+            }
+        };
+
+        /// Allocation-complete public-channel clone plan. The ticket is
+        /// logically non-copyable: retain one mutable value and call commit,
+        /// abort, or deinit exactly as with the daemon's other prepared tickets.
+        /// Replacement/purge previews remain stable only while state=prepared.
+        pub const PreparedPublicChannelClone = struct {
+            const State = enum { prepared, committed, aborted };
+
+            store: *Self,
+            /// Independently-owned normalized lookup keys for every destination
+            /// channel/member entity that commit will remove.
+            purge_entity_keys: [][]u8,
+            /// Independently-owned stable views for clock/tombstone preparation.
+            replacement_facts: []PreparedPropFact,
+            purge_facts: []PreparedPropFact,
+            /// Detached destination channel state and its distinct outer map key.
+            /// Null means the source has no public properties, so commit is an
+            /// exact destination clear with no replacement entity.
+            staged_outer_key: ?[]u8,
+            staged_state: ?EntityState,
+            state: State = .prepared,
+
+            pub fn replacementFacts(self: *const PreparedPublicChannelClone) []const PreparedPropFact {
+                std.debug.assert(self.state == .prepared);
+                if (self.state != .prepared) return &.{};
+                return self.replacement_facts;
+            }
+
+            pub fn purgedFacts(self: *const PreparedPublicChannelClone) []const PreparedPropFact {
+                std.debug.assert(self.state == .prepared);
+                if (self.state != .prepared) return &.{};
+                return self.purge_facts;
+            }
+
+            /// Publish the complete prepared image without allocating. Callers
+            /// serialize prepare->commit under the daemon's World write lock, so
+            /// every copied purge key is guaranteed to remain present here.
+            pub fn commit(self: *PreparedPublicChannelClone) void {
+                if (self.state != .prepared) return;
+                for (self.purge_entity_keys) |lookup_key| {
+                    const removed = self.store.entities.fetchRemove(lookup_key) orelse unreachable;
+                    self.store.allocator.free(removed.key);
+                    var removed_state = removed.value;
+                    removed_state.deinit(self.store.allocator);
+                    std.debug.assert(self.store.entity_count != 0);
+                    self.store.entity_count -= 1;
+                }
+                if (self.staged_outer_key) |outer_key| {
+                    const staged = self.staged_state orelse unreachable;
+                    self.store.entities.putAssumeCapacityNoClobber(outer_key, staged);
+                    self.store.entity_count += 1;
+                    self.staged_outer_key = null;
+                    self.staged_state = null;
+                }
+                self.destroyPlanOwned();
+                self.state = .committed;
+            }
+
+            /// Discard the detached image. Idempotent before or after another
+            /// lifecycle method, so `defer ticket.deinit()` is always safe.
+            pub fn abort(self: *PreparedPublicChannelClone) void {
+                if (self.state != .prepared) return;
+                if (self.staged_state) |*staged| staged.deinit(self.store.allocator);
+                self.staged_state = null;
+                if (self.staged_outer_key) |key| self.store.allocator.free(key);
+                self.staged_outer_key = null;
+                self.destroyPlanOwned();
+                self.state = .aborted;
+            }
+
+            pub fn deinit(self: *PreparedPublicChannelClone) void {
+                self.abort();
+            }
+
+            fn destroyPlanOwned(self: *PreparedPublicChannelClone) void {
+                for (self.purge_entity_keys) |key| self.store.allocator.free(key);
+                self.store.allocator.free(self.purge_entity_keys);
+                self.purge_entity_keys = undefined;
+                for (self.replacement_facts) |*fact| fact.deinit(self.store.allocator);
+                self.store.allocator.free(self.replacement_facts);
+                self.replacement_facts = undefined;
+                for (self.purge_facts) |*fact| fact.deinit(self.store.allocator);
+                self.store.allocator.free(self.purge_facts);
+                self.purge_facts = undefined;
+            }
+        };
+
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
@@ -396,6 +504,218 @@ pub fn PropStore(comptime params: Params) type {
                 },
                 .user => false,
             };
+        }
+
+        /// Prepare an exact public-PROP image for a newly-created channel clone.
+        /// Public source channel properties are deep-copied; secret source keys
+        /// are deliberately excluded. Commit also removes every stale destination
+        /// channel and `channel:nick` member entity, matching clearChannel's new-
+        /// incarnation semantics. No live state changes until commit.
+        pub fn preparePublicChannelClone(
+            self: *Self,
+            source_channel: []const u8,
+            destination_channel: []const u8,
+        ) PropError!PreparedPublicChannelClone {
+            const source_entity = Entity{ .kind = .channel, .id = source_channel };
+            const destination_entity = Entity{ .kind = .channel, .id = destination_channel };
+            try validateEntity(source_entity, params.max_entity_id);
+            try validateEntity(destination_entity, params.max_entity_id);
+            if (!isChannelEntityId(source_channel) or !isChannelEntityId(destination_channel))
+                return error.InvalidEntity;
+            if (std.ascii.eqlIgnoreCase(source_channel, destination_channel))
+                return error.InvalidEntity;
+
+            var source_key_buf: [max_entity_key]u8 = undefined;
+            const source_key = try writeEntityKey(&source_key_buf, source_entity, params.max_entity_id);
+            const source_state = self.entities.getPtr(source_key);
+
+            var replacement_count: usize = 0;
+            if (source_state) |state| {
+                var props_it = state.props.iterator();
+                while (props_it.next()) |entry| {
+                    if (!isSecretChannelProp(source_entity, entry.value_ptr.key))
+                        replacement_count = std.math.add(usize, replacement_count, 1) catch return error.LimitReached;
+                }
+            }
+
+            var purge_entity_count: usize = 0;
+            var purge_fact_count: usize = 0;
+            var entity_it = self.entities.iterator();
+            while (entity_it.next()) |entry| {
+                if (!entityInChannel(entry.value_ptr.entity, destination_channel)) continue;
+                purge_entity_count = std.math.add(usize, purge_entity_count, 1) catch return error.LimitReached;
+                purge_fact_count = std.math.add(usize, purge_fact_count, entry.value_ptr.prop_count) catch return error.LimitReached;
+            }
+            std.debug.assert(purge_entity_count <= self.entity_count);
+            const retained_count = self.entity_count - purge_entity_count;
+            if (replacement_count != 0 and retained_count >= params.max_entities)
+                return error.LimitReached;
+
+            const purge_entity_keys = self.allocator.alloc([]u8, purge_entity_count) catch return error.LimitReached;
+            var purge_entity_keys_init: usize = 0;
+            errdefer {
+                for (purge_entity_keys[0..purge_entity_keys_init]) |key| self.allocator.free(key);
+                self.allocator.free(purge_entity_keys);
+            }
+            const replacement_facts = self.allocator.alloc(PreparedPropFact, replacement_count) catch return error.LimitReached;
+            var replacement_facts_init: usize = 0;
+            errdefer {
+                for (replacement_facts[0..replacement_facts_init]) |*fact| fact.deinit(self.allocator);
+                self.allocator.free(replacement_facts);
+            }
+            const purge_facts = self.allocator.alloc(PreparedPropFact, purge_fact_count) catch return error.LimitReached;
+            var purge_facts_init: usize = 0;
+            errdefer {
+                for (purge_facts[0..purge_facts_init]) |*fact| fact.deinit(self.allocator);
+                self.allocator.free(purge_facts);
+            }
+
+            // Snapshot all purge selectors/facts before any outer-map capacity
+            // reservation can rehash and invalidate iterator entry pointers.
+            entity_it = self.entities.iterator();
+            while (entity_it.next()) |entry| {
+                if (!entityInChannel(entry.value_ptr.entity, destination_channel)) continue;
+                purge_entity_keys[purge_entity_keys_init] = self.allocator.dupe(u8, entry.key_ptr.*) catch return error.LimitReached;
+                purge_entity_keys_init += 1;
+                var props_it = entry.value_ptr.props.iterator();
+                while (props_it.next()) |prop_entry| {
+                    purge_facts[purge_facts_init] = try clonePreparedPropFact(
+                        self.allocator,
+                        entry.value_ptr.entity,
+                        prop_entry.value_ptr,
+                    );
+                    purge_facts_init += 1;
+                }
+            }
+            std.debug.assert(purge_entity_keys_init == purge_entity_keys.len);
+            std.debug.assert(purge_facts_init == purge_facts.len);
+
+            // Build stable replacement previews separately from the detached
+            // EntityState so clock preparation cannot alias bytes commit moves.
+            if (source_state) |state| {
+                var props_it = state.props.iterator();
+                while (props_it.next()) |entry| {
+                    if (isSecretChannelProp(source_entity, entry.value_ptr.key)) continue;
+                    replacement_facts[replacement_facts_init] = try clonePreparedPropFact(
+                        self.allocator,
+                        destination_entity,
+                        entry.value_ptr,
+                    );
+                    replacement_facts_init += 1;
+                }
+            }
+            std.debug.assert(replacement_facts_init == replacement_facts.len);
+            std.mem.sort(PreparedPropFact, replacement_facts, {}, preparedPropFactLessThan);
+            std.mem.sort(PreparedPropFact, purge_facts, {}, preparedPropFactLessThan);
+
+            var staged_outer_key: ?[]u8 = null;
+            errdefer if (staged_outer_key) |key| self.allocator.free(key);
+            var staged_state: ?EntityState = null;
+            errdefer if (staged_state) |*state| state.deinit(self.allocator);
+            if (replacement_count != 0) {
+                var destination_key_buf: [max_entity_key]u8 = undefined;
+                const destination_key = try writeEntityKey(
+                    &destination_key_buf,
+                    destination_entity,
+                    params.max_entity_id,
+                );
+                staged_outer_key = self.allocator.dupe(u8, destination_key) catch return error.LimitReached;
+                const destination_id = self.allocator.dupe(u8, destination_channel) catch return error.LimitReached;
+                staged_state = EntityState.init(self.allocator, .{ .kind = .channel, .id = destination_id });
+                const state = &staged_state.?;
+                if (source_state) |source| {
+                    var props_it = source.props.iterator();
+                    while (props_it.next()) |entry| {
+                        if (isSecretChannelProp(source_entity, entry.value_ptr.key)) continue;
+                        var cloned = try clonePreparedEntry(self.allocator, entry.key_ptr.*, entry.value_ptr);
+                        state.props.put(cloned.normalized_key, cloned.entry) catch {
+                            self.allocator.free(cloned.normalized_key);
+                            cloned.entry.deinit(self.allocator);
+                            return error.LimitReached;
+                        };
+                        state.prop_count += 1;
+                    }
+                }
+                std.debug.assert(state.prop_count == replacement_count);
+
+                // The detached source image and every lookup/preview byte are now
+                // owned. Only now may the live outer map rehash.
+                if (purge_entity_count == 0)
+                    self.entities.ensureUnusedCapacity(1) catch return error.LimitReached;
+            }
+
+            const out = PreparedPublicChannelClone{
+                .store = self,
+                .purge_entity_keys = purge_entity_keys,
+                .replacement_facts = replacement_facts,
+                .purge_facts = purge_facts,
+                .staged_outer_key = staged_outer_key,
+                .staged_state = staged_state,
+            };
+            staged_outer_key = null;
+            staged_state = null;
+            purge_entity_keys_init = 0;
+            replacement_facts_init = 0;
+            purge_facts_init = 0;
+            return out;
+        }
+
+        fn clonePreparedPropFact(
+            allocator: std.mem.Allocator,
+            entity: Entity,
+            entry: *const Entry,
+        ) PropError!PreparedPropFact {
+            const entity_id = allocator.dupe(u8, entity.id) catch return error.LimitReached;
+            errdefer allocator.free(entity_id);
+            const key = allocator.dupe(u8, entry.key) catch return error.LimitReached;
+            errdefer allocator.free(key);
+            const value = allocator.dupe(u8, entry.value) catch return error.LimitReached;
+            errdefer allocator.free(value);
+            const owner = allocator.dupe(u8, entry.owner) catch return error.LimitReached;
+            return .{
+                .entity = .{ .kind = entity.kind, .id = entity_id },
+                .key = key,
+                .value = value,
+                .owner = owner,
+                .access = entry.access,
+            };
+        }
+
+        fn clonePreparedEntry(
+            allocator: std.mem.Allocator,
+            normalized_key_source: []const u8,
+            entry: *const Entry,
+        ) PropError!struct { normalized_key: []u8, entry: Entry } {
+            const normalized_key = allocator.dupe(u8, normalized_key_source) catch return error.LimitReached;
+            errdefer allocator.free(normalized_key);
+            const display_key = allocator.dupe(u8, entry.key) catch return error.LimitReached;
+            errdefer allocator.free(display_key);
+            const value = allocator.dupe(u8, entry.value) catch return error.LimitReached;
+            errdefer allocator.free(value);
+            const owner = allocator.dupe(u8, entry.owner) catch return error.LimitReached;
+            return .{
+                .normalized_key = normalized_key,
+                .entry = .{
+                    .key = display_key,
+                    .value = value,
+                    .owner = owner,
+                    .access = entry.access,
+                },
+            };
+        }
+
+        fn preparedPropFactLessThan(_: void, lhs: PreparedPropFact, rhs: PreparedPropFact) bool {
+            if (lhs.entity.kind != rhs.entity.kind)
+                return @intFromEnum(lhs.entity.kind) < @intFromEnum(rhs.entity.kind);
+            const entity_order = std.mem.order(u8, lhs.entity.id, rhs.entity.id);
+            if (entity_order != .eq) return entity_order == .lt;
+            const key_order = std.mem.order(u8, lhs.key, rhs.key);
+            if (key_order != .eq) return key_order == .lt;
+            const value_order = std.mem.order(u8, lhs.value, rhs.value);
+            if (value_order != .eq) return value_order == .lt;
+            const owner_order = std.mem.order(u8, lhs.owner, rhs.owner);
+            if (owner_order != .eq) return owner_order == .lt;
+            return @intFromEnum(lhs.access) < @intFromEnum(rhs.access);
         }
 
         pub fn setProp(self: *Self, entity: Entity, key: []const u8, value: []const u8, setter: Setter) PropError!EntryView {
@@ -680,9 +1000,12 @@ fn validateEntity(entity: Entity, max_entity_id: usize) PropError!void {
     }
 
     switch (entity.kind) {
-        .channel => switch (entity.id[0]) {
-            '#', '&', '+', '%' => {},
-            else => return error.InvalidEntity,
+        .channel => {
+            if (std.mem.indexOfScalar(u8, entity.id, ':') != null) return error.InvalidEntity;
+            switch (entity.id[0]) {
+                '#', '&', '+', '%' => {},
+                else => return error.InvalidEntity,
+            }
         },
         .user => if (std.mem.indexOfScalar(u8, entity.id, ':') != null) return error.InvalidEntity,
         .member => {
@@ -1001,4 +1324,336 @@ test "reply builders and no-leak clear path" {
 
     store.clear();
     _ = try store.setProp(try Entity.fromId("nick"), "away", "no", .{ .id = "nick", .access = .user });
+}
+
+test "prepared public channel clone is exact deterministic and independently owned" {
+    var store = DefaultStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const source = try Entity.fromId("#Template");
+    const destination = try Entity.fromId("#Clone");
+    const member_a = try Entity.fromId("#Clone:Alice");
+    const member_b = try Entity.fromId("#clone:Bob");
+    const near_prefix_member = try Entity.fromId("#Clone2:Eve");
+    const unrelated = try Entity.fromId("Watcher");
+    try std.testing.expectEqual(EntityKind.member, member_a.kind);
+    try std.testing.expectEqual(EntityKind.member, member_b.kind);
+
+    _ = try store.setProp(source, "TOPIC", "source topic", .{ .id = "source-host", .access = .host });
+    _ = try store.setProp(source, "CUSTOM", "source custom", .{ .id = "source-host", .access = .host });
+    _ = try store.setProp(source, "HOSTKEY", "source-secret", .{ .id = "source-owner", .access = .owner });
+    _ = try store.setProp(destination, "CUSTOM", "stale", .{ .id = "old-host", .access = .host });
+    _ = try store.setProp(destination, "HOSTKEY", "destination-secret", .{ .id = "old-owner", .access = .owner });
+    _ = try store.setProp(member_a, "ROLE", "old-op", .{ .id = "Alice", .access = .member });
+    _ = try store.setProp(member_b, "NOTE", "old-note", .{ .id = "Bob", .access = .member });
+    _ = try store.setProp(near_prefix_member, "ROLE", "keep-op", .{ .id = "Eve", .access = .member });
+    _ = try store.setProp(unrelated, "BIO", "untouched", .{ .id = "Watcher", .access = .user });
+    try std.testing.expectEqual(@as(usize, 6), store.entity_count);
+
+    var ticket = try store.preparePublicChannelClone(source.id, destination.id);
+    const replacements = ticket.replacementFacts();
+    try std.testing.expectEqual(@as(usize, 2), replacements.len);
+    try std.testing.expectEqualStrings("CUSTOM", replacements[0].key);
+    try std.testing.expectEqualStrings("TOPIC", replacements[1].key);
+    try std.testing.expectEqualStrings("source custom", replacements[0].value);
+    try std.testing.expectEqualStrings("source-host", replacements[0].owner);
+    try std.testing.expectEqual(AccessLevel.host, replacements[0].access);
+    try std.testing.expectEqualStrings("source topic", replacements[1].value);
+    try std.testing.expectEqualStrings("source-host", replacements[1].owner);
+    try std.testing.expectEqual(AccessLevel.host, replacements[1].access);
+    for (replacements) |fact| try std.testing.expectEqualStrings(destination.id, fact.entity.id);
+
+    const purged = ticket.purgedFacts();
+    try std.testing.expectEqual(@as(usize, 4), purged.len);
+    try std.testing.expectEqual(EntityKind.channel, purged[0].entity.kind);
+    try std.testing.expectEqualStrings("CUSTOM", purged[0].key);
+    try std.testing.expectEqualStrings("HOSTKEY", purged[1].key);
+    try std.testing.expectEqualStrings(member_a.id, purged[2].entity.id);
+    try std.testing.expectEqualStrings("ROLE", purged[2].key);
+    try std.testing.expectEqualStrings(member_b.id, purged[3].entity.id);
+    try std.testing.expectEqualStrings("NOTE", purged[3].key);
+    try std.testing.expectEqual(@as(usize, 3), ticket.purge_entity_keys.len);
+
+    const staged = if (ticket.staged_state) |*state| state else return error.TestUnexpectedResult;
+    try std.testing.expect(@intFromPtr(ticket.staged_outer_key.?.ptr) != @intFromPtr(staged.entity.id.ptr));
+    try std.testing.expect(@intFromPtr(replacements[0].entity.id.ptr) != @intFromPtr(staged.entity.id.ptr));
+    try std.testing.expect(@intFromPtr(replacements[0].entity.id.ptr) != @intFromPtr(replacements[1].entity.id.ptr));
+    var staged_it = staged.props.iterator();
+    while (staged_it.next()) |entry| {
+        var preview: ?*const DefaultStore.PreparedPropFact = null;
+        for (replacements) |*fact| {
+            if (std.mem.eql(u8, fact.key, entry.value_ptr.key)) {
+                preview = fact;
+                break;
+            }
+        }
+        const fact = preview orelse return error.TestUnexpectedResult;
+        try std.testing.expect(@intFromPtr(entry.key_ptr.*.ptr) != @intFromPtr(entry.value_ptr.key.ptr));
+        try std.testing.expect(@intFromPtr(fact.key.ptr) != @intFromPtr(entry.key_ptr.*.ptr));
+        try std.testing.expect(@intFromPtr(fact.key.ptr) != @intFromPtr(entry.value_ptr.key.ptr));
+        try std.testing.expect(@intFromPtr(fact.value.ptr) != @intFromPtr(entry.value_ptr.value.ptr));
+        try std.testing.expect(@intFromPtr(fact.owner.ptr) != @intFromPtr(entry.value_ptr.owner.ptr));
+    }
+    const live_source_custom = try store.getPropRaw(source, "CUSTOM");
+    try std.testing.expect(@intFromPtr(live_source_custom.value.ptr) != @intFromPtr(replacements[0].value.ptr));
+    const live_destination_secret = try store.getPropRaw(destination, "HOSTKEY");
+    try std.testing.expect(@intFromPtr(live_destination_secret.value.ptr) != @intFromPtr(purged[1].value.ptr));
+
+    // Abort is exact and every lifecycle operation is idempotent.
+    ticket.abort();
+    ticket.abort();
+    ticket.deinit();
+    try std.testing.expectEqual(@as(usize, 6), store.entity_count);
+    try std.testing.expectEqualStrings("stale", (try store.getPropRaw(destination, "CUSTOM")).value);
+    try std.testing.expectEqualStrings("destination-secret", (try store.getPropRaw(destination, "HOSTKEY")).value);
+    try std.testing.expectEqualStrings("old-op", (try store.getPropRaw(member_a, "ROLE")).value);
+
+    var committed = try store.preparePublicChannelClone(source.id, destination.id);
+    committed.commit();
+    committed.commit();
+    committed.abort();
+    committed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), store.entity_count);
+    try std.testing.expectEqualStrings("source custom", (try store.getPropRaw(destination, "CUSTOM")).value);
+    try std.testing.expectEqualStrings("source topic", (try store.getPropRaw(destination, "TOPIC")).value);
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(destination, "HOSTKEY"));
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_a, "ROLE"));
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_b, "NOTE"));
+    try std.testing.expectEqualStrings("keep-op", (try store.getPropRaw(near_prefix_member, "ROLE")).value);
+    try std.testing.expectEqualStrings("source-secret", (try store.getPropRaw(source, "HOSTKEY")).value);
+    try std.testing.expectEqualStrings("untouched", (try store.getPropRaw(unrelated, "BIO")).value);
+
+    // The committed replacement owns bytes independently of the source.
+    _ = try store.setProp(source, "CUSTOM", "source changed", .{ .id = "new-source", .access = .host });
+    try std.testing.expectEqualStrings("source custom", (try store.getPropRaw(destination, "CUSTOM")).value);
+    _ = try store.setProp(destination, "TOPIC", "destination changed", .{ .id = "new-dst", .access = .host });
+    try std.testing.expectEqualStrings("source topic", (try store.getPropRaw(source, "TOPIC")).value);
+}
+
+test "prepared public channel clone rejects same fold and parser members round trip" {
+    const member_request = try parseLine("PROP #room:Nick SET ROLE :operator");
+    try std.testing.expectEqual(Request.set, @as(std.meta.Tag(Request), member_request));
+    try std.testing.expectEqual(EntityKind.member, member_request.set.entity.kind);
+    try std.testing.expectEqualStrings("#room:Nick", member_request.set.entity.id);
+
+    var store = DefaultStore.init(std.testing.allocator);
+    defer store.deinit();
+    const source = try Entity.fromId("#Same");
+    _ = try store.setProp(source, "CUSTOM", "preserved", .{ .id = "host", .access = .host });
+    try std.testing.expectError(error.InvalidEntity, store.preparePublicChannelClone("#Same", "#sAME"));
+    try std.testing.expectEqual(@as(usize, 1), store.entity_count);
+    try std.testing.expectEqualStrings("preserved", (try store.getPropRaw(source, "CUSTOM")).value);
+    try std.testing.expectError(
+        error.InvalidEntity,
+        store.setProp(.{ .kind = .channel, .id = "#room:Nick" }, "CUSTOM", "bad", .{ .id = "host", .access = .host }),
+    );
+}
+
+test "prepared public channel clone secret-only source clears destination exactly" {
+    var store = DefaultStore.init(std.testing.allocator);
+    defer store.deinit();
+    const source = try Entity.fromId("#SecretTemplate");
+    const destination = try Entity.fromId("#ClearMe");
+    const member_a = try Entity.fromId("#ClearMe:Alice");
+    const member_b = try Entity.fromId("#clearme:Bob");
+    const unrelated = try Entity.fromId("Other");
+    _ = try store.setProp(source, "HOSTKEY", "never-copy", .{ .id = "owner", .access = .owner });
+    _ = try store.setProp(destination, "CUSTOM", "stale", .{ .id = "host", .access = .host });
+    _ = try store.setProp(member_a, "ROLE", "op", .{ .id = "Alice", .access = .member });
+    _ = try store.setProp(member_b, "ROLE", "voice", .{ .id = "Bob", .access = .member });
+    _ = try store.setProp(unrelated, "CUSTOM", "keep", .{ .id = "Other", .access = .user });
+    try std.testing.expectEqual(@as(usize, 5), store.entity_count);
+
+    var ticket = try store.preparePublicChannelClone(source.id, destination.id);
+    try std.testing.expectEqual(@as(usize, 0), ticket.replacementFacts().len);
+    try std.testing.expectEqual(@as(usize, 3), ticket.purgedFacts().len);
+    try std.testing.expect(ticket.staged_outer_key == null);
+    try std.testing.expect(ticket.staged_state == null);
+    ticket.commit();
+    defer ticket.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), store.entity_count);
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(destination, "CUSTOM"));
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_a, "ROLE"));
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_b, "ROLE"));
+    try std.testing.expectEqualStrings("never-copy", (try store.getPropRaw(source, "HOSTKEY")).value);
+    try std.testing.expectEqualStrings("keep", (try store.getPropRaw(unrelated, "CUSTOM")).value);
+}
+
+test "prepared public channel clone uses post-purge entity cap math" {
+    const Capped = PropStore(.{ .max_entities = 5 });
+    var store = Capped.init(std.testing.allocator);
+    defer store.deinit();
+    const source = try Entity.fromId("#Src");
+    const destination = try Entity.fromId("#Dst");
+    const member_a = try Entity.fromId("#Dst:A");
+    const member_b = try Entity.fromId("#dst:B");
+    const unrelated = try Entity.fromId("Other");
+    _ = try store.setProp(source, "CUSTOM", "copy", .{ .id = "host", .access = .host });
+    _ = try store.setProp(destination, "CUSTOM", "stale", .{ .id = "host", .access = .host });
+    _ = try store.setProp(member_a, "ROLE", "a", .{ .id = "A", .access = .member });
+    _ = try store.setProp(member_b, "ROLE", "b", .{ .id = "B", .access = .member });
+    _ = try store.setProp(unrelated, "CUSTOM", "keep", .{ .id = "Other", .access = .user });
+    try std.testing.expectEqual(@as(usize, 5), store.entity_count);
+    var ticket = try store.preparePublicChannelClone(source.id, destination.id);
+    ticket.commit();
+    defer ticket.deinit();
+    try std.testing.expectEqual(@as(usize, 3), store.entity_count);
+    try std.testing.expectEqualStrings("copy", (try store.getPropRaw(destination, "CUSTOM")).value);
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_a, "ROLE"));
+    try std.testing.expectError(error.PropMissing, store.getPropRaw(member_b, "ROLE"));
+
+    const NoRoom = PropStore(.{ .max_entities = 2 });
+    var no_room = NoRoom.init(std.testing.allocator);
+    defer no_room.deinit();
+    _ = try no_room.setProp(source, "CUSTOM", "copy", .{ .id = "host", .access = .host });
+    _ = try no_room.setProp(unrelated, "CUSTOM", "keep", .{ .id = "Other", .access = .user });
+    try std.testing.expectError(error.LimitReached, no_room.preparePublicChannelClone(source.id, "#Absent"));
+    try std.testing.expectEqual(@as(usize, 2), no_room.entity_count);
+    try std.testing.expectEqualStrings("copy", (try no_room.getPropRaw(source, "CUSTOM")).value);
+    try std.testing.expectEqualStrings("keep", (try no_room.getPropRaw(unrelated, "CUSTOM")).value);
+}
+
+test "prepared public channel clone is atomic on every allocation boundary" {
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        try std.testing.expect(fail_offset < 256);
+        const completed = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var store = DefaultStore.init(failing.allocator());
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                store.deinit();
+            }
+
+            const source = try Entity.fromId("#AllocSource");
+            const destination = try Entity.fromId("#AllocDestination");
+            const member = try Entity.fromId("#allocdestination:Nick");
+            const unrelated = try Entity.fromId("Other");
+            _ = try store.setProp(source, "CUSTOM", "copy", .{ .id = "source-host", .access = .host });
+            _ = try store.setProp(source, "TOPIC", "copy-topic", .{ .id = "source-host", .access = .host });
+            _ = try store.setProp(source, "HOSTKEY", "source-secret", .{ .id = "source-owner", .access = .owner });
+            _ = try store.setProp(destination, "CUSTOM", "stale", .{ .id = "old-host", .access = .host });
+            _ = try store.setProp(destination, "HOSTKEY", "destination-secret", .{ .id = "old-owner", .access = .owner });
+            _ = try store.setProp(member, "ROLE", "old-role", .{ .id = "Nick", .access = .member });
+            _ = try store.setProp(unrelated, "CUSTOM", "untouched", .{ .id = "Other", .access = .user });
+            try std.testing.expectEqual(@as(usize, 4), store.entity_count);
+
+            failing.fail_index = failing.alloc_index + fail_offset;
+            var prepared = store.preparePublicChannelClone(source.id, destination.id) catch |err| {
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectEqual(error.LimitReached, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(@as(usize, 4), store.entity_count);
+                try std.testing.expectEqualStrings("copy", (try store.getPropRaw(source, "CUSTOM")).value);
+                try std.testing.expectEqualStrings("copy-topic", (try store.getPropRaw(source, "TOPIC")).value);
+                try std.testing.expectEqualStrings("source-secret", (try store.getPropRaw(source, "HOSTKEY")).value);
+                try std.testing.expectEqualStrings("stale", (try store.getPropRaw(destination, "CUSTOM")).value);
+                try std.testing.expectEqualStrings("destination-secret", (try store.getPropRaw(destination, "HOSTKEY")).value);
+                try std.testing.expectEqualStrings("old-role", (try store.getPropRaw(member, "ROLE")).value);
+                try std.testing.expectEqualStrings("untouched", (try store.getPropRaw(unrelated, "CUSTOM")).value);
+                break :blk false;
+            };
+            try std.testing.expect(!failing.has_induced_failure);
+
+            // Once preparation succeeds, abort remains allocation-free even
+            // when the allocator would reject the very next allocation.
+            failing.fail_index = failing.alloc_index;
+            failing.has_induced_failure = false;
+            prepared.abort();
+            prepared.abort();
+            prepared.deinit();
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 4), store.entity_count);
+            try std.testing.expectEqualStrings("stale", (try store.getPropRaw(destination, "CUSTOM")).value);
+            try std.testing.expectEqualStrings("old-role", (try store.getPropRaw(member, "ROLE")).value);
+
+            // Re-prepare without injection, then prove commit is also fully
+            // allocation-free under an immediate-failure allocator.
+            failing.fail_index = std.math.maxInt(usize);
+            var committed = try store.preparePublicChannelClone(source.id, destination.id);
+            failing.has_induced_failure = false;
+            failing.fail_index = failing.alloc_index;
+            committed.commit();
+            committed.commit();
+            committed.deinit();
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 3), store.entity_count);
+            try std.testing.expectEqualStrings("copy", (try store.getPropRaw(destination, "CUSTOM")).value);
+            try std.testing.expectEqualStrings("copy-topic", (try store.getPropRaw(destination, "TOPIC")).value);
+            try std.testing.expectError(error.PropMissing, store.getPropRaw(destination, "HOSTKEY"));
+            try std.testing.expectError(error.PropMissing, store.getPropRaw(member, "ROLE"));
+            try std.testing.expectEqualStrings("source-secret", (try store.getPropRaw(source, "HOSTKEY")).value);
+            try std.testing.expectEqualStrings("untouched", (try store.getPropRaw(unrelated, "CUSTOM")).value);
+            break :blk true;
+        };
+        if (completed) break;
+    }
+}
+
+test "prepared public channel clone reserves a fresh target and handles an all-zero plan" {
+    // Missing source plus missing destination is a valid no-op ticket, including
+    // zero-length owned plans and repeated lifecycle calls.
+    var empty_store = DefaultStore.init(std.testing.allocator);
+    defer empty_store.deinit();
+    var empty = try empty_store.preparePublicChannelClone("#Missing", "#FreshEmpty");
+    try std.testing.expectEqual(@as(usize, 0), empty.replacementFacts().len);
+    try std.testing.expectEqual(@as(usize, 0), empty.purgedFacts().len);
+    empty.commit();
+    empty.commit();
+    empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_store.entity_count);
+
+    // Fill the live outer map to its load threshold so the absent-destination
+    // branch must reserve a new map before returning a prepared ticket.
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        try std.testing.expect(fail_offset < 128);
+        const completed = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var store = DefaultStore.init(failing.allocator());
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                store.deinit();
+            }
+            const source = try Entity.fromId("#FreshSource");
+            const destination = try Entity.fromId("#FreshTarget");
+            _ = try store.setProp(source, "CUSTOM", "fresh-copy", .{ .id = "host", .access = .host });
+
+            const load_limit = (store.entities.capacity() * std.hash_map.default_max_load_percentage) / 100;
+            var filler_index: usize = 0;
+            var filler_buf: [32]u8 = undefined;
+            while (store.entities.count() < load_limit) : (filler_index += 1) {
+                const filler_id = std.fmt.bufPrint(&filler_buf, "Filler-{d}", .{filler_index}) catch unreachable;
+                _ = try store.setProp(try Entity.fromId(filler_id), "CUSTOM", "keep", .{ .id = "filler", .access = .user });
+            }
+            try std.testing.expectEqual(load_limit, store.entities.count());
+            const initial_count = store.entity_count;
+
+            failing.fail_index = failing.alloc_index + fail_offset;
+            var prepared = store.preparePublicChannelClone(source.id, destination.id) catch |err| {
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectEqual(error.LimitReached, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(initial_count, store.entity_count);
+                try std.testing.expectEqualStrings("fresh-copy", (try store.getPropRaw(source, "CUSTOM")).value);
+                try std.testing.expectError(error.PropMissing, store.getPropRaw(destination, "CUSTOM"));
+                break :blk false;
+            };
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 1), prepared.replacementFacts().len);
+            try std.testing.expectEqual(@as(usize, 0), prepared.purgedFacts().len);
+
+            failing.has_induced_failure = false;
+            failing.fail_index = failing.alloc_index;
+            prepared.commit();
+            prepared.deinit();
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(initial_count + 1, store.entity_count);
+            try std.testing.expectEqualStrings("fresh-copy", (try store.getPropRaw(source, "CUSTOM")).value);
+            try std.testing.expectEqualStrings("fresh-copy", (try store.getPropRaw(destination, "CUSTOM")).value);
+            break :blk true;
+        };
+        if (completed) break;
+    }
 }
