@@ -54,6 +54,31 @@ pub const PropError = irc_line.ParseError || error{
     TooManyParams,
 };
 
+pub const CheckpointError = std.mem.Allocator.Error || error{
+    BadMagic,
+    UnsupportedVersion,
+    CapacityExceeded,
+    CheckpointTooLarge,
+    Truncated,
+    TrailingBytes,
+    ChecksumMismatch,
+    DuplicateEntity,
+    DuplicateProperty,
+    NonCanonicalOrder,
+    InvalidField,
+    CachedCountMismatch,
+};
+
+pub const prop_checkpoint_max_bytes: usize = 512 * 1024 * 1024;
+
+const prop_checkpoint_magic = [_]u8{ 'P', 'R', 'P', 'S' };
+const prop_checkpoint_version: u8 = 1;
+const prop_checkpoint_header_len: usize = 17;
+const prop_checkpoint_checksum_len: usize = std.crypto.hash.Blake3.digest_length;
+const prop_checkpoint_entity_prefix_len: usize = 1 + 4 + 4;
+const prop_checkpoint_prop_prefix_len: usize = 4 + 4 + 4 + 1 + 1;
+const prop_checkpoint_checksum_domain = "orochi-ircx-prop-store-checkpoint-v1";
+
 pub const EntityKind = enum {
     channel,
     user,
@@ -718,6 +743,383 @@ pub fn PropStore(comptime params: Params) type {
             return @intFromEnum(lhs.access) < @intFromEnum(rhs.access);
         }
 
+        /// Encode the complete raw store, including secret channel properties
+        /// and member/user entities, into a canonical checksummed checkpoint.
+        /// The returned allocation belongs to `allocator`.
+        pub fn encodeCheckpoint(self: *const Self, allocator: std.mem.Allocator) CheckpointError![]u8 {
+            if (self.entity_count != self.entities.count()) return error.CachedCountMismatch;
+            if (self.entity_count > params.max_entities or self.entity_count > std.math.maxInt(u32))
+                return error.CapacityExceeded;
+
+            const OrderedEntity = struct {
+                state: *const EntityState,
+
+                fn less(_: void, lhs: @This(), rhs: @This()) bool {
+                    if (lhs.state.entity.kind != rhs.state.entity.kind)
+                        return @intFromEnum(lhs.state.entity.kind) < @intFromEnum(rhs.state.entity.kind);
+                    return asciiFoldOrder(lhs.state.entity.id, rhs.state.entity.id) == .lt;
+                }
+            };
+            const OrderedProp = struct {
+                normalized_key: []const u8,
+                entry: *const Entry,
+
+                fn less(_: void, lhs: @This(), rhs: @This()) bool {
+                    return std.mem.lessThan(u8, lhs.normalized_key, rhs.normalized_key);
+                }
+            };
+
+            const ordered_entities = try allocator.alloc(OrderedEntity, self.entity_count);
+            defer allocator.free(ordered_entities);
+
+            var body_len: usize = 0;
+            var total_prop_count: usize = 0;
+            var max_prop_count: usize = 0;
+            var entity_index: usize = 0;
+            var entity_it = self.entities.iterator();
+            while (entity_it.next()) |outer| : (entity_index += 1) {
+                const state = outer.value_ptr;
+                validateEntity(state.entity, params.max_entity_id) catch return error.InvalidField;
+                if (state.prop_count != state.props.count()) return error.CachedCountMismatch;
+                if (state.prop_count > params.max_props_per_entity or state.prop_count > std.math.maxInt(u32))
+                    return error.CapacityExceeded;
+
+                var expected_outer_buf: [max_entity_key]u8 = undefined;
+                const expected_outer = writeEntityKey(&expected_outer_buf, state.entity, params.max_entity_id) catch
+                    return error.InvalidField;
+                if (!std.mem.eql(u8, outer.key_ptr.*, expected_outer)) return error.InvalidField;
+
+                body_len = checkpointAdd(body_len, prop_checkpoint_entity_prefix_len) catch
+                    return error.CheckpointTooLarge;
+                body_len = checkpointAdd(body_len, state.entity.id.len) catch
+                    return error.CheckpointTooLarge;
+                total_prop_count = checkpointAdd(total_prop_count, state.prop_count) catch
+                    return error.CheckpointTooLarge;
+                if (total_prop_count > std.math.maxInt(u32)) return error.CapacityExceeded;
+                max_prop_count = @max(max_prop_count, state.prop_count);
+
+                var prop_it = state.props.iterator();
+                while (prop_it.next()) |prop| {
+                    try validateCheckpointFields(
+                        state.entity,
+                        prop.value_ptr.key,
+                        prop.value_ptr.value,
+                        prop.value_ptr.owner,
+                        prop.value_ptr.access,
+                    );
+                    var expected_prop_buf: [params.max_key]u8 = undefined;
+                    const expected_prop = writePropKey(&expected_prop_buf, prop.value_ptr.key, params.max_key) catch
+                        return error.InvalidField;
+                    if (!std.mem.eql(u8, prop.key_ptr.*, expected_prop)) return error.InvalidField;
+                    body_len = checkpointAdd(body_len, prop_checkpoint_prop_prefix_len) catch
+                        return error.CheckpointTooLarge;
+                    body_len = checkpointAdd(body_len, prop.value_ptr.key.len) catch
+                        return error.CheckpointTooLarge;
+                    body_len = checkpointAdd(body_len, prop.value_ptr.value.len) catch
+                        return error.CheckpointTooLarge;
+                    body_len = checkpointAdd(body_len, prop.value_ptr.owner.len) catch
+                        return error.CheckpointTooLarge;
+                }
+                if (body_len > prop_checkpoint_max_bytes) return error.CheckpointTooLarge;
+                ordered_entities[entity_index] = .{ .state = state };
+            }
+            std.debug.assert(entity_index == ordered_entities.len);
+            std.mem.sort(OrderedEntity, ordered_entities, {}, OrderedEntity.less);
+
+            const ordered_props = try allocator.alloc(OrderedProp, max_prop_count);
+            defer allocator.free(ordered_props);
+            const prefix_len = checkpointAdd(prop_checkpoint_header_len, body_len) catch
+                return error.CheckpointTooLarge;
+            const total_len = checkpointAdd(prefix_len, prop_checkpoint_checksum_len) catch
+                return error.CheckpointTooLarge;
+            if (total_len > prop_checkpoint_max_bytes) return error.CheckpointTooLarge;
+            const out = try allocator.alloc(u8, total_len);
+            errdefer allocator.free(out);
+
+            @memcpy(out[0..prop_checkpoint_magic.len], &prop_checkpoint_magic);
+            out[prop_checkpoint_magic.len] = prop_checkpoint_version;
+            checkpointWriteU32(out[5..9], @intCast(self.entity_count));
+            checkpointWriteU32(out[9..13], @intCast(total_prop_count));
+            checkpointWriteU32(out[13..17], @intCast(body_len));
+
+            var pos: usize = prop_checkpoint_header_len;
+            for (ordered_entities) |ordered_entity| {
+                const state = ordered_entity.state;
+                out[pos] = @intFromEnum(state.entity.kind);
+                pos += 1;
+                checkpointWriteU32(out[pos..][0..4], @intCast(state.entity.id.len));
+                pos += 4;
+                checkpointWriteU32(out[pos..][0..4], @intCast(state.prop_count));
+                pos += 4;
+                @memcpy(out[pos..][0..state.entity.id.len], state.entity.id);
+                pos += state.entity.id.len;
+
+                var prop_index: usize = 0;
+                var prop_it = state.props.iterator();
+                while (prop_it.next()) |prop| : (prop_index += 1) {
+                    ordered_props[prop_index] = .{
+                        .normalized_key = prop.key_ptr.*,
+                        .entry = prop.value_ptr,
+                    };
+                }
+                std.debug.assert(prop_index == state.prop_count);
+                const entity_props = ordered_props[0..prop_index];
+                std.mem.sort(OrderedProp, entity_props, {}, OrderedProp.less);
+                for (entity_props) |ordered_prop| {
+                    const entry = ordered_prop.entry;
+                    checkpointWriteU32(out[pos..][0..4], @intCast(entry.key.len));
+                    pos += 4;
+                    checkpointWriteU32(out[pos..][0..4], @intCast(entry.value.len));
+                    pos += 4;
+                    checkpointWriteU32(out[pos..][0..4], @intCast(entry.owner.len));
+                    pos += 4;
+                    out[pos] = @intFromEnum(entry.access);
+                    pos += 1;
+                    // Reserved v1 boolean. Keep this independent of mutable
+                    // property policy so upgrades cannot reinterpret old state.
+                    out[pos] = 0;
+                    pos += 1;
+                    @memcpy(out[pos..][0..entry.key.len], entry.key);
+                    pos += entry.key.len;
+                    @memcpy(out[pos..][0..entry.value.len], entry.value);
+                    pos += entry.value.len;
+                    @memcpy(out[pos..][0..entry.owner.len], entry.owner);
+                    pos += entry.owner.len;
+                }
+            }
+            std.debug.assert(pos == prefix_len);
+            propCheckpointChecksum(out[0..prefix_len], out[prefix_len..][0..prop_checkpoint_checksum_len]);
+            return out;
+        }
+
+        /// Decode a complete independently-owned store. Validation and checksum
+        /// verification finish before the returned state can become live.
+        pub fn decodeCheckpoint(allocator: std.mem.Allocator, bytes: []const u8) CheckpointError!Self {
+            if (bytes.len < prop_checkpoint_header_len + prop_checkpoint_checksum_len)
+                return error.Truncated;
+            if (!std.mem.eql(u8, bytes[0..prop_checkpoint_magic.len], &prop_checkpoint_magic))
+                return error.BadMagic;
+            if (bytes[prop_checkpoint_magic.len] != prop_checkpoint_version)
+                return error.UnsupportedVersion;
+
+            const encoded_entity_count: usize = checkpointReadU32(bytes[5..9]);
+            const encoded_prop_count: usize = checkpointReadU32(bytes[9..13]);
+            const body_len: usize = checkpointReadU32(bytes[13..17]);
+            if (encoded_entity_count > params.max_entities) return error.CapacityExceeded;
+            const max_total_props = std.math.mul(usize, params.max_entities, params.max_props_per_entity) catch
+                std.math.maxInt(usize);
+            if (encoded_prop_count > max_total_props) return error.CapacityExceeded;
+            const encoded_entity_prop_limit = std.math.mul(usize, encoded_entity_count, params.max_props_per_entity) catch
+                return error.CapacityExceeded;
+            if (encoded_prop_count > encoded_entity_prop_limit) return error.CapacityExceeded;
+            if (body_len > prop_checkpoint_max_bytes) return error.CheckpointTooLarge;
+            const prefix_len = checkpointAdd(prop_checkpoint_header_len, body_len) catch
+                return error.CheckpointTooLarge;
+            const expected_len = checkpointAdd(prefix_len, prop_checkpoint_checksum_len) catch
+                return error.CheckpointTooLarge;
+            if (expected_len > prop_checkpoint_max_bytes) return error.CheckpointTooLarge;
+            if (bytes.len < expected_len) return error.Truncated;
+            if (bytes.len > expected_len) return error.TrailingBytes;
+            var actual_checksum: [prop_checkpoint_checksum_len]u8 = undefined;
+            propCheckpointChecksum(bytes[0..prefix_len], &actual_checksum);
+            const expected_checksum: [prop_checkpoint_checksum_len]u8 = bytes[prefix_len..][0..prop_checkpoint_checksum_len].*;
+            if (!std.crypto.timing_safe.eql(
+                [prop_checkpoint_checksum_len]u8,
+                actual_checksum,
+                expected_checksum,
+            ))
+                return error.ChecksumMismatch;
+
+            var minimum_body_len = std.math.mul(
+                usize,
+                encoded_entity_count,
+                prop_checkpoint_entity_prefix_len + 1,
+            ) catch return error.CheckpointTooLarge;
+            minimum_body_len = checkpointAdd(
+                minimum_body_len,
+                std.math.mul(
+                    usize,
+                    encoded_prop_count,
+                    prop_checkpoint_prop_prefix_len + 2,
+                ) catch return error.CheckpointTooLarge,
+            ) catch return error.CheckpointTooLarge;
+            if (minimum_body_len > body_len) return error.Truncated;
+
+            var restored = Self.init(allocator);
+            errdefer restored.deinit();
+            try restored.entities.ensureTotalCapacity(@intCast(encoded_entity_count));
+
+            var pos: usize = prop_checkpoint_header_len;
+            var observed_prop_count: usize = 0;
+            var previous_kind: ?EntityKind = null;
+            var previous_entity_id: ?[]const u8 = null;
+            for (0..encoded_entity_count) |_| {
+                if (prefix_len - pos < prop_checkpoint_entity_prefix_len) return error.Truncated;
+                const kind_raw = bytes[pos];
+                pos += 1;
+                const kind: EntityKind = switch (kind_raw) {
+                    @intFromEnum(EntityKind.channel) => .channel,
+                    @intFromEnum(EntityKind.user) => .user,
+                    @intFromEnum(EntityKind.member) => .member,
+                    else => return error.InvalidField,
+                };
+                const id_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+                pos += 4;
+                const prop_count: usize = checkpointReadU32(bytes[pos..][0..4]);
+                pos += 4;
+                if (id_len == 0 or id_len > params.max_entity_id) return error.CapacityExceeded;
+                if (prop_count > params.max_props_per_entity) return error.CapacityExceeded;
+                const min_props_len = std.math.mul(usize, prop_count, prop_checkpoint_prop_prefix_len) catch
+                    return error.CheckpointTooLarge;
+                const min_remaining = checkpointAdd(id_len, min_props_len) catch
+                    return error.CheckpointTooLarge;
+                if (min_remaining > prefix_len - pos) return error.Truncated;
+                const entity_id = try checkpointTake(bytes, &pos, prefix_len, id_len);
+                const entity = Entity{ .kind = kind, .id = entity_id };
+                validateEntity(entity, params.max_entity_id) catch return error.InvalidField;
+
+                if (previous_kind) |prev_kind| {
+                    if (@intFromEnum(kind) < @intFromEnum(prev_kind)) return error.NonCanonicalOrder;
+                    if (kind == prev_kind) {
+                        const order = asciiFoldOrder(previous_entity_id.?, entity_id);
+                        if (order == .eq) return error.DuplicateEntity;
+                        if (order != .lt) return error.NonCanonicalOrder;
+                    }
+                }
+                previous_kind = kind;
+                previous_entity_id = entity_id;
+
+                var outer_key_buf: [max_entity_key]u8 = undefined;
+                const outer_key_view = writeEntityKey(&outer_key_buf, entity, params.max_entity_id) catch
+                    return error.InvalidField;
+                const outer_key = try allocator.dupe(u8, outer_key_view);
+                var outer_key_owned = true;
+                errdefer if (outer_key_owned) allocator.free(outer_key);
+                const entity_id_copy = try allocator.dupe(u8, entity_id);
+                var state = EntityState.init(allocator, .{ .kind = kind, .id = entity_id_copy });
+                var state_owned = true;
+                errdefer if (state_owned) state.deinit(allocator);
+                try state.props.ensureTotalCapacity(@intCast(prop_count));
+
+                var previous_prop_key: ?[]const u8 = null;
+                for (0..prop_count) |_| {
+                    if (prefix_len - pos < prop_checkpoint_prop_prefix_len) return error.Truncated;
+                    const key_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+                    pos += 4;
+                    const value_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+                    pos += 4;
+                    const owner_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+                    pos += 4;
+                    const access_raw = bytes[pos];
+                    pos += 1;
+                    const reserved_bool = bytes[pos];
+                    pos += 1;
+                    if (key_len == 0 or key_len > params.max_key) return error.CapacityExceeded;
+                    if (value_len > params.max_value) return error.CapacityExceeded;
+                    if (owner_len == 0 or owner_len > params.max_owner_bytes) return error.CapacityExceeded;
+                    if (access_raw > @intFromEnum(AccessLevel.server) or reserved_bool != 0)
+                        return error.InvalidField;
+                    var fields_len = checkpointAdd(key_len, value_len) catch
+                        return error.CheckpointTooLarge;
+                    fields_len = checkpointAdd(fields_len, owner_len) catch
+                        return error.CheckpointTooLarge;
+                    if (fields_len > prefix_len - pos) return error.Truncated;
+                    const key = try checkpointTake(bytes, &pos, prefix_len, key_len);
+                    const value = try checkpointTake(bytes, &pos, prefix_len, value_len);
+                    const owner = try checkpointTake(bytes, &pos, prefix_len, owner_len);
+                    const access: AccessLevel = @enumFromInt(access_raw);
+                    try validateCheckpointFields(entity, key, value, owner, access);
+
+                    if (previous_prop_key) |previous| {
+                        const order = asciiFoldOrder(previous, key);
+                        if (order == .eq) return error.DuplicateProperty;
+                        if (order != .lt) return error.NonCanonicalOrder;
+                    }
+                    previous_prop_key = key;
+
+                    var normalized_key_buf: [params.max_key]u8 = undefined;
+                    const normalized_key_view = writePropKey(&normalized_key_buf, key, params.max_key) catch
+                        return error.InvalidField;
+                    var cloned = try cloneCheckpointEntry(
+                        allocator,
+                        normalized_key_view,
+                        key,
+                        value,
+                        owner,
+                        access,
+                    );
+                    state.props.putAssumeCapacityNoClobber(cloned.normalized_key, cloned.entry);
+                    state.prop_count += 1;
+                    cloned = undefined;
+                }
+                if (state.prop_count != prop_count or state.props.count() != prop_count)
+                    return error.CachedCountMismatch;
+                observed_prop_count = checkpointAdd(observed_prop_count, prop_count) catch
+                    return error.CheckpointTooLarge;
+                if (observed_prop_count > encoded_prop_count) return error.CachedCountMismatch;
+
+                restored.entities.putAssumeCapacityNoClobber(outer_key, state);
+                restored.entity_count += 1;
+                outer_key_owned = false;
+                state_owned = false;
+            }
+            if (observed_prop_count != encoded_prop_count) return error.CachedCountMismatch;
+            if (pos < prefix_len) return error.TrailingBytes;
+            if (pos > prefix_len) return error.Truncated;
+            if (restored.entity_count != encoded_entity_count or restored.entities.count() != encoded_entity_count)
+                return error.CachedCountMismatch;
+            return restored;
+        }
+
+        /// Atomically replace this store from a verified checkpoint. Any decode,
+        /// validation, or allocation error leaves the previous store untouched.
+        pub fn replaceFromCheckpoint(self: *Self, bytes: []const u8) CheckpointError!void {
+            var replacement = try Self.decodeCheckpoint(self.allocator, bytes);
+            const previous = self.*;
+            self.* = replacement;
+            replacement = previous;
+            replacement.deinit();
+        }
+
+        fn validateCheckpointFields(
+            entity: Entity,
+            key: []const u8,
+            value: []const u8,
+            owner: []const u8,
+            access: AccessLevel,
+        ) CheckpointError!void {
+            validateKeyWithLimit(key, params.max_key) catch return error.InvalidField;
+            validateOwner(owner, params.max_owner_bytes) catch return error.InvalidField;
+            if (entity.kind == .channel) {
+                if (checkpointV1CanonicalChannelKey(key)) |canonical| {
+                    if (!std.mem.eql(u8, key, canonical)) return error.InvalidField;
+                }
+            }
+            _ = access;
+            validateValue(value, params.max_value) catch return error.InvalidField;
+        }
+
+        fn cloneCheckpointEntry(
+            allocator: std.mem.Allocator,
+            normalized_key_source: []const u8,
+            key_source: []const u8,
+            value_source: []const u8,
+            owner_source: []const u8,
+            access: AccessLevel,
+        ) std.mem.Allocator.Error!struct { normalized_key: []u8, entry: Entry } {
+            const normalized_key = try allocator.dupe(u8, normalized_key_source);
+            errdefer allocator.free(normalized_key);
+            const key = try allocator.dupe(u8, key_source);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, value_source);
+            errdefer allocator.free(value);
+            const owner = try allocator.dupe(u8, owner_source);
+            return .{
+                .normalized_key = normalized_key,
+                .entry = .{ .key = key, .value = value, .owner = owner, .access = access },
+            };
+        }
+
         pub fn setProp(self: *Self, entity: Entity, key: []const u8, value: []const u8, setter: Setter) PropError!EntryView {
             try validateEntity(entity, params.max_entity_id);
             try validateKeyWithLimit(key, params.max_key);
@@ -1124,6 +1526,226 @@ fn writeEntityKey(out: []u8, entity: Entity, max_entity_id: usize) PropError![]c
 
 fn entryLessThan(_: void, lhs: EntryView, rhs: EntryView) bool {
     return std.mem.lessThan(u8, lhs.key, rhs.key);
+}
+
+fn asciiFoldOrder(lhs: []const u8, rhs: []const u8) std.math.Order {
+    const common_len = @min(lhs.len, rhs.len);
+    for (lhs[0..common_len], rhs[0..common_len]) |lhs_byte, rhs_byte| {
+        const folded_lhs = std.ascii.toLower(lhs_byte);
+        const folded_rhs = std.ascii.toLower(rhs_byte);
+        if (folded_lhs < folded_rhs) return .lt;
+        if (folded_lhs > folded_rhs) return .gt;
+    }
+    return std.math.order(lhs.len, rhs.len);
+}
+
+fn checkpointAdd(lhs: usize, rhs: usize) error{Overflow}!usize {
+    return std.math.add(usize, lhs, rhs);
+}
+
+fn checkpointReadU32(bytes: *const [4]u8) u32 {
+    return std.mem.readInt(u32, bytes, .big);
+}
+
+fn checkpointWriteU32(bytes: *[4]u8, value: u32) void {
+    std.mem.writeInt(u32, bytes, value, .big);
+}
+
+fn checkpointTake(
+    bytes: []const u8,
+    pos: *usize,
+    limit: usize,
+    len: usize,
+) CheckpointError![]const u8 {
+    if (pos.* > limit or len > limit - pos.*) return error.Truncated;
+    const out = bytes[pos.* .. pos.* + len];
+    pos.* += len;
+    return out;
+}
+
+fn propCheckpointChecksum(prefix: []const u8, out: *[prop_checkpoint_checksum_len]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(prop_checkpoint_checksum_domain);
+    hasher.update(prefix);
+    hasher.final(out);
+}
+
+/// PRPS v1's display-key canon is immutable wire grammar, not live policy.
+/// Future channel keys remain valid unknown keys without changing v1 decode.
+fn checkpointV1CanonicalChannelKey(raw: []const u8) ?[]const u8 {
+    const canonical_keys = [_][]const u8{
+        "OID",
+        "NAME",
+        "CREATION",
+        "MEMBERCOUNT",
+        "MEMBERLIMIT",
+        "LANGUAGE",
+        "FOUNDERKEY",
+        "OWNERKEY",
+        "HOSTKEY",
+        "VOICEKEY",
+        "MEMBERKEY",
+        "PICS",
+        "TOPIC",
+        "SUBJECT",
+        "CLIENT",
+        "ONJOIN",
+        "ONPART",
+        "LAG",
+        "ACCOUNT",
+        "CLIENTGUID",
+        "SERVICEPATH",
+        "no-ai",
+        "local-only",
+        "server-ai-ok",
+        "history-policy",
+        "encryption-policy",
+    };
+    for (canonical_keys) |canonical| {
+        if (std.ascii.eqlIgnoreCase(raw, canonical)) return canonical;
+    }
+    return null;
+}
+
+fn testAddEmptyPropEntity(store: *DefaultStore, entity: Entity) !void {
+    var outer_buf: [DefaultStore.max_entity_key]u8 = undefined;
+    const outer_view = try writeEntityKey(&outer_buf, entity, default_max_entity_id);
+    try store.entities.ensureUnusedCapacity(1);
+    const outer_key = try store.allocator.dupe(u8, outer_view);
+    errdefer store.allocator.free(outer_key);
+    const id = try store.allocator.dupe(u8, entity.id);
+    store.entities.putAssumeCapacityNoClobber(
+        outer_key,
+        DefaultStore.EntityState.init(store.allocator, .{ .kind = entity.kind, .id = id }),
+    );
+    store.entity_count += 1;
+}
+
+fn testAddRawProp(
+    store: *DefaultStore,
+    entity: Entity,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    access: AccessLevel,
+) !void {
+    var outer_buf: [DefaultStore.max_entity_key]u8 = undefined;
+    const outer_key = try writeEntityKey(&outer_buf, entity, default_max_entity_id);
+    const state = store.entities.getPtr(outer_key) orelse return error.TestUnexpectedResult;
+    try state.props.ensureUnusedCapacity(1);
+    var normalized_buf: [default_max_key]u8 = undefined;
+    const normalized = try writePropKey(&normalized_buf, key, default_max_key);
+    var cloned = try DefaultStore.cloneCheckpointEntry(
+        store.allocator,
+        normalized,
+        key,
+        value,
+        owner,
+        access,
+    );
+    state.props.putAssumeCapacityNoClobber(cloned.normalized_key, cloned.entry);
+    cloned = undefined;
+    state.prop_count += 1;
+}
+
+fn installPropCheckpointFixture(store: *DefaultStore, reverse: bool) !void {
+    const alpha = try Entity.fromId("#Alpha");
+    const bravo = try Entity.fromId("#Bravo");
+    const mixed = try Entity.fromId("#MiXeD");
+    const user = try Entity.fromId("CaseUser");
+    const member = try Entity.fromId("#MiXeD:Alice");
+    const zero = try Entity.fromId("ZeroState");
+    var policy_drift_topic: [200]u8 = @splat('t');
+
+    const add_mixed = struct {
+        fn run(target: *DefaultStore, entity: Entity, topic: []const u8, reversed: bool) !void {
+            try testAddEmptyPropEntity(target, entity);
+            if (reversed) {
+                try testAddRawProp(target, entity, "TOPIC", topic, "legacy-user", .user);
+                try testAddRawProp(target, entity, "HOSTKEY", "mesh-secret", "founder", .owner);
+                try testAddRawProp(target, entity, "FuTuRe-X", "future-value", "legacy-user", .user);
+                try testAddRawProp(target, entity, "BRAVO", "second", "host", .host);
+                try testAddRawProp(target, entity, "ALPHA", "first", "host", .host);
+            } else {
+                try testAddRawProp(target, entity, "ALPHA", "first", "host", .host);
+                try testAddRawProp(target, entity, "BRAVO", "second", "host", .host);
+                try testAddRawProp(target, entity, "FuTuRe-X", "future-value", "legacy-user", .user);
+                try testAddRawProp(target, entity, "HOSTKEY", "mesh-secret", "founder", .owner);
+                try testAddRawProp(target, entity, "TOPIC", topic, "legacy-user", .user);
+            }
+        }
+    }.run;
+
+    if (reverse) {
+        try testAddEmptyPropEntity(store, zero);
+        _ = try store.setProp(member, "ROLE", "operator", .{ .id = "Alice", .access = .member });
+        _ = try store.setProp(user, "BIO", "case-preserved", .{ .id = "CaseUser", .access = .user });
+        try add_mixed(store, mixed, &policy_drift_topic, true);
+        _ = try store.setProp(bravo, "CUSTOM", "bravo", .{ .id = "host", .access = .host });
+        _ = try store.setProp(alpha, "CUSTOM", "alpha", .{ .id = "host", .access = .host });
+    } else {
+        _ = try store.setProp(alpha, "CUSTOM", "alpha", .{ .id = "host", .access = .host });
+        _ = try store.setProp(bravo, "CUSTOM", "bravo", .{ .id = "host", .access = .host });
+        try add_mixed(store, mixed, &policy_drift_topic, false);
+        _ = try store.setProp(user, "BIO", "case-preserved", .{ .id = "CaseUser", .access = .user });
+        _ = try store.setProp(member, "ROLE", "operator", .{ .id = "Alice", .access = .member });
+        try testAddEmptyPropEntity(store, zero);
+    }
+}
+
+fn testCheckpointEntityEnd(bytes: []const u8, entity_start: usize) usize {
+    const id_len: usize = checkpointReadU32(bytes[entity_start + 1 ..][0..4]);
+    const prop_count: usize = checkpointReadU32(bytes[entity_start + 5 ..][0..4]);
+    var pos = entity_start + prop_checkpoint_entity_prefix_len + id_len;
+    for (0..prop_count) |_| {
+        const key_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+        const value_len: usize = checkpointReadU32(bytes[pos + 4 ..][0..4]);
+        const owner_len: usize = checkpointReadU32(bytes[pos + 8 ..][0..4]);
+        pos += prop_checkpoint_prop_prefix_len + key_len + value_len + owner_len;
+    }
+    return pos;
+}
+
+fn testFindCheckpointEntity(bytes: []const u8, wanted_id: []const u8) ?usize {
+    const entity_count: usize = checkpointReadU32(bytes[5..9]);
+    var pos: usize = prop_checkpoint_header_len;
+    for (0..entity_count) |_| {
+        const id_len: usize = checkpointReadU32(bytes[pos + 1 ..][0..4]);
+        const id = bytes[pos + prop_checkpoint_entity_prefix_len ..][0..id_len];
+        if (std.mem.eql(u8, id, wanted_id)) return pos;
+        pos = testCheckpointEntityEnd(bytes, pos);
+    }
+    return null;
+}
+
+fn testFindCheckpointProp(bytes: []const u8, entity_start: usize, wanted_key: []const u8) ?usize {
+    const id_len: usize = checkpointReadU32(bytes[entity_start + 1 ..][0..4]);
+    const prop_count: usize = checkpointReadU32(bytes[entity_start + 5 ..][0..4]);
+    var pos = entity_start + prop_checkpoint_entity_prefix_len + id_len;
+    for (0..prop_count) |_| {
+        const key_len: usize = checkpointReadU32(bytes[pos..][0..4]);
+        const value_len: usize = checkpointReadU32(bytes[pos + 4 ..][0..4]);
+        const owner_len: usize = checkpointReadU32(bytes[pos + 8 ..][0..4]);
+        const key = bytes[pos + prop_checkpoint_prop_prefix_len ..][0..key_len];
+        if (std.mem.eql(u8, key, wanted_key)) return pos;
+        pos += prop_checkpoint_prop_prefix_len + key_len + value_len + owner_len;
+    }
+    return null;
+}
+
+fn rewritePropCheckpointChecksum(bytes: []u8) void {
+    const body_len: usize = checkpointReadU32(bytes[13..17]);
+    const prefix_len = prop_checkpoint_header_len + body_len;
+    std.debug.assert(bytes.len == prefix_len + prop_checkpoint_checksum_len);
+    propCheckpointChecksum(bytes[0..prefix_len], bytes[prefix_len..][0..prop_checkpoint_checksum_len]);
+}
+
+fn testSliceAliasesBytes(bytes: []const u8, slice: []const u8) bool {
+    const bytes_start = @intFromPtr(bytes.ptr);
+    const bytes_end = bytes_start + bytes.len;
+    const slice_start = @intFromPtr(slice.ptr);
+    const slice_end = slice_start + slice.len;
+    return slice_start < bytes_end and bytes_start < slice_end;
 }
 
 test "set get overwrite delete and list properties" {
@@ -1652,6 +2274,402 @@ test "prepared public channel clone reserves a fresh target and handles an all-z
             try std.testing.expectEqual(initial_count + 1, store.entity_count);
             try std.testing.expectEqualStrings("fresh-copy", (try store.getPropRaw(source, "CUSTOM")).value);
             try std.testing.expectEqualStrings("fresh-copy", (try store.getPropRaw(destination, "CUSTOM")).value);
+            break :blk true;
+        };
+        if (completed) break;
+    }
+}
+
+test "PROP checkpoint is deterministic complete and independently owned" {
+    var first = DefaultStore.init(std.testing.allocator);
+    defer first.deinit();
+    var second = DefaultStore.init(std.testing.allocator);
+    defer second.deinit();
+    try installPropCheckpointFixture(&first, false);
+    try installPropCheckpointFixture(&second, true);
+
+    const first_bytes = try first.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(first_bytes);
+    const second_bytes = try second.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(second_bytes);
+    try std.testing.expectEqualSlices(u8, first_bytes, second_bytes);
+
+    var restored = try DefaultStore.decodeCheckpoint(std.testing.allocator, first_bytes);
+    defer restored.deinit();
+    try std.testing.expectEqual(first.entity_count, restored.entity_count);
+    try std.testing.expectEqual(@as(usize, 6), restored.entity_count);
+    const mixed = try Entity.fromId("#MiXeD");
+    try std.testing.expectEqualStrings("mesh-secret", (try restored.getPropRaw(mixed, "HOSTKEY")).value);
+    try std.testing.expectEqualStrings("future-value", (try restored.getPropRaw(mixed, "future-x")).value);
+    const restored_topic = try restored.getPropRaw(mixed, "TOPIC");
+    try std.testing.expectEqual(@as(usize, 200), restored_topic.value.len);
+    try std.testing.expectEqualStrings("legacy-user", restored_topic.owner);
+    try std.testing.expectEqual(AccessLevel.user, restored_topic.access);
+    try std.testing.expectEqualStrings(
+        "case-preserved",
+        (try restored.getPropRaw(try Entity.fromId("CaseUser"), "BIO")).value,
+    );
+    try std.testing.expectEqualStrings(
+        "operator",
+        (try restored.getPropRaw(try Entity.fromId("#MiXeD:Alice"), "ROLE")).value,
+    );
+
+    var zero_key_buf: [DefaultStore.max_entity_key]u8 = undefined;
+    const zero_entity = try Entity.fromId("ZeroState");
+    const zero_key = try writeEntityKey(&zero_key_buf, zero_entity, default_max_entity_id);
+    const zero_state = restored.entities.getPtr(zero_key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), zero_state.prop_count);
+    try std.testing.expectEqual(@as(usize, 0), zero_state.props.count());
+
+    var mixed_key_buf: [DefaultStore.max_entity_key]u8 = undefined;
+    const mixed_key = try writeEntityKey(&mixed_key_buf, mixed, default_max_entity_id);
+    const outer = restored.entities.getEntry(mixed_key) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(@intFromPtr(outer.key_ptr.*.ptr) != @intFromPtr(outer.value_ptr.entity.id.ptr));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, outer.key_ptr.*));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, outer.value_ptr.entity.id));
+    var prop_key_buf: [default_max_key]u8 = undefined;
+    const prop_key = try writePropKey(&prop_key_buf, "FuTuRe-X", default_max_key);
+    const prop = outer.value_ptr.props.getEntry(prop_key) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(@intFromPtr(prop.key_ptr.*.ptr) != @intFromPtr(prop.value_ptr.key.ptr));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, prop.key_ptr.*));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, prop.value_ptr.key));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, prop.value_ptr.value));
+    try std.testing.expect(!testSliceAliasesBytes(first_bytes, prop.value_ptr.owner));
+
+    const round_trip = try restored.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(round_trip);
+    try std.testing.expectEqualSlices(u8, first_bytes, round_trip);
+
+    var empty = DefaultStore.init(std.testing.allocator);
+    defer empty.deinit();
+    const empty_bytes = try empty.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(empty_bytes);
+    try std.testing.expectEqual(
+        prop_checkpoint_header_len + prop_checkpoint_checksum_len,
+        empty_bytes.len,
+    );
+    var empty_restored = try DefaultStore.decodeCheckpoint(std.testing.allocator, empty_bytes);
+    defer empty_restored.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_restored.entity_count);
+}
+
+test "PROP checkpoint replacement is atomic and validates private cached state" {
+    var source = DefaultStore.init(std.testing.allocator);
+    defer source.deinit();
+    try installPropCheckpointFixture(&source, false);
+    const checkpoint = try source.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    var target = DefaultStore.init(std.testing.allocator);
+    defer target.deinit();
+    const sentinel = try Entity.fromId("Sentinel");
+    _ = try target.setProp(sentinel, "CUSTOM", "old-state", .{ .id = "Sentinel", .access = .user });
+    try target.replaceFromCheckpoint(checkpoint);
+    try std.testing.expectError(error.PropMissing, target.getPropRaw(sentinel, "CUSTOM"));
+    try std.testing.expectEqualStrings(
+        "mesh-secret",
+        (try target.getPropRaw(try Entity.fromId("#MiXeD"), "HOSTKEY")).value,
+    );
+
+    source.entity_count += 1;
+    try std.testing.expectError(error.CachedCountMismatch, source.encodeCheckpoint(std.testing.allocator));
+    source.entity_count -= 1;
+    var entity_it = source.entities.iterator();
+    const entity_entry = entity_it.next() orelse return error.TestUnexpectedResult;
+    entity_entry.value_ptr.prop_count += 1;
+    try std.testing.expectError(error.CachedCountMismatch, source.encodeCheckpoint(std.testing.allocator));
+    entity_entry.value_ptr.prop_count -= 1;
+
+    const mutable_outer_key = @constCast(entity_entry.key_ptr.*);
+    const saved_outer_byte = mutable_outer_key[mutable_outer_key.len - 1];
+    mutable_outer_key[mutable_outer_key.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidField, source.encodeCheckpoint(std.testing.allocator));
+    mutable_outer_key[mutable_outer_key.len - 1] = saved_outer_byte;
+    const mixed = try Entity.fromId("#MiXeD");
+    var mixed_key_buf: [DefaultStore.max_entity_key]u8 = undefined;
+    const mixed_key = try writeEntityKey(&mixed_key_buf, mixed, default_max_entity_id);
+    const nonempty_state = source.entities.getPtr(mixed_key) orelse return error.TestUnexpectedResult;
+    const prop_entry = nonempty_state.props.getEntry("alpha") orelse return error.TestUnexpectedResult;
+    const mutable_prop_key = @constCast(prop_entry.key_ptr.*);
+    const saved_prop_byte = mutable_prop_key[0];
+    mutable_prop_key[0] ^= 1;
+    try std.testing.expectError(error.InvalidField, source.encodeCheckpoint(std.testing.allocator));
+    mutable_prop_key[0] = saved_prop_byte;
+}
+
+test "PROP checkpoint rejects corrupt noncanonical duplicate and out-of-bounds wires" {
+    var source = DefaultStore.init(std.testing.allocator);
+    defer source.deinit();
+    try installPropCheckpointFixture(&source, false);
+    const checkpoint = try source.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    // Every strict prefix is rejected; none can be mistaken for an empty or
+    // partially valid predecessor state.
+    for (0..checkpoint.len) |prefix_len| {
+        if (DefaultStore.decodeCheckpoint(std.testing.allocator, checkpoint[0..prefix_len])) |decoded_value| {
+            var decoded = decoded_value;
+            decoded.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+
+    const bad_magic = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(bad_magic);
+    bad_magic[0] ^= 1;
+    try std.testing.expectError(error.BadMagic, DefaultStore.decodeCheckpoint(std.testing.allocator, bad_magic));
+    const bad_version = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(bad_version);
+    bad_version[4] +%= 1;
+    try std.testing.expectError(error.UnsupportedVersion, DefaultStore.decodeCheckpoint(std.testing.allocator, bad_version));
+
+    const trailing = try std.testing.allocator.alloc(u8, checkpoint.len + 1);
+    defer std.testing.allocator.free(trailing);
+    @memcpy(trailing[0..checkpoint.len], checkpoint);
+    trailing[checkpoint.len] = 0xa5;
+    try std.testing.expectError(error.TrailingBytes, DefaultStore.decodeCheckpoint(std.testing.allocator, trailing));
+
+    const bitflip = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(bitflip);
+    bitflip[prop_checkpoint_header_len + prop_checkpoint_entity_prefix_len] ^= 1;
+    try std.testing.expectError(error.ChecksumMismatch, DefaultStore.decodeCheckpoint(std.testing.allocator, bitflip));
+
+    const alpha_start = testFindCheckpointEntity(checkpoint, "#Alpha") orelse return error.TestUnexpectedResult;
+    const bravo_start = testFindCheckpointEntity(checkpoint, "#Bravo") orelse return error.TestUnexpectedResult;
+    const mixed_start = testFindCheckpointEntity(checkpoint, "#MiXeD") orelse return error.TestUnexpectedResult;
+    const mixed_alpha = testFindCheckpointProp(checkpoint, mixed_start, "ALPHA") orelse return error.TestUnexpectedResult;
+    const mixed_bravo = testFindCheckpointProp(checkpoint, mixed_start, "BRAVO") orelse return error.TestUnexpectedResult;
+    const mixed_topic = testFindCheckpointProp(checkpoint, mixed_start, "TOPIC") orelse return error.TestUnexpectedResult;
+
+    const invalid_kind = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(invalid_kind);
+    invalid_kind[alpha_start] = 0xff;
+    rewritePropCheckpointChecksum(invalid_kind);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, invalid_kind));
+
+    const invalid_access = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(invalid_access);
+    invalid_access[mixed_alpha + 12] = 0xff;
+    rewritePropCheckpointChecksum(invalid_access);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, invalid_access));
+    const invalid_bool = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(invalid_bool);
+    invalid_bool[mixed_alpha + 13] = 1;
+    rewritePropCheckpointChecksum(invalid_bool);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, invalid_bool));
+
+    const oversized_key = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(oversized_key);
+    checkpointWriteU32(oversized_key[mixed_alpha..][0..4], default_max_key + 1);
+    rewritePropCheckpointChecksum(oversized_key);
+    try std.testing.expectError(error.CapacityExceeded, DefaultStore.decodeCheckpoint(std.testing.allocator, oversized_key));
+    const empty_owner = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(empty_owner);
+    checkpointWriteU32(empty_owner[mixed_alpha + 8 ..][0..4], 0);
+    rewritePropCheckpointChecksum(empty_owner);
+    try std.testing.expectError(error.CapacityExceeded, DefaultStore.decodeCheckpoint(std.testing.allocator, empty_owner));
+
+    const too_many_entities = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(too_many_entities);
+    checkpointWriteU32(too_many_entities[5..9], default_max_entities + 1);
+    rewritePropCheckpointChecksum(too_many_entities);
+    try std.testing.expectError(error.CapacityExceeded, DefaultStore.decodeCheckpoint(std.testing.allocator, too_many_entities));
+    const too_many_props = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(too_many_props);
+    checkpointWriteU32(too_many_props[mixed_start + 5 ..][0..4], default_max_props_per_entity + 1);
+    rewritePropCheckpointChecksum(too_many_props);
+    try std.testing.expectError(error.CapacityExceeded, DefaultStore.decodeCheckpoint(std.testing.allocator, too_many_props));
+    const mismatched_total = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(mismatched_total);
+    checkpointWriteU32(mismatched_total[9..13], checkpointReadU32(mismatched_total[9..13]) + 1);
+    rewritePropCheckpointChecksum(mismatched_total);
+    try std.testing.expectError(error.CachedCountMismatch, DefaultStore.decodeCheckpoint(std.testing.allocator, mismatched_total));
+    const huge_body = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(huge_body);
+    checkpointWriteU32(huge_body[13..17], std.math.maxInt(u32));
+    try std.testing.expectError(error.CheckpointTooLarge, DefaultStore.decodeCheckpoint(std.testing.allocator, huge_body));
+
+    // Counts remain within configured caps but cannot fit in the authenticated
+    // body. Shape validation must reject this before the allocator is touched.
+    const allocation_bomb = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(allocation_bomb);
+    checkpointWriteU32(allocation_bomb[5..9], default_max_entities);
+    rewritePropCheckpointChecksum(allocation_bomb);
+    var fail_immediately = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.Truncated,
+        DefaultStore.decodeCheckpoint(fail_immediately.allocator(), allocation_bomb),
+    );
+    try std.testing.expect(!fail_immediately.has_induced_failure);
+
+    const duplicate_entity = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(duplicate_entity);
+    @memcpy(
+        duplicate_entity[bravo_start + prop_checkpoint_entity_prefix_len ..][0..6],
+        "#aLpHa",
+    );
+    rewritePropCheckpointChecksum(duplicate_entity);
+    try std.testing.expectError(error.DuplicateEntity, DefaultStore.decodeCheckpoint(std.testing.allocator, duplicate_entity));
+    const reversed_entities = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(reversed_entities);
+    var saved_alpha_id: [6]u8 = undefined;
+    @memcpy(&saved_alpha_id, reversed_entities[alpha_start + prop_checkpoint_entity_prefix_len ..][0..6]);
+    @memcpy(
+        reversed_entities[alpha_start + prop_checkpoint_entity_prefix_len ..][0..6],
+        reversed_entities[bravo_start + prop_checkpoint_entity_prefix_len ..][0..6],
+    );
+    @memcpy(
+        reversed_entities[bravo_start + prop_checkpoint_entity_prefix_len ..][0..6],
+        &saved_alpha_id,
+    );
+    rewritePropCheckpointChecksum(reversed_entities);
+    try std.testing.expectError(error.NonCanonicalOrder, DefaultStore.decodeCheckpoint(std.testing.allocator, reversed_entities));
+
+    const duplicate_prop = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(duplicate_prop);
+    @memcpy(
+        duplicate_prop[mixed_bravo + prop_checkpoint_prop_prefix_len ..][0..5],
+        "aLpHa",
+    );
+    rewritePropCheckpointChecksum(duplicate_prop);
+    try std.testing.expectError(error.DuplicateProperty, DefaultStore.decodeCheckpoint(std.testing.allocator, duplicate_prop));
+    const reversed_props = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(reversed_props);
+    var saved_alpha_key: [5]u8 = undefined;
+    @memcpy(&saved_alpha_key, reversed_props[mixed_alpha + prop_checkpoint_prop_prefix_len ..][0..5]);
+    @memcpy(
+        reversed_props[mixed_alpha + prop_checkpoint_prop_prefix_len ..][0..5],
+        reversed_props[mixed_bravo + prop_checkpoint_prop_prefix_len ..][0..5],
+    );
+    @memcpy(
+        reversed_props[mixed_bravo + prop_checkpoint_prop_prefix_len ..][0..5],
+        &saved_alpha_key,
+    );
+    rewritePropCheckpointChecksum(reversed_props);
+    try std.testing.expectError(error.NonCanonicalOrder, DefaultStore.decodeCheckpoint(std.testing.allocator, reversed_props));
+
+    const noncanonical_known = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(noncanonical_known);
+    @memcpy(
+        noncanonical_known[mixed_topic + prop_checkpoint_prop_prefix_len ..][0..5],
+        "topic",
+    );
+    rewritePropCheckpointChecksum(noncanonical_known);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, noncanonical_known));
+    const unsafe_key = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(unsafe_key);
+    @memcpy(unsafe_key[mixed_alpha + prop_checkpoint_prop_prefix_len ..][0..5], "ALP!A");
+    rewritePropCheckpointChecksum(unsafe_key);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, unsafe_key));
+    const unsafe_value = try std.testing.allocator.dupe(u8, checkpoint);
+    defer std.testing.allocator.free(unsafe_value);
+    const alpha_value_start = mixed_alpha + prop_checkpoint_prop_prefix_len + 5;
+    unsafe_value[alpha_value_start] = '\n';
+    rewritePropCheckpointChecksum(unsafe_value);
+    try std.testing.expectError(error.InvalidField, DefaultStore.decodeCheckpoint(std.testing.allocator, unsafe_value));
+
+    // The extra byte is inside the authenticated body. Declared records decode,
+    // then exact EOF rejects the hidden extension.
+    const authenticated_trailing = try std.testing.allocator.alloc(u8, checkpoint.len + 1);
+    defer std.testing.allocator.free(authenticated_trailing);
+    const old_prefix_len = checkpoint.len - prop_checkpoint_checksum_len;
+    @memcpy(authenticated_trailing[0..old_prefix_len], checkpoint[0..old_prefix_len]);
+    authenticated_trailing[old_prefix_len] = 0xa5;
+    checkpointWriteU32(
+        authenticated_trailing[13..17],
+        checkpointReadU32(checkpoint[13..17]) + 1,
+    );
+    rewritePropCheckpointChecksum(authenticated_trailing);
+    try std.testing.expectError(error.TrailingBytes, DefaultStore.decodeCheckpoint(std.testing.allocator, authenticated_trailing));
+
+    // A corrupt replacement never displaces the live sentinel.
+    var target = DefaultStore.init(std.testing.allocator);
+    defer target.deinit();
+    const sentinel = try Entity.fromId("Sentinel");
+    _ = try target.setProp(sentinel, "CUSTOM", "old-state", .{ .id = "Sentinel", .access = .user });
+    const corrupt_replacements = [_][]const u8{
+        bitflip,
+        invalid_kind,
+        invalid_access,
+        allocation_bomb,
+        duplicate_entity,
+        reversed_entities,
+        duplicate_prop,
+        noncanonical_known,
+        unsafe_value,
+        trailing,
+        authenticated_trailing,
+    };
+    for (corrupt_replacements) |corrupt| {
+        if (target.replaceFromCheckpoint(corrupt)) |_| return error.TestUnexpectedResult else |_| {}
+        try std.testing.expectEqualStrings("old-state", (try target.getPropRaw(sentinel, "CUSTOM")).value);
+        try std.testing.expectEqual(@as(usize, 1), target.entity_count);
+    }
+}
+
+test "PROP checkpoint encode decode and atomic replace exhaust allocation failures" {
+    var source = DefaultStore.init(std.testing.allocator);
+    defer source.deinit();
+    try installPropCheckpointFixture(&source, false);
+
+    const EncodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, store: *const DefaultStore) !void {
+            const bytes = try store.encodeCheckpoint(allocator);
+            defer allocator.free(bytes);
+            try std.testing.expect(bytes.len > prop_checkpoint_header_len + prop_checkpoint_checksum_len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, EncodeSweep.run, .{&source});
+
+    const checkpoint = try source.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+    const DecodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var decoded = try DefaultStore.decodeCheckpoint(allocator, bytes);
+            defer decoded.deinit();
+            try std.testing.expectEqual(@as(usize, 6), decoded.entity_count);
+            try std.testing.expectEqualStrings(
+                "mesh-secret",
+                (try decoded.getPropRaw(try Entity.fromId("#MiXeD"), "HOSTKEY")).value,
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, DecodeSweep.run, .{checkpoint});
+
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        try std.testing.expect(fail_offset < 512);
+        const completed = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var target = DefaultStore.init(failing.allocator());
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                target.deinit();
+            }
+            const sentinel = try Entity.fromId("Sentinel");
+            _ = try target.setProp(sentinel, "CUSTOM", "old-state", .{ .id = "Sentinel", .access = .user });
+
+            failing.fail_index = failing.alloc_index + fail_offset;
+            target.replaceFromCheckpoint(checkpoint) catch |err| {
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(@as(usize, 1), target.entity_count);
+                try std.testing.expectEqualStrings("old-state", (try target.getPropRaw(sentinel, "CUSTOM")).value);
+                try std.testing.expectError(
+                    error.PropMissing,
+                    target.getPropRaw(try Entity.fromId("#MiXeD"), "HOSTKEY"),
+                );
+                break :blk false;
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectError(error.PropMissing, target.getPropRaw(sentinel, "CUSTOM"));
+            try std.testing.expectEqual(@as(usize, 6), target.entity_count);
+            try std.testing.expectEqualStrings(
+                "mesh-secret",
+                (try target.getPropRaw(try Entity.fromId("#MiXeD"), "HOSTKEY")).value,
+            );
             break :blk true;
         };
         if (completed) break;
