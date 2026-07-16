@@ -188,6 +188,17 @@ pub const TokenBindKind = union(enum) {
     adopt_verified: bool,
 };
 
+/// Pointer-free account-row image captured by `PreparedTokenBind` while its
+/// retained exclusive lock freezes every ASCII-fold-equivalent account key.
+/// Restore planners may safely inspect this slice without borrowing Session or
+/// snapshot storage that another attachment could replace or free.
+pub const TokenBindRowSnapshot = struct {
+    client: ClientId,
+    token: Token,
+    attached: bool,
+    portable_resume: bool,
+};
+
 /// A token bind prepared while holding the store's exclusive lock. Preparation
 /// captures every value needed by the commit, so `commit` performs no allocation
 /// and cannot expose a half-applied token-group merge. The lock remains held after
@@ -221,11 +232,31 @@ pub const PreparedTokenBind = struct {
     target_projection_dirty: bool,
     target_local_projection_revision: u64,
     merged_local_projections: LocalChannelProjectionSet,
+    /// Complete, deterministically ordered folded-account view captured under
+    /// the retained exclusive lock. Freed immediately before that lock is
+    /// released on every lifecycle exit.
+    locked_account_rows: []TokenBindRowSnapshot,
     /// Missing per-row journals allocated during preparation. They remain
     /// detached from store state until commit and are destroyed on abort.
     staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null,
     result_portable: bool,
     state: State = .prepared,
+
+    /// Return the complete folded-account row image frozen by this ticket. The
+    /// slice remains valid through commit and until finish/abort releases the
+    /// retained SessionStore lock.
+    pub fn accountRows(self: *const PreparedTokenBind) []const TokenBindRowSnapshot {
+        std.debug.assert(self.state == .prepared or self.state == .committed);
+        if (self.state != .prepared and self.state != .committed) return &.{};
+        return self.locked_account_rows;
+    }
+
+    /// Portable authority that commit will install on the claimant's target
+    /// group, derived under the same retained lock as `accountRows`.
+    pub fn resultPortable(self: *const PreparedTokenBind) bool {
+        std.debug.assert(self.state == .prepared or self.state == .committed);
+        return self.result_portable;
+    }
 
     /// Preview the exact bounded local-channel image that commit will install on
     /// the target token. Callers use this while the ticket retains the exclusive
@@ -333,6 +364,7 @@ pub const PreparedTokenBind = struct {
         if (self.state == .finished) return;
         std.debug.assert(self.state == .committed);
         if (self.state != .committed) return;
+        self.destroyLockedAccountRows();
         self.state = .finished;
         self.store.lock.unlockExclusive();
     }
@@ -344,6 +376,7 @@ pub const PreparedTokenBind = struct {
         std.debug.assert(self.state == .prepared);
         if (self.state != .prepared) return;
         self.destroyStagedLocalProjectionSets();
+        self.destroyLockedAccountRows();
         self.state = .aborted;
         self.store.lock.unlockExclusive();
     }
@@ -355,6 +388,7 @@ pub const PreparedTokenBind = struct {
         switch (self.state) {
             .prepared => self.abort(),
             .committed => {
+                self.destroyLockedAccountRows();
                 self.state = .finished;
                 self.store.lock.unlockExclusive();
                 std.debug.assert(false);
@@ -368,6 +402,12 @@ pub const PreparedTokenBind = struct {
         for (staged) |set| self.store.allocator.destroy(set);
         self.store.allocator.free(staged);
         self.staged_local_projection_sets = null;
+    }
+
+    fn destroyLockedAccountRows(self: *PreparedTokenBind) void {
+        if (self.locked_account_rows.len == 0) return;
+        self.store.allocator.free(self.locked_account_rows);
+        self.locked_account_rows = &.{};
     }
 };
 
@@ -693,6 +733,63 @@ pub const SessionStore = struct {
         // A bind that would exceed the fixed retry budget is refused before the
         // caller stages World changes. No pending channel may be discarded.
         if (!mergeLocalProjectionSets(&merged_local_projections, &claimant_set, &target_set)) return null;
+
+        // Capture every row under every ASCII-fold-equivalent account key, not
+        // merely `account_entry`'s exact spelling. Account maps intentionally
+        // retain display casing, while reusable-token authority is folded; a
+        // restore plan built from only one spelling can otherwise miss a live
+        // attachment that joins or leaves immediately before this ticket.
+        var locked_row_count: usize = 0;
+        var count_it = self.accounts.iterator();
+        while (count_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account_key)) continue;
+            locked_row_count = std.math.add(
+                usize,
+                locked_row_count,
+                entry.value_ptr.items.items.len,
+            ) catch return null;
+        }
+        std.debug.assert(locked_row_count != 0);
+        const locked_account_rows = self.allocator.alloc(
+            TokenBindRowSnapshot,
+            locked_row_count,
+        ) catch return null;
+        var rows_transferred = false;
+        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        var locked_row_index: usize = 0;
+        var rows_it = self.accounts.iterator();
+        while (rows_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account_key)) continue;
+            for (entry.value_ptr.items.items) |session| {
+                locked_account_rows[locked_row_index] = .{
+                    .client = session.client,
+                    .token = session.token,
+                    .attached = session.attached,
+                    .portable_resume = session.portable_resume,
+                };
+                locked_row_index += 1;
+            }
+        }
+        std.debug.assert(locked_row_index == locked_account_rows.len);
+        const RowOrder = struct {
+            fn lessThan(_: void, a: TokenBindRowSnapshot, b: TokenBindRowSnapshot) bool {
+                return a.client < b.client;
+            }
+        };
+        std.mem.sort(
+            TokenBindRowSnapshot,
+            locked_account_rows,
+            {},
+            RowOrder.lessThan,
+        );
+        // Exact-case account lists enforce unique clients internally, but
+        // independently-created case variants can contain the same packed id
+        // with conflicting authority. Sorting makes the fail-closed duplicate
+        // check linear even if many case spellings reach their individual caps.
+        for (locked_account_rows[1..], 1..) |row, row_index| {
+            if (locked_account_rows[row_index - 1].client == row.client) return null;
+        }
+
         var staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null;
         if (!merged_local_projections.isEmpty()) {
             var missing: usize = 0;
@@ -727,6 +824,7 @@ pub const SessionStore = struct {
             .adopt_verified => |portable| portable,
         };
         keep_locked = true;
+        rows_transferred = true;
         return .{
             .store = self,
             .account = account_key,
@@ -745,6 +843,7 @@ pub const SessionStore = struct {
             .target_projection_dirty = target.projection_dirty,
             .target_local_projection_revision = target_set.revision,
             .merged_local_projections = merged_local_projections,
+            .locked_account_rows = locked_account_rows,
             .staged_local_projection_sets = staged_local_projection_sets,
             .result_portable = result_portable,
         };
@@ -2151,6 +2250,148 @@ test "prepared token bind preview is complete at capacity and keeps newest targe
     }
 }
 
+test "prepared token bind row snapshot supersedes stale exact-case copy and freezes folded account" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x3A);
+    const generated = tok(0x3B);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, generated, 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+
+    const stale = try s.copySessionsAlloc(testing.allocator, "alice");
+    defer testing.allocator.free(stale);
+    try testing.expectEqual(@as(usize, 2), stale.len);
+    try testing.expect(stale[0].attached);
+
+    // Deterministically model the old race window between copySessionsAlloc and
+    // prepareTokenBind: one target row detaches and another attaches under a
+    // case-variant spelling before the retained ticket acquires its lock.
+    try testing.expect(s.markDetached("alice", 1));
+    _ = try s.attach("ALICE", 3, target, 3);
+
+    var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    const rows = prepared.accountRows();
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(ClientId, 1), rows[0].client);
+    try testing.expectEqual(@as(ClientId, 2), rows[1].client);
+    try testing.expectEqual(@as(ClientId, 3), rows[2].client);
+    try testing.expect(!rows[0].attached);
+    try testing.expect(rows[0].portable_resume);
+    try testing.expectEqual(target, rows[0].token);
+    try testing.expect(rows[1].attached);
+    try testing.expectEqual(generated, rows[1].token);
+    try testing.expect(rows[2].attached);
+    try testing.expectEqual(target, rows[2].token);
+    try testing.expect(prepared.resultPortable());
+    try testing.expect(!s.lock.tryLockExclusive());
+
+    // The stale exact-case copy cannot see C3 and still reports C1 attached;
+    // only the ticket snapshot is complete/current enough for World planning.
+    try testing.expect(stale[0].attached);
+    for (stale) |row| try testing.expect(row.client != 3);
+
+    try testing.expect(prepared.commit());
+    try testing.expectEqual(@as(usize, 3), prepared.accountRows().len);
+    prepared.finish();
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 2, target));
+    try testing.expect(s.clientHasToken("ALICE", 3, target));
+}
+
+test "prepared token bind rejects duplicate client ids across folded account keys" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const target = tok(0x38);
+    const generated = tok(0x39);
+    const conflicting = tok(0x37);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, generated, 2);
+    _ = try s.attach("ALICE", 1, conflicting, 3);
+
+    try testing.expect(s.prepareTokenBind("alice", 2, target, .join_existing) == null);
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 1, target));
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+    try testing.expect(s.clientHasToken("ALICE", 1, conflicting));
+    try testing.expect(!s.clientHasToken("alice", 2, target));
+    try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+}
+
+test "prepared token bind locked row allocation OOM is transactional and retryable" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+    const target = tok(0x35);
+    const generated = tok(0x36);
+    _ = try s.attach("alice", 1, target, 1);
+    _ = try s.attach("alice", 2, generated, 2);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(s.prepareTokenBind("alice", 2, target, .join_existing) == null);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+    try testing.expect(!s.clientHasToken("alice", 2, target));
+
+    failing.fail_index = std.math.maxInt(usize);
+    var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expectEqual(@as(usize, 2), prepared.accountRows().len);
+    prepared.abort();
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+}
+
+test "prepared token bind folded row and staged journal tickets are leak-clean on every allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+            const target = tok(0x33);
+            _ = try s.attach("alice", 1, target, 1);
+            const intent = try s.armTokenLocalChannelProjection(target, "#locked", true, 3);
+            _ = try s.attach("ALICE", 3, target, 3);
+            _ = try s.attach("alice", 2, tok(0x34), 2);
+
+            // Implicit prepared deinit and explicit abort must both release the
+            // row snapshot plus the claimant's staged lazy journal unchanged.
+            var implicit = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+                return error.OutOfMemory;
+            try testing.expectEqual(@as(usize, 3), implicit.accountRows().len);
+            implicit.deinit();
+            var aborted = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+                return error.OutOfMemory;
+            try testing.expectEqual(@as(usize, 3), aborted.accountRows().len);
+            aborted.abort();
+            aborted.deinit();
+            try testing.expect(s.lock.tryLockExclusive());
+            s.lock.unlockExclusive();
+            try testing.expect(s.clientHasToken("alice", 2, tok(0x34)));
+            try testing.expectEqual(@as(usize, 2), s.dirtyLocalProjectionRowCount());
+
+            // Success commits the same prepared resources without allocating,
+            // then finish frees the locked rows before releasing the lock.
+            var committed = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+                return error.OutOfMemory;
+            defer committed.deinit();
+            try testing.expect(committed.commit());
+            committed.finish();
+            try testing.expect(s.clientHasToken("alice", 2, target));
+            try testing.expectEqual(intent.generation, s.tokenLocalChannelProjection(target, "#locked").?.generation);
+            try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
+
 test "prepared token adopt carries the journal and abort frees staged rows" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
@@ -2909,7 +3150,7 @@ test "prepared token bind rejects invalid and stale preconditions without mutati
     try testing.expectEqual(@as(usize, 0), s.dirtyReplicaProjectionRowCount());
 }
 
-test "prepared token bind remains no-allocation after exhaustive setup failures" {
+test "prepared token bind commit remains no-allocation after exhaustive preparation failures" {
     const Exercise = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var s = SessionStore.init(allocator);
@@ -2921,7 +3162,7 @@ test "prepared token bind remains no-allocation after exhaustive setup failures"
             try testing.expect(s.markPortableResumeIssued("sweep", 1));
 
             var prepared = s.prepareTokenBind("sweep", 2, target, .join_existing) orelse
-                return error.TestUnexpectedResult;
+                return error.OutOfMemory;
             defer prepared.deinit();
             try testing.expect(prepared.commit());
             try testing.expect(!s.lock.tryLockExclusive());

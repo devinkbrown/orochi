@@ -32598,33 +32598,31 @@ pub const LinuxServer = struct {
             self.flushDeferredSessionMeshAnnouncements(id, conn);
         if (conn.session_mesh_announce_pending) return false;
 
+        // Lock order is the completion-wide World write lock (already held by
+        // the reactor), then SessionStore exclusive, then World's internal RCU
+        // writer stages. The retained bind ticket freezes every folded-account
+        // row through World/profile/output planning and both no-fail commits.
+        // No SessionStore API may be called again before token_ticket.finish().
+        const wid = worldIdFromClient(id);
+        const cid = monitorIdFromClient(id);
+        var token_ticket = self.sessions.prepareTokenBind(account, cid, session_token, bind_kind) orelse return false;
+        defer token_ticket.deinit();
+        const session_rows = token_ticket.accountRows();
+
         // Decide exact-token attachment semantics before any live identity,
         // World, Store, output, or sidecar mutation. The claimant's current row
         // may belong to another reusable group. Moving its World nick while a
         // sibling still sustains that group would orphan the old identity, so
         // require a fresh connection for that cross-group attach.
-        const session_rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
-        defer self.allocator.free(session_rows);
-        const wid = worldIdFromClient(id);
-        const cid = monitorIdFromClient(id);
         var claimant_token: ?sessions_mod.Token = null;
-        var claimant_portable = false;
-        var target_group_portable = false;
         var displaced_handle: ?sessions_mod.ResumeHandle = null;
         for (session_rows) |row| {
-            if (std.crypto.timing_safe.eql(sessions_mod.Token, row.token, session_token))
-                target_group_portable = target_group_portable or row.portable_resume;
             if (row.client == cid) {
                 claimant_token = row.token;
-                claimant_portable = row.portable_resume;
                 displaced_handle = .{ .token = row.token, .portable = row.portable_resume };
             }
         }
-        const bind_portable = switch (bind_kind) {
-            .join_existing => claimant_portable or target_group_portable,
-            .adopt_verified => |portable| portable,
-        };
-        const requires_v2_authority = bind_portable;
+        const requires_v2_authority = token_ticket.resultPortable();
         if (claimant_token) |current_token| {
             if (!tokenIsNull(current_token) and
                 !std.crypto.timing_safe.eql(sessions_mod.Token, current_token, session_token))
@@ -32710,12 +32708,10 @@ pub const LinuxServer = struct {
         const nonexclusive_rename = !std.ascii.eqlIgnoreCase(conn.session.displayName(), snap.nick) and
             !exclusive_rename;
 
-        // Prepare the bind before World/output plans and preview the SAME merged
-        // retry journal its no-fail commit will publish. A detached snapshot may
-        // lag an accepted PART/JOIN/MODE intent; overlaying here prevents RESUME
-        // from visibly replaying stale membership for even one event-loop turn.
-        var token_ticket = self.sessions.prepareTokenBind(account, cid, session_token, bind_kind) orelse return false;
-        defer token_ticket.deinit();
+        // Preview the SAME merged retry journal the retained ticket's no-fail
+        // commit will publish. A detached snapshot may lag an accepted
+        // PART/JOIN/MODE intent; overlaying here prevents RESUME from visibly
+        // replaying stale membership for even one event-loop turn.
         var projection_buf: [sessions_mod.local_channel_projection_capacity]sessions_mod.LocalChannelProjection = undefined;
         const pending_projections = token_ticket.mergedLocalChannelProjectionsInto(&projection_buf);
 
@@ -66306,6 +66302,339 @@ test "session-foundation adversarial: absent projector converges live exact rows
     try std.testing.expectEqual(@as(usize, 0), primary.send_len);
     try std.testing.expectEqual(@as(usize, 0), ghost.send_len);
     try std.testing.expectEqual(@as(usize, 0), survivor.send_len);
+}
+
+test "session-foundation locked rows: folded exact owner survives while a current detached sibling is excluded" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const owner_id = try addTestLocalClient(&server, "Shared", "Alice");
+    const detached_id = try addTestLocalClient(&server, "Retired", "ALICE");
+    const claimant_id = try addTestLocalClient(&server, "Device", "aLiCe");
+    const claimant = server.connFor(claimant_id).?;
+    const target = server.sessions.resumeHandleForClient(
+        "Alice",
+        monitorIdFromClient(owner_id),
+    ).?;
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "ALICE",
+        monitorIdFromClient(detached_id),
+        target.token,
+    ));
+    try std.testing.expect(server.sessions.markDetached(
+        "ALICE",
+        monitorIdFromClient(detached_id),
+    ));
+    server.world.removeClient(worldIdFromClient(detached_id));
+    try server.world.restoreMember(
+        "#folded-current",
+        worldIdFromClient(owner_id),
+        world_model.MemberModes.fromModes(&.{.op}),
+    );
+
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Shared",
+        .umodes = "+i",
+        .channels = &.{"#folded-current"},
+        .channel_modes = &.{world_model.MemberModes.fromModes(&.{.voice}).bits},
+        .account = "ALICE",
+    };
+    claimant.send_len = 0;
+    claimant.send_offset = 0;
+    try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "aLiCe",
+        target.token,
+        .join_existing,
+        &snapshot,
+    ));
+
+    // The attached exact owner in another folded map keeps the rendered nick.
+    // The detached exact sibling is part of the frozen row image but must not be
+    // treated as a live World participant.
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(owner_id)),
+        server.world.findNick("Shared"),
+    );
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(claimant_id)) == null);
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(detached_id)) == null);
+    try std.testing.expect(server.world.isMember("#folded-current", worldIdFromClient(owner_id)));
+    try std.testing.expect(server.world.isMember("#folded-current", worldIdFromClient(claimant_id)));
+    try std.testing.expect(!server.world.isMember("#folded-current", worldIdFromClient(detached_id)));
+    try std.testing.expectEqual(
+        world_model.MemberModes.fromModes(&.{.voice}).bits,
+        server.world.memberModes("#folded-current", worldIdFromClient(claimant_id)).?.bits,
+    );
+    try std.testing.expectEqualStrings("Shared", claimant.session.displayName());
+    const rebound = server.sessions.resumeHandleForClient(
+        "aLiCe",
+        monitorIdFromClient(claimant_id),
+    ).?;
+    try std.testing.expectEqualSlices(u8, &target.token, &rebound.token);
+    const detached_rows = try server.sessions.copySessionsAlloc(server.allocator, "ALICE");
+    defer server.allocator.free(detached_rows);
+    try std.testing.expectEqual(@as(usize, 1), detached_rows.len);
+    try std.testing.expect(!detached_rows[0].attached);
+    try std.testing.expectEqualSlices(u8, &target.token, &detached_rows[0].token);
+}
+
+test "session-foundation locked rows: duplicate client across folded accounts fails closed and clean retry succeeds" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const owner_id = try addTestLocalClient(&server, "Owner", "Dupe");
+    const claimant_id = try addTestLocalClient(&server, "Claimant", "dupe");
+    const claimant = server.connFor(claimant_id).?;
+    const target = server.sessions.resumeHandleForClient(
+        "Dupe",
+        monitorIdFromClient(owner_id),
+    ).?;
+    const prior = server.sessions.resumeHandleForClient(
+        "dupe",
+        monitorIdFromClient(claimant_id),
+    ).?;
+    const conflicting: sessions_mod.Token = @splat(0xD7);
+    _ = try server.sessions.attach(
+        "DUPE",
+        monitorIdFromClient(claimant_id),
+        conflicting,
+        3,
+    );
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Owner",
+        .umodes = "+i",
+        .channels = &.{"#dupe-safe"},
+        .channel_modes = &.{0},
+        .account = "dupe",
+    };
+
+    const claimant_send_len = claimant.send_len;
+    const claimant_send_offset = claimant.send_offset;
+    try std.testing.expect(!server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "dupe",
+        target.token,
+        .join_existing,
+        &snapshot,
+    ));
+    try std.testing.expectEqualStrings("Claimant", claimant.session.displayName());
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(claimant_id)),
+        server.world.findNick("Claimant"),
+    );
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(owner_id)),
+        server.world.findNick("Owner"),
+    );
+    try std.testing.expect(!server.world.channelExists("#dupe-safe"));
+    try std.testing.expectEqual(claimant_send_len, claimant.send_len);
+    try std.testing.expectEqual(claimant_send_offset, claimant.send_offset);
+    const retained = server.sessions.resumeHandleForClient(
+        "dupe",
+        monitorIdFromClient(claimant_id),
+    ).?;
+    try std.testing.expectEqualSlices(u8, &prior.token, &retained.token);
+
+    // Removing the corrupt duplicate and retrying also proves the failed ticket
+    // released its exclusive lock and left every authority row reusable.
+    try std.testing.expect(server.sessions.remove("DUPE", monitorIdFromClient(claimant_id)));
+    try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "dupe",
+        target.token,
+        .join_existing,
+        &snapshot,
+    ));
+    const rebound = server.sessions.resumeHandleForClient(
+        "dupe",
+        monitorIdFromClient(claimant_id),
+    ).?;
+    try std.testing.expectEqualSlices(u8, &target.token, &rebound.token);
+}
+
+test "session-foundation locked rows: retained ticket blocks detach drift until abort" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "ticket-drift";
+    const owner_id = try addTestLocalClient(&server, "Owner", account);
+    const claimant_id = try addTestLocalClient(&server, "Claimant", account);
+    const target = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(owner_id),
+    ).?;
+    var prepared = server.sessions.prepareTokenBind(
+        account,
+        monitorIdFromClient(claimant_id),
+        target.token,
+        .join_existing,
+    ) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), prepared.accountRows().len);
+
+    const DetachCtx = struct {
+        store: *sessions_mod.SessionStore,
+        account: []const u8,
+        client: sessions_mod.ClientId,
+        started: *std.atomic.Value(bool),
+        done: *std.atomic.Value(bool),
+        changed: *std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            ctx.started.store(true, .release);
+            const result = ctx.store.markDetached(ctx.account, ctx.client);
+            ctx.changed.store(result, .release);
+            ctx.done.store(true, .release);
+        }
+    };
+    var started = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    var changed = std.atomic.Value(bool).init(false);
+    var ctx = DetachCtx{
+        .store = &server.sessions,
+        .account = account,
+        .client = monitorIdFromClient(owner_id),
+        .started = &started,
+        .done = &done,
+        .changed = &changed,
+    };
+    var thread = std.Thread.spawn(.{}, DetachCtx.run, .{&ctx}) catch return error.SkipZigTest;
+    var joined = false;
+    defer if (!joined) {
+        prepared.abort();
+        thread.join();
+    };
+
+    var spins: usize = 0;
+    while (!started.load(.acquire) and spins < 100_000) : (spins += 1)
+        std.Thread.yield() catch {};
+    try std.testing.expect(started.load(.acquire));
+    try std.testing.expect(!done.load(.acquire));
+    // The snapshot cannot drift while World/output planning consumes it.
+    try std.testing.expect(prepared.accountRows()[0].attached);
+
+    prepared.abort();
+    thread.join();
+    joined = true;
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(changed.load(.acquire));
+    const rows = try server.sessions.copySessionsAlloc(server.allocator, account);
+    defer server.allocator.free(rows);
+    var owner_attached = true;
+    for (rows) |row| if (row.client == monitorIdFromClient(owner_id)) {
+        owner_attached = row.attached;
+    };
+    try std.testing.expect(!owner_attached);
+}
+
+test "session-foundation locked rows: capture OOM is failure-atomic and retryable through RESUME" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var server = Server.init(failing.allocator(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        server.deinit();
+    }
+
+    const account = "row-alloc";
+    const owner_id = try addTestLocalClient(&server, "Owner", account);
+    const claimant_id = try addTestLocalClient(&server, "Claimant", account);
+    const claimant = server.connFor(claimant_id).?;
+    const target = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(owner_id),
+    ).?;
+    const prior = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(claimant_id),
+    ).?;
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Owner",
+        .umodes = "+i",
+        .channels = &.{"#row-alloc"},
+        .channel_modes = &.{0},
+        .account = account,
+    };
+
+    const claimant_send_len = claimant.send_len;
+    const claimant_send_offset = claimant.send_offset;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expect(!server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        account,
+        target.token,
+        .join_existing,
+        &snapshot,
+    ));
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("Claimant", claimant.session.displayName());
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(claimant_id)),
+        server.world.findNick("Claimant"),
+    );
+    try std.testing.expect(!server.world.channelExists("#row-alloc"));
+    try std.testing.expectEqual(claimant_send_len, claimant.send_len);
+    try std.testing.expectEqual(claimant_send_offset, claimant.send_offset);
+    const retained = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(claimant_id),
+    ).?;
+    try std.testing.expectEqualSlices(u8, &prior.token, &retained.token);
+
+    try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        account,
+        target.token,
+        .join_existing,
+        &snapshot,
+    ));
+    const rebound = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(claimant_id),
+    ).?;
+    try std.testing.expectEqualSlices(u8, &target.token, &rebound.token);
+    try std.testing.expect(server.world.isMember("#row-alloc", worldIdFromClient(claimant_id)));
 }
 
 test {
