@@ -3,11 +3,14 @@
 
 //! Multi-session registry: account -> set of live client sessions (Phase 3).
 //!
-//! Orochi treats an *account* as the durable identity and each connection as a
-//! *session* of that account. This store tracks, per account, the live sessions
-//! (client id + a reclaim token + signon time) so the daemon can list a user's
-//! devices (`SESSION`), reclaim a dropped session by token, and route per-account
-//! fan-out (bouncer). Pure and self-contained: the caller keys sessions by the
+//! Orochi treats an *account* as the durable identity, a reclaim token as one
+//! logical resumable session, and each connection as an attachment to that
+//! session. Multiple attached rows may therefore deliberately carry the SAME
+//! token: presenting a valid token joins the logical session; it does not steal
+//! it from another live client. This store tracks, per account, the attachments
+//! (client id + logical-session token + signon time) so the daemon can list a
+//! user's devices, resume a dropped attachment, and route per-session fan-out.
+//! Pure and self-contained: the caller keys attachments by the
 //! flat `u64` client id (the same packed id used by MONITOR / activity subs) and
 //! supplies the reclaim token (generated from the daemon CSPRNG). A flat per-
 //! account list keeps ownership trivial (one owned account-name key per account).
@@ -34,12 +37,33 @@ pub const Session = struct {
     attached: bool = true,
     /// Optional server-owned encoded restore snapshot for detached sessions.
     snapshot: ?[]u8 = null,
+    /// True after a portable (mesh-sealed) resume credential has been revealed
+    /// for this exact session. Only opted-in sessions need their detached state
+    /// replicated to mesh peers.
+    portable_resume: bool = false,
+};
+
+pub const ResumeHandle = struct {
+    token: Token,
+    portable: bool,
 };
 
 pub const DetachedSnapshot = struct {
     client: ClientId,
     signon_ms: i64,
     snapshot: []u8,
+};
+
+pub const PortableDetachedSnapshot = struct {
+    account: []u8,
+    token: Token,
+    snapshot: []u8,
+
+    pub fn deinit(self: *PortableDetachedSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.account);
+        allocator.free(self.snapshot);
+        self.* = undefined;
+    }
 };
 
 const SessionList = struct {
@@ -150,6 +174,106 @@ pub const SessionStore = struct {
         return true;
     }
 
+    /// Mark that this session's portable resume credential was successfully
+    /// emitted to its owner. Idempotent; never creates a session implicitly.
+    pub fn markPortableResumeIssued(self: *SessionStore, account: []const u8, client: ClientId) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        list.items.items[idx].portable_resume = true;
+        return true;
+    }
+
+    /// Restore the carried portable-resume bit during a Helix adoption. This is
+    /// deliberately separate from `attach`: a normal re-attach rotates the local
+    /// token and resets portability, while an in-place upgrade preserves both.
+    pub fn restorePortableResumeIssued(self: *SessionStore, account: []const u8, client: ClientId, issued: bool) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        list.items.items[idx].portable_resume = issued;
+        return true;
+    }
+
+    /// Return the stable local token and portability state for one tracked
+    /// connection. Used by detach to decide whether a peer snapshot is owed.
+    pub fn resumeHandleForClient(self: *const SessionStore, account: []const u8, client: ClientId) ?ResumeHandle {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        const idx = list.indexOfClient(client) orelse return null;
+        const session = list.items.items[idx];
+        return .{ .token = session.token, .portable = session.portable_resume };
+    }
+
+    /// Join `client` to the logical session identified by `token`. The client
+    /// must already be tracked under `account`; this only rebinds its generated
+    /// first-login token to the presented stable session credential. Other live
+    /// attachments keep the same token and remain connected. Portable issuance
+    /// is group-wide: a newly joined attachment inherits it from any sibling so
+    /// its later detach is replicated too.
+    pub fn joinTokenGroup(self: *SessionStore, account: []const u8, client: ClientId, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        var portable = list.items.items[idx].portable_resume;
+        var found = false;
+        for (list.items.items) |session| {
+            if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+            found = true;
+            portable = portable or session.portable_resume;
+        }
+        if (!found) return false;
+        list.items.items[idx].token = token;
+        list.items.items[idx].portable_resume = portable;
+        return true;
+    }
+
+    /// Bind a tracked client to a token whose authority was established outside
+    /// the local store (for example by a verified mesh credential + signed
+    /// migration replica). Unlike `joinTokenGroup`, this does not require a
+    /// pre-existing local attachment bearing the token.
+    pub fn adoptTokenGroup(self: *SessionStore, account: []const u8, client: ClientId, token: Token, portable: bool) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        list.items.items[idx].token = token;
+        list.items.items[idx].portable_resume = portable;
+        return true;
+    }
+
+    /// Whether this exact attached client already belongs to `token`'s logical
+    /// session. Kept separate from token lookup because duplicate tokens across
+    /// live attachments are intentional.
+    pub fn clientHasToken(self: *const SessionStore, account: []const u8, client: ClientId, token: Token) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        return std.crypto.timing_safe.eql(Token, list.items.items[idx].token, token);
+    }
+
+    /// Exact client membership probe that does not truncate at the public list
+    /// snapshot size. Session tracking uses this so high configured caps cannot
+    /// accidentally mint a second token for an already-tracked client.
+    pub fn containsClient(self: *const SessionStore, account: []const u8, client: ClientId) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        return list.indexOfClient(client) != null;
+    }
+
     /// Fully remove a session (e.g. explicit logout / reclaim consumed). Prunes
     /// the account when its last session goes. Returns true if removed.
     pub fn remove(self: *SessionStore, account: []const u8, client: ClientId) bool {
@@ -193,6 +317,20 @@ pub const SessionStore = struct {
         @memcpy(out[0..n], list.items.items[0..n]);
         for (out[0..n]) |*session| session.snapshot = null;
         return out[0..n];
+    }
+
+    /// Allocate an exact, complete snapshot for callers whose correctness cannot
+    /// depend on a fixed stack buffer. Snapshot payload pointers are deliberately
+    /// stripped; use the dedicated detached-snapshot APIs for owned payload data.
+    pub fn copySessionsAlloc(self: *const SessionStore, allocator: std.mem.Allocator, account: []const u8) std.mem.Allocator.Error![]Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return try allocator.alloc(Session, 0);
+        const out = try allocator.alloc(Session, list.items.items.len);
+        @memcpy(out, list.items.items);
+        for (out) |*session| session.snapshot = null;
+        return out;
     }
 
     pub const Match = struct { account: []const u8, client: ClientId };
@@ -240,11 +378,52 @@ pub const SessionStore = struct {
         return null;
     }
 
-    /// Reclaim lookup that intentionally ignores still-attached sessions. A live
-    /// sibling token must not be consumable by another connection of the account.
+    /// Find a LIVE attachment to `token`, excluding the caller. A stable session
+    /// credential is reusable, so this is the source from which a second client
+    /// clones current state and joins the same live token group.
+    pub fn findAttachedTokenSessionInAccount(
+        self: *const SessionStore,
+        account: []const u8,
+        token: Token,
+        exclude_client: ClientId,
+    ) ?Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        for (list.items.items) |s| {
+            if (s.client == exclude_client or !s.attached) continue;
+            if (!std.crypto.timing_safe.eql(Token, s.token, token)) continue;
+            var copied = s;
+            copied.snapshot = null;
+            return copied;
+        }
+        return null;
+    }
+
+    /// Find the newest detached attachment to `token`. Attached rows bearing the
+    /// same group token are skipped instead of hiding a valid detached snapshot.
+    pub fn findDetachedTokenSessionInAccount(self: *const SessionStore, account: []const u8, token: Token) ?Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        var best: ?Session = null;
+        for (list.items.items) |s| {
+            if (s.attached or !std.crypto.timing_safe.eql(Token, s.token, token)) continue;
+            if (best == null or s.signon_ms >= best.?.signon_ms) {
+                best = s;
+                best.?.snapshot = null;
+            }
+        }
+        return best;
+    }
+
+    /// Detached lookup within a reusable logical-session token group. Attached
+    /// siblings bearing the same token do not mask the detached row.
     pub fn findDetachedTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
-        const s = self.findTokenSessionInAccount(account, token) orelse return null;
-        return if (s.attached) null else s.client;
+        const s = self.findDetachedTokenSessionInAccount(account, token) orelse return null;
+        return s.client;
     }
 
     /// Copy the encoded restore snapshot for a detached token in `account`.
@@ -259,13 +438,14 @@ pub const SessionStore = struct {
         defer @constCast(&self.lock).unlockShared();
 
         const list = self.accounts.getPtr(account) orelse return null;
-        for (list.items.items) |s| {
+        var matched: ?*const Session = null;
+        for (list.items.items) |*s| {
             if (!std.crypto.timing_safe.eql(Token, s.token, token)) continue;
-            if (s.attached) return null;
-            const bytes = s.snapshot orelse return null;
-            return try allocator.dupe(u8, bytes);
+            if (s.attached or s.snapshot == null) continue;
+            if (matched == null or s.signon_ms >= matched.?.signon_ms) matched = s;
         }
-        return null;
+        const bytes = (matched orelse return null).snapshot.?;
+        return try allocator.dupe(u8, bytes);
     }
 
     /// Copy the newest detached restore snapshot for `account`, excluding the
@@ -300,6 +480,40 @@ pub const SessionStore = struct {
             .signon_ms = matched_signon,
             .snapshot = try allocator.dupe(u8, bytes),
         };
+    }
+
+    /// Deep-copy every detached snapshot whose portable credential was issued.
+    /// Used when a secured peer (re)establishes after missing the detach-time
+    /// broadcast. The returned records and outer slice are caller-owned.
+    pub fn copyPortableDetachedSnapshots(self: *const SessionStore, allocator: std.mem.Allocator) std.mem.Allocator.Error![]PortableDetachedSnapshot {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        var count: usize = 0;
+        var count_it = self.accounts.iterator();
+        while (count_it.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                if (!session.attached and session.portable_resume and session.snapshot != null) count += 1;
+            }
+        }
+
+        const out = try allocator.alloc(PortableDetachedSnapshot, count);
+        errdefer allocator.free(out);
+        var n: usize = 0;
+        errdefer for (out[0..n]) |*record| record.deinit(allocator);
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                if (session.attached or !session.portable_resume) continue;
+                const snapshot = session.snapshot orelse continue;
+                const account = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(account);
+                const copied = try allocator.dupe(u8, snapshot);
+                out[n] = .{ .account = account, .token = session.token, .snapshot = copied };
+                n += 1;
+            }
+        }
+        return out;
     }
 
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
@@ -375,6 +589,47 @@ test "detached session snapshots are copied and released across lifecycle paths"
     try testing.expect(s.markDetachedWithSnapshot("alice", 2, "second"));
     _ = try s.attach("alice", 2, tok(3), 30); // reattach same client frees old snapshot
     try testing.expect((try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(3))) == null);
+}
+
+test "portable resume issuance is explicit and resets on a normal re-attach" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expectEqual(false, s.resumeHandleForClient("alice", 1).?.portable);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expectEqual(true, s.resumeHandleForClient("alice", 1).?.portable);
+
+    // A normal same-client attach rotates the token and requires the client to
+    // request a fresh portable credential.
+    _ = try s.attach("alice", 1, tok(2), 20);
+    const refreshed = s.resumeHandleForClient("alice", 1).?;
+    try testing.expectEqualSlices(u8, &tok(2), &refreshed.token);
+    try testing.expectEqual(false, refreshed.portable);
+
+    // Helix adoption is the exceptional path: it restores the carried bit.
+    try testing.expect(s.restorePortableResumeIssued("alice", 1, true));
+    try testing.expectEqual(true, s.resumeHandleForClient("alice", 1).?.portable);
+}
+
+test "portable detached anti-entropy copies only opted-in snapshots" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("alice", 1, tok(1), 1);
+    _ = try s.attach("alice", 2, tok(2), 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "portable"));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "local-only"));
+
+    const copies = try s.copyPortableDetachedSnapshots(testing.allocator);
+    defer {
+        for (copies) |*copy| copy.deinit(testing.allocator);
+        testing.allocator.free(copies);
+    }
+    try testing.expectEqual(@as(usize, 1), copies.len);
+    try testing.expectEqualStrings("alice", copies[0].account);
+    try testing.expectEqualStrings("portable", copies[0].snapshot);
+    try testing.expectEqualSlices(u8, &tok(1), &copies[0].token);
 }
 
 test "copyNewestDetachedSnapshotInAccount ignores current client and returns newest ghost" {
@@ -456,7 +711,7 @@ test "findTokenInAccount is scoped to the account" {
     try testing.expect(s.findTokenInAccount("alice", tok(0xCD)) == null);
 }
 
-test "findDetachedTokenInAccount rejects attached sibling tokens" {
+test "detached token lookup ignores attached members of the same token group" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
 
@@ -468,6 +723,29 @@ test "findDetachedTokenInAccount rejects attached sibling tokens" {
     try testing.expectEqual(@as(ClientId, 2), s.findDetachedTokenInAccount("alice", tok(0xCD)).?);
     const snap = s.findTokenSessionInAccount("alice", tok(0xCD)).?;
     try testing.expect(!snap.attached);
+}
+
+test "multiple live clients join one reusable token group" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0xAA), 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    _ = try s.attach("alice", 2, tok(0xBB), 20);
+    try testing.expect(s.joinTokenGroup("alice", 2, tok(0xAA)));
+
+    try testing.expect(s.clientHasToken("alice", 1, tok(0xAA)));
+    try testing.expect(s.clientHasToken("alice", 2, tok(0xAA)));
+    try testing.expectEqual(true, s.resumeHandleForClient("alice", 2).?.portable);
+    try testing.expectEqual(@as(ClientId, 1), s.findAttachedTokenSessionInAccount("alice", tok(0xAA), 2).?.client);
+
+    // A detached member remains discoverable even while another attachment to
+    // the same logical session is live.
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "shared-state"));
+    try testing.expectEqual(@as(ClientId, 1), s.findDetachedTokenInAccount("alice", tok(0xAA)).?);
+    const copied = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(0xAA))).?;
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("shared-state", copied);
 }
 
 test "sessionsInto and findByTokenInto do not retain snapshots" {
@@ -485,6 +763,21 @@ test "sessionsInto and findByTokenInto do not retain snapshots" {
         try testing.expectEqualStrings("alice", found.account);
         try testing.expectEqual(@as(ClientId, 1), found.client);
     }
+}
+
+test "allocated session snapshot is complete above the legacy stack capacity" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = snapshot_capacity + 8 });
+    defer s.deinit();
+    for (0..snapshot_capacity + 8) |i| {
+        var token: Token = @splat(0);
+        std.mem.writeInt(u64, token[0..8], i, .little);
+        _ = try s.attach("wide", @intCast(i + 1), token, @intCast(i));
+    }
+
+    const all = try s.copySessionsAlloc(testing.allocator, "wide");
+    defer testing.allocator.free(all);
+    try testing.expectEqual(snapshot_capacity + 8, all.len);
+    try testing.expect(s.containsClient("wide", snapshot_capacity + 8));
 }
 
 const SessionMtCtx = struct {

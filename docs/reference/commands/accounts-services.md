@@ -182,11 +182,12 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## SESSION
 
 - Syntax: `SESSION [LIST|TOKEN|RESUME <token>]`
-- Description: Lists live sessions for the caller's account, reveals this session's local and optional mesh reclaim tokens, or resumes a detached session. `SESSION TOKEN` replies with `NOTICE ... :SESSION TOKEN <hex>` and, when mesh reclaim is enabled, `NOTICE ... :SESSION MTOKEN <hex>`; either token is supplied to `SESSION RESUME <token>`.
+- Description: Lists account attachments, reveals credentials for this exact logical session, or attaches the client to that session. `SESSION TOKEN` emits a 32-hex-character origin-local credential and, when mesh resume is enabled, a separately sealed portable credential. Both are reusable: every successful `RESUME` adds or restores an attachment without disconnecting siblings or consuming the credential. These are session credentials, not the `sst_...` account-authentication credential used by SASL `SESSION-TOKEN` / `SESSIONTOKEN`; authentication alone never selects another same-account session.
 - Privileges: Registered client logged in to an account.
 - Parameters: Optional subcommand; `LIST` is default.
-- Replies: Server notices for `SESSION LIST`, `SESSION TOKEN`, optional `SESSION MTOKEN`, `SESSION RESUME: ...`, redirect, and list end. Reclaim and migration state changes are also published on the Event Spine service plane.
-- Errors: `FAIL SESSION INVALID_TOKEN`, `NO_SESSION`, `SESSION_ATTACHED`; account-required notice.
+- Replies: `NOTICE ... :SESSION TOKEN <hex>`, optional `NOTICE ... :SESSION MTOKEN <sealed-hex> expires=<unix-seconds>`, successful `SESSION RESUME: already attached`, `attached to live session`, `attached to live mesh session`, `attached to replicated mesh session`, or `session restored`, plus redirect, list rows, and list end. A portable token is valid for 12 hours; its live snapshot is offered immediately and re-offered on secured-peer establishment/reconnect. All attachments share identity/channel state, receive events, and may participate.
+- Retry behavior: `ORIGIN_UNREACHABLE` and `TEMPORARILY_UNAVAILABLE` retain the supplied credential. After either result or a redirect, the immediately following `SESSION TOKEN` is suppressed once with `WARN SESSION RESUME_CREDENTIAL_PRESERVED`, preventing a reconnecting client from overwriting its still-valid stored credential. Repeating `SESSION TOKEN` explicitly returns the credential for the current attachment. An already-live session is a successful attachment path, not `SESSION_ATTACHED`.
+- Errors: Terminal `FAIL SESSION INVALID_TOKEN` or `NO_SESSION`; retryable `WARN SESSION ORIGIN_UNREACHABLE`, `TEMPORARILY_UNAVAILABLE`, or `RESUME_CREDENTIAL_PRESERVED`; account-required notice.
 - Example: `SESSION TOKEN`
 - Sources: `src/daemon/modules/accounts.zig:143`, `src/daemon/server.zig:24958`, `src/daemon/server.zig:25007`, `src/daemon/services.zig:899`
 

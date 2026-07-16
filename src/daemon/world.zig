@@ -584,6 +584,33 @@ pub const World = struct {
         }
     }
 
+    /// Atomically hand an existing nick's primary lookup ownership from one live
+    /// transport to another without taking the identity offline. The owned nick
+    /// string is moved between reverse-index keys (not copied), the forward maps
+    /// are updated in place, and the RCU registry flips directly from `from` to
+    /// `to`; observers can therefore never see an intermediate missing nick.
+    pub fn transferNick(self: *World, from: ClientId, to: ClientId) WorldError!bool {
+        if (from.eql(to)) return self.client_nicks.contains(from);
+        if (self.client_nicks.contains(to)) return false;
+        const nick = self.client_nicks.get(from) orelse return false;
+        const forward = self.nicks.getEntry(nick) orelse return false;
+        if (!forward.value_ptr.*.eql(from)) return false;
+
+        // Reserve the reverse-index slot before mutating any authoritative view;
+        // everything after the RCU set is allocation-free.
+        try self.client_nicks.ensureUnusedCapacity(1);
+        const r = try self.ensureRcuNicks();
+        const current = r.nicks.lookup(r.writer_participant, nick) orelse return false;
+        if (!(@as(ClientId, @bitCast(current))).eql(from)) return false;
+        try r.nicks.set(r.writer_participant, nick, @bitCast(to));
+        self.noteRcuNickWrite(r);
+
+        forward.value_ptr.* = to;
+        const removed = self.client_nicks.fetchRemove(from) orelse unreachable;
+        self.client_nicks.putAssumeCapacity(to, removed.value);
+        return true;
+    }
+
     pub fn nickOf(self: *const World, client: ClientId) ?[]const u8 {
         return self.client_nicks.get(client);
     }
@@ -2385,6 +2412,21 @@ test "nick collisions are case-insensitive (Alice then alice collides)" {
     world.unregisterNick(alice);
     try world.registerNick("alice", mallory);
     try std.testing.expectEqual(@as(?ClientId, mallory), world.findNick("Alice"));
+}
+
+test "transferNick hands a live identity to a sibling without an offline gap" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const primary = testClient(1);
+    const sibling = testClient(2);
+    try world.registerNick("Kain", primary);
+
+    try std.testing.expect(try world.transferNick(primary, sibling));
+    try std.testing.expect(world.nickOf(primary) == null);
+    try std.testing.expectEqualStrings("Kain", world.nickOf(sibling).?);
+    try std.testing.expectEqual(@as(?ClientId, sibling), world.findNick("kain"));
+    try std.testing.expect(!(try world.transferNick(primary, sibling)));
 }
 
 test "channelExists mirror matches the authoritative map (case-insensitive)" {

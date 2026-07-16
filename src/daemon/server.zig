@@ -1715,6 +1715,8 @@ pub const Config = struct {
     /// Multi-session/bouncer registry sizing.
     session_max_accounts: u64 = 65536,
     session_max_per_account: u32 = 64,
+    session_migrate_on_detach: bool = true,
+    session_max_pending_migrations: u32 = 4096,
     /// Runtime Tegami offline-mailbox limits. Configurable via `[bouncer]`.
     tegami_config: tegami_mod.Config = .{},
     /// Runtime draft/search inverted-index limits. Configurable via
@@ -2136,6 +2138,17 @@ pub const ConnState = struct {
     /// which such conns never reach.
     overflow_allocator: std.mem.Allocator = undefined,
     closing: bool = false,
+    /// Login found a detached snapshot and is giving the client a short window
+    /// to present the exact resume credential before account autojoin runs. This
+    /// avoids consuming an arbitrary same-account ghost and avoids joining under
+    /// a generated pre-resume nick.
+    resume_autojoin_deferred: bool = false,
+    resume_autojoin_deadline_ms: i64 = 0,
+    /// A retryable RESUME result must survive Onyx's normal `RESUME` then
+    /// `TOKEN` pipeline. Suppress the next TOKEN response once so the client
+    /// does not overwrite the still-valid old credential. A second explicit
+    /// TOKEN request deliberately replaces it.
+    preserve_resume_credential_once: bool = false,
     /// When this connection took a REGISTERED nick while unauthenticated (UNIX ms;
     /// 0 = nick is free / owned by this account). The sweep enforces the grace.
     nick_claimed_at_ms: i64 = 0,
@@ -2861,6 +2874,16 @@ const OperPrefixDedup = struct {
     }
 };
 
+/// Security binding for a reusable session snapshot successfully offered to an
+/// authenticated mesh peer. The token is unguessable and the peer id comes from
+/// the Tsumugi handshake; together they let the origin recognize later traffic
+/// from a remote attachment without trusting the relay's unsigned account/nick
+/// fields by themselves.
+const SessionReplicaRoute = struct {
+    token: sessions_mod.Token,
+    peer: u64,
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -3143,27 +3166,24 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
-    /// Replay tracker for cross-server (mesh-sealed) session reclaim nonces, so a
-    /// captured mesh reclaim token cannot be replayed against this node.
+    /// Legacy one-shot replay state carried for rolling compatibility. Modern
+    /// mesh session credentials are reusable multi-attachment capabilities.
     session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
-    /// Holding area for live-session migration capsules that arrived over the
-    /// mesh ahead of the client's reconnect. Keyed by the 16-byte session token
-    /// (the `session_id` the mesh-sealed reclaim token carries), populated when a
-    /// SESSION_MIGRATE frame is verified by `MigrationTarget.accept`, and consumed
-    /// in `handleMeshReclaim` to restore the full session. Initialized in start().
+    /// Holding area for reusable session replicas received over the mesh. Keyed
+    /// by the 16-byte token carried inside the mesh credential, populated only
+    /// after `MigrationTarget.accept` verifies the frame, and borrowed by every
+    /// valid attachment in `handleMeshReclaim`. Initialized in start().
     pending_migrations: ?session_migrate.PendingMigrations = null,
-    /// Replay/stale-epoch journal for the migration-relay TARGET side, persisting
-    /// across capsules so a replayed SESSION_MIGRATE frame is rejected exactly as
-    /// the relay's own tests require. Lives beside `pending_migrations`.
-    migration_target_policy: migration_relay.Policy = .{},
-    migration_target_journal: migration_relay.Journal = .{},
-    /// ORIGIN-side replay journal + policy, so re-preparing the same migration
-    /// nonce/epoch for an account is rejected rather than re-shipped.
-    migration_origin_policy: migration_relay.Policy = .{},
-    migration_origin_journal: migration_relay.Journal = .{},
-    /// Monotonic nonce source for minted migration capsules (deterministic, never
-    /// drawn from the relay itself which forbids touching the CSPRNG).
-    migration_nonce: u64 = 0,
+    /// Bounded token -> authenticated-peer bindings for replicas this node
+    /// actually queued. Used after the origin attachment disconnects so a remote
+    /// attachment remains a valid channel member without weakening the general
+    /// cross-node nick/account anti-spoof gates. Accessed under the completion
+    /// world's process-wide mutation lock like the SessionStore and World state.
+    session_replica_routes: std.AutoHashMapUnmanaged(SessionReplicaRoute, void) = .empty,
+    /// Last signed offer epoch minted by this process. Epochs use a wall-clock
+    /// base plus a process-local monotonic floor; receivers enforce ordering per
+    /// bounded session-token entry rather than in an unbounded global journal.
+    migration_offer_epoch: u64 = 0,
     /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
     /// audit view. Bounded ring; oldest entries roll off.
     mesh_log: mesh_event_log.MeshEventLog(128) = .{},
@@ -3740,7 +3760,10 @@ pub const LinuxServer = struct {
         // client's reconnect. Allocated once here so handleMeshReclaim and the S2S
         // drain both see a live store (null until start = migration inert).
         if (self.pending_migrations == null) {
-            self.pending_migrations = session_migrate.PendingMigrations.init(self.allocator);
+            self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
+                .max_entries = self.config.session_max_pending_migrations,
+                .max_per_account = self.config.session_max_per_account,
+            });
         }
         // Restore runtime operator grants persisted by a previous run.
         self.loadGrants();
@@ -4431,10 +4454,7 @@ pub const LinuxServer = struct {
         self.activity_subs.deinit();
         self.sessions.deinit();
         if (self.pending_migrations) |*pm| pm.deinit();
-        self.migration_target_policy.deinit(self.allocator);
-        self.migration_target_journal.deinit(self.allocator);
-        self.migration_origin_policy.deinit(self.allocator);
-        self.migration_origin_journal.deinit(self.allocator);
+        self.session_replica_routes.deinit(self.allocator);
         self.content_filter.deinit();
         // Stop BOTH media pump threads before freeing either transport or the
         // bridge registry. Each pump's cross-leg sink reaches into the OTHER
@@ -4676,6 +4696,7 @@ pub const LinuxServer = struct {
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
         if (self.rx() == &self.reactors[0]) self.maybeSwapOcspStaple();
         self.sweepTimeouts();
+        self.sweepDeferredSessionAutojoins();
         // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
         // maintenance; runs under the same world write lock as hold/check/release).
         if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
@@ -4731,7 +4752,7 @@ pub const LinuxServer = struct {
             // as the membership resync below: BOTH the work and the cadence
             // guard live behind the reactors[0] gate, so a link-less sibling
             // reactor can never consume the guard while doing nothing.
-            if (now - self.last_oper_grant_refresh_ms >= oper_grant_refresh_interval_ms) {
+            if (operGrantRefreshDue(self.last_oper_grant_refresh_ms, now)) {
                 self.last_oper_grant_refresh_ms = now;
                 self.rebroadcastLocalOpers();
             }
@@ -6507,11 +6528,16 @@ pub const LinuxServer = struct {
     fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
         const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
-        link.feed(bytes, now) catch {
+        link.feed(bytes, now) catch |err| {
+            var err_buf: [128]u8 = undefined;
+            const detail = std.fmt.bufPrint(&err_buf, "secured link handshake/feed failed: {s}", .{@errorName(err)}) catch "secured link handshake/feed failed";
+            self.traceLog(.warn, .s2s, detail);
+            self.logMeshEvent(.link_handshake, if (link.remoteName().len != 0) link.remoteName() else "pending-secured-peer", detail);
             conn.closing = true;
             return;
         };
         const out = link.outbound();
+        var out_len = out.len;
         if (out.len != 0) {
             appendToConn(conn, out) catch {
                 conn.closing = true;
@@ -6531,8 +6557,23 @@ pub const LinuxServer = struct {
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
+
+            // The peer may have been partitioned when portable state changed.
+            // Re-offer both live attachments and detached snapshots so a client
+            // can attach there immediately without waiting for the source to
+            // disconnect. Per-token signed epochs make reordering safe.
+            self.syncPortableSessions(link);
+            const sync_out = link.outbound();
+            if (sync_out.len != 0) {
+                appendToConn(conn, sync_out) catch {
+                    conn.closing = true;
+                    return;
+                };
+                out_len += sync_out.len;
+                link.clearOutbound();
+            }
         }
-        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
+        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
         // Drain inbound cross-node user messages over the secured link.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -6567,6 +6608,10 @@ pub const LinuxServer = struct {
         self.drainWards(link);
         self.drainTegamiPushes(link);
         self.drainRepairResync(conn, link, true);
+        // Consume tombstones first. The peer driver keeps frame families in
+        // separate queues, so this ordering makes a consume win over a delayed
+        // offer that arrived in the same socket turn.
+        self.drainSessionMigrationConsumed(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -7455,8 +7500,8 @@ pub const LinuxServer = struct {
     ) void {
         const skip_a_flat = monitorIdFromClient(skip_a);
         const skip_b_flat = if (skip_b) |id| monitorIdFromClient(id) else null;
-        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
+        defer self.allocator.free(account_sessions);
         for (account_sessions) |s| {
             const sibling_id = clientIdFromMonitor(s.client);
             const sibling = self.connFor(sibling_id) orelse continue;
@@ -7756,6 +7801,41 @@ pub const LinuxServer = struct {
         return home != origin_node;
     }
 
+    /// Resolve authority carried by a session replica this node actually sent to
+    /// `origin_node`. This is the narrow exception to ordinary residence-based
+    /// nick collision rules: after the local attachment drops, the peer may still
+    /// host live clients of the SAME reusable logical session. Authorization
+    /// requires all of: authenticated peer route, exact random token, current
+    /// detached portable snapshot, account, nick, and (when requested) channel.
+    fn replicatedSessionModes(
+        self: *LinuxServer,
+        origin_node: u64,
+        account: []const u8,
+        nick: []const u8,
+        channel: ?[]const u8,
+    ) ?world_model.MemberModes {
+        if (account.len == 0 or nick.len == 0) return null;
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return null;
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (row.attached or !row.portable_resume) continue;
+            if (!self.session_replica_routes.contains(.{ .token = row.token, .peer = origin_node })) continue;
+            const encoded = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, row.token) catch null orelse continue;
+            defer self.allocator.free(encoded);
+            var snap = migration_relay.Snapshot.decode(self.allocator, encoded) catch continue;
+            defer snap.deinit(self.allocator);
+            if (snap.account.len != 0 and !std.ascii.eqlIgnoreCase(snap.account, account)) continue;
+            if (!std.ascii.eqlIgnoreCase(snap.nick, nick)) continue;
+            const wanted = channel orelse return world_model.MemberModes.empty();
+            for (snap.channels, 0..) |carried, i| {
+                if (!std.ascii.eqlIgnoreCase(carried, wanted)) continue;
+                const bits: u8 = if (i < snap.channel_modes.len) snap.channel_modes[i] else 0;
+                return .{ .bits = bits };
+            }
+        }
+        return null;
+    }
+
     /// Account + audit a relayed message dropped locally because its sender nick is
     /// homed on a different node than the frame claims. Mirrors
     /// `recordRelaySignatureReject`, on the dedicated home-mismatch counter.
@@ -7989,7 +8069,13 @@ pub const LinuxServer = struct {
         // presence convergence is guaranteed, so an unlearned sender is dropped
         // rather than delivered. Both left out here to avoid regressing legitimate
         // convergence-lagged / legacy-unsigned cross-node delivery.
-        if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node)) {
+        const replica_modes = self.replicatedSessionModes(
+            clean_msg.origin_node,
+            clean_msg.account,
+            clean_msg.source_nick,
+            if (world_model.isChannelName(clean_msg.target)) clean_msg.target else null,
+        );
+        if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node) and replica_modes == null) {
             self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
             const drop_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
                 .{ .channel = clean_msg.target }
@@ -8015,6 +8101,7 @@ pub const LinuxServer = struct {
                 clean_msg.text,
                 clean_msg.verb == .notice,
                 clean_msg.min_rank,
+                replica_modes,
             );
             if (speech == .deny) {
                 // Still re-forward for multi-hop; just do not deliver locally.
@@ -8298,41 +8385,65 @@ pub const LinuxServer = struct {
             self.releaseThrottle(conn);
             self.meshCloneRelease(conn);
             self.activity_subs.removeClient(monitorIdFromClient(id));
+            var remote_identity_may_remain = false;
             // Multi-session: a logged-in client's session is *retained* as
             // detached (for reclaim/bouncer); an anonymous client is dropped.
             if (conn.session.account()) |acct| {
+                const resume_handle = self.sessions.resumeHandleForClient(acct, monitorIdFromClient(id));
                 if (self.encodeMigrationSnapshot(id, conn)) |snapshot| {
                     defer self.allocator.free(snapshot);
                     _ = self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot);
                 } else {
                     _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
                 }
+                // Portable resume is opt-in: only a session whose MTOKEN was
+                // actually delivered is replicated. The connection/world state
+                // is still intact here, so the snapshot is complete.
+                if (self.config.session_migrate_on_detach) {
+                    if (resume_handle) |handle| {
+                        if (handle.portable and !tokenIsNull(handle.token)) {
+                            // A portable logical session can have live attachments
+                            // behind any established secured peer. There is no
+                            // ownership transfer/ACK to wait for: publishing PART
+                            // or QUIT for this one socket would incorrectly evict
+                            // those remote attachments from the shared identity.
+                            remote_identity_may_remain = self.hasEstablishedSecuredPeer();
+                            self.shipSessionMigration(id, conn, acct, handle.token);
+                        }
+                    }
+                }
             } else {
                 _ = self.sessions.removeClient(monitorIdFromClient(id));
             }
+            // Transport loss is not logical-session loss while another local
+            // attachment remains. Hand off nick ownership and channel state
+            // before any offline/QUIT side effect is emitted.
+            const identity_remains = self.handoffLiveSessionIdentity(id, conn) or remote_identity_may_remain;
             // Hold this nick against reuse for the nick-delay window before the
             // world drops it. No-op on a clean QUIT (handleQuit already held +
             // removed the nick) and for anonymous/unregistered/shared sessions.
-            self.holdNickOnExit(id, conn);
+            if (!identity_remains) self.holdNickOnExit(id, conn);
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
-            if (self.world.nickOf(worldIdFromClient(id)) != null) self.recordWhowas(conn);
+            if (!identity_remains and self.world.nickOf(worldIdFromClient(id)) != null) self.recordWhowas(conn);
             // MONITOR: report this nick offline + drop its own subscriptions.
-            if (conn.session.registered()) {
+            if (!identity_remains and conn.session.registered()) {
                 const nick = conn.session.displayName();
                 if (!std.mem.eql(u8, nick, "*")) self.monitorOffline(id, nick) catch {};
             }
             // Media: drop the departing nick from any call, notifying members.
             if (conn.session.registered()) self.leaveAllMediaRooms(id, conn);
             // OBSERVE: push a quit record, then drop this client's own subscription.
-            if (conn.session.registered()) {
+            if (!identity_remains and conn.session.registered()) {
                 self.notifyObservers(.quit, observeSubject(conn, reason));
                 if (self.world.nickOf(worldIdFromClient(id)) != null) self.publishUserDisconnectEvent(conn, reason) catch {};
             }
             _ = self.observe.clear(monitorIdFromClient(id));
-            try self.broadcastQuit(id, conn, reason);
-            self.publishChannelDestroyEventsForClient(id);
+            if (!identity_remains) {
+                try self.broadcastQuit(id, conn, reason);
+                self.publishChannelDestroyEventsForClient(id);
+            }
             closeFd(conn.fd);
             _ = self.rx().clients.free(id);
         }
@@ -9114,6 +9225,65 @@ pub const LinuxServer = struct {
         const nick = self.world.nickOf(worldIdFromClient(id)) orelse return;
         const expires = self.nowMs() + @as(i64, @intCast(self.config.nick_delay_ms));
         self.nick_delay.hold(nick, expires, conn.session.account()) catch {};
+    }
+
+    /// Preserve a logical identity when one transport leaves but another local
+    /// attachment of the same authenticated account+nick is still live. If the
+    /// departing transport owns the nick lookup, transfer it atomically. Merge
+    /// its channel memberships/modes into the successor before removal so the
+    /// remaining client keeps receiving events and can participate everywhere
+    /// the shared session was joined. Returns true when the identity remains.
+    fn handoffLiveSessionIdentity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) bool {
+        const account = conn.session.account() orelse return false;
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return false;
+        const cid = monitorIdFromClient(id);
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
+        defer self.allocator.free(rows);
+
+        var successor_id: ?client_model.ClientId = null;
+        for (rows) |row| {
+            if (!row.attached or row.client == cid) continue;
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+            if (!std.ascii.eqlIgnoreCase(sibling.session.displayName(), nick)) continue;
+            successor_id = sibling_id;
+            break;
+        }
+        const successor = successor_id orelse return false;
+        const from_wid = worldIdFromClient(id);
+        const to_wid = worldIdFromClient(successor);
+
+        // Preserve the union of the departing attachment's channel authority.
+        var channels = self.world.channels.iterator();
+        while (channels.next()) |entry| {
+            const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid) orelse continue;
+            const current = self.world.memberModes(entry.key_ptr.*, to_wid) orelse world_model.MemberModes.empty();
+            self.world.restoreMember(entry.key_ptr.*, to_wid, .{ .bits = current.bits | old_modes.bits }) catch {};
+        }
+
+        if (self.world.nickOf(from_wid) != null) {
+            if (!(self.world.transferNick(from_wid, to_wid) catch false)) return false;
+        }
+        return true;
+    }
+
+    /// A portable session replica only rides authenticated secured links. If at
+    /// least one is established, another attachment may remain live remotely;
+    /// closing one local transport must therefore not publish identity-wide
+    /// PART/QUIT/offline side effects.
+    fn hasEstablishedSecuredPeer(self: *LinuxServer) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or slot.value.closing) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (link.established()) return true;
+            }
+        }
+        return false;
     }
 
     /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
@@ -9916,8 +10086,8 @@ pub const LinuxServer = struct {
     /// from an account switch is skipped, mirroring `deliverSessionSyncSiblingsNick`).
     fn accountHasLocalSession(self: *LinuxServer, account: []const u8) bool {
         if (account.len == 0) return false;
-        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
+        defer self.allocator.free(account_sessions);
         for (account_sessions) |s| {
             const conn = self.connFor(clientIdFromMonitor(s.client)) orelse continue;
             const cur = conn.session.account() orelse continue;
@@ -10698,13 +10868,14 @@ pub const LinuxServer = struct {
         text: []const u8,
         is_notice: bool,
         min_rank: u8,
+        replicated_modes: ?world_model.MemberModes,
     ) ChannelSpeechResult {
         // +n no_external: only members may send. Resolve membership across the
         // combined local+remote projection; a non-member is dropped.
-        const is_member = self.relaySenderIsMember(channel, nick);
+        const is_member = replicated_modes != null or self.relaySenderIsMember(channel, nick);
         if (self.world.channelHasFlag(channel, .no_external) and !is_member) return .deny;
 
-        const modes = self.relaySenderModes(channel, nick);
+        const modes = replicated_modes orelse self.relaySenderModes(channel, nick);
         const opmod = self.world.channelHasExtFlag(channel, .opmoderate);
         var opmod_route = false;
 
@@ -10928,6 +11099,11 @@ pub const LinuxServer = struct {
         const changes = link.takeMembershipChanges() catch return;
         defer self.allocator.free(changes);
         const remote = link.remoteName();
+        // A trusted same-account/same-nick claim is another attachment of the
+        // local logical session. Fold its membership transition into every local
+        // attachment before rendering, so JOIN/PART/status initiated on either
+        // node immediately governs participation on both.
+        for (changes) |*change| self.applyRemoteSessionMembership(change, remote);
         var i: usize = 0;
         while (i < changes.len) {
             if (changes[i].kind == .joined) {
@@ -10959,6 +11135,46 @@ pub const LinuxServer = struct {
                 changes[i].deinit(self.allocator);
                 i += 1;
             }
+        }
+    }
+
+    fn applyRemoteSessionMembership(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        if (ch.account.len == 0 or ch.nick.len == 0 or !self.nickIsLiveLocal(ch.nick)) return;
+        const rows = self.sessions.copySessionsAlloc(self.allocator, ch.account) catch return;
+        defer self.allocator.free(rows);
+
+        var ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer ids.deinit(self.allocator);
+        for (rows) |row| {
+            if (!row.attached) continue;
+            const id = clientIdFromMonitor(row.client);
+            const conn = self.connFor(id) orelse continue;
+            if (conn.closing) continue;
+            const account = conn.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(account, ch.account)) continue;
+            if (!std.ascii.eqlIgnoreCase(conn.session.displayName(), ch.nick)) continue;
+            ids.append(self.allocator, id) catch return;
+        }
+        if (ids.items.len == 0) return;
+
+        const host = if (ch.host.len != 0) ch.host else if (remote_name.len != 0) remote_name else default_host;
+        const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
+        var line_buf: [900]u8 = undefined;
+        switch (ch.kind) {
+            .joined => {
+                for (ids.items) |id| self.world.restoreMember(ch.channel, worldIdFromClient(id), .{ .bits = ch.status }) catch {};
+                const line = std.fmt.bufPrint(&line_buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
+                self.broadcastChannel(ch.channel, line, null) catch {};
+            },
+            .parted => {
+                const line = std.fmt.bufPrint(&line_buf, ":{s}!{s}@{s} PART {s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
+                self.broadcastChannel(ch.channel, line, null) catch {};
+                for (ids.items) |id| self.world.part(ch.channel, worldIdFromClient(id)) catch {};
+            },
+            .status => {
+                for (ids.items) |id| self.world.restoreMember(ch.channel, worldIdFromClient(id), .{ .bits = ch.status }) catch {};
+            },
+            .ghost_reclaim => {},
         }
     }
 
@@ -12389,6 +12605,7 @@ pub const LinuxServer = struct {
             }
         }
 
+        self.syncTokenGroupChannel(id, conn, join_target);
         try self.broadcastJoin(join_target, conn);
         // Spamtrap: a non-oper joining an operator-designated honeypot channel
         // trips the trap (oper alert + offender flag). Lock-free no-op when no
@@ -12495,13 +12712,12 @@ pub const LinuxServer = struct {
         } else {
             try self.broadcastChannel(channel, msg, null);
         }
-        const destroys_channel = self.willChannelDestroyOnPart(channel);
         const parted_nick = conn.session.displayName();
         try self.publishMemberEvent("PART", channel, parted_nick, reason);
         // Standing OBSERVE feed: fire the part action (previously never emitted).
         self.notifyObservers(.part, observeSubject(conn, channel));
-        try self.world.part(channel, wid);
-        if (destroys_channel and !self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
+        self.partTokenGroupChannel(id, conn, channel);
+        if (!self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
         // Tell mesh peers this member left, carrying the real identity so the far
         // side renders the member's actual `user@host`, not the placeholder.
         self.announceMembership(channel, parted_nick, 0, false, membershipIdentityOf(conn), "");
@@ -16343,29 +16559,134 @@ pub const LinuxServer = struct {
         for (chans) |c| self.joinOne(id, conn, c, null, 0) catch {};
     }
 
-    /// Prefer restoring a detached session snapshot over account autojoin during
-    /// login. Browser reconnects can authenticate before their explicit
-    /// SESSION RESUME command arrives; restoring here keeps generated temporary
-    /// nicks from joining the user's saved channels.
+    /// Attach a newly logged-in session-sync client to the channel projection of
+    /// its already-live same-account/same-nick siblings. Each socket becomes a
+    /// real World member (so it receives every channel event and can speak from
+    /// that socket), while the attach is rendered only to the new client rather
+    /// than as a duplicate logical JOIN to everyone else.
+    fn syncLiveSessionChannels(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) void {
+        if (!conn.session.hasCap(.orochi_session_sync)) return;
+        const cid = monitorIdFromClient(id);
+        const sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
+        defer self.allocator.free(sessions);
+
+        var channel_it = self.world.channels.iterator();
+        while (channel_it.next()) |entry| {
+            const channel = entry.key_ptr.*;
+            if (self.world.isMember(channel, worldIdFromClient(id))) continue;
+
+            var inherited = world_model.MemberModes.empty();
+            var found = false;
+            for (sessions) |session| {
+                if (!session.attached or session.client == cid) continue;
+                const sibling_id = clientIdFromMonitor(session.client);
+                const sibling = self.connFor(sibling_id) orelse continue;
+                const sibling_account = sibling.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+                if (!std.ascii.eqlIgnoreCase(sibling.session.displayName(), conn.session.displayName())) continue;
+                const modes = self.world.memberModes(channel, worldIdFromClient(sibling_id)) orelse continue;
+                inherited.bits |= modes.bits;
+                found = true;
+            }
+            if (!found) continue;
+            self.world.restoreMember(channel, worldIdFromClient(id), inherited) catch continue;
+            self.sendJoinToAttachment(id, conn, channel) catch {};
+            self.sendTopicReply(conn, channel) catch {};
+            if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, channel) catch {};
+            self.announceMembership(channel, conn.session.displayName(), @truncate(inherited.bits), true, membershipIdentityOf(conn), "");
+        }
+    }
+
+    fn sendJoinToAttachment(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) !void {
+        var prefix_buf: [256]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        var plain_buf: [default_reply_bytes]u8 = undefined;
+        const plain = try formatMessage(&plain_buf, prefix, "JOIN", &.{channel}, null);
+        var ext_buf: [default_reply_bytes]u8 = undefined;
+        const account = conn.session.account() orelse "*";
+        const ext = try formatMessage(&ext_buf, prefix, "JOIN", &.{ channel, account }, conn.session.realname());
+        var tag_buf: [48]u8 = undefined;
+        try self.deliverTimed(id, serverTimeTag(&tag_buf), if (conn.session.hasCap(.extended_join)) ext else plain);
+    }
+
+    /// Mirror one logical session's channel membership to all of its attached
+    /// local transports. Every attachment then receives channel events through
+    /// the ordinary World fan-out and can speak with the same member status.
+    fn syncTokenGroupChannel(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) void {
+        const account = conn.session.account() orelse return;
+        const cid = monitorIdFromClient(id);
+        const handle = self.sessions.resumeHandleForClient(account, cid) orelse return;
+        const source_modes = self.world.memberModes(channel, worldIdFromClient(id)) orelse return;
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (!row.attached or row.client == cid) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (sibling.closing) continue;
+            self.world.restoreMember(channel, worldIdFromClient(sibling_id), source_modes) catch {};
+        }
+    }
+
+    /// PART is a logical-session action: remove every local attachment sharing
+    /// the token, after the single PART line has been delivered to all of them.
+    fn partTokenGroupChannel(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) void {
+        const account = conn.session.account() orelse {
+            self.world.part(channel, worldIdFromClient(id)) catch {};
+            return;
+        };
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse {
+            self.world.part(channel, worldIdFromClient(id)) catch {};
+            return;
+        };
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch {
+            self.world.part(channel, worldIdFromClient(id)) catch {};
+            return;
+        };
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (!row.attached) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
+            self.world.part(channel, worldIdFromClient(clientIdFromMonitor(row.client))) catch {};
+        }
+    }
+
+    /// Give an authenticated reconnect a bounded window to present an exact
+    /// SESSION RESUME credential before account autojoin. A same-account login
+    /// is not proof of ownership of any particular detached device session, so
+    /// this probe NEVER restores or consumes the newest ghost implicitly.
     fn restoreDetachedBeforeAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) bool {
         const cid = monitorIdFromClient(id);
         const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch return false;
         const detached = candidate orelse return false;
         defer self.allocator.free(detached.snapshot);
 
-        const restored = self.restoreEncodedMigrationSnapshot(id, conn, account, detached.snapshot);
-        if (!restored) return true;
-
-        _ = self.sessions.remove(account, detached.client);
-        conn.nick_claimed_at_ms = 0;
-        var event_buf: [default_reply_bytes]u8 = undefined;
-        const event = std.fmt.bufPrint(&event_buf, "SESSION auto-restored account={s}", .{account}) catch return true;
-        self.publishOperEvent(.service, .notice, event) catch {};
+        conn.resume_autojoin_deferred = true;
+        conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
         return true;
+    }
+
+    fn finishDeferredSessionAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, restored: bool) void {
+        if (!conn.resume_autojoin_deferred) return;
+        conn.resume_autojoin_deferred = false;
+        conn.resume_autojoin_deadline_ms = 0;
+        if (!restored) self.applyAutojoin(id, conn);
+    }
+
+    fn sweepDeferredSessionAutojoins(self: *LinuxServer) void {
+        const now = self.nowMs();
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value;
+            if (!conn.resume_autojoin_deferred or now < conn.resume_autojoin_deadline_ms) continue;
+            self.finishDeferredSessionAutojoin(entry.id, conn, false);
+        }
     }
 
     fn applyLoginJoinState(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
         const account = conn.session.account() orelse return;
+        self.syncLiveSessionChannels(id, conn, account);
         if (self.restoreDetachedBeforeAutojoin(id, conn, account)) return;
         self.applyAutojoin(id, conn);
     }
@@ -16991,15 +17312,15 @@ pub const LinuxServer = struct {
         var sealed: usize = 0;
         self.sessions.lock.lockShared();
         defer self.sessions.lock.unlockShared();
-        var entries_buf: [sessions_mod.snapshot_capacity]session_capsule.SessionEntry = undefined;
         var it = self.sessions.accounts.iterator();
         while (it.next()) |entry| {
             const acct_sessions = entry.value_ptr.items.items;
             if (acct_sessions.len == 0) continue;
-            const n = @min(acct_sessions.len, entries_buf.len);
+            const entries_buf = self.allocator.alloc(session_capsule.SessionEntry, acct_sessions.len) catch continue;
+            defer self.allocator.free(entries_buf);
             // Entries borrow store-owned token/snapshot bytes; the shared lock
             // held above keeps them stable until encode() copies them below.
-            for (acct_sessions[0..n], entries_buf[0..n]) |*s, *out| {
+            for (acct_sessions, entries_buf) |*s, *out| {
                 out.* = .{
                     .token = s.token[0..],
                     .signon_unix = s.signon_ms,
@@ -17007,11 +17328,12 @@ pub const LinuxServer = struct {
                     .client = s.client,
                     .fd = if (s.attached) (fd_by_cid.get(s.client) orelse -1) else -1,
                     .snapshot = if (!s.attached) (s.snapshot orelse &.{}) else &.{},
+                    .portable_resume = s.portable_resume,
                 };
             }
             const cap = session_capsule.SessionCapsule{
                 .account = entry.key_ptr.*,
-                .sessions = entries_buf[0..n],
+                .sessions = entries_buf,
             };
             const buf = self.allocator.alloc(u8, cap.encodedLen()) catch continue;
             _ = cap.encode(buf) catch {
@@ -17059,6 +17381,32 @@ pub const LinuxServer = struct {
         return sealed;
     }
 
+    fn sealSessionTombstones(
+        self: *LinuxServer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) usize {
+        const pm = if (self.pending_migrations) |*p| p else return 0;
+        var sealed: usize = 0;
+        var it = pm.consumed.iterator();
+        while (it.next()) |entry| {
+            const buf = self.allocator.alloc(u8, session_migrate.tombstone_wire_len) catch continue;
+            var fixed: [session_migrate.tombstone_wire_len]u8 = undefined;
+            const wire = session_migrate.encodeTombstone(.{
+                .token = entry.key_ptr.*,
+                .consumed_at_ms = entry.value_ptr.*,
+            }, &fixed);
+            @memcpy(buf, wire);
+            blobs.append(self.allocator, buf) catch {
+                self.allocator.free(buf);
+                continue;
+            };
+            pieces.append(self.allocator, .{ .kind = .session_tombstone, .bytes = buf }) catch continue;
+            sealed += 1;
+        }
+        return sealed;
+    }
+
     /// Successor side of `sealPendingMigrations`: decode one carried
     /// `.pending_migration` payload and re-stage it in `pending_migrations`
     /// (lazily initializing the store — adoption runs before `start()`), so the
@@ -17070,9 +17418,24 @@ pub const LinuxServer = struct {
     fn adoptPendingMigrationCapsule(self: *LinuxServer, bytes: []const u8) bool {
         const cap = session_migrate.decode(bytes) catch return false;
         if (self.pending_migrations == null) {
-            self.pending_migrations = session_migrate.PendingMigrations.init(self.allocator);
+            self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
+                .max_entries = self.config.session_max_pending_migrations,
+                .max_per_account = self.config.session_max_per_account,
+            });
         }
         self.pending_migrations.?.put(cap, self.nowMs()) catch return false;
+        return true;
+    }
+
+    fn adoptSessionTombstoneCapsule(self: *LinuxServer, bytes: []const u8) bool {
+        const tombstone = session_migrate.decodeTombstone(bytes) catch return false;
+        if (self.pending_migrations == null) {
+            self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
+                .max_entries = self.config.session_max_pending_migrations,
+                .max_per_account = self.config.session_max_per_account,
+            });
+        }
+        self.pending_migrations.?.markConsumed(tombstone.token, tombstone.consumed_at_ms) catch return false;
         return true;
     }
 
@@ -17259,12 +17622,9 @@ pub const LinuxServer = struct {
             // lives until encode() copies it below.
             var sess_tok: sessions_mod.Token = undefined;
             if (e.value.session.account()) |acct| {
-                var tok_sessions: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-                for (self.sessions.sessionsInto(acct, &tok_sessions)) |s| {
-                    if (s.client != monitorIdFromClient(e.id)) continue;
-                    sess_tok = s.token;
+                if (self.sessions.resumeHandleForClient(acct, monitorIdFromClient(e.id))) |handle| {
+                    sess_tok = handle.token;
                     snap.session_token = sess_tok[0..];
-                    break;
                 }
             }
             // v4 tail: the partial inbound line pending in the RecvQ (inline
@@ -17487,6 +17847,7 @@ pub const LinuxServer = struct {
         // capsule per entry) so a capsule shipped by a peer just before the
         // swap still unlocks the client's reclaim on the successor.
         const migrations_sealed = self.sealPendingMigrations(&pieces, &blobs);
+        const tombstones_sealed = self.sealSessionTombstones(&pieces, &blobs);
         // Seal EVERY shard's clients. Siblings are parked (see the quiesce
         // above), so reading foreign per-connection state here cannot race the
         // owning reactor thread. The carried-fd scratch spans all shards.
@@ -17531,7 +17892,7 @@ pub const LinuxServer = struct {
             return self.upgradeListenerOnly(requester);
         };
         var sbuf: [224]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} staged migration(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, migrations_sealed }) catch "UPGRADE: re-exec");
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} staged migration(s), {d} consumed tombstone(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, migrations_sealed, tombstones_sealed }) catch "UPGRADE: re-exec");
 
         // Preserve EVERY shard's client listener + the arena across execve
         // (clear FD_CLOEXEC). The successor adopts one listener per shard, so
@@ -17739,8 +18100,10 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .sessions) continue;
             if (c.fields.len == 0) continue;
-            var entries: [sessions_mod.snapshot_capacity]session_capsule.SessionEntry = undefined;
-            const cap = session_capsule.SessionCapsule.decode(c.fields[0].bytes, &entries) catch continue;
+            const count = session_capsule.peekSessionCount(c.fields[0].bytes) catch continue;
+            const entries = self.allocator.alloc(session_capsule.SessionEntry, count) catch continue;
+            defer self.allocator.free(entries);
+            const cap = session_capsule.SessionCapsule.decode(c.fields[0].bytes, entries) catch continue;
             const restored = self.adoptSessionRegistryAccount(cap);
             if (restored != 0) {
                 session_accounts += 1;
@@ -17758,6 +18121,13 @@ pub const LinuxServer = struct {
             if (c.header.kind != .pending_migration) continue;
             if (c.fields.len == 0) continue;
             if (self.adoptPendingMigrationCapsule(c.fields[0].bytes)) migrations_staged += 1;
+        }
+
+        var tombstones_staged: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .session_tombstone) continue;
+            if (c.fields.len == 0) continue;
+            if (self.adoptSessionTombstoneCapsule(c.fields[0].bytes)) tombstones_staged += 1;
         }
 
         // Pass 3: re-dial carried mesh peers NOW (not on the sweep timer), so a
@@ -17809,8 +18179,8 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, migrations_staged, tombstones_staged, s2s_resumed, redialed },
         );
     }
 
@@ -17824,13 +18194,13 @@ pub const LinuxServer = struct {
     /// (all-old-or-all-new, never a torn subset). Returns sessions restored.
     fn adoptSessionRegistryAccount(self: *LinuxServer, cap: session_capsule.SessionCapsule) usize {
         if (cap.account.len == 0 or cap.sessions.len == 0) return 0;
-        if (cap.sessions.len > sessions_mod.snapshot_capacity) return 0;
         // Validate first, apply second: one malformed entry rejects the whole
         // account BEFORE anything is written (fail-closed).
         for (cap.sessions) |entry| {
             if (entry.token.len != @sizeOf(sessions_mod.Token)) return 0;
         }
-        var applied: [sessions_mod.snapshot_capacity]u64 = undefined;
+        const applied = self.allocator.alloc(u64, cap.sessions.len) catch return 0;
+        defer self.allocator.free(applied);
         var applied_n: usize = 0;
         for (cap.sessions) |entry| {
             var token: sessions_mod.Token = undefined;
@@ -17845,6 +18215,7 @@ pub const LinuxServer = struct {
                 for (applied[0..applied_n]) |rc| _ = self.sessions.remove(cap.account, rc);
                 return 0;
             };
+            _ = self.sessions.restorePortableResumeIssued(cap.account, cid, entry.portable_resume);
             if (live_cid == null) {
                 // The connection did not survive the swap (or the session was
                 // already detached): retain a detached ghost — the token still
@@ -18299,6 +18670,12 @@ pub const LinuxServer = struct {
         self.flushS2sOutbound(conn, link.outbound()) catch {};
         link.clearOutbound();
         self.sendMeshStateBurstTo(conn);
+        // Re-offer portable logical sessions and rebuild the successor's
+        // token->peer authorization bindings. Those bindings are deliberately
+        // process-local; the signed snapshots themselves are the wire truth.
+        self.syncPortableSessions(link);
+        self.flushS2sOutbound(conn, link.outbound()) catch {};
+        link.clearOutbound();
         self.armSendIfNeeded(conn) catch {};
         // Re-register the operational surfaces the fresh-establishment hook would
         // have: the link resumes ALREADY established, so driveS2sSecured's
@@ -23677,6 +24054,16 @@ pub const LinuxServer = struct {
     /// lapses while the oper stays logged in, even across long-lived links.
     const oper_grant_refresh_interval_ms: i64 = @intCast(oper_grant_ttl_ms / 4);
 
+    /// A zero marker means the periodic refresh has never run and is due even
+    /// on a freshly booted host whose monotonic uptime is shorter than the
+    /// normal refresh interval. Treat clock regression as not due; the next
+    /// monotonic tick will recover without an overflowing subtraction.
+    fn operGrantRefreshDue(last_refresh_ms: i64, now_ms: i64) bool {
+        if (last_refresh_ms == 0) return true;
+        return now_ms >= last_refresh_ms and
+            now_ms - last_refresh_ms >= oper_grant_refresh_interval_ms;
+    }
+
     /// Derive this node's Ed25519 signing keypair (for minting oper grants) from
     /// the sovereign node identity seed. Null when no node identity is configured
     /// (cross-mesh oper grants then unsigned/disabled).
@@ -24365,7 +24752,7 @@ pub const LinuxServer = struct {
         try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
         try self.deliverTegami(conn);
-        self.applyAutojoin(id, conn);
+        self.applyLoginJoinState(id, conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(id, conn);
         self.evaluateNickProtection(conn);
@@ -26504,14 +26891,20 @@ pub const LinuxServer = struct {
         // burn all later ones), so match the unset-mesh-key behavior: reclaim
         // disabled rather than silently degraded.
         const io = self.config.crypto_io orelse return null;
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Portable credentials cross hosts, so their absolute issued/expiry
+        // timestamps must use the mesh wall-clock domain. Host monotonic clocks
+        // encode uptime and are not comparable between origin and reclaim node.
+        const now = self.meshWallMs();
         var nb: [8]u8 = undefined;
         io.random(&nb);
         const nonce = std.mem.readInt(u64, &nb, .big);
         const fields = session_reclaim_mesh.ReclaimFields{
             .account = account,
             .session_id = session_id,
-            .origin_node = protocol_inventory.currentServerName(),
+            // Bind placement to this server instance's configured mesh name.
+            // The protocol-inventory global can describe a different test/node
+            // instance in a multi-server process and produced false redirects.
+            .origin_node = self.serverName(),
             .issued_ms = now,
             .expiry_ms = now + mesh_reclaim_ttl_ms,
             .nonce = nonce,
@@ -26527,11 +26920,7 @@ pub const LinuxServer = struct {
     fn trackSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
         const account = conn.session.account() orelse return;
         const cid = monitorIdFromClient(id);
-        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
-        for (account_sessions) |s| {
-            if (s.client == cid) return; // already tracked
-        }
+        if (self.sessions.containsClient(account, cid)) return;
         const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         _ = self.sessions.attach(account, cid, self.genSessionToken(), signon) catch |err| {
             // Surface, never swallow: at the per-account cap with every slot
@@ -26558,31 +26947,51 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
-            var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-            const account_sessions = self.sessions.sessionsInto(account, &session_buf);
-            for (account_sessions) |s| {
-                if (s.client != cid) continue;
-                if (tokenIsNull(s.token)) break; // sentinel: no CSPRNG at issue time — nothing to reveal
-                const hex = std.fmt.bytesToHex(s.token, .lower);
-                const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
-                try self.noticeTo(conn, line);
-                // Also offer a mesh-sealed token usable to reclaim/redirect from
-                // ANY node in the mesh (only when a mesh shared key is set).
-                var mbuf: [1024]u8 = undefined;
-                if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
-                    var lb: [1152]u8 = undefined;
-                    const mline = std.fmt.bufPrint(&lb, "SESSION MTOKEN {s}", .{mhex}) catch return;
-                    try self.noticeTo(conn, mline);
-                }
+            // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
+            // the deferral still set means no resume succeeded; release autojoin
+            // now instead of waiting for the timer.
+            self.finishDeferredSessionAutojoin(id, conn, false);
+            if (conn.preserve_resume_credential_once) {
+                conn.preserve_resume_credential_once = false;
+                try self.warnReply(conn, "SESSION", "RESUME_CREDENTIAL_PRESERVED", "retryable resume did not consume the stored credential; repeat SESSION TOKEN to replace it");
                 return;
+            }
+            if (self.sessions.resumeHandleForClient(account, cid)) |handle| {
+                if (!tokenIsNull(handle.token)) {
+                    const hex = std.fmt.bytesToHex(handle.token, .lower);
+                    const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
+                    try self.noticeTo(conn, line);
+                    // Also offer a mesh-sealed token usable to reclaim/redirect from
+                    // ANY node in the mesh (only when a mesh shared key is set).
+                    var mbuf: [1024]u8 = undefined;
+                    if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
+                        // Set the replication gate before emitting the credential: if
+                        // the connection drops after the write is queued, detach must
+                        // still ship the snapshot that this token can unlock.
+                        _ = self.sessions.markPortableResumeIssued(account, cid);
+                        // Replicate LIVE state too. A second client may present this
+                        // MTOKEN on another node while the issuer remains connected;
+                        // waiting until detach would force a redirect/ownership race
+                        // and violate mesh-wide multi-attachment semantics.
+                        self.shipSessionMigration(id, conn, account, handle.token);
+                        var lb: [1152]u8 = undefined;
+                        const expires_unix = (self.meshWallMs() + mesh_reclaim_ttl_ms) / 1000;
+                        const mline = std.fmt.bufPrint(&lb, "SESSION MTOKEN {s} expires={d}", .{ mhex, expires_unix }) catch return;
+                        try self.noticeTo(conn, mline);
+                    }
+                    return;
+                }
             }
             try self.noticeTo(conn, "SESSION: no token for this session");
             return;
         }
         // LIST (default): never reveal tokens here.
         var idx: usize = 0;
-        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
-        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
+            return;
+        };
+        defer self.allocator.free(account_sessions);
         for (account_sessions) |s| {
             idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
@@ -26593,10 +27002,12 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, "SESSION: end of session list");
     }
 
-    /// `SESSION RESUME <token>` — reclaim a previously-detached session of the
-    /// caller's own account by its reclaim token. The detached ghost is consumed
-    /// (removed) and the caller's live session continues in its place. Bouncer
-    /// replay of buffered traffic is layered on top in a later step.
+    /// `SESSION RESUME <token>` — attach this client to the caller's logical
+    /// account session. Tokens are stable, reusable group credentials: if another
+    /// attachment is live we clone its current state and KEEP it connected; if
+    /// only a detached attachment exists we replace that ghost. Every successful
+    /// attachment carries the same token so later reconnects can land on any live
+    /// sibling instead of racing for one-shot ownership.
     pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
         const cid = monitorIdFromClient(id);
         const params = parsed.paramSlice();
@@ -26621,18 +27032,48 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
             return;
         }
-        const matched = self.sessions.findTokenSessionInAccount(account, token) orelse {
+        if (self.sessions.clientHasToken(account, cid, token)) {
+            self.finishDeferredSessionAutojoin(id, conn, true);
+            try self.noticeTo(conn, "SESSION RESUME: already attached to this session");
+            return;
+        }
+
+        // A live sibling is not an error and is never disconnected. Snapshot its
+        // current identity/channels, attach this client to the same token group,
+        // and leave the source untouched.
+        if (self.sessions.findAttachedTokenSessionInAccount(account, token, cid)) |source| {
+            const source_id = clientIdFromMonitor(source.client);
+            const source_conn = self.connFor(source_id) orelse {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attachment is converging; retry the same token");
+                return;
+            };
+            const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live session; retry the same token");
+                return;
+            };
+            defer self.allocator.free(snapshot);
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, snapshot)) {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attach failed; token remains valid");
+                return;
+            }
+            if (!self.sessions.joinTokenGroup(account, cid, token)) {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during attach; retry the same token");
+                return;
+            }
+            conn.preserve_resume_credential_once = false;
+            self.finishDeferredSessionAutojoin(id, conn, true);
+            try self.noticeTo(conn, "SESSION RESUME: attached to live session");
+            return;
+        }
+
+        const matched = self.sessions.findDetachedTokenSessionInAccount(account, token) orelse {
             try self.failReply(conn, "SESSION", "NO_SESSION", "No session matches that token");
             return;
         };
-        if (matched.client == cid) {
-            try self.noticeTo(conn, "SESSION: that token is this live session; nothing to resume");
-            return;
-        }
-        if (matched.attached) {
-            try self.failReply(conn, "SESSION", "SESSION_ATTACHED", "That session is still attached");
-            return;
-        }
         const snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, token) catch null;
         defer if (snapshot) |bytes| self.allocator.free(bytes);
         // Restore FIRST, consume the ghost only AFTER a successful restore: a
@@ -26644,10 +27085,22 @@ pub const LinuxServer = struct {
         // unconditional discard, and self-heals once the conflict clears.
         const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
         if (snapshot != null and !restored) {
-            try self.failReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
+            conn.preserve_resume_credential_once = true;
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
             return;
         }
-        _ = self.sessions.remove(account, matched.client); // reclaim consumes the detached ghost
+        // Bind BEFORE removing the ghost so joinTokenGroup can verify the local
+        // credential exists and inherit its portable-replication state. The old
+        // detached attachment is then replaced by this live one; the TOKEN itself
+        // remains reusable for additional clients.
+        if (!self.sessions.joinTokenGroup(account, cid, token)) {
+            conn.preserve_resume_credential_once = true;
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
+            return;
+        }
+        _ = self.sessions.remove(account, matched.client);
+        conn.preserve_resume_credential_once = false;
+        self.finishDeferredSessionAutojoin(id, conn, true);
         if (restored) {
             try self.noticeTo(conn, "SESSION RESUME: session restored");
         } else {
@@ -26661,8 +27114,10 @@ pub const LinuxServer = struct {
     /// Cross-server reclaim: `SESSION RESUME <mesh-token>` where the token is a
     /// mesh-sealed `session_reclaim_mesh` blob (hex). Verify it under the mesh
     /// shared key, confirm it is for the caller's OWN authenticated account, then
-    /// either reclaim a detached session held here (grant_local) or tell the
-    /// client which node owns it (grant_redirect). Nonces are replay-protected.
+    /// either attach to a local/replicated session or tell the client where a
+    /// replica can be obtained. Portable credentials are reusable for their
+    /// bounded lifetime: replay rejection would make two legitimate clients race
+    /// for ownership, contradicting the multi-attachment session contract.
     fn handleMeshReclaim(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, tok_hex: []const u8) !void {
         const key = self.config.mesh_pass;
         if (key.len == 0) {
@@ -26678,7 +27133,7 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token is not valid hex");
             return;
         };
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now = self.meshWallMs();
         const fields = session_reclaim_mesh.open(key, rb, now) catch |e| {
             const msg = switch (e) {
                 error.Expired => "reclaim token expired",
@@ -26694,76 +27149,123 @@ pub const LinuxServer = struct {
             return;
         }
         const cid = monitorIdFromClient(id);
-        // Does this node hold this exact detached session for the account (other
-        // than the caller's own live session)?
-        var ghost: ?sessions_mod.ClientId = null;
-        if (sessionTokenFromHex(fields.session_id)) |token| {
-            if (self.sessions.findTokenSessionInAccount(account, token)) |s| {
-                if (s.client != cid and !s.attached) ghost = s.client;
-            }
+        const migrate_token = sessionTokenFromHex(fields.session_id) orelse {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token carries an invalid session id");
+            return;
+        };
+        if (self.sessions.clientHasToken(account, cid, migrate_token)) {
+            self.finishDeferredSessionAutojoin(id, conn, true);
+            try self.noticeTo(conn, "SESSION RESUME: already attached to this mesh session");
+            return;
         }
+
+        // Join an already-live local attachment without disturbing it. This is
+        // the common same-node multi-client path for an MTOKEN shared by browser
+        // tabs/devices.
+        if (self.sessions.findAttachedTokenSessionInAccount(account, migrate_token, cid)) |source| {
+            const source_id = clientIdFromMonitor(source.client);
+            const source_conn = self.connFor(source_id) orelse {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live mesh attachment is converging; retry the same token");
+                return;
+            };
+            const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live mesh session; retry the same token");
+                return;
+            };
+            defer self.allocator.free(snapshot);
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, snapshot) or
+                !self.sessions.joinTokenGroup(account, cid, migrate_token))
+            {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session attach failed; token remains valid");
+                return;
+            }
+            conn.preserve_resume_credential_once = false;
+            self.finishDeferredSessionAutojoin(id, conn, true);
+            try self.noticeTo(conn, "SESSION RESUME: attached to live mesh session");
+            return;
+        }
+
+        const detached = self.sessions.findDetachedTokenSessionInAccount(account, migrate_token);
+        const ghost: ?sessions_mod.ClientId = if (detached) |session| session.client else null;
         const origin_is_self = std.mem.eql(u8, fields.origin_node, self.serverName());
         // A live-session migration capsule for this exact session token may have
         // been shipped ahead of the client by the owning node. The token's HMAC,
-        // expiry, account-ownership, and replay checks above gate this restore
+        // expiry and account-ownership checks above gate this restore
         // EXACTLY as they gate the legacy grant paths — migration never weakens
         // them. A staged capsule means the full session state is now HERE, so a
         // would-be redirect becomes a local restore.
-        const migrate_token: ?session_migrate.Token = sessionTokenFromHex(fields.session_id);
         const have_capsule = if (self.pending_migrations) |*pm|
-            (if (migrate_token) |mt| pm.has(mt) else false)
+            pm.has(migrate_token)
         else
             false;
-        // PURE probe — the nonce is recorded (burned) only on the outcomes that
-        // truly consume the token (capsule consume / grant_local below). A
-        // redirect or denial stays idempotent: burning on first sight stranded
-        // a still-valid session for the whole 12h TTL when the client probed a
-        // non-owning node first.
-        const seen = self.session_reclaim_replay.contains(fields.nonce);
         var buf: [default_reply_bytes]u8 = undefined;
-        // Replay/expiry still win over a staged capsule: a replayed or expired
-        // reclaim is denied and the capsule is left untouched for a legitimate
-        // future reconnect (or TTL eviction). Only a fresh, valid reclaim consumes.
-        if (have_capsule and !seen and now <= fields.expiry_ms) {
-            if (self.consumeMigration(id, conn, account, migrate_token.?)) {
+        // A signed staged snapshot is a bounded replica, not a one-shot transfer.
+        // Keep it staged so every authenticated client presenting the same valid
+        // MTOKEN can attach on this node.
+        if (have_capsule and now <= fields.expiry_ms) {
+            if (self.restoreStagedMigration(id, conn, account, migrate_token)) {
+                const rebound = if (ghost != null)
+                    self.sessions.joinTokenGroup(account, cid, migrate_token)
+                else
+                    self.sessions.adoptTokenGroup(account, cid, migrate_token, true);
+                if (!rebound) {
+                    conn.preserve_resume_credential_once = true;
+                    try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during attach; retry the same token");
+                    return;
+                }
                 if (ghost) |g| _ = self.sessions.remove(account, g);
-                self.session_reclaim_replay.record(fields.nonce); // consumed: burn the nonce
-                try self.noticeTo(conn, "SESSION RESUME: session migrated and reclaimed (cross-server)");
-                const event = std.fmt.bufPrint(&buf, "SESSION migrated+reclaimed account={s}", .{account}) catch return;
+                conn.preserve_resume_credential_once = false;
+                self.finishDeferredSessionAutojoin(id, conn, true);
+                try self.noticeTo(conn, "SESSION RESUME: attached to replicated mesh session");
+                const event = std.fmt.bufPrint(&buf, "SESSION replica-attached account={s}", .{account}) catch return;
                 self.publishOperEvent(.service, .notice, event) catch {};
                 return;
             }
             // Restore failed mid-way: fall through to the legacy decision so the
             // client still gets a coherent (redirect/deny) answer.
         }
-        switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, seen, now)) {
+        var peer_names: [32][]const u8 = undefined;
+        const peer_count = self.readPeerNames(&peer_names);
+        var origin_reachable = origin_is_self;
+        for (peer_names[0..peer_count]) |name| {
+            if (std.ascii.eqlIgnoreCase(name, fields.origin_node)) {
+                origin_reachable = true;
+                break;
+            }
+        }
+        switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, origin_reachable, false, now)) {
             .grant_local => {
                 // This node owns the detached session. Prefer the local detached
                 // snapshot first: the client may have followed a redirect back to
                 // the origin, and should get the same full-state restore as the
                 // ordinary local SESSION RESUME path.
-                const local_snapshot = if (migrate_token) |mt|
-                    self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, mt) catch null
-                else
-                    null;
+                const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
                 const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
 
-                // If no local snapshot was available, best-effort ship a
-                // migration capsule of the ghost's live state to secured peers
-                // BEFORE consuming it, so a later reconnect elsewhere can still
-                // restore the complete session rather than just a token grant.
+                if (local_snapshot != null and !restored) {
+                    conn.preserve_resume_credential_once = true;
+                    try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
+                    return;
+                }
+
                 if (ghost) |g| {
-                    if (!restored) {
-                        if (migrate_token) |mt| {
-                            if (self.connFor(clientIdFromMonitor(g))) |gconn| {
-                                self.shipSessionMigration(clientIdFromMonitor(g), gconn, account, mt);
-                            }
-                        }
+                    if (!self.sessions.joinTokenGroup(account, cid, migrate_token)) {
+                        conn.preserve_resume_credential_once = true;
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
+                        return;
                     }
                     _ = self.sessions.remove(account, g);
+                } else if (!self.sessions.adoptTokenGroup(account, cid, migrate_token, true)) {
+                    conn.preserve_resume_credential_once = true;
+                    try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
+                    return;
                 }
-                self.session_reclaim_replay.record(fields.nonce); // ghost consumed: burn the nonce
+                conn.preserve_resume_credential_once = false;
+                self.finishDeferredSessionAutojoin(id, conn, restored);
                 if (restored) {
                     try self.noticeTo(conn, "SESSION RESUME: session restored (cross-server)");
                 } else {
@@ -26777,12 +27279,17 @@ pub const LinuxServer = struct {
                 // owning node ships the migration capsule from its own grant_local
                 // path (above) when it consumes the ghost, so the peer the client
                 // lands on already has the staged capsule to restore from.
+                conn.preserve_resume_credential_once = true;
                 const line = std.fmt.bufPrint(&buf, "SESSION REDIRECT: session lives on {s}; reconnect there to reclaim", .{node}) catch return;
                 try self.noticeTo(conn, line);
             },
             .deny_expired => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token expired"),
-            .deny_replay => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token already used"),
+            .deny_replay => unreachable, // reusable credentials are never probed as consumed
             .deny_unknown => try self.failReply(conn, "SESSION", "NO_SESSION", "no matching session on origin node"),
+            .deny_unreachable => {
+                conn.preserve_resume_credential_once = true;
+                try self.warnReply(conn, "SESSION", "ORIGIN_UNREACHABLE", "origin is disconnected; retry this resume credential when the mesh converges");
+            },
         }
     }
 
@@ -26857,9 +27364,8 @@ pub const LinuxServer = struct {
     /// session identified by the 16-byte `session_token`) to every established
     /// secured peer, so whichever node the client reconnects to can restore the
     /// full session. Best-effort: a missing signing key or any encode/ship failure
-    /// silently no-ops (the legacy redirect path still works). Reuses the relay's
-    /// `MigrationOrigin.prepare` (signature + replay journal) verbatim by lending
-    /// it the server-persistent origin policy/journal around the call.
+    /// silently no-ops (the legacy redirect path still works). Uses the relay's
+    /// `MigrationOrigin.prepare` for canonical hashing and node-key signatures.
     fn shipSessionMigration(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -26867,8 +27373,6 @@ pub const LinuxServer = struct {
         account: []const u8,
         session_token: session_migrate.Token,
     ) void {
-        const kp = self.migrationKeypair() orelse return;
-
         const chan_cap = self.world.channelCountOf(worldIdFromClient(id));
         const chan_buf = self.allocator.alloc([]const u8, chan_cap) catch return;
         defer self.allocator.free(chan_buf);
@@ -26877,42 +27381,110 @@ pub const LinuxServer = struct {
         var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
         const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf, chan_mode_buf, umode_buf[0..]);
 
-        // Lend the persistent origin policy/journal to a transient MigrationOrigin
-        // so replay/stale-epoch state survives across capsules without re-deriving
-        // the relay's logic here. Moved back out on return.
-        var origin = migration_relay.MigrationOrigin.init(self.allocator, kp);
-        origin.policy = self.migration_origin_policy;
-        origin.journal = self.migration_origin_journal;
-        defer {
-            self.migration_origin_policy = origin.policy;
-            self.migration_origin_journal = origin.journal;
-            origin.policy = .{};
-            origin.journal = .{};
-            origin.deinit();
-        }
+        const wire = self.encodeSessionMigration(account, session_token, snapshot) orelse return;
+        defer self.allocator.free(wire);
+        self.broadcastSessionMigration(session_token, wire);
+    }
 
-        self.migration_nonce +%= 1;
-        const epoch: u64 = @intCast(@max(@as(i64, 1), self.nowMs()));
-        var prepared = origin.prepare(account, snapshot, self.migration_nonce, epoch) catch return;
+    fn recordSessionReplicaRoute(self: *LinuxServer, token: session_migrate.Token, peer: u64) void {
+        const key = SessionReplicaRoute{ .token = token, .peer = peer };
+        if (self.session_replica_routes.contains(key)) return;
+        // Bound stale routes independently from peer behavior. A stale entry is
+        // harmless (authorization also requires a current detached portable
+        // snapshot with the exact random token), but it must not grow forever.
+        const cap = @max(@as(usize, 64), self.config.session_max_pending_migrations *| 16);
+        if (self.session_replica_routes.count() >= cap) {
+            var it = self.session_replica_routes.keyIterator();
+            if (it.next()) |oldest_arbitrary| _ = self.session_replica_routes.remove(oldest_arbitrary.*);
+        }
+        self.session_replica_routes.put(self.allocator, key, {}) catch {};
+    }
+
+    /// Sign and wrap one portable snapshot. Detach-time fanout and peer-rejoin
+    /// anti-entropy deliberately share this path so nonce/epoch ordering,
+    /// account binding, and replay policy cannot drift apart.
+    fn encodeSessionMigration(
+        self: *LinuxServer,
+        account: []const u8,
+        session_token: session_migrate.Token,
+        snapshot: migration_relay.Snapshot,
+    ) ?[]u8 {
+        const kp = self.migrationKeypair() orelse return null;
+
+        // The relay object verifies and signs one message. Durable replay/order
+        // state lives in the bounded token-keyed pending/tombstone store, not in
+        // the relay's unbounded account/nonce maps (which also collide across
+        // independent origin peers whose counters start at the same value).
+        var origin = migration_relay.MigrationOrigin.init(self.allocator, kp);
+        defer origin.deinit();
+
+        // Reserve six decimal digits per wall-clock millisecond for same-tick
+        // offers. The process-local floor makes every offer strictly newer;
+        // wall time makes restart/USR2 epochs comparable at another host.
+        const wall_epoch = @max(@as(u64, 1), self.meshWallMs()) *| 1_000_000;
+        const epoch = @max(wall_epoch, self.migration_offer_epoch +| 1);
+        self.migration_offer_epoch = epoch;
+        var prepared = origin.prepare(account, snapshot, epoch, epoch) catch return null;
         defer prepared.deinit(self.allocator);
 
         // Wrap the relay frame in a session_migrate.Capsule keyed by the 16-byte
-        // session token (the key the reclaim side looks up), and ship it over the
+        // session token (the key the attachment side looks up), and ship it over the
         // secured mesh. The relay frame bytes ARE the capsule's snapshot blob.
         const cap = session_migrate.Capsule{
             .token = session_token,
             .account = account,
             .snapshot = prepared.frame_bytes,
         };
-        const wire = session_migrate.encode(self.allocator, cap) catch return;
-        defer self.allocator.free(wire);
-        self.broadcastSessionMigration(wire);
+        return session_migrate.encode(self.allocator, cap) catch null;
+    }
+
+    /// Reconcile every portable logical-session replica to one newly-established
+    /// secured peer. Live attachments are snapshotted from their connection;
+    /// detached snapshots come from exact owned SessionStore copies. Link I/O
+    /// happens without holding the session lock.
+    fn syncPortableSessions(self: *LinuxServer, link: anytype) void {
+        if (!self.config.session_migrate_on_detach) return;
+
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.s2s != null or conn.s2s_secured != null or conn.closing) continue;
+                const account = conn.session.account() orelse continue;
+                const id = slotClientId(reactor, i, slot.gen);
+                const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse continue;
+                if (!handle.portable or tokenIsNull(handle.token)) continue;
+                const snapshot_bytes = self.encodeMigrationSnapshot(id, conn) orelse continue;
+                defer self.allocator.free(snapshot_bytes);
+                var snapshot = migration_relay.Snapshot.decode(self.allocator, snapshot_bytes) catch continue;
+                defer snapshot.deinit(self.allocator);
+                const wire = self.encodeSessionMigration(account, handle.token, snapshot) orelse continue;
+                defer self.allocator.free(wire);
+                link.sendSessionMigrate(wire) catch continue;
+                if (link.peerShortId()) |peer| self.recordSessionReplicaRoute(handle.token, peer);
+            }
+        }
+
+        const copies = self.sessions.copyPortableDetachedSnapshots(self.allocator) catch return;
+        defer {
+            for (copies) |*copy| copy.deinit(self.allocator);
+            self.allocator.free(copies);
+        }
+        for (copies) |copy| {
+            var snapshot = migration_relay.Snapshot.decode(self.allocator, copy.snapshot) catch continue;
+            defer snapshot.deinit(self.allocator);
+            if (!std.ascii.eqlIgnoreCase(snapshot.account, copy.account)) continue;
+            const wire = self.encodeSessionMigration(copy.account, copy.token, snapshot) orelse continue;
+            defer self.allocator.free(wire);
+            link.sendSessionMigrate(wire) catch continue;
+            if (link.peerShortId()) |peer| self.recordSessionReplicaRoute(copy.token, peer);
+        }
     }
 
     /// Broadcast an encoded `session_migrate` capsule to every established secured
     /// peer (the encrypted, authenticated leg — never the plaintext S2S path,
     /// since the capsule carries account/host state). Mirrors `broadcastOperGrant`.
-    fn broadcastSessionMigration(self: *LinuxServer, wire: []const u8) void {
+    fn broadcastSessionMigration(self: *LinuxServer, token: session_migrate.Token, wire: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -26922,16 +27494,62 @@ pub const LinuxServer = struct {
                 link.sendSessionMigrate(wire) catch continue;
                 self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                 link.clearOutbound();
+                if (link.peerShortId()) |peer| self.recordSessionReplicaRoute(token, peer);
             }
         }
     }
 
+    /// Legacy rolling-version compatibility for pre-multi-attachment peers that
+    /// still emit one-shot consume notices. New code never calls this for a
+    /// successful attach: reusable session replicas are retained until TTL.
+    fn convergeSessionConsumed(self: *LinuxServer, account: []const u8, token: session_migrate.Token, nonce: ?u64) void {
+        if (self.pending_migrations) |*pm| pm.markConsumed(token, self.nowMs()) catch {};
+        if (nonce) |n| self.session_reclaim_replay.record(n);
+
+        var payload_buf: [512]u8 = undefined;
+        const payload = session_reclaim_mesh.encodeConsumeNotice(.{
+            .session_token = token,
+            .account = account,
+            .nonce = nonce,
+        }, &payload_buf) catch return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendSessionMigrateConsumed(payload) catch continue;
+                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    fn drainSessionMigrationConsumed(self: *LinuxServer, link: anytype) void {
+        const notices = link.takeSessionMigrateConsumed() catch return;
+        defer self.allocator.free(notices);
+        for (notices) |wire| {
+            defer self.allocator.free(wire);
+            const notice = session_reclaim_mesh.decodeConsumeNotice(wire) catch continue;
+            if (notice.account.len == 0) continue;
+            self.applySessionConsumedNotice(notice);
+        }
+    }
+
+    fn applySessionConsumedNotice(self: *LinuxServer, notice: session_reclaim_mesh.ConsumeNotice) void {
+        // Compatibility-only wire input from one-shot migration releases. A
+        // modern logical session is reusable and may have other live clients, so
+        // deleting its replica/ghost here would strand those attachments. Fresh
+        // signed offers supersede legacy tombstones in PendingMigrations.
+        _ = self;
+        _ = notice;
+    }
+
     /// Drain a secured link's inbound session-migration capsules: verify each via
-    /// `MigrationTarget.accept` (pinned to the peer's node key, lent the server's
-    /// persistent target policy/journal for replay defense), then stage the
-    /// decoded session into `pending_migrations` keyed by its 16-byte session
-    /// token. A capsule that fails verification or whose outer/inner accounts
-    /// disagree is dropped, never fatal to the link.
+    /// `MigrationTarget.accept` (pinned to the peer's node key), then stage the
+    /// decoded session into the bounded, epoch-ordered `pending_migrations` store
+    /// keyed by its 16-byte session token. A capsule that fails verification or
+    /// whose outer/inner accounts disagree is dropped, never fatal to the link.
     fn drainSessionMigrations(self: *LinuxServer, link: anytype) void {
         const caps = link.takeSessionMigrations() catch return;
         defer self.allocator.free(caps);
@@ -26951,9 +27569,10 @@ pub const LinuxServer = struct {
 
     /// Verify + stage one inbound `session_migrate` capsule wire blob. Splits the
     /// 16-byte session-token key from the embedded relay frame, runs the relay's
-    /// `MigrationTarget.accept` (full signature/account/hash/replay checks) using
-    /// the server-persistent target journal/policy, and on success copies the
-    /// decoded session snapshot into `pm` under the session-token key.
+    /// `MigrationTarget.accept` signature/account/hash checks for the authenticated
+    /// peer, then copies the decoded snapshot into the bounded token-keyed store.
+    /// That store enforces signed-epoch order and consumed tombstones without a
+    /// global nonce journal that could collide across peers or grow forever.
     fn stageSessionMigration(
         self: *LinuxServer,
         pm: *session_migrate.PendingMigrations,
@@ -26963,15 +27582,7 @@ pub const LinuxServer = struct {
         const outer = session_migrate.decode(wire) catch return;
 
         var target = migration_relay.MigrationTarget.init(self.allocator, expected_signer);
-        target.policy = self.migration_target_policy;
-        target.journal = self.migration_target_journal;
-        defer {
-            self.migration_target_policy = target.policy;
-            self.migration_target_journal = target.journal;
-            target.policy = .{};
-            target.journal = .{};
-            target.deinit();
-        }
+        defer target.deinit();
 
         var capsule = target.accept(outer.snapshot) catch return;
         defer capsule.deinit(self.allocator);
@@ -26981,25 +27592,25 @@ pub const LinuxServer = struct {
         if (!std.mem.eql(u8, capsule.account, outer.account)) return;
 
         // Re-encode the verified snapshot so the staged blob is a self-contained
-        // migration_relay.Snapshot the reclaim side decodes directly.
+        // migration_relay.Snapshot the attachment side decodes directly.
         const snap_bytes = capsule.snapshot.encode(self.allocator) catch return;
         defer self.allocator.free(snap_bytes);
 
-        pm.put(.{
+        pm.putAtEpoch(.{
             .token = outer.token,
             .account = outer.account,
             .snapshot = snap_bytes,
-        }, self.nowMs()) catch return;
+        }, self.nowMs(), capsule.token.epoch) catch return;
     }
 
-    /// Consume the staged migration capsule for `session_token` and restore the
-    /// full session into the live `conn`, REUSING the Helix-upgrade restore
+    /// Borrow the staged replica for `session_token` and restore the full session
+    /// into the live `conn`, REUSING the Helix-upgrade restore
     /// helpers (`session.restore` + `world.registerNick` + `world.restoreMember`)
     /// so join/mode logic is never duplicated. Returns true on a successful
-    /// restore (capsule consumed); false if no capsule was staged or it failed to
-    /// decode (capsule then left/dropped, caller falls back to legacy behavior).
-    /// Caller has ALREADY passed the mesh token HMAC/expiry/account/replay gates.
-    fn consumeMigration(
+    /// restore; false if no replica was staged or it failed to decode. The entry
+    /// stays staged so concurrent clients may attach until its TTL expires.
+    /// Caller has ALREADY passed the mesh token HMAC/expiry/account gates.
+    fn restoreStagedMigration(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
@@ -27007,8 +27618,8 @@ pub const LinuxServer = struct {
         session_token: session_migrate.Token,
     ) bool {
         const pm = if (self.pending_migrations) |*p| p else return false;
-        const entry = pm.take(session_token) orelse return false;
-        defer pm.freeEntry(entry);
+        const entry = pm.get(session_token) orelse return false;
+        if (!std.ascii.eqlIgnoreCase(entry.account, account)) return false;
 
         var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
         defer snap.deinit(self.allocator);
@@ -27029,6 +27640,10 @@ pub const LinuxServer = struct {
         account: []const u8,
         snap: *const migration_relay.Snapshot,
     ) bool {
+        // The authenticated account and mesh-token HMAC are the authorization
+        // boundary. A signed peer snapshot may restore only that same account;
+        // never let carried snapshot data switch the live connection's identity.
+        if (snap.account.len != 0 and !std.ascii.eqlIgnoreCase(snap.account, account)) return false;
         const wid = worldIdFromClient(id);
         var old_nick_buf: [64]u8 = undefined;
         const old_nick_src = conn.session.displayName();
@@ -27069,6 +27684,22 @@ pub const LinuxServer = struct {
         const live_title_src = conn.session.operTitle();
         const live_title_len = @min(live_title_src.len, live_title_buf.len);
         @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
+
+        // Claim the migrated nick BEFORE mutating the live session. A collision
+        // with the SAME authenticated account is an existing attachment of this
+        // logical identity, not a restore failure: the current world owner stays
+        // primary and this connection shares the nick. If the claimant still owns
+        // a generated pre-resume nick, release that old mapping only after the
+        // same-account collision has been proven.
+        if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
+            self.world.registerNick(snap.nick, wid) catch |err| switch (err) {
+                error.NickInUse => {
+                    if (!self.nickHeldBySameAccount(snap.nick, account, wid)) return false;
+                    self.world.unregisterNick(wid);
+                },
+                else => return false,
+            };
+        }
 
         // Restore identity/account/away/oper through the SAME session restore the
         // UPGRADE path uses, by projecting the migration snapshot onto a
@@ -27111,9 +27742,6 @@ pub const LinuxServer = struct {
         // Re-register the nick so the migrated client stays addressable, then
         // re-join every carried channel with its exact member modes — the exact
         // helpers `adoptInheritedClient` calls on UPGRADE resume.
-        if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
-            self.world.registerNick(snap.nick, wid) catch return false;
-        }
         if (nick_msg.len != 0) {
             self.deliver(id, nick_msg) catch {};
             self.notifyCommonChannels(id, nick_msg, null, id, null) catch {};
@@ -28977,6 +29605,21 @@ pub const LinuxServer = struct {
         }
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "FAIL {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// Emit a retryable IRCv3 `WARN`. Unlike `FAIL`, clients must retain the
+    /// credential/state needed to retry the operation.
+    fn warnReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
+        if (dispatch.hasControlByte(command) or dispatch.hasControlByte(code) or dispatch.hasControlByte(reason)) return;
+        if (!conn.session.hasCap(.standard_replies)) {
+            var notice_buf: [default_reply_bytes]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "WARN {s} {s}: {s}", .{ command, code, reason }) catch return;
+            try self.noticeTo(conn, notice);
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "WARN {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -31775,6 +32418,13 @@ pub const LinuxServer = struct {
 
     pub fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
+        // QUIT closes this transport, not the shared logical identity. If another
+        // attachment is live, hand ownership/state to it and let the ordinary
+        // close path detach this row without emitting offline/QUIT for the user.
+        if (self.handoffLiveSessionIdentity(id, conn)) {
+            conn.closing = true;
+            return;
+        }
         // SEEN: record this account's logout for the LASTSEEN history.
         if (conn.session.account()) |acct| {
             var mb: [256]u8 = undefined;
@@ -31882,6 +32532,18 @@ pub const LinuxServer = struct {
         while (it.next()) |member| {
             if (count >= max_members) break;
             const nick = self.world.nickOf(member.*) orelse continue;
+            // Multiple sockets attached to one logical session are distinct
+            // delivery endpoints but one IRC identity. Keep every endpoint in
+            // World for fan-out/participation, while rendering the nick once in
+            // NAMES so clients do not manufacture duplicate users.
+            var duplicate = false;
+            for (members_buf[0..count]) |listed| {
+                if (std.ascii.eqlIgnoreCase(listed.nick, nick)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
             const modes = self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty();
             if (is_auditorium) {
                 const is_self = if (viewer_wid) |vw| member.*.eql(vw) else false;
@@ -34172,6 +34834,13 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
     } else return error.SkipZigTest;
 }
 
+test "zero oper grant refresh marker is due below the normal interval" {
+    try std.testing.expect(Server.operGrantRefreshDue(0, 1));
+    try std.testing.expect(!Server.operGrantRefreshDue(1, 2));
+    try std.testing.expect(Server.operGrantRefreshDue(1, 1 + Server.oper_grant_refresh_interval_ms));
+    try std.testing.expect(!Server.operGrantRefreshDue(2, 1));
+}
+
 test "REHASH oper binding builder preserves configured group privileges" {
     const text =
         \\[node]
@@ -36362,6 +37031,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
             "\x01VERSION\x01",
             false,
             0,
+            null,
         ));
 
         _ = try server.world.setChannelFlag("#relay", .no_ctcp, false);
@@ -36374,6 +37044,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
             "notice",
             true,
             0,
+            null,
         ));
 
         _ = try server.world.setChannelFlag("#relay", .no_notice, false);
@@ -36387,6 +37058,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
             "held",
             false,
             0,
+            null,
         ));
 
         _ = try server.world.setChannelFlag("#relay", .moderated, false);
@@ -36398,6 +37070,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
             "ops only",
             false,
             2,
+            null,
         ));
         _ = try server.world.setMemberMode("#relay", worldIdFromClient(remote_id), .voice, true);
         try std.testing.expectEqual(.allow, server.relayChannelSpeechGate(
@@ -36408,6 +37081,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
             "ops only",
             false,
             2,
+            null,
         ));
     } else return error.SkipZigTest;
 }
@@ -38629,7 +39303,7 @@ test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
     try std.testing.expect(std.mem.indexOf(u8, client.written(), "sst_") == null);
 }
 
-test "threaded server: login auto-restores detached nick and all channels before autojoin" {
+test "threaded server: login defers autojoin and restores only after exact SESSION RESUME token" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -38637,7 +39311,7 @@ test "threaded server: login auto-restores detached nick and all channels before
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services };
+    var cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io };
     cfg.chanlimit = 96;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -38679,6 +39353,17 @@ test "threaded server: login auto-restores detached nick and all channels before
         a.reset();
     }
 
+    a.reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(&a, "SESSION TOKEN ", 200);
+    const token_marker = "SESSION TOKEN ";
+    const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
+    const token_tail = a.written()[token_start..];
+    const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
+    var token_buf: [64]u8 = undefined;
+    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
+    const resume_token = token_buf[0..token_len];
+
     closeFd(fd_a);
     fd_a_open = false;
     testSleepMs(50);
@@ -38692,6 +39377,12 @@ test "threaded server: login auto-restores detached nick and all channels before
     b.reset();
     try writeAllFd(fd_b, "IDENTIFY trev correcthorse\r\n");
     try recvUntil(&b, "You are now identified as trev", 200);
+    // Same-account authentication alone must not consume an arbitrary device
+    // ghost. The exact credential is the ownership proof.
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "NICK :trev") == null);
+    var resume_line: [128]u8 = undefined;
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
+    try recvUntil(&b, "SESSION RESUME: session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #root", 200);
     try recvUntil(&b, "JOIN #ops", 200);
@@ -38706,18 +39397,26 @@ test "threaded server: login auto-restores detached nick and all channels before
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TempResume") == null);
 }
 
-test "threaded server: SASL-opered login keeps oper privileges across detached-ghost auto-restore" {
-    // Regression: SASL registration elevates the live session FIRST
-    // (elevateOperFromAccount), then applyLoginJoinState auto-restores the
-    // newest detached ghost of the same account. The ghost's migration
+test "threaded server: SASL-opered login keeps privileges across explicit detached-session restore" {
+    // Regression: SASL registration elevates the live session FIRST, then the
+    // client explicitly restores its detached ghost. The ghost's migration
     // snapshot carries at most a bare `is_oper` bool — no privilege bits,
     // class, or title — so a blind session.restore() clobbered the freshly
     // granted oper privileges to zero and the next privileged action 481'd.
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-sasl-oper-resume.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -38745,19 +39444,32 @@ test "threaded server: SASL-opered login keeps oper privileges across detached-g
     a.reset();
     try writeAllFd(fd_a, "JOIN #ops\r\n");
     try recvUntil(&a, " 366 trev #ops ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(&a, "SESSION TOKEN ", 200);
+    const token_marker = "SESSION TOKEN ";
+    const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
+    const token_tail = a.written()[token_start..];
+    const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
+    var token_buf: [64]u8 = undefined;
+    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
+    const resume_token = token_buf[0..token_len];
     closeFd(fd_a);
     fd_a_open = false;
     testSleepMs(50);
 
     // Session B: fresh SASL-oper login on the same account. Registration
-    // elevates it (381), then the detached ghost is auto-restored (nick +
-    // channels). The restore must NOT downgrade the live elevation.
+    // elevates it (381); the exact resume credential then restores the detached
+    // ghost. The restore must NOT downgrade the live elevation.
     const fd_b = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_b);
     var b = LiveClient{ .fd = fd_b };
     try saslPlainPrelude(fd_b, "admin", "orochi");
     try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
     try recvUntil(&b, " 381 TempOper ", 200);
+    var resume_line: [128]u8 = undefined;
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
+    try recvUntil(&b, "SESSION RESUME: session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #ops", 200);
 
@@ -38816,7 +39528,8 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
     const marker = "SESSION MTOKEN ";
     const mtok_start = (std.mem.indexOf(u8, a.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
     const mtok_tail = a.written()[mtok_start..];
-    const mtok_len = std.mem.indexOfScalar(u8, mtok_tail, '\r') orelse return error.TestUnexpectedResult;
+    const mtok_cr = std.mem.indexOfScalar(u8, mtok_tail, '\r') orelse return error.TestUnexpectedResult;
+    const mtok_len = std.mem.indexOfScalar(u8, mtok_tail[0..mtok_cr], ' ') orelse mtok_cr;
     if (mtok_len > 1024) return error.TestUnexpectedResult;
     var mtok_buf: [1024]u8 = undefined;
     @memcpy(mtok_buf[0..mtok_len], mtok_tail[0..mtok_len]);
@@ -38847,7 +39560,7 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "Helper") == null);
 }
 
-test "threaded server: session reclaim denial does not burn the nonce; consume does" {
+test "threaded server: one mesh credential attaches multiple live clients without nonce races" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const mesh_key = "unit-mesh-reclaim-key";
     var server = Server.init(std.testing.allocator, .{
@@ -38875,7 +39588,7 @@ test "threaded server: session reclaim denial does not burn the nonce; consume d
     }
     const token = a_token orelse return error.TestUnexpectedResult;
     const token_hex = std.fmt.bytesToHex(token, .lower);
-    const now: u64 = @intCast(@max(@as(i64, 0), server.nowMs()));
+    const now = server.meshWallMs();
     const fields = session_reclaim_mesh.ReclaimFields{
         .account = "acct",
         .session_id = &token_hex,
@@ -38892,22 +39605,21 @@ test "threaded server: session reclaim denial does not burn the nonce; consume d
     const resume_txt = try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{mesh_hex});
     var parsed = try irc_line.parseLine(resume_txt);
 
-    // 1) While A is still attached there is no ghost and we are the origin:
-    //    deny_unknown. This denial must NOT burn the nonce.
+    // 1) While A is still attached, B joins the same logical session. A remains
+    // live and both attachment rows carry the stable token.
     try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
-    try expectContains(b_conn.send_buf[0..b_conn.send_len], "no matching session on origin node");
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "attached to live mesh session");
+    try std.testing.expect(server.sessions.clientHasToken("acct", a_cid, token));
+    try std.testing.expect(server.sessions.clientHasToken("acct", monitorIdFromClient(b_id), token));
+    try std.testing.expect(server.connFor(a_id) != null);
 
-    // 2) A detaches; the SAME token must now be honored (regression: burning
-    //    on first sight stranded the session for the whole token TTL).
+    // 2) A detaches, but B remains a live source for the same group.
     try std.testing.expect(server.sessions.markDetachedWithSnapshot("acct", a_cid, null));
-    b_conn.send_len = 0;
-    try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
-    try expectContains(b_conn.send_buf[0..b_conn.send_len], "session reclaimed (cross-server)");
-
-    // 3) The consume DID burn the nonce: a third presentation is a replay.
-    b_conn.send_len = 0;
-    try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
-    try expectContains(b_conn.send_buf[0..b_conn.send_len], "reclaim token already used");
+    const c_id = try addTestLocalClient(&server, "livec", "acct");
+    const c_conn = server.connFor(c_id).?;
+    try server.handleSessionResume(c_id, c_conn, "acct", &parsed);
+    try expectContains(c_conn.send_buf[0..c_conn.send_len], "attached to live mesh session");
+    try std.testing.expect(server.sessions.clientHasToken("acct", monitorIdFromClient(c_id), token));
 }
 
 test "threaded server: session reclaim local restore failure leaves the ghost reclaimable" {
@@ -38946,10 +39658,242 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
     // The failure is reported AND the ghost (with its snapshot) survives for a
     // later reclaim — the old order removed it before attempting the restore.
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "session restore failed");
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "WARN SESSION TEMPORARILY_UNAVAILABLE");
     try std.testing.expect(server.sessions.findTokenSessionInAccount("acct2", token) != null);
     const snap = server.sessions.copyDetachedSnapshotInAccount(std.testing.allocator, "acct2", token) catch null;
     defer if (snap) |bytes| std.testing.allocator.free(bytes);
     try std.testing.expect(snap != null);
+
+    // Onyx immediately asks for TOKEN after RESUME. The first request after a
+    // retryable failure must not overwrite the old stored credential. A second
+    // explicit request is the user's escape hatch to replace it.
+    b_conn.send_len = 0;
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(b_id, b_conn, &token_line);
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "WARN SESSION RESUME_CREDENTIAL_PRESERVED");
+    try std.testing.expect(std.mem.indexOf(u8, b_conn.send_buf[0..b_conn.send_len], ":SESSION TOKEN ") == null);
+    b_conn.send_len = 0;
+    try server.handleSession(b_id, b_conn, &token_line);
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "SESSION TOKEN ");
+}
+
+test "threaded server: local resume joins an attached reusable session" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const owner_id = try addTestLocalClient(&server, "owner", "sameacct");
+    const claimant_id = try addTestLocalClient(&server, "claimant", "sameacct");
+    const claimant = server.connFor(claimant_id).?;
+    const token = server.sessions.resumeHandleForClient("sameacct", monitorIdFromClient(owner_id)).?.token;
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
+
+    try server.handleSessionResume(claimant_id, claimant, "sameacct", &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "attached to live session");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+    try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(owner_id), token));
+    try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(claimant_id), token));
+    try std.testing.expect(server.connFor(owner_id) != null);
+}
+
+test "threaded server: legacy consumed notice cannot delete a reusable session replica" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(std.testing.allocator);
+
+    const ghost_id = try addTestLocalClient(&server, "ghost", "alice");
+    const token = server.sessions.resumeHandleForClient("alice", monitorIdFromClient(ghost_id)).?.token;
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot("alice", monitorIdFromClient(ghost_id), "snapshot"));
+    try server.pending_migrations.?.put(.{ .token = token, .account = "alice", .snapshot = "remote-copy" }, 1);
+
+    server.applySessionConsumedNotice(.{ .session_token = token, .account = "alice", .nonce = 0xCAFE });
+    try std.testing.expect(server.sessions.findDetachedTokenSessionInAccount("alice", token) != null);
+    try std.testing.expect(server.pending_migrations.?.has(token));
+    try std.testing.expect(!server.pending_migrations.?.isConsumed(token));
+    try std.testing.expect(!server.session_reclaim_replay.contains(0xCAFE));
+}
+
+test "threaded server: migration staging isolates equal nonces from different peer signers" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(alloc);
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const key_a = try migration_relay.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xA1)));
+    const key_b = try migration_relay.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xB2)));
+    const token_a: session_migrate.Token = @splat(0x11);
+    const token_b: session_migrate.Token = @splat(0x22);
+
+    const Maker = struct {
+        fn make(allocator: std.mem.Allocator, key: migration_relay.KeyPair, token: session_migrate.Token, nick: []const u8) ![]u8 {
+            var origin = migration_relay.MigrationOrigin.init(allocator, key);
+            defer origin.deinit();
+            var prepared = try origin.prepare("alice", .{
+                .nick = nick,
+                .umodes = "+i",
+                .channels = &.{},
+                .account = "alice",
+            }, 1, 100);
+            defer prepared.deinit(allocator);
+            return session_migrate.encode(allocator, .{
+                .token = token,
+                .account = "alice",
+                .snapshot = prepared.frame_bytes,
+            });
+        }
+    };
+
+    const wire_a = try Maker.make(alloc, key_a, token_a, "from-a");
+    defer alloc.free(wire_a);
+    const wire_b = try Maker.make(alloc, key_b, token_b, "from-b");
+    defer alloc.free(wire_b);
+
+    // Both peers legitimately start their local relay nonce at 1. They must not
+    // collide in a node-global journal: signer verification is per frame and
+    // ordering is scoped to each bounded outer session token.
+    server.stageSessionMigration(&server.pending_migrations.?, key_a.public_key.toBytes(), wire_a);
+    server.stageSessionMigration(&server.pending_migrations.?, key_b.public_key.toBytes(), wire_b);
+    try std.testing.expect(server.pending_migrations.?.has(token_a));
+    try std.testing.expect(server.pending_migrations.?.has(token_b));
+    try std.testing.expectEqual(@as(usize, 2), server.pending_migrations.?.count());
+}
+
+test "threaded server: peer reconnect anti-entropy reoffers portable detached state" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xD7)), "local");
+    defer identity.deinit();
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const token: session_migrate.Token = @splat(0x44);
+    _ = try server.sessions.attach("alice", 77, token, 1);
+    try std.testing.expect(server.sessions.markPortableResumeIssued("alice", 77));
+    const snapshot = try (migration_relay.Snapshot{
+        .nick = "alice-phone",
+        .umodes = "+i",
+        .channels = &.{"#home"},
+        .channel_modes = &.{0},
+        .account = "alice",
+    }).encode(alloc);
+    defer alloc.free(snapshot);
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot("alice", 77, snapshot));
+
+    const CaptureLink = struct {
+        allocator: std.mem.Allocator,
+        wires: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn sendSessionMigrate(self: *@This(), wire: []const u8) !void {
+            const owned = try self.allocator.dupe(u8, wire);
+            errdefer self.allocator.free(owned);
+            try self.wires.append(self.allocator, owned);
+        }
+
+        fn peerShortId(_: *const @This()) ?u64 {
+            return null;
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.wires.items) |wire| self.allocator.free(wire);
+            self.wires.deinit(self.allocator);
+        }
+    };
+    var link = CaptureLink{ .allocator = alloc };
+    defer link.deinit();
+
+    // Each secured-link establishment re-offers the still-detached portable
+    // snapshot, with strictly increasing signed order metadata.
+    server.syncPortableSessions(&link);
+    server.syncPortableSessions(&link);
+    try std.testing.expectEqual(@as(usize, 2), link.wires.items.len);
+    const outer_1 = try session_migrate.decode(link.wires.items[0]);
+    const outer_2 = try session_migrate.decode(link.wires.items[1]);
+    try std.testing.expectEqualSlices(u8, &token, &outer_1.token);
+    try std.testing.expectEqualStrings("alice", outer_1.account);
+    var frame_1 = try migration_relay.decodeFrame(alloc, outer_1.snapshot);
+    defer frame_1.deinit(alloc);
+    var frame_2 = try migration_relay.decodeFrame(alloc, outer_2.snapshot);
+    defer frame_2.deinit(alloc);
+    try std.testing.expect(frame_2.token.epoch > frame_1.token.epoch);
+
+    // The ordinary receive path verifies the node signature and stages the
+    // snapshot under the exact local session token.
+    server.pending_migrations = session_migrate.PendingMigrations.init(alloc);
+    server.stageSessionMigration(&server.pending_migrations.?, identity.sign_kp.public_key, link.wires.items[1]);
+    const staged = server.pending_migrations.?.get(token) orelse return error.TestUnexpectedResult;
+    var restored = try migration_relay.Snapshot.decode(alloc, staged.snapshot);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("alice-phone", restored.nick);
+    try std.testing.expectEqualStrings("alice", restored.account);
+    try std.testing.expectEqualStrings("#home", restored.channels[0]);
+
+    // The operational kill switch covers reconnect reconciliation as well as
+    // the detach-time broadcast.
+    server.config.session_migrate_on_detach = false;
+    server.syncPortableSessions(&link);
+    try std.testing.expectEqual(@as(usize, 2), link.wires.items.len);
+}
+
+test "threaded server: session migration restore cannot switch the authenticated account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(alloc);
+
+    const claimant_id = try addTestLocalClient(&server, "alice-live", "alice");
+    const claimant = server.connFor(claimant_id).?;
+    const token: session_migrate.Token = @splat(0x33);
+    const malicious_snapshot = try (migration_relay.Snapshot{
+        .nick = "mallory",
+        .umodes = "+i",
+        .channels = &.{},
+        .account = "mallory",
+    }).encode(alloc);
+    defer alloc.free(malicious_snapshot);
+    try server.pending_migrations.?.put(.{
+        .token = token,
+        .account = "alice",
+        .snapshot = malicious_snapshot,
+    }, 1);
+
+    try std.testing.expect(!server.restoreStagedMigration(claimant_id, claimant, "alice", token));
+    try std.testing.expectEqualStrings("alice", claimant.session.account().?);
+    try std.testing.expect(server.pending_migrations.?.has(token));
 }
 
 test "threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens" {
@@ -38986,6 +39930,34 @@ test "threaded server: session reclaim crypto_io-null disables reclaim not const
     var resume_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
     try server.handleSessionResume(id, conn, "acct3", &resume_line);
     try expectContains(conn.send_buf[0..conn.send_len], "RESUME requires a valid session token");
+}
+
+test "threaded server: mesh reclaim credentials use portable wall-clock expiry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const mesh_key = "wall-clock-mesh-key";
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_pass = mesh_key,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const before = server.meshWallMs();
+    var token_hex_buf: [1024]u8 = undefined;
+    const token_hex = server.meshReclaimToken("wallacct", "0123456789abcdef0123456789abcdef", &token_hex_buf) orelse
+        return error.TestUnexpectedResult;
+    const after = server.meshWallMs();
+
+    var raw: [512]u8 = undefined;
+    const sealed = try std.fmt.hexToBytes(raw[0 .. token_hex.len / 2], token_hex);
+    const fields = try session_reclaim_mesh.open(mesh_key, sealed, after);
+    try std.testing.expect(fields.issued_ms >= before);
+    try std.testing.expect(fields.issued_ms <= after);
+    try std.testing.expectEqual(Server.mesh_reclaim_ttl_ms, fields.expiry_ms - fields.issued_ms);
 }
 
 test "threaded server: session tracking at cap with all slots attached is surfaced not fatal" {
@@ -42157,6 +43129,108 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     k2.reset();
     try writeAllFd(fd_k2, "PING probe2\r\n");
     try recvUntil(&k2, "PONG", 200);
+}
+
+test "threaded server: reusable session keeps all local clients live, synchronized, and participating" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-multi-attachment.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var cfg = operTestConfig(0);
+    cfg.crypto_io = std.testing.io;
+    cfg.account_services = &services;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_sender = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_sender);
+    const fd_one = connectLoopback(port) catch return error.SkipZigTest;
+    var one_open = true;
+    defer if (one_open) closeFd(fd_one);
+    const fd_two = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_two);
+    var sender = LiveClient{ .fd = fd_sender };
+    var one = LiveClient{ .fd = fd_one };
+    var two = LiveClient{ .fd = fd_two };
+
+    try writeAllFd(fd_sender, "NICK Sender\r\nUSER sender 0 * :Sender\r\n");
+    try recvUntil(&sender, " 001 Sender ", 200);
+
+    try saslPlainPreludeWithCaps(fd_one, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_one, "NICK kain\r\nUSER one 0 * :One\r\n");
+    try recvUntil(&one, " 001 kain ", 200);
+    try writeAllFd(fd_one, "JOIN #shared\r\n");
+    try recvUntil(&one, " 366 kain #shared ", 200);
+    one.reset();
+    try writeAllFd(fd_one, "SESSION TOKEN\r\n");
+    try recvUntil(&one, "SESSION TOKEN ", 200);
+    const marker = "SESSION TOKEN ";
+    const start = (std.mem.indexOf(u8, one.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
+    const tail = one.written()[start..];
+    const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
+    var token_buf: [64]u8 = undefined;
+    @memcpy(token_buf[0..token_len], tail[0..token_len]);
+    const token = token_buf[0..token_len];
+
+    // The second socket reaches 001, inherits #shared as a real member, then
+    // presents the SAME credential and joins the logical token group. The first
+    // socket remains connected throughout.
+    try saslPlainPreludeWithCaps(fd_two, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_two, "NICK kain\r\nUSER two 0 * :Two\r\n");
+    try recvUntil(&two, " 001 kain ", 200);
+    try recvUntil(&two, "JOIN #shared", 200);
+    var resume_buf: [128]u8 = undefined;
+    try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try recvUntil(&two, "attached to live session", 200);
+
+    one.reset();
+    two.reset();
+    try writeAllFd(fd_sender, "JOIN #shared\r\n");
+    try recvUntil(&sender, " 366 Sender #shared ", 200);
+    sender.reset();
+    try writeAllFd(fd_sender, "PRIVMSG #shared :event-to-every-client\r\n");
+    try recvUntil(&one, "PRIVMSG #shared :event-to-every-client", 200);
+    try recvUntil(&two, "PRIVMSG #shared :event-to-every-client", 200);
+
+    // Either attachment can act with the shared channel membership.
+    sender.reset();
+    one.reset();
+    try writeAllFd(fd_two, "PRIVMSG #shared :sent-from-second\r\n");
+    try recvUntil(&sender, "PRIVMSG #shared :sent-from-second", 200);
+    try recvUntil(&one, "PRIVMSG #shared :sent-from-second", 200);
+
+    // Losing the original world owner hands nick/channel ownership to the second
+    // attachment without an offline transition or disconnecting it.
+    closeFd(fd_one);
+    one_open = false;
+    testSleepMs(80);
+    two.reset();
+    try writeAllFd(fd_sender, "PRIVMSG kain :after-handoff\r\n");
+    try recvUntil(&two, "PRIVMSG kain :after-handoff", 200);
+    sender.reset();
+    try writeAllFd(fd_two, "PRIVMSG #shared :still-participating\r\n");
+    try recvUntil(&sender, "PRIVMSG #shared :still-participating", 200);
+
+    // TOKEN remains the group credential after handoff, not a newly minted
+    // per-owner secret.
+    two.reset();
+    try writeAllFd(fd_two, "SESSION TOKEN\r\n");
+    try recvUntil(&two, "SESSION TOKEN ", 200);
+    try expectContains(two.written(), token);
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {
@@ -51093,6 +52167,220 @@ test "threaded server: an UNPROVEN cross-node same-account claim grants no coexi
     try std.testing.expect(std.mem.indexOf(u8, s2.written(), "ping-mesh") == null);
 }
 
+test "threaded server: one reusable session stays live and participatory across a secured mesh" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+
+    var tmp1 = std.testing.tmpDir(.{});
+    defer tmp1.cleanup();
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var store1 = try services_mod.OroStore.open(alloc, std.testing.io, tmp1.dir, "mesh-session-node1.wal");
+    defer store1.deinit();
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp2.dir, "mesh-session-node2.wal");
+    defer store2.deinit();
+    var services1 = services_mod.Services.init(&store1, null);
+    var services2 = services_mod.Services.init(&store2, null);
+
+    var ident1 = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "mesh-session-test");
+    defer ident1.deinit();
+    var ident2 = try node_identity.fromSeed(@as([32]u8, @splat(0x92)), "mesh-session-test");
+    defer ident2.deinit();
+
+    // Boot the target first so node 1 can auto-dial its real ephemeral S2S port.
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = ident2.shortId(),
+        .server_name = "session-node2.test",
+        .node_identity = &ident2,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "mesh-session-shared-secret",
+        .require_secured = true,
+        .sasl_checker = test_dm_relay_checker,
+        .account_services = &services2,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+    node2.start();
+    const port2 = node2.boundPort() catch return error.SkipZigTest;
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    var node2_cleanup_owned = true;
+    errdefer if (node2_cleanup_owned) {
+        node2.requestStop(&run2);
+        thr2.join();
+    };
+
+    var peer_buf: [32]u8 = undefined;
+    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const peers = [_][]const u8{peer};
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = ident1.shortId(),
+        .server_name = "session-node1.test",
+        .node_identity = &ident1,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "mesh-session-shared-secret",
+        .require_secured = true,
+        .mesh_connect = &peers,
+        .sasl_checker = test_dm_relay_checker,
+        .account_services = &services1,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    node1.start();
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    var run1 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    node2_cleanup_owned = false;
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    // Do not issue the portable credential until the authenticated link is up;
+    // TOKEN must replicate the current live snapshot immediately.
+    const fd_probe = connectLoopback(port1) catch return error.SkipZigTest;
+    var probe = LiveClient{ .fd = fd_probe };
+    try writeAllFd(fd_probe, "NICK Probe\r\nUSER probe 0 * :Probe\r\n");
+    try recvUntil(&probe, " 001 Probe ", 200);
+    try expectMeshPeerVisible(&probe, "session-node2.test", 80);
+    closeFd(fd_probe);
+
+    const clients = try alloc.alloc(LiveClient, 4);
+    defer alloc.free(clients);
+    const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
+    var a_open = true;
+    defer if (a_open) closeFd(fd_a);
+    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const fd_sender = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_sender);
+    clients[0] = .{ .fd = fd_a };
+    clients[1] = .{ .fd = fd_b };
+    clients[2] = .{ .fd = fd_c };
+    clients[3] = .{ .fd = fd_sender };
+    const a = &clients[0];
+    const b = &clients[1];
+    const c = &clients[2];
+    const sender = &clients[3];
+
+    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", "orochi/session-sync");
+    try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Origin attachment\r\n");
+    try recvUntil(a, " 001 Ruri ", 200);
+    try writeAllFd(fd_a, "JOIN #mesh-session\r\n");
+    try recvUntil(a, " 366 Ruri #mesh-session ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(a, "SESSION MTOKEN ", 200);
+    const marker = "SESSION MTOKEN ";
+    const token_start = (std.mem.indexOf(u8, a.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
+    const token_tail = a.written()[token_start..];
+    const token_cr = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
+    const token_len = std.mem.indexOfScalar(u8, token_tail[0..token_cr], ' ') orelse token_cr;
+    if (token_len == 0 or token_len > 1024) return error.TestUnexpectedResult;
+    var token_buf: [1024]u8 = undefined;
+    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
+    const mesh_token = token_buf[0..token_len];
+
+    // Attach B on the other node. Retrying the same credential while the signed
+    // replica is in flight must be safe: no nonce burn and no source disconnect.
+    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", "orochi/session-sync");
+    try writeAllFd(fd_b, "NICK DeviceB\r\nUSER ruri 0 * :Mesh attachment B\r\n");
+    try recvUntil(b, " 001 DeviceB ", 200);
+    var resume_line: [1200]u8 = undefined;
+    const resume_cmd = try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{mesh_token});
+    var attached_b = false;
+    for (0..80) |_| {
+        b.reset();
+        try writeAllFd(fd_b, resume_cmd);
+        const retry_deadline = platform.monotonicMillis() + 250;
+        while (platform.monotonicMillis() < retry_deadline and
+            std.mem.indexOf(u8, b.written(), "attached to replicated mesh session") == null)
+        {
+            var retry_fds = [_]posix.pollfd{.{ .fd = fd_b, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&retry_fds, 20) catch return error.Unexpected;
+            if (ready != 0 and (retry_fds[0].revents & linux.POLL.IN) != 0) try b.readAvailable();
+        }
+        if (std.mem.indexOf(u8, b.written(), "attached to replicated mesh session") != null) {
+            attached_b = true;
+            break;
+        }
+        testSleepMs(15);
+    }
+    try std.testing.expect(attached_b);
+    try expectContains(b.written(), "JOIN #mesh-session");
+
+    // A second attachment on node 2 reuses the exact same staged replica while
+    // A and B remain live; no attachment owns or consumes the session.
+    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", "orochi/session-sync");
+    try writeAllFd(fd_c, "NICK DeviceC\r\nUSER ruri 0 * :Mesh attachment C\r\n");
+    try recvUntil(c, " 001 DeviceC ", 200);
+    c.reset();
+    try writeAllFd(fd_c, resume_cmd);
+    try recvUntil(c, "attached to live mesh session", 200);
+    try expectContains(c.written(), "JOIN #mesh-session");
+
+    // A neutral channel participant generates an event. Every attachment on
+    // both nodes sees it, and either remote attachment can participate.
+    try saslPlainPrelude(fd_sender, "kazu", "pw");
+    try writeAllFd(fd_sender, "NICK Kazu\r\nUSER kazu 0 * :Mesh sender\r\n");
+    try recvUntil(sender, " 001 Kazu ", 200);
+    try writeAllFd(fd_sender, "JOIN #mesh-session\r\n");
+    try recvUntil(sender, " 366 Kazu #mesh-session ", 200);
+    a.reset();
+    b.reset();
+    c.reset();
+    sender.reset();
+    try writeAllFd(fd_sender, "PRIVMSG #mesh-session :event-for-all-attachments\r\n");
+    try recvUntil(a, "PRIVMSG #mesh-session :event-for-all-attachments", 400);
+    try recvUntil(b, "PRIVMSG #mesh-session :event-for-all-attachments", 400);
+    try recvUntil(c, "PRIVMSG #mesh-session :event-for-all-attachments", 400);
+
+    a.reset();
+    b.reset();
+    sender.reset();
+    try writeAllFd(fd_c, "PRIVMSG #mesh-session :participating-from-node2\r\n");
+    try recvUntil(sender, "PRIVMSG #mesh-session :participating-from-node2", 400);
+    try recvUntil(a, "PRIVMSG #mesh-session :participating-from-node2", 400);
+    try recvUntil(b, "PRIVMSG #mesh-session :participating-from-node2", 400);
+
+    // Drop the original node-1 attachment. The logical identity remains online
+    // on node 2: both survivors still receive events and can send back over the
+    // mesh, proving this is multi-attachment rather than migration ownership.
+    closeFd(fd_a);
+    a_open = false;
+    testSleepMs(150);
+    b.reset();
+    c.reset();
+    sender.reset();
+    try writeAllFd(fd_sender, "PRIVMSG #mesh-session :after-origin-detach\r\n");
+    try recvUntil(b, "PRIVMSG #mesh-session :after-origin-detach", 400);
+    try recvUntil(c, "PRIVMSG #mesh-session :after-origin-detach", 400);
+    sender.reset();
+    c.reset();
+    try writeAllFd(fd_b, "PRIVMSG #mesh-session :survivor-can-still-send\r\n");
+    try recvUntil(sender, "PRIVMSG #mesh-session :survivor-can-still-send", 400);
+    try recvUntil(c, "PRIVMSG #mesh-session :survivor-can-still-send", 400);
+}
+
 // FIX 1: the RECEIVING node re-enforces ITS OWN channel policy against a remote
 // (mesh-relayed) actor. Two live nodes are meshed; node A's #c is set -n/-t so a
 // local non-op/non-member can legitimately speak/set-topic there and relay to
@@ -51602,10 +52890,12 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     });
     defer alloc.free(sess_blob);
     // ... and the `.sessions` registry capsule for its account: one attached
-    // session joined by fd, one detached bouncer ghost with a restore snapshot,
-    // and one attached session whose connection did not survive the swap.
+    // session joined by fd, another attachment carrying the SAME logical token
+    // whose socket was not carried, one detached bouncer ghost with a restore
+    // snapshot, and one unrelated attached session that also did not survive.
     const entries = [_]session_capsule.SessionEntry{
-        .{ .token = &tok_a, .signon_unix = 1111, .detached = false, .client = 0xDEAD, .fd = sp[0] },
+        .{ .token = &tok_a, .signon_unix = 1111, .detached = false, .client = 0xDEAD, .fd = sp[0], .portable_resume = true },
+        .{ .token = &tok_a, .signon_unix = 1112, .detached = false, .client = 0xBEEF, .fd = 99_998, .portable_resume = true },
         .{ .token = &tok_b, .signon_unix = 2222, .detached = true, .client = 777, .snapshot = "restore-blob" },
         .{ .token = &tok_c, .signon_unix = 3333, .detached = false, .client = 888, .fd = 99_999 },
     };
@@ -51645,6 +52935,23 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
         return error.TestUnexpectedResult;
     try std.testing.expect(attached.attached);
     try std.testing.expect(attached.client != 0xDEAD); // re-joined to the successor id
+    // The shared token remains a token GROUP: both rows survive atomically, the
+    // carried socket is attached, and the missing socket degrades to a detached
+    // attachment without rotating/consuming the credential or portability bit.
+    const rows = try server.sessions.copySessionsAlloc(alloc, "alice");
+    defer alloc.free(rows);
+    var shared_count: usize = 0;
+    var shared_attached: usize = 0;
+    var shared_detached: usize = 0;
+    for (rows) |row| {
+        if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, tok_a)) continue;
+        shared_count += 1;
+        if (row.attached) shared_attached += 1 else shared_detached += 1;
+        try std.testing.expect(row.portable_resume);
+    }
+    try std.testing.expectEqual(@as(usize, 2), shared_count);
+    try std.testing.expectEqual(@as(usize, 1), shared_attached);
+    try std.testing.expectEqual(@as(usize, 1), shared_detached);
     // (2) The detached bouncer ghost survived with token, identity, and a
     // byte-identical restore snapshot — SESSION RESUME finds it, not NO_SESSION.
     try std.testing.expectEqual(@as(u64, 777), server.sessions.findDetachedTokenInAccount("alice", tok_b).?);
@@ -51735,7 +53042,9 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     defer pred.deinit();
     pred.pending_migrations = session_migrate.PendingMigrations.init(alloc);
     const token: session_migrate.Token = @as([15]u8, @splat(0)) ++ .{9};
+    const consumed_token: session_migrate.Token = @as([15]u8, @splat(0)) ++ .{10};
     try pred.pending_migrations.?.put(.{ .token = token, .account = "kain", .snapshot = "verified-relay-snapshot" }, 1);
+    try pred.pending_migrations.?.markConsumed(consumed_token, 2);
 
     var blobs: std.ArrayList([]u8) = .empty;
     defer {
@@ -51745,6 +53054,7 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
     defer pieces.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), pred.sealPendingMigrations(&pieces, &blobs));
+    try std.testing.expectEqual(@as(usize, 1), pred.sealSessionTombstones(&pieces, &blobs));
 
     // Add a truncated (undecodable) piece too: the successor must skip it
     // cleanly while still adopting the good one (tolerant decode).
@@ -51780,6 +53090,8 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     defer pm.freeEntry(e);
     try std.testing.expectEqualStrings("kain", e.account);
     try std.testing.expectEqualStrings("verified-relay-snapshot", e.snapshot);
+    try std.testing.expect(pm.isConsumed(consumed_token));
+    try std.testing.expectError(error.AlreadyConsumed, pm.put(.{ .token = consumed_token, .account = "kain", .snapshot = "late" }, 3));
 }
 
 test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {

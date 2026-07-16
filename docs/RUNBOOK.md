@@ -86,9 +86,15 @@ systemctl reload orochi
 ```
 
 `ExecReload=/bin/kill -USR2 $MAINPID` asks the live daemon to re-exec in place. The
-successor inherits the listener and attempts to reattach live sessions from the sealed
+successor inherits every per-shard `SO_REUSEPORT` listener and attempts to reattach
+live client, TLS, WebSocket, session-registry, and secured-mesh state from the sealed
 Helix arena. The process PID remains under systemd control; systemd does not see a
 normal restart.
+
+The session registry preserves duplicate same-token attachment rows rather than
+electing a single owner. Portable flags, detached snapshots, and staged reusable mesh
+replicas are carried as well; adopted secured links immediately re-offer portable
+state so remote attachments remain authorized after re-exec.
 
 Verify after reload:
 
@@ -127,15 +133,29 @@ install -m 0755 /tmp/orochi-stage/bin/orochi /usr/local/bin/orochi
 systemctl reload orochi
 ```
 
-If the new image fails after reload:
+If the new image fails after reload and the previous binary supports the same
+multi-shard listener handoff (Orochi 0.5.2 or newer), a second reload is allowed:
 
 ```sh
 install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
-systemctl reload orochi || systemctl restart orochi
+systemctl reload orochi
 ```
 
-Prefer a second reload for rollback. Use restart only if the process is already failed
-or the reload path itself is broken.
+**Compatibility boundary:** never hot-roll back a multi-shard node from Orochi 0.5.2
+or newer to a pre-0.5.2 binary. The newer predecessor passes one inherited listener
+fd per shard through `OROCHI_HELIX_LISTEN_FDS`; an older successor only adopts shard
+0 and leaves the sibling fds open but unserved. Because those fds remain in the
+`SO_REUSEPORT` group, a share of new connections is silently hashed into queues no
+reactor accepts. Use a cold restart for that rollback:
+
+```sh
+install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
+systemctl restart orochi
+```
+
+Use a cold restart as well when the process is already failed, the reload path is
+broken, or listener-handoff compatibility is unknown. This drops sessions, but it
+closes every inherited listener and rebuilds the complete shard set safely.
 
 ## Health Checks
 

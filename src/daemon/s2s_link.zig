@@ -510,6 +510,14 @@ pub const S2sLink = struct {
         return self.peer.takeSessionMigrations();
     }
 
+    pub fn sendSessionMigrateConsumed(self: *S2sLink, payload: []const u8) !void {
+        try self.peer.sendSessionMigrateConsumed(self.sink(), payload);
+    }
+
+    pub fn takeSessionMigrateConsumed(self: *S2sLink) ![][]u8 {
+        return self.peer.takeSessionMigrateConsumed();
+    }
+
     /// Emit a CLONE_COUNT batch (`mesh_clones` counts bytes) to this peer.
     pub fn sendCloneCounts(self: *S2sLink, payload: []const u8) !void {
         try self.peer.sendCloneCounts(self.sink(), payload);
