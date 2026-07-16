@@ -430,6 +430,17 @@ pub const S2sLink = struct {
         return self.peer.takeNickChanges();
     }
 
+    /// Transfer the next MEMBERSHIP/NICK delta in peer application order.
+    pub fn takeNextIdentityTransition(self: *S2sLink) ?s2s_peer.S2sPeer.IdentityTransition {
+        return self.peer.takeNextIdentityTransition();
+    }
+
+    /// Peek a leading membership delta so the daemon can retain NETJOIN batching
+    /// without crossing an intervening NICK transition.
+    pub fn peekNextMembershipTransition(self: *const S2sLink) ?*const s2s_peer.S2sPeer.MembershipDelta {
+        return self.peer.peekNextMembershipTransition();
+    }
+
     /// Remote members the peer has announced for `channel` (borrowed roster).
     pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return self.peer.channelMembers(channel);

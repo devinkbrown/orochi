@@ -449,6 +449,11 @@ pub const S2sPeer = struct {
     /// as live `:nick JOIN/PART #chan` lines to local members. Re-affirmations
     /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
     membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
+    /// Wire/application order shared by MEMBERSHIP and NICKCHANGE deltas. The
+    /// payloads remain in their long-standing typed queues for compatibility;
+    /// these markers let the daemon drain an identity transition atomically in
+    /// the same order in which the route table accepted it.
+    identity_transition_order: std.ArrayListUnmanaged(IdentityTransitionKind) = .empty,
     /// Remote aggregate channel MODE flag changes that won the LWW route-table
     /// state, awaiting the daemon to apply them to the local world and emit MODE.
     channel_mode_flag_changes: std.ArrayListUnmanaged(ChannelModeFlagsDelta) = .empty,
@@ -713,6 +718,7 @@ pub const S2sPeer = struct {
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
         self.membership_changes.deinit(self.allocator);
+        self.identity_transition_order.deinit(self.allocator);
         for (self.channel_mode_flag_changes.items) |*d| d.deinit(self.allocator);
         self.channel_mode_flag_changes.deinit(self.allocator);
         for (self.channel_mode_state_changes.items) |*d| d.deinit(self.allocator);
@@ -1581,7 +1587,9 @@ pub const S2sPeer = struct {
     /// Drain the queued remote membership changes. Caller owns the slice and each
     /// delta's strings (call `deinit` per entry, then free the slice).
     pub fn takeMembershipChanges(self: *S2sPeer) ![]MembershipDelta {
-        return self.membership_changes.toOwnedSlice(self.allocator);
+        const changes = try self.membership_changes.toOwnedSlice(self.allocator);
+        self.discardIdentityTransitionMarkers(.membership);
+        return changes;
     }
 
     /// A remote channel's aggregate boolean MODE flags changed. `channel` is
@@ -1758,6 +1766,15 @@ pub const S2sPeer = struct {
         }
     };
 
+    pub const IdentityTransitionKind = enum { membership, nick };
+
+    /// One identity transition in the exact order accepted by this peer. The
+    /// caller owns the selected delta and must call its `deinit` method.
+    pub const IdentityTransition = union(IdentityTransitionKind) {
+        membership: MembershipDelta,
+        nick: NickDelta,
+    };
+
     /// Drain remote channel topic changes. Caller owns the slice + each delta's
     /// strings (call `deinit` per entry, then free the slice).
     pub fn takeTopicChanges(self: *S2sPeer) ![]TopicDelta {
@@ -1767,7 +1784,46 @@ pub const S2sPeer = struct {
     /// Drain remote user nick changes. Caller owns the slice + each delta's
     /// strings (call `deinit` per entry, then free the slice).
     pub fn takeNickChanges(self: *S2sPeer) ![]NickDelta {
-        return self.nick_changes.toOwnedSlice(self.allocator);
+        const changes = try self.nick_changes.toOwnedSlice(self.allocator);
+        self.discardIdentityTransitionMarkers(.nick);
+        return changes;
+    }
+
+    /// Peek the next ordered membership transition without transferring it.
+    /// Returns null when the queue is empty or a NICK must be observed first.
+    pub fn peekNextMembershipTransition(self: *const S2sPeer) ?*const MembershipDelta {
+        if (self.identity_transition_order.items.len == 0 or
+            self.identity_transition_order.items[0] != .membership or
+            self.membership_changes.items.len == 0)
+        {
+            return null;
+        }
+        return &self.membership_changes.items[0];
+    }
+
+    /// Transfer the next MEMBERSHIP/NICK delta in application order.
+    pub fn takeNextIdentityTransition(self: *S2sPeer) ?IdentityTransition {
+        if (self.identity_transition_order.items.len == 0) return null;
+        return switch (self.identity_transition_order.orderedRemove(0)) {
+            .membership => blk: {
+                std.debug.assert(self.membership_changes.items.len != 0);
+                break :blk .{ .membership = self.membership_changes.orderedRemove(0) };
+            },
+            .nick => blk: {
+                std.debug.assert(self.nick_changes.items.len != 0);
+                break :blk .{ .nick = self.nick_changes.orderedRemove(0) };
+            },
+        };
+    }
+
+    fn discardIdentityTransitionMarkers(self: *S2sPeer, kind: IdentityTransitionKind) void {
+        var write: usize = 0;
+        for (self.identity_transition_order.items) |queued| {
+            if (queued == kind) continue;
+            self.identity_transition_order.items[write] = queued;
+            write += 1;
+        }
+        self.identity_transition_order.shrinkRetainingCapacity(write);
     }
 
     /// Drain origin-mismatch + signature-rejection counts for daemon-side audit
@@ -2179,7 +2235,10 @@ pub const S2sPeer = struct {
     ) !void {
         var delta = try self.ownedNickDelta(old_nick, new_nick, ident);
         errdefer delta.deinit(self.allocator);
-        try self.nick_changes.append(self.allocator, delta);
+        try self.nick_changes.ensureUnusedCapacity(self.allocator, 1);
+        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
+        self.nick_changes.appendAssumeCapacity(delta);
+        self.identity_transition_order.appendAssumeCapacity(.nick);
     }
 
     /// Build one fully-owned NICK delta without publishing it. Collision
@@ -2239,6 +2298,7 @@ pub const S2sPeer = struct {
         var exact_delta_owned = true;
         defer if (exact_delta_owned) exact_delta.deinit(self.allocator);
         try self.nick_changes.ensureUnusedCapacity(self.allocator, 2);
+        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 2);
 
         const renamed = try self.routes.renameNickBindingSessionTokenDisplacing(
             node,
@@ -2254,8 +2314,10 @@ pub const S2sPeer = struct {
         // Vacate the contested nick before publishing the exact winner, matching
         // IRC's required observable order while both state mutations are atomic.
         self.nick_changes.appendAssumeCapacity(incumbent_delta);
+        self.identity_transition_order.appendAssumeCapacity(.nick);
         incumbent_delta_owned = false;
         self.nick_changes.appendAssumeCapacity(exact_delta);
+        self.identity_transition_order.appendAssumeCapacity(.nick);
         exact_delta_owned = false;
         return true;
     }
@@ -2312,7 +2374,9 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(st);
         const ac = try self.allocator.dupe(u8, account_value);
         errdefer self.allocator.free(ac);
-        try self.membership_changes.append(self.allocator, .{
+        try self.membership_changes.ensureUnusedCapacity(self.allocator, 1);
+        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
+        self.membership_changes.appendAssumeCapacity(.{
             .channel = ch,
             .nick = nk,
             .username = un,
@@ -2324,6 +2388,7 @@ pub const S2sPeer = struct {
             .status = status,
             .prev_status = prev_status,
         });
+        self.identity_transition_order.appendAssumeCapacity(.membership);
     }
 
     /// Apply an inbound CHANNEL_MODE_FLAGS event to the route table (LWW by hlc).
@@ -3550,6 +3615,91 @@ fn newPeer(
             },
         },
     });
+}
+
+test "identity transition queue preserves mixed order and legacy drains discard matching markers" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "a.test");
+    defer peer.deinit();
+    const ident = MemberIdentity{ .username = "device", .realname = "Device B", .host = "mesh.test" };
+
+    try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
+    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+
+    var first = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (first) {
+        .membership => |*change| {
+            try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, change.kind);
+            try std.testing.expectEqualStrings("#old", change.channel);
+            change.deinit(allocator);
+        },
+        .nick => return error.TestUnexpectedResult,
+    }
+    var second = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (second) {
+        .nick => |*change| {
+            try std.testing.expectEqualStrings("DeviceB", change.old_nick);
+            try std.testing.expectEqualStrings("Ruri", change.new_nick);
+            change.deinit(allocator);
+        },
+        .membership => return error.TestUnexpectedResult,
+    }
+    var third = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (third) {
+        .membership => |*change| {
+            try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, change.kind);
+            try std.testing.expectEqualStrings("#new", change.channel);
+            change.deinit(allocator);
+        },
+        .nick => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(peer.takeNextIdentityTransition() == null);
+
+    // Historical typed drains remain valid: taking only memberships removes
+    // only membership markers, leaving the intervening NICK as the next mixed
+    // transition instead of stranding stale markers behind empty typed queues.
+    try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
+    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+    const memberships = try peer.takeMembershipChanges();
+    defer allocator.free(memberships);
+    try std.testing.expectEqual(@as(usize, 2), memberships.len);
+    for (memberships) |*change| change.deinit(allocator);
+    var remaining = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (remaining) {
+        .nick => |*change| change.deinit(allocator),
+        .membership => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(peer.takeNextIdentityTransition() == null);
+
+    try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
+    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+    const nicks = try peer.takeNickChanges();
+    defer allocator.free(nicks);
+    try std.testing.expectEqual(@as(usize, 1), nicks.len);
+    for (nicks) |*change| change.deinit(allocator);
+    var old_part = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (old_part) {
+        .membership => |*change| {
+            try std.testing.expectEqualStrings("#old", change.channel);
+            change.deinit(allocator);
+        },
+        .nick => return error.TestUnexpectedResult,
+    }
+    var new_join = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
+    switch (new_join) {
+        .membership => |*change| {
+            try std.testing.expectEqualStrings("#new", change.channel);
+            change.deinit(allocator);
+        },
+        .nick => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(peer.takeNextIdentityTransition() == null);
 }
 
 test "two s2s peer drivers handshake and converge channel CRDT state" {

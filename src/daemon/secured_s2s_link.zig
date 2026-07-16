@@ -619,6 +619,18 @@ pub const SecuredLink = struct {
         return link.takeNickChanges();
     }
 
+    /// Transfer the next MEMBERSHIP/NICK delta in peer application order.
+    pub fn takeNextIdentityTransition(self: *SecuredLink) ?s2s_peer.S2sPeer.IdentityTransition {
+        const link = self.inner orelse return null;
+        return link.takeNextIdentityTransition();
+    }
+
+    /// Peek a leading membership delta without crossing an intervening NICK.
+    pub fn peekNextMembershipTransition(self: *const SecuredLink) ?*const s2s_peer.S2sPeer.MembershipDelta {
+        const link = self.inner orelse return null;
+        return link.peekNextMembershipTransition();
+    }
+
     /// Forward a cross-node user message over the secured CRDT link.
     pub fn sendMessage(self: *SecuredLink, msg: s2s_link.RelayMessage) anyerror!void {
         const link = self.inner orelse return;

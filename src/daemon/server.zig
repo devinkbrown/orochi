@@ -508,7 +508,7 @@ const default_motd_template =
 /// The name is route-only and never surfaces to users: it leads with `~`, which no
 /// channel-name validator accepts (`world.isChannelName` only takes `#`/`&`/`%`;
 /// `svc_forceaction.isChannelName` adds `+`/`!`), so it can't be JOINed/NAMEd/LISTed
-/// and is never created as a `world` channel; `drainMembershipChanges` also skips it
+/// and is never created as a `world` channel; the identity-transition drain also skips it
 /// so no fabricated JOIN/PART leaks. It must stay printable & space-free: the
 /// MEMBERSHIP codec (`membership_event.decode`) rejects control bytes (<0x20) in the
 /// channel field, so a control-char sentinel would be silently dropped on receive.
@@ -2114,6 +2114,71 @@ const max_carried_silence_masks = 256;
 
 const AcceptKind = enum { plain, tls, ws };
 
+const DeferredSessionMeshPart = struct {
+    len: u8,
+    bytes: [migration_relay.max_snapshot_channel_len]u8 = undefined,
+
+    fn init(name: []const u8) error{InvalidChannel}!DeferredSessionMeshPart {
+        if (name.len > migration_relay.max_snapshot_channel_len) return error.InvalidChannel;
+        var result = DeferredSessionMeshPart{ .len = @intCast(name.len) };
+        @memcpy(result.bytes[0..name.len], name);
+        return result;
+    }
+
+    fn channel(self: *const DeferredSessionMeshPart) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const DeferredSessionMeshIdentity = struct {
+    username_len: u8 = 0,
+    username: [64]u8 = undefined,
+    realname_len: u16 = 0,
+    realname: [256]u8 = undefined,
+    host_len: u8 = 0,
+    host: [255]u8 = undefined,
+    account_len: u8 = 0,
+    account: [64]u8 = undefined,
+    real_host_len: u8 = 0,
+    real_host: [255]u8 = undefined,
+    certfp_len: u8 = 0,
+    certfp: [255]u8 = undefined,
+
+    fn init(conn: *const ConnState) DeferredSessionMeshIdentity {
+        var result = DeferredSessionMeshIdentity{};
+        const username = conn.session.username();
+        result.username_len = @intCast(@min(username.len, result.username.len));
+        @memcpy(result.username[0..result.username_len], username[0..result.username_len]);
+        const realname = conn.session.realname();
+        result.realname_len = @intCast(@min(realname.len, result.realname.len));
+        @memcpy(result.realname[0..result.realname_len], realname[0..result.realname_len]);
+        const visible_host = hostOf(conn);
+        result.host_len = @intCast(@min(visible_host.len, result.host.len));
+        @memcpy(result.host[0..result.host_len], visible_host[0..result.host_len]);
+        const account = conn.session.account() orelse "";
+        result.account_len = @intCast(@min(account.len, result.account.len));
+        @memcpy(result.account[0..result.account_len], account[0..result.account_len]);
+        const real_host = conn.session.realHost();
+        result.real_host_len = @intCast(@min(real_host.len, result.real_host.len));
+        @memcpy(result.real_host[0..result.real_host_len], real_host[0..result.real_host_len]);
+        const certfp_value = conn.session.tls_certfp orelse "";
+        result.certfp_len = @intCast(@min(certfp_value.len, result.certfp.len));
+        @memcpy(result.certfp[0..result.certfp_len], certfp_value[0..result.certfp_len]);
+        return result;
+    }
+
+    fn view(self: *const DeferredSessionMeshIdentity) s2s_link.S2sLink.MemberIdentity {
+        return .{
+            .username = self.username[0..self.username_len],
+            .realname = self.realname[0..self.realname_len],
+            .host = self.host[0..self.host_len],
+            .account = self.account[0..self.account_len],
+            .real_host = self.real_host[0..self.real_host_len],
+            .certfp = self.certfp[0..self.certfp_len],
+        };
+    }
+};
+
 pub const ConnState = struct {
     fd: linux.fd_t = -1,
     token: RingFdToken = .{ .slot = 0, .gen = 0 },
@@ -2194,11 +2259,17 @@ pub const ConnState = struct {
     /// immediate; only the compatibility sidecars are deferred here.
     session_mesh_announce_pending: bool = false,
     session_mesh_announce_token_bound: bool = false,
+    session_mesh_announce_requires_authority: bool = false,
     session_mesh_announce_token: sessions_mod.Token = @splat(0),
     session_mesh_announce_old_retracted: bool = false,
     session_mesh_announce_nick_change: bool = false,
     session_mesh_announce_old_nick_len: u8 = 0,
     session_mesh_announce_old_nick: [64]u8 = @splat(0),
+    session_mesh_announce_old_identity: DeferredSessionMeshIdentity = .{},
+    /// Exact old-prefix channel departures retained until every peer accepts the
+    /// restore sidecar. Inline channel storage keeps retry bytes independent of
+    /// World keys that the atomic restore may destroy at commit.
+    session_mesh_announce_parts: []DeferredSessionMeshPart = &.{},
     /// When this connection took a REGISTERED nick while unauthenticated (UNIX ms;
     /// 0 = nick is free / owned by this account). The sweep enforces the grace.
     nick_claimed_at_ms: i64 = 0,
@@ -4569,6 +4640,7 @@ pub const LinuxServer = struct {
                         self.allocator.destroy(w);
                         slot.value.ws = null;
                     }
+                    self.clearDeferredSessionMeshParts(&slot.value);
                     closeFd(slot.value.fd);
                 }
             }
@@ -6915,11 +6987,8 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
-        // NICK precedes MEMBERSHIP in authority-first restore/reconcile batches;
-        // preserve that event order after the peer's frame-family queues split.
-        self.drainNickChanges(link);
-        // Surface remote channel JOIN/PART to local members in real time.
-        self.drainMembershipChanges(link);
+        // Surface identity transitions in the exact order accepted by the peer.
+        self.drainIdentityTransitions(link);
         // Apply/surface remote aggregate channel MODE flag changes in real time.
         self.drainChannelModeFlagChanges(link);
         // Apply/surface remote parameter/IRCX channel MODE state in real time.
@@ -7093,10 +7162,8 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
-        // Preserve NICK-before-MEMBERSHIP ordering after family queueing.
-        self.drainNickChanges(link);
-        // Surface remote channel JOIN/PART to local members in real time.
-        self.drainMembershipChanges(link);
+        // Surface identity transitions in the exact order accepted by the peer.
+        self.drainIdentityTransitions(link);
         // Apply/surface remote aggregate channel MODE flag changes in real time.
         self.drainChannelModeFlagChanges(link);
         // Apply/surface remote parameter/IRCX channel MODE state in real time.
@@ -9181,11 +9248,12 @@ pub const LinuxServer = struct {
             // path intentionally skips broadcastQuit, but a pre-restore Device*
             // PRESENCE route still needs explicit retirement if authority never
             // became publishable.
-            self.retractDeferredSessionMeshIdentity(id, conn);
+            const identity_remains = local_identity_remains or remote_identity_may_remain;
+            self.retractDeferredSessionMeshIdentity(id, conn, identity_remains);
+            self.clearDeferredSessionMeshParts(conn);
             // Transport loss is not logical-session loss while another local
             // attachment remains. Hand off nick ownership and channel state
             // before any offline/QUIT side effect is emitted.
-            const identity_remains = local_identity_remains or remote_identity_may_remain;
             // Hold this nick against reuse for the nick-delay window before the
             // world drops it. No-op on a clean QUIT (handleQuit already held +
             // removed the nick) and for anonymous/unregistered/shared sessions.
@@ -11801,7 +11869,7 @@ pub const LinuxServer = struct {
                 self.broadcastChannel(ch.channel, line, null) catch {};
             },
             .status => self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status, ch.setter),
-            // Not a roster transition — handled in drainMembershipChanges, never
+            // Not a roster transition — handled in drainIdentityTransitions, never
             // surfaced as an IRC line here.
             .ghost_reclaim => {},
         }
@@ -11934,57 +12002,61 @@ pub const LinuxServer = struct {
         self.broadcastChannel(channel, line, null) catch {};
     }
 
-    /// Drain a link's remote membership changes and surface each as live IRC.
-    /// A run of consecutive joins to the SAME channel — as a link-up membership
-    /// burst delivers them — is wrapped in one IRCv3 `netjoin` BATCH (cap-gated)
-    /// so rejoining users collapse client-side instead of arriving as a flood of
-    /// bare JOINs; everything else stays an individual live line. Frees the
-    /// drained slice + each delta's owned strings.
-    fn drainMembershipChanges(self: *LinuxServer, link: anytype) void {
-        const changes = link.takeMembershipChanges() catch return;
-        defer self.allocator.free(changes);
+    /// Drain MEMBERSHIP and NICKCHANGE through their shared peer-application
+    /// order. A resume transition may deliberately arrive as PART(old nick),
+    /// NICK(old -> new), JOIN(new nick); draining the historical typed queues in
+    /// family order rewrote that sequence and exposed impossible client state.
+    /// Consecutive same-channel JOINs are still grouped into bounded NETJOIN
+    /// batches, but an intervening NICK is now an ordering barrier.
+    fn drainIdentityTransitions(self: *LinuxServer, link: anytype) void {
         const remote = link.remoteName();
-        // Modern secured peers converge reusable sessions through the signed,
-        // token-bearing SESSION_REPLICA snapshot drained before this queue. A
-        // MEMBERSHIP delta carries no token, so account+nick is never sufficient
-        // to mutate local attachments on a v2 link (especially when a decoy
-        // session intentionally shares both). Keep the old fold only for a
-        // rolling-version peer that did not negotiate v2.
-        if (!link.supportsSessionReplicaV2()) {
-            for (changes) |*change| {
-                _ = self.foldLegacySessionMembership(link, change, remote);
-            }
-        }
-        var i: usize = 0;
-        while (i < changes.len) {
-            if (changes[i].kind == .joined) {
-                const chan = changes[i].channel;
-                var j = i;
-                while (j < changes.len and changes[j].kind == .joined and
-                    std.mem.eql(u8, changes[j].channel, chan)) : (j += 1)
-                {}
-                // The PRESENCE pseudo-channel is route-only: applyMembership already
-                // updated the route_table; never surface it to clients as a JOIN.
-                if (!isPresenceChannel(chan)) {
-                    if (j - i >= 2) {
-                        self.emitNetjoinRun(chan, remote, changes[i..j]);
-                    } else {
-                        self.emitRemoteMembership(&changes[i], remote);
+        const fold_legacy = !link.supportsSessionReplicaV2();
+
+        while (link.takeNextIdentityTransition()) |queued| {
+            var transition = queued;
+            switch (transition) {
+                .nick => |*d| {
+                    self.emitRemoteNick(d, remote, link);
+                    d.deinit(self.allocator);
+                },
+                .membership => |*first| {
+                    if (fold_legacy) _ = self.foldLegacySessionMembership(link, first, remote);
+                    if (first.kind != .joined) {
+                        if (first.kind == .ghost_reclaim) {
+                            self.reclaimGhostSession(first);
+                        } else if (!isPresenceChannel(first.channel)) {
+                            self.emitRemoteMembership(first, remote);
+                        }
+                        first.deinit(self.allocator);
+                        continue;
                     }
-                }
-                for (changes[i..j]) |*ch| ch.deinit(self.allocator);
-                i = j;
-            } else if (changes[i].kind == .ghost_reclaim) {
-                // Not a roster line: retire the stale local session holding this nick
-                // in favour of the live remote one (same account, strictly-newer
-                // mesh claim — already gated by the route table).
-                self.reclaimGhostSession(&changes[i]);
-                changes[i].deinit(self.allocator);
-                i += 1;
-            } else {
-                if (!isPresenceChannel(changes[i].channel)) self.emitRemoteMembership(&changes[i], remote);
-                changes[i].deinit(self.allocator);
-                i += 1;
+
+                    var run: [mesh_batch_chunk]s2s_peer_mod.S2sPeer.MembershipDelta = undefined;
+                    run[0] = first.*;
+                    var count: usize = 1;
+                    while (count < run.len) {
+                        const next = link.peekNextMembershipTransition() orelse break;
+                        if (next.kind != .joined or !std.mem.eql(u8, next.channel, run[0].channel)) break;
+                        var next_transition = link.takeNextIdentityTransition() orelse unreachable;
+                        switch (next_transition) {
+                            .membership => |*change| {
+                                if (fold_legacy) _ = self.foldLegacySessionMembership(link, change, remote);
+                                run[count] = change.*;
+                                count += 1;
+                            },
+                            .nick => unreachable,
+                        }
+                    }
+
+                    if (!isPresenceChannel(run[0].channel)) {
+                        if (count >= 2) {
+                            self.emitNetjoinRun(run[0].channel, remote, run[0..count]);
+                        } else {
+                            self.emitRemoteMembership(&run[0], remote);
+                        }
+                    }
+                    for (run[0..count]) |*change| change.deinit(self.allocator);
+                },
             }
         }
     }
@@ -12478,19 +12550,6 @@ pub const LinuxServer = struct {
         var buf: [900]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ prefix, ch.channel, ch.topic }) catch return;
         self.broadcastChannel(ch.channel, line, null) catch {};
-    }
-
-    /// Drain remote user nick changes: the route table already renamed the user
-    /// in its rosters, so here we only surface a live `:old!u@h NICK new` line to
-    /// each local client sharing a channel with the renamed user (deduped).
-    fn drainNickChanges(self: *LinuxServer, link: anytype) void {
-        const changes = link.takeNickChanges() catch return;
-        const remote = link.remoteName();
-        for (changes) |*d| {
-            self.emitRemoteNick(d, remote, link);
-            d.deinit(self.allocator);
-        }
-        self.allocator.free(changes);
     }
 
     fn emitRemoteNick(self: *LinuxServer, d: anytype, remote_name: []const u8, link: anytype) void {
@@ -13438,6 +13497,22 @@ pub const LinuxServer = struct {
     }
 
     fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8, depth: u8) !void {
+        return self.joinOneWith(id, conn, channel, key, depth, false);
+    }
+
+    /// Join implementation with one internal-only exception for IRCX CREATE's
+    /// cloned-channel path. CREATE pre-seats its founder to bypass inherited
+    /// +i/+k gates; `prejoined_create` preserves that bypass while still treating
+    /// the seat as a new logical JOIN for rendering, persistence, and mesh sync.
+    fn joinOneWith(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        channel: []const u8,
+        key: ?[]const u8,
+        depth: u8,
+        prejoined_create: bool,
+    ) !void {
         // Reject malformed or over-long channel names (CHANNELLEN, advertised in
         // ISUPPORT and enforced here — the name validator checks only the prefix).
         if (!world_model.isChannelName(channel) or channel.len > self.config.channellen) {
@@ -13476,7 +13551,7 @@ pub const LinuxServer = struct {
             if (try self.joinDenied(conn, id, channel, key, fwd_quiet)) {
                 if (fwd_quiet) {
                     if (try self.forwardTarget(conn, channel, depth, &fwd_buf)) |target| {
-                        return self.joinOne(id, conn, target, null, depth + 1);
+                        return self.joinOneWith(id, conn, target, null, depth + 1, false);
                     }
                     _ = try self.joinDenied(conn, id, channel, key, false);
                 }
@@ -13515,7 +13590,7 @@ pub const LinuxServer = struct {
                 } else {
                     // +l full: redirect to +f forward target if set, else hard 471.
                     if (try self.forwardTarget(conn, channel, depth, &fwd_buf)) |target| {
-                        return self.joinOne(id, conn, target, null, depth + 1);
+                        return self.joinOneWith(id, conn, target, null, depth + 1, false);
                     }
                     try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
                     return;
@@ -13539,6 +13614,7 @@ pub const LinuxServer = struct {
 
         const pre_join_modes = self.world.memberModes(join_target, wid);
         const newly_joined = try self.world.join(join_target, wid);
+        const logical_joined = newly_joined or prejoined_create;
         if (creating) {
             try self.publishChannelEvent("CREATE", join_target);
             // KEEPTOPIC: restore a registered channel's saved topic on recreation,
@@ -13580,7 +13656,7 @@ pub const LinuxServer = struct {
         // Gate on the +j umode (not the bare oper_override privilege): an oper
         // WITHOUT +j has no override authority and still needs founder-by-creation to
         // manage what it creates.
-        if (newly_joined and conn.session.hasUmode(.override)) {
+        if (logical_joined and conn.session.hasUmode(.override)) {
             if (self.world.memberModes(join_target, wid)) |mm| {
                 if (mm.contains(.founder))
                     _ = self.world.setMemberMode(join_target, wid, .founder, false) catch {};
@@ -13650,7 +13726,7 @@ pub const LinuxServer = struct {
             }
         }
 
-        if (newly_joined) try self.broadcastJoin(join_target, conn);
+        if (logical_joined) try self.broadcastJoin(join_target, conn);
         // The JOIN is one logical identity event for existing channel members.
         // After that broadcast, attach every sibling transport to the World row
         // and bootstrap that socket with its own JOIN/topic/NAMES view.
@@ -13662,11 +13738,11 @@ pub const LinuxServer = struct {
         // A re-JOIN may still change status through a tiered key or ACCESS grant;
         // identical re-JOINs mint no revision.
         const pre_join_bits = if (pre_join_modes) |modes| modes.bits else 0;
-        if (newly_joined or pre_join_bits != jmodes.bits) _ = self.commitPortableSessionMutation(id, conn);
+        if (logical_joined or pre_join_bits != jmodes.bits) _ = self.commitPortableSessionMutation(id, conn);
         // Spamtrap: a non-oper joining an operator-designated honeypot channel
         // trips the trap (oper alert + offender flag). Lock-free no-op when no
         // channel traps are configured.
-        if (newly_joined) {
+        if (logical_joined) {
             self.spamtrapCheck(conn.session.displayName(), .channel, join_target, conn.session.isOper());
             try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
             // Standing OBSERVE feed: fire the join action so an oper watching a
@@ -13680,7 +13756,7 @@ pub const LinuxServer = struct {
             const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ join_target, flags }, null);
             try self.broadcastChannel(join_target, msg, null);
         }
-        if (newly_joined) {
+        if (logical_joined) {
             try self.sendTopicReply(conn, join_target);
             // draft/no-implicit-names: a capable client suppresses the automatic
             // NAMES burst on JOIN (it can still request NAMES explicitly).
@@ -13697,11 +13773,11 @@ pub const LinuxServer = struct {
 
         // Propagate this membership to mesh peers (status = the joiner's modes,
         // e.g. founder on a freshly created/cloned channel).
-        if ((newly_joined or pre_join_bits != jmodes.bits) and !conn.session_mesh_announce_pending)
+        if ((logical_joined or pre_join_bits != jmodes.bits) and !conn.session_mesh_announce_pending)
             self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn), "");
 
         // IRCX ONJOIN: deliver the channel's on-join message PROP to the joiner.
-        if (newly_joined) self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
+        if (logical_joined) self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
     }
 
     /// Deliver a channel's IRCX on-join/on-part message PROP (ONJOIN/ONPART) to a
@@ -18468,7 +18544,9 @@ pub const LinuxServer = struct {
                     continue;
                 }
                 const id = slotClientId(reactor, i, slot.gen);
-                if (conn.session_mesh_announce_token_bound) {
+                if (conn.session_mesh_announce_token_bound and
+                    !self.deferredSessionMeshAuthorityReady(id, conn))
+                {
                     _ = self.publishCurrentSessionReplicaToken(conn.session_mesh_announce_token);
                     if (self.deferredSessionMeshAuthorityReady(id, conn)) {
                         self.flushDeferredSessionMeshAnnouncements(id, conn);
@@ -24688,9 +24766,9 @@ pub const LinuxServer = struct {
             // Seat the creator as founder of the just-cloned (empty) channel before
             // joinOne so it skips the join gates — the channel now carries the
             // template's modes (which could be +i/+k) but the creator owns it.
-            _ = self.world.join(req.channel, worldIdFromClient(id)) catch {};
+            _ = try self.world.join(req.channel, worldIdFromClient(id));
         }
-        try self.joinOne(id, conn, req.channel, null, 0);
+        try self.joinOneWith(id, conn, req.channel, null, 0, req.clone_from != null);
         if (req.clone_from != null) {
             // joinOne suppresses the founder-MODE broadcast on a pre-existing
             // (cloned) channel; announce the inherited channel modes explicitly so
@@ -28776,7 +28854,18 @@ pub const LinuxServer = struct {
     ) bool {
         var complete = true;
 
-        if (link.supportsSessionReplicaV2()) authority: {
+        if (!conn.session_mesh_announce_token_bound) return false;
+        const account = conn.session.account() orelse return false;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return false;
+        if (!std.crypto.timing_safe.eql(
+            sessions_mod.Token,
+            handle.token,
+            conn.session_mesh_announce_token,
+        )) return false;
+        const requires_authority = conn.session_mesh_announce_requires_authority or handle.portable;
+        if (link.supportsSessionReplicaV2() and
+            requires_authority)
+        authority: {
             if (!conn.session_mesh_announce_token_bound) {
                 complete = false;
                 break :authority;
@@ -28792,6 +28881,33 @@ pub const LinuxServer = struct {
                 complete = false;
                 break :authority;
             };
+        }
+
+        if (complete and
+            conn.session_mesh_announce_parts.len != 0 and
+            (conn.session_mesh_announce_nick_change or !requires_authority))
+        {
+            const old_len: usize = conn.session_mesh_announce_old_nick_len;
+            const old_nick = if (old_len != 0)
+                conn.session_mesh_announce_old_nick[0..old_len]
+            else
+                conn.session.displayName();
+            const membership_hlc = self.nextMeshHlc();
+            const old_identity = conn.session_mesh_announce_old_identity.view();
+            for (conn.session_mesh_announce_parts) |*part| {
+                link.sendMembership(
+                    part.channel(),
+                    old_nick,
+                    0,
+                    membership_hlc,
+                    false,
+                    old_identity,
+                    "",
+                ) catch {
+                    complete = false;
+                    break;
+                };
+            }
         }
 
         if (complete and conn.session_mesh_announce_nick_change) {
@@ -28877,21 +28993,33 @@ pub const LinuxServer = struct {
 
         conn.session_mesh_announce_pending = false;
         conn.session_mesh_announce_token_bound = false;
+        conn.session_mesh_announce_requires_authority = false;
         conn.session_mesh_announce_token = @splat(0);
         conn.session_mesh_announce_old_retracted = false;
         conn.session_mesh_announce_nick_change = false;
         conn.session_mesh_announce_old_nick_len = 0;
+        conn.session_mesh_announce_old_identity = .{};
+        self.clearDeferredSessionMeshParts(conn);
+    }
+
+    fn clearDeferredSessionMeshParts(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.session_mesh_announce_parts.len != 0)
+            self.allocator.free(conn.session_mesh_announce_parts);
+        conn.session_mesh_announce_parts = &.{};
     }
 
     /// A connection may close while its restored identity is still held behind
-    /// the authority barrier. Retract only the identity peers could have learned
-    /// before restore (normally DeviceB PRESENCE), never the unproven restored
-    /// nick. Unknown channel PARTs are idempotent and make this safe even when
-    /// the old alias was route-only.
+    /// the authority barrier. Retained predecessor-only channel departures are
+    /// safe only while the predecessor alias is distinct. With a shared same nick,
+    /// another attachment can join a formerly old-only channel before this pending
+    /// claimant closes, so even a retained PART could evict live identity. When an
+    /// exact identity still exists, never retract any same-nick channel or PRESENCE
+    /// merely because this transport closed.
     fn retractDeferredSessionMeshIdentity(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
+        restored_identity_remains: bool,
     ) void {
         if (!conn.session_mesh_announce_pending or conn.session_mesh_announce_old_retracted) return;
         conn.session_mesh_announce_old_retracted = true;
@@ -28901,26 +29029,63 @@ pub const LinuxServer = struct {
             conn.session.displayName();
         if (old_nick.len == 0 or std.mem.eql(u8, old_nick, "*")) return;
 
+        const old_identity = conn.session_mesh_announce_old_identity.view();
+        const restored_nick = conn.session.displayName();
+        const predecessor_parts_are_safe = !std.ascii.eqlIgnoreCase(old_nick, restored_nick);
+        if (!restored_identity_remains or predecessor_parts_are_safe) {
+            for (conn.session_mesh_announce_parts) |*part|
+                self.announceMembership(part.channel(), old_nick, 0, false, old_identity, "");
+        }
+        if (restored_identity_remains) return;
+
         var channels = self.world.channelIterator();
         while (channels.next()) |channel| {
             if (!self.world.isMember(channel.name, worldIdFromClient(id))) continue;
-            self.announceMembership(channel.name, old_nick, 0, false, membershipIdentityOf(conn), "");
+            self.announceMembership(channel.name, old_nick, 0, false, old_identity, "");
+            if (!std.ascii.eqlIgnoreCase(old_nick, restored_nick))
+                self.announceMembership(channel.name, restored_nick, 0, false, membershipIdentityOf(conn), "");
         }
-        self.announceMembership(presence_channel, old_nick, 0, false, membershipIdentityOf(conn), "");
+        self.announceMembership(presence_channel, old_nick, 0, false, old_identity, "");
+        if (!std.ascii.eqlIgnoreCase(old_nick, restored_nick))
+            self.announceMembership(presence_channel, restored_nick, 0, false, membershipIdentityOf(conn), "");
     }
 
     /// Arm a restored sidecar only after SessionStore accepted the exact group
     /// binding. Until this call, housekeeping must never infer readiness from a
     /// pre-existing token (or from the absence of one) after a failed attach.
-    fn bindDeferredSessionMeshAnnouncements(conn: *ConnState, token: sessions_mod.Token) void {
+    fn bindDeferredSessionMeshAnnouncements(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        token: sessions_mod.Token,
+    ) void {
         if (!conn.session_mesh_announce_pending) return;
+        const account = conn.session.account() orelse return;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return;
+        if (!std.crypto.timing_safe.eql(sessions_mod.Token, handle.token, token)) return;
         conn.session_mesh_announce_token = token;
         conn.session_mesh_announce_token_bound = true;
+        conn.session_mesh_announce_requires_authority = handle.portable;
     }
 
-    /// A non-portable restore has no v2 authority requirement. A portable one
-    /// is ready only after this node's exact, live Store row matches the restored
-    /// attachment; merely setting the retry dirty bit is not enough.
+    /// Portability can be enabled after a non-portable restore has already armed
+    /// a compatibility sidecar. Promote the barrier monotonically with the Store
+    /// row so no later housekeeping turn can release that sidecar OFFER-less.
+    fn markPortableResumeIssuedForConn(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+    ) bool {
+        if (!self.sessions.markPortableResumeIssued(account, monitorIdFromClient(id))) return false;
+        if (conn.session_mesh_announce_pending)
+            conn.session_mesh_announce_requires_authority = true;
+        return true;
+    }
+
+    /// A portable restore needs an exact signed projection before compatibility
+    /// sidecars are released. A non-portable local TOKEN never crosses this
+    /// privacy boundary and may use compatibility NICK/MEMBERSHIP directly.
     fn deferredSessionMeshAuthorityReady(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -28934,7 +29099,7 @@ pub const LinuxServer = struct {
             handle.token,
             conn.session_mesh_announce_token,
         )) return false;
-        if (!handle.portable or !self.config.session_migrate_on_detach or self.config.node_identity == null) return true;
+        if (!conn.session_mesh_announce_requires_authority and !handle.portable) return true;
         const token = conn.session_mesh_announce_token;
         if (self.sessions.tokenReplicaDirty(token) or self.sessions.tokenReplicaProjectionDirty(token)) return false;
         const entry = self.session_replica_store.getOrigin(token, self.config.node_id) orelse return false;
@@ -28954,6 +29119,11 @@ pub const LinuxServer = struct {
                 const conn = &slot.value;
                 if (conn.closing or conn.s2s != null or conn.s2s_secured != null) continue;
                 const id = slotClientId(reactor, i, slot.gen);
+                if (conn.session_mesh_announce_token_bound and
+                    !self.deferredSessionMeshAuthorityReady(id, conn))
+                {
+                    _ = self.publishCurrentSessionReplicaToken(conn.session_mesh_announce_token);
+                }
                 if (!self.deferredSessionMeshAuthorityReady(id, conn)) continue;
                 self.flushDeferredSessionMeshAnnouncements(id, conn);
             }
@@ -28971,10 +29141,13 @@ pub const LinuxServer = struct {
         account: []const u8,
         token: session_migrate.Token,
     ) bool {
-        if (!self.config.session_migrate_on_detach) return true;
-        const active = self.portableSessionTokenForClient(id, conn) orelse return true;
-        if (!std.crypto.timing_safe.eql(session_migrate.Token, active, token)) return false;
-        return self.shipSessionMigration(id, conn, account, token);
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return false;
+        if (!std.crypto.timing_safe.eql(session_migrate.Token, handle.token, token)) return false;
+        if (handle.portable) {
+            if (!self.config.session_migrate_on_detach or self.config.node_identity == null) return false;
+            return self.shipSessionMigration(id, conn, account, token);
+        }
+        return true;
     }
 
     /// Lifetime of a cross-server (mesh-sealed) reclaim token.
@@ -29152,7 +29325,7 @@ pub const LinuxServer = struct {
                         // Set the replication gate before emitting the credential: if
                         // the connection drops after the write is queued, detach must
                         // still ship the snapshot that this token can unlock.
-                        _ = self.sessions.markPortableResumeIssued(account, cid);
+                        _ = self.markPortableResumeIssuedForConn(id, conn, account);
                         // Replicate LIVE state too. A second client may present this
                         // MTOKEN on another node while the issuer remains connected;
                         // waiting until detach would force a redirect/ownership race
@@ -29238,17 +29411,11 @@ pub const LinuxServer = struct {
                 return;
             };
             defer self.allocator.free(snapshot);
-            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, token, snapshot)) {
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, token, snapshot, .join_existing)) {
                 conn.preserve_resume_credential_once = true;
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attach failed; token remains valid");
                 return;
             }
-            if (!self.sessions.joinTokenGroup(account, cid, token)) {
-                conn.preserve_resume_credential_once = true;
-                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during attach; retry the same token");
-                return;
-            }
-            bindDeferredSessionMeshAnnouncements(conn, token);
             conn.preserve_resume_credential_once = false;
             self.finishDeferredSessionAutojoin(id, conn, true);
             if (self.refreshPortableSessionReplicas(id, conn, account, token))
@@ -29270,7 +29437,7 @@ pub const LinuxServer = struct {
         // deterministic post-decode failure (e.g. nick re-registration) simply
         // re-preserves the ghost until its TTL — no worse than the old
         // unconditional discard, and self-heals once the conflict clears.
-        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, token, bytes) else false;
+        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, token, bytes, .join_existing) else false;
         if (snapshot != null and !restored) {
             conn.preserve_resume_credential_once = true;
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
@@ -29280,12 +29447,12 @@ pub const LinuxServer = struct {
         // credential exists and inherit its portable-replication state. The old
         // detached attachment is then replaced by this live one; the TOKEN itself
         // remains reusable for additional clients.
-        if (!self.sessions.joinTokenGroup(account, cid, token)) {
+        if (snapshot == null and !self.sessions.joinTokenGroup(account, cid, token)) {
             conn.preserve_resume_credential_once = true;
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
             return;
         }
-        bindDeferredSessionMeshAnnouncements(conn, token);
+        if (snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, token);
         _ = self.removeTrackedSession(account, matched.client);
         conn.preserve_resume_credential_once = false;
         self.finishDeferredSessionAutojoin(id, conn, true);
@@ -29365,16 +29532,13 @@ pub const LinuxServer = struct {
                 return;
             };
             defer self.allocator.free(snapshot);
-            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, snapshot) or
-                !self.sessions.joinTokenGroup(account, cid, migrate_token))
-            {
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, snapshot, .join_existing)) {
                 conn.preserve_resume_credential_once = true;
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session attach failed; token remains valid");
                 return;
             }
-            bindDeferredSessionMeshAnnouncements(conn, migrate_token);
             conn.preserve_resume_credential_once = false;
-            _ = self.sessions.markPortableResumeIssued(account, cid);
+            _ = self.markPortableResumeIssuedForConn(id, conn, account);
             self.finishDeferredSessionAutojoin(id, conn, true);
             if (self.refreshPortableSessionReplicas(id, conn, account, migrate_token))
                 self.flushDeferredSessionMeshAnnouncements(id, conn);
@@ -29400,20 +29564,14 @@ pub const LinuxServer = struct {
         // Keep it staged so every authenticated client presenting the same valid
         // MTOKEN can attach on this node.
         if (have_capsule and now <= fields.expiry_ms) {
-            if (self.restoreStagedMigration(id, conn, account, migrate_token)) {
-                const rebound = if (ghost != null)
-                    self.sessions.joinTokenGroup(account, cid, migrate_token)
-                else
-                    self.sessions.adoptTokenGroup(account, cid, migrate_token, true);
-                if (!rebound) {
-                    conn.preserve_resume_credential_once = true;
-                    try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during attach; retry the same token");
-                    return;
-                }
-                bindDeferredSessionMeshAnnouncements(conn, migrate_token);
+            const staged_bind: sessions_mod.TokenBindKind = if (ghost != null)
+                .join_existing
+            else
+                .{ .adopt_verified = true };
+            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind)) {
                 if (ghost) |g| _ = self.removeTrackedSession(account, g);
                 conn.preserve_resume_credential_once = false;
-                _ = self.sessions.markPortableResumeIssued(account, cid);
+                _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, true);
                 if (self.refreshPortableSessionReplicas(id, conn, account, migrate_token))
                     self.flushDeferredSessionMeshAnnouncements(id, conn);
@@ -29442,7 +29600,14 @@ pub const LinuxServer = struct {
                 // ordinary local SESSION RESUME path.
                 const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
-                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, bytes) else false;
+                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
+                    id,
+                    conn,
+                    account,
+                    migrate_token,
+                    bytes,
+                    .join_existing,
+                ) else false;
 
                 if (local_snapshot != null and !restored) {
                     conn.preserve_resume_credential_once = true;
@@ -29451,20 +29616,16 @@ pub const LinuxServer = struct {
                 }
 
                 if (ghost) |g| {
-                    if (!self.sessions.joinTokenGroup(account, cid, migrate_token)) {
+                    if (local_snapshot == null and !self.sessions.joinTokenGroup(account, cid, migrate_token)) {
                         conn.preserve_resume_credential_once = true;
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
                     _ = self.removeTrackedSession(account, g);
-                } else if (!self.sessions.adoptTokenGroup(account, cid, migrate_token, true)) {
-                    conn.preserve_resume_credential_once = true;
-                    try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
-                    return;
-                }
-                bindDeferredSessionMeshAnnouncements(conn, migrate_token);
+                } else unreachable;
+                if (local_snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, migrate_token);
                 conn.preserve_resume_credential_once = false;
-                _ = self.sessions.markPortableResumeIssued(account, cid);
+                _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, restored);
                 if (self.refreshPortableSessionReplicas(id, conn, account, migrate_token))
                     self.flushDeferredSessionMeshAnnouncements(id, conn);
@@ -30654,14 +30815,12 @@ pub const LinuxServer = struct {
                 if (!link.established() or !link.supportsSessionReplicaV2()) continue;
                 _ = link.reconcileSessionToken(token, desired_nick, desired_channels) catch {
                     complete = false;
-                    self.drainNickChanges(link);
-                    self.drainMembershipChanges(link);
+                    self.drainIdentityTransitions(link);
                     continue;
                 };
                 // OFFER-only rename/revoke still has a client-visible event even
                 // when no compatibility NICK/PART sidecar follows this feed.
-                self.drainNickChanges(link);
-                self.drainMembershipChanges(link);
+                self.drainIdentityTransitions(link);
             }
         }
         return complete;
@@ -31410,6 +31569,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         account: []const u8,
         session_token: session_migrate.Token,
+        bind_kind: sessions_mod.TokenBindKind,
     ) bool {
         const pm = if (self.pending_migrations) |*p| p else return false;
         const entry = pm.getLive(
@@ -31421,7 +31581,7 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
         defer snap.deinit(self.allocator);
 
-        return self.restoreMigrationSnapshot(id, conn, account, session_token, &snap);
+        return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
     }
 
     fn restoreEncodedMigrationSnapshot(
@@ -31431,141 +31591,500 @@ pub const LinuxServer = struct {
         account: []const u8,
         session_token: sessions_mod.Token,
         bytes: []const u8,
+        bind_kind: sessions_mod.TokenBindKind,
     ) bool {
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
-        return self.restoreMigrationSnapshot(id, conn, account, session_token, &snap);
+        return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
     }
 
-    fn restoreMigrationSnapshot(
+    const ResumePartPlan = struct {
+        channel: []u8,
+        line: []u8,
+        recipients: []client_model.ClientId,
+        logical_part: bool,
+
+        fn deinit(self: *ResumePartPlan, allocator: std.mem.Allocator) void {
+            allocator.free(self.recipients);
+            allocator.free(self.line);
+            allocator.free(self.channel);
+            self.* = undefined;
+        }
+    };
+
+    const ResumeJoinPlan = struct {
+        channel: []const u8,
+        plain: []u8,
+        extended: []u8,
+        recipients: []client_model.ClientId,
+        logical_join: bool,
+
+        fn deinit(self: *ResumeJoinPlan, allocator: std.mem.Allocator) void {
+            allocator.free(self.recipients);
+            allocator.free(self.extended);
+            allocator.free(self.plain);
+            self.* = undefined;
+        }
+    };
+
+    fn appendUniqueResumeRecipient(
+        self: *LinuxServer,
+        recipients: *std.ArrayList(client_model.ClientId),
+        id: client_model.ClientId,
+    ) std.mem.Allocator.Error!void {
+        for (recipients.items) |existing| if (existing.eql(id)) return;
+        try recipients.append(self.allocator, id);
+    }
+
+    fn prepareResumePartPlan(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        channel: []const u8,
+        old_prefix: []const u8,
+        target_exact_ids: []const world_model.ClientId,
+        old_nick: []const u8,
+        account: []const u8,
+    ) !ResumePartPlan {
+        const owned_channel = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(owned_channel);
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const rendered = try formatMessage(&line_buf, old_prefix, "PART", &.{channel}, null);
+        const line = try self.allocator.dupe(u8, rendered);
+        errdefer self.allocator.free(line);
+
+        const claimant_wid = worldIdFromClient(id);
+        var target_sibling_remains = false;
+        for (target_exact_ids) |exact_wid| {
+            if (exact_wid.eql(claimant_wid)) continue;
+            if (self.world.isMember(channel, exact_wid)) {
+                target_sibling_remains = true;
+                break;
+            }
+        }
+        if (!target_sibling_remains) {
+            var identity_members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+            while (identity_members.next()) |member| {
+                if (member.*.eql(claimant_wid)) continue;
+                const member_conn = self.connFor(clientIdFromWorld(member.*)) orelse continue;
+                if (member_conn.closing or member_conn.s2s != null or member_conn.s2s_secured != null) continue;
+                const member_account = member_conn.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(member_account, account) or
+                    !std.ascii.eqlIgnoreCase(member_conn.session.displayName(), old_nick)) continue;
+                target_sibling_remains = true;
+                break;
+            }
+        }
+        var recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipients.deinit(self.allocator);
+        if (target_sibling_remains) {
+            try self.appendUniqueResumeRecipient(&recipients, id);
+        } else {
+            const claimant_rank = auditoriumRank(
+                self.world.memberModes(channel, claimant_wid) orelse world_model.MemberModes.empty(),
+            );
+            const restricted = self.world.channelHasExtFlag(channel, .auditorium) and
+                !auditorium.shouldRelayJoinPart(claimant_rank);
+            var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+            while (members.next()) |member| {
+                if (restricted and !member.*.eql(claimant_wid)) {
+                    const rank = auditoriumRank(
+                        self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty(),
+                    );
+                    if (!auditorium.shouldRelayJoinPart(rank)) continue;
+                }
+                try self.appendUniqueResumeRecipient(&recipients, clientIdFromWorld(member.*));
+            }
+        }
+        return .{
+            .channel = owned_channel,
+            .line = line,
+            .recipients = try recipients.toOwnedSlice(self.allocator),
+            .logical_part = !target_sibling_remains,
+        };
+    }
+
+    fn prepareResumeJoinPlan(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        channel: []const u8,
+        desired_prefix: []const u8,
+        account: []const u8,
+        realname: []const u8,
+        desired_modes: world_model.MemberModes,
+        exact_sibling_was_member: bool,
+    ) !ResumeJoinPlan {
+        var plain_buf: [default_reply_bytes]u8 = undefined;
+        const plain = try formatMessage(&plain_buf, desired_prefix, "JOIN", &.{channel}, null);
+        const owned_plain = try self.allocator.dupe(u8, plain);
+        errdefer self.allocator.free(owned_plain);
+        var ext_buf: [default_reply_bytes]u8 = undefined;
+        const extended = try formatMessage(&ext_buf, desired_prefix, "JOIN", &.{ channel, account }, realname);
+        const owned_extended = try self.allocator.dupe(u8, extended);
+        errdefer self.allocator.free(owned_extended);
+
+        var recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipients.deinit(self.allocator);
+        if (exact_sibling_was_member) {
+            try self.appendUniqueResumeRecipient(&recipients, id);
+        } else {
+            const restricted = self.world.channelHasExtFlag(channel, .auditorium) and
+                !auditorium.shouldRelayJoinPart(auditoriumRank(desired_modes));
+            if (self.world.memberIterator(channel)) |members_src| {
+                var members = members_src;
+                while (members.next()) |member| {
+                    if (restricted) {
+                        const rank = auditoriumRank(
+                            self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty(),
+                        );
+                        if (!auditorium.shouldRelayJoinPart(rank)) continue;
+                    }
+                    try self.appendUniqueResumeRecipient(&recipients, clientIdFromWorld(member.*));
+                }
+            }
+            try self.appendUniqueResumeRecipient(&recipients, id);
+        }
+        return .{
+            .channel = channel,
+            .plain = owned_plain,
+            .extended = owned_extended,
+            .recipients = try recipients.toOwnedSlice(self.allocator),
+            .logical_join = !exact_sibling_was_member,
+        };
+    }
+
+    fn snapshotContainsChannel(snap: *const migration_relay.Snapshot, channel: []const u8) bool {
+        for (snap.channels) |desired| {
+            if (std.ascii.eqlIgnoreCase(desired, channel)) return true;
+        }
+        return false;
+    }
+
+    fn worldIdInResumeSet(ids: []const world_model.ClientId, candidate: world_model.ClientId) bool {
+        for (ids) |id| if (id.eql(candidate)) return true;
+        return false;
+    }
+
+    /// Restore one decoded migration image and bind its reusable token as a
+    /// single failure-atomic operation. Every fallible allocation and every
+    /// recipient/message snapshot precedes the World and SessionStore tickets;
+    /// after the token ticket commits, the remaining state changes cannot fail.
+    fn restoreAndBindMigrationSnapshot(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
         account: []const u8,
         session_token: sessions_mod.Token,
+        bind_kind: sessions_mod.TokenBindKind,
         snap: *const migration_relay.Snapshot,
     ) bool {
         // The authenticated account and mesh-token HMAC are the authorization
         // boundary. A signed peer snapshot may restore only that same account;
         // never let carried snapshot data switch the live connection's identity.
         if (snap.account.len != 0 and !std.ascii.eqlIgnoreCase(snap.account, account)) return false;
-        // Decide exact-token attachment semantics before any live identity or
-        // World mutation. OOM must leave the claimant untouched and retryable.
+        if (snap.nick.len == 0 or std.mem.eql(u8, snap.nick, "*") or !isValidNick(snap.nick)) return false;
+
+        // A prior successful restore may still be waiting behind signed replica
+        // publication. Flush it only through the authority-aware gate; never
+        // overwrite an unbound transition or relabel token A as token B.
+        if (conn.session_mesh_announce_pending and self.deferredSessionMeshAuthorityReady(id, conn))
+            self.flushDeferredSessionMeshAnnouncements(id, conn);
+        if (conn.session_mesh_announce_pending) return false;
+
+        // Decide exact-token attachment semantics before any live identity,
+        // World, Store, output, or sidecar mutation. The claimant's current row
+        // may belong to another reusable group. Moving its World nick while a
+        // sibling still sustains that group would orphan the old identity, so
+        // require a fresh connection for that cross-group attach.
         const session_rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
         defer self.allocator.free(session_rows);
         const wid = worldIdFromClient(id);
+        const cid = monitorIdFromClient(id);
+        var claimant_token: ?sessions_mod.Token = null;
+        var claimant_portable = false;
+        var target_group_portable = false;
+        var displaced_handle: ?sessions_mod.ResumeHandle = null;
+        for (session_rows) |row| {
+            if (std.crypto.timing_safe.eql(sessions_mod.Token, row.token, session_token))
+                target_group_portable = target_group_portable or row.portable_resume;
+            if (row.client == cid) {
+                claimant_token = row.token;
+                claimant_portable = row.portable_resume;
+                displaced_handle = .{ .token = row.token, .portable = row.portable_resume };
+            }
+        }
+        const bind_portable = switch (bind_kind) {
+            .join_existing => claimant_portable or target_group_portable,
+            .adopt_verified => |portable| portable,
+        };
+        const requires_v2_authority = bind_portable;
+        if (claimant_token) |current_token| {
+            if (!tokenIsNull(current_token) and
+                !std.crypto.timing_safe.eql(sessions_mod.Token, current_token, session_token))
+            {
+                for (session_rows) |row| {
+                    if (row.client == cid or !row.attached) continue;
+                    if (std.crypto.timing_safe.eql(sessions_mod.Token, row.token, current_token)) return false;
+                }
+            }
+        }
+
+        var exact_world_ids: std.ArrayList(world_model.ClientId) = .empty;
+        defer exact_world_ids.deinit(self.allocator);
+        for (session_rows) |row| {
+            if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, session_token)) continue;
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse return false;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) return false;
+            const sibling_account = sibling.session.account() orelse return false;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) return false;
+            const sibling_wid = worldIdFromClient(sibling_id);
+            if (!worldIdInResumeSet(exact_world_ids.items, sibling_wid))
+                exact_world_ids.append(self.allocator, sibling_wid) catch return false;
+        }
+        if (!worldIdInResumeSet(exact_world_ids.items, wid))
+            exact_world_ids.append(self.allocator, wid) catch return false;
+
+        const disposition: world_model.World.SessionNickDisposition = if (self.world.findNick(snap.nick)) |owner|
+            if (worldIdInResumeSet(exact_world_ids.items, owner))
+                .{ .claim_exact = owner }
+            else blk: {
+                const owner_conn = self.connFor(clientIdFromWorld(owner)) orelse return false;
+                if (owner_conn.closing or owner_conn.s2s != null or owner_conn.s2s_secured != null) return false;
+                const owner_account = owner_conn.session.account() orelse return false;
+                if (!std.ascii.eqlIgnoreCase(owner_account, account)) return false;
+                break :blk .{ .preserve_foreign = owner };
+            }
+        else
+            .{ .claim_exact = wid };
+
+        const desired_members = self.allocator.alloc(world_model.MemberRestore, snap.channels.len) catch return false;
+        defer self.allocator.free(desired_members);
+        for (snap.channels, 0..) |channel, i| {
+            desired_members[i] = .{
+                .channel = channel,
+                .modes = .{ .bits = if (i < snap.channel_modes.len) snap.channel_modes[i] else 0 },
+            };
+        }
+
+        // Profile preparation runs on a value copy. restore() deliberately does
+        // not touch negotiated capabilities, transport callbacks, or the SASL
+        // nonce, but the latter is self-referential and must be repointed after
+        // assigning the value into ConnState.
+        var nonce_buf: [32]u8 = undefined;
+        const nonce_len = @min(conn.session.sasl_server_nonce.len, nonce_buf.len);
+        @memcpy(nonce_buf[0..nonce_len], conn.session.sasl_server_nonce[0..nonce_len]);
+        var desired_session = conn.session;
+        const profile = prepareMigratedSessionProfile(&desired_session, account, snap, conn.is_tls);
+
         var old_nick_buf: [64]u8 = undefined;
         const old_nick_src = conn.session.displayName();
         const old_nick_len = @min(old_nick_src.len, old_nick_buf.len);
         @memcpy(old_nick_buf[0..old_nick_len], old_nick_src[0..old_nick_len]);
         const old_nick = old_nick_buf[0..old_nick_len];
+        var old_user_buf: [64]u8 = undefined;
+        const old_user_src = conn.session.username();
+        const old_user_len = @min(old_user_src.len, old_user_buf.len);
+        @memcpy(old_user_buf[0..old_user_len], old_user_src[0..old_user_len]);
+        const old_user = old_user_buf[0..old_user_len];
+        const old_mesh_identity = DeferredSessionMeshIdentity.init(conn);
 
         var old_prefix_buf: [256]u8 = undefined;
-        var nick_msg_buf: [default_reply_bytes]u8 = undefined;
         const old_prefix = clientPrefix(conn, &old_prefix_buf) catch "";
         const announce_nick = snap.nick.len != 0 and
             !std.mem.eql(u8, snap.nick, "*") and
             old_nick.len != 0 and
             !std.mem.eql(u8, old_nick, "*") and
             !std.ascii.eqlIgnoreCase(old_nick, snap.nick);
-        const nick_msg = if (announce_nick and old_prefix.len != 0)
-            formatMessage(&nick_msg_buf, old_prefix, "NICK", &.{}, snap.nick) catch ""
-        else
-            "";
+        var part_plans: std.ArrayListUnmanaged(ResumePartPlan) = .empty;
+        defer {
+            for (part_plans.items) |*plan| plan.deinit(self.allocator);
+            part_plans.deinit(self.allocator);
+        }
+        var join_plans: std.ArrayListUnmanaged(ResumeJoinPlan) = .empty;
+        defer {
+            for (join_plans.items) |*plan| plan.deinit(self.allocator);
+            join_plans.deinit(self.allocator);
+        }
 
-        // Claim the migrated nick BEFORE mutating the live session. A collision
-        // with the SAME authenticated account is an existing attachment of this
-        // logical identity, not a restore failure: the current world owner stays
-        // primary and this connection shares the nick. If the claimant still owns
-        // a generated pre-resume nick, release that old mapping only after the
-        // same-account collision has been proven.
-        if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
-            self.world.registerNick(snap.nick, wid) catch |err| switch (err) {
-                error.NickInUse => {
-                    if (!self.nickHeldBySameAccount(snap.nick, account, wid)) return false;
-                    self.world.unregisterNick(wid);
-                },
-                else => return false,
+        const old_channel_count = self.world.channelCountOf(wid);
+        const old_channels = self.allocator.alloc([]const u8, old_channel_count) catch return false;
+        defer self.allocator.free(old_channels);
+        const old_channel_len = self.world.channelsOf(wid, old_channels);
+        for (old_channels[0..old_channel_len]) |channel| {
+            if (snapshotContainsChannel(snap, channel)) continue;
+            var plan = self.prepareResumePartPlan(
+                id,
+                channel,
+                old_prefix,
+                exact_world_ids.items,
+                old_nick,
+                account,
+            ) catch return false;
+            part_plans.append(self.allocator, plan) catch {
+                plan.deinit(self.allocator);
+                return false;
             };
         }
 
-        // Prepare the migrated profile through a pure/no-audit value seam. A
-        // later failure-atomic RESUME composition can run this against a temporary
-        // ClientSession before committing World/token state; this wave deliberately
-        // keeps the existing call graph and applies it to the live value in place.
-        const profile = prepareMigratedSessionProfile(&conn.session, account, snap, conn.is_tls);
-        self.injectSessionState(conn);
-        conn.nick_claimed_at_ms = 0;
-
-        // Re-register the nick so the migrated client stays addressable, then
-        // re-join every carried channel with its exact member modes — the exact
-        // helpers `adoptInheritedClient` calls on UPGRADE resume.
-        if (nick_msg.len != 0) {
-            self.deliver(id, nick_msg) catch {};
-            self.notifyCommonChannels(id, nick_msg, null, id, null) catch {};
-            self.monitorTransition(old_nick, snap.nick) catch {};
+        var nick_line: ?[]u8 = null;
+        defer if (nick_line) |line| self.allocator.free(line);
+        var nick_recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer nick_recipients.deinit(self.allocator);
+        if (announce_nick and old_prefix.len != 0) {
+            var nick_buf: [default_reply_bytes]u8 = undefined;
+            const rendered = formatMessage(&nick_buf, old_prefix, "NICK", &.{}, snap.nick) catch return false;
+            nick_line = self.allocator.dupe(u8, rendered) catch return false;
+            self.appendUniqueResumeRecipient(&nick_recipients, id) catch return false;
+            for (old_channels[0..old_channel_len]) |channel| {
+                if (!snapshotContainsChannel(snap, channel)) continue;
+                var members = self.world.memberIterator(channel) orelse continue;
+                while (members.next()) |member|
+                    self.appendUniqueResumeRecipient(&nick_recipients, clientIdFromWorld(member.*)) catch return false;
+            }
         }
-        // A live sibling already present in a carried channel proves that this
-        // is a new transport for an existing logical member, not a new logical
-        // JOIN.
-        var channel_restore_complete = true;
+
+        var desired_prefix_buf: [256]u8 = undefined;
+        const desired_prefix = std.fmt.bufPrint(&desired_prefix_buf, "{s}!{s}@{s}", .{
+            desired_session.displayName(),
+            desired_session.username(),
+            if (desired_session.host().len == 0) default_host else desired_session.host(),
+        }) catch return false;
+        const claimant_was_member = self.allocator.alloc(bool, snap.channels.len) catch return false;
+        defer self.allocator.free(claimant_was_member);
         for (snap.channels, 0..) |chan, i| {
-            const modes: u8 = if (i < snap.channel_modes.len) snap.channel_modes[i] else 0;
-            const was_member = self.world.isMember(chan, wid);
+            claimant_was_member[i] = self.world.isMember(chan, wid);
+            if (claimant_was_member[i]) continue;
             var exact_sibling_was_member = false;
-            for (session_rows) |row| {
-                if (!row.attached or row.client == monitorIdFromClient(id)) continue;
-                if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, session_token)) continue;
-                const sibling_id = clientIdFromMonitor(row.client);
-                const sibling = self.connFor(sibling_id) orelse continue;
-                if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
-                const sibling_account = sibling.session.account() orelse continue;
-                if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
-                if (self.world.isMember(chan, worldIdFromClient(sibling_id))) {
+            for (exact_world_ids.items) |exact_wid| {
+                if (exact_wid.eql(wid)) continue;
+                if (self.world.isMember(chan, exact_wid)) {
                     exact_sibling_was_member = true;
                     break;
                 }
             }
-            self.world.restoreMember(chan, wid, .{ .bits = modes }) catch {
-                channel_restore_complete = false;
-                continue;
+            var plan = self.prepareResumeJoinPlan(
+                id,
+                chan,
+                desired_prefix,
+                account,
+                desired_session.realname(),
+                desired_members[i].modes,
+                exact_sibling_was_member,
+            ) catch return false;
+            join_plans.append(self.allocator, plan) catch {
+                plan.deinit(self.allocator);
+                return false;
             };
-            if (!was_member) {
-                if (exact_sibling_was_member) {
-                    // Every transport is a real World member and receives future
-                    // events, but an existing logical identity does not JOIN the
-                    // channel twice merely because another client resumed it.
-                    self.sendJoinToAttachment(id, conn, chan) catch {};
-                } else {
-                    self.broadcastJoin(chan, conn) catch {};
-                    self.publishMemberEvent("JOIN", chan, conn.session.displayName(), null) catch {};
-                    self.notifyObservers(.join, observeSubject(conn, chan));
-                }
-                self.sendTopicReply(conn, chan) catch {};
-                if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, chan) catch {};
+        }
+
+        var deferred_parts: []DeferredSessionMeshPart = &.{};
+        var deferred_parts_transferred = false;
+        defer if (!deferred_parts_transferred and deferred_parts.len != 0) self.allocator.free(deferred_parts);
+        var logical_part_count: usize = 0;
+        for (part_plans.items) |plan| {
+            logical_part_count += @intFromBool(plan.logical_part);
+        }
+        if (logical_part_count != 0) {
+            deferred_parts = self.allocator.alloc(DeferredSessionMeshPart, logical_part_count) catch return false;
+            var next_part: usize = 0;
+            for (part_plans.items) |plan| {
+                if (!plan.logical_part) continue;
+                deferred_parts[next_part] = DeferredSessionMeshPart.init(plan.channel) catch return false;
+                next_part += 1;
             }
         }
-        if (!channel_restore_complete) return false;
-        // The caller still has to bind/adopt the exact reusable token. Keep the
-        // local restore visible immediately, but defer every token-less mesh
-        // sidecar until that token's new-origin signed OFFER is Store-accepted.
-        // Otherwise peers receive NICK/MEMBERSHIP first, conservatively mint a
-        // collision UID, and later render both that alias and the exact snapshot.
+        // World preparation comes first. The token ticket is deliberately last
+        // because it retains SessionStore's exclusive lock until the no-fail
+        // cross-component commit has completed.
+        var world_ticket = self.world.prepareSessionRestore(
+            snap.nick,
+            wid,
+            exact_world_ids.items,
+            disposition,
+            desired_members,
+        ) catch return false;
+        defer world_ticket.abort();
+        var token_ticket = self.sessions.prepareTokenBind(account, cid, session_token, bind_kind) orelse return false;
+        defer token_ticket.deinit();
+        if (!token_ticket.commit()) {
+            token_ticket.abort();
+            return false;
+        }
+        world_ticket.commit();
+        conn.session = desired_session;
         if (!conn.session_mesh_announce_pending) {
             conn.session_mesh_announce_pending = true;
-            conn.session_mesh_announce_token_bound = false;
-            conn.session_mesh_announce_token = @splat(0);
+            conn.session_mesh_announce_token_bound = true;
+            conn.session_mesh_announce_requires_authority = requires_v2_authority;
+            conn.session_mesh_announce_token = session_token;
             conn.session_mesh_announce_old_retracted = false;
             conn.session_mesh_announce_nick_change = announce_nick;
-            conn.session_mesh_announce_old_nick_len = if (announce_nick) @intCast(old_nick.len) else 0;
-            if (announce_nick) @memcpy(conn.session_mesh_announce_old_nick[0..old_nick.len], old_nick);
-        } else if (announce_nick and !conn.session_mesh_announce_nick_change) {
-            // A retry after a bind/adopt failure may restore again. Preserve the
-            // first unsent transition; never overwrite DeviceB->Ruri with the
-            // retry's already-restored Ruri->Ruri no-op.
-            conn.session_mesh_announce_nick_change = true;
-            conn.session_mesh_announce_old_nick_len = @intCast(old_nick.len);
-            @memcpy(conn.session_mesh_announce_old_nick[0..old_nick.len], old_nick);
+            conn.session_mesh_announce_old_nick_len = if (announce_nick or deferred_parts.len != 0) @intCast(old_nick.len) else 0;
+            if (announce_nick or deferred_parts.len != 0)
+                @memcpy(conn.session_mesh_announce_old_nick[0..old_nick.len], old_nick);
+            conn.session_mesh_announce_old_identity = old_mesh_identity;
+            conn.session_mesh_announce_parts = deferred_parts;
+            deferred_parts_transferred = true;
+        }
+        conn.nick_claimed_at_ms = 0;
+        token_ticket.finish();
+
+        // Restore runtime callbacks/policy only after the transaction is visible,
+        // then repair the nonce's self pointer to ConnState's inline backing.
+        self.injectSessionState(conn);
+        conn.session.setSaslServerNonce(nonce_buf[0..nonce_len]);
+        if (displaced_handle) |old_handle| {
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, old_handle.token, session_token))
+                self.finalizeRemovedSessionAuthority(old_handle);
+        }
+
+        // Observable ordering mirrors a real client transition: leave obsolete
+        // channels under the old prefix, rename while common peers still see the
+        // identity, then enter/bootstrap target-only channels under the new one.
+        for (part_plans.items) |plan| {
+            var tag_buf: [48]u8 = undefined;
+            const tag = serverTimeTag(&tag_buf);
+            for (plan.recipients) |recipient| {
+                self.deliverTimed(recipient, tag, plan.line) catch {};
+            }
+            if (!plan.logical_part) continue;
+            self.recordHistoryEventSender(plan.channel, old_prefix, "PART", plan.channel);
+            self.publishMemberEvent("PART", plan.channel, old_nick, null) catch {};
+            self.notifyObservers(.part, .{
+                .nick = old_nick,
+                .user = old_user,
+                .host = old_mesh_identity.real_host[0..old_mesh_identity.real_host_len],
+                .account = account,
+                .detail = plan.channel,
+            });
+            if (!self.world.channelExists(plan.channel)) self.publishChannelEvent("DESTROY", plan.channel) catch {};
+        }
+        if (nick_line) |line| {
+            self.deliverLogicalNickEvent(nick_recipients.items, line);
+            var nick_body_buf: [64]u8 = undefined;
+            const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{snap.nick}) catch snap.nick;
+            for (snap.channels, 0..) |channel, i|
+                if (claimant_was_member[i]) self.recordHistoryEventSender(channel, old_prefix, "NICK", nick_body);
+            self.monitorTransition(old_nick, snap.nick) catch {};
+        }
+        for (join_plans.items) |plan| {
+            var tag_buf: [48]u8 = undefined;
+            const tag = serverTimeTag(&tag_buf);
+            for (plan.recipients) |recipient| {
+                const recipient_conn = self.connFor(recipient) orelse continue;
+                self.deliverTimed(
+                    recipient,
+                    tag,
+                    if (recipient_conn.session.hasCap(.extended_join)) plan.extended else plan.plain,
+                ) catch {};
+            }
+            if (plan.logical_join) {
+                self.recordHistoryEventSender(plan.channel, desired_prefix, "JOIN", plan.channel);
+                self.publishMemberEvent("JOIN", plan.channel, conn.session.displayName(), null) catch {};
+                self.notifyObservers(.join, observeSubject(conn, plan.channel));
+            }
+            self.sendTopicReply(conn, plan.channel) catch {};
+            if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, plan.channel) catch {};
         }
         if (profile.override_activated) {
             self.auditOverrideUse(conn, "UMODE", conn.session.displayName(), "override restored via migration");
@@ -42094,6 +42613,89 @@ test "repeated JOIN repairs exact siblings without emitting a duplicate logical 
     try std.testing.expectEqual(@as(usize, 1), server.world.channelCountOf(worldIdFromClient(id)));
 }
 
+test "clone CREATE bootstraps every exact attachment with one JOIN view" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "create-shared";
+    const creator_id = try addTestLocalClient(&server, "Shared", account);
+    const second_id = try addTestLocalClient(&server, "Second", account);
+    const third_id = try addTestLocalClient(&server, "Third", account);
+    const creator = server.connFor(creator_id).?;
+    const second = server.connFor(second_id).?;
+    const third = server.connFor(third_id).?;
+
+    // Model three live transports of one logical session. Only the primary owns
+    // the World nick lookup; the other exact-token attachments render the same
+    // nick and participate through their independent World membership rows.
+    server.world.unregisterNick(worldIdFromClient(second_id));
+    server.world.unregisterNick(worldIdFromClient(third_id));
+    try second.session.setNick("Shared");
+    try third.session.setNick("Shared");
+    const token = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(creator_id),
+    ).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        account,
+        monitorIdFromClient(second_id),
+        token,
+    ));
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        account,
+        monitorIdFromClient(third_id),
+        token,
+    ));
+
+    // A clone source only needs to exist; cloneChannel copies its channel image,
+    // then CREATE pre-seats the creator before the ordinary logical JOIN path.
+    try server.world.restoreMember(
+        "#create-template",
+        worldIdFromClient(creator_id),
+        world_model.MemberModes.fromModes(&.{.founder}),
+    );
+    _ = try server.world.setChannelFlag("#create-template", .no_external, true);
+    var parsed = try irc_line.parseLine("CREATE #create-clone +s #create-template");
+    try server.handleCreate(creator_id, creator, &parsed);
+
+    const attachment_ids = [_]client_model.ClientId{ creator_id, second_id, third_id };
+    for (attachment_ids) |attachment_id| {
+        try std.testing.expect(server.world.isMember(
+            "#create-clone",
+            worldIdFromClient(attachment_id),
+        ));
+        const modes = server.world.memberModes(
+            "#create-clone",
+            worldIdFromClient(attachment_id),
+        ).?;
+        try std.testing.expect(modes.contains(.founder));
+    }
+
+    // One logical JOIN is broadcast while only the pre-seated creator exists;
+    // syncTokenGroupChannel then gives each newly seated socket exactly one local
+    // bootstrap JOIN. No attachment sees duplicate logical membership traffic.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(creator.send_buf[0..creator.send_len], " JOIN #create-clone\r\n"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(second.send_buf[0..second.send_len], " JOIN #create-clone\r\n"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(third.send_buf[0..third.send_len], " JOIN #create-clone\r\n"),
+    );
+}
+
 test "UPGRADE preflight flushes deferred resume sidecars only after exact authority is publishable" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6D)), "upgrade-session-boundary");
@@ -42118,6 +42720,7 @@ test "UPGRADE preflight flushes deferred resume sidecars only after exact author
     try std.testing.expect(server.sessions.markTokenReplicaDirty(handle.token));
     conn.session_mesh_announce_pending = true;
     conn.session_mesh_announce_token_bound = true;
+    conn.session_mesh_announce_requires_authority = true;
     conn.session_mesh_announce_token = handle.token;
     conn.session_mesh_announce_nick_change = true;
     conn.session_mesh_announce_old_nick_len = "DeviceB".len;
@@ -42221,9 +42824,11 @@ test "deferred resume sidecar flush preserves old nick across peer queue allocat
 
     const id = try addTestLocalClient(&server, "Ruri", "ruri");
     const conn = server.connFor(id).?;
+    const handle = server.sessions.resumeHandleForClient("ruri", monitorIdFromClient(id)).?;
     try server.world.restoreMember("#resume-tx", worldIdFromClient(id), world_model.MemberModes.empty());
     conn.session_mesh_announce_pending = true;
-    conn.session_mesh_announce_token_bound = false;
+    conn.session_mesh_announce_token_bound = true;
+    conn.session_mesh_announce_token = handle.token;
     conn.session_mesh_announce_nick_change = true;
     conn.session_mesh_announce_old_nick_len = "DeviceB".len;
     @memcpy(conn.session_mesh_announce_old_nick[0.."DeviceB".len], "DeviceB");
@@ -46540,6 +47145,148 @@ fn pumpLinkPair(a: *s2s_link.S2sLink, b: *s2s_link.S2sLink, alloc: std.mem.Alloc
     }
 }
 
+test "S2S identity transition renders PART before NICK before JOIN" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer = server.connFor(observer_id).?;
+    _ = try server.world.join("#obsolete", worldIdFromClient(observer_id));
+    _ = try server.world.join("#common", worldIdFromClient(observer_id));
+    _ = try server.world.join("#desired", worldIdFromClient(observer_id));
+
+    var sender: s2s_link.S2sLink = undefined;
+    try sender.init(.{
+        .allocator = alloc,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.orochi",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer sender.deinit();
+    const receiver = try alloc.create(s2s_link.S2sLink);
+    try receiver.init(.{
+        .allocator = alloc,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.orochi",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const link_conn = server.rx().clients.get(link_id).?;
+    link_conn.s2s = receiver;
+
+    try sender.start(50);
+    try pumpLinkPair(&sender, receiver, alloc);
+    try std.testing.expect(receiver.established());
+
+    const old_ident = s2s_peer_mod.MemberIdentity{ .username = "device", .realname = "Device B", .host = "mesh.test" };
+    try sender.sendMembership("#obsolete", "DeviceB", 0, 100, true, old_ident, "");
+    try sender.sendMembership("#common", "DeviceB", 0, 101, true, old_ident, "");
+    const seed_bytes = try alloc.dupe(u8, sender.outbound());
+    defer alloc.free(seed_bytes);
+    sender.clearOutbound();
+    server.driveS2s(link_conn, receiver, seed_bytes);
+    try std.testing.expect(!link_conn.closing);
+    observer.send_len = 0;
+    observer.send_offset = 0;
+
+    try sender.sendMembership("#obsolete", "DeviceB", 0, 200, false, old_ident, "");
+    try sender.sendNickChange("DeviceB", "Ruri", old_ident, 201);
+    try sender.sendMembership("#desired", "Ruri", 0, 202, true, old_ident, "");
+    const transition_bytes = try alloc.dupe(u8, sender.outbound());
+    defer alloc.free(transition_bytes);
+    sender.clearOutbound();
+    server.driveS2s(link_conn, receiver, transition_bytes);
+    try std.testing.expect(!link_conn.closing);
+
+    const rendered = observer.send_buf[0..observer.send_len];
+    const part_at = std.mem.indexOf(u8, rendered, ":DeviceB!device@mesh.test PART #obsolete\r\n") orelse return error.TestUnexpectedResult;
+    const nick_at = std.mem.indexOf(u8, rendered, ":DeviceB!device@mesh.test NICK Ruri\r\n") orelse return error.TestUnexpectedResult;
+    const join_at = std.mem.indexOf(u8, rendered, ":Ruri!device@mesh.test JOIN :#desired\r\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(part_at < nick_at);
+    try std.testing.expect(nick_at < join_at);
+}
+
+test "secured S2S v2 identity transition renders PART before NICK before JOIN" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expect(pair.b.supportsSessionReplicaV2());
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.idb.shortId(),
+        .node_identity = &pair.idb,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    pair.b.setLocalNickResolver(server.localNickResolver());
+    pair.b.setResidenceVerifier(server.residenceVerifier());
+    pair.b.setSessionTokenResolver(server.sessionTokenResolver());
+    pair.b.setSessionTokenNickAuthorizer(server.sessionTokenNickAuthorizer());
+
+    const observer_id = try addTestLocalClient(&server, "SecureObserver", null);
+    const observer = server.connFor(observer_id).?;
+    _ = try server.world.join("#secure-old", worldIdFromClient(observer_id));
+    _ = try server.world.join("#secure-common", worldIdFromClient(observer_id));
+    _ = try server.world.join("#secure-new", worldIdFromClient(observer_id));
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = alloc;
+    conn.send_armed = true;
+    conn.sendq_cap = default_sendq_cap;
+    conn.s2s_secured = &pair.b;
+    defer {
+        conn.s2s_secured = null;
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    }
+
+    const old_ident = s2s_peer_mod.MemberIdentity{ .username = "device", .realname = "Secure Device", .host = "secure.mesh" };
+    try pair.a.sendMembership("#secure-old", "SecureB", 0, 300, true, old_ident, "");
+    try pair.a.sendMembership("#secure-common", "SecureB", 0, 301, true, old_ident, "");
+    const seed_bytes = try alloc.dupe(u8, pair.a.outbound());
+    defer alloc.free(seed_bytes);
+    pair.a.clearOutbound();
+    server.driveS2sSecured(&conn, &pair.b, seed_bytes);
+    try std.testing.expect(!conn.closing);
+    observer.send_len = 0;
+    observer.send_offset = 0;
+
+    // All three signed sidecars share one encrypted record batch. The v2 driver
+    // defers them until replica authority is drained, then must retain their
+    // original PART -> NICK -> JOIN order through client rendering.
+    try pair.a.sendMembership("#secure-old", "SecureB", 0, 400, false, old_ident, "");
+    try pair.a.sendNickChange("SecureB", "SecureRuri", old_ident, 401);
+    try pair.a.sendMembership("#secure-new", "SecureRuri", 0, 402, true, old_ident, "");
+    const transition_bytes = try alloc.dupe(u8, pair.a.outbound());
+    defer alloc.free(transition_bytes);
+    pair.a.clearOutbound();
+    server.driveS2sSecured(&conn, &pair.b, transition_bytes);
+    try std.testing.expect(!conn.closing);
+
+    const rendered = observer.send_buf[0..observer.send_len];
+    const part_at = std.mem.indexOf(u8, rendered, ":SecureB!device@secure.mesh PART #secure-old\r\n") orelse return error.TestUnexpectedResult;
+    const nick_at = std.mem.indexOf(u8, rendered, ":SecureB!device@secure.mesh NICK SecureRuri\r\n") orelse return error.TestUnexpectedResult;
+    const join_at = std.mem.indexOf(u8, rendered, ":SecureRuri!device@secure.mesh JOIN :#secure-new\r\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(part_at < nick_at);
+    try std.testing.expect(nick_at < join_at);
+}
+
 test "mesh LIST: remote-only channels join the union with the global count, secret hidden, deduped" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -47314,40 +48061,119 @@ test "threaded server: local resume joins an attached reusable session" {
     try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(claimant_id), token));
     try std.testing.expect(server.connFor(owner_id) != null);
 
+    // A third exact attachment begins with unrelated local state. Its first
+    // RESUME must atomically leave that state under its old identity, then
+    // bootstrap only the new socket into the already-live logical session.
+    const follower_id = try addTestLocalClient(&server, "follower", "sameacct");
+    const follower = server.connFor(follower_id).?;
+    follower.session.addCap(.away_notify);
+    follower.session.addCap(.setname);
+    follower.session.setRealHost("203.0.113.77");
+    follower.session.setVisibleHost("cloak.test");
+    try server.world.restoreMember("#claimant-extra", worldIdFromClient(follower_id), world_model.MemberModes.empty());
+
+    const observer_id = try addTestLocalClient(&server, "observer", null);
+    const observer = server.connFor(observer_id).?;
+    observer.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try server.observe.set(
+        LinuxServer.observeKey(observer),
+        "*!*@203.0.113.77",
+        observe_mod.Action.part.bit(),
+        server.nowMs(),
+    );
+
+    owner.send_len = 0;
+    claimant.send_len = 0;
+    follower.send_len = 0;
+    observer.send_len = 0;
+    try server.handleSessionResume(follower_id, follower, "sameacct", &resume_line);
+    const first_resume = follower.send_buf[0..follower.send_len];
+    try expectContains(first_resume, "attached to live session");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_resume, " PART #claimant-extra"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_resume, " NICK :owner"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_resume, " JOIN #resume-exact"));
+    const part_at = std.mem.indexOf(u8, first_resume, " PART #claimant-extra") orelse return error.TestUnexpectedResult;
+    const nick_at = std.mem.indexOf(u8, first_resume, " NICK :owner") orelse return error.TestUnexpectedResult;
+    const join_at = std.mem.indexOf(u8, first_resume, " JOIN #resume-exact") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(part_at < nick_at and nick_at < join_at);
+    try std.testing.expect(std.mem.indexOf(u8, owner.send_buf[0..owner.send_len], " JOIN #resume-exact") == null);
+    try std.testing.expect(std.mem.indexOf(u8, claimant.send_buf[0..claimant.send_len], " JOIN #resume-exact") == null);
+    try std.testing.expect(!server.world.channelExists("#claimant-extra"));
+    try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(owner_id), token));
+    try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(claimant_id), token));
+    try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(follower_id), token));
+    try std.testing.expect(!server.sessions.clientHasToken("sameacct", monitorIdFromClient(decoy_id), token));
+
+    const observed_part = observer.send_buf[0..observer.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observed_part, " OBSERVE part follower!"));
+    try expectContains(observed_part, "@203.0.113.77 acct=sameacct #claimant-extra");
+    try std.testing.expect(std.mem.indexOf(u8, observed_part, "@cloak.test") == null);
+
+    // Re-presenting the same token on an already-converged attachment is
+    // idempotent: it may acknowledge success, but emits no lifecycle event to
+    // any of the three siblings and no duplicate OBSERVE record.
+    owner.send_len = 0;
+    claimant.send_len = 0;
+    follower.send_len = 0;
+    observer.send_len = 0;
+    try server.handleSessionResume(follower_id, follower, "sameacct", &resume_line);
+    try expectContains(follower.send_buf[0..follower.send_len], "already attached to this session");
+    for ([_]*ConnState{ owner, claimant, follower }) |sibling| {
+        const written = sibling.send_buf[0..sibling.send_len];
+        try std.testing.expect(std.mem.indexOf(u8, written, " NICK ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, written, " JOIN ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, written, " PART ") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), observer.send_len);
+    try std.testing.expect(!follower.session_mesh_announce_pending);
+    try std.testing.expect(!follower.session_mesh_announce_token_bound);
+    try std.testing.expect(!follower.session_mesh_announce_requires_authority);
+    try std.testing.expectEqual(@as(usize, 0), follower.session_mesh_announce_parts.len);
+
     // AWAY, SETNAME, and user MODE are identity state, not socket state. Either
-    // attachment mutates both sessions and both capable clients observe one
+    // attachment mutates all sessions and all capable clients observe one
     // reflection while the reusable token remains shared.
     owner.send_len = 0;
     claimant.send_len = 0;
+    follower.send_len = 0;
     var away_line = try irc_line.parseLine("AWAY :stepped out");
     try server.handleAway(claimant_id, claimant, &away_line);
     try std.testing.expectEqualStrings("stepped out", owner.session.awayMessage().?);
     try std.testing.expectEqualStrings("stepped out", claimant.session.awayMessage().?);
+    try std.testing.expectEqualStrings("stepped out", follower.session.awayMessage().?);
     try std.testing.expect(decoy.session.awayMessage() == null);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " AWAY :stepped out"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(follower.send_buf[0..follower.send_len], " AWAY :stepped out"));
 
     owner.send_len = 0;
     claimant.send_len = 0;
+    follower.send_len = 0;
     var setname_line = try irc_line.parseLine("SETNAME :Shared Person");
     try server.handleSetname(claimant_id, claimant, &setname_line);
     try std.testing.expectEqualStrings("Shared Person", owner.session.realname());
     try std.testing.expectEqualStrings("Shared Person", claimant.session.realname());
+    try std.testing.expectEqualStrings("Shared Person", follower.session.realname());
     try std.testing.expect(!std.mem.eql(u8, "Shared Person", decoy.session.realname()));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " SETNAME :Shared Person"));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(claimant.send_buf[0..claimant.send_len], " SETNAME :Shared Person"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(follower.send_buf[0..follower.send_len], " SETNAME :Shared Person"));
 
     owner.send_len = 0;
     claimant.send_len = 0;
+    follower.send_len = 0;
     var mode_line = try irc_line.parseLine("MODE owner +iB");
     try server.handleMode(claimant_id, claimant, &mode_line);
     try std.testing.expect(owner.session.hasUmode(.invisible));
     try std.testing.expect(owner.session.hasUmode(.bot));
     try std.testing.expect(claimant.session.hasUmode(.invisible));
     try std.testing.expect(claimant.session.hasUmode(.bot));
+    try std.testing.expect(follower.session.hasUmode(.invisible));
+    try std.testing.expect(follower.session.hasUmode(.bot));
     try std.testing.expect(!decoy.session.hasUmode(.invisible));
     try std.testing.expect(!decoy.session.hasUmode(.bot));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " MODE owner +iB"));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(claimant.send_buf[0..claimant.send_len], " MODE owner +iB"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(follower.send_buf[0..follower.send_len], " MODE owner +iB"));
 }
 
 test "live session identity handoff requires the exact reusable token" {
@@ -47821,9 +48647,287 @@ test "threaded server: session migration restore cannot switch the authenticated
         .snapshot = malicious_snapshot,
     }, 1);
 
-    try std.testing.expect(!server.restoreStagedMigration(claimant_id, claimant, "alice", token));
+    try std.testing.expect(!server.restoreStagedMigration(
+        claimant_id,
+        claimant,
+        "alice",
+        token,
+        .{ .adopt_verified = true },
+    ));
     try std.testing.expectEqualStrings("alice", claimant.session.account().?);
     try std.testing.expect(server.pending_migrations.?.has(token));
+}
+
+test "atomic RESUME staged capsule adopts a rowless verified token" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(allocator);
+
+    const claimant_id = try addTestLocalClient(&server, "Before", "stage-acct");
+    const claimant = server.connFor(claimant_id).?;
+    const target_token: session_migrate.Token = @splat(0xA7);
+    const channels = [_][]const u8{"#staged-atomic"};
+    const modes = [_]u8{world_model.MemberModes.fromModes(&.{.op}).bits};
+    const encoded = try (migration_relay.Snapshot{
+        .nick = "After",
+        .umodes = "+i",
+        .channels = &channels,
+        .channel_modes = &modes,
+        .account = "stage-acct",
+        .realname = "Restored Person",
+        .host = "restored.example",
+        .username = "restored",
+    }).encode(allocator);
+    defer allocator.free(encoded);
+    try server.pending_migrations.?.put(.{
+        .token = target_token,
+        .account = "stage-acct",
+        .snapshot = encoded,
+    }, @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64)))));
+
+    try std.testing.expect(server.restoreStagedMigration(
+        claimant_id,
+        claimant,
+        "stage-acct",
+        target_token,
+        .{ .adopt_verified = true },
+    ));
+    try std.testing.expect(server.sessions.clientHasToken(
+        "stage-acct",
+        monitorIdFromClient(claimant_id),
+        target_token,
+    ));
+    try std.testing.expectEqualStrings("After", claimant.session.displayName());
+    try std.testing.expectEqualStrings("Restored Person", claimant.session.realname());
+    try std.testing.expect(server.world.isMember("#staged-atomic", worldIdFromClient(claimant_id)));
+    try std.testing.expect(claimant.session_mesh_announce_pending);
+    try std.testing.expect(claimant.session_mesh_announce_token_bound);
+    try std.testing.expect(claimant.session_mesh_announce_requires_authority);
+}
+
+test "atomic RESUME staged capsule joins then removes an existing ghost" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mesh_key = "atomic-staged-ghost-key";
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_pass = mesh_key,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(allocator);
+
+    const ghost_id = try addTestLocalClient(&server, "Ghost", "ghost-stage-acct");
+    const claimant_id = try addTestLocalClient(&server, "Before", "ghost-stage-acct");
+    const claimant = server.connFor(claimant_id).?;
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const target_token = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid).?.token;
+    const channels = [_][]const u8{"#ghost-staged"};
+    const encoded = try (migration_relay.Snapshot{
+        .nick = "RestoredGhost",
+        .umodes = "+i",
+        .channels = &channels,
+        .account = "ghost-stage-acct",
+        .realname = "Ghost Restored",
+        .host = "ghost-restored.example",
+        .username = "ghost-user",
+    }).encode(allocator);
+    defer allocator.free(encoded);
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(
+        "ghost-stage-acct",
+        ghost_cid,
+        encoded,
+    ));
+    server.world.removeClient(worldIdFromClient(ghost_id));
+    _ = server.rx().clients.free(ghost_id);
+    try server.pending_migrations.?.put(.{
+        .token = target_token,
+        .account = "ghost-stage-acct",
+        .snapshot = encoded,
+    }, @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64)))));
+
+    const token_hex = std.fmt.bytesToHex(target_token, .lower);
+    const now = server.meshWallMs();
+    const fields = session_reclaim_mesh.ReclaimFields{
+        .account = "ghost-stage-acct",
+        .session_id = &token_hex,
+        .origin_node = "remote-origin.test",
+        .issued_ms = now,
+        .expiry_ms = now + 60_000,
+        .nonce = 0xA700_0000_0000_0001,
+    };
+    var sealed: [512]u8 = undefined;
+    const sealed_len = try session_reclaim_mesh.seal(mesh_key, fields, &sealed);
+    var mesh_hex_buf: [1024]u8 = undefined;
+    const mesh_hex = Server.toHexLower(sealed[0..sealed_len], &mesh_hex_buf);
+    var line_buf: [1200]u8 = undefined;
+    var parsed = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{mesh_hex},
+    ));
+
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, "ghost-stage-acct", &parsed);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "attached to replicated mesh session");
+    try std.testing.expect(server.sessions.clientHasToken(
+        "ghost-stage-acct",
+        monitorIdFromClient(claimant_id),
+        target_token,
+    ));
+    try std.testing.expect(server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) == null);
+    try std.testing.expectEqualStrings("RestoredGhost", claimant.session.displayName());
+    try std.testing.expect(server.world.isMember("#ghost-staged", worldIdFromClient(claimant_id)));
+    try std.testing.expect(server.pending_migrations.?.has(target_token));
+}
+
+test "atomic RESUME refuses pending token A and an attached old token group" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const claimant_id = try addTestLocalClient(&server, "Claimant", "barrier-acct");
+    const old_sibling_id = try addTestLocalClient(&server, "OldSibling", "barrier-acct");
+    const target_id = try addTestLocalClient(&server, "Target", "barrier-acct");
+    const claimant = server.connFor(claimant_id).?;
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    const old_token = server.sessions.resumeHandleForClient("barrier-acct", claimant_cid).?.token;
+    const target_token = server.sessions.resumeHandleForClient("barrier-acct", monitorIdFromClient(target_id)).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "barrier-acct",
+        monitorIdFromClient(old_sibling_id),
+        old_token,
+    ));
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Target",
+        .umodes = "+i",
+        .channels = &.{},
+        .account = "barrier-acct",
+    };
+
+    claimant.session_mesh_announce_pending = true;
+    claimant.session_mesh_announce_token_bound = true;
+    claimant.session_mesh_announce_token = old_token;
+    try std.testing.expect(server.markPortableResumeIssuedForConn(
+        claimant_id,
+        claimant,
+        "barrier-acct",
+    ));
+    try std.testing.expect(claimant.session_mesh_announce_requires_authority);
+    try std.testing.expect(!server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "barrier-acct",
+        target_token,
+        .join_existing,
+        &snapshot,
+    ));
+    try std.testing.expect(server.sessions.clientHasToken("barrier-acct", claimant_cid, old_token));
+    try std.testing.expect(std.crypto.timing_safe.eql(
+        sessions_mod.Token,
+        claimant.session_mesh_announce_token,
+        old_token,
+    ));
+
+    claimant.session_mesh_announce_pending = false;
+    claimant.session_mesh_announce_token_bound = false;
+    claimant.session_mesh_announce_requires_authority = false;
+    try std.testing.expect(!server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "barrier-acct",
+        target_token,
+        .join_existing,
+        &snapshot,
+    ));
+    try std.testing.expectEqualStrings("Claimant", claimant.session.displayName());
+    try std.testing.expect(server.sessions.clientHasToken("barrier-acct", claimant_cid, old_token));
+    try std.testing.expect(server.sessions.clientHasToken(
+        "barrier-acct",
+        monitorIdFromClient(old_sibling_id),
+        old_token,
+    ));
+}
+
+test "atomic RESUME claimant-only PART preserves a target sibling" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const claimant_id = try addTestLocalClient(&server, "Before", "part-acct");
+    const target_id = try addTestLocalClient(&server, "Shared", "part-acct");
+    const foreign_id = try addTestLocalClient(&server, "Other", "part-acct");
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const claimant = server.connFor(claimant_id).?;
+    const target = server.connFor(target_id).?;
+    const foreign = server.connFor(foreign_id).?;
+    const observer = server.connFor(observer_id).?;
+    server.world.unregisterNick(worldIdFromClient(foreign_id));
+    try foreign.session.setNick("Before");
+    const target_token = server.sessions.resumeHandleForClient("part-acct", monitorIdFromClient(target_id)).?.token;
+    try server.world.restoreMember("#target-retains", worldIdFromClient(claimant_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#target-retains", worldIdFromClient(target_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#target-retains", worldIdFromClient(observer_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#foreign-retains", worldIdFromClient(claimant_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#foreign-retains", worldIdFromClient(foreign_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#foreign-retains", worldIdFromClient(observer_id), world_model.MemberModes.empty());
+    claimant.send_len = 0;
+    target.send_len = 0;
+    foreign.send_len = 0;
+    observer.send_len = 0;
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Shared",
+        .umodes = "+i",
+        .channels = &.{},
+        .account = "part-acct",
+    };
+
+    try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        "part-acct",
+        target_token,
+        .join_existing,
+        &snapshot,
+    ));
+    try std.testing.expect(!server.world.isMember("#target-retains", worldIdFromClient(claimant_id)));
+    try std.testing.expect(server.world.isMember("#target-retains", worldIdFromClient(target_id)));
+    try std.testing.expect(!server.world.isMember("#foreign-retains", worldIdFromClient(claimant_id)));
+    try std.testing.expect(server.world.isMember("#foreign-retains", worldIdFromClient(foreign_id)));
+    try expectContains(claimant.send_buf[0..claimant.send_len], " PART #target-retains");
+    try expectContains(claimant.send_buf[0..claimant.send_len], " PART #foreign-retains");
+    try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], " PART #target-retains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " PART #target-retains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, foreign.send_buf[0..foreign.send_len], " PART #foreign-retains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " PART #foreign-retains") == null);
+    try std.testing.expectEqual(@as(usize, 0), claimant.session_mesh_announce_parts.len);
 }
 
 test "threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens" {
@@ -62633,6 +63737,634 @@ test "REHASH applyReloadedLimits: swaps class registry + throttle without double
         try std.testing.expect(server.conn_throttle == null); // throttle disabled
         try std.testing.expectEqual(@as(u32, 7), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
     } else return error.SkipZigTest;
+}
+
+test "same-nick atomic restore sends only safe deferred mesh departures" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const CaptureLink = struct {
+        offer_count: usize = 0,
+        negative_count: usize = 0,
+        negative_channel_len: u8 = 0,
+        negative_channel: [64]u8 = undefined,
+        negative_nick_len: u8 = 0,
+        negative_nick: [64]u8 = undefined,
+
+        fn supportsSessionReplicaV2(_: *const @This()) bool {
+            return true;
+        }
+
+        fn sendSessionReplica(
+            self: *@This(),
+            kind: s2s_link.SessionReplicaKind,
+            signed_payload: []const u8,
+        ) !void {
+            try std.testing.expect(signed_payload.len != 0);
+            if (kind == .offer) self.offer_count += 1;
+        }
+
+        fn sendMembership(
+            self: *@This(),
+            channel: []const u8,
+            nick: []const u8,
+            status: u4,
+            hlc: u64,
+            present: bool,
+            identity: s2s_link.S2sLink.MemberIdentity,
+            setter: []const u8,
+        ) !void {
+            _ = status;
+            _ = hlc;
+            _ = identity;
+            _ = setter;
+            if (present) return;
+            self.negative_count += 1;
+            self.negative_channel_len = @intCast(@min(channel.len, self.negative_channel.len));
+            @memcpy(
+                self.negative_channel[0..self.negative_channel_len],
+                channel[0..self.negative_channel_len],
+            );
+            self.negative_nick_len = @intCast(@min(nick.len, self.negative_nick.len));
+            @memcpy(
+                self.negative_nick[0..self.negative_nick_len],
+                nick[0..self.negative_nick_len],
+            );
+        }
+
+        fn sendNickChange(
+            _: *@This(),
+            old_nick: []const u8,
+            new_nick: []const u8,
+            identity: s2s_link.S2sLink.MemberIdentity,
+            hlc: u64,
+        ) !void {
+            _ = old_nick;
+            _ = new_nick;
+            _ = identity;
+            _ = hlc;
+            return error.UnexpectedNickChange;
+        }
+
+        fn outbound(_: *const @This()) []const u8 {
+            return "";
+        }
+
+        fn clearOutbound(_: *@This()) void {}
+    };
+
+    const Scenario = struct {
+        fn run(portable: bool) !void {
+            var ident = try node_identity.fromSeed(
+                @as([32]u8, @splat(if (portable) 0xC7 else 0xC8)),
+                if (portable) "same-nick-portable" else "same-nick-local",
+            );
+            defer ident.deinit();
+            var server = Server.init(std.testing.allocator, .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .node_id = ident.shortId(),
+                .node_identity = &ident,
+                .crypto_io = std.testing.io,
+                .session_migrate_on_detach = true,
+            }) catch |err| switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer server.deinit();
+
+            const account = if (portable) "portable-same" else "local-same";
+            const claimant_id = try addTestLocalClient(&server, "Shared", account);
+            const target_id = try addTestLocalClient(&server, "Target", account);
+            const claimant = server.connFor(claimant_id).?;
+            const target_token: sessions_mod.Token = @splat(if (portable) 0xD7 else 0xD8);
+            try std.testing.expect(server.sessions.adoptTokenGroup(
+                account,
+                monitorIdFromClient(target_id),
+                target_token,
+                portable,
+            ));
+            try server.world.restoreMember(
+                "#same-nick-old",
+                worldIdFromClient(claimant_id),
+                world_model.MemberModes.fromModes(&.{.op}),
+            );
+            const snapshot = migration_relay.Snapshot{
+                .nick = "Shared",
+                .umodes = "+i",
+                .channels = &.{},
+                .account = account,
+            };
+            try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+                claimant_id,
+                claimant,
+                account,
+                target_token,
+                .join_existing,
+                &snapshot,
+            ));
+            try std.testing.expectEqual(@as(usize, 0), claimant.session.sasl_server_nonce.len);
+            try std.testing.expectEqual(
+                @intFromPtr(&claimant.session.sasl_server_nonce_buf[0]),
+                @intFromPtr(claimant.session.sasl_server_nonce.ptr),
+            );
+            try std.testing.expect(!claimant.session_mesh_announce_nick_change);
+            try std.testing.expectEqual(@as(usize, 1), claimant.session_mesh_announce_parts.len);
+            try std.testing.expectEqualStrings(
+                "#same-nick-old",
+                claimant.session_mesh_announce_parts[0].channel(),
+            );
+            try std.testing.expectEqual(portable, claimant.session_mesh_announce_requires_authority);
+
+            if (portable) {
+                try std.testing.expect(server.shipSessionMigration(
+                    claimant_id,
+                    claimant,
+                    account,
+                    target_token,
+                ));
+            }
+            var capture = CaptureLink{};
+            try std.testing.expect(server.queueDeferredSessionMeshAnnouncementsTo(
+                claimant_id,
+                &capture,
+                claimant_id,
+                claimant,
+            ));
+            if (portable) {
+                // The signed exact snapshot is authoritative. A tokenless same-nick
+                // PART could evict an independent survivor, so only OFFER is sent.
+                try std.testing.expectEqual(@as(usize, 1), capture.offer_count);
+                try std.testing.expectEqual(@as(usize, 0), capture.negative_count);
+            } else {
+                // Local TOKEN restores have no signed exact reconciliation. Their
+                // unambiguous local predecessor must therefore send the retained
+                // compatibility departure even though its display nick is stable.
+                try std.testing.expectEqual(@as(usize, 0), capture.offer_count);
+                try std.testing.expectEqual(@as(usize, 1), capture.negative_count);
+                try std.testing.expectEqualStrings(
+                    "#same-nick-old",
+                    capture.negative_channel[0..capture.negative_channel_len],
+                );
+                try std.testing.expectEqualStrings(
+                    "Shared",
+                    capture.negative_nick[0..capture.negative_nick_len],
+                );
+            }
+        }
+    };
+
+    try Scenario.run(false);
+    try Scenario.run(true);
+}
+
+test "same-nick exact sibling close keeps restored mesh membership live" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 2,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "same-nick-close";
+    const claimant_id = try addTestLocalClient(&server, "Shared", account);
+    const sibling_id = try addTestLocalClient(&server, "Sibling", account);
+    const claimant = server.connFor(claimant_id).?;
+    const sibling = server.connFor(sibling_id).?;
+    server.world.unregisterNick(worldIdFromClient(sibling_id));
+    try sibling.session.setNick("Shared");
+
+    const target_token = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(sibling_id),
+    ).?.token;
+    try server.world.restoreMember(
+        "#predecessor-only",
+        worldIdFromClient(claimant_id),
+        world_model.MemberModes.fromModes(&.{.op}),
+    );
+    const snapshot = migration_relay.Snapshot{
+        .nick = "Shared",
+        .umodes = "+i",
+        .channels = &.{"#restored-current"},
+        .account = account,
+    };
+    try std.testing.expect(server.restoreAndBindMigrationSnapshot(
+        claimant_id,
+        claimant,
+        account,
+        target_token,
+        .join_existing,
+        &snapshot,
+    ));
+    try std.testing.expect(!claimant.session_mesh_announce_nick_change);
+    try std.testing.expect(!claimant.session_mesh_announce_requires_authority);
+    try std.testing.expectEqual(@as(usize, 1), claimant.session_mesh_announce_parts.len);
+    try std.testing.expect(server.world.isMember(
+        "#restored-current",
+        worldIdFromClient(claimant_id),
+    ));
+    // The survivor may legitimately join the restored image and rejoin a channel
+    // that was old-only when restore staged the claimant's retained departure. A
+    // later same-nick PART for either entry would now evict live sibling state.
+    try server.world.restoreMember(
+        "#restored-current",
+        worldIdFromClient(sibling_id),
+        world_model.MemberModes.fromModes(&.{.op}),
+    );
+    try server.world.restoreMember(
+        "#predecessor-only",
+        worldIdFromClient(sibling_id),
+        world_model.MemberModes.fromModes(&.{.voice}),
+    );
+
+    // Attach a real established peer so closeConn exercises the production
+    // retraction fan-out and the receiver decodes exactly what crossed the wire.
+    var remote: s2s_link.S2sLink = undefined;
+    try remote.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "remote.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer remote.deinit();
+    const local_link = try allocator.create(s2s_link.S2sLink);
+    try local_link.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "local.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const link_conn = server.rx().clients.get(link_id).?;
+    link_conn.s2s = local_link;
+    link_conn.send_armed = true;
+    link_conn.overflow_allocator = allocator;
+
+    try remote.start(50);
+    try pumpLinkPair(&remote, local_link, allocator);
+    try std.testing.expect(local_link.established());
+    remote.clearOutbound();
+    local_link.clearOutbound();
+    resetTestSendQ(link_conn);
+
+    const claimant_token = claimant.token;
+    try server.closeConn(claimant_token, "transport lost");
+    try std.testing.expect(server.connFor(claimant_id) == null);
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+        server.world.findNick("Shared"),
+    );
+    try std.testing.expect(server.world.isMember(
+        "#restored-current",
+        worldIdFromClient(sibling_id),
+    ));
+    try std.testing.expect(server.world.isMember(
+        "#predecessor-only",
+        worldIdFromClient(sibling_id),
+    ));
+
+    const wire = try copyTestSendQ(allocator, server.connFor(link_id).?);
+    defer allocator.free(wire);
+    try remote.feed(wire, 500, 9);
+    remote.processDeferredResidenceFrames(500);
+    const changes = try remote.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    var predecessor_negatives: usize = 0;
+    var current_negatives: usize = 0;
+    var presence_negatives: usize = 0;
+    for (changes) |change| {
+        try std.testing.expectEqual(
+            s2s_peer_mod.S2sPeer.MembershipDelta.Kind.parted,
+            change.kind,
+        );
+        try std.testing.expectEqualStrings("Shared", change.nick);
+        if (std.mem.eql(u8, change.channel, "#predecessor-only")) predecessor_negatives += 1;
+        if (std.mem.eql(u8, change.channel, "#restored-current")) current_negatives += 1;
+        if (isPresenceChannel(change.channel)) presence_negatives += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), predecessor_negatives);
+    try std.testing.expectEqual(@as(usize, 0), current_negatives);
+    try std.testing.expectEqual(@as(usize, 0), presence_negatives);
+}
+
+test "atomic session restore and token bind preserve every component on allocation failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var fail_offset: usize = 0;
+    while (fail_offset < 256) : (fail_offset += 1) {
+        const completed = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var server = Server.init(failing.allocator(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .crypto_io = std.testing.io,
+            }) catch |err| switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                server.deinit();
+            }
+
+            const account = "alloc-restore";
+            const sibling_id = try addTestLocalClient(&server, "Restored", account);
+            const claimant_id = try addTestLocalClient(&server, "DeviceB", account);
+            const sibling = server.connFor(sibling_id).?;
+            const claimant = server.connFor(claimant_id).?;
+
+            try claimant.session.setRealname("Device B");
+            claimant.session.setVisibleHost("old.example");
+            claimant.session.setAway("old away");
+            _ = claimant.session.setUmode(.bot, true);
+            claimant.session.addCap(.echo_message);
+            const original_nonce = "0123456789abcdef0123456789abcdef";
+            claimant.session.setSaslServerNonce(original_nonce);
+
+            const target_token: sessions_mod.Token = @splat(0xA5);
+            const old_token: sessions_mod.Token = @splat(0xB6);
+            try std.testing.expect(server.sessions.adoptTokenGroup(
+                account,
+                monitorIdFromClient(sibling_id),
+                target_token,
+                true,
+            ));
+            try std.testing.expect(server.sessions.adoptTokenGroup(
+                account,
+                monitorIdFromClient(claimant_id),
+                old_token,
+                false,
+            ));
+            const target_handle = server.sessions.resumeHandleForClient(
+                account,
+                monitorIdFromClient(sibling_id),
+            ).?;
+            const old_handle = server.sessions.resumeHandleForClient(
+                account,
+                monitorIdFromClient(claimant_id),
+            ).?;
+            try std.testing.expectEqualSlices(u8, &target_token, &target_handle.token);
+            try std.testing.expectEqualSlices(u8, &old_token, &old_handle.token);
+            try std.testing.expect(target_handle.portable);
+            try std.testing.expect(!old_handle.portable);
+            try std.testing.expect(server.sessions.markTokenReplicaDirty(target_token));
+            try std.testing.expect(server.sessions.markTokenReplicaProjectionDirty(target_token));
+            try std.testing.expect(server.sessions.markTokenReplicaProjectionDirty(old_token));
+            const target_projection = try server.sessions.armTokenLocalChannelProjection(
+                target_token,
+                "#target-journal",
+                true,
+                world_model.MemberModes.fromModes(&.{.op}).bits,
+            );
+            const old_projection = try server.sessions.armTokenLocalChannelProjection(
+                old_token,
+                "#old-journal",
+                false,
+                world_model.MemberModes.fromModes(&.{.voice}).bits,
+            );
+
+            const sibling_common_modes = world_model.MemberModes.fromModes(&.{.op});
+            const sibling_target_modes = world_model.MemberModes.fromModes(&.{.voice});
+            const claimant_old_modes = world_model.MemberModes.fromModes(&.{.op});
+            const claimant_common_modes = world_model.MemberModes.fromModes(&.{.voice});
+            try server.world.restoreMember("#common", worldIdFromClient(sibling_id), sibling_common_modes);
+            try server.world.restoreMember("#target", worldIdFromClient(sibling_id), sibling_target_modes);
+            try server.world.restoreMember("#old", worldIdFromClient(claimant_id), claimant_old_modes);
+            try server.world.restoreMember("#common", worldIdFromClient(claimant_id), claimant_common_modes);
+
+            const desired_common_modes = world_model.MemberModes.fromModes(&.{ .op, .voice });
+            const desired_target_modes = world_model.MemberModes.fromModes(&.{.op});
+            const snapshot = migration_relay.Snapshot{
+                .nick = "Restored",
+                .umodes = "+i-B",
+                .channels = &.{ "#common", "#target" },
+                .channel_modes = &.{
+                    @truncate(desired_common_modes.bits),
+                    @truncate(desired_target_modes.bits),
+                },
+                .realname = "Restored Session",
+                .host = "restored.example",
+                .account = account,
+                .away = "restored away",
+                .username = "restored-user",
+            };
+
+            const claimant_send_len = claimant.send_len;
+            const claimant_send_offset = claimant.send_offset;
+            const sibling_send_len = sibling.send_len;
+            const sibling_send_offset = sibling.send_offset;
+
+            failing.fail_index = failing.alloc_index + fail_offset;
+            const restored = server.restoreAndBindMigrationSnapshot(
+                claimant_id,
+                claimant,
+                account,
+                target_handle.token,
+                .join_existing,
+                &snapshot,
+            );
+            failing.fail_index = std.math.maxInt(usize);
+
+            if (!restored) {
+                try std.testing.expect(failing.has_induced_failure);
+
+                // World and its exact membership modes remain byte-for-byte
+                // equivalent to the preflight image.
+                try std.testing.expectEqual(
+                    @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+                    server.world.findNick("Restored"),
+                );
+                try std.testing.expectEqual(
+                    @as(?world_model.ClientId, worldIdFromClient(claimant_id)),
+                    server.world.findNick("DeviceB"),
+                );
+                try std.testing.expectEqualStrings("Restored", server.world.nickOf(worldIdFromClient(sibling_id)).?);
+                try std.testing.expectEqualStrings("DeviceB", server.world.nickOf(worldIdFromClient(claimant_id)).?);
+                try std.testing.expectEqual(
+                    sibling_common_modes.bits,
+                    server.world.memberModes("#common", worldIdFromClient(sibling_id)).?.bits,
+                );
+                try std.testing.expectEqual(
+                    sibling_target_modes.bits,
+                    server.world.memberModes("#target", worldIdFromClient(sibling_id)).?.bits,
+                );
+                try std.testing.expectEqual(
+                    claimant_old_modes.bits,
+                    server.world.memberModes("#old", worldIdFromClient(claimant_id)).?.bits,
+                );
+                try std.testing.expectEqual(
+                    claimant_common_modes.bits,
+                    server.world.memberModes("#common", worldIdFromClient(claimant_id)).?.bits,
+                );
+                try std.testing.expect(!server.world.isMember("#target", worldIdFromClient(claimant_id)));
+
+                // SessionStore keeps both authority domains and all mergeable
+                // flags/journals untouched until both tickets can commit.
+                const retained_old = server.sessions.resumeHandleForClient(
+                    account,
+                    monitorIdFromClient(claimant_id),
+                ).?;
+                const retained_target = server.sessions.resumeHandleForClient(
+                    account,
+                    monitorIdFromClient(sibling_id),
+                ).?;
+                try std.testing.expectEqualSlices(u8, &old_handle.token, &retained_old.token);
+                try std.testing.expect(!retained_old.portable);
+                try std.testing.expectEqualSlices(u8, &target_handle.token, &retained_target.token);
+                try std.testing.expect(retained_target.portable);
+                try std.testing.expect(!server.sessions.tokenReplicaDirty(old_handle.token));
+                try std.testing.expect(server.sessions.tokenReplicaProjectionDirty(old_handle.token));
+                try std.testing.expect(server.sessions.tokenReplicaDirty(target_handle.token));
+                try std.testing.expect(server.sessions.tokenReplicaProjectionDirty(target_handle.token));
+                const retained_old_projection = server.sessions.tokenLocalChannelProjection(
+                    old_handle.token,
+                    "#OLD-JOURNAL",
+                ).?;
+                const retained_target_projection = server.sessions.tokenLocalChannelProjection(
+                    target_handle.token,
+                    "#TARGET-JOURNAL",
+                ).?;
+                try std.testing.expectEqual(old_projection.generation, retained_old_projection.generation);
+                try std.testing.expectEqual(old_projection.present, retained_old_projection.present);
+                try std.testing.expectEqual(old_projection.member_mode_bits, retained_old_projection.member_mode_bits);
+                try std.testing.expectEqual(target_projection.generation, retained_target_projection.generation);
+                try std.testing.expectEqual(target_projection.present, retained_target_projection.present);
+                try std.testing.expectEqual(target_projection.member_mode_bits, retained_target_projection.member_mode_bits);
+
+                // The live profile, deferred sidecar journal, and every local
+                // SendQ are still the exact pre-call connection image.
+                try std.testing.expectEqualStrings("DeviceB", claimant.session.displayName());
+                try std.testing.expectEqualStrings(account, claimant.session.account().?);
+                try std.testing.expectEqualStrings("Device B", claimant.session.realname());
+                try std.testing.expectEqualStrings("old.example", claimant.session.host());
+                try std.testing.expectEqualStrings("old away", claimant.session.awayMessage().?);
+                try std.testing.expect(claimant.session.hasUmode(.bot));
+                try std.testing.expect(!claimant.session.hasUmode(.invisible));
+                try std.testing.expect(claimant.session.hasCap(.echo_message));
+                try std.testing.expectEqualStrings(original_nonce, claimant.session.sasl_server_nonce);
+                try std.testing.expectEqual(
+                    @intFromPtr(&claimant.session.sasl_server_nonce_buf[0]),
+                    @intFromPtr(claimant.session.sasl_server_nonce.ptr),
+                );
+                try std.testing.expect(!claimant.session_mesh_announce_pending);
+                try std.testing.expect(!claimant.session_mesh_announce_token_bound);
+                try std.testing.expect(!claimant.session_mesh_announce_requires_authority);
+                try std.testing.expect(std.mem.allEqual(
+                    u8,
+                    &claimant.session_mesh_announce_token,
+                    0,
+                ));
+                try std.testing.expect(!claimant.session_mesh_announce_old_retracted);
+                try std.testing.expect(!claimant.session_mesh_announce_nick_change);
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_nick_len);
+                try std.testing.expect(std.mem.allEqual(
+                    u8,
+                    &claimant.session_mesh_announce_old_nick,
+                    0,
+                ));
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_identity.username_len);
+                try std.testing.expectEqual(@as(u16, 0), claimant.session_mesh_announce_old_identity.realname_len);
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_identity.host_len);
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_identity.account_len);
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_identity.real_host_len);
+                try std.testing.expectEqual(@as(u8, 0), claimant.session_mesh_announce_old_identity.certfp_len);
+                try std.testing.expectEqual(@as(usize, 0), claimant.session_mesh_announce_parts.len);
+                try std.testing.expectEqual(claimant_send_len, claimant.send_len);
+                try std.testing.expectEqual(claimant_send_offset, claimant.send_offset);
+                try std.testing.expectEqual(sibling_send_len, sibling.send_len);
+                try std.testing.expectEqual(sibling_send_offset, sibling.send_offset);
+                break :blk false;
+            }
+
+            // The first allocation-complete pass installs the entire World,
+            // SessionStore, profile, and deferred compatibility image together.
+            try std.testing.expectEqual(
+                @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+                server.world.findNick("Restored"),
+            );
+            try std.testing.expect(server.world.findNick("DeviceB") == null);
+            try std.testing.expect(server.world.nickOf(worldIdFromClient(claimant_id)) == null);
+            try std.testing.expect(!server.world.isMember("#old", worldIdFromClient(claimant_id)));
+            try std.testing.expectEqual(
+                desired_common_modes.bits,
+                server.world.memberModes("#common", worldIdFromClient(claimant_id)).?.bits,
+            );
+            try std.testing.expectEqual(
+                desired_target_modes.bits,
+                server.world.memberModes("#target", worldIdFromClient(claimant_id)).?.bits,
+            );
+            try std.testing.expectEqual(
+                sibling_common_modes.bits,
+                server.world.memberModes("#common", worldIdFromClient(sibling_id)).?.bits,
+            );
+            try std.testing.expectEqual(
+                sibling_target_modes.bits,
+                server.world.memberModes("#target", worldIdFromClient(sibling_id)).?.bits,
+            );
+
+            const rebound = server.sessions.resumeHandleForClient(
+                account,
+                monitorIdFromClient(claimant_id),
+            ).?;
+            try std.testing.expectEqualSlices(u8, &target_handle.token, &rebound.token);
+            try std.testing.expect(rebound.portable);
+            try std.testing.expect(server.sessions.tokenReplicaDirty(target_handle.token));
+            try std.testing.expect(server.sessions.tokenReplicaProjectionDirty(target_handle.token));
+            try std.testing.expect(server.sessions.tokenLocalChannelProjection(
+                target_handle.token,
+                "#old-journal",
+            ) != null);
+            try std.testing.expect(server.sessions.tokenLocalChannelProjection(
+                target_handle.token,
+                "#target-journal",
+            ) != null);
+
+            try std.testing.expectEqualStrings("Restored", claimant.session.displayName());
+            try std.testing.expectEqualStrings(account, claimant.session.account().?);
+            try std.testing.expectEqualStrings("Restored Session", claimant.session.realname());
+            try std.testing.expectEqualStrings("restored-user", claimant.session.username());
+            try std.testing.expectEqualStrings("restored.example", claimant.session.host());
+            try std.testing.expectEqualStrings("restored away", claimant.session.awayMessage().?);
+            try std.testing.expect(claimant.session.hasUmode(.invisible));
+            try std.testing.expect(!claimant.session.hasUmode(.bot));
+            try std.testing.expect(claimant.session.hasCap(.echo_message));
+            try std.testing.expectEqualStrings(original_nonce, claimant.session.sasl_server_nonce);
+            try std.testing.expectEqual(
+                @intFromPtr(&claimant.session.sasl_server_nonce_buf[0]),
+                @intFromPtr(claimant.session.sasl_server_nonce.ptr),
+            );
+            try std.testing.expect(claimant.session_mesh_announce_pending);
+            try std.testing.expect(claimant.session_mesh_announce_token_bound);
+            try std.testing.expect(claimant.session_mesh_announce_requires_authority);
+            try std.testing.expectEqualSlices(u8, &target_handle.token, &claimant.session_mesh_announce_token);
+            try std.testing.expect(claimant.session_mesh_announce_nick_change);
+            try std.testing.expectEqualStrings(
+                "DeviceB",
+                claimant.session_mesh_announce_old_nick[0..claimant.session_mesh_announce_old_nick_len],
+            );
+            try std.testing.expectEqual(@as(usize, 1), claimant.session_mesh_announce_parts.len);
+            try std.testing.expectEqualStrings("#old", claimant.session_mesh_announce_parts[0].channel());
+            try std.testing.expect(claimant.send_len > claimant_send_len);
+            try std.testing.expect(sibling.send_len > sibling_send_len);
+            break :blk true;
+        };
+        if (completed) break;
+    } else return error.TestUnexpectedResult;
 }
 
 test {
