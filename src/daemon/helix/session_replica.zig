@@ -1252,6 +1252,20 @@ pub const Store = struct {
         return count;
     }
 
+    /// Whether an exact token has a live, nonquarantined authority at another
+    /// mesh origin. Connection teardown uses this receiver-owned fact instead of
+    /// treating an arbitrary established peer as proof that a remote attachment
+    /// exists for the departing logical session.
+    pub fn hasLiveOriginOtherThan(self: *const Store, token: Token, excluded_origin: NodeId, now_ms: i64) bool {
+        var it = @constCast(&self.entries).iterator();
+        while (it.next()) |slot| {
+            if (!tokenEql(slot.key_ptr.token, token) or slot.key_ptr.origin_node == excluded_origin) continue;
+            if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
+            return true;
+        }
+        return false;
+    }
+
     /// Test for any or one exact anti-entropy parent of an authority origin.
     pub fn hasReplicaParent(self: *const Store, token: Token, origin_node: NodeId, parent_peer: ?NodeId) bool {
         if (self.isQuarantined(token)) return false;
@@ -3600,6 +3614,8 @@ test "session replica sweep removes only the expired origin and its paths" {
     _ = try store.applySignedOffer(a.decoded, 41, 200);
     _ = try store.applySignedOffer(a.decoded, 42, 201);
     _ = try store.applySignedOffer(b.decoded, 43, 202);
+    try testing.expect(store.hasLiveOriginOtherThan(tok, a.decoded.offer.revision.origin_node, 202));
+    try testing.expect(store.hasLiveOriginOtherThan(tok, b.decoded.offer.revision.origin_node, 202));
 
     const swept = store.sweep(251);
     try testing.expectEqual(@as(usize, 1), swept.entries);
@@ -3609,6 +3625,8 @@ test "session replica sweep removes only the expired origin and its paths" {
     try testing.expect(store.getOrigin(tok, b.decoded.offer.revision.origin_node) != null);
     try testing.expect(store.hasOriginRoute(tok, b.decoded.offer.revision.origin_node, 43));
     try testing.expectEqual(@as(usize, 1), store.routeCountForToken(tok));
+    try testing.expect(store.hasLiveOriginOtherThan(tok, a.decoded.offer.revision.origin_node, 251));
+    try testing.expect(!store.hasLiveOriginOtherThan(tok, b.decoded.offer.revision.origin_node, 251));
 }
 
 test "session replica routesInto reports bounded route values" {

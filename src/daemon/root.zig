@@ -82,6 +82,7 @@ pub const reactor_fabric = @import("reactor_fabric.zig");
 pub const reactor_pool = @import("reactor_pool.zig");
 pub const reactor_wake = @import("reactor_wake.zig");
 pub const registry = @import("registry.zig");
+pub const relay_v2_replay_guard = @import("relay_v2_replay_guard.zig");
 pub const reuseport = @import("reuseport.zig");
 pub const s2s_dst = @import("s2s_dst.zig");
 pub const s2s_link = @import("s2s_link.zig");
@@ -221,6 +222,7 @@ test {
     _ = reactor_pool;
     _ = reactor_wake;
     _ = registry;
+    _ = relay_v2_replay_guard;
     _ = reuseport;
     _ = s2s_dst;
     _ = s2s_link;

@@ -148,6 +148,44 @@ pub const Participant = struct {
 
     domain: *Domain = undefined,
 
+    /// Pins one writer participant to the epoch observed while a transaction
+    /// reserves a specific limbo bag. At most one epoch advance can occur while
+    /// this token is active; a second advance sees the participant pinned in
+    /// the older epoch and stops. Retires therefore stay both allocation-free
+    /// and correctly aged even when another thread advances concurrently.
+    pub const RetireReservation = struct {
+        participant: *Participant,
+        bag_index: usize,
+        remaining: usize,
+        active: bool = true,
+
+        pub fn retireErased(
+            self: *RetireReservation,
+            ptr: *anyopaque,
+            free_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+            allocator: std.mem.Allocator,
+        ) void {
+            std.debug.assert(self.active);
+            std.debug.assert(self.remaining != 0);
+            self.participant.bags[self.bag_index].items.appendAssumeCapacity(.{
+                .ptr = ptr,
+                .free_fn = free_fn,
+                .allocator = allocator,
+            });
+            self.remaining -= 1;
+            _ = self.participant.domain.retired_count.fetchAdd(1, .monotonic);
+        }
+
+        /// Release the epoch pin. Unused capacity is harmless; it remains in
+        /// the bag for a future reservation.
+        pub fn finish(self: *RetireReservation) void {
+            std.debug.assert(self.active);
+            var guard = Guard{ .participant = self.participant };
+            guard.unpin();
+            self.active = false;
+        }
+    };
+
     /// Enter a read critical section. Publishes the current global epoch as this
     /// participant's local epoch and marks it active, then fences so the first
     /// shared-pointer load cannot float above the publication.
@@ -178,6 +216,24 @@ pub const Participant = struct {
             }
         };
         self.retireErased(@ptrCast(ptr), Closure.free, allocator);
+    }
+
+    /// Pin the observed epoch and reserve exact limbo-bag slots before
+    /// publication. Callers must enqueue through the returned token and finish
+    /// it on both commit and abort. Pinning closes the reserve/reload race where
+    /// a concurrent epoch advance selected an unreserved bag after publication.
+    pub fn reserveRetireCapacity(self: *Participant, additional: usize) std.mem.Allocator.Error!RetireReservation {
+        std.debug.assert(self.in_use.load(.monotonic));
+        var guard = self.pin();
+        errdefer guard.unpin();
+        const g = self.domain.global_epoch.load(.acquire);
+        const idx = g % epoch_count;
+        try self.bags[idx].items.ensureUnusedCapacity(self.domain.backing, additional);
+        return .{
+            .participant = self,
+            .bag_index = idx,
+            .remaining = additional,
+        };
     }
 
     /// Type-erased retire: caller supplies a free function. Writer side.
@@ -490,6 +546,50 @@ test "advance is blocked while a participant is pinned in an older epoch" {
     // Reader leaves; now advance succeeds.
     g.unpin();
     try testing.expect(domain.advance()); // 1 -> 2
+}
+
+test "retire reservation survives concurrent epoch advance and allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var tracking: TrackingAllocator = .{ .child = testing.allocator };
+    const node_allocator = tracking.allocator();
+    var domain = Domain.init(failing.allocator());
+    defer domain.deinit();
+    const writer = try domain.register();
+    defer writer.unregister();
+
+    const node = try node_allocator.create(TestNode);
+    node.* = .{ .value = 99 };
+    var reservation = try writer.reserveRetireCapacity(1);
+
+    // Advance on another thread between reservation and publication. The first
+    // advance is legal; the reservation's epoch pin blocks the second.
+    const Advancer = struct {
+        fn run(d: *Domain) void {
+            _ = d.advance();
+            _ = d.advance();
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Advancer.run, .{&domain});
+    thread.join();
+    try testing.expectEqual(@as(u64, 1), domain.global_epoch.load(.acquire));
+
+    // Any append to the newly-current, unreserved bag would now fail. The
+    // token appends to its fixed pre-reserved bag without touching allocator.
+    failing.fail_index = failing.alloc_index;
+    const Closure = struct {
+        fn reclaim(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            allocator.destroy(@as(*TestNode, @ptrCast(@alignCast(ptr))));
+        }
+    };
+    reservation.retireErased(@ptrCast(node), Closure.reclaim, node_allocator);
+    try testing.expect(!failing.has_induced_failure);
+    reservation.finish();
+
+    try testing.expect(domain.advance()); // 1 -> 2
+    try testing.expectEqual(@as(usize, 1), tracking.live);
+    try testing.expect(domain.advance()); // 2 -> 3, fixed bag 0 is now safe
+    try testing.expectEqual(@as(usize, 0), tracking.live);
+    failing.fail_index = std.math.maxInt(usize);
 }
 
 test "premature free is impossible while a reader holds a retired pointer" {

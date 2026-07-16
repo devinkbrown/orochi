@@ -2163,6 +2163,17 @@ pub const ConnState = struct {
     /// which such conns never reach.
     overflow_allocator: std.mem.Allocator = undefined,
     closing: bool = false,
+    /// A local exact-token sibling exists, but the failure-atomic World handoff
+    /// could not be staged under current allocation pressure. The socket stays
+    /// owned by this slot and the timer retries close before any teardown/QUIT.
+    session_handoff_retry: bool = false,
+    /// The exact-token World handoff already committed (for example in QUIT).
+    /// closeConn must not restage it or turn a later OOM into a false teardown.
+    session_handoff_complete: bool = false,
+    /// The fallible handoff preflight reached a definitive result. This is
+    /// distinct from `complete`: false can validly mean no exact sibling exists,
+    /// and finalization must not allocate or re-run that decision either.
+    session_handoff_checked: bool = false,
     /// Login found a detached snapshot and is giving the client a short window
     /// to present the exact resume credential before account autojoin runs. This
     /// avoids consuming an arbitrary same-account ghost and avoids joining under
@@ -2194,6 +2205,14 @@ pub const ConnState = struct {
     /// via the send-drain path. Defaults to the generic socket-close reason; the
     /// timeout sweep overrides it (e.g. "Ping timeout") before marking `closing`.
     close_reason: []const u8 = "Client quit",
+    /// Stable backing for a retryable close reason borrowed from RecvQ/parser
+    /// storage. Handoff OOM can defer close beyond RecvQ reset, so the timer must
+    /// never retain that borrowed slice directly.
+    close_reason_store: [512]u8 = @splat(0),
+    /// A clean QUIT captured and retained the full pre-removal exact-token
+    /// snapshot already. The later send-drain close must not replace it with an
+    /// empty post-remove World snapshot or publish that empty state to the mesh.
+    session_detach_prepared: bool = false,
     /// Wall-clock ms when the connection was accepted (registration-timeout base).
     connected_at_ms: i64 = 0,
     /// Wall-clock ms of the last inbound activity (recv with data). Updated on
@@ -4885,6 +4904,7 @@ pub const LinuxServer = struct {
         }
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
         if (self.rx() == &self.reactors[0]) self.maybeSwapOcspStaple();
+        self.retryFailedSessionHandoffs();
         self.sweepTimeouts();
         self.sweepDeferredSessionAutojoins();
         // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
@@ -4971,6 +4991,36 @@ pub const LinuxServer = struct {
             self.retrySessionReplicaStoreStages();
         }
         self.maybeWriteStats();
+    }
+
+    /// Retry closes whose exact-token World handoff failed before teardown.
+    /// Slot storage is stable while iterating; closeConn may mark the current
+    /// slot free but never reallocates the slot array. A repeated OOM simply
+    /// leaves the retry bit set for the next timer tick.
+    fn retryFailedSessionHandoffs(self: *LinuxServer) void {
+        var index: usize = 0;
+        while (index < self.rx().clients.slots.items.len) : (index += 1) {
+            const slot = &self.rx().clients.slots.items[index];
+            if (!slot.occupied or !slot.value.session_handoff_retry) continue;
+            const id = idFromToken(slot.value.token);
+            const handed_off = self.handoffLiveSessionIdentity(id, &slot.value) catch continue;
+            slot.value.session_handoff_complete = handed_off;
+            slot.value.session_handoff_checked = true;
+            slot.value.session_handoff_retry = false;
+
+            // A send CQE may still hold a kernel reference to send_buf. The
+            // ordinary send-completion path owns final teardown in that case.
+            if (slot.value.send_armed) continue;
+            if (slot.value.send_offset < slot.value.send_len or slot.value.send_overflow.items.len != 0) {
+                self.armSendIfNeeded(&slot.value) catch {
+                    // Arming failed, so no kernel reference was created and it
+                    // is safe to drop the unsent tail during final close.
+                    self.closeConn(slot.value.token, slot.value.close_reason) catch {};
+                };
+                continue;
+            }
+            self.closeConn(slot.value.token, slot.value.close_reason) catch {};
+        }
     }
 
     /// Re-send local mesh state to every established S2S peer. Membership is
@@ -7724,35 +7774,42 @@ pub const LinuxServer = struct {
     fn deliverSessionSyncSiblings(
         self: *LinuxServer,
         account: []const u8,
+        excluded_token: ?sessions_mod.Token,
         tags: MsgTags,
         bytes: []const u8,
         skip_a: client_model.ClientId,
         skip_b: ?client_model.ClientId,
     ) void {
-        self.deliverSessionSyncSiblingsNick(account, tags, bytes, skip_a, skip_b, null);
+        self.deliverSessionSyncSiblingsNick(account, excluded_token, null, tags, bytes, skip_a, skip_b, null, null);
     }
 
-    /// Fan a message out to an account's other live sessions. `same_nick` (when
-    /// non-null) is the DM target nick: a sibling whose display nick equals it is
-    /// a SAME-NICK session of the same identity (e.g. one user signed in to the
-    /// same nick from two clients/devices), so it receives the message REGARDLESS
-    /// of the `orochi/session-sync` cap — that cap is opt-in mirroring of OTHER
-    /// nicks, not delivery to your own nick. Different-nick siblings still require
-    /// the cap.
+    /// Optionally mirror to an account's OTHER named sessions. Exact-token
+    /// attachments use mandatory delivery before this helper. Excluded nicks are
+    /// authority boundaries: another token rendering the addressed/source nick
+    /// is independent and cannot opt into that event through account affinity.
     fn deliverSessionSyncSiblingsNick(
         self: *LinuxServer,
         account: []const u8,
+        excluded_token_a: ?sessions_mod.Token,
+        excluded_token_b: ?sessions_mod.Token,
         tags: MsgTags,
         bytes: []const u8,
         skip_a: ?client_model.ClientId,
         skip_b: ?client_model.ClientId,
-        same_nick: ?[]const u8,
+        excluded_nick_a: ?[]const u8,
+        excluded_nick_b: ?[]const u8,
     ) void {
         const skip_a_flat = if (skip_a) |id| monitorIdFromClient(id) else null;
         const skip_b_flat = if (skip_b) |id| monitorIdFromClient(id) else null;
         const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
         defer self.allocator.free(account_sessions);
         for (account_sessions) |s| {
+            if (excluded_token_a) |token| {
+                if (std.crypto.timing_safe.eql(sessions_mod.Token, s.token, token)) continue;
+            }
+            if (excluded_token_b) |token| {
+                if (std.crypto.timing_safe.eql(sessions_mod.Token, s.token, token)) continue;
+            }
             const sibling_id = clientIdFromMonitor(s.client);
             const sibling = self.connFor(sibling_id) orelse continue;
             // Defense in depth: only mirror to a sibling STILL authenticated to
@@ -7760,12 +7817,17 @@ pub const LinuxServer = struct {
             // account switch) must never leak this account's DMs to a connection
             // no longer logged into it.
             const cur = sibling.session.account() orelse continue;
-            if (!std.mem.eql(u8, cur, account)) continue;
-            const is_same_nick = if (same_nick) |n|
-                std.ascii.eqlIgnoreCase(sibling.session.displayName(), n)
-            else
-                false;
-            if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat, is_same_nick)) continue;
+            if (!std.ascii.eqlIgnoreCase(cur, account)) continue;
+            // Same rendered nick with a DIFFERENT token is an independent
+            // authority domain, never an account-sync alias. Exact-token peers
+            // were already delivered through the mandatory path above.
+            if (excluded_nick_a) |n| {
+                if (std.ascii.eqlIgnoreCase(sibling.session.displayName(), n)) continue;
+            }
+            if (excluded_nick_b) |n| {
+                if (std.ascii.eqlIgnoreCase(sibling.session.displayName(), n)) continue;
+            }
+            if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat)) continue;
             self.deliverTagged(sibling_id, tags, bytes) catch continue;
         }
     }
@@ -8143,12 +8205,14 @@ pub const LinuxServer = struct {
 
     const ReplicatedSessionProof = struct {
         trusted_account: []const u8,
+        token: sessions_mod.Token,
         modes: world_model.MemberModes,
     };
 
     fn proofFromSessionReplicaEntry(
         self: *LinuxServer,
         entry: *const session_replica_v2.Store.Entry,
+        token: sessions_mod.Token,
         account: []const u8,
         nick: []const u8,
         channel: ?[]const u8,
@@ -8172,7 +8236,7 @@ pub const LinuxServer = struct {
             }
             if (!found_channel) return null;
         }
-        return .{ .trusted_account = entry.account, .modes = modes };
+        return .{ .trusted_account = entry.account, .token = token, .modes = modes };
     }
 
     /// Resolve signed portable-session authority without consulting the relay's
@@ -8199,7 +8263,7 @@ pub const LinuxServer = struct {
             if (!std.ascii.eqlIgnoreCase(local.account, live.entry.account)) return null;
             const local_session = self.sessions.findTokenSessionInAccount(local.account, live.token) orelse return null;
             if (!local_session.portable_resume) return null;
-            return self.proofFromSessionReplicaEntry(live.entry, local.account, nick, channel, now_wall);
+            return self.proofFromSessionReplicaEntry(live.entry, live.token, local.account, nick, channel, now_wall);
         };
         const owner_id = clientIdFromWorld(wid);
         const local_conn = self.connFor(owner_id) orelse return null;
@@ -8213,7 +8277,7 @@ pub const LinuxServer = struct {
         // of the local World nick owner. An unrelated same-account detached token
         // is never a substitute. Routes remain reachability hints only.
         if (self.session_replica_store.getOrigin(handle.token, origin_node)) |entry| {
-            if (self.proofFromSessionReplicaEntry(entry, account, nick, channel, now_wall)) |proof| return proof;
+            if (self.proofFromSessionReplicaEntry(entry, handle.token, account, nick, channel, now_wall)) |proof| return proof;
         }
 
         // Rolling-old direct-peer fallback remains bound to the same exact owner
@@ -8221,7 +8285,7 @@ pub const LinuxServer = struct {
         if (!self.session_replica_routes.contains(.{ .token = handle.token, .peer = origin_node })) return null;
         var modes = world_model.MemberModes.empty();
         if (channel) |wanted| modes = self.world.memberModes(wanted, wid) orelse return null;
-        return .{ .trusted_account = account, .modes = modes };
+        return .{ .trusted_account = account, .token = handle.token, .modes = modes };
     }
 
     /// Account + audit a relayed message dropped locally because its sender nick is
@@ -8498,7 +8562,16 @@ pub const LinuxServer = struct {
         // the Store-derived account. The relay-v1 account field remains mutable
         // hop data and cannot become authority merely because origin signed the
         // distinct prefix transcript.
-        const policy_account = if (replica_proof) |proof| proof.trusted_account else clean_msg.account;
+        const residence_account: ?[]const u8 = if (origin_auth == .verified and replica_proof == null)
+            self.trustedRemoteAccountAtNode(clean_msg.source_nick, clean_msg.origin_node)
+        else
+            null;
+        const policy_account = if (replica_proof) |proof|
+            proof.trusted_account
+        else if (residence_account) |account|
+            account
+        else
+            "";
         const relay_tags = MsgTags{
             .time_value = if (stable_event_identity)
                 serverTimeValueAt(&time_buf, mesh_clock_mod.MeshClock.physicalOf(clean_msg.hlc))
@@ -8667,7 +8740,12 @@ pub const LinuxServer = struct {
         } else {
             var recipient_id: ?client_model.ClientId = null;
             var recipient_account: ?[]const u8 = null;
+            var recipient_token: ?sessions_mod.Token = null;
             var sender_copy_allowed = true;
+            var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer recipient_ids.deinit(self.allocator);
+            var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer sender_ids.deinit(self.allocator);
             if (self.world.findNick(clean_msg.target)) |wid| {
                 recipient_id = clientIdFromWorld(wid);
                 if (self.relayDirectMessagePolicyBlocks(clean_msg, policy_account, recipient_id.?)) {
@@ -8675,27 +8753,81 @@ pub const LinuxServer = struct {
                     // both recipient delivery and the author's sibling sent-copy.
                     sender_copy_allowed = false;
                 } else {
-                    self.deliverTagged(recipient_id.?, relay_tags, line) catch {};
-                    recipient_account = if (self.connFor(recipient_id.?)) |rconn| rconn.session.account() else null;
-                    if (recipient_account) |acct| {
-                        self.deliverSessionSyncSiblingsNick(acct, relay_tags, line, recipient_id.?, null, clean_msg.target);
+                    if (self.connFor(recipient_id.?)) |rconn| {
+                        recipient_account = rconn.session.account();
+                        self.collectAttachedExactTokenClients(recipient_id.?, rconn, &recipient_ids) catch return;
+                        if (recipient_account) |account| {
+                            if (self.sessions.resumeHandleForClient(account, monitorIdFromClient(recipient_id.?))) |handle| {
+                                if (!tokenIsNull(handle.token)) recipient_token = handle.token;
+                            }
+                        }
+                    } else {
+                        recipient_ids.append(self.allocator, recipient_id.?) catch return;
                     }
                 }
             }
 
             // Sender sent-copy mirror: a relay may reach this peer solely through
-            // the author's authenticated portable-session route, even when the
-            // DM target is not local. Same-nick sessions of the sender receive the
-            // copy without a cap; different-nick siblings still opt in through
-            // orochi/session-sync. A peer-local recipient on the same account was
-            // already covered by recipient fan-out, so do not duplicate it.
+            // the author's authenticated portable-session route, even when the DM
+            // target is not local. Exact token identity, not account/nick affinity,
+            // selects that mandatory sent-copy set.
             if (sender_copy_allowed) {
                 if (replica_proof) |proof| {
-                    const sender_is_recipient_account = if (recipient_account) |acct| std.ascii.eqlIgnoreCase(proof.trusted_account, acct) else false;
-                    if (!sender_is_recipient_account) {
-                        self.deliverSessionSyncSiblingsNick(proof.trusted_account, relay_tags, line, recipient_id, null, clean_msg.source_nick);
-                    }
+                    const sender_is_recipient_token = if (recipient_token) |token|
+                        (if (recipient_account) |account|
+                            std.ascii.eqlIgnoreCase(account, proof.trusted_account)
+                        else
+                            false) and std.crypto.timing_safe.eql(sessions_mod.Token, token, proof.token)
+                    else
+                        false;
+                    if (!sender_is_recipient_token)
+                        self.collectAttachedTokenAuthorityClients(proof.trusted_account, proof.token, &sender_ids) catch return;
                 }
+            }
+
+            // Both complete sets were snapshotted before the first delivery.
+            // Congestion/closure of one transport is isolated from every sibling.
+            for (recipient_ids.items) |logical_id| self.deliverTagged(logical_id, relay_tags, line) catch {};
+            for (sender_ids.items) |logical_id| self.deliverTagged(logical_id, relay_tags, line) catch {};
+            const sender_is_recipient_account = if (replica_proof) |proof|
+                if (recipient_account) |account| std.ascii.eqlIgnoreCase(proof.trusted_account, account) else false
+            else
+                false;
+            if (sender_copy_allowed and sender_is_recipient_account) {
+                if (replica_proof) |proof| self.deliverSessionSyncSiblingsNick(
+                    proof.trusted_account,
+                    recipient_token,
+                    proof.token,
+                    relay_tags,
+                    line,
+                    recipient_id,
+                    null,
+                    clean_msg.target,
+                    clean_msg.source_nick,
+                );
+            } else if (sender_copy_allowed) {
+                if (recipient_account) |account| self.deliverSessionSyncSiblingsNick(
+                    account,
+                    recipient_token,
+                    null,
+                    relay_tags,
+                    line,
+                    recipient_id,
+                    null,
+                    clean_msg.target,
+                    null,
+                );
+                if (replica_proof) |proof| self.deliverSessionSyncSiblingsNick(
+                    proof.trusted_account,
+                    proof.token,
+                    null,
+                    relay_tags,
+                    line,
+                    recipient_id,
+                    null,
+                    clean_msg.source_nick,
+                    null,
+                );
             }
 
             // Store a remote PRIVMSG under the same account-canonical DM key the
@@ -8848,9 +8980,36 @@ pub const LinuxServer = struct {
         conn.session.sasl_decode_max_bytes = @min(@as(usize, self.config.sasl_decode_max_bytes), sasl_mechrouter.MAX_RAW_MESSAGE);
     }
 
+    fn retainCloseReason(conn: *ConnState, reason: []const u8) void {
+        const len = @min(reason.len, conn.close_reason_store.len);
+        if (reason.ptr != @as([*]const u8, @ptrCast(&conn.close_reason_store[0])))
+            @memcpy(conn.close_reason_store[0..len], reason[0..len]);
+        conn.close_reason = conn.close_reason_store[0..len];
+    }
+
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
+            // This is the only fallible phase allowed to precede teardown for a
+            // normal client. If a live exact-token sibling exists but staging
+            // its World handoff hits allocation pressure, retain the slot and
+            // retry from the periodic timer. Treating that failure as "no
+            // sibling" would emit a false final QUIT and erase shared state.
+            var local_identity_remains = false;
+            if (conn.s2s == null and conn.s2s_secured == null) {
+                local_identity_remains = conn.session_handoff_complete;
+                if (!conn.session_handoff_checked) {
+                    local_identity_remains = self.handoffLiveSessionIdentity(id, conn) catch |err| {
+                        conn.closing = true;
+                        retainCloseReason(conn, reason);
+                        conn.session_handoff_retry = true;
+                        return err;
+                    };
+                    conn.session_handoff_complete = local_identity_remains;
+                    conn.session_handoff_checked = true;
+                }
+                conn.session_handoff_retry = false;
+            }
             // Release any SendQ / RecvQ overflow heap before the slot is freed/reused
             // (covers every close path below, including S2S links that carry mesh bursts).
             if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
@@ -8933,11 +9092,13 @@ pub const LinuxServer = struct {
             // detached (for reclaim/bouncer); an anonymous client is dropped.
             if (conn.session.account()) |acct| {
                 const resume_handle = self.sessions.resumeHandleForClient(acct, monitorIdFromClient(id));
-                if (self.encodeMigrationSnapshot(id, conn)) |snapshot| {
-                    defer self.allocator.free(snapshot);
-                    _ = self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot);
-                } else {
-                    _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
+                if (!conn.session_detach_prepared) {
+                    if (self.encodeMigrationSnapshot(id, conn)) |snapshot| {
+                        defer self.allocator.free(snapshot);
+                        _ = self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot);
+                    } else {
+                        _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
+                    }
                 }
                 // Portable resume is opt-in: only a session whose MTOKEN was
                 // actually delivered is replicated. The connection/world state
@@ -8950,8 +9111,9 @@ pub const LinuxServer = struct {
                             // ownership transfer/ACK to wait for: publishing PART
                             // or QUIT for this one socket would incorrectly evict
                             // those remote attachments from the shared identity.
-                            remote_identity_may_remain = self.hasEstablishedSecuredPeer();
-                            _ = self.shipSessionMigration(id, conn, acct, handle.token);
+                            remote_identity_may_remain = self.exactRemoteSessionAuthority(handle.token);
+                            if (!conn.session_detach_prepared)
+                                _ = self.shipSessionMigration(id, conn, acct, handle.token);
                         }
                     }
                 }
@@ -8966,7 +9128,7 @@ pub const LinuxServer = struct {
             // Transport loss is not logical-session loss while another local
             // attachment remains. Hand off nick ownership and channel state
             // before any offline/QUIT side effect is emitted.
-            const identity_remains = self.handoffLiveSessionIdentity(id, conn) or remote_identity_may_remain;
+            const identity_remains = local_identity_remains or remote_identity_may_remain;
             // Hold this nick against reuse for the nick-delay window before the
             // world drops it. No-op on a clean QUIT (handleQuit already held +
             // removed the nick) and for anonymous/unregistered/shared sessions.
@@ -8989,7 +9151,7 @@ pub const LinuxServer = struct {
             }
             _ = self.observe.clear(monitorIdFromClient(id));
             if (!identity_remains) {
-                try self.broadcastQuit(id, conn, reason);
+                self.broadcastQuit(id, conn, reason) catch {};
                 self.publishChannelDestroyEventsForClient(id);
             }
             closeFd(conn.fd);
@@ -9031,7 +9193,11 @@ pub const LinuxServer = struct {
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
-                try self.broadcastChannel(entry.key_ptr.*, msg, id);
+                // One congested recipient/channel must not abort teardown for
+                // every later channel or strand the mesh presence route. QUIT
+                // fanout is best-effort; history and authoritative membership
+                // withdrawal must always run to completion.
+                self.broadcastChannel(entry.key_ptr.*, msg, id) catch {};
                 self.recordHistoryEventSender(entry.key_ptr.*, quit_prefix, "QUIT", quit_body);
                 // Tell mesh peers this member is gone so their remote roster drops
                 // it and they emit a PART to their own local members (otherwise a
@@ -9242,6 +9408,10 @@ pub const LinuxServer = struct {
             self.stats.onLine();
             try self.processLiveLine(id, conn, line);
             recvqReset(conn);
+            // QUIT, parser/flood policy, and command handlers can mark the
+            // transport closing. Bytes later in the same TCP/TLS/WS payload
+            // are untrusted post-close input and must never be dispatched.
+            if (conn.closing) return;
         }
     }
 
@@ -9785,14 +9955,14 @@ pub const LinuxServer = struct {
     /// everywhere the shared session was joined. Returns true when the identity
     /// remains. A null-token session has no reusable credential and therefore can
     /// never authorize a handoff to an otherwise-similar account session.
-    fn handoffLiveSessionIdentity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) bool {
+    fn handoffLiveSessionIdentity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !bool {
         const account = conn.session.account() orelse return false;
         const nick = conn.session.displayName();
         if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return false;
         const cid = monitorIdFromClient(id);
         const handle = self.sessions.resumeHandleForClient(account, cid) orelse return false;
         if (tokenIsNull(handle.token)) return false;
-        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
+        const rows = try self.sessions.copySessionsAlloc(self.allocator, account);
         defer self.allocator.free(rows);
 
         var successor_id: ?client_model.ClientId = null;
@@ -9813,32 +9983,65 @@ pub const LinuxServer = struct {
         const to_wid = worldIdFromClient(successor);
 
         // Preserve the union of the departing attachment's channel authority.
+        // Stage the complete image first: a later allocation failure must not
+        // add only a prefix of channels and then fall through to ordinary QUIT.
+        var restores: std.ArrayListUnmanaged(world_model.MemberRestore) = .empty;
+        defer restores.deinit(self.allocator);
         var channels = self.world.channels.iterator();
         while (channels.next()) |entry| {
             const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid) orelse continue;
             const current = self.world.memberModes(entry.key_ptr.*, to_wid) orelse world_model.MemberModes.empty();
-            self.world.restoreMember(entry.key_ptr.*, to_wid, .{ .bits = current.bits | old_modes.bits }) catch {};
+            try restores.append(self.allocator, .{
+                .channel = entry.key_ptr.*,
+                .modes = .{ .bits = current.bits | old_modes.bits },
+            });
         }
-
         if (self.world.nickOf(from_wid) != null) {
-            if (!(self.world.transferNick(from_wid, to_wid) catch false)) return false;
+            const exact = [_]world_model.ClientId{ from_wid, to_wid };
+            _ = try self.world.handoffExactSessionIdentity(nick, to_wid, &exact, restores.items);
+        } else {
+            _ = try self.world.restoreMembersBatchExisting(to_wid, restores.items);
         }
         return true;
     }
 
-    /// A portable session replica only rides authenticated secured links. If at
-    /// least one is established, another attachment may remain live remotely;
-    /// closing one local transport must therefore not publish identity-wide
-    /// PART/QUIT/offline side effects.
-    fn hasEstablishedSecuredPeer(self: *LinuxServer) bool {
-        for (self.reactors) |*reactor| {
-            for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied or slot.value.closing) continue;
-                const link = slot.value.s2s_secured orelse continue;
-                if (link.established()) return true;
-            }
+    /// Exact Store authority is the only remote proof that a portable logical
+    /// session remains live. An arbitrary secured peer is not evidence that it
+    /// holds this token and must never suppress the final QUIT.
+    fn exactRemoteSessionAuthority(self: *LinuxServer, token: sessions_mod.Token) bool {
+        if (tokenIsNull(token)) return false;
+        const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        return self.session_replica_store.hasLiveOriginOtherThan(token, self.config.node_id, now_wall);
+    }
+
+    /// Capture the final clean-QUIT image while World still contains every
+    /// channel, then publish/ship that same complete state before handleQuit
+    /// removes the local identity. closeConn observes the flag and must not
+    /// replace it with a newer empty post-removal snapshot.
+    fn prepareCleanSessionDetach(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) bool {
+        if (conn.session_detach_prepared) return true;
+        const account = conn.session.account() orelse return false;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return false;
+        const encoded = self.encodeMigrationSnapshot(id, conn) orelse return false;
+        defer self.allocator.free(encoded);
+        if (!self.sessions.markDetachedWithSnapshot(account, monitorIdFromClient(id), encoded)) return false;
+        conn.session_detach_prepared = true;
+
+        if (self.config.session_migrate_on_detach and handle.portable and !tokenIsNull(handle.token)) {
+            // shipSessionMigration publishes the v2 Store object first and marks
+            // the token dirty on every failure. Because the detached snapshot is
+            // already retained, the retry path can reproduce this exact image
+            // after ConnState and World membership are gone.
+            _ = self.shipSessionMigration(id, conn, account, handle.token);
         }
-        return false;
+        return true;
+    }
+
+    fn connHasExactRemoteSessionAuthority(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) bool {
+        if (!self.config.session_migrate_on_detach) return false;
+        const account = conn.session.account() orelse return false;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return false;
+        return handle.portable and self.exactRemoteSessionAuthority(handle.token);
     }
 
     /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
@@ -13390,7 +13593,7 @@ pub const LinuxServer = struct {
             }
         }
 
-        try self.broadcastJoin(join_target, conn);
+        if (newly_joined) try self.broadcastJoin(join_target, conn);
         // The JOIN is one logical identity event for existing channel members.
         // After that broadcast, attach every sibling transport to the World row
         // and bootstrap that socket with its own JOIN/topic/NAMES view.
@@ -13406,11 +13609,13 @@ pub const LinuxServer = struct {
         // Spamtrap: a non-oper joining an operator-designated honeypot channel
         // trips the trap (oper alert + offender flag). Lock-free no-op when no
         // channel traps are configured.
-        self.spamtrapCheck(conn.session.displayName(), .channel, join_target, conn.session.isOper());
-        try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
-        // Standing OBSERVE feed: fire the join action so an oper watching a
-        // host sees channel joins (previously defined but never emitted).
-        self.notifyObservers(.join, observeSubject(conn, join_target));
+        if (newly_joined) {
+            self.spamtrapCheck(conn.session.displayName(), .channel, join_target, conn.session.isOper());
+            try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
+            // Standing OBSERVE feed: fire the join action so an oper watching a
+            // host sees channel joins (previously defined but never emitted).
+            self.notifyObservers(.join, observeSubject(conn, join_target));
+        }
         if (creating) {
             var flags_buf: [16]u8 = undefined;
             const flags = self.world.channelModeString(join_target, &flags_buf);
@@ -13418,26 +13623,28 @@ pub const LinuxServer = struct {
             const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ join_target, flags }, null);
             try self.broadcastChannel(join_target, msg, null);
         }
-        try self.sendTopicReply(conn, join_target);
-        // draft/no-implicit-names: a capable client suppresses the automatic
-        // NAMES burst on JOIN (it can still request NAMES explicitly).
-        if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
+        if (newly_joined) {
+            try self.sendTopicReply(conn, join_target);
+            // draft/no-implicit-names: a capable client suppresses the automatic
+            // NAMES burst on JOIN (it can still request NAMES explicitly).
+            if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
 
-        try self.pushMarkreadOnJoin(conn, join_target);
+            try self.pushMarkreadOnJoin(conn, join_target);
 
-        // Bouncer rewind: a reconnecting client with orochi/bouncer gets the
-        // channel messages it missed (everything after its stored read marker)
-        // right after the NAMES burst. The replay renderer adds BATCH only when
-        // the client negotiated the `batch` cap.
-        try self.replayRewindOnJoin(conn, join_target);
+            // Bouncer rewind: a reconnecting client with orochi/bouncer gets the
+            // channel messages it missed (everything after its stored read marker)
+            // right after the NAMES burst. The replay renderer adds BATCH only when
+            // the client negotiated the `batch` cap.
+            try self.replayRewindOnJoin(conn, join_target);
+        }
 
         // Propagate this membership to mesh peers (status = the joiner's modes,
         // e.g. founder on a freshly created/cloned channel).
-        if (!conn.session_mesh_announce_pending)
+        if ((newly_joined or pre_join_bits != jmodes.bits) and !conn.session_mesh_announce_pending)
             self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn), "");
 
         // IRCX ONJOIN: deliver the channel's on-join message PROP to the joiner.
-        self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
+        if (newly_joined) self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
     }
 
     /// Deliver a channel's IRCX on-join/on-part message PROP (ONJOIN/ONPART) to a
@@ -13674,7 +13881,7 @@ pub const LinuxServer = struct {
                 }
             }
             // User-target MODE: only the client's own nick is settable.
-            try self.handleUserMode(conn, parsed, channel);
+            try self.handleUserMode(id, conn, parsed, channel);
             return;
         }
         if (!self.world.channelExists(channel)) {
@@ -14155,8 +14362,8 @@ pub const LinuxServer = struct {
     /// MODE <nick> [modes] — user modes. A client may only view/change its own
     /// (ERR_USERSDONTMATCH 502 otherwise). Query form returns RPL_UMODEIS (221).
     /// Supports +i invisible and +B bot today (IRCv3 bot-mode).
-    pub fn handleUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
-        if (!std.mem.eql(u8, target, conn.session.displayName())) {
+    pub fn handleUserMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
+        if (!std.ascii.eqlIgnoreCase(target, conn.session.displayName())) {
             if (conn.session.isOper() and parsed.param_count >= 2) {
                 try self.handleOperUserMode(conn, parsed, target);
                 return;
@@ -14172,6 +14379,9 @@ pub const LinuxServer = struct {
         }
 
         const mode_str = parsed.paramSlice()[1];
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        try self.collectAttachedExactTokenClients(id, conn, &logical_ids);
         var applied_buf: [32]u8 = undefined;
         var applied = Buf{ .storage = &applied_buf };
         var adding = true;
@@ -14192,7 +14402,12 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: requires the 'oper_override' operator privilege");
                         continue;
                     }
-                    if (conn.session.setUmode(mode, adding)) {
+                    var changed = false;
+                    for (logical_ids.items) |logical_id| {
+                        const logical_conn = self.connFor(logical_id) orelse continue;
+                        changed = logical_conn.session.setUmode(mode, adding) or changed;
+                    }
+                    if (changed) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
                         if (mode == .override) {
                             const detail = if (adding) "enabled override" else "disabled override";
@@ -14204,11 +14419,17 @@ pub const LinuxServer = struct {
         }
         if (applied.written().len == 0) return;
 
+        // User modes are logical-session state. Publish the complete exact-token
+        // snapshot before any attachment observes the reflection; a failed Store
+        // accept remains dirty and retryable rather than emitting token-less mesh
+        // state ahead of its authority.
+        _ = self.commitPortableSessionMutation(id, conn);
+
         var prefix_buf: [256]u8 = undefined;
         var line_buf: [default_reply_bytes]u8 = undefined;
         const nick = conn.session.displayName();
         const msg = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "MODE", &.{ nick, applied.written() }, null);
-        try appendToConn(conn, msg);
+        for (logical_ids.items) |logical_id| self.deliver(logical_id, msg) catch {};
     }
 
     fn handleOperUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
@@ -14222,6 +14443,9 @@ pub const LinuxServer = struct {
             return;
         };
         const mode_str = parsed.paramSlice()[1];
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        try self.collectAttachedExactTokenClients(tid, tconn, &logical_ids);
         var applied_buf: [16]u8 = undefined;
         var applied = Buf{ .storage = &applied_buf };
         var adding = true;
@@ -14236,18 +14460,28 @@ pub const LinuxServer = struct {
                         .media_tx_deny, .media_presence_private => {},
                         else => continue,
                     }
-                    if (tconn.session.setUmode(mode, adding)) {
+                    var changed = false;
+                    for (logical_ids.items) |logical_id| {
+                        const logical_conn = self.connFor(logical_id) orelse continue;
+                        changed = logical_conn.session.setUmode(mode, adding) or changed;
+                    }
+                    if (changed) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
                     }
                 },
             }
         }
         if (applied.written().len == 0) return;
+        _ = self.commitPortableSessionMutation(tid, tconn);
 
         var line_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ target, applied.written() }, null);
-        try appendToConn(conn, msg);
-        if (tconn != conn) try self.deliver(tid, msg);
+        appendToConn(conn, msg) catch {};
+        for (logical_ids.items) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            if (logical_conn == conn) continue;
+            self.deliver(logical_id, msg) catch {};
+        }
     }
 
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
@@ -17397,6 +17631,7 @@ pub const LinuxServer = struct {
         if (!conn.session.hasCap(.orochi_session_sync)) return;
         const cid = monitorIdFromClient(id);
         const handle = self.sessions.resumeHandleForClient(account, cid) orelse return;
+        if (tokenIsNull(handle.token)) return;
         const sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
         defer self.allocator.free(sessions);
 
@@ -17441,6 +17676,78 @@ pub const LinuxServer = struct {
         try self.deliverTimed(id, serverTimeTag(&tag_buf), if (conn.session.hasCap(.extended_join)) ext else plain);
     }
 
+    /// Collect every live local transport in `id`'s exact reusable-token group.
+    /// Account equality is deliberately insufficient: independently issued
+    /// sessions remain separate authority domains even when they render the same
+    /// nick. The caller supplies an empty list and performs this before mutation,
+    /// so allocation failure cannot leave only part of a logical identity updated.
+    fn collectAttachedExactTokenClients(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        out: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!void {
+        try out.append(self.allocator, id);
+        const account = conn.session.account() orelse return;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return;
+        // The all-zero value is the untracked/CSPRNG-unavailable sentinel, not a
+        // shared credential. Equal sentinels must never merge independent clients.
+        if (tokenIsNull(handle.token)) return;
+        const rows = try self.sessions.copySessionsAlloc(self.allocator, account);
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (!row.attached or row.client == monitorIdFromClient(id)) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+            try out.append(self.allocator, sibling_id);
+        }
+    }
+
+    /// Resolve live local attachments from an already-authenticated
+    /// `(account, token)` authority (for inbound mesh events where there may be
+    /// no single World owner). Unlike account session-sync this is mandatory
+    /// exact-token fan-out and never widens through a shared rendered nick.
+    fn collectAttachedTokenAuthorityClients(
+        self: *LinuxServer,
+        account: []const u8,
+        token: sessions_mod.Token,
+        out: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!void {
+        if (tokenIsNull(token)) return;
+        const rows = try self.sessions.copySessionsAlloc(self.allocator, account);
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
+            const id = clientIdFromMonitor(row.client);
+            const conn = self.connFor(id) orelse continue;
+            if (conn.closing or conn.s2s != null or conn.s2s_secured != null) continue;
+            const current_account = conn.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(current_account, account)) continue;
+            try out.append(self.allocator, id);
+        }
+    }
+
+    fn clientsShareExactToken(
+        self: *LinuxServer,
+        left_id: client_model.ClientId,
+        left: *ConnState,
+        right_id: client_model.ClientId,
+        right: *ConnState,
+    ) bool {
+        if (left_id.eql(right_id)) return true;
+        const left_account = left.session.account() orelse return false;
+        const right_account = right.session.account() orelse return false;
+        if (!std.ascii.eqlIgnoreCase(left_account, right_account)) return false;
+        const left_handle = self.sessions.resumeHandleForClient(left_account, monitorIdFromClient(left_id)) orelse return false;
+        const right_handle = self.sessions.resumeHandleForClient(right_account, monitorIdFromClient(right_id)) orelse return false;
+        if (tokenIsNull(left_handle.token) or tokenIsNull(right_handle.token)) return false;
+        return std.crypto.timing_safe.eql(sessions_mod.Token, left_handle.token, right_handle.token);
+    }
+
     /// Mirror one logical session's channel membership to all of its attached
     /// local transports. Every attachment then receives channel events through
     /// the ordinary World fan-out and can speak with the same member status.
@@ -17448,6 +17755,7 @@ pub const LinuxServer = struct {
         const account = conn.session.account() orelse return;
         const cid = monitorIdFromClient(id);
         const handle = self.sessions.resumeHandleForClient(account, cid) orelse return;
+        if (tokenIsNull(handle.token)) return;
         const source_modes = self.world.memberModes(channel, worldIdFromClient(id)) orelse return;
         const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
         defer self.allocator.free(rows);
@@ -17456,7 +17764,9 @@ pub const LinuxServer = struct {
             if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
             const sibling_id = clientIdFromMonitor(row.client);
             const sibling = self.connFor(sibling_id) orelse continue;
-            if (sibling.closing) continue;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
             const sibling_wid = worldIdFromClient(sibling_id);
             const already_member = self.world.isMember(channel, sibling_wid);
             self.world.restoreMember(channel, sibling_wid, source_modes) catch continue;
@@ -17480,6 +17790,7 @@ pub const LinuxServer = struct {
         const account = conn.session.account() orelse return;
         const cid = monitorIdFromClient(id);
         const handle = self.sessions.resumeHandleForClient(account, cid) orelse return;
+        if (tokenIsNull(handle.token)) return;
         const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return;
         defer self.allocator.free(rows);
         for (rows) |row| {
@@ -17488,6 +17799,8 @@ pub const LinuxServer = struct {
             const sibling_id = clientIdFromMonitor(row.client);
             const sibling = self.connFor(sibling_id) orelse continue;
             if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
             self.world.restoreMember(channel, worldIdFromClient(sibling_id), modes) catch {};
         }
     }
@@ -17503,6 +17816,10 @@ pub const LinuxServer = struct {
             self.world.part(channel, worldIdFromClient(id)) catch {};
             return;
         };
+        if (tokenIsNull(handle.token)) {
+            self.world.part(channel, worldIdFromClient(id)) catch {};
+            return;
+        }
         const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch {
             self.world.part(channel, worldIdFromClient(id)) catch {};
             return;
@@ -17511,7 +17828,12 @@ pub const LinuxServer = struct {
         for (rows) |row| {
             if (!row.attached) continue;
             if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
-            self.world.part(channel, worldIdFromClient(clientIdFromMonitor(row.client))) catch {};
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+            self.world.part(channel, worldIdFromClient(sibling_id)) catch {};
         }
     }
 
@@ -25054,24 +25376,152 @@ pub const LinuxServer = struct {
     /// Server-initiated forced nick change (nick-protection enforcement). Mirrors
     /// the broadcast path of handleNickChange. Best-effort: returns silently if the
     /// target nick is already taken (retried on a later sweep).
+    fn collectExactLogicalClients(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        logical_ids: *std.ArrayList(client_model.ClientId),
+    ) !void {
+        try logical_ids.append(self.allocator, id);
+        const account = conn.session.account() orelse return;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return;
+        if (tokenIsNull(handle.token)) return;
+        const rows = try self.sessions.copySessionsAlloc(self.allocator, account);
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            if (!row.attached or row.client == monitorIdFromClient(id)) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
+            const sibling_id = clientIdFromMonitor(row.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+            const sibling_account = sibling.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+            try logical_ids.append(self.allocator, sibling_id);
+        }
+    }
+
+    fn exactWorldIds(
+        self: *LinuxServer,
+        logical_ids: []const client_model.ClientId,
+        world_ids: *std.ArrayList(world_model.ClientId),
+    ) !void {
+        try world_ids.ensureTotalCapacity(self.allocator, logical_ids.len);
+        for (logical_ids) |logical_id| world_ids.appendAssumeCapacity(worldIdFromClient(logical_id));
+    }
+
+    fn existingExactWorldOwner(
+        self: *LinuxServer,
+        logical_ids: []const client_model.ClientId,
+    ) client_model.ClientId {
+        for (logical_ids) |logical_id| {
+            if (self.world.nickOf(worldIdFromClient(logical_id)) != null) return logical_id;
+        }
+        return logical_ids[0];
+    }
+
+    /// Snapshot every recipient of one logical NICK event before changing any
+    /// identity state. This keeps allocator failure on the safe side of the
+    /// World/session transaction and a single seen set prevents duplicates when
+    /// attachments or their channel peers overlap.
+    fn collectExactLogicalNickRecipients(
+        self: *LinuxServer,
+        logical_ids: []const client_model.ClientId,
+        recipients: *std.ArrayList(client_model.ClientId),
+    ) !void {
+        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        defer seen.deinit();
+        for (logical_ids) |logical_id| {
+            try seen.put(@bitCast(logical_id), {});
+            try recipients.append(self.allocator, logical_id);
+        }
+        var channels = self.world.channels.iterator();
+        while (channels.next()) |entry| {
+            var belongs = false;
+            for (logical_ids) |logical_id| {
+                if (entry.value_ptr.members.contains(worldIdFromClient(logical_id))) {
+                    belongs = true;
+                    break;
+                }
+            }
+            if (!belongs) continue;
+            var members = self.world.memberIterator(entry.key_ptr.*) orelse continue;
+            while (members.next()) |member| {
+                const member_id = clientIdFromWorld(member.*);
+                const key: u64 = @bitCast(member_id);
+                if (seen.contains(key)) continue;
+                try seen.put(key, {});
+                try recipients.append(self.allocator, member_id);
+            }
+        }
+    }
+
+    /// Output congestion on one transport must never prevent another attached
+    /// transport or channel peer from observing the already-committed rename.
+    fn deliverLogicalNickEvent(self: *LinuxServer, recipients: []const client_model.ClientId, msg: []const u8) void {
+        for (recipients) |recipient| self.deliver(recipient, msg) catch {};
+    }
+
     fn forceRenameTo(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, newnick: []const u8) void {
-        const wid = worldIdFromClient(id);
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        self.collectExactLogicalClients(id, conn, &logical_ids) catch return;
+        var logical_world_ids: std.ArrayList(world_model.ClientId) = .empty;
+        defer logical_world_ids.deinit(self.allocator);
+        self.exactWorldIds(logical_ids.items, &logical_world_ids) catch return;
+        var nick_recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer nick_recipients.deinit(self.allocator);
+        self.collectExactLogicalNickRecipients(logical_ids.items, &nick_recipients) catch return;
+        const registry_id = self.existingExactWorldOwner(logical_ids.items);
+        const registry_conn = self.connFor(registry_id) orelse return;
+        const registry_wid = worldIdFromClient(registry_id);
+
         var old_buf: [64]u8 = undefined;
-        const old_slice = conn.session.displayName();
+        const old_slice = registry_conn.session.displayName();
         if (old_slice.len == 0 or old_slice.len > old_buf.len) return;
         @memcpy(old_buf[0..old_slice.len], old_slice);
         const old = old_buf[0..old_slice.len];
-        if (std.mem.eql(u8, old, newnick)) return;
 
-        self.world.registerNick(newnick, wid) catch return; // taken → try next sweep
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const old_prefix = clientPrefix(conn, &prefix_buf) catch return;
+        const old_prefix = clientPrefix(registry_conn, &prefix_buf) catch return;
         const msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, newnick) catch return;
-        self.recordWhowas(conn);
-        conn.session.setNick(newnick) catch return;
-        self.deliver(id, msg) catch {};
-        self.notifyCommonChannels(id, msg, null, id, null) catch {};
+
+        _ = self.world.replaceExactSessionNickOwner(newnick, registry_wid, logical_world_ids.items) catch return;
+        if (std.mem.eql(u8, old, newnick)) {
+            // The World transaction may still have retired stale sibling aliases;
+            // align every attachment without manufacturing a no-op NICK event.
+            for (logical_ids.items) |logical_id| {
+                if (self.connFor(logical_id)) |logical_conn| logical_conn.session.setNick(newnick) catch unreachable;
+            }
+            _ = self.commitPortableSessionMutation(id, conn);
+            return;
+        }
+
+        self.recordWhowas(registry_conn);
+        for (logical_ids.items) |logical_id| {
+            if (self.connFor(logical_id)) |logical_conn| logical_conn.session.setNick(newnick) catch unreachable;
+        }
+        const v2_authority_ready = self.commitPortableSessionMutation(id, conn);
+        self.deliverLogicalNickEvent(nick_recipients.items, msg);
+        var nick_body_buf: [64]u8 = undefined;
+        const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{newnick}) catch newnick;
+        var logical_channels = self.world.channels.iterator();
+        while (logical_channels.next()) |entry| {
+            var belongs = false;
+            for (logical_ids.items) |logical_id| {
+                if (entry.value_ptr.members.contains(worldIdFromClient(logical_id))) {
+                    belongs = true;
+                    break;
+                }
+            }
+            if (belongs) self.recordHistoryEventSender(entry.key_ptr.*, old_prefix, "NICK", nick_body);
+        }
+        if (!conn.session_mesh_announce_pending)
+            self.announceNickChange(old, newnick, membershipIdentityOf(conn), v2_authority_ready);
+        const nick_hlc = self.nextMeshHlc();
+        for (logical_ids.items) |logical_id| {
+            if (self.connFor(logical_id)) |logical_conn| logical_conn.mesh_nick_hlc = nick_hlc;
+        }
         self.monitorTransition(old, newnick) catch {};
     }
 
@@ -25121,43 +25571,38 @@ pub const LinuxServer = struct {
         @memcpy(old_buf[0..old_slice.len], old_slice);
         const old = old_buf[0..old_slice.len];
         if (std.mem.eql(u8, old, newnick)) return; // no-op
-        const wid = worldIdFromClient(id);
+
+        // Resolve the local attachments of this reusable logical-session token
+        // before applying identity-wide policy. NICK mutates the logical
+        // identity, so a sibling membership cannot be used to bypass +N.
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        try self.collectExactLogicalClients(id, conn, &logical_ids);
+        var logical_world_ids: std.ArrayList(world_model.ClientId) = .empty;
+        defer logical_world_ids.deinit(self.allocator);
+        try self.exactWorldIds(logical_ids.items, &logical_world_ids);
 
         // +N no-nick: a non-op member of any +N channel may not change nick.
-        // Server opers bypass.
+        // Server opers bypass. Evaluate the complete exact-token membership
+        // union rather than only the socket which issued NICK.
         if (!conn.session.isOper()) {
             var nit = self.world.channels.iterator();
             while (nit.next()) |entry| {
-                if (!entry.value_ptr.members.contains(wid)) continue;
                 if (!self.world.channelHasFlag(entry.key_ptr.*, .no_nick)) continue;
-                const mm = self.world.memberModes(entry.key_ptr.*, wid) orelse world_model.MemberModes.empty();
-                if (!mm.isOperator()) {
+                var blocked = false;
+                for (logical_world_ids.items) |logical_wid| {
+                    if (!entry.value_ptr.members.contains(logical_wid)) continue;
+                    const mm = self.world.memberModes(entry.key_ptr.*, logical_wid) orelse world_model.MemberModes.empty();
+                    if (!mm.isOperator()) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) {
                     var nb: [default_reply_bytes]u8 = undefined;
                     const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Cannot change nick while on {s} (+N)\r\n", .{ self.serverName(), old, entry.key_ptr.* }) catch return;
                     try emitReplyLine(conn, note);
                     return;
-                }
-            }
-        }
-
-        // Resolve the local attachments of this reusable logical-session token
-        // before changing any state. NICK mutates the logical identity, not one
-        // transport: every attached socket must render and subsequently speak as
-        // the same nick. Anonymous/untracked clients naturally form a group of 1.
-        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
-        defer logical_ids.deinit(self.allocator);
-        try logical_ids.append(self.allocator, id);
-        if (conn.session.account()) |acct| {
-            if (self.sessions.resumeHandleForClient(acct, monitorIdFromClient(id))) |handle| {
-                const rows = try self.sessions.copySessionsAlloc(self.allocator, acct);
-                defer self.allocator.free(rows);
-                for (rows) |row| {
-                    if (!row.attached or row.client == monitorIdFromClient(id)) continue;
-                    if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, handle.token)) continue;
-                    const sibling_id = clientIdFromMonitor(row.client);
-                    const sibling = self.connFor(sibling_id) orelse continue;
-                    if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
-                    try logical_ids.append(self.allocator, sibling_id);
                 }
             }
         }
@@ -25170,6 +25615,18 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // Everything needed to render and route the identity-wide event must be
+        // ready before the World nick transaction. A formatting/allocation
+        // failure therefore cannot leave World resolving a nick that ConnState
+        // has not adopted.
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const old_prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, old_prefix, "NICK", &.{}, newnick);
+        var nick_recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer nick_recipients.deinit(self.allocator);
+        try self.collectExactLogicalNickRecipients(logical_ids.items, &nick_recipients);
+
         // Reserve the new nick (frees the old mapping for this client).
         // Account-aware same-nick allowance (mirrors registerConnNick): if this
         // SASL-authed client changes to a nick already held by another LOCAL
@@ -25178,24 +25635,27 @@ pub const LinuxServer = struct {
         // skip re-registering the world nick (which would collide) but still
         // rewrite the session nick and surface the local NICK line below so the
         // client sees its requested nick took effect.
-        var registry_id = id;
-        var group_owned_old_nick = false;
-        if (self.world.findNick(old)) |old_owner| {
-            for (logical_ids.items) |candidate| {
-                if (worldIdFromClient(candidate).eql(old_owner)) {
-                    registry_id = candidate;
-                    group_owned_old_nick = true;
-                    break;
-                }
-            }
-        }
+        const registry_id = self.existingExactWorldOwner(logical_ids.items);
         const registry_wid = worldIdFromClient(registry_id);
         var shared_same_account = false;
-        self.world.registerNick(newnick, registry_wid) catch |err| switch (err) {
+        _ = self.world.replaceExactSessionNickOwner(newnick, registry_wid, logical_world_ids.items) catch |err| switch (err) {
             error.NickInUse => {
-                if (conn.session.account()) |acct| {
-                    if (self.nickHeldBySameAccount(newnick, acct, registry_wid)) {
-                        shared_same_account = true;
+                if (self.world.findNick(newnick)) |foreign_owner| {
+                    if (conn.session.account()) |acct| {
+                        if (self.nickHeldBySameAccount(newnick, acct, registry_wid)) {
+                            _ = self.world.relinquishExactSessionNickOwners(
+                                newnick,
+                                foreign_owner,
+                                logical_world_ids.items,
+                            ) catch |relinquish_err| switch (relinquish_err) {
+                                error.NickInUse, error.InvalidOwnerSet => {
+                                    try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{newnick}, "Nickname is already in use");
+                                    return;
+                                },
+                                else => return relinquish_err,
+                            };
+                            shared_same_account = true;
+                        }
                     }
                 }
                 if (!shared_same_account) {
@@ -25205,19 +25665,9 @@ pub const LinuxServer = struct {
             },
             else => return err,
         };
-        // Joining a same-account nick owned by another logical token leaves that
-        // token as the primary lookup owner, but this token must relinquish its
-        // old primary nick or the World would expose two names for one group.
-        if (shared_same_account and group_owned_old_nick) self.world.unregisterNick(registry_wid);
         // The nick is now this client's: clear any hold an oper / exempt class
         // bypassed so a later sweep cannot evict a stale entry for a live nick.
         if (self.config.nick_delay_ms != 0 and !shared_same_account) self.nick_delay.release(newnick);
-
-        // Build the NICK line with the OLD prefix before rewriting the session.
-        var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
-        const old_prefix = try clientPrefix(conn, &prefix_buf);
-        const msg = try formatMessage(&msg_buf, old_prefix, "NICK", &.{}, newnick);
 
         // Record the old identity, then rewrite the session nick.
         self.recordWhowas(conn);
@@ -25232,25 +25682,23 @@ pub const LinuxServer = struct {
         const v2_authority_ready = self.commitPortableSessionMutation(id, conn);
 
         // Deliver to self + every common-channel member (dedup, except self once).
-        try self.deliver(id, msg);
-        try self.notifyCommonChannels(id, msg, null, id, null);
-        // A previously-diverged sibling may not yet share one of the issuer's
-        // channels; it is still an attachment of this identity and must observe
-        // the NICK event exactly once.
-        for (logical_ids.items[1..]) |logical_id| {
-            if (self.sharesAnyChannelWith(wid, worldIdFromClient(logical_id))) continue;
-            try self.deliver(logical_id, msg);
-        }
+        self.deliverLogicalNickEvent(nick_recipients.items, msg);
 
         // draft/event-playback: record the rename as a NICK event into each channel
         // the user is in. Body is `:newnick` so it replays exactly like the live
         // broadcast (`:oldnick NICK :newnick`), with the OLD prefix.
         var nick_body_buf: [64]u8 = undefined;
         const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{newnick}) catch newnick;
-        var nick_chans: [64][]const u8 = undefined;
-        const nick_chan_n = self.world.channelsOf(worldIdFromClient(id), &nick_chans);
-        for (nick_chans[0..nick_chan_n]) |cn| {
-            self.recordHistoryEventSender(cn, old_prefix, "NICK", nick_body);
+        var logical_channels = self.world.channels.iterator();
+        while (logical_channels.next()) |entry| {
+            var belongs = false;
+            for (logical_ids.items) |logical_id| {
+                if (entry.value_ptr.members.contains(worldIdFromClient(logical_id))) {
+                    belongs = true;
+                    break;
+                }
+            }
+            if (belongs) self.recordHistoryEventSender(entry.key_ptr.*, old_prefix, "NICK", nick_body);
         }
 
         // Propagate the nick change across the mesh so remote members rename the
@@ -25304,12 +25752,27 @@ pub const LinuxServer = struct {
         else
             null;
 
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        try self.collectAttachedExactTokenClients(id, conn, &logical_ids);
+
         if (reason) |text| {
-            conn.session.setAway(text);
-            try queueNumeric(conn, .RPL_NOWAWAY, &.{}, "You have been marked as being away");
+            for (logical_ids.items) |logical_id| {
+                const logical_conn = self.connFor(logical_id) orelse continue;
+                logical_conn.session.setAway(text);
+            }
         } else {
-            conn.session.clearAway();
-            try queueNumeric(conn, .RPL_UNAWAY, &.{}, "You are no longer marked as being away");
+            for (logical_ids.items) |logical_id| {
+                const logical_conn = self.connFor(logical_id) orelse continue;
+                logical_conn.session.clearAway();
+            }
+        }
+
+        _ = self.commitPortableSessionMutation(id, conn);
+        if (reason != null) {
+            queueNumeric(conn, .RPL_NOWAWAY, &.{}, "You have been marked as being away") catch {};
+        } else {
+            queueNumeric(conn, .RPL_UNAWAY, &.{}, "You are no longer marked as being away") catch {};
         }
 
         // away-notify: announce to common-channel members who negotiated it.
@@ -25317,7 +25780,13 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "AWAY", &.{}, reason);
-        try self.notifyCommonChannels(id, msg, .away_notify, id, conn.session.displayName());
+        self.notifyCommonChannels(id, msg, .away_notify, id, conn.session.displayName()) catch {};
+        for (logical_ids.items[1..]) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            if (!logical_conn.session.hasCap(.away_notify)) continue;
+            if (self.sharesAnyChannelWith(worldIdFromClient(id), worldIdFromClient(logical_id))) continue;
+            self.deliver(logical_id, msg) catch {};
+        }
 
         // #33: feed the ACTIVITY stream a presence transition.
         self.pushPresenceActivity(id, conn, if (reason != null) .away else .active);
@@ -25331,17 +25800,32 @@ pub const LinuxServer = struct {
             return;
         }
         const newname = parsed.paramSlice()[0];
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
+        try self.collectAttachedExactTokenClients(id, conn, &logical_ids);
         conn.session.setRealname(newname) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETNAME"}, "Realname too long");
             return;
         };
+        for (logical_ids.items[1..]) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            logical_conn.session.setRealname(newname) catch unreachable;
+        }
+
+        _ = self.commitPortableSessionMutation(id, conn);
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "SETNAME", &.{}, newname);
-        if (conn.session.hasCap(.setname)) try self.deliver(id, msg); // echo to self
-        try self.notifyCommonChannels(id, msg, .setname, id, conn.session.displayName());
+        if (conn.session.hasCap(.setname)) self.deliver(id, msg) catch {}; // echo to self
+        self.notifyCommonChannels(id, msg, .setname, id, conn.session.displayName()) catch {};
+        for (logical_ids.items[1..]) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            if (!logical_conn.session.hasCap(.setname)) continue;
+            if (self.sharesAnyChannelWith(worldIdFromClient(id), worldIdFromClient(logical_id))) continue;
+            self.deliver(logical_id, msg) catch {};
+        }
     }
 
     /// OPER <name> <password> — elevate to IRC operator. Matches against the
@@ -28682,7 +29166,7 @@ pub const LinuxServer = struct {
                 return;
             };
             defer self.allocator.free(snapshot);
-            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, snapshot)) {
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, token, snapshot)) {
                 conn.preserve_resume_credential_once = true;
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attach failed; token remains valid");
                 return;
@@ -28714,7 +29198,7 @@ pub const LinuxServer = struct {
         // deterministic post-decode failure (e.g. nick re-registration) simply
         // re-preserves the ghost until its TTL — no worse than the old
         // unconditional discard, and self-heals once the conflict clears.
-        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
+        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, token, bytes) else false;
         if (snapshot != null and !restored) {
             conn.preserve_resume_credential_once = true;
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
@@ -28809,7 +29293,7 @@ pub const LinuxServer = struct {
                 return;
             };
             defer self.allocator.free(snapshot);
-            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, snapshot) or
+            if (!self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, snapshot) or
                 !self.sessions.joinTokenGroup(account, cid, migrate_token))
             {
                 conn.preserve_resume_credential_once = true;
@@ -28886,7 +29370,7 @@ pub const LinuxServer = struct {
                 // ordinary local SESSION RESUME path.
                 const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
-                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
+                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, bytes) else false;
 
                 if (local_snapshot != null and !restored) {
                     conn.preserve_resume_credential_once = true;
@@ -30012,6 +30496,90 @@ pub const LinuxServer = struct {
         self.broadcastChannel(channel, line, null) catch {};
     }
 
+    /// Only client-owned modes are portable profile state. `+M` is the sole
+    /// server-managed exception: a remote authority may carry the restrictive
+    /// media deny forward, but absence never clears a locally imposed deny.
+    fn portableReplicaUmode(mode: usermode.UserMode) bool {
+        const spec = usermode.specFor(mode) orelse return false;
+        return spec.policy == .client_writable or mode == .media_tx_deny;
+    }
+
+    /// Parse the rendered migration form without trusting it as a raw bitset.
+    /// Derived/server privilege letters (`o`, `r`, `z`, `x`, `a`) are accepted
+    /// for compatibility but ignored; unknown/malformed input is terminal.
+    fn parsePortableReplicaUmodes(mode_str: []const u8) ?usermode.UmodeSet {
+        if (mode_str.len > usermode.MAX_MODE_CHANGES + 2) return null;
+        var desired = usermode.UmodeSet.empty();
+        var adding: ?bool = null;
+        for (mode_str) |letter| {
+            switch (letter) {
+                '+' => adding = true,
+                '-' => adding = false,
+                'o' => if (adding == null) return null,
+                else => {
+                    const on = adding orelse return null;
+                    const mode = usermode.modeFromLetter(letter) orelse return null;
+                    if (!portableReplicaUmode(mode)) continue;
+                    if (on) desired.add(mode) else desired.remove(mode);
+                },
+            }
+        }
+        return desired;
+    }
+
+    fn writeReplicaUmodeDelta(
+        out: []u8,
+        added: usermode.UmodeSet,
+        removed: usermode.UmodeSet,
+    ) ?[]const u8 {
+        var n: usize = 0;
+        if (!added.isEmpty()) {
+            if (n >= out.len) return null;
+            out[n] = '+';
+            n += 1;
+            for (usermode.default_specs) |spec| {
+                if (!portableReplicaUmode(spec.mode) or !added.contains(spec.mode)) continue;
+                if (n >= out.len) return null;
+                out[n] = spec.letter;
+                n += 1;
+            }
+        }
+        if (!removed.isEmpty()) {
+            if (n >= out.len) return null;
+            out[n] = '-';
+            n += 1;
+            for (usermode.default_specs) |spec| {
+                if (!portableReplicaUmode(spec.mode) or !removed.contains(spec.mode)) continue;
+                if (n >= out.len) return null;
+                out[n] = spec.letter;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    /// Deliver a remote logical-session profile transition once to observers
+    /// and once to every exact attachment that negotiated the relevant cap.
+    /// Different tokens sharing account/nick are never selected.
+    fn notifyReplicaProfileEvent(
+        self: *LinuxServer,
+        source_id: client_model.ClientId,
+        logical_ids: []const client_model.ClientId,
+        msg: []const u8,
+        cap: dispatch.CapId,
+        monitor_nick: []const u8,
+    ) void {
+        self.notifyCommonChannels(source_id, msg, cap, source_id, monitor_nick) catch {};
+        const source_wid = worldIdFromClient(source_id);
+        for (logical_ids) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            if (!logical_conn.session.hasCap(cap)) continue;
+            if (!logical_id.eql(source_id) and
+                self.sharesAnyChannelWith(source_wid, worldIdFromClient(logical_id))) continue;
+            self.deliver(logical_id, msg) catch {};
+        }
+    }
+
     /// Diff one accepted best signed snapshot into attached LOCAL rows bearing
     /// exactly `token`. Account+nick alone never selects an attachment. JOIN is
     /// restored to every exact row before one logical broadcast; PART broadcasts
@@ -30037,19 +30605,98 @@ pub const LinuxServer = struct {
         {
             return true;
         }
+        // Decode success alone does not make reflected text safe. Validate the
+        // complete profile before mutating any attachment so malformed signed
+        // state is terminal and can never leave a half-updated token group.
+        if (snapshot.realname.len > 256 or dispatch.hasControlByte(snapshot.realname) or
+            snapshot.away.len > self.config.awaylen or dispatch.hasControlByte(snapshot.away))
+        {
+            return true;
+        }
+        const desired_umodes = parsePortableReplicaUmodes(snapshot.umodes) orelse return true;
 
         const rows = self.sessions.copySessionsAlloc(self.allocator, entry.account) catch return false;
         defer self.allocator.free(rows);
-        var has_exact_live = false;
+        var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer logical_ids.deinit(self.allocator);
         for (rows) |row| {
             if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-            const conn = self.connFor(clientIdFromMonitor(row.client)) orelse continue;
+            const id = clientIdFromMonitor(row.client);
+            const conn = self.connFor(id) orelse continue;
             if (conn.closing or conn.s2s != null or conn.s2s_secured != null) continue;
             const account = conn.session.account() orelse continue;
             if (!std.ascii.eqlIgnoreCase(account, entry.account)) continue;
-            has_exact_live = true;
+            logical_ids.append(self.allocator, id) catch return false;
         }
-        if (!has_exact_live) return true;
+        if (logical_ids.items.len == 0) return true;
+
+        var logical_world_ids: std.ArrayList(world_model.ClientId) = .empty;
+        defer logical_world_ids.deinit(self.allocator);
+        self.exactWorldIds(logical_ids.items, &logical_world_ids) catch return false;
+        const registry_id = self.existingExactWorldOwner(logical_ids.items);
+        const registry_wid = worldIdFromClient(registry_id);
+
+        var event_id: ?client_model.ClientId = null;
+        for (logical_ids.items) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            if (!std.mem.eql(u8, logical_conn.session.displayName(), entry.nick)) {
+                event_id = logical_id;
+                break;
+            }
+        }
+        var old_buf: [session_replica_v2.max_nick_len]u8 = undefined;
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        var old_nick: []const u8 = "";
+        var old_prefix: []const u8 = "";
+        var nick_msg: []const u8 = "";
+        if (event_id) |source_id| {
+            const source = self.connFor(source_id) orelse return false;
+            const old = source.session.displayName();
+            if (old.len > old_buf.len) return true;
+            @memcpy(old_buf[0..old.len], old);
+            old_nick = old_buf[0..old.len];
+            old_prefix = clientPrefix(source, &prefix_buf) catch return true;
+            nick_msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, entry.nick) catch return true;
+        }
+        var nick_recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer nick_recipients.deinit(self.allocator);
+        if (event_id != null)
+            self.collectExactLogicalNickRecipients(logical_ids.items, &nick_recipients) catch return false;
+
+        _ = self.world.replaceExactSessionNickOwner(entry.nick, registry_wid, logical_world_ids.items) catch |err| switch (err) {
+            error.NickInUse => {
+                const foreign_owner = self.world.findNick(entry.nick) orelse return false;
+                if (!self.nickHeldBySameAccount(entry.nick, entry.account, registry_wid)) return false;
+                _ = self.world.relinquishExactSessionNickOwners(
+                    entry.nick,
+                    foreign_owner,
+                    logical_world_ids.items,
+                ) catch return false;
+            },
+            else => return false,
+        };
+        for (logical_ids.items) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            logical_conn.session.setNick(entry.nick) catch unreachable;
+        }
+        if (event_id != null) {
+            self.deliverLogicalNickEvent(nick_recipients.items, nick_msg);
+            var nick_body_buf: [session_replica_v2.max_nick_len + 1]u8 = undefined;
+            const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{entry.nick}) catch entry.nick;
+            var logical_channels = self.world.channels.iterator();
+            while (logical_channels.next()) |channel_entry| {
+                var belongs = false;
+                for (logical_ids.items) |logical_id| {
+                    if (channel_entry.value_ptr.members.contains(worldIdFromClient(logical_id))) {
+                        belongs = true;
+                        break;
+                    }
+                }
+                if (belongs) self.recordHistoryEventSender(channel_entry.key_ptr.*, old_prefix, "NICK", nick_body);
+            }
+            self.monitorTransition(old_nick, entry.nick) catch {};
+        }
 
         // Snapshot all channels that must be removed before mutating World: a
         // PART may destroy the last-local-member channel and invalidate a live
@@ -30059,11 +30706,7 @@ pub const LinuxServer = struct {
             for (removals.items) |channel| self.allocator.free(channel);
             removals.deinit(self.allocator);
         }
-        for (rows) |row| {
-            if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-            const id = clientIdFromMonitor(row.client);
-            const conn = self.connFor(id) orelse continue;
-            if (conn.closing or conn.s2s != null or conn.s2s_secured != null) continue;
+        for (logical_ids.items) |id| {
             const cap = self.world.channelCountOf(worldIdFromClient(id));
             const names = self.allocator.alloc([]const u8, cap) catch return false;
             defer self.allocator.free(names);
@@ -30092,9 +30735,7 @@ pub const LinuxServer = struct {
                 .bits = if (i < snapshot.channel_modes.len) snapshot.channel_modes[i] else 0,
             };
             var logical_was_present = false;
-            for (rows) |row| {
-                if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-                const id = clientIdFromMonitor(row.client);
+            for (logical_ids.items) |id| {
                 if (self.world.isMember(channel, worldIdFromClient(id))) {
                     logical_was_present = true;
                     break;
@@ -30102,11 +30743,7 @@ pub const LinuxServer = struct {
             }
 
             var restored_any = false;
-            for (rows) |row| {
-                if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-                const id = clientIdFromMonitor(row.client);
-                const conn = self.connFor(id) orelse continue;
-                if (conn.closing or conn.s2s != null or conn.s2s_secured != null) continue;
+            for (logical_ids.items) |id| {
                 const wid = worldIdFromClient(id);
                 const was_member = self.world.isMember(channel, wid);
                 self.world.restoreMember(channel, wid, modes) catch |err| {
@@ -30121,27 +30758,106 @@ pub const LinuxServer = struct {
 
         for (removals.items) |channel| {
             var logical_was_present = false;
-            for (rows) |row| {
-                if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-                if (self.world.isMember(channel, worldIdFromClient(clientIdFromMonitor(row.client)))) {
+            for (logical_ids.items) |id| {
+                if (self.world.isMember(channel, worldIdFromClient(id))) {
                     logical_was_present = true;
                     break;
                 }
             }
             if (!logical_was_present) continue;
             self.renderReplicaPart(&snapshot, channel);
-            for (rows) |row| {
-                if (!row.attached or !std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
-                self.world.part(channel, worldIdFromClient(clientIdFromMonitor(row.client))) catch |err| {
+            for (logical_ids.items) |id| {
+                self.world.part(channel, worldIdFromClient(id)) catch |err| {
                     if (err == error.OutOfMemory) complete = false;
                 };
+            }
+        }
+
+        // Do not expose profile state ahead of a retryable channel projection.
+        // Once the World diff is complete, applying profile fields is entirely
+        // allocation-free and therefore atomic across this exact token group.
+        if (!complete) return false;
+        const profile_source_id = logical_ids.items[0];
+        const profile_source = self.connFor(profile_source_id) orelse return false;
+        var away_changed = false;
+        var realname_changed = false;
+        var modes_added = usermode.UmodeSet.empty();
+        var modes_removed = usermode.UmodeSet.empty();
+        for (logical_ids.items) |logical_id| {
+            const logical_conn = self.connFor(logical_id) orelse continue;
+            const old_away = logical_conn.session.awayMessage() orelse "";
+            away_changed = away_changed or !std.mem.eql(u8, old_away, snapshot.away);
+            realname_changed = realname_changed or !std.mem.eql(u8, logical_conn.session.realname(), snapshot.realname);
+            for (usermode.default_specs) |spec| {
+                if (!portableReplicaUmode(spec.mode)) continue;
+                var want = desired_umodes.contains(spec.mode);
+                if (spec.mode == .override and !logical_conn.session.hasPriv(.oper_override)) want = false;
+                // A missing remote +M cannot clear a stricter local policy.
+                if (spec.mode == .media_tx_deny and !want) continue;
+                const had = logical_conn.session.hasUmode(spec.mode);
+                if (had == want) continue;
+                _ = logical_conn.session.setUmode(spec.mode, want);
+                if (want) modes_added.add(spec.mode) else modes_removed.add(spec.mode);
+            }
+            if (snapshot.away.len == 0) logical_conn.session.clearAway() else logical_conn.session.setAway(snapshot.away);
+            logical_conn.session.setRealname(snapshot.realname) catch unreachable;
+        }
+
+        var profile_prefix_buf: [256]u8 = undefined;
+        const profile_prefix = clientPrefix(profile_source, &profile_prefix_buf) catch "";
+        if (away_changed and profile_prefix.len != 0) {
+            var away_buf: [default_reply_bytes]u8 = undefined;
+            const away_msg = formatMessage(
+                &away_buf,
+                profile_prefix,
+                "AWAY",
+                &.{},
+                if (snapshot.away.len == 0) null else snapshot.away,
+            ) catch "";
+            if (away_msg.len != 0) self.notifyReplicaProfileEvent(
+                profile_source_id,
+                logical_ids.items,
+                away_msg,
+                .away_notify,
+                snapshot.nick,
+            );
+            self.pushPresenceActivity(
+                profile_source_id,
+                profile_source,
+                if (snapshot.away.len == 0) .active else .away,
+            );
+        }
+        if (realname_changed and profile_prefix.len != 0) {
+            var setname_buf: [default_reply_bytes]u8 = undefined;
+            const setname_msg = formatMessage(
+                &setname_buf,
+                profile_prefix,
+                "SETNAME",
+                &.{},
+                snapshot.realname,
+            ) catch "";
+            if (setname_msg.len != 0) self.notifyReplicaProfileEvent(
+                profile_source_id,
+                logical_ids.items,
+                setname_msg,
+                .setname,
+                snapshot.nick,
+            );
+        }
+        if ((!modes_added.isEmpty() or !modes_removed.isEmpty()) and profile_prefix.len != 0) {
+            var delta_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
+            if (writeReplicaUmodeDelta(&delta_buf, modes_added, modes_removed)) |delta| {
+                var mode_buf: [default_reply_bytes]u8 = undefined;
+                const mode_msg = formatMessage(&mode_buf, profile_prefix, "MODE", &.{ snapshot.nick, delta }, null) catch "";
+                if (mode_msg.len != 0) {
+                    for (logical_ids.items) |logical_id| self.deliver(logical_id, mode_msg) catch {};
+                }
             }
         }
 
         // Make the receive-side no-republish rule explicit at the same boundary
         // local JOIN/PART uses. This is intentionally a no-op.
         self.convergeSessionReplicaToken(token, .remote_projection);
-        if (!complete) return false;
         return true;
     }
 
@@ -30424,13 +31140,20 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
         defer snap.deinit(self.allocator);
 
-        return self.restoreMigrationSnapshot(id, conn, account, &snap);
+        return self.restoreMigrationSnapshot(id, conn, account, session_token, &snap);
     }
 
-    fn restoreEncodedMigrationSnapshot(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, bytes: []const u8) bool {
+    fn restoreEncodedMigrationSnapshot(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: sessions_mod.Token,
+        bytes: []const u8,
+    ) bool {
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
-        return self.restoreMigrationSnapshot(id, conn, account, &snap);
+        return self.restoreMigrationSnapshot(id, conn, account, session_token, &snap);
     }
 
     fn restoreMigrationSnapshot(
@@ -30438,12 +31161,17 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         conn: *ConnState,
         account: []const u8,
+        session_token: sessions_mod.Token,
         snap: *const migration_relay.Snapshot,
     ) bool {
         // The authenticated account and mesh-token HMAC are the authorization
         // boundary. A signed peer snapshot may restore only that same account;
         // never let carried snapshot data switch the live connection's identity.
         if (snap.account.len != 0 and !std.ascii.eqlIgnoreCase(snap.account, account)) return false;
+        // Decide exact-token attachment semantics before any live identity or
+        // World mutation. OOM must leave the claimant untouched and retryable.
+        const session_rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return false;
+        defer self.allocator.free(session_rows);
         const wid = worldIdFromClient(id);
         var old_nick_buf: [64]u8 = undefined;
         const old_nick_src = conn.session.displayName();
@@ -30547,18 +31275,42 @@ pub const LinuxServer = struct {
             self.notifyCommonChannels(id, nick_msg, null, id, null) catch {};
             self.monitorTransition(old_nick, snap.nick) catch {};
         }
+        // A live sibling already present in a carried channel proves that this
+        // is a new transport for an existing logical member, not a new logical
+        // JOIN.
         var channel_restore_complete = true;
         for (snap.channels, 0..) |chan, i| {
             const modes: u8 = if (i < snap.channel_modes.len) snap.channel_modes[i] else 0;
             const was_member = self.world.isMember(chan, wid);
+            var exact_sibling_was_member = false;
+            for (session_rows) |row| {
+                if (!row.attached or row.client == monitorIdFromClient(id)) continue;
+                if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, session_token)) continue;
+                const sibling_id = clientIdFromMonitor(row.client);
+                const sibling = self.connFor(sibling_id) orelse continue;
+                if (sibling.closing or sibling.s2s != null or sibling.s2s_secured != null) continue;
+                const sibling_account = sibling.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(sibling_account, account)) continue;
+                if (self.world.isMember(chan, worldIdFromClient(sibling_id))) {
+                    exact_sibling_was_member = true;
+                    break;
+                }
+            }
             self.world.restoreMember(chan, wid, .{ .bits = modes }) catch {
                 channel_restore_complete = false;
                 continue;
             };
             if (!was_member) {
-                self.broadcastJoin(chan, conn) catch {};
-                self.publishMemberEvent("JOIN", chan, conn.session.displayName(), null) catch {};
-                self.notifyObservers(.join, observeSubject(conn, chan));
+                if (exact_sibling_was_member) {
+                    // Every transport is a real World member and receives future
+                    // events, but an existing logical identity does not JOIN the
+                    // channel twice merely because another client resumed it.
+                    self.sendJoinToAttachment(id, conn, chan) catch {};
+                } else {
+                    self.broadcastJoin(chan, conn) catch {};
+                    self.publishMemberEvent("JOIN", chan, conn.session.displayName(), null) catch {};
+                    self.notifyObservers(.join, observeSubject(conn, chan));
+                }
                 self.sendTopicReply(conn, chan) catch {};
                 if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, chan) catch {};
             }
@@ -34200,7 +34952,7 @@ pub const LinuxServer = struct {
                 if (cap) |c| {
                     if (!mconn.session.hasCap(c)) continue;
                 }
-                try self.deliver(mid, msg);
+                self.deliver(mid, msg) catch continue;
             }
         }
         // extended-monitor: also deliver to clients MONITORing this nick who do
@@ -34226,7 +34978,7 @@ pub const LinuxServer = struct {
                 if (cap) |c| {
                     if (!wconn.session.hasCap(c)) continue;
                 }
-                try self.deliver(wid, msg);
+                self.deliver(wid, msg) catch continue;
             }
         }
     }
@@ -35013,6 +35765,16 @@ pub const LinuxServer = struct {
                         if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
                         return;
                     }
+                    var local_sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+                    defer local_sender_ids.deinit(self.allocator);
+                    self.collectAttachedExactTokenClients(id, conn, &local_sender_ids) catch {
+                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                        return;
+                    };
+                    const exact_sender_token: ?sessions_mod.Token = if (conn.session.account()) |account| blk: {
+                        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse break :blk null;
+                        break :blk if (tokenIsNull(handle.token)) null else handle.token;
+                    } else null;
                     _ = self.relay_seen.observe(self.config.node_id, event_hlc);
                     var relay_tag_buf: [256]u8 = undefined;
                     var relay_msg = s2s_link.RelayMessage{
@@ -35049,9 +35811,12 @@ pub const LinuxServer = struct {
                     }
                     var et_buf: [40]u8 = undefined;
                     const etags = MsgTags{ .time_value = serverTimeValueAt(&et_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-                    if (echo) self.deliverTagged(id, etags, msg) catch {};
+                    for (local_sender_ids.items) |logical_id| {
+                        if (logical_id.eql(id) and !echo) continue;
+                        self.deliverTagged(logical_id, etags, msg) catch {};
+                    }
                     if (conn.session.account()) |sender_account| {
-                        self.deliverSessionSyncSiblingsNick(sender_account, etags, msg, id, null, conn.session.displayName());
+                        self.deliverSessionSyncSiblingsNick(sender_account, exact_sender_token, null, etags, msg, id, null, conn.session.displayName(), null);
                     }
                     return;
                 } else |_| {}
@@ -35122,32 +35887,96 @@ pub const LinuxServer = struct {
             const sender_mask = try clientPrefix(conn, &smask_buf);
             if (self.silence.isSilenced(target, sender_mask)) return;
         }
+
+        // Snapshot both exact logical-session recipient sets before the first
+        // delivery. Allocation failure is retryable for PRIVMSG and silent for
+        // NOTICE; it must never expose a partial account/nick-selected fan-out.
+        var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipient_ids.deinit(self.allocator);
+        if (recipient_conn) |rconn| {
+            self.collectAttachedExactTokenClients(recipient_id, rconn, &recipient_ids) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                return;
+            };
+        } else {
+            recipient_ids.append(self.allocator, recipient_id) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                return;
+            };
+        }
+        const same_logical_session = if (recipient_conn) |rconn|
+            self.clientsShareExactToken(id, conn, recipient_id, rconn)
+        else
+            false;
+        const sender_exact_token: ?sessions_mod.Token = if (conn.session.account()) |account| blk: {
+            const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse break :blk null;
+            break :blk if (tokenIsNull(handle.token)) null else handle.token;
+        } else null;
+        const recipient_exact_token: ?sessions_mod.Token = if (recipient_conn) |rconn| if (rconn.session.account()) |account| blk: {
+            const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(recipient_id)) orelse break :blk null;
+            break :blk if (tokenIsNull(handle.token)) null else handle.token;
+        } else null else null;
+        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer sender_ids.deinit(self.allocator);
+        if (!same_logical_session) {
+            self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                return;
+            };
+        }
         var time_buf: [40]u8 = undefined;
         const dtags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-        // A sender addressing its own shared nick is a recipient, regardless of
-        // which attachment currently owns the World nick entry. Recipient fanout
-        // must therefore include the sending attachment when another sibling is
-        // the owner, and echo-message must not add a second copy when the sender
-        // itself is the owner.
-        const self_dm = std.ascii.eqlIgnoreCase(conn.session.displayName(), target);
-        try self.deliverTagged(recipient_id, dtags, msg);
+        // Every exact recipient attachment participates independently. A full or
+        // closing owner's queue cannot prevent its siblings from receiving the
+        // event. Same-account/same-nick DIFFERENT tokens are absent by design.
+        for (recipient_ids.items) |logical_id| self.deliverTagged(logical_id, dtags, msg) catch {};
         const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
-        if (recipient_account) |acct| {
-            // Pass the DM target nick so SAME-NICK siblings (the same identity
-            // signed in to this nick from another client) receive the message
-            // even without the session-sync cap; different-nick siblings still
-            // need the cap to opt in.
-            self.deliverSessionSyncSiblingsNick(acct, dtags, msg, recipient_id, if (self_dm) null else id, target);
+        const sender_account = conn.session.account();
+        const same_account = if (sender_account) |sa|
+            if (recipient_account) |ra| std.ascii.eqlIgnoreCase(sa, ra) else false
+        else
+            false;
+        if (!same_logical_session) {
+            for (sender_ids.items) |logical_id| {
+                if (logical_id.eql(id) and !echo) continue;
+                self.deliverTagged(logical_id, dtags, msg) catch {};
+            }
         }
-        if (echo and !self_dm) try self.deliverTagged(id, dtags, msg);
-        if (conn.session.account()) |sender_account| {
-            const same_account = if (recipient_account) |acct| std.mem.eql(u8, sender_account, acct) else false;
-            // Pass the SENDER's nick as `same_nick`: a sibling session on the
-            // sender's own nick (the same identity's other device) receives the
-            // sent-copy WITHOUT the session-sync cap — the same rule the
-            // recipient-side fan-out above applies to the target nick.
-            // Different-nick siblings still opt in via the cap.
-            if (!same_account) self.deliverSessionSyncSiblingsNick(sender_account, dtags, msg, id, recipient_id, conn.session.displayName());
+        if (same_account) {
+            if (sender_account) |account| self.deliverSessionSyncSiblingsNick(
+                account,
+                recipient_exact_token,
+                sender_exact_token,
+                dtags,
+                msg,
+                id,
+                recipient_id,
+                target,
+                conn.session.displayName(),
+            );
+        } else {
+            if (recipient_account) |account| self.deliverSessionSyncSiblingsNick(
+                account,
+                recipient_exact_token,
+                null,
+                dtags,
+                msg,
+                recipient_id,
+                id,
+                target,
+                null,
+            );
+            if (sender_account) |account| self.deliverSessionSyncSiblingsNick(
+                account,
+                sender_exact_token,
+                null,
+                dtags,
+                msg,
+                id,
+                recipient_id,
+                conn.session.displayName(),
+                null,
+            );
         }
         // Cross-node multi-client relay: the target nick resolved LOCALLY, but
         // the same identity may hold live sessions on other mesh nodes (one nick
@@ -35325,7 +36154,30 @@ pub const LinuxServer = struct {
         // QUIT closes this transport, not the shared logical identity. If another
         // attachment is live, hand ownership/state to it and let the ordinary
         // close path detach this row without emitting offline/QUIT for the user.
-        if (self.handoffLiveSessionIdentity(id, conn)) {
+        const handed_off = self.handoffLiveSessionIdentity(id, conn) catch {
+            retainCloseReason(conn, reason);
+            conn.session_handoff_retry = true;
+            conn.closing = true;
+            return;
+        };
+        if (handed_off) {
+            conn.session_handoff_complete = true;
+            conn.session_handoff_checked = true;
+            conn.closing = true;
+            return;
+        }
+        conn.session_handoff_checked = true;
+        // A live other-origin Store row for this exact portable token is the
+        // remote equivalent of a local sibling. Leave World intact so closeConn
+        // can retain/ship the complete image, then suppress identity-wide QUIT.
+        if (self.connHasExactRemoteSessionAuthority(id, conn)) {
+            conn.closing = true;
+            return;
+        }
+        // Clean QUIT normally removes World before closeConn runs. Retain and
+        // publish the full pre-removal image now; on OOM, leave World untouched
+        // and let closeConn take the ordinary abrupt-drop path instead.
+        if (conn.session.account() != null and !self.prepareCleanSessionDetach(id, conn)) {
             conn.closing = true;
             return;
         }
@@ -35704,7 +36556,6 @@ fn allowsSessionSyncSibling(
     conn: *const ConnState,
     skip_a_flat: ?u64,
     skip_b_flat: ?u64,
-    same_nick: bool,
 ) bool {
     if (!session.attached) return false;
     if (skip_a_flat) |skip| {
@@ -35715,11 +36566,8 @@ fn allowsSessionSyncSibling(
     }
     if (conn.closing) return false;
     if (conn.s2s != null or conn.s2s_secured != null) return false;
-    // A same-nick sibling is the same identity attaching from another client
-    // (multi-session under one nick): it must receive direct messages to its own
-    // nick regardless of the session-sync cap, which only governs OPT-IN
-    // mirroring of the account's OTHER nicks.
-    if (same_nick) return true;
+    // Exact-token siblings use the mandatory logical-session path. This helper
+    // is only optional mirroring to a differently named account session.
     return conn.session.hasCap(.orochi_session_sync);
 }
 
@@ -40255,7 +41103,6 @@ test "session-sync unit: two sessions same account both session-sync get the DM"
         &sibling,
         monitorIdFromClient(target_id),
         monitorIdFromClient(sender_id),
-        false,
     ));
 }
 
@@ -40274,13 +41121,12 @@ test "session-sync unit: a session without the cap does not get the DM" {
         &sibling,
         monitorIdFromClient(target_id),
         null,
-        false,
     ));
 }
 
-test "session-sync unit: a same-nick sibling gets the DM even without the cap" {
-    // A same-nick sibling (same identity, second client on the same nick) must
-    // receive a DM to its own nick regardless of the session-sync cap.
+test "session-sync unit: optional account mirror requires the explicit cap" {
+    // Exact-token delivery is tested at the daemon path. This lower-level
+    // selector covers only optional differently-named account mirroring.
     const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
     const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
     var sibling = ConnState.init(-1); // NO orochi_session_sync cap
@@ -40289,21 +41135,11 @@ test "session-sync unit: a same-nick sibling gets the DM even without the cap" {
         .token = @as([16]u8, @splat(0)),
         .signon_ms = 0,
     };
-    // same_nick = true bypasses the cap requirement.
-    try std.testing.expect(allowsSessionSyncSibling(
-        session,
-        &sibling,
-        monitorIdFromClient(target_id),
-        null,
-        true,
-    ));
-    // Without same_nick, the same capless sibling is NOT eligible.
     try std.testing.expect(!allowsSessionSyncSibling(
         session,
         &sibling,
         monitorIdFromClient(target_id),
         null,
-        false,
     ));
 }
 
@@ -40324,7 +41160,6 @@ test "session-sync unit: sender other session gets outgoing DM echo" {
         &sibling,
         monitorIdFromClient(sender_id),
         monitorIdFromClient(recipient_id),
-        false,
     ));
 }
 
@@ -40345,7 +41180,6 @@ test "session-sync unit: single-session account has no sibling copies" {
             &target_conn,
             monitorIdFromClient(target_id),
             null,
-            false,
         )) copies += 1;
     }
 
@@ -40406,6 +41240,73 @@ test "portable local NICK publishes exact Store authority before v2 authorizatio
         .bind => |token| try std.testing.expect(std.crypto.timing_safe.eql(session_migrate.Token, token, handle.token)),
         .reject, .legacy => return error.TestUnexpectedResult,
     }
+}
+
+test "exact-token NICK enforces no-nick across sibling membership union" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const primary_id = try addTestLocalClient(&server, "Primary", "shared-acct");
+    const sibling_id = try addTestLocalClient(&server, "Sibling", "shared-acct");
+    const primary = server.connFor(primary_id).?;
+    const sibling = server.connFor(sibling_id).?;
+    const token = server.sessions.resumeHandleForClient("shared-acct", monitorIdFromClient(primary_id)).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("shared-acct", monitorIdFromClient(sibling_id), token));
+
+    // Only the sibling is in +N. The initiating transport must not bypass the
+    // logical session's restriction merely because its own World id is absent.
+    try server.world.restoreMember("#locked", worldIdFromClient(sibling_id), world_model.MemberModes.empty());
+    _ = try server.world.setChannelFlag("#locked", .no_nick, true);
+    var parsed = try irc_line.parseLine("NICK Renamed");
+    try server.handleNickChange(primary_id, primary, &parsed);
+    try std.testing.expectEqualStrings("Primary", primary.session.displayName());
+    try std.testing.expectEqualStrings("Sibling", sibling.session.displayName());
+    try std.testing.expect(server.world.findNick("Renamed") == null);
+    try expectContains(primary.send_buf[0..primary.send_len], "Cannot change nick while on #locked (+N)");
+
+    // Once the sibling is an operator, the same identity-wide action succeeds
+    // and every exact attachment adopts the new rendered nick.
+    _ = try server.world.setMemberMode("#locked", worldIdFromClient(sibling_id), .op, true);
+    primary.send_len = 0;
+    try server.handleNickChange(primary_id, primary, &parsed);
+    try std.testing.expectEqualStrings("Renamed", primary.session.displayName());
+    try std.testing.expectEqualStrings("Renamed", sibling.session.displayName());
+    try std.testing.expect(server.world.findNick("Renamed") != null);
+}
+
+test "repeated JOIN repairs exact siblings without emitting a duplicate logical event" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Ruri", "ruri");
+    const conn = server.connFor(id).?;
+    var parsed = try irc_line.parseLine("JOIN #once");
+    try server.handleJoin(id, conn, &parsed);
+    try std.testing.expect(server.world.isMember("#once", worldIdFromClient(id)));
+    try expectContains(conn.send_buf[0..conn.send_len], " JOIN #once\r\n");
+
+    // A second JOIN is still allowed through syncTokenGroupChannel so it can
+    // repair an absent exact sibling, but it is not a new logical transition.
+    conn.send_len = 0;
+    try server.handleJoin(id, conn, &parsed);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 1), server.world.channelCountOf(worldIdFromClient(id)));
 }
 
 test "UPGRADE preflight flushes deferred resume sidecars only after exact authority is publishable" {
@@ -41070,7 +41971,9 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
             .target = "Target",
             .source_nick = "Remote",
             .source_prefix = "Remote!r@host",
-            .account = "",
+            // Mutable relay account text is not authentication and cannot
+            // bypass the recipient's +R policy.
+            .account = "forged-logged-in",
             .tags = "",
             .text = "blocked by +R",
             .origin_node = 99,
@@ -41080,6 +41983,23 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
         try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
 
         _ = target.session.setUmode(.regonly_pm, false);
+        _ = target.session.setUmode(.callerid, true);
+        server.deliverRelay(.{
+            .verb = .privmsg,
+            .target = "Target",
+            .source_nick = "Remote",
+            .source_prefix = "Remote!r@elsewhere",
+            // Nor can an attacker claim the recipient account to obtain +g's
+            // same-account bypass without signed residence/token authority.
+            .account = "targetacct",
+            .tags = "",
+            .text = "blocked by +g",
+            .origin_node = 99,
+            .hlc = 2,
+        });
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+        _ = target.session.setUmode(.callerid, false);
         _ = try server.silence.add("Target", "Remote!*@host");
         server.deliverRelay(.{
             .verb = .privmsg,
@@ -41090,7 +42010,7 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
             .tags = "",
             .text = "blocked by silence",
             .origin_node = 99,
-            .hlc = 2,
+            .hlc = 3,
         });
         try std.testing.expectEqual(@as(usize, 0), target.send_len);
         try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
@@ -41104,7 +42024,7 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
             .tags = "",
             .text = "delivered",
             .origin_node = 99,
-            .hlc = 3,
+            .hlc = 4,
         });
         try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
         try expectContains(sibling.send_buf[0..sibling.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
@@ -41164,7 +42084,7 @@ test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ig
 
 test "session-sync: sender same-account same-nick sibling gets the DM sent-copy without the cap" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -41176,12 +42096,12 @@ test "session-sync: sender same-account same-nick sibling gets the DM sent-copy 
     const sender = server.connFor(sender_id).?;
     const sibling = server.connFor(sibling_id).?;
     const recipient = server.connFor(recipient_id).?;
-    // The sibling is the SAME identity signed in on the SENDER's nick from a
-    // second device (routine across the mesh; modeled locally here). It holds NO
-    // orochi/session-sync cap — a same-nick sibling of the SENDER must receive
-    // the sent-copy capless, exactly as a same-nick sibling of the RECIPIENT
-    // receives the inbound copy capless.
+    // Bind the second transport to the exact reusable credential. Account+nick
+    // alone is deliberately insufficient; exact-token siblings receive the
+    // sent copy without requiring the optional account session-sync cap.
     try sibling.session.setNick("Kazu");
+    const sender_token = server.sessions.resumeHandleForClient("kazuacct", monitorIdFromClient(sender_id)).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("kazuacct", monitorIdFromClient(sibling_id), sender_token));
 
     try server.messageOne(sender_id, sender, "PRIVMSG", "Ruri", "hello there", null);
 
@@ -41190,6 +42110,115 @@ test "session-sync: sender same-account same-nick sibling gets the DM sent-copy 
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "PRIVMSG Ruri :hello there"));
     // No echo-message cap: the sending session itself gets nothing back.
     try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+}
+
+test "session-sync exact-once matrix: local same-account distinct tokens dedupe mandatory and optional copies" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "matrix-acct";
+    const token_a: sessions_mod.Token = @splat(0xA1);
+    const token_b: sessions_mod.Token = @splat(0xB2);
+    const token_c: sessions_mod.Token = @splat(0xC3);
+    const token_decoy: sessions_mod.Token = @splat(0xD4);
+    const sender_id = try addTestLocalClient(&server, "Sender", account);
+    const sender_exact_id = try addTestLocalClient(&server, "SenderAttach", account);
+    const recipient_id = try addTestLocalClient(&server, "Recipient", account);
+    const account_sync_id = try addTestLocalClient(&server, "Archive", account);
+    const same_nick_decoy_id = try addTestLocalClient(&server, "SenderDecoy", account);
+    const sender = server.connFor(sender_id).?;
+    const sender_exact = server.connFor(sender_exact_id).?;
+    const recipient = server.connFor(recipient_id).?;
+    const account_sync = server.connFor(account_sync_id).?;
+    const same_nick_decoy = server.connFor(same_nick_decoy_id).?;
+
+    // A and B are independent exact-token identities under one account. A's
+    // second attachment is mandatory fan-out; C explicitly opts into the account
+    // DM view. The cap-enabled same-nick decoy remains a separate authority and
+    // must not consume Sender's event through account/nick affinity.
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(sender_id), token_a, false));
+    try std.testing.expect(server.sessions.joinTokenGroup(account, monitorIdFromClient(sender_exact_id), token_a));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(recipient_id), token_b, false));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(account_sync_id), token_c, false));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(same_nick_decoy_id), token_decoy, false));
+    try sender_exact.session.setNick("Sender");
+    try same_nick_decoy.session.setNick("Sender");
+    account_sync.session.addCap(.orochi_session_sync);
+    same_nick_decoy.session.addCap(.orochi_session_sync);
+
+    try server.messageOne(sender_id, sender, "PRIVMSG", "Recipient", "matrix-local", null);
+
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(sender.send_buf[0..sender.send_len], "PRIVMSG Recipient :matrix-local"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_exact.send_buf[0..sender_exact.send_len], "PRIVMSG Recipient :matrix-local"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], "PRIVMSG Recipient :matrix-local"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(account_sync.send_buf[0..account_sync.send_len], "PRIVMSG Recipient :matrix-local"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(same_nick_decoy.send_buf[0..same_nick_decoy.send_len], "PRIVMSG Recipient :matrix-local"));
+}
+
+test "session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "relay-matrix-acct";
+    const token_a: sessions_mod.Token = @splat(0xA5);
+    const token_b: sessions_mod.Token = @splat(0xB6);
+    const token_c: sessions_mod.Token = @splat(0xC7);
+    const token_decoy: sessions_mod.Token = @splat(0xD8);
+    const sender_owner_id = try addTestLocalClient(&server, "Remote", account);
+    const sender_exact_id = try addTestLocalClient(&server, "RemoteAttach", account);
+    const recipient_id = try addTestLocalClient(&server, "Target", account);
+    const account_sync_id = try addTestLocalClient(&server, "RelayArchive", account);
+    const same_nick_decoy_id = try addTestLocalClient(&server, "RemoteDecoy", account);
+    const sender_owner = server.connFor(sender_owner_id).?;
+    const sender_exact = server.connFor(sender_exact_id).?;
+    const recipient = server.connFor(recipient_id).?;
+    const account_sync = server.connFor(account_sync_id).?;
+    const same_nick_decoy = server.connFor(same_nick_decoy_id).?;
+
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(sender_owner_id), token_a, true));
+    try std.testing.expect(server.sessions.joinTokenGroup(account, monitorIdFromClient(sender_exact_id), token_a));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(recipient_id), token_b, false));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(account_sync_id), token_c, false));
+    try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(same_nick_decoy_id), token_decoy, false));
+    try sender_exact.session.setNick("Remote");
+    try same_nick_decoy.session.setNick("Remote");
+    account_sync.session.addCap(.orochi_session_sync);
+    same_nick_decoy.session.addCap(.orochi_session_sync);
+
+    // The signed Store offer binds the remote author to exact token A. Therefore
+    // both local A attachments receive the sent-copy, B receives as the target,
+    // and C receives one optional account mirror. The same-nick D decoy is outside
+    // both exact sets and remains excluded even though it negotiated session-sync.
+    var remote = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x5A)));
+    defer remote.deinit();
+    try applyTestRemoteSessionReplica(&server, &remote, token_a, account, "Remote", 1);
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+    var msg = try buildSignedRelay(&remote, "Target", "Remote!r@mesh.test", "matrix-relay", 7, &pk_buf, &sig_buf);
+    msg.account = account;
+    server.deliverRelay(msg);
+
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_owner.send_buf[0..sender_owner.send_len], "PRIVMSG Target :matrix-relay"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_exact.send_buf[0..sender_exact.send_len], "PRIVMSG Target :matrix-relay"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], "PRIVMSG Target :matrix-relay"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(account_sync.send_buf[0..account_sync.send_len], "PRIVMSG Target :matrix-relay"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(same_nick_decoy.send_buf[0..same_nick_decoy.send_len], "PRIVMSG Target :matrix-relay"));
 }
 
 test "relay DM rejects an unproven same-account sender-copy claim" {
@@ -43357,14 +44386,25 @@ test "signed session replica projects JOIN PART only to the exact token and neve
     defer server.deinit();
 
     const exact_id = try addTestLocalClient(&server, "Shared", "shared-acct");
+    const sibling_id = try addTestLocalClient(&server, "Sibling", "shared-acct");
     const decoy_id = try addTestLocalClient(&server, "Decoy", "shared-acct");
     const exact = server.connFor(exact_id).?;
+    const sibling = server.connFor(sibling_id).?;
     const decoy = server.connFor(decoy_id).?;
+    server.world.unregisterNick(worldIdFromClient(sibling_id));
+    try sibling.session.setNick("Shared");
     server.world.unregisterNick(worldIdFromClient(decoy_id));
     try decoy.session.setNick("Shared");
+    exact.session.addCap(.away_notify);
+    exact.session.addCap(.setname);
+    sibling.session.addCap(.away_notify);
+    sibling.session.addCap(.setname);
+    decoy.session.addCap(.away_notify);
+    decoy.session.addCap(.setname);
     decoy.session.addCap(.orochi_session_sync);
 
     const exact_token = server.sessions.resumeHandleForClient("shared-acct", monitorIdFromClient(exact_id)).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("shared-acct", monitorIdFromClient(sibling_id), exact_token));
     const decoy_token = server.sessions.resumeHandleForClient("shared-acct", monitorIdFromClient(decoy_id)).?.token;
     try std.testing.expect(!std.crypto.timing_safe.eql(sessions_mod.Token, exact_token, decoy_token));
     try std.testing.expect(server.sessions.markPortableResumeIssued("shared-acct", monitorIdFromClient(exact_id)));
@@ -43377,9 +44417,11 @@ test "signed session replica projects JOIN PART only to the exact token and neve
 
     const joined_snapshot = try (migration_relay.Snapshot{
         .nick = "Shared",
-        .umodes = "+i",
+        .umodes = "+iB",
         .channels = &.{"#signed-exact"},
         .channel_modes = &.{@as(u8, 0)},
+        .realname = "Remote Shared",
+        .away = "brb",
         .account = "shared-acct",
         .username = "shared",
         .host = "remote.test",
@@ -43419,10 +44461,33 @@ test "signed session replica projects JOIN PART only to the exact token and neve
     _ = server.projectBestSessionReplicaV2(exact_token);
 
     try std.testing.expect(server.world.isMember("#signed-exact", worldIdFromClient(exact_id)));
+    try std.testing.expect(server.world.isMember("#signed-exact", worldIdFromClient(sibling_id)));
     try std.testing.expect(!server.world.isMember("#signed-exact", worldIdFromClient(decoy_id)));
     try std.testing.expect(!server.world.isMember("#local-exact", worldIdFromClient(exact_id)));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], "JOIN :#signed-exact"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "JOIN :#signed-exact"));
     try std.testing.expect(std.mem.indexOf(u8, decoy.send_buf[0..decoy.send_len], "JOIN :#signed-exact") == null);
+    try std.testing.expectEqualStrings("brb", exact.session.awayMessage().?);
+    try std.testing.expectEqualStrings("brb", sibling.session.awayMessage().?);
+    try std.testing.expect(decoy.session.awayMessage() == null);
+    try std.testing.expectEqualStrings("Remote Shared", exact.session.realname());
+    try std.testing.expectEqualStrings("Remote Shared", sibling.session.realname());
+    try std.testing.expect(!std.mem.eql(u8, "Remote Shared", decoy.session.realname()));
+    try std.testing.expect(exact.session.hasUmode(.invisible));
+    try std.testing.expect(exact.session.hasUmode(.bot));
+    try std.testing.expect(sibling.session.hasUmode(.invisible));
+    try std.testing.expect(sibling.session.hasUmode(.bot));
+    try std.testing.expect(!decoy.session.hasUmode(.invisible));
+    try std.testing.expect(!decoy.session.hasUmode(.bot));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " AWAY :brb"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], " AWAY :brb"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " SETNAME :Remote Shared"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], " SETNAME :Remote Shared"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " MODE Shared +iB"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], " MODE Shared +iB"));
+    try std.testing.expect(std.mem.indexOf(u8, decoy.send_buf[0..decoy.send_len], " AWAY :brb") == null);
+    try std.testing.expect(std.mem.indexOf(u8, decoy.send_buf[0..decoy.send_len], " SETNAME :Remote Shared") == null);
+    try std.testing.expect(std.mem.indexOf(u8, decoy.send_buf[0..decoy.send_len], " MODE Shared +iB") == null);
     try std.testing.expect(server.session_replica_store.getOrigin(exact_token, local_ident.shortId()) == null);
     try std.testing.expectEqual(@as(usize, 0), server.sessions.dirtyReplicaProjectionRowCount());
 
@@ -43430,15 +44495,20 @@ test "signed session replica projects JOIN PART only to the exact token and neve
     // duplicate logical JOIN.
     _ = server.projectBestSessionReplicaV2(exact_token);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], "JOIN :#signed-exact"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " AWAY :brb"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " SETNAME :Remote Shared"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " MODE Shared +iB"));
 
     // A decoy that independently occupies the channel survives the exact-token
     // PART projection even though account and rendered nick are identical.
     try server.world.restoreMember("#signed-exact", worldIdFromClient(decoy_id), world_model.MemberModes.fromModes(&.{.voice}));
     const parted_snapshot = try (migration_relay.Snapshot{
         .nick = "Shared",
-        .umodes = "+i",
+        .umodes = "+B",
         .channels = &.{},
         .channel_modes = &.{},
+        .realname = "Remote Shared Again",
+        .away = "",
         .account = "shared-acct",
         .username = "shared",
         .host = "remote.test",
@@ -43461,7 +44531,23 @@ test "signed session replica projects JOIN PART only to the exact token and neve
     try std.testing.expectEqual(session_replica_v2.ApplyDisposition.superseded, parted_result.disposition);
     _ = server.projectBestSessionReplicaV2(exact_token);
     try std.testing.expect(!server.world.isMember("#signed-exact", worldIdFromClient(exact_id)));
+    try std.testing.expect(!server.world.isMember("#signed-exact", worldIdFromClient(sibling_id)));
     try std.testing.expect(server.world.isMember("#signed-exact", worldIdFromClient(decoy_id)));
+    try std.testing.expect(exact.session.awayMessage() == null);
+    try std.testing.expect(sibling.session.awayMessage() == null);
+    try std.testing.expectEqualStrings("Remote Shared Again", exact.session.realname());
+    try std.testing.expectEqualStrings("Remote Shared Again", sibling.session.realname());
+    try std.testing.expect(!exact.session.hasUmode(.invisible));
+    try std.testing.expect(!sibling.session.hasUmode(.invisible));
+    try std.testing.expect(exact.session.hasUmode(.bot));
+    try std.testing.expect(sibling.session.hasUmode(.bot));
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(exact.send_buf[0..exact.send_len], " AWAY"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " SETNAME :Remote Shared Again"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(exact.send_buf[0..exact.send_len], " MODE Shared -i"));
+    try std.testing.expect(decoy.session.awayMessage() == null);
+    try std.testing.expect(!std.mem.eql(u8, "Remote Shared Again", decoy.session.realname()));
+    try std.testing.expect(!decoy.session.hasUmode(.invisible));
+    try std.testing.expect(!decoy.session.hasUmode(.bot));
     try std.testing.expect(server.session_replica_store.getOrigin(exact_token, local_ident.shortId()) == null);
 
     // A future-ahead accepted origin cannot pin the token: the next local
@@ -45363,18 +46449,69 @@ test "threaded server: local resume joins an attached reusable session" {
 
     const owner_id = try addTestLocalClient(&server, "owner", "sameacct");
     const claimant_id = try addTestLocalClient(&server, "claimant", "sameacct");
+    const decoy_id = try addTestLocalClient(&server, "decoy", "sameacct");
+    const owner = server.connFor(owner_id).?;
     const claimant = server.connFor(claimant_id).?;
+    const decoy = server.connFor(decoy_id).?;
+    owner.session.addCap(.away_notify);
+    owner.session.addCap(.setname);
+    claimant.session.addCap(.away_notify);
+    claimant.session.addCap(.setname);
+    try server.world.restoreMember("#resume-exact", worldIdFromClient(owner_id), world_model.MemberModes.fromModes(&.{.op}));
     const token = server.sessions.resumeHandleForClient("sameacct", monitorIdFromClient(owner_id)).?.token;
     const token_hex = std.fmt.bytesToHex(token, .lower);
     var line_buf: [64]u8 = undefined;
     var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
 
+    owner.send_len = 0;
+    claimant.send_len = 0;
     try server.handleSessionResume(claimant_id, claimant, "sameacct", &resume_line);
     try expectContains(claimant.send_buf[0..claimant.send_len], "attached to live session");
+    try expectContains(claimant.send_buf[0..claimant.send_len], "JOIN #resume-exact");
+    try std.testing.expect(std.mem.indexOf(u8, owner.send_buf[0..owner.send_len], "JOIN #resume-exact") == null);
+    try std.testing.expectEqual(
+        world_model.MemberModes.fromModes(&.{.op}).bits,
+        server.world.memberModes("#resume-exact", worldIdFromClient(claimant_id)).?.bits,
+    );
     try std.testing.expect(!claimant.preserve_resume_credential_once);
     try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(owner_id), token));
     try std.testing.expect(server.sessions.clientHasToken("sameacct", monitorIdFromClient(claimant_id), token));
     try std.testing.expect(server.connFor(owner_id) != null);
+
+    // AWAY, SETNAME, and user MODE are identity state, not socket state. Either
+    // attachment mutates both sessions and both capable clients observe one
+    // reflection while the reusable token remains shared.
+    owner.send_len = 0;
+    claimant.send_len = 0;
+    var away_line = try irc_line.parseLine("AWAY :stepped out");
+    try server.handleAway(claimant_id, claimant, &away_line);
+    try std.testing.expectEqualStrings("stepped out", owner.session.awayMessage().?);
+    try std.testing.expectEqualStrings("stepped out", claimant.session.awayMessage().?);
+    try std.testing.expect(decoy.session.awayMessage() == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " AWAY :stepped out"));
+
+    owner.send_len = 0;
+    claimant.send_len = 0;
+    var setname_line = try irc_line.parseLine("SETNAME :Shared Person");
+    try server.handleSetname(claimant_id, claimant, &setname_line);
+    try std.testing.expectEqualStrings("Shared Person", owner.session.realname());
+    try std.testing.expectEqualStrings("Shared Person", claimant.session.realname());
+    try std.testing.expect(!std.mem.eql(u8, "Shared Person", decoy.session.realname()));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " SETNAME :Shared Person"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(claimant.send_buf[0..claimant.send_len], " SETNAME :Shared Person"));
+
+    owner.send_len = 0;
+    claimant.send_len = 0;
+    var mode_line = try irc_line.parseLine("MODE owner +iB");
+    try server.handleMode(claimant_id, claimant, &mode_line);
+    try std.testing.expect(owner.session.hasUmode(.invisible));
+    try std.testing.expect(owner.session.hasUmode(.bot));
+    try std.testing.expect(claimant.session.hasUmode(.invisible));
+    try std.testing.expect(claimant.session.hasUmode(.bot));
+    try std.testing.expect(!decoy.session.hasUmode(.invisible));
+    try std.testing.expect(!decoy.session.hasUmode(.bot));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(owner.send_buf[0..owner.send_len], " MODE owner +iB"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(claimant.send_buf[0..claimant.send_len], " MODE owner +iB"));
 }
 
 test "live session identity handoff requires the exact reusable token" {
@@ -45406,7 +46543,7 @@ test "live session identity handoff requires the exact reusable token" {
     try server.world.restoreMember("#mode-isolated", worldIdFromClient(isolated_owner), world_model.MemberModes.fromModes(&.{.op}));
     try server.world.restoreMember("#mode-isolated", worldIdFromClient(isolated_other), world_model.MemberModes.fromModes(&.{.voice}));
 
-    try std.testing.expect(!server.handoffLiveSessionIdentity(isolated_owner, server.connFor(isolated_owner).?));
+    try std.testing.expect(!try server.handoffLiveSessionIdentity(isolated_owner, server.connFor(isolated_owner).?));
     try std.testing.expect(server.world.findNick("Isolated").?.eql(worldIdFromClient(isolated_owner)));
     try std.testing.expect(server.world.nickOf(worldIdFromClient(isolated_other)) == null);
     try std.testing.expect(server.world.memberModes("#owner-only", worldIdFromClient(isolated_other)) == null);
@@ -45427,13 +46564,223 @@ test "live session identity handoff requires the exact reusable token" {
     try server.world.restoreMember("#shared-handoff", worldIdFromClient(shared_owner), world_model.MemberModes.fromModes(&.{.op}));
     try server.world.restoreMember("#shared-handoff", worldIdFromClient(shared_successor), world_model.MemberModes.fromModes(&.{.voice}));
 
-    try std.testing.expect(server.handoffLiveSessionIdentity(shared_owner, server.connFor(shared_owner).?));
+    try std.testing.expect(try server.handoffLiveSessionIdentity(shared_owner, server.connFor(shared_owner).?));
     try std.testing.expect(server.world.findNick("Shared").?.eql(worldIdFromClient(shared_successor)));
     try std.testing.expect(server.world.nickOf(worldIdFromClient(shared_owner)) == null);
     try std.testing.expectEqualStrings("Shared", server.world.nickOf(worldIdFromClient(shared_successor)).?);
     const shared_modes = server.world.memberModes("#shared-handoff", worldIdFromClient(shared_successor)).?;
     try std.testing.expect(shared_modes.contains(.voice));
     try std.testing.expect(shared_modes.contains(.op));
+}
+
+test "live session identity handoff never transfers nick after allocation failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var fail_offset: usize = 0;
+    while (fail_offset < 128) : (fail_offset += 1) {
+        const completed = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var server = Server.init(failing.allocator(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .crypto_io = std.testing.io,
+            }) catch |err| switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                server.deinit();
+            }
+
+            const owner_id = try addTestLocalClient(&server, "FailSafe", "failsafe-acct");
+            const successor_id = try addTestLocalClient(&server, "Successor", "failsafe-acct");
+            const successor = server.connFor(successor_id).?;
+            server.world.unregisterNick(worldIdFromClient(successor_id));
+            try successor.session.setNick("FailSafe");
+            const token = server.sessions.resumeHandleForClient("failsafe-acct", monitorIdFromClient(owner_id)).?.token;
+            try std.testing.expect(server.sessions.joinTokenGroup("failsafe-acct", monitorIdFromClient(successor_id), token));
+            try server.world.restoreMember("#departing-only", worldIdFromClient(owner_id), world_model.MemberModes.fromModes(&.{.op}));
+
+            failing.fail_index = failing.alloc_index + fail_offset;
+            const handoff_result = server.handoffLiveSessionIdentity(owner_id, server.connFor(owner_id).?);
+            failing.fail_index = std.math.maxInt(usize);
+
+            if (failing.has_induced_failure) {
+                try std.testing.expectError(error.OutOfMemory, handoff_result);
+                try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(owner_id)), server.world.findNick("FailSafe"));
+                try std.testing.expect(server.world.isMember("#departing-only", worldIdFromClient(owner_id)));
+                try std.testing.expect(!server.world.isMember("#departing-only", worldIdFromClient(successor_id)));
+                break :blk false;
+            }
+            const handed_off = try handoff_result;
+            try std.testing.expect(handed_off);
+            try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(successor_id)), server.world.findNick("FailSafe"));
+            try std.testing.expect(server.world.isMember("#departing-only", worldIdFromClient(successor_id)));
+            break :blk true;
+        };
+        if (completed) break;
+    } else return error.TestUnexpectedResult;
+}
+
+test "close retries exact-session handoff before teardown after allocation failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var server = Server.init(failing.allocator(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        server.deinit();
+    }
+
+    const owner_id = try addTestLocalClient(&server, "Retry", "retry-acct");
+    const sibling_id = try addTestLocalClient(&server, "Sibling", "retry-acct");
+    const owner = server.connFor(owner_id).?;
+    const sibling = server.connFor(sibling_id).?;
+    server.world.unregisterNick(worldIdFromClient(sibling_id));
+    try sibling.session.setNick("Retry");
+    const token = server.sessions.resumeHandleForClient("retry-acct", monitorIdFromClient(owner_id)).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("retry-acct", monitorIdFromClient(sibling_id), token));
+    try server.world.restoreMember("#retry-close", worldIdFromClient(owner_id), world_model.MemberModes.fromModes(&.{.op}));
+
+    owner.closing = true;
+    var borrowed_reason: [32]u8 = @splat(0);
+    @memcpy(borrowed_reason[0.."retry handoff".len], "retry handoff");
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, server.closeConn(owner.token, borrowed_reason[0.."retry handoff".len]));
+    failing.fail_index = std.math.maxInt(usize);
+    @memset(&borrowed_reason, 'x'); // model RecvQ reset/reuse after dispatch
+
+    // Nothing destructive ran: the owner slot, nick, and sole membership are
+    // intact, and the periodic retry marker is armed.
+    const retained = server.connFor(owner_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retained.session_handoff_retry);
+    try std.testing.expectEqualStrings("retry handoff", retained.close_reason);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(owner_id)), server.world.findNick("Retry"));
+    try std.testing.expect(server.world.isMember("#retry-close", worldIdFromClient(owner_id)));
+    try std.testing.expect(!server.world.isMember("#retry-close", worldIdFromClient(sibling_id)));
+
+    // Model an in-flight send during the next timer attempt. The timer commits
+    // only the World handoff and leaves slot/fd ownership to send completion.
+    retained.send_armed = true;
+    server.retryFailedSessionHandoffs();
+    try std.testing.expect(server.connFor(owner_id) != null);
+    try std.testing.expect(!retained.session_handoff_retry);
+    try std.testing.expect(retained.session_handoff_complete);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(sibling_id)), server.world.findNick("Retry"));
+    try std.testing.expect(server.world.isMember("#retry-close", worldIdFromClient(sibling_id)));
+
+    // Send completion is now safe to run the allocation-free finalizer exactly
+    // once because the handoff-complete latch bypasses restaging.
+    retained.send_armed = false;
+    try server.closeConn(retained.token, retained.close_reason);
+    try std.testing.expect(server.connFor(owner_id) == null);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(sibling_id)), server.world.findNick("Retry"));
+    try std.testing.expect(server.world.isMember("#retry-close", worldIdFromClient(sibling_id)));
+    try std.testing.expect(server.world.memberModes("#retry-close", worldIdFromClient(sibling_id)).?.isOperator());
+}
+
+test "portable teardown requires exact remote authority and retains clean QUIT channels" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .mesh_pass = "session-replay-secret",
+        .crypto_io = std.testing.io,
+        .session_migrate_on_detach = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Keep a genuinely established secured peer attached throughout both
+    // cases. Its mere existence must not count as remote token authority.
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.token = try tokenFromId(peer_id);
+    peer.s2s_secured = &pair.a;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const local_id = try addTestLocalClient(&server, "LocalOnly", "local-acct");
+    const local_conn = server.connFor(local_id).?;
+    const local_token = server.sessions.resumeHandleForClient("local-acct", monitorIdFromClient(local_id)).?.token;
+    try std.testing.expect(server.sessions.markPortableResumeIssued("local-acct", monitorIdFromClient(local_id)));
+    try server.world.restoreMember("#retained-clean-quit", worldIdFromClient(local_id), world_model.MemberModes.fromModes(&.{.op}));
+    const local_observer_id = try addTestLocalClient(&server, "LocalObserver", null);
+    const local_observer = server.connFor(local_observer_id).?;
+    try server.world.restoreMember("#retained-clean-quit", worldIdFromClient(local_observer_id), world_model.MemberModes.empty());
+
+    try std.testing.expect(pair.a.established());
+    try std.testing.expect(!server.connHasExactRemoteSessionAuthority(local_id, local_conn));
+    var local_quit = try irc_line.parseLine("QUIT :local final");
+    try server.handleQuit(local_id, local_conn, &local_quit);
+    try std.testing.expect(local_conn.session_detach_prepared);
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(local_id)) == null);
+    try expectContains(local_observer.send_buf[0..local_observer.send_len], " QUIT :local final");
+
+    // The retained SessionStore image and the signed Store authority both carry
+    // the full pre-removal channel set. closeConn must not supersede either with
+    // a newer empty image after handleQuit removed World membership.
+    const retained = (try server.sessions.copyDetachedSnapshotInAccount(allocator, "local-acct", local_token)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(retained);
+    var retained_snapshot = try migration_relay.Snapshot.decode(allocator, retained);
+    defer retained_snapshot.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), retained_snapshot.channels.len);
+    try std.testing.expectEqualStrings("#retained-clean-quit", retained_snapshot.channels[0]);
+
+    const now_wall: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const before_close = server.session_replica_store.bestLiveIdentity(local_token, now_wall) orelse
+        return error.TestUnexpectedResult;
+    const before_revision = before_close.revision;
+    try std.testing.expectEqualSlices(u8, retained, before_close.snapshot);
+    const local_ring_token = local_conn.token;
+    try server.closeConn(local_ring_token, "local final");
+    const after_close = server.session_replica_store.bestLiveIdentity(local_token, now_wall) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(before_revision.eql(after_close.revision));
+    try std.testing.expectEqualSlices(u8, retained, after_close.snapshot);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(local_observer.send_buf[0..local_observer.send_len], " QUIT :local final"));
+
+    // The same exact token at a live other Store origin is positive authority:
+    // clean QUIT and close both preserve the logical identity and emit no QUIT.
+    const remote_id = try addTestLocalClient(&server, "RemoteLive", "remote-acct");
+    const remote_conn = server.connFor(remote_id).?;
+    const remote_token = server.sessions.resumeHandleForClient("remote-acct", monitorIdFromClient(remote_id)).?.token;
+    try std.testing.expect(server.sessions.markPortableResumeIssued("remote-acct", monitorIdFromClient(remote_id)));
+    try server.world.restoreMember("#remote-authority", worldIdFromClient(remote_id), world_model.MemberModes.empty());
+    const remote_observer_id = try addTestLocalClient(&server, "RemoteObserver", null);
+    const remote_observer = server.connFor(remote_observer_id).?;
+    try server.world.restoreMember("#remote-authority", worldIdFromClient(remote_observer_id), world_model.MemberModes.empty());
+    try applyTestRemoteSessionReplica(&server, &pair.idb.sign_kp, remote_token, "remote-acct", "RemoteLive", 77);
+    try std.testing.expect(server.connHasExactRemoteSessionAuthority(remote_id, remote_conn));
+
+    var remote_quit = try irc_line.parseLine("QUIT :transport only");
+    try server.handleQuit(remote_id, remote_conn, &remote_quit);
+    try std.testing.expect(!remote_conn.session_detach_prepared);
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(remote_id)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_observer.send_buf[0..remote_observer.send_len], " QUIT ") == null);
+    const remote_ring_token = remote_conn.token;
+    try server.closeConn(remote_ring_token, "transport only");
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(remote_id)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_observer.send_buf[0..remote_observer.send_len], " QUIT ") == null);
 }
 
 test "threaded server: legacy consumed notice cannot delete a reusable session replica" {
@@ -45656,6 +47003,12 @@ test "threaded server: session reclaim crypto_io-null disables reclaim not const
 
     // And RESUME refuses the sentinel outright — it can never match a ghost.
     const g_id = try addTestLocalClient(&server, "zghost", "acct3");
+    const ghost = server.connFor(g_id).?;
+    var away_line = try irc_line.parseLine("AWAY :only zed");
+    try server.handleAway(id, conn, &away_line);
+    try std.testing.expectEqualStrings("only zed", conn.session.awayMessage().?);
+    try std.testing.expect(ghost.session.awayMessage() == null);
+
     _ = server.sessions.markDetachedWithSnapshot("acct3", monitorIdFromClient(g_id), null);
     conn.send_len = 0;
     var resume_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
@@ -48803,11 +50156,54 @@ test "threaded server: session-sync single-session account keeps direct message 
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "PRIVMSG A :single copy"));
 }
 
-// FIX 2: same account + SAME nick from a second client must attach as a session
-// and continue — it must NOT get a fatal 433 + connection drop. Both clients
-// reach 001, and a DM to the shared nick reaches the account's sessions.
+test "threaded server: pipelined bytes after QUIT are never dispatched" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_sender = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_sender);
+    const fd_target = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_target);
+    var sender = LiveClient{ .fd = fd_sender };
+    var target = LiveClient{ .fd = fd_target };
+
+    try writeAllFd(fd_sender, "NICK Sender\r\nUSER sender 0 * :Sender\r\n");
+    try writeAllFd(fd_target, "NICK Target\r\nUSER target 0 * :Target\r\n");
+    try recvUntil(&sender, " 001 Sender ", 200);
+    try recvUntil(&target, " 001 Target ", 200);
+
+    target.reset();
+    try writeAllFd(fd_sender, "QUIT :gone\r\nPRIVMSG Target :must not run\r\n");
+    waitMillis(100);
+    try target.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, target.written(), "must not run") == null);
+}
+
+// Same account + SAME nick from a second client stays connected, but the reusable
+// token remains the authority boundary: pre-resume DMs are isolated and the same
+// socket joins mandatory fan-out immediately after exact SESSION RESUME.
 test "threaded server: same-account same-nick second client attaches, not 433-dropped" {
-    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-same-nick-resume.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var cfg = operTestConfig(0);
+    cfg.crypto_io = std.testing.io;
+    cfg.account_services = &services;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -48847,14 +50243,39 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     // The second client must NOT have received a fatal ERR_NICKNAMEINUSE (433).
     try std.testing.expect(std.mem.indexOf(u8, k2.written(), " 433 ") == null);
 
-    // A DM to the shared nick reaches the account's same-nick sessions. The world
-    // holder (k1) always gets it; k2 — a same-nick sibling of the same identity —
-    // receives it regardless of the session-sync cap.
+    k1.reset();
+    try writeAllFd(fd_k1, "SESSION TOKEN\r\n");
+    try recvUntil(&k1, "SESSION TOKEN ", 200);
+    const marker = "SESSION TOKEN ";
+    const start = (std.mem.indexOf(u8, k1.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
+    const tail = k1.written()[start..];
+    const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
+    var token_buf: [64]u8 = undefined;
+    @memcpy(token_buf[0..token_len], tail[0..token_len]);
+    const token = token_buf[0..token_len];
+
+    // Same account and nick but a distinct token cannot consume the DM.
     k1.reset();
     k2.reset();
-    try writeAllFd(fd_s, "PRIVMSG kain :hello shared\r\n");
-    try recvUntil(&k1, ":S!sender@localhost PRIVMSG kain :hello shared\r\n", 200);
-    try recvUntil(&k2, ":S!sender@localhost PRIVMSG kain :hello shared\r\n", 200);
+    try writeAllFd(fd_s, "PRIVMSG kain :before exact resume\r\n");
+    try recvUntil(&k1, ":S!sender@localhost PRIVMSG kain :before exact resume\r\n", 200);
+    waitMillis(50);
+    try k2.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, k2.written(), "before exact resume") == null);
+
+    // Presenting the exact credential joins the live logical session; the next
+    // event reaches both transports once while both remain connected.
+    var resume_buf: [128]u8 = undefined;
+    k2.reset();
+    try writeAllFd(fd_k2, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try recvUntil(&k2, "attached to live session", 200);
+    k1.reset();
+    k2.reset();
+    try writeAllFd(fd_s, "PRIVMSG kain :after exact resume\r\n");
+    try recvUntil(&k1, ":S!sender@localhost PRIVMSG kain :after exact resume\r\n", 200);
+    try recvUntil(&k2, ":S!sender@localhost PRIVMSG kain :after exact resume\r\n", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(k1.written(), "after exact resume"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(k2.written(), "after exact resume"));
 
     // And the second connection is still live: it answers a PING.
     k2.reset();
@@ -48932,9 +50353,17 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     try two.readAvailable();
     try std.testing.expect(std.mem.indexOf(u8, two.written(), "JOIN #shared") == null);
     var resume_buf: [128]u8 = undefined;
+    one.reset();
+    two.reset();
     try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
     try recvUntil(&two, "attached to live session", 200);
     try recvUntil(&two, "JOIN #shared", 200);
+    // The new transport receives its own JOIN bootstrap, topic and NAMES, but
+    // the logical session was already in #shared. Existing attachments must not
+    // see another identity-wide JOIN merely because a sibling resumed.
+    waitMillis(50);
+    try one.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, one.written(), "JOIN #shared") == null);
 
     one.reset();
     two.reset();

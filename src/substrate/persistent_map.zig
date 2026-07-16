@@ -327,10 +327,7 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
             errdefer allocator.free(entries);
             @memcpy(entries[0..c.entries.len], c.entries);
             entries[c.entries.len] = .{ .key = key, .value = value };
-            return newCollision(allocator, entries) catch |err| {
-                allocator.free(entries);
-                return err;
-            };
+            return try newCollision(allocator, entries);
         }
 
         /// Insert/overwrite into a copy of an internal node, recursing into the
@@ -352,12 +349,10 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                 const child = inode.children[pidx];
                 // Recurse first; child is shared input, not consumed.
                 const new_child = try putNode(allocator, child, h, depth + 1, key, value, added);
+                var new_child_transferred = false;
+                errdefer if (!new_child_transferred) releaseNode(new_child, allocator);
                 // Copy child array; retain every sibling, point at new_child.
                 const children = try allocator.alloc(*Node, pop);
-                errdefer {
-                    releaseNode(new_child, allocator);
-                    allocator.free(children);
-                }
                 for (inode.children, 0..) |sib, i| {
                     if (i == pidx) {
                         children[i] = new_child; // already rc==1, owned by us
@@ -366,20 +361,21 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                         children[i] = sib;
                     }
                 }
-                return newInternal(allocator, inode.bitmap, children) catch |err| {
+                new_child_transferred = true;
+                errdefer {
                     for (children) |ch| releaseNode(ch, allocator);
                     allocator.free(children);
-                    return err;
-                };
+                }
+                return try newInternal(allocator, inode.bitmap, children);
             }
 
             // Slot empty: add a fresh leaf and grow the compacted array by one.
             added.* = true;
             const new_leaf = try newLeaf(allocator, key, value);
-            errdefer releaseNode(new_leaf, allocator);
+            var new_leaf_transferred = false;
+            errdefer if (!new_leaf_transferred) releaseNode(new_leaf, allocator);
             const pidx = physIndex(inode.bitmap, slot);
             const children = try allocator.alloc(*Node, pop + 1);
-            errdefer allocator.free(children);
             // Copy [0,pidx), insert, copy [pidx,pop) — all siblings retained.
             for (inode.children[0..pidx], 0..) |sib, i| {
                 retainNode(sib);
@@ -391,12 +387,12 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                 children[pidx + 1 + j] = sib;
             }
             const new_bitmap = inode.bitmap | (@as(u32, 1) << slot);
-            // On error, release everything we retained (incl. the new leaf).
-            return newInternal(allocator, new_bitmap, children) catch |err| {
+            new_leaf_transferred = true;
+            errdefer {
                 for (children) |ch| releaseNode(ch, allocator);
                 allocator.free(children);
-                return err;
-            };
+            }
+            return try newInternal(allocator, new_bitmap, children);
         }
 
         /// Build a subtree holding two distinct keys whose hashes are
@@ -419,10 +415,7 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                 errdefer allocator.free(entries);
                 entries[0] = .{ .key = ka, .value = va };
                 entries[1] = .{ .key = kb, .value = vb };
-                return newCollision(allocator, entries) catch |err| {
-                    allocator.free(entries);
-                    return err;
-                };
+                return try newCollision(allocator, entries);
             }
 
             const sa = slotOf(ha, depth);
@@ -431,11 +424,12 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
             if (sa != sb) {
                 // Diverge here: a 2-child internal node.
                 const leaf_a = try newLeaf(allocator, ka, va);
-                errdefer releaseNode(leaf_a, allocator);
+                var leaf_a_transferred = false;
+                errdefer if (!leaf_a_transferred) releaseNode(leaf_a, allocator);
                 const leaf_b = try newLeaf(allocator, kb, vb);
-                errdefer releaseNode(leaf_b, allocator);
+                var leaf_b_transferred = false;
+                errdefer if (!leaf_b_transferred) releaseNode(leaf_b, allocator);
                 const children = try allocator.alloc(*Node, 2);
-                errdefer allocator.free(children);
                 const bitmap = (@as(u32, 1) << sa) | (@as(u32, 1) << sb);
                 if (sa < sb) {
                     children[0] = leaf_a;
@@ -444,27 +438,29 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                     children[0] = leaf_b;
                     children[1] = leaf_a;
                 }
-                return newInternal(allocator, bitmap, children) catch |err| {
-                    releaseNode(leaf_a, allocator);
-                    releaseNode(leaf_b, allocator);
+                leaf_a_transferred = true;
+                leaf_b_transferred = true;
+                errdefer {
+                    for (children) |child| releaseNode(child, allocator);
                     allocator.free(children);
-                    return err;
-                };
+                }
+                return try newInternal(allocator, bitmap, children);
             }
 
             // Same slot at this level → recurse one deeper, wrap in a single-
             // child internal node.
             const sub = try mergeTwo(allocator, depth + 1, ka, va, ha, kb, vb, hb);
-            errdefer releaseNode(sub, allocator);
+            var sub_transferred = false;
+            errdefer if (!sub_transferred) releaseNode(sub, allocator);
             const children = try allocator.alloc(*Node, 1);
-            errdefer allocator.free(children);
             children[0] = sub;
             const bitmap = @as(u32, 1) << sa;
-            return newInternal(allocator, bitmap, children) catch |err| {
-                releaseNode(sub, allocator);
+            sub_transferred = true;
+            errdefer {
+                releaseNode(children[0], allocator);
                 allocator.free(children);
-                return err;
-            };
+            }
+            return try newInternal(allocator, bitmap, children);
         }
 
         // ---- remove ------------------------------------------------------
@@ -558,10 +554,7 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                 entries[w] = entry;
                 w += 1;
             }
-            return newCollision(allocator, entries) catch |err| {
-                allocator.free(entries);
-                return err;
-            };
+            return try newCollision(allocator, entries);
         }
 
         fn removeFromInternal(
@@ -595,7 +588,6 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                 }
                 const new_bitmap = inode.bitmap & ~(@as(u32, 1) << slot);
                 const children = try allocator.alloc(*Node, pop - 1);
-                errdefer allocator.free(children);
                 var w: usize = 0;
                 for (inode.children, 0..) |sib, i| {
                     if (i == pidx) continue;
@@ -603,21 +595,19 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                     children[w] = sib;
                     w += 1;
                 }
-                return newInternal(allocator, new_bitmap, children) catch |err| {
+                errdefer {
                     for (children) |ch| releaseNode(ch, allocator);
                     allocator.free(children);
-                    return err;
-                };
+                }
+                return try newInternal(allocator, new_bitmap, children);
             }
 
             // Child shrank but still present: copy array, swap in new_child,
             // retain the rest. new_child already rc==1 and owned by us.
             const nc = new_child.?;
+            var nc_transferred = false;
+            errdefer if (!nc_transferred) releaseNode(nc, allocator);
             const children = try allocator.alloc(*Node, pop);
-            errdefer {
-                releaseNode(nc, allocator);
-                allocator.free(children);
-            }
             for (inode.children, 0..) |sib, i| {
                 if (i == pidx) {
                     children[i] = nc;
@@ -626,11 +616,12 @@ pub fn PersistentMap(comptime K: type, comptime V: type, comptime Context: type)
                     children[i] = sib;
                 }
             }
-            return newInternal(allocator, inode.bitmap, children) catch |err| {
+            nc_transferred = true;
+            errdefer {
                 for (children) |ch| releaseNode(ch, allocator);
                 allocator.free(children);
-                return err;
-            };
+            }
+            return try newInternal(allocator, inode.bitmap, children);
         }
 
         // ---- iteration (pure read) ---------------------------------------
@@ -725,6 +716,31 @@ const CollidingContext = struct {
 
 const Map = PersistentMap(u64, u64, U64Context);
 const CMap = PersistentMap(u64, u64, CollidingContext);
+
+test "put and remove unwind every allocation failure without double-free or leak" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var map = Map.empty();
+            defer map.release(allocator);
+
+            for (0..24) |i| {
+                const next = try map.put(allocator, @intCast(i * 17 + 3), @intCast(i));
+                map.release(allocator);
+                map = next;
+            }
+            for ([_]u64{ 3, 37, 88, 173, 292 }) |key| {
+                const next = try map.remove(allocator, key);
+                map.release(allocator);
+                map = next;
+            }
+            const inserted = try map.put(allocator, 0xDEAD_BEEF, 99);
+            map.release(allocator);
+            map = inserted;
+            try testing.expectEqual(@as(?u64, 99), map.get(0xDEAD_BEEF));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
 
 test "empty / put / get / count / overwrite" {
     const a = testing.allocator;

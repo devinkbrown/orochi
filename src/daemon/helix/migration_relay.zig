@@ -40,6 +40,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const cpv = @import("../../proto/coilpack_value.zig");
 const signed_object = @import("../../proto/signed_object.zig");
 const secure_fns = @import("../../proto/secure_fns.zig");
+const usermode = @import("../../proto/usermode.zig");
 
 comptime {
     // Hard 64-bit-only guarantee, matching the rest of the daemon.
@@ -73,6 +74,25 @@ pub const frame_header_len: usize = 1 + 1 + 1 + 4;
 /// Upper bound on a decoded relay frame, mirroring the S2S frame ceiling. Large
 /// enough for a full session snapshot, small enough to reject hostile inputs.
 pub const max_frame_len: usize = 1024 * 1024;
+
+/// Snapshot schema limits mirror the daemon's inline session storage and hard
+/// protocol ceilings. The 10k channel ceiling matches the maximum configured
+/// CHANLIMIT and, critically, bounds both the CPV tree and owned restore image.
+pub const max_snapshot_wire_len: usize = max_frame_len;
+pub const max_snapshot_channels: usize = 10_000;
+pub const max_snapshot_nick_len: usize = 64;
+pub const max_snapshot_username_len: usize = 16;
+pub const max_snapshot_account_len: usize = 64;
+pub const max_snapshot_realname_len: usize = 256;
+pub const max_snapshot_host_len: usize = 255;
+pub const max_snapshot_away_len: usize = 256;
+pub const max_snapshot_channel_len: usize = 200;
+pub const valid_snapshot_member_mode_mask: u8 = 0x0f;
+
+const max_snapshot_map_entries: usize = 32;
+const max_snapshot_field_name_len: usize = 64;
+const max_snapshot_cpv_depth: usize = 8;
+const max_snapshot_cpv_values: usize = 2 * max_snapshot_channels + 128;
 
 const endian: std.builtin.Endian = .little;
 
@@ -146,6 +166,227 @@ pub const FsmState = enum(u8) {
 // Snapshot — the session state to restore on the target
 // ---------------------------------------------------------------------------
 
+/// Allocation-free schema scanner run before the generic owned CPV decoder. It
+/// rejects hostile declared counts and overlong known fields before CPV can grow
+/// a large transient Value tree. Unknown root fields remain forward-compatible,
+/// but share the same shallow/value/input budgets.
+const SnapshotWireScanner = struct {
+    input: []const u8,
+    pos: usize = 0,
+    values_seen: usize = 0,
+
+    fn scan(self: *SnapshotWireScanner) Error!void {
+        try self.noteValue(0);
+        if (try self.readByte() != 0x08) return error.MalformedCapsule; // map
+        const count = try self.readBoundedCount(max_snapshot_map_entries);
+        var channel_count: ?usize = null;
+        var mode_count: ?usize = null;
+
+        for (0..count) |_| {
+            const key = try self.readSizedBytes(max_snapshot_field_name_len);
+            if (std.mem.eql(u8, key, "nick")) {
+                const value = try self.scanString(max_snapshot_nick_len);
+                if (!validSnapshotNick(value)) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "umodes")) {
+                const value = try self.scanString(usermode.MAX_MODE_CHANGES + 2);
+                if (!validSnapshotUmodes(value)) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "channels")) {
+                channel_count = try self.scanChannels();
+            } else if (std.mem.eql(u8, key, "channel_modes")) {
+                mode_count = try self.scanMemberModes();
+            } else if (std.mem.eql(u8, key, "realname")) {
+                if (hasControlByte(try self.scanString(max_snapshot_realname_len))) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "host")) {
+                if (hasControlByte(try self.scanString(max_snapshot_host_len))) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "account")) {
+                if (hasControlByte(try self.scanString(max_snapshot_account_len))) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "away")) {
+                if (hasControlByte(try self.scanString(max_snapshot_away_len))) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "username")) {
+                if (hasControlByte(try self.scanString(max_snapshot_username_len))) return error.MalformedCapsule;
+            } else if (std.mem.eql(u8, key, "is_oper")) {
+                _ = try self.scanUnsigned(1);
+            } else {
+                try self.skipValue(1);
+            }
+        }
+        if (channel_count != null and mode_count != null and channel_count.? != mode_count.?)
+            return error.MalformedCapsule;
+        if (self.pos != self.input.len) return error.MalformedCapsule;
+    }
+
+    fn scanChannels(self: *SnapshotWireScanner) Error!usize {
+        try self.noteValue(1);
+        if (try self.readByte() != 0x07) return error.MalformedCapsule; // array
+        const count = try self.readBoundedCount(max_snapshot_channels);
+        if (count > max_snapshot_cpv_values - self.values_seen) return error.MalformedCapsule;
+        for (0..count) |_| {
+            const channel = try self.scanString(max_snapshot_channel_len);
+            if (!validSnapshotChannel(channel)) return error.MalformedCapsule;
+        }
+        return count;
+    }
+
+    fn scanMemberModes(self: *SnapshotWireScanner) Error!usize {
+        try self.noteValue(1);
+        if (try self.readByte() != 0x07) return error.MalformedCapsule; // array
+        const count = try self.readBoundedCount(max_snapshot_channels);
+        if (count > max_snapshot_cpv_values - self.values_seen) return error.MalformedCapsule;
+        for (0..count) |_| _ = try self.scanUnsigned(valid_snapshot_member_mode_mask);
+        return count;
+    }
+
+    fn scanString(self: *SnapshotWireScanner, max_len: usize) Error![]const u8 {
+        try self.noteValue(1);
+        if (try self.readByte() != 0x06) return error.MalformedCapsule; // string
+        return self.readSizedBytes(max_len);
+    }
+
+    fn scanUnsigned(self: *SnapshotWireScanner, max_value: u64) Error!u64 {
+        try self.noteValue(1);
+        if (try self.readByte() != 0x03) return error.MalformedCapsule; // u64
+        const value = try self.readVarint();
+        if (value > max_value) return error.MalformedCapsule;
+        return value;
+    }
+
+    fn skipValue(self: *SnapshotWireScanner, depth: usize) Error!void {
+        try self.noteValue(depth);
+        switch (try self.readByte()) {
+            0x00, 0x01, 0x02 => {}, // nil / booleans
+            0x03, 0x04 => _ = try self.readVarint(), // integers
+            0x05, 0x06 => _ = try self.readSizedBytes(max_snapshot_wire_len),
+            0x07 => {
+                const count = try self.readBoundedCount(max_snapshot_cpv_values);
+                if (count > max_snapshot_cpv_values - self.values_seen) return error.MalformedCapsule;
+                for (0..count) |_| try self.skipValue(depth + 1);
+            },
+            0x08 => {
+                const count = try self.readBoundedCount(max_snapshot_cpv_values);
+                if (count > max_snapshot_cpv_values - self.values_seen) return error.MalformedCapsule;
+                for (0..count) |_| {
+                    _ = try self.readSizedBytes(max_snapshot_wire_len);
+                    try self.skipValue(depth + 1);
+                }
+            },
+            else => return error.MalformedCapsule,
+        }
+    }
+
+    fn noteValue(self: *SnapshotWireScanner, depth: usize) Error!void {
+        if (depth > max_snapshot_cpv_depth or self.values_seen >= max_snapshot_cpv_values)
+            return error.MalformedCapsule;
+        self.values_seen += 1;
+    }
+
+    fn readBoundedCount(self: *SnapshotWireScanner, max: usize) Error!usize {
+        const value = try self.readVarint();
+        if (value > max or value > std.math.maxInt(usize)) return error.MalformedCapsule;
+        return @intCast(value);
+    }
+
+    fn readSizedBytes(self: *SnapshotWireScanner, max: usize) Error![]const u8 {
+        const len = try self.readBoundedCount(max);
+        if (len > self.input.len - self.pos) return error.MalformedCapsule;
+        const start = self.pos;
+        self.pos += len;
+        return self.input[start..self.pos];
+    }
+
+    fn readVarint(self: *SnapshotWireScanner) Error!u64 {
+        const start = self.pos;
+        var result: u64 = 0;
+        for (0..10) |i| {
+            const byte = try self.readByte();
+            const payload: u64 = byte & 0x7f;
+            if (i == 9 and payload > 1) return error.MalformedCapsule;
+            result |= payload << @intCast(i * 7);
+            if ((byte & 0x80) == 0) {
+                if (cpvVarintLen(result) != self.pos - start) return error.MalformedCapsule;
+                return result;
+            }
+        }
+        return error.MalformedCapsule;
+    }
+
+    fn readByte(self: *SnapshotWireScanner) Error!u8 {
+        if (self.pos >= self.input.len) return error.MalformedCapsule;
+        const byte = self.input[self.pos];
+        self.pos += 1;
+        return byte;
+    }
+};
+
+fn cpvVarintLen(value: u64) usize {
+    var n = value;
+    var len: usize = 1;
+    while (n >= 0x80) : (len += 1) n >>= 7;
+    return len;
+}
+
+fn hasControlByte(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return true;
+    return false;
+}
+
+fn validSnapshotNick(nick: []const u8) bool {
+    if (nick.len == 0 or nick.len > max_snapshot_nick_len) return false;
+    if (nick[0] == '-' or std.ascii.isDigit(nick[0])) return false;
+    for (nick) |byte| switch (byte) {
+        ' ', ',', '*', '?', '!', '@', '.', '#', '&', '+', '~' => return false,
+        else => if (byte <= 0x20 or byte == 0x7f) return false,
+    };
+    return true;
+}
+
+fn validSnapshotChannel(channel: []const u8) bool {
+    if (channel.len < 2 or channel.len > max_snapshot_channel_len) return false;
+    if (channel[0] == '%') {
+        if (channel.len < 3 or (channel[1] != '#' and channel[1] != '&')) return false;
+    } else if (channel[0] != '#' and channel[0] != '&') return false;
+    for (channel) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == ',') return false;
+    }
+    return true;
+}
+
+fn validSnapshotUmodes(modes: []const u8) bool {
+    if (modes.len > usermode.MAX_MODE_CHANGES + 2) return false;
+    var have_operation = false;
+    for (modes) |letter| switch (letter) {
+        '+', '-' => have_operation = true,
+        // `o` is derived rather than catalog-backed; `w` is accepted for
+        // compatibility with v2 snapshots emitted before wallops was retired.
+        'o', 'w' => if (!have_operation) return false,
+        else => {
+            if (!have_operation or usermode.modeFromLetter(letter) == null) return false;
+        },
+    };
+    return true;
+}
+
+const SnapshotChannelContext = struct {
+    pub fn hash(_: @This(), key: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (key) |byte| {
+            const lower = std.ascii.toLower(byte);
+            h.update(std.mem.asBytes(&lower));
+        }
+        return h.final();
+    }
+
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+const SnapshotChannelSet = std.HashMapUnmanaged(
+    []const u8,
+    void,
+    SnapshotChannelContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 /// A point-in-time view of a logged-in session, sufficient to recreate it on a
 /// new node. Borrowed slices on construction; owned slices after `decode`.
 ///
@@ -208,22 +449,56 @@ pub const Snapshot = struct {
     /// its `nick`, `umodes`, identity strings, and each `channels` entry plus the
     /// outer slice. Release with `deinit`.
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Snapshot {
-        var value = cpv.Decoder.decode(allocator, bytes) catch return error.MalformedCapsule;
+        if (bytes.len > max_snapshot_wire_len) return error.OversizeFrame;
+        var scanner = SnapshotWireScanner{ .input = bytes };
+        try scanner.scan();
+
+        var value = cpv.Decoder.decode(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedCapsule,
+        };
         defer value.deinit(allocator);
         if (value != .map) return error.MalformedCapsule;
 
         const nick_src = mapString(value.map, "nick") orelse return error.MalformedCapsule;
         const umodes_src = mapString(value.map, "umodes") orelse return error.MalformedCapsule;
         const chans_src = mapArray(value.map, "channels") orelse return error.MalformedCapsule;
-        const modes_src = mapArray(value.map, "channel_modes");
+        const modes_src = try optionalMapArray(value.map, "channel_modes");
         // Identity/state fields default to empty/false so an older-format capsule
         // missing them still decodes (forward-compatible widening).
-        const realname_src = mapString(value.map, "realname") orelse "";
-        const host_src = mapString(value.map, "host") orelse "";
-        const account_src = mapString(value.map, "account") orelse "";
-        const away_src = mapString(value.map, "away") orelse "";
-        const username_src = mapString(value.map, "username") orelse "";
-        const is_oper = (mapUnsigned(value.map, "is_oper") orelse 0) != 0;
+        const realname_src = try optionalMapString(value.map, "realname");
+        const host_src = try optionalMapString(value.map, "host");
+        const account_src = try optionalMapString(value.map, "account");
+        const away_src = try optionalMapString(value.map, "away");
+        const username_src = try optionalMapString(value.map, "username");
+        const is_oper = (try optionalMapBoolUnsigned(value.map, "is_oper")) != 0;
+
+        // Recheck semantic bounds on the decoded tree before allocating the
+        // Snapshot-owned copy. The wire scanner already enforces these before
+        // CPV allocation; this keeps the ownership boundary independently safe.
+        if (!validSnapshotNick(nick_src) or !validSnapshotUmodes(umodes_src) or
+            realname_src.len > max_snapshot_realname_len or hasControlByte(realname_src) or
+            host_src.len > max_snapshot_host_len or hasControlByte(host_src) or
+            account_src.len > max_snapshot_account_len or hasControlByte(account_src) or
+            away_src.len > max_snapshot_away_len or hasControlByte(away_src) or
+            username_src.len > max_snapshot_username_len or hasControlByte(username_src) or
+            chans_src.len > max_snapshot_channels)
+        {
+            return error.MalformedCapsule;
+        }
+        if (modes_src) |mode_values| {
+            if (mode_values.len != chans_src.len) return error.MalformedCapsule;
+        }
+
+        var seen_channels: SnapshotChannelSet = .empty;
+        defer seen_channels.deinit(allocator);
+        try seen_channels.ensureTotalCapacity(allocator, @intCast(chans_src.len));
+        for (chans_src) |chan_value| {
+            if (chan_value != .string or !validSnapshotChannel(chan_value.string))
+                return error.MalformedCapsule;
+            const entry = try seen_channels.getOrPut(allocator, chan_value.string);
+            if (entry.found_existing) return error.MalformedCapsule;
+        }
 
         const nick = try allocator.dupe(u8, nick_src);
         errdefer allocator.free(nick);
@@ -250,14 +525,13 @@ pub const Snapshot = struct {
         errdefer allocator.free(channel_modes);
         @memset(channel_modes, 0);
         for (chans_src) |chan_value| {
-            if (chan_value != .string) return error.MalformedCapsule;
             channels[filled] = try allocator.dupe(u8, chan_value.string);
             filled += 1;
         }
         if (modes_src) |mode_values| {
-            if (mode_values.len != chans_src.len) return error.MalformedCapsule;
             for (mode_values, 0..) |mode_value, i| {
-                if (mode_value != .unsigned or mode_value.unsigned > std.math.maxInt(u8)) return error.MalformedCapsule;
+                if (mode_value != .unsigned or mode_value.unsigned > valid_snapshot_member_mode_mask)
+                    return error.MalformedCapsule;
                 channel_modes[i] = @intCast(mode_value.unsigned);
             }
         }
@@ -1005,6 +1279,24 @@ fn mapArray(entries: []cpv.MapEntry, key: []const u8) ?[]cpv.Value {
     return if (value == .array) value.array else null;
 }
 
+fn optionalMapString(entries: []cpv.MapEntry, key: []const u8) Error![]const u8 {
+    const value = mapEntry(entries, key) orelse return "";
+    if (value != .string) return error.MalformedCapsule;
+    return value.string;
+}
+
+fn optionalMapArray(entries: []cpv.MapEntry, key: []const u8) Error!?[]cpv.Value {
+    const value = mapEntry(entries, key) orelse return null;
+    if (value != .array) return error.MalformedCapsule;
+    return value.array;
+}
+
+fn optionalMapBoolUnsigned(entries: []cpv.MapEntry, key: []const u8) Error!u64 {
+    const value = mapEntry(entries, key) orelse return 0;
+    if (value != .unsigned or value.unsigned > 1) return error.MalformedCapsule;
+    return value.unsigned;
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1312,4 +1604,190 @@ test "snapshot encode/decode round-trips the widened identity + state fields" {
     try testing.expectEqualStrings("alice", decoded.account);
     try testing.expectEqualStrings("in the rabbit hole", decoded.away);
     try testing.expect(decoded.is_oper);
+}
+
+test "snapshot decode preserves legacy missing optional fields and mode vector" {
+    const allocator = testing.allocator;
+    var channels = [_]cpv.Value{.{ .string = "#legacy" }};
+    var entries = [_]cpv.MapEntry{
+        .{ .key = "channels", .value = .{ .array = channels[0..] } },
+        .{ .key = "nick", .value = .{ .string = "legacy" } },
+        .{ .key = "umodes", .value = .{ .string = "+iw" } },
+    };
+    const bytes = try canonicalEncode(allocator, .{ .map = entries[0..] });
+    defer allocator.free(bytes);
+
+    var decoded = try Snapshot.decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+    try testing.expectEqualStrings("", decoded.account);
+    try testing.expectEqualStrings("", decoded.username);
+    try testing.expectEqualStrings("", decoded.realname);
+    try testing.expectEqualStrings("", decoded.host);
+    try testing.expectEqualStrings("", decoded.away);
+    try testing.expect(!decoded.is_oper);
+    try testing.expectEqualSlices(u8, &.{0}, decoded.channel_modes);
+}
+
+test "snapshot decode accepts exact daemon field and member-mode bounds" {
+    const allocator = testing.allocator;
+    var nick: [max_snapshot_nick_len]u8 = @splat('n');
+    nick[0] = 'N';
+    var channel: [max_snapshot_channel_len]u8 = @splat('c');
+    channel[0] = '#';
+    const channels = [_][]const u8{channel[0..]};
+    const modes = [_]u8{valid_snapshot_member_mode_mask};
+    const bytes = try (Snapshot{
+        .nick = nick[0..],
+        .umodes = "+iw",
+        .channels = &channels,
+        .channel_modes = &modes,
+    }).encode(allocator);
+    defer allocator.free(bytes);
+
+    var decoded = try Snapshot.decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+    try testing.expectEqual(max_snapshot_nick_len, decoded.nick.len);
+    try testing.expectEqual(max_snapshot_channel_len, decoded.channels[0].len);
+    try testing.expectEqual(valid_snapshot_member_mode_mask, decoded.channel_modes[0]);
+}
+
+test "snapshot decode rejects duplicate channels and invalid member bits" {
+    const allocator = testing.allocator;
+    const duplicate_channels = [_][]const u8{ "#One", "#oNE" };
+    const duplicate_modes = [_]u8{ 0, 0 };
+    const duplicate_bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = &duplicate_channels,
+        .channel_modes = &duplicate_modes,
+    }).encode(allocator);
+    defer allocator.free(duplicate_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, duplicate_bytes));
+
+    const channel = [_][]const u8{"#modes"};
+    const invalid_modes = [_]u8{valid_snapshot_member_mode_mask + 1};
+    const mode_bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = &channel,
+        .channel_modes = &invalid_modes,
+    }).encode(allocator);
+    defer allocator.free(mode_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, mode_bytes));
+}
+
+test "snapshot decode rejects overlong scalar and channel fields" {
+    const allocator = testing.allocator;
+    var long_nick: [max_snapshot_nick_len + 1]u8 = @splat('n');
+    long_nick[0] = 'N';
+    const no_channels: []const []const u8 = &.{};
+    const nick_bytes = try (Snapshot{
+        .nick = long_nick[0..],
+        .umodes = "+i",
+        .channels = no_channels,
+    }).encode(allocator);
+    defer allocator.free(nick_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, nick_bytes));
+
+    var long_account: [max_snapshot_account_len + 1]u8 = @splat('a');
+    const account_bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = no_channels,
+        .account = long_account[0..],
+    }).encode(allocator);
+    defer allocator.free(account_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, account_bytes));
+
+    var long_channel: [max_snapshot_channel_len + 1]u8 = @splat('c');
+    long_channel[0] = '#';
+    const bad_channels = [_][]const u8{long_channel[0..]};
+    const channel_bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = &bad_channels,
+    }).encode(allocator);
+    defer allocator.free(channel_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, channel_bytes));
+}
+
+test "snapshot decode rejects non-boolean is_oper and invalid channel syntax" {
+    const allocator = testing.allocator;
+    var channels = [_]cpv.Value{.{ .string = "#ok" }};
+    var modes = [_]cpv.Value{.{ .unsigned = 0 }};
+    var entries = [_]cpv.MapEntry{
+        .{ .key = "channel_modes", .value = .{ .array = modes[0..] } },
+        .{ .key = "channels", .value = .{ .array = channels[0..] } },
+        .{ .key = "is_oper", .value = .{ .unsigned = 2 } },
+        .{ .key = "nick", .value = .{ .string = "alice" } },
+        .{ .key = "umodes", .value = .{ .string = "+i" } },
+    };
+    const oper_bytes = try canonicalEncode(allocator, .{ .map = entries[0..] });
+    defer allocator.free(oper_bytes);
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, oper_bytes));
+
+    const invalid_channels = [_][]const u8{ "plain", "#bad,name" };
+    for (invalid_channels) |invalid| {
+        const one = [_][]const u8{invalid};
+        const bytes = try (Snapshot{
+            .nick = "alice",
+            .umodes = "+i",
+            .channels = &one,
+        }).encode(allocator);
+        defer allocator.free(bytes);
+        try testing.expectError(error.MalformedCapsule, Snapshot.decode(allocator, bytes));
+    }
+}
+
+test "snapshot wire preflight rejects amplification before allocator use" {
+    const allocator = testing.allocator;
+    const channels = try allocator.alloc([]const u8, max_snapshot_channels + 1);
+    defer allocator.free(channels);
+    for (channels) |*channel| channel.* = "#x";
+    const bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = channels,
+    }).encode(allocator);
+    defer allocator.free(bytes);
+
+    var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.MalformedCapsule, Snapshot.decode(failing.allocator(), bytes));
+    try testing.expect(!failing.has_induced_failure);
+
+    const oversize = try allocator.alloc(u8, max_snapshot_wire_len + 1);
+    defer allocator.free(oversize);
+    @memset(oversize, 0);
+    try testing.expectError(error.OversizeFrame, Snapshot.decode(failing.allocator(), oversize));
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "snapshot decode is leak-free across every allocation failure" {
+    const allocator = testing.allocator;
+    const channels = [_][]const u8{ "#one", "#two", "%#utf8" };
+    const modes = [_]u8{ 1, 2, 4 };
+    const bytes = try (Snapshot{
+        .nick = "alice",
+        .umodes = "+iwx",
+        .channels = &channels,
+        .channel_modes = &modes,
+        .realname = "Alice Example",
+        .host = "alice.users.test",
+        .account = "alice",
+        .away = "testing",
+        .username = "webchat",
+        .is_oper = true,
+    }).encode(allocator);
+    defer allocator.free(bytes);
+
+    const Exercise = struct {
+        fn run(failing_allocator: std.mem.Allocator, wire: []const u8) !void {
+            var decoded = try Snapshot.decode(failing_allocator, wire);
+            defer decoded.deinit(failing_allocator);
+            try testing.expectEqualStrings("alice", decoded.nick);
+            try testing.expectEqual(@as(usize, 3), decoded.channels.len);
+            try testing.expectEqualSlices(u8, &.{ 1, 2, 4 }, decoded.channel_modes);
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, Exercise.run, .{bytes});
 }

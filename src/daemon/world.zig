@@ -113,8 +113,16 @@ pub const ClientId = packed struct {
     }
 };
 
+fn clientIdInSet(client: ClientId, clients: []const ClientId) bool {
+    for (clients) |candidate| {
+        if (client.eql(candidate)) return true;
+    }
+    return false;
+}
+
 pub const WorldError = std.mem.Allocator.Error || error{
     NickInUse,
+    InvalidOwnerSet,
     NoSuchChannel,
     NotOnChannel,
     NoSuchNick,
@@ -168,6 +176,13 @@ pub const MemberIterator = MemberMap.KeyIterator;
 pub const MemberMode = chanmode.MemberMode;
 pub const MemberModes = chanmode.MemberModes;
 pub const ChannelMode = chanmode.ChannelMode;
+
+/// One exact per-channel membership image for `restoreMembersBatchExisting`.
+/// Channel names borrow caller storage for the duration of the call.
+pub const MemberRestore = struct {
+    channel: []const u8,
+    modes: MemberModes,
+};
 
 const Channel = struct {
     allocator: std.mem.Allocator,
@@ -584,6 +599,112 @@ pub const World = struct {
         }
     }
 
+    /// Atomically collapse every nick alias owned by one exact logical-session
+    /// client set onto `target`, with `chosen` as the sole lookup owner. The RCU
+    /// mirror publishes one immutable replacement snapshot; the fallback maps
+    /// are capacity-reserved and their target storage is owned before that
+    /// publish. A foreign target, OOM, or malformed owner set therefore leaves
+    /// all three indexes unchanged. Returns false only for an exact idempotent
+    /// no-op (same sole owner and display spelling).
+    pub fn replaceExactSessionNickOwner(
+        self: *World,
+        target: []const u8,
+        chosen: ClientId,
+        exact_clients: []const ClientId,
+    ) WorldError!bool {
+        if (!clientIdInSet(chosen, exact_clients)) return error.InvalidOwnerSet;
+
+        var owned_aliases: usize = 0;
+        var already_exact = false;
+        for (exact_clients) |client| {
+            const current = self.client_nicks.get(client) orelse continue;
+            owned_aliases += 1;
+            if (client.eql(chosen) and std.mem.eql(u8, current, target)) already_exact = true;
+        }
+        if (owned_aliases == 1 and already_exact) {
+            if (self.rcu_nicks) |r| {
+                if (r.nicks.lookup(r.writer_participant, target)) |bits| {
+                    if ((@as(ClientId, @bitCast(bits))).eql(chosen)) return false;
+                }
+            }
+        }
+
+        const r = try self.ensureRcuNicks();
+        if (r.nicks.lookup(r.writer_participant, target)) |bits| {
+            const owner: ClientId = @bitCast(bits);
+            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
+        }
+        if (self.findNickFallback(target)) |owner| {
+            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
+        }
+
+        const owned_target = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(owned_target);
+        const rcu_clients = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
+        defer self.allocator.free(rcu_clients);
+        for (exact_clients, rcu_clients) |client, *rcu_client| rcu_client.* = @bitCast(client);
+        try self.nicks.ensureUnusedCapacity(1);
+        try self.client_nicks.ensureUnusedCapacity(1);
+
+        if (!try r.nicks.replaceRemovingValues(r.writer_participant, target, @bitCast(chosen), rcu_clients))
+            return error.NickInUse;
+
+        // Everything below is allocation-free. The RCU publication above is the
+        // linearization point seen by lock-free readers; World mutations run
+        // under the caller's exclusive lock and cannot fail after that point.
+        for (exact_clients) |client| {
+            if (self.client_nicks.fetchRemove(client)) |removed| {
+                _ = self.nicks.remove(removed.value);
+                self.allocator.free(removed.value);
+            }
+        }
+        self.nicks.putAssumeCapacity(owned_target, chosen);
+        self.client_nicks.putAssumeCapacity(chosen, owned_target);
+        self.noteRcuNickWrite(r);
+        return true;
+    }
+
+    /// Atomically retire every World alias owned by one exact logical session
+    /// while preserving an independently-authorized foreign owner of `target`.
+    /// This is the same-account/distinct-token shared-display exception: the
+    /// foreign token remains the sole global lookup owner and the attaching
+    /// token cannot leave its previous nick(s) reachable.
+    pub fn relinquishExactSessionNickOwners(
+        self: *World,
+        target: []const u8,
+        foreign_owner: ClientId,
+        exact_clients: []const ClientId,
+    ) WorldError!bool {
+        if (clientIdInSet(foreign_owner, exact_clients)) return error.InvalidOwnerSet;
+        var aliases: usize = 0;
+        for (exact_clients) |client| {
+            if (self.client_nicks.contains(client)) aliases += 1;
+        }
+        if (aliases == 0) return false;
+
+        const r = try self.ensureRcuNicks();
+        const current_bits = r.nicks.lookup(r.writer_participant, target) orelse return error.NickInUse;
+        const current: ClientId = @bitCast(current_bits);
+        if (!current.eql(foreign_owner)) return error.NickInUse;
+        const fallback = self.findNickFallback(target) orelse return error.NickInUse;
+        if (!fallback.eql(foreign_owner)) return error.NickInUse;
+
+        const rcu_clients = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
+        defer self.allocator.free(rcu_clients);
+        for (exact_clients, rcu_clients) |client, *rcu_client| rcu_client.* = @bitCast(client);
+        if (!try r.nicks.removeValuesPreservingKey(r.writer_participant, target, @bitCast(foreign_owner), rcu_clients))
+            return error.NickInUse;
+
+        for (exact_clients) |client| {
+            if (self.client_nicks.fetchRemove(client)) |removed| {
+                _ = self.nicks.remove(removed.value);
+                self.allocator.free(removed.value);
+            }
+        }
+        self.noteRcuNickWrite(r);
+        return true;
+    }
+
     /// Atomically hand an existing nick's primary lookup ownership from one live
     /// transport to another without taking the identity offline. The owned nick
     /// string is moved between reverse-index keys (not copied), the forward maps
@@ -686,6 +807,258 @@ pub const World = struct {
                 self.noteRcuChannelWrite(c);
             }
         }
+    }
+
+    /// Failure-atomically restore one client across an exact batch of channels
+    /// that already exist. Every fallback member-map capacity, immutable RCU
+    /// membership snapshot, publication box, and EBR retire slot is prepared
+    /// before the first semantic mutation. Therefore OutOfMemory leaves all
+    /// membership and mode state unchanged; after the commit boundary no step
+    /// can fail. Duplicate channel names use the last supplied mode image.
+    ///
+    /// This deliberately requires existing channels: session handoff merges
+    /// authority into channels the departing attachment already occupies. New
+    /// channel creation has a separate existence-registry transaction and must
+    /// not be smuggled into this no-partial-membership primitive.
+    pub fn restoreMembersBatchExisting(
+        self: *World,
+        client: ClientId,
+        restores: []const MemberRestore,
+    ) WorldError!bool {
+        if (restores.len == 0) return false;
+        const c = self.rcu_channels orelse return error.NoSuchChannel;
+
+        const Entry = struct {
+            channel: *Channel,
+            set: *world_rcu.MembershipSet,
+            modes: MemberModes,
+
+            fn lessThan(_: void, a: @This(), b: @This()) bool {
+                return @intFromPtr(a.set) < @intFromPtr(b.set);
+            }
+        };
+
+        const entries = try self.allocator.alloc(Entry, restores.len);
+        defer self.allocator.free(entries);
+        var entry_count: usize = 0;
+        for (restores) |restore| {
+            const channel_entry = self.channels.getEntry(restore.channel) orelse return error.NoSuchChannel;
+            const set = rcuMembershipGet(c, channel_entry.key_ptr.*) orelse return error.NoSuchChannel;
+            var duplicate: ?usize = null;
+            for (entries[0..entry_count], 0..) |entry, i| {
+                if (entry.channel == channel_entry.value_ptr) {
+                    duplicate = i;
+                    break;
+                }
+            }
+            if (duplicate) |i| {
+                entries[i].modes = restore.modes;
+            } else {
+                entries[entry_count] = .{
+                    .channel = channel_entry.value_ptr,
+                    .set = set,
+                    .modes = restore.modes,
+                };
+                entry_count += 1;
+            }
+        }
+        const active_entries = entries[0..entry_count];
+        std.mem.sort(Entry, active_entries, {}, Entry.lessThan);
+
+        // Reserve authoritative map capacity before holding any RCU writer
+        // locks. Capacity growth is not a semantic membership mutation.
+        for (active_entries) |entry| {
+            if (!entry.channel.members.contains(client))
+                try entry.channel.members.ensureUnusedCapacity(1);
+        }
+
+        const staged = try self.allocator.alloc(world_rcu.MembershipSet.StagedAdd, entry_count);
+        defer self.allocator.free(staged);
+        // stageAdd also reserves one slot for standalone use. This aggregate
+        // reservation is what makes a sequence of commits no-allocation: none
+        // of the staged retires has entered the limbo bag yet.
+        var reservation = try c.writer_participant.reserveRetireCapacity(entry_count);
+        defer reservation.finish();
+
+        var staged_count: usize = 0;
+        var committed = false;
+        defer if (!committed) {
+            while (staged_count != 0) {
+                staged_count -= 1;
+                staged[staged_count].abort();
+            }
+        };
+
+        var changed = false;
+        for (active_entries) |entry| {
+            const old_modes = entry.channel.members.get(client);
+            if (old_modes == null or old_modes.?.bits != entry.modes.bits) changed = true;
+            if (try entry.set.stageAddReserved(&reservation, @bitCast(client))) |prepared| {
+                staged[staged_count] = prepared;
+                staged_count += 1;
+                changed = true;
+            }
+        }
+
+        // Commit the fallback maps first using pre-reserved capacity, then
+        // publish each already-built RCU snapshot. No allocation or error path
+        // remains beyond this point, so the operation is failure-atomic.
+        for (active_entries) |entry| {
+            const member = entry.channel.members.getOrPutAssumeCapacity(client);
+            member.value_ptr.* = entry.modes;
+        }
+        for (staged[0..staged_count]) |*prepared| {
+            prepared.commit();
+        }
+        // Epoch advancement must happen only after every pre-reserved retire is
+        // enqueued. Advancing between commits could select a different limbo
+        // bag than the one reserved above and reintroduce a post-publication
+        // allocation panic.
+        for (0..staged_count) |_| self.noteRcuChannelWrite(c);
+        committed = true;
+        return changed;
+    }
+
+    /// One failure-atomic logical-session handoff transaction: merge the
+    /// supplied exact membership union into `chosen` and collapse every nick
+    /// alias in `exact_clients` onto `target`/`chosen`. Both fallback maps and
+    /// every RCU snapshot are fully staged before mutation; an allocation or
+    /// collision leaves nick ownership, modes, and all memberships unchanged.
+    /// Channels must already exist, matching a live departing attachment.
+    pub fn handoffExactSessionIdentity(
+        self: *World,
+        target: []const u8,
+        chosen: ClientId,
+        exact_clients: []const ClientId,
+        restores: []const MemberRestore,
+    ) WorldError!bool {
+        if (!clientIdInSet(chosen, exact_clients)) return error.InvalidOwnerSet;
+
+        const MemberEntry = struct {
+            channel: *Channel,
+            set: *world_rcu.MembershipSet,
+            modes: MemberModes,
+
+            fn lessThan(_: void, a: @This(), b: @This()) bool {
+                return @intFromPtr(a.set) < @intFromPtr(b.set);
+            }
+        };
+
+        const member_entries = try self.allocator.alloc(MemberEntry, restores.len);
+        defer self.allocator.free(member_entries);
+        var member_count: usize = 0;
+        const channel_rcu = if (restores.len != 0) self.rcu_channels orelse return error.NoSuchChannel else null;
+        for (restores) |restore| {
+            const channel_entry = self.channels.getEntry(restore.channel) orelse return error.NoSuchChannel;
+            const set = rcuMembershipGet(channel_rcu.?, channel_entry.key_ptr.*) orelse return error.NoSuchChannel;
+            var duplicate: ?usize = null;
+            for (member_entries[0..member_count], 0..) |entry, i| {
+                if (entry.channel == channel_entry.value_ptr) {
+                    duplicate = i;
+                    break;
+                }
+            }
+            if (duplicate) |i| {
+                member_entries[i].modes = restore.modes;
+            } else {
+                member_entries[member_count] = .{
+                    .channel = channel_entry.value_ptr,
+                    .set = set,
+                    .modes = restore.modes,
+                };
+                member_count += 1;
+            }
+        }
+        const active_members = member_entries[0..member_count];
+        std.mem.sort(MemberEntry, active_members, {}, MemberEntry.lessThan);
+        for (active_members) |entry| {
+            if (!entry.channel.members.contains(chosen))
+                try entry.channel.members.ensureUnusedCapacity(1);
+        }
+
+        const nick_rcu = try self.ensureRcuNicks();
+        if (nick_rcu.nicks.lookup(nick_rcu.writer_participant, target)) |bits| {
+            const owner: ClientId = @bitCast(bits);
+            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
+        }
+        if (self.findNickFallback(target)) |owner| {
+            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
+        }
+
+        const owned_target = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(owned_target);
+        const rcu_clients = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
+        defer self.allocator.free(rcu_clients);
+        for (exact_clients, rcu_clients) |client, *rcu_client| rcu_client.* = @bitCast(client);
+        try self.nicks.ensureUnusedCapacity(1);
+        try self.client_nicks.ensureUnusedCapacity(1);
+        const member_stages = try self.allocator.alloc(world_rcu.MembershipSet.StagedAdd, member_count);
+        defer self.allocator.free(member_stages);
+
+        // Lock order is global and deterministic: nick registry first, then
+        // unique MembershipSets in ascending address order. Every combined
+        // handoff follows this order; ordinary single-registry writers never
+        // hold one lock while acquiring another.
+        var nick_stage = (try nick_rcu.nicks.stageReplaceRemovingValues(
+            nick_rcu.writer_participant,
+            target,
+            @bitCast(chosen),
+            rcu_clients,
+        )) orelse return error.NickInUse;
+        var nick_committed = false;
+        defer if (!nick_committed) nick_stage.abort();
+
+        var member_reservation = if (channel_rcu) |c|
+            try c.writer_participant.reserveRetireCapacity(member_count)
+        else
+            null;
+        defer if (member_reservation) |*reservation| reservation.finish();
+        var member_stage_count: usize = 0;
+        var members_committed = false;
+        defer if (!members_committed) {
+            while (member_stage_count != 0) {
+                member_stage_count -= 1;
+                member_stages[member_stage_count].abort();
+            }
+        };
+
+        // The staged nick replacement always installs a fresh exact owner/key,
+        // even when every requested membership mode was already present.
+        var changed = true;
+        for (active_members) |entry| {
+            const old_modes = entry.channel.members.get(chosen);
+            if (old_modes == null or old_modes.?.bits != entry.modes.bits) changed = true;
+            if (try entry.set.stageAddReserved(&member_reservation.?, @bitCast(chosen))) |prepared| {
+                member_stages[member_stage_count] = prepared;
+                member_stage_count += 1;
+                changed = true;
+            }
+        }
+
+        // No operation below can allocate or return an error.
+        for (active_members) |entry| {
+            const member = entry.channel.members.getOrPutAssumeCapacity(chosen);
+            member.value_ptr.* = entry.modes;
+        }
+        for (exact_clients) |client| {
+            if (self.client_nicks.fetchRemove(client)) |removed| {
+                _ = self.nicks.remove(removed.value);
+                self.allocator.free(removed.value);
+                changed = true;
+            }
+        }
+        self.nicks.putAssumeCapacity(owned_target, chosen);
+        self.client_nicks.putAssumeCapacity(chosen, owned_target);
+
+        for (member_stages[0..member_stage_count]) |*prepared| prepared.commit();
+        members_committed = true;
+        nick_stage.commit();
+        nick_committed = true;
+        if (channel_rcu) |c| {
+            for (0..member_stage_count) |_| self.noteRcuChannelWrite(c);
+        }
+        self.noteRcuNickWrite(nick_rcu);
+        return changed;
     }
 
     /// Status modes for `client` in `name`, or null if not a member / no channel.
@@ -1631,6 +2004,161 @@ test "channelCountOf counts a client's memberships" {
     try std.testing.expectEqual(@as(usize, 1), world.channelCountOf(a));
 }
 
+test "restoreMembersBatchExisting commits fallback and RCU membership together" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const owner = testClient(1);
+    const restored = testClient(2);
+    _ = try world.join("#one", owner);
+    _ = try world.join("#two", owner);
+    try world.restoreMember("#one", restored, MemberModes.empty());
+
+    const changes = [_]MemberRestore{
+        .{ .channel = "#one", .modes = MemberModes.fromModes(&.{.op}) },
+        .{ .channel = "#two", .modes = MemberModes.fromModes(&.{.voice}) },
+        // Case-folded duplicate: last exact mode image wins.
+        .{ .channel = "#TWO", .modes = MemberModes.fromModes(&.{ .op, .voice }) },
+    };
+    try std.testing.expect(try world.restoreMembersBatchExisting(restored, &changes));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#ONE", restored).?.bits);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{ .op, .voice }).bits, world.memberModes("#two", restored).?.bits);
+    try std.testing.expect(world.isMember("#one", restored));
+    try std.testing.expect(world.isMember("#TWO", restored));
+    try std.testing.expect(!(try world.restoreMembersBatchExisting(restored, &changes)));
+    try std.testing.expectError(
+        error.NoSuchChannel,
+        world.restoreMembersBatchExisting(restored, &.{.{ .channel = "#missing", .modes = MemberModes.empty() }}),
+    );
+}
+
+test "restoreMembersBatchExisting leaves no partial membership on any allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var world = World.init(allocator);
+            defer world.deinit();
+            const owner = testClient(11);
+            const restored = testClient(12);
+            _ = try world.join("#old", owner);
+            _ = try world.join("#new-a", owner);
+            _ = try world.join("#new-b", owner);
+            try world.restoreMember("#old", restored, MemberModes.fromModes(&.{.voice}));
+
+            const changes = [_]MemberRestore{
+                .{ .channel = "#old", .modes = MemberModes.fromModes(&.{.op}) },
+                .{ .channel = "#new-a", .modes = MemberModes.fromModes(&.{.voice}) },
+                .{ .channel = "#new-b", .modes = MemberModes.fromModes(&.{ .op, .voice }) },
+            };
+            const result = world.restoreMembersBatchExisting(restored, &changes);
+            if (result) |changed| {
+                try std.testing.expect(changed);
+                try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#old", restored).?.bits);
+                try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#new-a", restored).?.bits);
+                try std.testing.expectEqual(MemberModes.fromModes(&.{ .op, .voice }).bits, world.memberModes("#new-b", restored).?.bits);
+                try std.testing.expect(world.isMember("#old", restored));
+                try std.testing.expect(world.isMember("#new-a", restored));
+                try std.testing.expect(world.isMember("#new-b", restored));
+            } else |err| switch (err) {
+                error.OutOfMemory => {
+                    // Check both the mutable fallback maps and lock-free RCU
+                    // reads: neither representation may expose a partial batch.
+                    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#old", restored).?.bits);
+                    try std.testing.expect(world.memberModes("#new-a", restored) == null);
+                    try std.testing.expect(world.memberModes("#new-b", restored) == null);
+                    try std.testing.expect(world.isMember("#old", restored));
+                    try std.testing.expect(!world.isMember("#new-a", restored));
+                    try std.testing.expect(!world.isMember("#new-b", restored));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
+test "handoffExactSessionIdentity commits nick and membership union together" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const owner = testClient(21);
+    const successor = testClient(22);
+    try world.registerNick("Shared", owner);
+    try world.registerNick("Temporary", successor);
+    world.unregisterNick(successor);
+    try world.restoreMember("#one", owner, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#two", owner, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#two", successor, MemberModes.fromModes(&.{.voice}));
+
+    const exact = [_]ClientId{ owner, successor };
+    const membership_union = [_]MemberRestore{
+        .{ .channel = "#one", .modes = MemberModes.fromModes(&.{.op}) },
+        .{ .channel = "#two", .modes = MemberModes.fromModes(&.{ .op, .voice }) },
+    };
+    try std.testing.expect(try world.handoffExactSessionIdentity("Shared", successor, &exact, &membership_union));
+    try std.testing.expect(world.nickOf(owner) == null);
+    try std.testing.expectEqualStrings("Shared", world.nickOf(successor).?);
+    try std.testing.expectEqual(@as(?ClientId, successor), world.findNick("sHaReD"));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#one", successor).?.bits);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{ .op, .voice }).bits, world.memberModes("#two", successor).?.bits);
+    try std.testing.expect(world.isMember("#one", successor));
+    try std.testing.expect(world.isMember("#two", successor));
+}
+
+test "handoffExactSessionIdentity leaves nick and every membership unchanged on allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var world = World.init(allocator);
+            defer world.deinit();
+            const owner = testClient(31);
+            const successor = testClient(32);
+            try world.registerNick("FailSafe", owner);
+            try world.registerNick("Temporary", successor);
+            world.unregisterNick(successor);
+            try world.restoreMember("#old", owner, MemberModes.fromModes(&.{.op}));
+            try world.restoreMember("#old", successor, MemberModes.fromModes(&.{.voice}));
+            try world.restoreMember("#new-a", owner, MemberModes.fromModes(&.{.op}));
+            try world.restoreMember("#new-b", owner, MemberModes.fromModes(&.{.voice}));
+
+            const exact = [_]ClientId{ owner, successor };
+            const membership_union = [_]MemberRestore{
+                .{ .channel = "#old", .modes = MemberModes.fromModes(&.{ .op, .voice }) },
+                .{ .channel = "#new-a", .modes = MemberModes.fromModes(&.{.op}) },
+                .{ .channel = "#new-b", .modes = MemberModes.fromModes(&.{.voice}) },
+            };
+            const result = world.handoffExactSessionIdentity("FailSafe", successor, &exact, &membership_union);
+            if (result) |changed| {
+                try std.testing.expect(changed);
+                try std.testing.expect(world.nickOf(owner) == null);
+                try std.testing.expectEqualStrings("FailSafe", world.nickOf(successor).?);
+                try std.testing.expectEqual(@as(?ClientId, successor), world.findNick("failsafe"));
+                try std.testing.expectEqual(MemberModes.fromModes(&.{ .op, .voice }).bits, world.memberModes("#old", successor).?.bits);
+                try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#new-a", successor).?.bits);
+                try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#new-b", successor).?.bits);
+                try std.testing.expect(world.isMember("#new-a", successor));
+                try std.testing.expect(world.isMember("#new-b", successor));
+            } else |err| switch (err) {
+                error.OutOfMemory => {
+                    // Forward/reverse nick indexes and their RCU projection all
+                    // remain on the departing owner.
+                    try std.testing.expectEqualStrings("FailSafe", world.nickOf(owner).?);
+                    try std.testing.expect(world.nickOf(successor) == null);
+                    try std.testing.expectEqual(@as(?ClientId, owner), world.findNick("FAILSAFE"));
+                    // Existing successor modes and every absent membership are
+                    // unchanged in both fallback and lock-free RCU views.
+                    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#old", successor).?.bits);
+                    try std.testing.expect(world.memberModes("#new-a", successor) == null);
+                    try std.testing.expect(world.memberModes("#new-b", successor) == null);
+                    try std.testing.expect(world.isMember("#old", successor));
+                    try std.testing.expect(!world.isMember("#new-a", successor));
+                    try std.testing.expect(!world.isMember("#new-b", successor));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
 test "channel list modes are capped at max_list_entries" {
     var world = World.init(std.testing.allocator);
     world.max_list_entries = 2;
@@ -2427,6 +2955,94 @@ test "transferNick hands a live identity to a sibling without an offline gap" {
     try std.testing.expectEqualStrings("Kain", world.nickOf(sibling).?);
     try std.testing.expectEqual(@as(?ClientId, sibling), world.findNick("kain"));
     try std.testing.expect(!(try world.transferNick(primary, sibling)));
+}
+
+test "exact session nick owner transaction removes sibling aliases and rejects foreign collision" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const primary = testClient(11);
+    const sibling = testClient(12);
+    const foreign = testClient(13);
+    try world.registerNick("DeviceA", primary);
+    try world.registerNick("DeviceB", sibling);
+    try world.registerNick("Taken", foreign);
+    const exact = [_]ClientId{ primary, sibling };
+
+    try std.testing.expect(try world.replaceExactSessionNickOwner("Unified", sibling, &exact));
+    try std.testing.expect(world.nickOf(primary) == null);
+    try std.testing.expectEqualStrings("Unified", world.nickOf(sibling).?);
+    try std.testing.expectEqual(@as(?ClientId, null), world.findNickFallback("devicea"));
+    try std.testing.expectEqual(@as(?ClientId, null), world.findNickFallback("DEVICEB"));
+    try std.testing.expectEqual(@as(?ClientId, sibling), world.findNickFallback("unified"));
+    try std.testing.expectEqual(@as(?ClientId, sibling), world.findNick("UNIFIED"));
+
+    // Exact idempotence does not publish another snapshot or allocate.
+    try std.testing.expect(!(try world.replaceExactSessionNickOwner("Unified", sibling, &exact)));
+
+    // An unrelated owner is preserved and every exact-session index remains
+    // byte-for-byte unchanged on collision.
+    try std.testing.expectError(error.NickInUse, world.replaceExactSessionNickOwner("tAkEn", primary, &exact));
+    try std.testing.expect(world.nickOf(primary) == null);
+    try std.testing.expectEqualStrings("Unified", world.nickOf(sibling).?);
+    try std.testing.expectEqualStrings("Taken", world.nickOf(foreign).?);
+    try std.testing.expectEqual(@as(?ClientId, foreign), world.findNick("TAKEN"));
+
+    try std.testing.expect(try world.relinquishExactSessionNickOwners("taken", foreign, &exact));
+    try std.testing.expect(world.nickOf(primary) == null);
+    try std.testing.expect(world.nickOf(sibling) == null);
+    try std.testing.expectEqualStrings("Taken", world.nickOf(foreign).?);
+    try std.testing.expectEqual(@as(?ClientId, foreign), world.findNick("tAkEn"));
+}
+
+test "exact session nick owner transaction is unchanged on every allocation failure" {
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        const primary = testClient(21);
+        const sibling = testClient(22);
+        const foreign = testClient(23);
+        try world.registerNick("OldPrimary", primary);
+        try world.registerNick("OldSibling", sibling);
+        try world.registerNick("Foreign", foreign);
+        const exact = [_]ClientId{ primary, sibling };
+
+        // Inject only after the fixture exists. PersistentMap's unrelated
+        // setup-time OOM paths are tested in its own module; this loop walks
+        // every allocation made by the World/RCU transaction itself.
+        failing.fail_index = failing.alloc_index + fail_offset;
+        const result = world.replaceExactSessionNickOwner("Unified", primary, &exact);
+        failing.fail_index = std.math.maxInt(usize);
+
+        if (result) |changed| {
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expect(changed);
+            try std.testing.expectEqualStrings("Unified", world.nickOf(primary).?);
+            try std.testing.expect(world.nickOf(sibling) == null);
+            try std.testing.expectEqualStrings("Foreign", world.nickOf(foreign).?);
+            const rcu_owner = world.rcu_nicks.?.nicks.lookup(world.rcu_nicks.?.writer_participant, "uNiFiEd") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(primary.eql(@as(ClientId, @bitCast(rcu_owner))));
+            world.deinit();
+            break;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expectEqualStrings("OldPrimary", world.nickOf(primary).?);
+                try std.testing.expectEqualStrings("OldSibling", world.nickOf(sibling).?);
+                try std.testing.expectEqualStrings("Foreign", world.nickOf(foreign).?);
+                try std.testing.expectEqual(@as(?ClientId, primary), world.findNickFallback("oldprimary"));
+                try std.testing.expectEqual(@as(?ClientId, sibling), world.findNickFallback("oldsibling"));
+                try std.testing.expectEqual(@as(?ClientId, foreign), world.findNickFallback("foreign"));
+                try std.testing.expectEqual(@as(?ClientId, null), world.findNickFallback("unified"));
+                try std.testing.expect(world.rcu_nicks.?.nicks.lookup(world.rcu_nicks.?.writer_participant, "Unified") == null);
+                world.deinit();
+            },
+            else => {
+                world.deinit();
+                return err;
+            },
+        }
+    }
 }
 
 test "channelExists mirror matches the authoritative map (case-insensitive)" {

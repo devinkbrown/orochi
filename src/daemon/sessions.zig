@@ -98,6 +98,133 @@ const SessionList = struct {
     }
 };
 
+/// Authority used to bind one already-tracked attachment to a reusable token.
+/// `join_existing` requires that the exact account already contains a row with
+/// the target token. `adopt_verified` is reserved for callers that established
+/// the token outside this store (for example, a verified mesh credential); its
+/// payload is the portable-resume state to install on the claimant row.
+pub const TokenBindKind = union(enum) {
+    join_existing,
+    adopt_verified: bool,
+};
+
+/// A token bind prepared while holding the store's exclusive lock. Preparation
+/// captures every value needed by the commit, so `commit` performs no allocation
+/// and cannot expose a half-applied token-group merge. The lock remains held after
+/// commit so a caller can finish its World/connection commit before calling
+/// `finish`; an uncommitted plan must use `abort`.
+///
+/// This type is logically non-copyable and single-use: keep one mutable instance
+/// and call lifecycle methods through its pointer. Install `defer plan.deinit()`
+/// immediately after preparation; it aborts an uncommitted plan and asserts if a
+/// committed plan escaped without the required explicit `finish`.
+pub const PreparedTokenBind = struct {
+    const State = enum { prepared, committed, aborted, finished };
+
+    store: *SessionStore,
+    list: *SessionList,
+    index: usize,
+    client: ClientId,
+    expected_token: Token,
+    expected_portable: bool,
+    expected_dirty: bool,
+    expected_projection_dirty: bool,
+    target_token: Token,
+    kind: TokenBindKind,
+    target_portable: bool,
+    target_dirty: bool,
+    target_projection_dirty: bool,
+    result_portable: bool,
+    state: State = .prepared,
+
+    /// Commit the prepared bind without allocating or releasing the exclusive
+    /// lock. Defensive revalidation rejects a stale/corrupted ticket without
+    /// applying the target token. Ordinary store users cannot make it stale
+    /// because the ticket owns the exclusive lock, but keeping this check at the
+    /// commit boundary prevents a future refactor from weakening that guarantee.
+    pub fn commit(self: *PreparedTokenBind) bool {
+        if (self.state != .prepared) return false;
+
+        if (self.index >= self.list.items.items.len) return false;
+        const claimant = &self.list.items.items[self.index];
+        if (claimant.client != self.client or
+            !std.crypto.timing_safe.eql(Token, claimant.token, self.expected_token) or
+            claimant.portable_resume != self.expected_portable or
+            claimant.replica_dirty != self.expected_dirty or
+            claimant.replica_projection_dirty != self.expected_projection_dirty)
+        {
+            return false;
+        }
+
+        var current_target_portable = false;
+        var target_in_account = false;
+        for (self.list.items.items) |session| {
+            if (!std.crypto.timing_safe.eql(Token, session.token, self.target_token)) continue;
+            target_in_account = true;
+            current_target_portable = current_target_portable or session.portable_resume;
+        }
+        if (self.kind == .join_existing and
+            (!target_in_account or current_target_portable != self.target_portable))
+        {
+            return false;
+        }
+        const current_target = self.store.tokenGroupStateLocked(self.target_token);
+        if (current_target.dirty != self.target_dirty or
+            current_target.projection_dirty != self.target_projection_dirty)
+        {
+            return false;
+        }
+
+        claimant.token = self.target_token;
+        claimant.portable_resume = self.result_portable;
+        self.store.setTokenGroupDirtyLocked(
+            self.target_token,
+            self.expected_dirty or self.target_dirty,
+        );
+        self.store.setTokenGroupProjectionDirtyLocked(
+            self.target_token,
+            self.expected_projection_dirty or self.target_projection_dirty,
+        );
+        self.state = .committed;
+        return true;
+    }
+
+    /// Release the exclusive lock after the caller has completed every other
+    /// no-fail authority mutation. Calling this before commit is a lifecycle bug.
+    pub fn finish(self: *PreparedTokenBind) void {
+        if (self.state == .finished) return;
+        std.debug.assert(self.state == .committed);
+        if (self.state != .committed) return;
+        self.state = .finished;
+        self.store.lock.unlockExclusive();
+    }
+
+    /// Discard an uncommitted plan and release the exclusive lock. Calling this
+    /// after commit is a lifecycle bug; committed plans require `finish`.
+    pub fn abort(self: *PreparedTokenBind) void {
+        if (self.state == .aborted or self.state == .finished) return;
+        std.debug.assert(self.state == .prepared);
+        if (self.state != .prepared) return;
+        self.state = .aborted;
+        self.store.lock.unlockExclusive();
+    }
+
+    /// Lifecycle guard for deferred cleanup. An uncommitted plan is safely
+    /// aborted. A committed-but-unfinished plan is unlocked to avoid poisoning
+    /// the store, then asserted so tests/debug builds catch the missing finish.
+    pub fn deinit(self: *PreparedTokenBind) void {
+        switch (self.state) {
+            .prepared => self.abort(),
+            .committed => {
+                self.state = .finished;
+                self.store.lock.unlockExclusive();
+                std.debug.assert(false);
+            },
+            .aborted, .finished => {},
+        }
+    }
+};
+
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -307,27 +434,13 @@ pub const SessionStore = struct {
     /// is group-wide: a newly joined attachment inherits it from any sibling so
     /// its later detach is replicated too.
     pub fn joinTokenGroup(self: *SessionStore, account: []const u8, client: ClientId, token: Token) bool {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
-
-        const list = self.accounts.getPtr(account) orelse return false;
-        const idx = list.indexOfClient(client) orelse return false;
-        const current_portable = list.items.items[idx].portable_resume;
-        const current_dirty = list.items.items[idx].replica_dirty;
-        const current_projection_dirty = list.items.items[idx].replica_projection_dirty;
-        var target_portable = false;
-        var found = false;
-        for (list.items.items) |session| {
-            if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-            found = true;
-            target_portable = target_portable or session.portable_resume;
+        var prepared = self.prepareTokenBind(account, client, token, .join_existing) orelse return false;
+        defer prepared.deinit();
+        if (!prepared.commit()) {
+            prepared.abort();
+            return false;
         }
-        if (!found) return false;
-        const target = self.tokenGroupStateLocked(token);
-        list.items.items[idx].token = token;
-        list.items.items[idx].portable_resume = current_portable or target_portable;
-        self.setTokenGroupDirtyLocked(token, current_dirty or target.dirty);
-        self.setTokenGroupProjectionDirtyLocked(token, current_projection_dirty or target.projection_dirty);
+        prepared.finish();
         return true;
     }
 
@@ -336,19 +449,67 @@ pub const SessionStore = struct {
     /// migration replica). Unlike `joinTokenGroup`, this does not require a
     /// pre-existing local attachment bearing the token.
     pub fn adoptTokenGroup(self: *SessionStore, account: []const u8, client: ClientId, token: Token, portable: bool) bool {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
-
-        const list = self.accounts.getPtr(account) orelse return false;
-        const idx = list.indexOfClient(client) orelse return false;
-        const current_dirty = list.items.items[idx].replica_dirty;
-        const current_projection_dirty = list.items.items[idx].replica_projection_dirty;
-        const target = self.tokenGroupStateLocked(token);
-        list.items.items[idx].token = token;
-        list.items.items[idx].portable_resume = portable;
-        self.setTokenGroupDirtyLocked(token, current_dirty or target.dirty);
-        self.setTokenGroupProjectionDirtyLocked(token, current_projection_dirty or target.projection_dirty);
+        var prepared = self.prepareTokenBind(account, client, token, .{ .adopt_verified = portable }) orelse return false;
+        defer prepared.deinit();
+        if (!prepared.commit()) {
+            prepared.abort();
+            return false;
+        }
+        prepared.finish();
         return true;
+    }
+
+    /// Prepare an exact account/client/token bind and retain the exclusive lock
+    /// through its later commit/abort boundary. This is deliberately allocation-
+    /// free: a daemon restore transaction may stage every fallible World change
+    /// first, prepare this ticket last, then commit all authority with no error
+    /// path remaining.
+    pub fn prepareTokenBind(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        kind: TokenBindKind,
+    ) ?PreparedTokenBind {
+        self.lock.lockExclusive();
+        var keep_locked = false;
+        defer if (!keep_locked) self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return null;
+        const index = list.indexOfClient(client) orelse return null;
+        const claimant = list.items.items[index];
+
+        var target_portable = false;
+        var target_in_account = false;
+        for (list.items.items) |session| {
+            if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+            target_in_account = true;
+            target_portable = target_portable or session.portable_resume;
+        }
+        if (kind == .join_existing and !target_in_account) return null;
+
+        const target = self.tokenGroupStateLocked(token);
+        const result_portable = switch (kind) {
+            .join_existing => claimant.portable_resume or target_portable,
+            .adopt_verified => |portable| portable,
+        };
+        keep_locked = true;
+        return .{
+            .store = self,
+            .list = list,
+            .index = index,
+            .client = client,
+            .expected_token = claimant.token,
+            .expected_portable = claimant.portable_resume,
+            .expected_dirty = claimant.replica_dirty,
+            .expected_projection_dirty = claimant.replica_projection_dirty,
+            .target_token = token,
+            .kind = kind,
+            .target_portable = target_portable,
+            .target_dirty = target.dirty,
+            .target_projection_dirty = target.projection_dirty,
+            .result_portable = result_portable,
+        };
     }
 
     /// Mark an opted-in logical session dirty before publishing its next signed
@@ -1144,6 +1305,150 @@ test "multiple live clients join one reusable token group" {
     const copied = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(0xAA))).?;
     defer testing.allocator.free(copied);
     try testing.expectEqualStrings("shared-state", copied);
+}
+
+test "prepared token join aborts cleanly then commits without allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const target = tok(0xA1);
+    const generated = tok(0xB2);
+    _ = try s.attach("alice", 1, target, 10);
+    _ = try s.attach("alice", 2, generated, 20);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(target));
+    try testing.expect(s.markTokenReplicaProjectionDirty(target));
+
+    // Abort is a true no-op and releases the lock for ordinary store calls.
+    var abandoned = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer abandoned.deinit();
+    try testing.expect(!s.lock.tryLockExclusive());
+    abandoned.abort();
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+    try testing.expect(!s.clientHasToken("alice", 2, target));
+
+    // Fail the allocator's very next request. Neither preparation nor commit may
+    // touch it, so the exact group transition still completes in one step.
+    failing.fail_index = failing.alloc_index;
+    var prepared = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expect(prepared.commit());
+    try testing.expect(!failing.has_induced_failure);
+    // Commit publishes the row change but deliberately retains the lock until
+    // the enclosing World/Conn transaction calls finish.
+    try testing.expect(!s.lock.tryLockExclusive());
+    try testing.expect(std.crypto.timing_safe.eql(Token, prepared.list.items.items[prepared.index].token, target));
+    prepared.finish();
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+
+    try testing.expect(s.clientHasToken("alice", 1, target));
+    try testing.expect(s.clientHasToken("alice", 2, target));
+    const joined = s.findTokenSessionInAccount("alice", target) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(joined.portable_resume);
+    try testing.expect(s.tokenReplicaDirty(target));
+    try testing.expect(s.tokenReplicaProjectionDirty(target));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+}
+
+test "prepared verified adopt is exact-account and preserves retry state" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const generated = tok(0x11);
+    const verified = tok(0x99);
+    _ = try s.attach("alice", 1, generated, 10);
+    _ = try s.attach("bob", 2, verified, 20);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(generated));
+    try testing.expect(s.markTokenReplicaProjectionDirty(generated));
+
+    // A row in another account never authorizes join_existing.
+    try testing.expect(s.prepareTokenBind("alice", 1, verified, .join_existing) == null);
+    try testing.expect(s.clientHasToken("alice", 1, generated));
+
+    // Verified mesh authority may adopt a rowless token. Its explicit portable
+    // bit replaces the claimant's old issuance bit, while pending retry work is
+    // carried across to the new exact group.
+    var prepared = s.prepareTokenBind("alice", 1, verified, .{ .adopt_verified = false }) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expect(prepared.commit());
+    try testing.expect(!s.lock.tryLockExclusive());
+    prepared.finish();
+    const adopted = s.resumeHandleForClient("alice", 1) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &verified, &adopted.token);
+    try testing.expect(!adopted.portable);
+    try testing.expect(s.tokenReplicaDirty(verified));
+    try testing.expect(s.tokenReplicaProjectionDirty(verified));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+}
+
+test "prepared token bind rejects invalid and stale preconditions without mutation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const target = tok(0x44);
+    const generated = tok(0x55);
+    _ = try s.attach("alice", 1, target, 10);
+    _ = try s.attach("alice", 2, generated, 20);
+
+    try testing.expect(s.prepareTokenBind("missing", 2, target, .join_existing) == null);
+    try testing.expect(s.prepareTokenBind("alice", 99, target, .join_existing) == null);
+    try testing.expect(s.prepareTokenBind("alice", 2, tok(0xEE), .join_existing) == null);
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+
+    var stale = s.prepareTokenBind("alice", 2, target, .join_existing) orelse
+        return error.TestUnexpectedResult;
+    defer stale.deinit();
+    // Model a stale/corrupted ticket at the commit boundary. Revalidation must
+    // reject it and leave every live row untouched until explicit abort.
+    stale.expected_token = tok(0xFE);
+    try testing.expect(!stale.commit());
+    // Rejection keeps the plan prepared and the lock held until explicit abort.
+    try testing.expect(!s.lock.tryLockExclusive());
+    stale.abort();
+    try testing.expect(!stale.commit());
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+    try testing.expect(s.clientHasToken("alice", 1, target));
+    try testing.expect(s.clientHasToken("alice", 2, generated));
+    try testing.expect(!s.clientHasToken("alice", 2, target));
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaProjectionRowCount());
+}
+
+test "prepared token bind remains no-allocation after exhaustive setup failures" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+
+            const target = tok(0x71);
+            _ = try s.attach("sweep", 1, target, 1);
+            _ = try s.attach("sweep", 2, tok(0x72), 2);
+            try testing.expect(s.markPortableResumeIssued("sweep", 1));
+
+            var prepared = s.prepareTokenBind("sweep", 2, target, .join_existing) orelse
+                return error.TestUnexpectedResult;
+            defer prepared.deinit();
+            try testing.expect(prepared.commit());
+            try testing.expect(!s.lock.tryLockExclusive());
+            prepared.finish();
+            try testing.expect(s.clientHasToken("sweep", 1, target));
+            try testing.expect(s.clientHasToken("sweep", 2, target));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
 }
 
 test "detached snapshot replacement OOM preserves prior retry state" {

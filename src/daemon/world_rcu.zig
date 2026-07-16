@@ -188,6 +188,20 @@ fn StringKeyedRegistry(comptime V: type) type {
             bytes: []u8,
         };
 
+        const RetiredKeysBatch = struct {
+            box: *Published,
+            keys: [][]u8,
+
+            fn reclaim(ptr: *anyopaque, allocator: Allocator) void {
+                const batch: *@This() = @ptrCast(@alignCast(ptr));
+                batch.box.map.release(allocator);
+                allocator.destroy(batch.box);
+                for (batch.keys) |bytes| allocator.free(bytes);
+                allocator.free(batch.keys);
+                allocator.destroy(batch);
+            }
+        };
+
         domain: *ebr.Domain,
         allocator: Allocator,
         published: std.atomic.Value(*Published),
@@ -251,6 +265,18 @@ fn StringKeyedRegistry(comptime V: type) type {
             // retire it after publishing the new version.
             const displaced = findOwnedKey(old_box.map, key);
 
+            // Publication must not be followed by a limbo-bag allocation panic.
+            // Unique insert retires one box; overwrite also retires one key.
+            var reservation = try p.reserveRetireCapacity(if (displaced == null) 1 else 2);
+            defer reservation.finish();
+
+            const retired_key = if (displaced) |old_key| blk: {
+                const rk = try self.allocator.create(RetiredKey);
+                rk.* = .{ .bytes = old_key };
+                break :blk rk;
+            } else null;
+            errdefer if (retired_key) |rk| self.allocator.destroy(rk);
+
             const owned_key = try self.allocator.dupe(u8, key);
             errdefer self.allocator.free(owned_key);
 
@@ -264,8 +290,8 @@ fn StringKeyedRegistry(comptime V: type) type {
 
             // The old box (and its unique nodes) plus the displaced key buffer
             // are now referenced only by the old version — retire both.
-            self.retireBox(p, old_box);
-            if (displaced) |old_key| self.retireKey(p, old_key);
+            self.retireBoxReserved(&reservation, old_box);
+            if (retired_key) |rk| self.retireKeyReserved(&reservation, rk);
         }
 
         /// Remove `key` if present. The entry's owned key buffer is retired for
@@ -278,6 +304,16 @@ fn StringKeyedRegistry(comptime V: type) type {
             const displaced = findOwnedKey(old_box.map, key);
             if (displaced == null) return; // absent: nothing to do
 
+            // Publication retires both the old box and its owned key buffer.
+            // Reserve both limbo entries before the release-store so neither
+            // retire call can allocate (and panic) after readers can see the
+            // replacement snapshot.
+            var reservation = try p.reserveRetireCapacity(2);
+            defer reservation.finish();
+            const retired_key = try self.allocator.create(RetiredKey);
+            errdefer self.allocator.destroy(retired_key);
+            retired_key.* = .{ .bytes = displaced.? };
+
             const new_map = try old_box.map.remove(self.allocator, key);
             errdefer new_map.release(self.allocator);
 
@@ -286,8 +322,205 @@ fn StringKeyedRegistry(comptime V: type) type {
 
             self.published.store(new_box, .release);
 
-            self.retireBox(p, old_box);
-            self.retireKey(p, displaced.?);
+            self.retireBoxReserved(&reservation, old_box);
+            self.retireKeyReserved(&reservation, retired_key);
+        }
+
+        /// Prepared exact-value replacement. The registry writer lock remains
+        /// held until commit or abort; commit is allocation-free.
+        pub const StagedReplaceRemovingValues = struct {
+            registry: *Self,
+            reservation: ebr.Participant.RetireReservation,
+            new_box: *Published,
+            owned_key: []u8,
+            removed_keys: [][]u8,
+            retired: *RetiredKeysBatch,
+            active: bool = true,
+
+            pub fn commit(self: *StagedReplaceRemovingValues) void {
+                std.debug.assert(self.active);
+                self.registry.published.store(self.new_box, .release);
+                self.reservation.retireErased(
+                    @ptrCast(self.retired),
+                    RetiredKeysBatch.reclaim,
+                    self.registry.allocator,
+                );
+                self.reservation.finish();
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+
+            pub fn abort(self: *StagedReplaceRemovingValues) void {
+                std.debug.assert(self.active);
+                self.new_box.map.release(self.registry.allocator);
+                self.registry.allocator.destroy(self.new_box);
+                self.registry.allocator.free(self.owned_key);
+                self.registry.allocator.free(self.removed_keys);
+                self.registry.allocator.destroy(self.retired);
+                self.reservation.finish();
+                self.active = false;
+                self.registry.writer_lock.unlock();
+            }
+        };
+
+        /// Build, but do not publish, one immutable snapshot that removes every
+        /// entry whose value belongs to `removed_values`, then binds `key` to
+        /// `value`. Null is a foreign-owner collision. The returned transaction
+        /// owns every allocation and holds the writer lock until commit/abort.
+        pub fn stageReplaceRemovingValues(
+            self: *Self,
+            p: *ebr.Participant,
+            key: []const u8,
+            value: V,
+            removed_values: []const V,
+        ) !?StagedReplaceRemovingValues {
+            self.writer_lock.lock();
+            errdefer self.writer_lock.unlock();
+
+            const old_box = self.published.load(.acquire);
+            if (old_box.map.get(key)) |existing| {
+                if (!valueInSet(existing, removed_values)) {
+                    self.writer_lock.unlock();
+                    return null;
+                }
+            }
+
+            var removed_count: usize = 0;
+            var count_it = old_box.map.iterator();
+            while (count_it.next()) |entry| {
+                if (valueInSet(entry.value, removed_values)) removed_count += 1;
+            }
+            const removed_keys = try self.allocator.alloc([]u8, removed_count);
+            errdefer self.allocator.free(removed_keys);
+            var next_removed: usize = 0;
+            var key_it = old_box.map.iterator();
+            while (key_it.next()) |entry| {
+                if (!valueInSet(entry.value, removed_values)) continue;
+                removed_keys[next_removed] = @constCast(entry.key);
+                next_removed += 1;
+            }
+            std.debug.assert(next_removed == removed_count);
+
+            var reservation = try p.reserveRetireCapacity(1);
+            errdefer reservation.finish();
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+
+            var new_map = old_box.map;
+            new_map.retain();
+            errdefer new_map.release(self.allocator);
+            for (removed_keys) |removed_key| {
+                const without_alias = try new_map.remove(self.allocator, removed_key);
+                new_map.release(self.allocator);
+                new_map = without_alias;
+            }
+            const with_target = try new_map.put(self.allocator, owned_key, value);
+            new_map.release(self.allocator);
+            new_map = with_target;
+
+            const new_box = try self.allocator.create(Published);
+            errdefer self.allocator.destroy(new_box);
+            new_box.* = .{ .map = new_map };
+            const retired = try self.allocator.create(RetiredKeysBatch);
+            errdefer self.allocator.destroy(retired);
+            retired.* = .{ .box = old_box, .keys = removed_keys };
+            return .{
+                .registry = self,
+                .reservation = reservation,
+                .new_box = new_box,
+                .owned_key = owned_key,
+                .removed_keys = removed_keys,
+                .retired = retired,
+            };
+        }
+
+        /// Publish one immutable exact-value replacement. All allocations are
+        /// staged before the release store, so OOM cannot expose partial aliases.
+        pub fn replaceRemovingValues(
+            self: *Self,
+            p: *ebr.Participant,
+            key: []const u8,
+            value: V,
+            removed_values: []const V,
+        ) !bool {
+            var staged = (try self.stageReplaceRemovingValues(p, key, value, removed_values)) orelse return false;
+            staged.commit();
+            return true;
+        }
+
+        /// Atomically remove all aliases owned by `removed_values` while
+        /// requiring `preserved_key` to remain owned by `preserved_value`.
+        /// Used when another independently-authorized logical session already
+        /// owns a shared display nick: the attaching token sheds every stale
+        /// World alias without stealing or briefly removing the foreign owner.
+        pub fn removeValuesPreservingKey(
+            self: *Self,
+            p: *ebr.Participant,
+            preserved_key: []const u8,
+            preserved_value: V,
+            removed_values: []const V,
+        ) !bool {
+            self.writer_lock.lock();
+            defer self.writer_lock.unlock();
+
+            const old_box = self.published.load(.acquire);
+            const current = old_box.map.get(preserved_key) orelse return false;
+            if (!std.meta.eql(current, preserved_value) or valueInSet(current, removed_values)) return false;
+
+            var removed_count: usize = 0;
+            var count_it = old_box.map.iterator();
+            while (count_it.next()) |entry| {
+                if (valueInSet(entry.value, removed_values)) removed_count += 1;
+            }
+            if (removed_count == 0) return false;
+            const removed_keys = try self.allocator.alloc([]u8, removed_count);
+            var removed_keys_transferred = false;
+            defer if (!removed_keys_transferred) self.allocator.free(removed_keys);
+            var next_removed: usize = 0;
+            var key_it = old_box.map.iterator();
+            while (key_it.next()) |entry| {
+                if (!valueInSet(entry.value, removed_values)) continue;
+                removed_keys[next_removed] = @constCast(entry.key);
+                next_removed += 1;
+            }
+            std.debug.assert(next_removed == removed_count);
+
+            var reservation = try p.reserveRetireCapacity(1);
+            defer reservation.finish();
+            var new_map = old_box.map;
+            new_map.retain();
+            errdefer new_map.release(self.allocator);
+            for (removed_keys) |removed_key| {
+                const without_alias = try new_map.remove(self.allocator, removed_key);
+                new_map.release(self.allocator);
+                new_map = without_alias;
+            }
+
+            const new_box = try self.allocator.create(Published);
+            errdefer self.allocator.destroy(new_box);
+            new_box.* = .{ .map = new_map };
+
+            const RetiredBatch = struct {
+                box: *Published,
+                keys: [][]u8,
+
+                fn reclaim(ptr: *anyopaque, allocator: Allocator) void {
+                    const batch: *@This() = @ptrCast(@alignCast(ptr));
+                    batch.box.map.release(allocator);
+                    allocator.destroy(batch.box);
+                    for (batch.keys) |bytes| allocator.free(bytes);
+                    allocator.free(batch.keys);
+                    allocator.destroy(batch);
+                }
+            };
+            const retired = try self.allocator.create(RetiredBatch);
+            errdefer self.allocator.destroy(retired);
+            retired.* = .{ .box = old_box, .keys = removed_keys };
+
+            self.published.store(new_box, .release);
+            removed_keys_transferred = true;
+            reservation.retireErased(@ptrCast(retired), RetiredBatch.reclaim, self.allocator);
+            return true;
         }
 
         // ---- internal retire helpers ------------------------------------
@@ -314,7 +547,18 @@ fn StringKeyedRegistry(comptime V: type) type {
             return null;
         }
 
-        fn retireBox(self: *Self, p: *ebr.Participant, box: *Published) void {
+        fn valueInSet(value: V, values: []const V) bool {
+            for (values) |candidate| {
+                if (std.meta.eql(value, candidate)) return true;
+            }
+            return false;
+        }
+
+        fn retireBoxReserved(
+            self: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            box: *Published,
+        ) void {
             const Closure = struct {
                 fn free(ptr: *anyopaque, a: Allocator) void {
                     const b: *Published = @ptrCast(@alignCast(ptr));
@@ -322,19 +566,14 @@ fn StringKeyedRegistry(comptime V: type) type {
                     a.destroy(b);
                 }
             };
-            p.retireErased(@ptrCast(box), Closure.free, self.allocator);
+            reservation.retireErased(@ptrCast(box), Closure.free, self.allocator);
         }
 
-        fn retireKey(self: *Self, p: *ebr.Participant, bytes: []u8) void {
-            // Box the slice (ptr+len) so the type-erased closure can free it.
-            const rk = self.allocator.create(RetiredKey) catch {
-                // Allocation for the retire record failed. We cannot safely
-                // free `bytes` now (a reader may hold it), so as a last resort
-                // leak the buffer rather than risk a use-after-free. This path
-                // is effectively unreachable under normal memory pressure.
-                return;
-            };
-            rk.* = .{ .bytes = bytes };
+        fn retireKeyReserved(
+            self: *Self,
+            reservation: *ebr.Participant.RetireReservation,
+            rk: *RetiredKey,
+        ) void {
             const Closure = struct {
                 fn free(ptr: *anyopaque, a: Allocator) void {
                     const r: *RetiredKey = @ptrCast(@alignCast(ptr));
@@ -342,7 +581,7 @@ fn StringKeyedRegistry(comptime V: type) type {
                     a.destroy(r);
                 }
             };
-            p.retireErased(@ptrCast(rk), Closure.free, self.allocator);
+            reservation.retireErased(@ptrCast(rk), Closure.free, self.allocator);
         }
     };
 }
@@ -425,6 +664,69 @@ pub const MembershipSet = struct {
 
     // ---- writes (serialized, CoW, publish, retire) ----------------------
 
+    /// Prepared membership insertion. `stageAdd` holds the set's writer lock
+    /// until exactly one of `commit` or `abort` is called. The new immutable
+    /// snapshot and its publication box are fully allocated up front, making
+    /// commit allocation-free. World uses this to prepare every channel in a
+    /// logical-session handoff before publishing any of them.
+    pub const StagedAdd = struct {
+        set: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        old_box: *Published,
+        new_box: *Published,
+        active: bool = true,
+
+        pub fn commit(self: *StagedAdd) void {
+            std.debug.assert(self.active);
+            self.set.published.store(self.new_box, .release);
+            self.set.retireBoxReserved(self.reservation, self.old_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+
+        pub fn abort(self: *StagedAdd) void {
+            std.debug.assert(self.active);
+            self.new_box.map.release(self.set.allocator);
+            self.set.allocator.destroy(self.new_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+    };
+
+    /// Stage one absent id without publishing it. Returns null when already
+    /// present. The caller must commit or abort a returned value.
+    pub fn stageAddReserved(
+        self: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        id: ClientId,
+    ) !?StagedAdd {
+        self.writer_lock.lock();
+        const old_box = self.published.load(.acquire);
+        if (old_box.map.get(id) != null) {
+            self.writer_lock.unlock();
+            return null;
+        }
+
+        std.debug.assert(reservation.active);
+        std.debug.assert(reservation.remaining != 0);
+        const new_map = old_box.map.put(self.allocator, id, {}) catch |err| {
+            self.writer_lock.unlock();
+            return err;
+        };
+        const new_box = self.allocator.create(Published) catch |err| {
+            new_map.release(self.allocator);
+            self.writer_lock.unlock();
+            return err;
+        };
+        new_box.* = .{ .map = new_map };
+        return .{
+            .set = self,
+            .reservation = reservation,
+            .old_box = old_box,
+            .new_box = new_box,
+        };
+    }
+
     /// Add `id` to the set (idempotent). Value keys carry no owned storage, so
     /// only the old snapshot box is retired.
     pub fn add(self: *Self, p: *ebr.Participant, id: ClientId) !void {
@@ -432,6 +734,9 @@ pub const MembershipSet = struct {
         defer self.writer_lock.unlock();
 
         const old_box = self.published.load(.acquire);
+        if (old_box.map.get(id) != null) return;
+        var reservation = try p.reserveRetireCapacity(1);
+        defer reservation.finish();
         const new_map = try old_box.map.put(self.allocator, id, {});
         errdefer new_map.release(self.allocator);
 
@@ -439,7 +744,7 @@ pub const MembershipSet = struct {
         new_box.* = .{ .map = new_map };
 
         self.published.store(new_box, .release);
-        self.retireBox(p, old_box);
+        self.retireBoxReserved(&reservation, old_box);
     }
 
     /// Remove `id` from the set if present.
@@ -449,6 +754,8 @@ pub const MembershipSet = struct {
 
         const old_box = self.published.load(.acquire);
         if (old_box.map.get(id) == null) return; // absent
+        var reservation = try p.reserveRetireCapacity(1);
+        defer reservation.finish();
 
         const new_map = try old_box.map.remove(self.allocator, id);
         errdefer new_map.release(self.allocator);
@@ -457,10 +764,14 @@ pub const MembershipSet = struct {
         new_box.* = .{ .map = new_map };
 
         self.published.store(new_box, .release);
-        self.retireBox(p, old_box);
+        self.retireBoxReserved(&reservation, old_box);
     }
 
-    fn retireBox(self: *Self, p: *ebr.Participant, box: *Published) void {
+    fn retireBoxReserved(
+        self: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        box: *Published,
+    ) void {
         const Closure = struct {
             fn free(ptr: *anyopaque, a: Allocator) void {
                 const b: *Published = @ptrCast(@alignCast(ptr));
@@ -468,7 +779,7 @@ pub const MembershipSet = struct {
                 a.destroy(b);
             }
         };
-        p.retireErased(@ptrCast(box), Closure.free, self.allocator);
+        reservation.retireErased(@ptrCast(box), Closure.free, self.allocator);
     }
 };
 
