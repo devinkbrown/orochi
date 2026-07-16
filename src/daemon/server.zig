@@ -4752,7 +4752,7 @@ pub const LinuxServer = struct {
             // as the membership resync below: BOTH the work and the cadence
             // guard live behind the reactors[0] gate, so a link-less sibling
             // reactor can never consume the guard while doing nothing.
-            if (now - self.last_oper_grant_refresh_ms >= oper_grant_refresh_interval_ms) {
+            if (operGrantRefreshDue(self.last_oper_grant_refresh_ms, now)) {
                 self.last_oper_grant_refresh_ms = now;
                 self.rebroadcastLocalOpers();
             }
@@ -24054,6 +24054,16 @@ pub const LinuxServer = struct {
     /// lapses while the oper stays logged in, even across long-lived links.
     const oper_grant_refresh_interval_ms: i64 = @intCast(oper_grant_ttl_ms / 4);
 
+    /// A zero marker means the periodic refresh has never run and is due even
+    /// on a freshly booted host whose monotonic uptime is shorter than the
+    /// normal refresh interval. Treat clock regression as not due; the next
+    /// monotonic tick will recover without an overflowing subtraction.
+    fn operGrantRefreshDue(last_refresh_ms: i64, now_ms: i64) bool {
+        if (last_refresh_ms == 0) return true;
+        return now_ms >= last_refresh_ms and
+            now_ms - last_refresh_ms >= oper_grant_refresh_interval_ms;
+    }
+
     /// Derive this node's Ed25519 signing keypair (for minting oper grants) from
     /// the sovereign node identity seed. Null when no node identity is configured
     /// (cross-mesh oper grants then unsigned/disabled).
@@ -34822,6 +34832,13 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
         try std.testing.expect(g.expiry_ms > now + 1_000);
         try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
     } else return error.SkipZigTest;
+}
+
+test "zero oper grant refresh marker is due below the normal interval" {
+    try std.testing.expect(Server.operGrantRefreshDue(0, 1));
+    try std.testing.expect(!Server.operGrantRefreshDue(1, 2));
+    try std.testing.expect(Server.operGrantRefreshDue(1, 1 + Server.oper_grant_refresh_interval_ms));
+    try std.testing.expect(!Server.operGrantRefreshDue(2, 1));
 }
 
 test "REHASH oper binding builder preserves configured group privileges" {
