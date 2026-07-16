@@ -41,6 +41,14 @@ pub const Session = struct {
     /// for this exact session. Only opted-in sessions need their detached state
     /// replicated to mesh peers.
     portable_resume: bool = false,
+    /// A local state mutation for this reusable token has not yet been accepted
+    /// by the signed replica store. Dirty is a token-group property: whenever
+    /// one row is dirty, every local row bearing the exact token is dirty.
+    replica_dirty: bool = false,
+    /// A signed replica was accepted but has not yet been projected into every
+    /// local attachment's live state. This receive-side retry lane is separate
+    /// from `replica_dirty` so projection never mints or republishes a replica.
+    replica_projection_dirty: bool = false,
 };
 
 pub const ResumeHandle = struct {
@@ -95,6 +103,19 @@ pub const SessionStore = struct {
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
     lock: rwlock.RwLock = .{},
+    /// Number of rows carrying `replica_dirty`, maintained under `lock`. This is
+    /// deliberately a row count (not a token count), so every mutation remains
+    /// O(1) once the affected row is known and collection can skip an empty
+    /// store without allocating an auxiliary token set.
+    dirty_replica_rows: usize = 0,
+    /// Last token returned by the bounded dirty scan. Advancing from this
+    /// caller-owned-value cursor prevents one permanently failing first token
+    /// from starving later groups without retaining pointers into the hash map.
+    dirty_scan_cursor: ?Token = null,
+    /// Projection retry bookkeeping mirrors the publish lane but advances
+    /// independently; a blocked local projection cannot perturb publish order.
+    dirty_projection_rows: usize = 0,
+    projection_scan_cursor: ?Token = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
         return initWithConfig(allocator, .{});
@@ -135,13 +156,30 @@ pub const SessionStore = struct {
         const list = try self.ensureAccount(account);
         if (list.indexOfClient(client)) |idx| {
             const displaced = list.items.items[idx];
+            const inherited = self.tokenGroupStateLocked(token);
+            self.removeDirtyRowLocked(&list.items.items[idx]);
             freeSnapshot(self.allocator, &list.items.items[idx]);
-            list.items.items[idx] = .{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
+            list.items.items[idx] = .{
+                .client = client,
+                .token = token,
+                .signon_ms = signon_ms,
+                .attached = true,
+                .replica_dirty = inherited.dirty,
+                .replica_projection_dirty = inherited.projection_dirty,
+            };
+            if (inherited.dirty) self.dirty_replica_rows += 1;
+            if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+            self.setTokenGroupDirtyLocked(token, inherited.dirty);
+            self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
             return .{
                 .session = list.items.items[idx],
                 .evicted = .{ .token = displaced.token, .portable = displaced.portable_resume },
             };
         }
+        // Capture destination retry state before capacity eviction: if the new
+        // attachment replaces the only detached row of this same exact token,
+        // its pending publish/projection work must move with the logical group.
+        const inherited = self.tokenGroupStateLocked(token);
         var evicted: ?ResumeHandle = null;
         if (list.items.items.len >= self.cfg.max_sessions_per_account) {
             // At cap: evict the oldest *detached* ghost to make room for the live
@@ -149,12 +187,24 @@ pub const SessionStore = struct {
             if (oldestDetached(list)) |evict| {
                 const displaced = list.items.items[evict];
                 evicted = .{ .token = displaced.token, .portable = displaced.portable_resume };
+                self.removeDirtyRowLocked(&list.items.items[evict]);
                 freeSnapshot(self.allocator, &list.items.items[evict]);
                 _ = list.items.swapRemove(evict);
             } else return error.TooManySessions;
         }
-        const session = Session{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
+        const session = Session{
+            .client = client,
+            .token = token,
+            .signon_ms = signon_ms,
+            .attached = true,
+            .replica_dirty = inherited.dirty,
+            .replica_projection_dirty = inherited.projection_dirty,
+        };
         try list.items.append(self.allocator, session);
+        if (inherited.dirty) self.dirty_replica_rows += 1;
+        if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+        self.setTokenGroupDirtyLocked(token, inherited.dirty);
+        self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
         return .{ .session = session, .evicted = evicted };
     }
 
@@ -171,9 +221,18 @@ pub const SessionStore = struct {
     }
 
     /// Mark a session detached (connection dropped) but retain it for reclaim/
-    /// bouncer. Returns true if it was present. The session is NOT removed.
+    /// bouncer. A previously-owned snapshot is deliberately preserved: callers
+    /// use this no-allocation fallback when encoding a fresher disconnect image
+    /// fails, and erasing the last retry source would strand a dirty portable
+    /// token after ConnState is freed. Returns true if the row was present.
     pub fn markDetached(self: *SessionStore, account: []const u8, client: ClientId) bool {
-        return self.markDetachedWithSnapshot(account, client, null);
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        list.items.items[idx].attached = false;
+        return true;
     }
 
     /// Mark a session detached and persist an optional encoded restore snapshot.
@@ -187,7 +246,15 @@ pub const SessionStore = struct {
         const idx = list.indexOfClient(client) orelse return false;
         const session = &list.items.items[idx];
         const copied = if (snapshot) |bytes|
-            if (bytes.len != 0) self.allocator.dupe(u8, bytes) catch null else null
+            if (bytes.len != 0) self.allocator.dupe(u8, bytes) catch {
+                // Transport loss still detaches the row, but snapshot replacement
+                // is transactional: retain the previous retry source and every
+                // token-group flag when allocation pressure prevents the update.
+                // Returning false lets interested callers surface the degraded
+                // capture while legacy disconnect callers remain fail-safe.
+                session.attached = false;
+                return false;
+            } else null
         else
             null;
         freeSnapshot(self.allocator, session);
@@ -245,16 +312,22 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
-        var portable = list.items.items[idx].portable_resume;
+        const current_portable = list.items.items[idx].portable_resume;
+        const current_dirty = list.items.items[idx].replica_dirty;
+        const current_projection_dirty = list.items.items[idx].replica_projection_dirty;
+        var target_portable = false;
         var found = false;
         for (list.items.items) |session| {
             if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
             found = true;
-            portable = portable or session.portable_resume;
+            target_portable = target_portable or session.portable_resume;
         }
         if (!found) return false;
+        const target = self.tokenGroupStateLocked(token);
         list.items.items[idx].token = token;
-        list.items.items[idx].portable_resume = portable;
+        list.items.items[idx].portable_resume = current_portable or target_portable;
+        self.setTokenGroupDirtyLocked(token, current_dirty or target.dirty);
+        self.setTokenGroupProjectionDirtyLocked(token, current_projection_dirty or target.projection_dirty);
         return true;
     }
 
@@ -268,9 +341,189 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
+        const current_dirty = list.items.items[idx].replica_dirty;
+        const current_projection_dirty = list.items.items[idx].replica_projection_dirty;
+        const target = self.tokenGroupStateLocked(token);
         list.items.items[idx].token = token;
         list.items.items[idx].portable_resume = portable;
+        self.setTokenGroupDirtyLocked(token, current_dirty or target.dirty);
+        self.setTokenGroupProjectionDirtyLocked(token, current_projection_dirty or target.projection_dirty);
         return true;
+    }
+
+    /// Mark an opted-in logical session dirty before publishing its next signed
+    /// replica. The operation is all-or-nothing: a token with no portable local
+    /// row is rejected and no row is modified. Once eligible, every exact-token
+    /// row is marked so a mutation from any sibling survives that sibling's
+    /// removal or migration.
+    pub fn markTokenReplicaDirty(self: *SessionStore, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found or !state.portable) return false;
+        self.setTokenGroupDirtyLocked(token, true);
+        return true;
+    }
+
+    /// Clear an exact token group only after the caller's signed replica was
+    /// synchronously accepted. Returns false only when no local row bears the
+    /// token; clearing an already-clean group is idempotent.
+    pub fn clearTokenReplicaDirty(self: *SessionStore, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found) return false;
+        self.setTokenGroupDirtyLocked(token, false);
+        return true;
+    }
+
+    /// Whether an exact token group still has an unpublished local mutation.
+    /// Deferred mesh sidecars consult this after checking their bound token so
+    /// an older same-origin Store row can never masquerade as acceptance of the
+    /// current restored snapshot.
+    pub fn tokenReplicaDirty(self: *const SessionStore, token: Token) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.tokenGroupStateLocked(token).dirty;
+    }
+
+    pub fn tokenReplicaProjectionDirty(self: *const SessionStore, token: Token) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.tokenGroupStateLocked(token).projection_dirty;
+    }
+
+    /// Copy at most `out.len` unique dirty portable tokens into caller storage.
+    /// `replica_dirty` can only be minted after group portability was verified,
+    /// so it remains the durable eligibility proof if the issuing sibling is
+    /// removed before retry. No allocation occurs and the returned slice borrows
+    /// `out`; a dirty token remains visible until explicitly cleared.
+    pub fn dirtyPortableTokensInto(self: *SessionStore, out: []Token) []const Token {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        return self.dirtyTokensIntoLocked(out, .publish);
+    }
+
+    /// Mark receive-side projection pending after a signed replica was accepted.
+    /// Store acceptance is the authority, so unlike publish dirtiness this does
+    /// not require a locally issued portable credential.
+    pub fn markTokenReplicaProjectionDirty(self: *SessionStore, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found) return false;
+        self.setTokenGroupProjectionDirtyLocked(token, true);
+        return true;
+    }
+
+    /// Clear receive-side projection retry only after every applicable local
+    /// attachment accepted the snapshot. Idempotent for an existing group.
+    pub fn clearTokenReplicaProjectionDirty(self: *SessionStore, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found) return false;
+        self.setTokenGroupProjectionDirtyLocked(token, false);
+        return true;
+    }
+
+    /// Fair, bounded, allocation-free projection retry collection. This cursor
+    /// is independent from `dirtyPortableTokensInto`.
+    pub fn dirtyProjectionTokensInto(self: *SessionStore, out: []Token) []const Token {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        return self.dirtyTokensIntoLocked(out, .projection);
+    }
+
+    const DirtyKind = enum { publish, projection };
+
+    fn dirtyTokensIntoLocked(self: *SessionStore, out: []Token, kind: DirtyKind) []const Token {
+        const dirty_rows = switch (kind) {
+            .publish => self.dirty_replica_rows,
+            .projection => self.dirty_projection_rows,
+        };
+        if (dirty_rows == 0 or out.len == 0) return out[0..0];
+
+        const cursor_ptr = switch (kind) {
+            .publish => &self.dirty_scan_cursor,
+            .projection => &self.projection_scan_cursor,
+        };
+        var n: usize = 0;
+        const original_cursor = cursor_ptr.*;
+        var wrapped = original_cursor == null;
+        var lower_bound = original_cursor;
+        while (n < out.len) {
+            var candidate: ?Token = null;
+            var it = self.accounts.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items.items) |session| {
+                    if (!sessionDirty(session, kind)) continue;
+                    if (tokenInSlice(out[0..n], session.token)) continue;
+
+                    if (lower_bound) |lower| {
+                        if (std.mem.order(u8, &session.token, &lower) != .gt) continue;
+                    }
+                    if (wrapped) {
+                        if (original_cursor) |upper| {
+                            if (std.mem.order(u8, &session.token, &upper) == .gt) continue;
+                        }
+                    }
+                    if (candidate == null or std.mem.order(u8, &session.token, &candidate.?) == .lt) {
+                        candidate = session.token;
+                    }
+                }
+            }
+
+            if (candidate) |token| {
+                out[n] = token;
+                n += 1;
+                lower_bound = token;
+                continue;
+            }
+            if (wrapped) break;
+            // Complete the circular scan at the smallest token. The ordering is
+            // by token value, not hash-map position, so this remains fair even
+            // when the previous cursor token was removed between calls.
+            wrapped = true;
+            lower_bound = null;
+        }
+
+        if (n != 0) cursor_ptr.* = out[n - 1];
+        return out[0..n];
+    }
+
+    fn sessionDirty(session: Session, kind: DirtyKind) bool {
+        return switch (kind) {
+            .publish => session.replica_dirty,
+            .projection => session.replica_projection_dirty,
+        };
+    }
+
+    fn tokenInSlice(tokens: []const Token, needle: Token) bool {
+        for (tokens) |token| {
+            if (std.crypto.timing_safe.eql(Token, token, needle)) return true;
+        }
+        return false;
+    }
+
+    /// Exact count of dirty rows. Exposed for scheduling/diagnostics; callers
+    /// needing unique tokens must use `dirtyPortableTokensInto`.
+    pub fn dirtyReplicaRowCount(self: *const SessionStore) usize {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.dirty_replica_rows;
+    }
+
+    pub fn dirtyReplicaProjectionRowCount(self: *const SessionStore) usize {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.dirty_projection_rows;
     }
 
     /// Whether this exact attached client already belongs to `token`'s logical
@@ -304,6 +557,7 @@ pub const SessionStore = struct {
 
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
+        self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
         freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
         _ = entry.value_ptr.items.swapRemove(idx);
         if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
@@ -319,6 +573,7 @@ pub const SessionStore = struct {
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
+                self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
                 freeSnapshot(self.allocator, &entry.value_ptr.items.items[idx]);
                 _ = entry.value_ptr.items.swapRemove(idx);
                 if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
@@ -547,8 +802,88 @@ pub const SessionStore = struct {
         return self.accounts.getPtr(account).?;
     }
 
+    const TokenGroupState = struct {
+        found: bool = false,
+        portable: bool = false,
+        dirty: bool = false,
+        projection_dirty: bool = false,
+    };
+
+    /// Caller holds `lock` exclusively or shared for the duration of the scan.
+    fn tokenGroupStateLocked(self: *const SessionStore, token: Token) TokenGroupState {
+        var state: TokenGroupState = .{};
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                state.found = true;
+                state.portable = state.portable or session.portable_resume;
+                state.dirty = state.dirty or session.replica_dirty;
+                state.projection_dirty = state.projection_dirty or session.replica_projection_dirty;
+            }
+        }
+        return state;
+    }
+
+    /// Apply token-group dirty state and keep `dirty_replica_rows` exact. Caller
+    /// holds `lock` exclusively. Portability remains a per-row issuance fact;
+    /// token-group eligibility is computed by OR in `tokenGroupStateLocked`.
+    fn setTokenGroupDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |*session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                self.setReplicaDirtyLocked(session, dirty);
+            }
+        }
+    }
+
+    fn setTokenGroupProjectionDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |*session| {
+                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+                self.setReplicaProjectionDirtyLocked(session, dirty);
+            }
+        }
+    }
+
+    fn setReplicaDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
+        if (session.replica_dirty == dirty) return;
+        session.replica_dirty = dirty;
+        if (dirty) {
+            self.dirty_replica_rows += 1;
+        } else {
+            std.debug.assert(self.dirty_replica_rows != 0);
+            self.dirty_replica_rows -= 1;
+        }
+    }
+
+    fn removeDirtyRowLocked(self: *SessionStore, session: *const Session) void {
+        if (session.replica_dirty) {
+            std.debug.assert(self.dirty_replica_rows != 0);
+            self.dirty_replica_rows -= 1;
+        }
+        if (session.replica_projection_dirty) {
+            std.debug.assert(self.dirty_projection_rows != 0);
+            self.dirty_projection_rows -= 1;
+        }
+    }
+
+    fn setReplicaProjectionDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
+        if (session.replica_projection_dirty == dirty) return;
+        session.replica_projection_dirty = dirty;
+        if (dirty) {
+            self.dirty_projection_rows += 1;
+        } else {
+            std.debug.assert(self.dirty_projection_rows != 0);
+            self.dirty_projection_rows -= 1;
+        }
+    }
+
     fn dropAccount(self: *SessionStore, entry: std.StringHashMap(SessionList).Entry) void {
         const owned_key = entry.key_ptr.*;
+        for (entry.value_ptr.items.items) |session| self.removeDirtyRowLocked(&session);
         entry.value_ptr.deinit(self.allocator);
         self.accounts.removeByPtr(entry.key_ptr);
         self.allocator.free(owned_key);
@@ -611,6 +946,20 @@ test "detached session snapshots are copied and released across lifecycle paths"
     try testing.expect(s.markDetachedWithSnapshot("alice", 2, "second"));
     _ = try s.attach("alice", 2, tok(3), 30); // reattach same client frees old snapshot
     try testing.expect((try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(3))) == null);
+}
+
+test "allocation-free detach preserves the last owned portable snapshot" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const token = tok(0x6d);
+    _ = try s.attach("alice", 1, token, 10);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "last-publishable-state"));
+
+    // Models encodeMigrationSnapshot failing during the later close path.
+    try testing.expect(s.markDetached("alice", 1));
+    const copied = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", token)).?;
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("last-publishable-state", copied);
 }
 
 test "portable resume issuance is explicit and resets on a normal re-attach" {
@@ -795,6 +1144,310 @@ test "multiple live clients join one reusable token group" {
     const copied = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", tok(0xAA))).?;
     defer testing.allocator.free(copied);
     try testing.expectEqualStrings("shared-state", copied);
+}
+
+test "detached snapshot replacement OOM preserves prior retry state" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const token = tok(0xAD);
+    _ = try s.attach("alice", 1, token, 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(token));
+    try testing.expect(s.markTokenReplicaProjectionDirty(token));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "last-good-snapshot"));
+
+    // Fail exactly the replacement copy. The row must still be detached and
+    // publishable from its previous owned snapshot; OOM must not erase either
+    // token-group durability bit or the portable credential.
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(!s.markDetachedWithSnapshot("alice", 1, "newer-snapshot"));
+    try testing.expect(failing.has_induced_failure);
+
+    const row = s.findTokenSessionInAccount("alice", token) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(!row.attached);
+    try testing.expect(row.portable_resume);
+    try testing.expect(row.replica_dirty);
+    try testing.expect(row.replica_projection_dirty);
+    try testing.expect(s.tokenReplicaDirty(token));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+
+    const retained = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", token)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(retained);
+    try testing.expectEqualStrings("last-good-snapshot", retained);
+}
+
+test "portable and dirty state are exact token group properties" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0xA1), 1);
+    _ = try s.attach("alice", 2, tok(0xA1), 2);
+    _ = try s.attach("bob", 3, tok(0xB2), 3);
+    _ = try s.attach("carol", 4, tok(0xC3), 4);
+
+    // Issuance remains an exact-row fact; token-group eligibility is its OR.
+    try testing.expect(s.markPortableResumeIssued("alice", 2));
+    try testing.expect(s.markPortableResumeIssued("bob", 3));
+    var alice_rows: [4]Session = undefined;
+    for (s.sessionsInto("alice", &alice_rows)) |session| {
+        try testing.expectEqual(session.client == 2, session.portable_resume);
+    }
+
+    // A non-portable token is rejected without leaving a partial dirty mark.
+    try testing.expect(!s.markTokenReplicaDirty(tok(0xC3)));
+    try testing.expect(!s.tokenReplicaDirty(tok(0xC3)));
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+
+    // A mutation from either sibling marks every row in that group.
+    try testing.expect(s.markTokenReplicaDirty(tok(0xA1)));
+    try testing.expect(s.markTokenReplicaDirty(tok(0xB2)));
+    try testing.expect(s.tokenReplicaDirty(tok(0xA1)));
+    try testing.expect(s.tokenReplicaDirty(tok(0xB2)));
+    try testing.expectEqual(@as(usize, 3), s.dirtyReplicaRowCount());
+    for (s.sessionsInto("alice", &alice_rows)) |session| {
+        try testing.expect(session.replica_dirty);
+    }
+
+    // Dirty is the durable eligibility proof after marking: removing the only
+    // row that received the credential must not strand the surviving sibling's
+    // pending group publication.
+    try testing.expect(s.remove("alice", 2));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    const surviving = s.sessionsInto("alice", &alice_rows);
+    try testing.expectEqual(@as(usize, 1), surviving.len);
+    try testing.expect(!surviving[0].portable_resume);
+    try testing.expect(surviving[0].replica_dirty);
+
+    // Collection is caller-bounded, allocation-free, and unique even though
+    // token A's credential-issuing row has already disappeared.
+    var one: [1]Token = undefined;
+    try testing.expectEqual(@as(usize, 1), s.dirtyPortableTokensInto(&one).len);
+    var all: [4]Token = undefined;
+    const dirty = s.dirtyPortableTokensInto(&all);
+    try testing.expectEqual(@as(usize, 2), dirty.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (dirty) |token| {
+        saw_a = saw_a or std.mem.eql(u8, &token, &tok(0xA1));
+        saw_b = saw_b or std.mem.eql(u8, &token, &tok(0xB2));
+    }
+    try testing.expect(saw_a and saw_b);
+
+    // Acceptance clears only its exact group; failed/unaccepted work remains.
+    try testing.expect(s.clearTokenReplicaDirty(tok(0xA1)));
+    try testing.expect(!s.tokenReplicaDirty(tok(0xA1)));
+    try testing.expect(s.tokenReplicaDirty(tok(0xB2)));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    const retained = s.dirtyPortableTokensInto(&all);
+    try testing.expectEqual(@as(usize, 1), retained.len);
+    try testing.expectEqualSlices(u8, &tok(0xB2), &retained[0]);
+    try testing.expect(s.clearTokenReplicaDirty(tok(0xA1))); // idempotent
+    try testing.expect(!s.clearTokenReplicaDirty(tok(0xEE)));
+}
+
+test "join and adopt OR dirty portable state across token groups" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0x11), 1);
+    _ = try s.attach("alice", 2, tok(0x22), 2);
+    _ = try s.attach("alice", 3, tok(0x33), 3);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(tok(0x11)));
+
+    // Moving the dirty source into an existing clean group dirties every
+    // destination sibling without losing its pending retry. Per-row portable
+    // issuance stays exact.
+    try testing.expect(s.joinTokenGroup("alice", 1, tok(0x22)));
+    var rows: [8]Session = undefined;
+    const joined = s.sessionsInto("alice", &rows);
+    for (joined) |session| {
+        if (!std.mem.eql(u8, &session.token, &tok(0x22))) continue;
+        try testing.expectEqual(session.client == 1, session.portable_resume);
+        try testing.expect(session.replica_dirty);
+    }
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+
+    // A clean adopted attachment inherits the destination group's OR state.
+    try testing.expect(s.adoptTokenGroup("alice", 3, tok(0x22), false));
+    try testing.expectEqual(@as(usize, 3), s.dirtyReplicaRowCount());
+    for (s.sessionsInto("alice", &rows)) |session| {
+        try testing.expectEqualSlices(u8, &tok(0x22), &session.token);
+        try testing.expectEqual(session.client == 1, session.portable_resume);
+        try testing.expect(session.replica_dirty);
+    }
+}
+
+test "bounded dirty collection rotates past an uncleared failing token" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    for (0..9) |i| {
+        var account_buf: [16]u8 = undefined;
+        const account = try std.fmt.bufPrint(&account_buf, "rotate-{d}", .{i});
+        const token = tok(@intCast(0x60 + i));
+        _ = try s.attach(account, @intCast(i + 1), token, @intCast(i));
+        try testing.expect(s.markPortableResumeIssued(account, @intCast(i + 1)));
+        try testing.expect(s.markTokenReplicaDirty(token));
+    }
+
+    var first_buf: [4]Token = undefined;
+    const first = s.dirtyPortableTokensInto(&first_buf);
+    try testing.expectEqual(@as(usize, 4), first.len);
+
+    // Nothing is cleared: model all four publications failing. The next batch
+    // still advances to four other unique groups instead of returning the same
+    // stable hash-map prefix forever.
+    var second_buf: [4]Token = undefined;
+    const second = s.dirtyPortableTokensInto(&second_buf);
+    try testing.expectEqual(@as(usize, 4), second.len);
+    for (second) |token| try testing.expect(!SessionStore.tokenInSlice(first, token));
+
+    // Remove the cursor token itself. Ordering by the retained token value (not
+    // a hash-map position) still advances to 0x68 before wrapping to 0x60.
+    try testing.expect(s.remove("rotate-7", 8));
+    var third_buf: [4]Token = undefined;
+    const third = s.dirtyPortableTokensInto(&third_buf);
+    try testing.expectEqual(@as(usize, 4), third.len);
+    try testing.expectEqualSlices(u8, &tok(0x68), &third[0]);
+    try testing.expectEqualSlices(u8, &tok(0x60), &third[1]);
+    try testing.expectEqualSlices(u8, &tok(0x61), &third[2]);
+    try testing.expectEqualSlices(u8, &tok(0x62), &third[3]);
+    try testing.expectEqual(@as(usize, 8), s.dirtyReplicaRowCount());
+}
+
+test "projection retry is group-wide durable and independent from publish retry" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0x71), 1);
+    _ = try s.attach("alice", 2, tok(0x71), 2);
+
+    // Signed Store acceptance, not local token issuance, authorizes projection.
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(0x71)));
+    try testing.expect(!s.markTokenReplicaProjectionDirty(tok(0x72)));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+
+    var rows: [4]Session = undefined;
+    for (s.sessionsInto("alice", &rows)) |session| {
+        try testing.expect(session.replica_projection_dirty);
+        try testing.expect(!session.replica_dirty);
+    }
+    var projection_buf: [2]Token = undefined;
+    const projection = s.dirtyProjectionTokensInto(&projection_buf);
+    try testing.expectEqual(@as(usize, 1), projection.len);
+    try testing.expectEqualSlices(u8, &tok(0x71), &projection[0]);
+
+    // Removing one sibling and attaching another to its exact token preserves
+    // the pending projection and the exact row count.
+    try testing.expect(s.remove("alice", 1));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+    _ = try s.attach("alice", 3, tok(0x73), 3);
+    try testing.expect(s.adoptTokenGroup("alice", 3, tok(0x71), false));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+
+    // Publish dirtiness can coexist, and clearing projection cannot clear it.
+    try testing.expect(s.markPortableResumeIssued("alice", 2));
+    try testing.expect(s.markTokenReplicaDirty(tok(0x71)));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    try testing.expect(s.clearTokenReplicaProjectionDirty(tok(0x71)));
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+    try testing.expect(!s.clearTokenReplicaProjectionDirty(tok(0xEE)));
+}
+
+test "bounded projection collection rotates independently without allocation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    for (0..9) |i| {
+        var account_buf: [20]u8 = undefined;
+        const account = try std.fmt.bufPrint(&account_buf, "projection-{d}", .{i});
+        const token = tok(@intCast(0x80 + i));
+        _ = try s.attach(account, @intCast(i + 1), token, @intCast(i));
+        try testing.expect(s.markTokenReplicaProjectionDirty(token));
+    }
+
+    var first_buf: [4]Token = undefined;
+    const first = s.dirtyProjectionTokensInto(&first_buf);
+    try testing.expectEqual(@as(usize, 4), first.len);
+    var second_buf: [4]Token = undefined;
+    const second = s.dirtyProjectionTokensInto(&second_buf);
+    try testing.expectEqual(@as(usize, 4), second.len);
+    for (second) |token| try testing.expect(!SessionStore.tokenInSlice(first, token));
+
+    // Advancing projection did not move or populate the independent publish
+    // cursor/lane.
+    var publish_buf: [4]Token = undefined;
+    try testing.expectEqual(@as(usize, 0), s.dirtyPortableTokensInto(&publish_buf).len);
+    try testing.expectEqual(@as(usize, 9), s.dirtyReplicaProjectionRowCount());
+}
+
+test "projection dirty count tracks replacement eviction and drop paths" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0x91), 1);
+    _ = try s.attach("alice", 2, tok(0x91), 2);
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(0x91)));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+
+    // A new token resets the replaced row while the surviving old-token group
+    // remains pending.
+    _ = try s.attach("alice", 1, tok(0x92), 3);
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+    // Replacing it back into the dirty token inherits the destination OR state.
+    _ = try s.attach("alice", 1, tok(0x91), 4);
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+
+    try testing.expect(s.markDetached("alice", 1));
+    _ = try s.attach("alice", 3, tok(0x93), 5); // evicts dirty detached row 1
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+    try testing.expectEqual(@as(usize, 1), s.removeClient(2));
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaProjectionRowCount());
+
+    _ = try s.attach("drop", 9, tok(0x99), 9);
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(0x99)));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaProjectionRowCount());
+    try testing.expect(s.remove("drop", 9)); // prunes the now-empty account
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaProjectionRowCount());
+}
+
+test "dirty row count survives removal replacement and detached eviction" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0x41), 1);
+    _ = try s.attach("alice", 2, tok(0x41), 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(tok(0x41)));
+    try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
+
+    try testing.expect(s.remove("alice", 1));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 1), s.removeClient(2));
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+
+    _ = try s.attach("evict", 10, tok(0x51), 10);
+    try testing.expect(s.markPortableResumeIssued("evict", 10));
+    try testing.expect(s.markTokenReplicaDirty(tok(0x51)));
+    try testing.expect(s.markDetached("evict", 10));
+    _ = try s.attach("evict", 11, tok(0x52), 20);
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    _ = try s.attach("evict", 12, tok(0x53), 30); // evicts dirty client 10
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
+
+    try testing.expect(s.markPortableResumeIssued("evict", 11));
+    try testing.expect(s.markTokenReplicaDirty(tok(0x52)));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    _ = try s.attach("evict", 11, tok(0x54), 40); // same-client replacement
+    try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
 }
 
 test "sessionsInto and findByTokenInto do not retain snapshots" {

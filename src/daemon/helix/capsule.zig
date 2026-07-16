@@ -123,12 +123,11 @@ pub const registry = [_]Descriptor{
     // capsules sealed by pre-bump binaries; `ws_snapshot.decode` is version-aware.
     .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
-    // One staged cross-mesh session-migration entry (a `session_migrate.encode`
-    // wire blob: token + account + verified snapshot), one capsule per entry, so
-    // migrations staged by a peer just before a USR2 survive the swap instead of
-    // dying with the predecessor (the client's reclaim would silently fall back
-    // to the legacy redirect).
-    .{ .kind = .pending_migration, .schema_id = 0x4850_4d47, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v1 carried one staged migration per capsule and necessarily lost ordering,
+    // lease, and consumed-token metadata. v2 carries one integrity-checked PMST
+    // checkpoint for the complete PendingMigrations store, so adoption is atomic
+    // and a corrupt/incomplete successor state cannot open a replay window.
+    .{ .kind = .pending_migration, .schema_id = 0x4850_4d47, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     // One carried per-client MONITOR watch list (a `monitor_capsule` wire blob;
     // its client_id field carries the inherited socket FD — the same join key
     // the TLS/WS capsules use — NOT a client id, which does not survive the

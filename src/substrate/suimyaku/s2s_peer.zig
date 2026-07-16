@@ -28,6 +28,7 @@ pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
 pub const MemberInfo = route_table.Member;
 pub const MemberIdentity = route_table.MemberIdentity;
+pub const SessionToken = route_table.SessionToken;
 pub const NickClaim = route_table.NickClaim;
 pub const ChannelModeFlags = route_table.ChannelModeFlags;
 pub const ChannelNameIterator = route_table.RouteTable.ChannelNameIterator;
@@ -37,20 +38,108 @@ pub const RelayVerb = message_relay.Verb;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 pub const LocalNickResolver = route_table.LocalNickResolver;
 pub const SessionReplicaKind = session_replica_frame.Kind;
+pub const SessionTokenReconcileResult = route_table.SessionTokenReconcileResult;
 
 /// RECEIVER-SIDE account-residence verifier seam (Design C, the F1 proper fix).
 /// The daemon supplies a callback that verifies an incoming claim's residence
 /// proof — looked up from the RECEIVER-OWNED replicated `identity.residence.*`
 /// and `identity.key.*` props, never from any wire field — binding
-/// `{account, origin_node}`. The peer driver consults it to compute the
-/// PER-CLAIM `account_trusted` bool it passes to `resolveIncomingNick`.
-/// Absent (null) ⇒ nothing is ever trusted ⇒ the conservative UID path.
+/// `{account, nick, origin_node}`. The peer driver consults it per claim: trusted
+/// reaches account-aware collision resolution, untrusted takes the conservative
+/// path, and reject is dropped before RouteTable mutation. Absent means untrusted.
+pub const ResidenceDecision = enum {
+    untrusted,
+    trusted,
+    reject,
+};
+
 pub const ResidenceVerifier = struct {
     ctx: *anyopaque,
-    verify_fn: *const fn (ctx: *anyopaque, account: []const u8, origin_node: NodeId) bool,
+    verify_fn: *const fn (
+        ctx: *anyopaque,
+        account: []const u8,
+        nick: []const u8,
+        origin_node: NodeId,
+        session_replica_v2_negotiated: bool,
+    ) ResidenceDecision,
 
-    pub fn verify(self: ResidenceVerifier, account: []const u8, origin_node: NodeId) bool {
-        return self.verify_fn(self.ctx, account, origin_node);
+    pub fn verify(
+        self: ResidenceVerifier,
+        account: []const u8,
+        nick: []const u8,
+        origin_node: NodeId,
+        session_replica_v2_negotiated: bool,
+    ) ResidenceDecision {
+        return self.verify_fn(self.ctx, account, nick, origin_node, session_replica_v2_negotiated);
+    }
+};
+
+/// Receiver-side decision for attaching a signed logical-session identity to a
+/// compatibility MEMBERSHIP row. The token is never decoded from that frame:
+/// the daemon derives it from its own signed SESSION_REPLICA authority.
+pub const SessionTokenDecision = union(enum) {
+    /// No unique live authority exists. Preserve interoperability, but leave the
+    /// row unbound so exact-token reconciliation can never delete it.
+    unbound,
+    /// This membership fact belongs to the exact signed logical session.
+    bind: SessionToken,
+    /// Receiver-owned authority proves the fact stale or contradictory. Drop it
+    /// before collision resolution, route-table mutation, or daemon deltas.
+    reject,
+};
+
+pub const SessionTokenResolver = struct {
+    ctx: *anyopaque,
+    resolve_fn: *const fn (
+        ctx: *anyopaque,
+        origin_node: NodeId,
+        nick: []const u8,
+        channel: []const u8,
+        present: bool,
+    ) SessionTokenDecision,
+
+    pub fn resolve(
+        self: SessionTokenResolver,
+        origin_node: NodeId,
+        nick: []const u8,
+        channel: []const u8,
+        present: bool,
+    ) SessionTokenDecision {
+        return self.resolve_fn(self.ctx, origin_node, nick, channel, present);
+    }
+};
+
+pub const SessionTokenNickDecision = union(enum) {
+    reject,
+    /// No retained signed authority exists for either identity. Preserve the
+    /// compatibility NICK path without inventing receiver token metadata.
+    legacy,
+    /// Store selected one exact logical session. The route layer binds this
+    /// token to every affected row before its transactional rename.
+    bind: SessionToken,
+};
+
+/// Receiver-owned authorization for a peer-controlled NICKCHANGE touching an
+/// exact-token roster identity. The daemon returns the Store-selected token,
+/// distinguishes true legacy traffic, or rejects the transition.
+pub const SessionTokenNickAuthorizer = struct {
+    ctx: *anyopaque,
+    authorize_fn: *const fn (
+        ctx: *anyopaque,
+        origin_node: NodeId,
+        old_nick: []const u8,
+        tagged_token: ?SessionToken,
+        new_nick: []const u8,
+    ) SessionTokenNickDecision,
+
+    pub fn authorize(
+        self: SessionTokenNickAuthorizer,
+        origin_node: NodeId,
+        old_nick: []const u8,
+        tagged_token: ?SessionToken,
+        new_nick: []const u8,
+    ) SessionTokenNickDecision {
+        return self.authorize_fn(self.ctx, origin_node, old_nick, tagged_token, new_nick);
     }
 };
 
@@ -211,6 +300,21 @@ pub const InboundSessionReplica = struct {
     }
 };
 
+/// NICK/MEMBERSHIP frames on a negotiated v2 link are residence-dependent.
+/// They must remain in original wire order until the daemon has applied every
+/// SESSION_REPLICA object from the same socket read to its authoritative Store.
+const DeferredResidenceFrame = struct {
+    const Kind = enum { membership, nick_change };
+
+    kind: Kind,
+    payload: []u8,
+
+    fn deinit(self: *DeferredResidenceFrame, allocator: Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
 pub const S2sPeer = struct {
     allocator: Allocator,
     decoder: s2s_frame.Decoder,
@@ -278,6 +382,13 @@ pub const S2sPeer = struct {
     /// and always on non-daemon/test peers) ⇒ no account is ever trusted ⇒ every
     /// same-account short-circuit stays on the conservative UID path.
     residence_verifier: ?ResidenceVerifier = null,
+    /// Receiver-owned exact-session resolver. Null deliberately means unbound:
+    /// compatibility MEMBERSHIP still converges, but later token reconciliation
+    /// cannot mistake an ambiguous row for signed session authority.
+    session_token_resolver: ?SessionTokenResolver = null,
+    /// Exact-token NICKCHANGE gate. Null is deliberately fail-closed for a
+    /// token-tagged old identity; unbound compatibility nicks remain legacy.
+    session_token_nick_authorizer: ?SessionTokenNickAuthorizer = null,
     /// Frames dropped because the peer's signed MeshPass token did not authorize
     /// the frame catalog family at runtime.
     rejected_admission_frames: u64 = 0,
@@ -334,6 +445,9 @@ pub const S2sPeer = struct {
     /// daemon's inner Helix signature/semantic verification. Each item retains
     /// the authenticated immediate hop for future multipath routing decisions.
     session_replica_frames: std.ArrayListUnmanaged(InboundSessionReplica) = .empty,
+    /// Bounded wire-ordered sidecars held across the feed/daemon Store boundary.
+    /// Legacy/non-v2 links never enter this queue and retain immediate behavior.
+    deferred_residence_frames: std.ArrayListUnmanaged(DeferredResidenceFrame) = .empty,
     dropped_session_replica_frames: u64 = 0,
     rejected_session_replica_frames: u64 = 0,
     /// Inbound CLONE_COUNT payloads (raw `mesh_clones` counts-codec bytes) from
@@ -568,6 +682,8 @@ pub const S2sPeer = struct {
         self.session_migration_consumed.deinit(self.allocator);
         for (self.session_replica_frames.items) |*frame| frame.deinit(self.allocator);
         self.session_replica_frames.deinit(self.allocator);
+        for (self.deferred_residence_frames.items) |*frame| frame.deinit(self.allocator);
+        self.deferred_residence_frames.deinit(self.allocator);
         for (self.clone_counts.items) |m| self.allocator.free(m);
         self.clone_counts.deinit(self.allocator);
         for (self.oper_events.items) |m| self.allocator.free(m);
@@ -777,11 +893,17 @@ pub const S2sPeer = struct {
             },
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
-            .MEMBERSHIP => try self.recvMembership(frame.payload, now_ms),
+            .MEMBERSHIP => if (self.supportsSessionReplicaV2())
+                self.deferResidenceFrame(.membership, frame.payload)
+            else
+                try self.recvMembership(frame.payload, now_ms),
             .CHANNEL_MODE_FLAGS => try self.recvChannelModeFlags(frame.payload),
             .CHANNEL_LIST => try self.recvChannelList(frame.payload),
             .TOPIC => try self.recvTopic(frame.payload),
-            .NICKCHANGE => try self.recvNickChange(frame.payload),
+            .NICKCHANGE => if (self.supportsSessionReplicaV2())
+                self.deferResidenceFrame(.nick_change, frame.payload)
+            else
+                try self.recvNickChange(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
@@ -904,10 +1026,77 @@ pub const S2sPeer = struct {
         return self.session_replica_frames.toOwnedSlice(self.allocator);
     }
 
+    /// Allocation-free ordered ownership transfer for the daemon hot path. The
+    /// queue is capped at 64, so ordered removal is bounded and preserves wire
+    /// order without a toOwnedSlice allocation that could split the authority
+    /// and residence sides of one feed under OOM.
+    pub fn takeNextSessionReplicaFrame(self: *S2sPeer) ?InboundSessionReplica {
+        if (self.session_replica_frames.items.len == 0) return null;
+        return self.session_replica_frames.orderedRemove(0);
+    }
+
     pub fn takeDroppedSessionReplicaFrames(self: *S2sPeer) u64 {
         const count = self.dropped_session_replica_frames;
         self.dropped_session_replica_frames = 0;
         return count;
+    }
+
+    fn deferResidenceFrame(
+        self: *S2sPeer,
+        kind: DeferredResidenceFrame.Kind,
+        outer_payload: []const u8,
+    ) void {
+        const frame_type: s2s_frame.FrameType = switch (kind) {
+            .membership => .MEMBERSHIP,
+            .nick_change => .NICKCHANGE,
+        };
+        // Authenticate the outer hop before allocating, then validate the small
+        // family codec and retain only its inner payload. An attacker can no
+        // longer pin max-frame-sized signed envelopes in this 64-item queue.
+        const payload = self.verifiedPayload(frame_type, outer_payload) orelse return;
+        switch (kind) {
+            .membership => _ = membership_event.decode(payload) catch return,
+            .nick_change => _ = nick_event.decode(payload) catch return,
+        }
+        if (self.deferred_residence_frames.items.len >= self.config.max_session_replica_frames) {
+            self.dropped_session_replica_frames +|= 1;
+            return;
+        }
+        const owned = self.allocator.dupe(u8, payload) catch {
+            self.dropped_session_replica_frames +|= 1;
+            return;
+        };
+        self.deferred_residence_frames.append(self.allocator, .{
+            .kind = kind,
+            .payload = owned,
+        }) catch {
+            self.allocator.free(owned);
+            self.dropped_session_replica_frames +|= 1;
+        };
+    }
+
+    /// Apply v2 residence-dependent sidecars only after the daemon has committed
+    /// every queued authority object from the same feed. One mixed queue retains
+    /// NICK/MEMBERSHIP wire order across the family boundary.
+    pub fn processDeferredResidenceFrames(self: *S2sPeer, now_ms: u64) void {
+        // Processing cannot append to this queue, so consume in place. This
+        // avoids a toOwnedSlice allocation whose OOM path could strand an old
+        // batch until after unrelated authority arrived.
+        for (self.deferred_residence_frames.items) |*frame| {
+            defer frame.deinit(self.allocator);
+            switch (frame.kind) {
+                .membership => self.applyMembershipPayload(frame.payload, now_ms) catch {},
+                .nick_change => self.applyNickChangePayload(frame.payload) catch {},
+            }
+        }
+        self.deferred_residence_frames.clearRetainingCapacity();
+    }
+
+    /// A dropped authority/sidecar frame makes the feed incomplete. Discard all
+    /// correlated token-less claims; the daemon requests RESYNC from the peer.
+    pub fn discardDeferredResidenceFrames(self: *S2sPeer) void {
+        for (self.deferred_residence_frames.items) |*frame| frame.deinit(self.allocator);
+        self.deferred_residence_frames.clearRetainingCapacity();
     }
 
     /// True only on an established, signing-key-backed link where the remote
@@ -1439,6 +1628,72 @@ pub const S2sPeer = struct {
         self.residence_verifier = verifier;
     }
 
+    /// Install (or clear) the receiver-owned signed-session resolver. Borrowed;
+    /// the daemon must keep the callback context alive for the link lifetime.
+    pub fn setSessionTokenResolver(self: *S2sPeer, resolver: ?SessionTokenResolver) void {
+        self.session_token_resolver = resolver;
+    }
+
+    /// Install (or clear) the receiver-owned exact-token NICKCHANGE gate.
+    pub fn setSessionTokenNickAuthorizer(self: *S2sPeer, authorizer: ?SessionTokenNickAuthorizer) void {
+        self.session_token_nick_authorizer = authorizer;
+    }
+
+    /// Retroactively bind or clear exact-token metadata after signed authority
+    /// arrives later than the compatibility MEMBERSHIP fact.
+    pub fn rebindSessionToken(self: *S2sPeer, origin_node: NodeId, nick: []const u8, token: ?SessionToken) route_table.Error!usize {
+        return self.routes.rebindSessionToken(origin_node, nick, token);
+    }
+
+    /// Reconcile exact-token rows against the signed Store projection. Owned
+    /// NICK/PART deltas are queued before route mutation; allocation failure
+    /// leaves the affected identity present and is returned for daemon retry.
+    pub fn reconcileSessionToken(
+        self: *S2sPeer,
+        token: SessionToken,
+        desired_nick: ?[]const u8,
+        desired_channels: []const []const u8,
+    ) route_table.Error!route_table.SessionTokenReconcileResult {
+        return self.routes.reconcileSessionTokenObserved(token, desired_nick, desired_channels, .{
+            .ctx = self,
+            .part_fn = queueReconciledSessionPart,
+            .rename_fn = queueReconciledSessionRename,
+        });
+    }
+
+    fn queueReconciledSessionPart(ctx: *anyopaque, channel: []const u8, member: *const route_table.Member) std.mem.Allocator.Error!void {
+        const self: *S2sPeer = @ptrCast(@alignCast(ctx));
+        try self.queueMembershipValues(channel, member.nick, member.username, member.realname, member.host, "", member.account, .parted, member.status, member.status);
+    }
+
+    fn queueReconciledSessionRename(ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, member: *const route_table.Member) std.mem.Allocator.Error!void {
+        const self: *S2sPeer = @ptrCast(@alignCast(ctx));
+        try self.queueForcedNickRename(old_nick, new_nick, .{
+            .username = member.username,
+            .realname = member.realname,
+            .host = member.host,
+            .account = member.account,
+        });
+    }
+
+    const WireNickRenameContext = struct {
+        peer: *S2sPeer,
+        ident: MemberIdentity,
+    };
+
+    fn rejectWireNickPart(_: *anyopaque, _: []const u8, _: *const route_table.Member) std.mem.Allocator.Error!void {
+        unreachable;
+    }
+
+    fn queueAuthorizedWireNick(ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, _: *const route_table.Member) std.mem.Allocator.Error!void {
+        const wire: *WireNickRenameContext = @ptrCast(@alignCast(ctx));
+        try wire.peer.queueForcedNickRename(old_nick, new_nick, wire.ident);
+    }
+
+    pub fn setLocalNickResolver(self: *S2sPeer, resolver: ?LocalNickResolver) void {
+        self.routes.setLocalNickResolver(resolver);
+    }
+
     /// The PER-CLAIM `account_trusted` bool for an incoming membership/nick
     /// claim (Design C verify order, fail-closed — ALL must hold or false):
     ///   1. the claim carries an account at all;
@@ -1447,15 +1702,19 @@ pub const S2sPeer = struct {
     ///      pinned `originShortId(pubkey)`) against a KNOWN remote node id —
     ///      an unsigned/plaintext link can never yield trust;
     ///   3. the daemon's verifier confirms a live residence proof binding
-    ///      `{account, origin_node}` against the receiver-owned replicated
+    ///      `{account, nick, origin_node}` against the receiver-owned replicated
     ///      account pubkey.
-    /// False ⇒ the resolver blanks the wire account and the claim takes the
-    /// conservative UID path — today's safe behaviour, so F1 never reopens.
-    fn accountResidenceTrusted(self: *S2sPeer, account: []const u8, origin_node: NodeId) bool {
-        if (account.len == 0) return false;
-        if (!self.peer_supports_signing or self.remote_node_id == 0) return false;
-        const verifier = self.residence_verifier orelse return false;
-        return verifier.verify(account, origin_node);
+    /// Untrusted ⇒ the resolver blanks the wire account and takes the conservative
+    /// collision path. Reject ⇒ the claim is dropped before RouteTable mutation.
+    fn accountResidenceDecision(self: *S2sPeer, account: []const u8, nick: []const u8, origin_node: NodeId) ResidenceDecision {
+        const verifier = self.residence_verifier orelse return .untrusted;
+        const decision = verifier.verify(account, nick, origin_node, self.supportsSessionReplicaV2());
+        // Downgrade rejection is receiver-owned and must run even when the peer
+        // also omits signing. Only positive trust depends on authenticated origin;
+        // an unsigned/plaintext transport can never upgrade an account claim.
+        if (decision == .trusted and
+            (account.len == 0 or !self.peer_supports_signing or self.remote_node_id == 0)) return .untrusted;
+        return decision;
     }
 
     fn acceptsDirectOrigin(self: *S2sPeer, origin_node: NodeId) bool {
@@ -1564,6 +1823,10 @@ pub const S2sPeer = struct {
     /// status-change is queued so the daemon can emit the matching live IRC line.
     fn recvMembership(self: *S2sPeer, frame_payload: []const u8, now_ms: u64) !void {
         const payload = self.verifiedPayload(.MEMBERSHIP, frame_payload) orelse return;
+        try self.applyMembershipPayload(payload, now_ms);
+    }
+
+    fn applyMembershipPayload(self: *S2sPeer, payload: []const u8, now_ms: u64) !void {
         const ev = membership_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         // The RECEIVER's local clock at apply time; stamped onto each present
@@ -1587,6 +1850,36 @@ pub const S2sPeer = struct {
         // account). Blank by default so a part (present=false) is also account-
         // less; set below for a trusted present claim.
         var store_account: []const u8 = "";
+        const residence = self.accountResidenceDecision(ev.account, ev.nick, ev.origin_node);
+        // A non-v2 claim for an identity already governed by retained signed
+        // token authority is a downgrade, not an ordinary untrusted collision.
+        // Drop it before RouteTable resolution so it cannot create a UID phantom
+        // route, daemon delta, or NAMES entry.
+        if (residence == .reject) return;
+        const session_token: ?SessionToken = if (self.session_token_resolver) |resolver|
+            switch (resolver.resolve(ev.origin_node, ev.nick, ev.channel, ev.present)) {
+                .unbound => null,
+                .bind => |token| token,
+                .reject => return,
+            }
+        else
+            null;
+        var prior_alias = false;
+        // A prior JOIN may have lost a collision and been stored under this
+        // origin's deterministic UID. Prefer that receiver-owned alias for every
+        // later status/reaffirm/PART, even if the original collision disappeared,
+        // so the route never splits into real-nick + UID zombies and deltas name
+        // what clients actually saw.
+        const prior_uid = if (ev.present)
+            self.routes.storedLoserUid(ev.origin_node, ev.nick)
+        else
+            self.routes.channelLoserUid(ev.channel, ev.origin_node, ev.nick);
+        if (prior_uid) |uid| {
+            @memcpy(uid_buf[0..uid.len], uid[0..]);
+            apply_nick = uid_buf[0..uid.len];
+            surfaced_nick = apply_nick;
+            prior_alias = true;
+        }
         if (ev.present) {
             // Design C (F1): the plaintext wire `account` is only honored by the
             // same-identity collision short-circuits when a residence proof
@@ -1594,9 +1887,9 @@ pub const S2sPeer = struct {
             // origin-authenticated link, against receiver-owned keys. When
             // false, resolveIncomingNick blanks the account internally so the
             // claim takes the conservative UID path.
-            const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
+            const account_trusted = residence == .trusted;
             store_account = if (account_trusted) ev.account else "";
-            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
+            if (!prior_alias) switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
                     // Newcomer lost: store + surface this member under its UID.
@@ -1631,15 +1924,17 @@ pub const S2sPeer = struct {
                         .account = store_account, // P2: only the trusted account is persisted
                         .real_host = ev.real_host,
                         .certfp = ev.certfp,
+                        .session_token = session_token,
                     }, local_now) catch {};
                     self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
                     return;
                 },
-            }
+            };
             // Newcomer wins over a different-node incumbent: displace the
             // incumbent to ITS uid first so two holders never coexist. Skipped for
             // a same-account reconcile, where LWW collapses the duplicate instead.
-            if (surfaced_nick == null and !skip_displace) self.displaceIncumbent(&ev);
+            if (!prior_alias and surfaced_nick == null and !skip_displace and
+                !self.displaceIncumbent(&ev)) return;
         }
 
         const res = self.routes.applyMembership(ev.channel, apply_nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
@@ -1649,6 +1944,7 @@ pub const S2sPeer = struct {
             .account = store_account, // P2: blanked unless residence-trusted
             .real_host = ev.real_host,
             .certfp = ev.certfp,
+            .session_token = session_token,
         }, local_now) catch return;
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
@@ -1664,8 +1960,8 @@ pub const S2sPeer = struct {
     /// the route table and surface a `:contested NICK <incumbentUID>` line, so
     /// local clients never see the same nick held by two mesh users at once. No-op
     /// when there is no incumbent or the incumbent is the SAME node (own update).
-    fn displaceIncumbent(self: *S2sPeer, ev: *const membership_event.MembershipEvent) void {
-        self.displaceIncumbentForRename(ev.nick, ev.origin_node);
+    fn displaceIncumbent(self: *S2sPeer, ev: *const membership_event.MembershipEvent) bool {
+        return self.displaceIncumbentForRename(ev.nick, ev.origin_node);
     }
 
     /// Shared incumbent-displacement: when a winning newcomer from `winner_node`
@@ -1673,10 +1969,10 @@ pub const S2sPeer = struct {
     /// own mesh UID across the route table and surface a `:nick NICK <incumbentUID>`
     /// line, so local clients never see two mesh users holding one nick. No-op when
     /// there is no incumbent or it is the same node (an own update, not a contest).
-    fn displaceIncumbentForRename(self: *S2sPeer, nick: []const u8, winner_node: NodeId) void {
-        const incumbent_node = self.routes.nickNode(nick) orelse return;
-        if (incumbent_node == winner_node) return;
-        const uid = self.routes.incumbentLoserUid(nick) orelse return;
+    fn displaceIncumbentForRename(self: *S2sPeer, nick: []const u8, winner_node: NodeId) bool {
+        const incumbent_node = self.routes.nickNode(nick) orelse return true;
+        if (incumbent_node == winner_node) return true;
+        const uid = self.routes.incumbentLoserUid(nick) orelse return false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
         @memcpy(uid_buf[0..uid.len], uid[0..]);
         const new_nick = uid_buf[0..uid.len];
@@ -1686,9 +1982,10 @@ pub const S2sPeer = struct {
         if (self.routes.findMember(nick)) |m| {
             ident = .{ .username = m.username, .realname = m.realname, .host = m.host, .account = m.account };
         }
-        const renamed = self.routes.renameNick(nick, new_nick, incumbent_node, ident) catch return;
-        if (!renamed) return;
+        const renamed = self.routes.renameNick(nick, new_nick, incumbent_node, ident) catch return false;
+        if (!renamed) return false;
         self.queueForcedNickRename(nick, new_nick, ident) catch {}; // best-effort surface
+        return true;
     }
 
     /// Queue a NickDelta for a forced collision rename so the daemon emits the
@@ -1700,6 +1997,20 @@ pub const S2sPeer = struct {
         new_nick: []const u8,
         ident: MemberIdentity,
     ) !void {
+        var delta = try self.ownedNickDelta(old_nick, new_nick, ident);
+        errdefer delta.deinit(self.allocator);
+        try self.nick_changes.append(self.allocator, delta);
+    }
+
+    /// Build one fully-owned NICK delta without publishing it. Collision
+    /// transactions use this to stage both the incumbent displacement and exact
+    /// rename before either route-table identity is allowed to move.
+    fn ownedNickDelta(
+        self: *S2sPeer,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        ident: MemberIdentity,
+    ) !NickDelta {
         const on = try self.allocator.dupe(u8, old_nick);
         errdefer self.allocator.free(on);
         const nn = try self.allocator.dupe(u8, new_nick);
@@ -1710,13 +2021,63 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(rn);
         const ho = try self.allocator.dupe(u8, ident.host);
         errdefer self.allocator.free(ho);
-        try self.nick_changes.append(self.allocator, .{
+        return .{
             .old_nick = on,
             .new_nick = nn,
             .username = un,
             .realname = rn,
             .host = ho,
-        });
+        };
+    }
+
+    /// Commit the exact-token winner and foreign incumbent as one collision
+    /// transaction. Both deltas and queue capacity exist before the RouteTable's
+    /// no-fail commit; false/error leaves spellings, routes, token tags, and the
+    /// observable delta queue unchanged.
+    fn applyAuthorizedSessionTokenCollisionRename(
+        self: *S2sPeer,
+        node: NodeId,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        token: SessionToken,
+        ident: MemberIdentity,
+        incumbent_node: NodeId,
+        incumbent_uid: []const u8,
+    ) !bool {
+        const incumbent = self.routes.findMemberOwnedBy(new_nick, incumbent_node) orelse return false;
+        const incumbent_ident = MemberIdentity{
+            .username = incumbent.username,
+            .realname = incumbent.realname,
+            .host = incumbent.host,
+            .account = incumbent.account,
+        };
+
+        var incumbent_delta = try self.ownedNickDelta(new_nick, incumbent_uid, incumbent_ident);
+        var incumbent_delta_owned = true;
+        defer if (incumbent_delta_owned) incumbent_delta.deinit(self.allocator);
+        var exact_delta = try self.ownedNickDelta(old_nick, new_nick, ident);
+        var exact_delta_owned = true;
+        defer if (exact_delta_owned) exact_delta.deinit(self.allocator);
+        try self.nick_changes.ensureUnusedCapacity(self.allocator, 2);
+
+        const renamed = try self.routes.renameNickBindingSessionTokenDisplacing(
+            node,
+            old_nick,
+            new_nick,
+            token,
+            ident,
+            incumbent_node,
+            incumbent_uid,
+        );
+        if (!renamed) return false;
+
+        // Vacate the contested nick before publishing the exact winner, matching
+        // IRC's required observable order while both state mutations are atomic.
+        self.nick_changes.appendAssumeCapacity(incumbent_delta);
+        incumbent_delta_owned = false;
+        self.nick_changes.appendAssumeCapacity(exact_delta);
+        exact_delta_owned = false;
+        return true;
     }
 
     /// Dupe an event's strings into an owned `MembershipDelta` and queue it.
@@ -1730,19 +2091,46 @@ pub const S2sPeer = struct {
         prev_status: u4,
         nick_override: ?[]const u8,
     ) !void {
-        const ch = try self.allocator.dupe(u8, ev.channel);
+        try self.queueMembershipValues(
+            ev.channel,
+            nick_override orelse ev.nick,
+            ev.username,
+            ev.realname,
+            ev.host,
+            ev.setter,
+            ev.account,
+            kind,
+            ev.status,
+            prev_status,
+        );
+    }
+
+    fn queueMembershipValues(
+        self: *S2sPeer,
+        channel: []const u8,
+        nick: []const u8,
+        username_value: []const u8,
+        realname_value: []const u8,
+        host_value: []const u8,
+        setter_value: []const u8,
+        account_value: []const u8,
+        kind: MembershipDelta.Kind,
+        status: u4,
+        prev_status: u4,
+    ) !void {
+        const ch = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(ch);
-        const nk = try self.allocator.dupe(u8, nick_override orelse ev.nick);
+        const nk = try self.allocator.dupe(u8, nick);
         errdefer self.allocator.free(nk);
-        const un = try self.allocator.dupe(u8, ev.username);
+        const un = try self.allocator.dupe(u8, username_value);
         errdefer self.allocator.free(un);
-        const rn = try self.allocator.dupe(u8, ev.realname);
+        const rn = try self.allocator.dupe(u8, realname_value);
         errdefer self.allocator.free(rn);
-        const ho = try self.allocator.dupe(u8, ev.host);
+        const ho = try self.allocator.dupe(u8, host_value);
         errdefer self.allocator.free(ho);
-        const st = try self.allocator.dupe(u8, ev.setter);
+        const st = try self.allocator.dupe(u8, setter_value);
         errdefer self.allocator.free(st);
-        const ac = try self.allocator.dupe(u8, ev.account);
+        const ac = try self.allocator.dupe(u8, account_value);
         errdefer self.allocator.free(ac);
         try self.membership_changes.append(self.allocator, .{
             .channel = ch,
@@ -1753,7 +2141,7 @@ pub const S2sPeer = struct {
             .setter = st,
             .account = ac,
             .kind = kind,
-            .status = ev.status,
+            .status = status,
             .prev_status = prev_status,
         });
     }
@@ -2169,6 +2557,10 @@ pub const S2sPeer = struct {
     /// Malformed payloads and no-op renames are dropped.
     fn recvNickChange(self: *S2sPeer, frame_payload: []const u8) !void {
         const payload = self.verifiedPayload(.NICKCHANGE, frame_payload) orelse return;
+        try self.applyNickChangePayload(payload);
+    }
+
+    fn applyNickChangePayload(self: *S2sPeer, payload: []const u8) !void {
         const ev = nick_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
 
@@ -2182,17 +2574,68 @@ pub const S2sPeer = struct {
         // and the claim takes the conservative UID path. P2: the account PERSISTED
         // via renameNick is likewise the wire account only when trusted, so a
         // forged rename is stored account-less (no later coexistence merge).
-        const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
+        const old_residence = self.accountResidenceDecision(ev.account, ev.old_nick, ev.origin_node);
+        const new_residence = self.accountResidenceDecision(ev.account, ev.new_nick, ev.origin_node);
+        // A downgraded rename can move a retained signed identity away from its
+        // protected old nick even when the free destination has no Store fact.
+        // Reject if either end is governed by v2 authority; trust of an accepted
+        // rename remains bound to the new identity claim.
+        if (old_residence == .reject or new_residence == .reject) return;
+        const account_trusted = new_residence == .trusted;
         const ident = MemberIdentity{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
             .account = if (account_trusted) ev.account else "",
         };
+        var old_nick: []const u8 = ev.old_nick;
+        var old_uid_buf: [nick_collision_uid_len]u8 = undefined;
+        if (self.routes.storedLoserUid(ev.origin_node, ev.old_nick)) |uid| {
+            @memcpy(old_uid_buf[0..uid.len], uid[0..]);
+            old_nick = old_uid_buf[0..uid.len];
+        }
+        var bind_token: ?SessionToken = null;
+        if (self.supportsSessionReplicaV2()) {
+            const authorizer = self.session_token_nick_authorizer orelse return;
+            const tagged_token: ?SessionToken = switch (self.routes.sessionTokenForOriginNick(ev.origin_node, ev.old_nick)) {
+                .none => null,
+                // Contradictory receiver tags are always denied, but still run
+                // the receiver-owned callback exactly once for every v2 rename.
+                // Null forces its independent Store lookup down the untagged
+                // origin/old-nick path without exposing either conflicting tag.
+                .ambiguous => {
+                    _ = authorizer.authorize(ev.origin_node, ev.old_nick, null, ev.new_nick);
+                    return;
+                },
+                .unique => |token| token,
+            };
+            switch (authorizer.authorize(ev.origin_node, ev.old_nick, tagged_token, ev.new_nick)) {
+                .reject => return,
+                .legacy => if (tagged_token != null) return,
+                .bind => |token| {
+                    if (tagged_token) |tagged| {
+                        if (!std.crypto.timing_safe.eql(SessionToken, tagged, token)) return;
+                    }
+                    bind_token = token;
+                },
+            }
+        }
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        var collision_incumbent: ?NodeId = null;
+        var incumbent_uid_buf: [nick_collision_uid_len]u8 = undefined;
+        var incumbent_uid: []const u8 = "";
         switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
-            .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
+            .keep => {
+                if (self.routes.nickNode(ev.new_nick)) |incumbent_node| {
+                    if (incumbent_node != ev.origin_node and bind_token != null) {
+                        const uid = self.routes.incumbentLoserUid(ev.new_nick) orelse return;
+                        @memcpy(incumbent_uid_buf[0..uid.len], uid[0..]);
+                        incumbent_uid = incumbent_uid_buf[0..uid.len];
+                        collision_incumbent = incumbent_node;
+                    } else if (!self.displaceIncumbentForRename(ev.new_nick, ev.origin_node)) return;
+                }
+            },
             .rename_to_uid => |uid| {
                 @memcpy(uid_buf[0..uid.len], uid[0..]);
                 target_nick = uid_buf[0..uid.len];
@@ -2209,45 +2652,39 @@ pub const S2sPeer = struct {
             .remote_same_account => {},
         }
 
-        const renamed = self.routes.renameNick(ev.old_nick, target_nick, ev.origin_node, ident) catch return;
-        if (!renamed) return;
-
-        const old_nick = self.allocator.dupe(u8, ev.old_nick) catch return;
-        const new_nick = self.allocator.dupe(u8, target_nick) catch {
-            self.allocator.free(old_nick);
-            return;
-        };
-        const username = self.allocator.dupe(u8, ev.username) catch {
-            self.allocator.free(old_nick);
-            self.allocator.free(new_nick);
-            return;
-        };
-        const realname = self.allocator.dupe(u8, ev.realname) catch {
-            self.allocator.free(old_nick);
-            self.allocator.free(new_nick);
-            self.allocator.free(username);
-            return;
-        };
-        const host = self.allocator.dupe(u8, ev.host) catch {
-            self.allocator.free(old_nick);
-            self.allocator.free(new_nick);
-            self.allocator.free(username);
-            self.allocator.free(realname);
-            return;
-        };
-        self.nick_changes.append(self.allocator, .{
-            .old_nick = old_nick,
-            .new_nick = new_nick,
-            .username = username,
-            .realname = realname,
-            .host = host,
-        }) catch {
-            self.allocator.free(old_nick);
-            self.allocator.free(new_nick);
-            self.allocator.free(username);
-            self.allocator.free(realname);
-            self.allocator.free(host);
-        };
+        if (bind_token) |token| {
+            if (collision_incumbent) |incumbent_node| {
+                const renamed = self.applyAuthorizedSessionTokenCollisionRename(
+                    ev.origin_node,
+                    old_nick,
+                    target_nick,
+                    token,
+                    ident,
+                    incumbent_node,
+                    incumbent_uid,
+                ) catch return;
+                if (!renamed) return;
+                return;
+            }
+            var wire_ctx = WireNickRenameContext{ .peer = self, .ident = ident };
+            const renamed = self.routes.renameNickBindingSessionToken(
+                ev.origin_node,
+                old_nick,
+                target_nick,
+                token,
+                ident,
+                .{
+                    .ctx = &wire_ctx,
+                    .part_fn = rejectWireNickPart,
+                    .rename_fn = queueAuthorizedWireNick,
+                },
+            ) catch return;
+            if (!renamed) return;
+        } else {
+            const renamed = self.routes.renameNick(old_nick, target_nick, ev.origin_node, ident) catch return;
+            if (!renamed) return;
+            self.queueForcedNickRename(old_nick, target_nick, ident) catch return;
+        }
     }
 
     /// Emit a NICKCHANGE event to the peer for a local user's nick change.
@@ -3777,22 +4214,791 @@ const ReclaimResolverStub = struct {
     }
 };
 
-/// Test residence verifier that trusts a fixed (account, origin) pair — stands
+/// Test residence verifier that trusts a fixed (account, origin) pair for any
+/// nick — stands
 /// in for the daemon's real receiver-owned proof lookup so the account-aware
 /// collision tests can exercise the TRUSTED path (Design C). With NO verifier
-/// installed, `accountResidenceTrusted` returns false and every same-account
+/// installed, `accountResidenceDecision` returns untrusted and every same-account
 /// short-circuit falls to the conservative UID path (the F1 fail-closed default).
 const TrustVerifierStub = struct {
     account: []const u8,
     origin_node: NodeId,
-    fn verify(ctx: *anyopaque, account: []const u8, origin_node: NodeId) bool {
+    fn verify(ctx: *anyopaque, account: []const u8, _: []const u8, origin_node: NodeId, _: bool) ResidenceDecision {
         const self: *TrustVerifierStub = @ptrCast(@alignCast(ctx));
-        return origin_node == self.origin_node and std.mem.eql(u8, account, self.account);
+        return if (origin_node == self.origin_node and std.mem.eql(u8, account, self.account)) .trusted else .untrusted;
     }
     fn verifier(self: *TrustVerifierStub) ResidenceVerifier {
         return .{ .ctx = self, .verify_fn = verify };
     }
 };
+
+const MutableTrustVerifierStub = struct {
+    account: []const u8,
+    origin_node: NodeId,
+    trusted: bool = false,
+    fn verify(ctx: *anyopaque, account: []const u8, _: []const u8, origin_node: NodeId, _: bool) ResidenceDecision {
+        const self: *MutableTrustVerifierStub = @ptrCast(@alignCast(ctx));
+        return if (self.trusted and origin_node == self.origin_node and std.mem.eql(u8, account, self.account))
+            .trusted
+        else
+            .untrusted;
+    }
+    fn verifier(self: *MutableTrustVerifierStub) ResidenceVerifier {
+        return .{ .ctx = self, .verify_fn = verify };
+    }
+};
+
+const RejectVerifierStub = struct {
+    fn verify(_: *anyopaque, _: []const u8, _: []const u8, _: NodeId, _: bool) ResidenceDecision {
+        return .reject;
+    }
+    fn verifier(self: *RejectVerifierStub) ResidenceVerifier {
+        return .{ .ctx = self, .verify_fn = verify };
+    }
+};
+
+const SessionTokenResolverStub = struct {
+    origin_node: NodeId,
+    token: SessionToken,
+    calls: usize = 0,
+    present_calls: usize = 0,
+    part_calls: usize = 0,
+
+    fn resolve(
+        ctx: *anyopaque,
+        origin_node: NodeId,
+        _: []const u8,
+        channel: []const u8,
+        present: bool,
+    ) SessionTokenDecision {
+        const self: *SessionTokenResolverStub = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (present) self.present_calls += 1 else self.part_calls += 1;
+        if (origin_node != self.origin_node) return .reject;
+        if (std.ascii.eqlIgnoreCase(channel, "#reject")) return .reject;
+        if (std.ascii.eqlIgnoreCase(channel, "#bind")) return .{ .bind = self.token };
+        return .unbound;
+    }
+
+    fn resolver(self: *SessionTokenResolverStub) SessionTokenResolver {
+        return .{ .ctx = self, .resolve_fn = resolve };
+    }
+};
+
+const SessionTokenNickAuthorizerStub = struct {
+    const Authority = enum { none, single, ambiguous };
+
+    origin_node: NodeId,
+    token: SessionToken,
+    best_nick: []const u8,
+    authority: Authority = .single,
+    calls: usize = 0,
+
+    fn authorize(
+        ctx: *anyopaque,
+        origin_node: NodeId,
+        _: []const u8,
+        tagged_token: ?SessionToken,
+        new_nick: []const u8,
+    ) SessionTokenNickDecision {
+        const self: *SessionTokenNickAuthorizerStub = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (origin_node != self.origin_node) return .reject;
+        return switch (self.authority) {
+            .none => if (tagged_token == null) .legacy else .reject,
+            .ambiguous => .reject,
+            .single => if ((tagged_token == null or std.crypto.timing_safe.eql(SessionToken, self.token, tagged_token.?)) and
+                std.ascii.eqlIgnoreCase(self.best_nick, new_nick))
+                .{ .bind = self.token }
+            else
+                .reject,
+        };
+    }
+
+    fn authorizer(self: *SessionTokenNickAuthorizerStub) SessionTokenNickAuthorizer {
+        return .{ .ctx = self, .authorize_fn = authorize };
+    }
+};
+
+test "session token resolver rejects or binds channel-aware membership before route mutation" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x6B);
+    const kp_b = try signingKeyFor(0x6C);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6B0);
+
+    var token: SessionToken = @splat(0x8D);
+    token[15] = 0xE1;
+    var resolver = SessionTokenResolverStub{ .origin_node = a_short, .token = token };
+    b.setSessionTokenResolver(resolver.resolver());
+
+    try a.sendMembership(a_to_b.sink(), "#reject", "reject-me", 0, 100, true, .{}, "");
+    try a.sendMembership(a_to_b.sink(), "#bind", "bound", 0, 101, true, .{}, "");
+    try a.sendMembership(a_to_b.sink(), "#plain", "legacy", 0, 102, true, .{}, "");
+    try a.sendMembership(a_to_b.sink(), "#plain", "legacy", 0, 103, false, .{}, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6B1);
+
+    try std.testing.expectEqual(@as(usize, 4), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 3), resolver.present_calls);
+    try std.testing.expectEqual(@as(usize, 1), resolver.part_calls);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#reject").len);
+    try std.testing.expect(b.routeNickNode("reject-me") == null);
+    const bound = b.channelMembers("#bind");
+    try std.testing.expectEqual(@as(usize, 1), bound.len);
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, token, bound[0].session_token.?));
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#plain").len);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    // reject emits nothing; bind joins; unbound compatibility membership joins
+    // and parts normally.
+    try std.testing.expectEqual(@as(usize, 3), changes.len);
+}
+
+test "session token reconcile revoke queues one PART and a later wire PART is unchanged" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x7B);
+    const kp_b = try signingKeyFor(0x7C);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7B0);
+
+    const token: SessionToken = @splat(0xB1);
+    var resolver = SessionTokenResolverStub{ .origin_node = a_short, .token = token };
+    b.setSessionTokenResolver(resolver.resolver());
+    var trust = TrustVerifierStub{ .account = "alice", .origin_node = a_short };
+    b.setResidenceVerifier(trust.verifier());
+    try a.sendMembership(a_to_b.sink(), "#bind", "alice", 0, 100, true, .{
+        .username = "user",
+        .realname = "Alice Real",
+        .host = "alice.test",
+        .account = "alice",
+    }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7B1);
+    const joined = try b.takeMembershipChanges();
+    defer allocator.free(joined);
+    try std.testing.expectEqual(@as(usize, 1), joined.len);
+    for (joined) |*change| change.deinit(allocator);
+
+    const revoked = try b.reconcileSessionToken(token, null, &.{});
+    try std.testing.expectEqual(@as(usize, 1), revoked.removed);
+    try std.testing.expectEqual(@as(usize, 0), revoked.renamed);
+    const revoke_changes = try b.takeMembershipChanges();
+    defer allocator.free(revoke_changes);
+    try std.testing.expectEqual(@as(usize, 1), revoke_changes.len);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, revoke_changes[0].kind);
+    try std.testing.expectEqualStrings("#bind", revoke_changes[0].channel);
+    try std.testing.expectEqualStrings("alice", revoke_changes[0].nick);
+    try std.testing.expectEqualStrings("user", revoke_changes[0].username);
+    try std.testing.expectEqualStrings("Alice Real", revoke_changes[0].realname);
+    try std.testing.expectEqualStrings("alice.test", revoke_changes[0].host);
+    try std.testing.expectEqualStrings("alice", revoke_changes[0].account);
+    for (revoke_changes) |*change| change.deinit(allocator);
+
+    // The authority-first removal consumed the route fact. A deferred wire PART
+    // is now an idempotent no-op and cannot enqueue a duplicate client line.
+    try a.sendMembership(a_to_b.sink(), "#bind", "alice", 0, 101, false, .{}, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7B2);
+    const deferred = try b.takeMembershipChanges();
+    defer allocator.free(deferred);
+    try std.testing.expectEqual(@as(usize, 0), deferred.len);
+}
+
+test "session token reconcile and NICKCHANGE honor Store-selected nick authority" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x7D);
+    const kp_b = try signingKeyFor(0x7E);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D0);
+    b.session_replica_transport_enabled = true;
+    b.peer_supports_signing = true;
+    b.peer_supports_session_replica_v2 = true;
+
+    const token: SessionToken = @splat(0xB2);
+    var authorizer = SessionTokenNickAuthorizerStub{ .origin_node = a_short, .token = token, .best_nick = "store-new" };
+    b.setSessionTokenNickAuthorizer(authorizer.authorizer());
+    _ = try b.routes.applyMembership("#bind", "old", a_short, 0, 100, true, .{
+        .username = "user",
+        .realname = "Old Real",
+        .host = "old.test",
+        .account = "alice",
+        .session_token = token,
+    }, @intCast(tc.now_ms));
+    const bound_old = b.channelMembers("#bind");
+    try std.testing.expectEqual(@as(usize, 1), bound_old.len);
+    try std.testing.expect(bound_old[0].session_token != null);
+
+    // OFFER-only authority change: no NICKCHANGE frame is needed. Reconcile
+    // queues one owned NICK delta before atomically renaming every token row.
+    const desired = [_][]const u8{"#bind"};
+    const reconciled = try b.reconcileSessionToken(token, "store-new", &desired);
+    try std.testing.expectEqual(@as(usize, 1), reconciled.renamed);
+    try std.testing.expectEqual(@as(usize, 0), reconciled.removed);
+    try std.testing.expectEqualStrings("store-new", b.channelMembers("#bind")[0].nick);
+    const offer_nicks = try b.takeNickChanges();
+    defer allocator.free(offer_nicks);
+    try std.testing.expectEqual(@as(usize, 1), offer_nicks.len);
+    try std.testing.expectEqualStrings("old", offer_nicks[0].old_nick);
+    try std.testing.expectEqualStrings("store-new", offer_nicks[0].new_nick);
+    for (offer_nicks) |*change| change.deinit(allocator);
+    const no_parts = try b.takeMembershipChanges();
+    defer allocator.free(no_parts);
+    try std.testing.expectEqual(@as(usize, 0), no_parts.len);
+
+    // A stale/malicious peer rename contradicting the Store-selected best nick
+    // is rejected before route mutation and emits nothing.
+    try a.sendNickChange(a_to_b.sink(), "store-new", "evil", .{ .username = "user", .realname = "Old Real", .host = "old.test", .account = "alice" }, 110);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D2);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("store-new", b.channelMembers("#bind")[0].nick);
+    var wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 0), wire_nicks.len);
+    allocator.free(wire_nicks);
+
+    // Once Store authority selects the new nick, the same wire transition is
+    // authorized and surfaces exactly once.
+    authorizer.best_nick = "wire-new";
+    try a.sendNickChange(a_to_b.sink(), "store-new", "wire-new", .{ .username = "user", .realname = "New Real", .host = "new.test", .account = "alice" }, 111);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D3);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("wire-new", b.channelMembers("#bind")[0].nick);
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 1), wire_nicks.len);
+    try std.testing.expectEqualStrings("store-new", wire_nicks[0].old_nick);
+    try std.testing.expectEqualStrings("wire-new", wire_nicks[0].new_nick);
+    for (wire_nicks) |*change| change.deinit(allocator);
+    allocator.free(wire_nicks);
+    try std.testing.expectEqual(@as(usize, 2), authorizer.calls);
+
+    // When the authorized destination is held by a lower-priority foreign
+    // origin, wire processing publishes the incumbent UID displacement first
+    // and the exact winner second, backed by one route-table transaction.
+    const collision_token: SessionToken = @splat(0xB7);
+    const incumbent_node: NodeId = 0xD00D;
+    const incumbent_uid = nick_collision.loserUid(incumbent_node, "collision-target");
+    _ = try b.routes.applyMembership("#collision", "collision-old", a_short, 0, 200, true, .{
+        .username = "exact-u",
+        .session_token = collision_token,
+    }, 10);
+    _ = try b.routes.applyMembership("#collision", "collision-target", incumbent_node, 0, 100, true, .{
+        .username = "inc-u",
+    }, 10);
+    authorizer.token = collision_token;
+    authorizer.best_nick = "collision-target";
+    try a.sendNickChange(a_to_b.sink(), "collision-old", "collision-target", .{ .username = "exact-new" }, 201);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D3A);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expect(b.routes.findMemberOwnedBy("collision-old", a_short) == null);
+    const collision_winner = b.routes.findMemberOwnedBy("collision-target", a_short) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, collision_token, collision_winner.session_token.?));
+    try std.testing.expect(b.routes.findMemberOwnedBy(&incumbent_uid, incumbent_node) != null);
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 2), wire_nicks.len);
+    try std.testing.expectEqualStrings("collision-target", wire_nicks[0].old_nick);
+    try std.testing.expectEqualStrings(&incumbent_uid, wire_nicks[0].new_nick);
+    try std.testing.expectEqualStrings("collision-old", wire_nicks[1].old_nick);
+    try std.testing.expectEqualStrings("collision-target", wire_nicks[1].new_nick);
+    for (wire_nicks) |*change| change.deinit(allocator);
+    allocator.free(wire_nicks);
+
+    // A Store-selected single authority may authorize an older compatibility
+    // row that arrived before token tagging. The callback sees tagged_token=null
+    // and returns the retained token from (origin, old nick) itself.
+    const single_token: SessionToken = @splat(0xB6);
+    _ = try b.routes.applyMembership("#single", "single-old", a_short, 0, 120, true, .{}, 10);
+    authorizer.authority = .single;
+    authorizer.token = single_token;
+    authorizer.best_nick = "single-new";
+    try a.sendNickChange(a_to_b.sink(), "single-old", "single-new", .{}, 121);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D4);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("single-new", b.channelMembers("#single")[0].nick);
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, single_token, b.channelMembers("#single")[0].session_token.?));
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 1), wire_nicks.len);
+    for (wire_nicks) |*change| change.deinit(allocator);
+    allocator.free(wire_nicks);
+
+    // Binding is what makes a later authority revoke exact: the renamed legacy
+    // row is now removed and surfaces one owned PART instead of becoming a ghost.
+    const single_revoked = try b.reconcileSessionToken(single_token, null, &.{});
+    try std.testing.expectEqual(@as(usize, 1), single_revoked.removed);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#single").len);
+    const single_parts = try b.takeMembershipChanges();
+    defer allocator.free(single_parts);
+    try std.testing.expectEqual(@as(usize, 1), single_parts.len);
+    try std.testing.expectEqualStrings("#single", single_parts[0].channel);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, single_parts[0].kind);
+    for (single_parts) |*change| change.deinit(allocator);
+    authorizer.token = token;
+
+    // Two retained tokens for the same origin/old nick are ambiguous. Even an
+    // untagged compatibility row must remain unchanged and emit no NICK.
+    _ = try b.routes.applyMembership("#ambiguous", "amb-old", a_short, 0, 130, true, .{}, 10);
+    authorizer.authority = .ambiguous;
+    authorizer.best_nick = "amb-evil";
+    try a.sendNickChange(a_to_b.sink(), "amb-old", "amb-evil", .{}, 131);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D5);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("amb-old", b.channelMembers("#ambiguous")[0].nick);
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 0), wire_nicks.len);
+    allocator.free(wire_nicks);
+
+    // Contradictory receiver tags are fail-closed even if a Store callback
+    // would otherwise accept the requested spelling. The callback still runs
+    // exactly once, preserving the v2 receiver-authorization invariant.
+    const other_token: SessionToken = @splat(0xB4);
+    _ = try b.routes.applyMembership("#tag-a", "tag-amb", a_short, 0, 135, true, .{ .session_token = token }, 10);
+    _ = try b.routes.applyMembership("#tag-b", "tag-amb", a_short, 0, 135, true, .{ .session_token = other_token }, 10);
+    authorizer.authority = .single;
+    authorizer.best_nick = "tag-new";
+    try a.sendNickChange(a_to_b.sink(), "tag-amb", "tag-new", .{}, 136);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D5A);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("tag-amb", b.channelMembers("#tag-a")[0].nick);
+    try std.testing.expectEqualStrings("tag-amb", b.channelMembers("#tag-b")[0].nick);
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 0), wire_nicks.len);
+    allocator.free(wire_nicks);
+
+    // With no retained Store authority and no token tag, the daemon explicitly
+    // classifies the identity as true legacy and preserves NICK compatibility.
+    _ = try b.routes.applyMembership("#legacy", "legacy-old", a_short, 0, 140, true, .{}, 10);
+    authorizer.authority = .none;
+    authorizer.best_nick = "";
+    try a.sendNickChange(a_to_b.sink(), "legacy-old", "legacy-new", .{}, 141);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7D6);
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqualStrings("legacy-new", b.channelMembers("#legacy")[0].nick);
+    wire_nicks = try b.takeNickChanges();
+    try std.testing.expectEqual(@as(usize, 1), wire_nicks.len);
+    for (wire_nicks) |*change| change.deinit(allocator);
+    allocator.free(wire_nicks);
+    try std.testing.expectEqual(@as(usize, 7), authorizer.calls);
+}
+
+test "session token reconcile allocation failure retains old identity for retry" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tc = TestClock{ .now_ms = 10 };
+            var state = ChannelCrdt.init(allocator, 1);
+            defer state.deinit();
+            var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "test");
+            defer peer.deinit();
+
+            const token: SessionToken = @splat(0xB3);
+            _ = try peer.routes.applyMembership("#room", "old", 2, 0, 10, true, .{
+                .username = "u",
+                .realname = "r",
+                .host = "h",
+                .account = "a",
+                .session_token = token,
+            }, 10);
+            const desired = [_][]const u8{"#room"};
+            const retried = peer.reconcileSessionToken(token, "new", &desired) catch |err| {
+                // This assertion runs for every rename-plan and NickDelta queue
+                // allocation site. Partial owned deltas unwind and the old row
+                // remains the retry source of truth.
+                try std.testing.expectEqualStrings("old", peer.channelMembers("#room")[0].nick);
+                try std.testing.expectEqual(@as(usize, 0), peer.nick_changes.items.len);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 1), retried.renamed);
+            try std.testing.expectEqualStrings("new", peer.channelMembers("#room")[0].nick);
+            const changes = try peer.takeNickChanges();
+            defer allocator.free(changes);
+            try std.testing.expectEqual(@as(usize, 1), changes.len);
+            for (changes) |*change| change.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "exact-token collision rename is atomic across both identities and deltas on allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tc = TestClock{ .now_ms = 10 };
+            var state = ChannelCrdt.init(allocator, 1);
+            defer state.deinit();
+            var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "test");
+            defer peer.deinit();
+
+            const exact_node: NodeId = 2;
+            const incumbent_node: NodeId = 3;
+            const token: SessionToken = @splat(0xBC);
+            const uid = nick_collision.loserUid(incumbent_node, "target");
+            for ([_][]const u8{ "#one", "#two" }) |channel| {
+                _ = try peer.routes.applyMembership(channel, "old", exact_node, 0, 20, true, .{
+                    .username = "exact-u",
+                    .realname = "Exact User",
+                    .host = "exact.test",
+                }, 10);
+                _ = try peer.routes.applyMembership(channel, "target", incumbent_node, 0, 10, true, .{
+                    .username = "inc-u",
+                    .realname = "Incumbent User",
+                    .host = "inc.test",
+                }, 10);
+            }
+
+            const renamed = peer.applyAuthorizedSessionTokenCollisionRename(
+                exact_node,
+                "old",
+                "target",
+                token,
+                .{ .username = "exact-new", .realname = "Exact New", .host = "new.test" },
+                incumbent_node,
+                &uid,
+            ) catch |err| {
+                const exact = peer.routes.findMemberOwnedBy("old", exact_node) orelse return error.TestUnexpectedResult;
+                const incumbent = peer.routes.findMemberOwnedBy("target", incumbent_node) orelse return error.TestUnexpectedResult;
+                try std.testing.expect(exact.session_token == null);
+                try std.testing.expectEqualStrings("exact-u", exact.username);
+                try std.testing.expectEqualStrings("inc-u", incumbent.username);
+                try std.testing.expectEqual(exact_node, peer.routes.nickNode("old").?);
+                try std.testing.expectEqual(incumbent_node, peer.routes.nickNode("target").?);
+                try std.testing.expect(peer.routes.nickNode(&uid) == null);
+                try std.testing.expectEqual(@as(usize, 0), peer.nick_changes.items.len);
+                return err;
+            };
+
+            try std.testing.expect(renamed);
+            const exact = peer.routes.findMemberOwnedBy("target", exact_node) orelse return error.TestUnexpectedResult;
+            const incumbent = peer.routes.findMemberOwnedBy(&uid, incumbent_node) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, token, exact.session_token.?));
+            try std.testing.expectEqualStrings("exact-new", exact.username);
+            try std.testing.expectEqualStrings("inc-u", incumbent.username);
+            try std.testing.expect(peer.routes.nickNode("old") == null);
+            try std.testing.expectEqual(exact_node, peer.routes.nickNode("target").?);
+            try std.testing.expectEqual(incumbent_node, peer.routes.nickNode(&uid).?);
+            try std.testing.expectEqual(@as(usize, 2), peer.nick_changes.items.len);
+            try std.testing.expectEqualStrings("target", peer.nick_changes.items[0].old_nick);
+            try std.testing.expectEqualStrings(&uid, peer.nick_changes.items[0].new_nick);
+            try std.testing.expectEqualStrings("old", peer.nick_changes.items[1].old_nick);
+            try std.testing.expectEqualStrings("target", peer.nick_changes.items[1].new_nick);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "session token revoke allocation failure retains membership for retry" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tc = TestClock{ .now_ms = 10 };
+            var state = ChannelCrdt.init(allocator, 1);
+            defer state.deinit();
+            var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "test");
+            defer peer.deinit();
+
+            const token: SessionToken = @splat(0xB5);
+            _ = try peer.routes.applyMembership("#room", "old", 2, 0, 10, true, .{
+                .username = "u",
+                .realname = "r",
+                .host = "h",
+                .account = "a",
+                .session_token = token,
+            }, 10);
+            const revoked = peer.reconcileSessionToken(token, null, &.{}) catch |err| {
+                // Every MembershipDelta string/list allocation precedes route
+                // deletion. Any OOM therefore leaves the exact row available
+                // as the retry source and cannot expose a partial PART delta.
+                try std.testing.expectEqual(@as(usize, 1), peer.channelMembers("#room").len);
+                try std.testing.expectEqualStrings("old", peer.channelMembers("#room")[0].nick);
+                try std.testing.expectEqual(@as(usize, 0), peer.membership_changes.items.len);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 1), revoked.removed);
+            try std.testing.expectEqual(@as(usize, 0), peer.channelMembers("#room").len);
+            const changes = try peer.takeMembershipChanges();
+            defer allocator.free(changes);
+            try std.testing.expectEqual(@as(usize, 1), changes.len);
+            try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, changes[0].kind);
+            for (changes) |*change| change.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "rejected downgraded MEMBERSHIP creates no UID route delta or roster entry" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x73);
+    const kp_b = try signingKeyFor(0x74);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x73E);
+    try std.testing.expect(!b.supportsSessionReplicaV2());
+    var reject_stub = RejectVerifierStub{};
+    b.setResidenceVerifier(reject_stub.verifier());
+
+    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 200, true, .{
+        .username = "u",
+        .realname = "r",
+        .host = "h",
+        .account = "ruri-acct",
+    }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x73F);
+
+    const changes = try b.takeMembershipChanges();
+    defer allocator.free(changes);
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#room").len);
+}
+
+test "negotiated-v2 rowless untrusted MEMBERSHIP keeps its route delta and roster entry" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x75);
+    const kp_b = try signingKeyFor(0x76);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    // Model the secured adapter's v2 enablement before the capability handshake.
+    a.session_replica_transport_enabled = true;
+    b.session_replica_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x75E);
+    try std.testing.expect(b.supportsSessionReplicaV2());
+
+    // No local token owner exists, so the daemon's exact Store verifier returns
+    // untrusted. On a negotiated-v2 link that is a compatibility sidecar, not a
+    // downgrade rejection: routing/NAMES still need this remote participant.
+    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 200, true, .{
+        .username = "u",
+        .realname = "r",
+        .host = "h",
+        .account = "ruri-acct",
+    }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x75F);
+    b.processDeferredResidenceFrames(tc.now_ms);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("Ruri", changes[0].nick);
+    const members = b.channelMembers("#room");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("Ruri", members[0].nick);
+}
+
+test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK and MEMBERSHIP" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x77);
+    const kp_b = try signingKeyFor(0x78);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.session_replica_transport_enabled = true;
+    b.session_replica_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x770);
+    try std.testing.expect(b.supportsSessionReplicaV2());
+
+    // The pre-resume nick is route-only. Ruri is held locally by the exact
+    // logical session, but its new-origin Store authority becomes visible only
+    // after feed returns (modelled by toggling this verifier before processing).
+    _ = try b.routes.applyMembership("#presence", "DeviceB", a_short, 0, 100, true, .{
+        .account = "ruri-acct",
+    }, 10);
+    var local = ReclaimResolverStub{ .held_nick = "Ruri", .acct = "ruri-acct", .hlc = 0 };
+    b.setLocalNickResolver(local.resolver());
+    var trust = MutableTrustVerifierStub{ .account = "ruri-acct", .origin_node = a_short };
+    b.setResidenceVerifier(trust.verifier());
+    var nick_authority = SessionTokenNickAuthorizerStub{
+        .origin_node = a_short,
+        .token = @splat(0x77),
+        .best_nick = "Ruri",
+    };
+    b.setSessionTokenNickAuthorizer(nick_authority.authorizer());
+
+    try a.sendNickChange(a_to_b.sink(), "DeviceB", "Ruri", .{
+        .username = "u",
+        .realname = "r",
+        .host = "h",
+        .account = "ruri-acct",
+    }, 200);
+    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 201, true, .{
+        .username = "u",
+        .realname = "r",
+        .host = "h",
+        .account = "ruri-acct",
+    }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x771);
+
+    try std.testing.expectEqual(@as(usize, 2), b.deferred_residence_frames.items.len);
+    try std.testing.expectEqual(@as(usize, 0), b.membership_changes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), b.nick_changes.items.len);
+    try std.testing.expectEqualStrings("DeviceB", b.channelMembers("#presence")[0].nick);
+
+    // The daemon applies the earlier signed OFFER before releasing this queue.
+    // Both sidecars then see trusted exact-origin authority and retain Ruri;
+    // processing pre-authority would have minted a collision UID here.
+    trust.trusted = true;
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqual(@as(usize, 0), b.deferred_residence_frames.items.len);
+    const nicks = try b.takeNickChanges();
+    defer {
+        for (nicks) |*change| change.deinit(allocator);
+        allocator.free(nicks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), nicks.len);
+    try std.testing.expectEqualStrings("DeviceB", nicks[0].old_nick);
+    try std.testing.expectEqualStrings("Ruri", nicks[0].new_nick);
+    try std.testing.expectEqual(@as(usize, 1), nick_authority.calls);
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("Ruri", changes[0].nick);
+    try std.testing.expectEqualStrings("Ruri", b.channelMembers("#room")[0].nick);
+}
+
+test "v2 residence barrier overflow discards the correlated sidecar batch" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x79);
+    const kp_b = try signingKeyFor(0x7A);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.session_replica_transport_enabled = true;
+    b.session_replica_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x790);
+    b.config.max_session_replica_frames = 1;
+
+    try a.sendMembership(a_to_b.sink(), "#one", "Ruri", 0, 300, true, .{ .account = "ruri-acct" }, "");
+    try a.sendMembership(a_to_b.sink(), "#two", "Ruri", 0, 301, true, .{ .account = "ruri-acct" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x791);
+    try std.testing.expectEqual(@as(u64, 1), b.takeDroppedSessionReplicaFrames());
+    try std.testing.expectEqual(@as(usize, 1), b.deferred_residence_frames.items.len);
+
+    // This is the daemon's incomplete-authority branch: no partial sidecar may
+    // mutate routing or surface a delta before the requested replay.
+    b.discardDeferredResidenceFrames();
+    b.processDeferredResidenceFrames(tc.now_ms);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#one").len);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#two").len);
+    const changes = try b.takeMembershipChanges();
+    defer allocator.free(changes);
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
 
 test "same-account MEMBERSHIP short-circuits require a VERIFIED residence proof (F1: no verifier ⇒ UID)" {
     const allocator = std.testing.allocator;

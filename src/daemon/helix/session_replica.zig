@@ -31,6 +31,7 @@ const std = @import("std");
 
 const sign = @import("../../crypto/sign.zig");
 const session_replica_transport = @import("../../proto/session_replica_frame.zig");
+const mesh_clock = @import("../../substrate/suimyaku/mesh_clock.zig");
 const signed_frame = @import("../../substrate/suimyaku/signed_frame.zig");
 
 pub const Token = [16]u8;
@@ -44,6 +45,7 @@ pub const ack_sign_domain = "orochi-session-replica-ack-v2";
 
 pub const max_account_len: usize = 128;
 pub const max_nick_len: usize = 64;
+pub const default_max_future_skew_ms: u64 = mesh_clock.default_max_future_skew_ms;
 
 const revision_wire_len: usize = 8 + 8 + 8;
 const signature_wire_len: usize = sign.public_key_len + sign.signature_len;
@@ -54,9 +56,12 @@ const ack_fixed_len: usize = ack_magic.len + 1 + @sizeOf(Token) + revision_wire_
 pub const max_snapshot_len: usize = session_replica_transport.max_signed_payload_len -
     offer_fixed_len - signature_wire_len - max_account_len - max_nick_len;
 
-/// A restart-safe, deterministic total-order revision. `epoch` is the durable
-/// generation/wall epoch, `sequence` orders writes inside it, and `origin_node`
-/// breaks simultaneous cross-node ties without depending on arrival order.
+/// A restart-safe, deterministic total-order revision. `sequence` is the full
+/// packed MeshClock stamp and `epoch` is its canonical physical projection.
+/// Carrying both on the wire makes ordering explicit while the equality
+/// invariant prevents a signer from placing an unrelated, unobservable epoch
+/// above every future local mutation. `origin_node` breaks simultaneous
+/// cross-node ties without depending on arrival order.
 pub const Revision = struct {
     epoch: u64,
     sequence: u64,
@@ -74,6 +79,10 @@ pub const Revision = struct {
 
     pub fn eql(a: Revision, b: Revision) bool {
         return compare(a, b) == .eq;
+    }
+
+    pub fn isCanonical(self: Revision) bool {
+        return self.epoch == mesh_clock.MeshClock.physicalOf(self.sequence);
     }
 };
 
@@ -329,7 +338,7 @@ pub fn verifyAck(signed: SignedAck) VerifyError!void {
 }
 
 fn validateOfferShape(offer: Offer) error{ InvalidOffer, TooLong }!void {
-    if (offer.revision.origin_node == 0) return error.InvalidOffer;
+    if (offer.revision.origin_node == 0 or !offer.revision.isCanonical()) return error.InvalidOffer;
     if (offer.issued_at_ms < 0 or offer.expires_at_ms < offer.issued_at_ms) return error.InvalidOffer;
     if (offer.account.len > max_account_len or offer.nick.len > max_nick_len or offer.snapshot.len > max_snapshot_len) return error.TooLong;
     switch (offer.operation) {
@@ -345,6 +354,7 @@ fn validateOfferShape(offer: Offer) error{ InvalidOffer, TooLong }!void {
 fn validateAckShape(ack: Ack) error{InvalidAck}!void {
     if (ack.ack_node == 0 or ack.offered_revision.origin_node == 0 or ack.observed_revision.origin_node == 0) return error.InvalidAck;
     if (ack.offered_revision.origin_node != ack.observed_revision.origin_node) return error.InvalidAck;
+    if (!ack.offered_revision.isCanonical() or !ack.observed_revision.isCanonical()) return error.InvalidAck;
     if (ack.issued_at_ms < 0 or ack.expires_at_ms < ack.issued_at_ms) return error.InvalidAck;
 }
 
@@ -408,6 +418,27 @@ pub const AckApplyError = VerifyError || error{
     InvalidLifetime,
 };
 
+/// Complete restart checkpoint for the authoritative SESSION_REPLICA v2
+/// Store. This is carried inside Helix's backwards-compatible mesh-checkpoint
+/// capsule family, so the inner magic must remain independently recognizable.
+pub const upgrade_checkpoint_magic = [_]u8{ 'S', 'R', 'S', 'T' };
+pub const upgrade_checkpoint_version: u8 = 1;
+const upgrade_checkpoint_checksum_len = 32;
+const upgrade_checkpoint_header_len = upgrade_checkpoint_magic.len + 1 + 8 + 4 + 4 + 4;
+
+pub const UpgradeCheckpointError = error{
+    BadMagic,
+    UnsupportedVersion,
+    Truncated,
+    TrailingBytes,
+    ChecksumMismatch,
+    CapacityExceeded,
+    DuplicateState,
+    InvalidMetadata,
+    InvalidSignedObject,
+    TooLarge,
+} || std.mem.Allocator.Error;
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -422,7 +453,7 @@ pub const Store = struct {
         max_tombstones: usize = 4096,
         max_quarantines: usize = 1024,
         max_offer_lifetime_ms: u64 = 24 * 60 * 60 * 1000,
-        max_future_skew_ms: u64 = 5 * 60 * 1000,
+        max_future_skew_ms: u64 = default_max_future_skew_ms,
         route_ttl_ms: u64 = 15 * 60 * 1000,
         tombstone_ttl_ms: u64 = 24 * 60 * 60 * 1000,
         max_account_bytes: usize = max_account_len,
@@ -544,6 +575,179 @@ pub const Store = struct {
         self.* = undefined;
     }
 
+    /// Cheap discriminator for Helix mesh-checkpoint capsules. Full integrity,
+    /// version, signature, and invariant checks happen during restore.
+    pub fn isUpgradeCheckpoint(bytes: []const u8) bool {
+        return bytes.len >= upgrade_checkpoint_magic.len and
+            std.mem.eql(u8, bytes[0..upgrade_checkpoint_magic.len], &upgrade_checkpoint_magic);
+    }
+
+    /// Encode every authoritative Store fact and its non-derived metadata.
+    /// Hop routes and ingress parents are deliberately omitted: they are link
+    /// observations and must be relearned after exec, not resurrected.
+    pub fn encodeUpgradeCheckpoint(
+        self: *const Store,
+        allocator: std.mem.Allocator,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError![]u8 {
+        if (captured_at_ms < 0) return error.InvalidMetadata;
+        if (self.entries.count() > std.math.maxInt(u32) or
+            self.tombstones.count() > std.math.maxInt(u32) or
+            self.quarantines.count() > std.math.maxInt(u32)) return error.TooLarge;
+
+        var total_len: usize = upgrade_checkpoint_header_len;
+        var entry_it = @constCast(&self.entries).valueIterator();
+        while (entry_it.next()) |entry| {
+            try checkpointAddLen(&total_len, 4);
+            try checkpointAddLen(&total_len, entry.wire.len);
+            try checkpointAddLen(&total_len, 8 + 1);
+            if (entry.quarantine_until_ms != null) try checkpointAddLen(&total_len, 8);
+        }
+        var tombstone_it = @constCast(&self.tombstones).valueIterator();
+        while (tombstone_it.next()) |tombstone| {
+            try checkpointAddLen(&total_len, 4);
+            try checkpointAddLen(&total_len, tombstone.wire.len);
+            try checkpointAddLen(&total_len, 8 + 1 + 1);
+            if (tombstone.identity_digest != null) try checkpointAddLen(&total_len, @sizeOf(Digest));
+            if (tombstone.quarantine_until_ms != null) try checkpointAddLen(&total_len, 8);
+        }
+        var quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            try checkpointAddLen(&total_len, 4);
+            try checkpointAddLen(&total_len, quarantine.first_wire.len);
+            try checkpointAddLen(&total_len, 4);
+            try checkpointAddLen(&total_len, quarantine.second_wire.len);
+            try checkpointAddLen(&total_len, 8 + 8);
+        }
+        try checkpointAddLen(&total_len, upgrade_checkpoint_checksum_len);
+
+        var out = try allocator.alloc(u8, total_len);
+        errdefer allocator.free(out);
+        var writer = Writer{ .bytes = out };
+        writer.writeBytes(&upgrade_checkpoint_magic);
+        writer.writeByte(upgrade_checkpoint_version);
+        writer.writeI64(captured_at_ms);
+        writer.writeU32(@intCast(self.entries.count()));
+        writer.writeU32(@intCast(self.tombstones.count()));
+        writer.writeU32(@intCast(self.quarantines.count()));
+
+        entry_it = @constCast(&self.entries).valueIterator();
+        while (entry_it.next()) |entry| {
+            try checkpointWriteWire(&writer, entry.wire);
+            writer.writeI64(entry.updated_at_ms);
+            writer.writeByte(@intFromBool(entry.quarantine_until_ms != null));
+            if (entry.quarantine_until_ms) |until_ms| writer.writeI64(until_ms);
+        }
+        tombstone_it = @constCast(&self.tombstones).valueIterator();
+        while (tombstone_it.next()) |tombstone| {
+            try checkpointWriteWire(&writer, tombstone.wire);
+            writer.writeI64(tombstone.removed_at_ms);
+            writer.writeByte(@intFromBool(tombstone.identity_digest != null));
+            if (tombstone.identity_digest) |identity_digest| writer.writeBytes(&identity_digest);
+            writer.writeByte(@intFromBool(tombstone.quarantine_until_ms != null));
+            if (tombstone.quarantine_until_ms) |until_ms| writer.writeI64(until_ms);
+        }
+        quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            try checkpointWriteWire(&writer, quarantine.first_wire);
+            try checkpointWriteWire(&writer, quarantine.second_wire);
+            writer.writeI64(quarantine.expires_at_ms);
+            writer.writeI64(quarantine.detected_at_ms);
+        }
+
+        std.debug.assert(writer.pos + upgrade_checkpoint_checksum_len == out.len);
+        const checksum = digestBytes(out[0..writer.pos]);
+        writer.writeBytes(&checksum);
+        std.debug.assert(writer.pos == out.len);
+        return out;
+    }
+
+    /// Decode into a fresh Store, validating the whole checkpoint before any
+    /// caller-visible state can change. Signed facts are validated at capture
+    /// time so a harmless wall-clock rollback cannot invalidate an accepted
+    /// checkpoint; expiry is then swept at the restore wall time.
+    pub fn restoreUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        bytes: []const u8,
+        restore_now_ms: i64,
+    ) UpgradeCheckpointError!Store {
+        if (bytes.len < upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len) return error.Truncated;
+        if (!Store.isUpgradeCheckpoint(bytes)) return error.BadMagic;
+
+        const body_end = bytes.len - upgrade_checkpoint_checksum_len;
+        const expected_checksum: Digest = bytes[body_end..][0..upgrade_checkpoint_checksum_len].*;
+        const actual_checksum = digestBytes(bytes[0..body_end]);
+        if (!std.crypto.timing_safe.eql(Digest, expected_checksum, actual_checksum)) return error.ChecksumMismatch;
+
+        var reader = UpgradeCheckpointReader{ .bytes = bytes[0..body_end] };
+        _ = try reader.take(upgrade_checkpoint_magic.len);
+        if (try reader.readByte() != upgrade_checkpoint_version) return error.UnsupportedVersion;
+        const captured_at_ms = try reader.readI64();
+        if (captured_at_ms < 0) return error.InvalidMetadata;
+        const entry_count: usize = try reader.readU32();
+        const tombstone_count: usize = try reader.readU32();
+        const quarantine_count: usize = try reader.readU32();
+        if (entry_count > cfg.max_entries or tombstone_count > cfg.max_tombstones or quarantine_count > cfg.max_quarantines)
+            return error.CapacityExceeded;
+
+        // Reject impossible record counts before reserving any map storage.
+        // These are deliberately conservative minima (one-byte wire), while
+        // each record's exact signed-wire bound is enforced as it is read.
+        var minimum_record_bytes: usize = 0;
+        try checkpointAddProduct(&minimum_record_bytes, entry_count, 4 + 1 + 8 + 1);
+        try checkpointAddProduct(&minimum_record_bytes, tombstone_count, 4 + 1 + 8 + 1 + 1);
+        try checkpointAddProduct(&minimum_record_bytes, quarantine_count, 4 + 1 + 4 + 1 + 8 + 8);
+        if (minimum_record_bytes > reader.bytes.len - reader.pos) return error.Truncated;
+
+        var restored = initWithConfig(allocator, cfg);
+        errdefer restored.deinit();
+        try restored.entries.ensureTotalCapacity(allocator, @intCast(entry_count));
+        try restored.tombstones.ensureTotalCapacity(allocator, @intCast(tombstone_count));
+        try restored.quarantines.ensureTotalCapacity(allocator, @intCast(quarantine_count));
+
+        for (0..entry_count) |_| {
+            const wire = try checkpointReadWire(&reader);
+            const updated_at_ms = try reader.readI64();
+            const quarantine_until_ms = try checkpointReadOptionalI64(&reader);
+            try restored.restoreCheckpointEntry(wire, updated_at_ms, quarantine_until_ms, captured_at_ms);
+        }
+        for (0..tombstone_count) |_| {
+            const wire = try checkpointReadWire(&reader);
+            const removed_at_ms = try reader.readI64();
+            const identity_digest = try checkpointReadOptionalDigest(&reader);
+            const quarantine_until_ms = try checkpointReadOptionalI64(&reader);
+            try restored.restoreCheckpointTombstone(wire, removed_at_ms, identity_digest, quarantine_until_ms, captured_at_ms);
+        }
+        for (0..quarantine_count) |_| {
+            const first_wire = try checkpointReadWire(&reader);
+            const second_wire = try checkpointReadWire(&reader);
+            const expires_at_ms = try reader.readI64();
+            const detected_at_ms = try reader.readI64();
+            try restored.restoreCheckpointQuarantine(first_wire, second_wire, expires_at_ms, detected_at_ms, captured_at_ms);
+        }
+        if (reader.pos != reader.bytes.len) return error.TrailingBytes;
+
+        // Cross-map invariants are checked only after all facts are present.
+        try restored.validateCheckpointIdentityState();
+        _ = restored.sweep(restore_now_ms);
+        return restored;
+    }
+
+    /// Atomically replace this Store. On corruption, capacity pressure, or OOM,
+    /// `self` remains byte-for-byte owned and usable.
+    pub fn replaceFromUpgradeCheckpoint(
+        self: *Store,
+        bytes: []const u8,
+        restore_now_ms: i64,
+    ) UpgradeCheckpointError!void {
+        var replacement = try restoreUpgradeCheckpoint(self.allocator, self.cfg, bytes, restore_now_ms);
+        const old = self.*;
+        self.* = replacement;
+        replacement = old;
+        replacement.deinit();
+    }
+
     /// Verify and converge a signed OFFER learned through `via_peer`. Zero means
     /// locally seeded state and deliberately creates no route.
     pub fn applySignedOffer(self: *Store, signed: SignedOffer, via_peer: NodeId, now_ms: i64) ApplyError!ApplyResult {
@@ -561,6 +765,8 @@ pub const Store = struct {
         try verifyAck(signed);
         const ack = signed.ack;
         try validateLifetime(ack.issued_at_ms, ack.expires_at_ms, now_ms, self.cfg.max_offer_lifetime_ms, self.cfg.max_future_skew_ms);
+        try validateRevisionAt(ack.offered_revision, now_ms, self.cfg.max_future_skew_ms);
+        try validateRevisionAt(ack.observed_revision, now_ms, self.cfg.max_future_skew_ms);
         if (via_peer == 0) return .ignored;
         switch (ack.status) {
             .accepted, .duplicate, .superseded => {},
@@ -611,15 +817,190 @@ pub const Store = struct {
         return best;
     }
 
+    /// Copy a bounded page of unique live OFFER tokens in lexicographic order,
+    /// strictly after the caller-owned value cursor. This scan is allocation
+    /// free and does not depend on hash-map iteration position, so the cursor
+    /// remains valid even when its entry expires or is revoked between pages.
+    /// Concurrent origins collapse to one token. Quarantined and expired facts
+    /// are omitted.
+    ///
+    /// An empty result marks the end of the ordered pass. Set `after` to null to
+    /// wrap to the smallest live token and begin the next fair circular pass.
+    /// Tokens inserted behind the current cursor are therefore visited after at
+    /// most one wrap instead of perturbing or starving the current pass.
+    pub fn liveTokensAfter(self: *const Store, now_ms: i64, after: ?Token, out: []Token) []const Token {
+        if (out.len == 0) return out[0..0];
+
+        var count: usize = 0;
+        var lower_bound = after;
+        while (count < out.len) {
+            var candidate: ?Token = null;
+            var it = @constCast(&self.entries).iterator();
+            while (it.next()) |slot| {
+                if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
+                const token = slot.key_ptr.token;
+                if (lower_bound) |lower| {
+                    if (std.mem.order(u8, &token, &lower) != .gt) continue;
+                }
+                if (candidate == null or std.mem.order(u8, &token, &candidate.?) == .lt)
+                    candidate = token;
+            }
+
+            const token = candidate orelse break;
+            out[count] = token;
+            count += 1;
+            lower_bound = token;
+        }
+        return out[0..count];
+    }
+
+    /// Ordered unique tokens with any nonexpired retained authority, including
+    /// tombstones and quarantine markers. Retry cursors use this broader view so
+    /// a failed revoke/quarantine route reconciliation is not stranded merely
+    /// because the token deliberately has no live identity projection.
+    pub fn authorityTokensAfter(self: *const Store, now_ms: i64, after: ?Token, out: []Token) []const Token {
+        if (out.len == 0) return out[0..0];
+        var count: usize = 0;
+        var lower_bound = after;
+        while (count < out.len) {
+            var candidate: ?Token = null;
+            var quarantine_it = @constCast(&self.quarantines).iterator();
+            while (quarantine_it.next()) |slot| {
+                if (now_ms > slot.value_ptr.expires_at_ms) continue;
+                considerOrderedToken(slot.key_ptr.*, lower_bound, &candidate);
+            }
+            var entry_it = @constCast(&self.entries).iterator();
+            while (entry_it.next()) |slot| {
+                if (now_ms > slot.value_ptr.expires_at_ms) continue;
+                considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
+            }
+            var tombstone_it = @constCast(&self.tombstones).iterator();
+            while (tombstone_it.next()) |slot| {
+                if (now_ms > slot.value_ptr.offer_expires_at_ms) continue;
+                considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
+            }
+            const token = candidate orelse break;
+            out[count] = token;
+            count += 1;
+            lower_bound = token;
+        }
+        return out[0..count];
+    }
+
+    /// Ordered unique tokens represented by any stored authority object,
+    /// including objects whose wall-clock lifetime has just elapsed but which
+    /// have not yet been swept. The daemon snapshots this bounded key set before
+    /// destructive expiry so every formerly-authoritative projection, including
+    /// a token whose last origin expired, can be reconciled afterward.
+    pub fn storedTokensAfter(self: *const Store, after: ?Token, out: []Token) []const Token {
+        if (out.len == 0) return out[0..0];
+        var count: usize = 0;
+        var lower_bound = after;
+        while (count < out.len) {
+            var candidate: ?Token = null;
+            var quarantine_it = @constCast(&self.quarantines).keyIterator();
+            while (quarantine_it.next()) |token| considerOrderedToken(token.*, lower_bound, &candidate);
+            var entry_it = @constCast(&self.entries).keyIterator();
+            while (entry_it.next()) |key| considerOrderedToken(key.token, lower_bound, &candidate);
+            var tombstone_it = @constCast(&self.tombstones).keyIterator();
+            while (tombstone_it.next()) |key| considerOrderedToken(key.token, lower_bound, &candidate);
+            const token = candidate orelse break;
+            out[count] = token;
+            count += 1;
+            lower_bound = token;
+        }
+        return out[0..count];
+    }
+
+    /// Ordered unique tokens whose authoritative projection can change during
+    /// `sweep(now_ms)`. Route-only expiry is excluded because it does not alter
+    /// identity state. Callers reconcile these keys before destructive removal
+    /// and again afterward so deny-marker expiry can safely reveal a survivor.
+    pub fn projectionSweepTokensAfter(self: *const Store, now_ms: i64, after: ?Token, out: []Token) []const Token {
+        if (out.len == 0) return out[0..0];
+        var count: usize = 0;
+        var lower_bound = after;
+        while (count < out.len) {
+            var candidate: ?Token = null;
+            var quarantine_it = @constCast(&self.quarantines).iterator();
+            while (quarantine_it.next()) |slot| {
+                if (now_ms > slot.value_ptr.expires_at_ms)
+                    considerOrderedToken(slot.key_ptr.*, lower_bound, &candidate);
+            }
+            var entry_it = @constCast(&self.entries).iterator();
+            while (entry_it.next()) |slot| {
+                const marker_expires = if (slot.value_ptr.quarantine_until_ms) |until_ms| now_ms > until_ms else false;
+                if (now_ms > slot.value_ptr.expires_at_ms or marker_expires)
+                    considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
+            }
+            var tombstone_it = @constCast(&self.tombstones).iterator();
+            while (tombstone_it.next()) |slot| {
+                const age = nonNegativeAge(now_ms, slot.value_ptr.removed_at_ms);
+                const object_expires = age >= self.cfg.tombstone_ttl_ms and now_ms > slot.value_ptr.offer_expires_at_ms;
+                const marker_expires = if (slot.value_ptr.quarantine_until_ms) |until_ms| now_ms > until_ms else false;
+                if (object_expires or marker_expires)
+                    considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
+            }
+            const token = candidate orelse break;
+            out[count] = token;
+            count += 1;
+            lower_bound = token;
+        }
+        return out[0..count];
+    }
+
+    pub const OriginIdentity = struct {
+        origin_node: NodeId,
+        nick: []const u8,
+    };
+
+    /// Page every live origin/nick authority for one exact token in stable
+    /// origin order. Views borrow Store-owned memory and remain valid until the
+    /// next mutation. Route projection uses this to retroactively tag all
+    /// compatibility rows before exact-token reconciliation, including retries.
+    pub fn liveOriginIdentitiesAfter(
+        self: *const Store,
+        token: Token,
+        now_ms: i64,
+        after_origin: ?NodeId,
+        out: []OriginIdentity,
+    ) []const OriginIdentity {
+        if (out.len == 0) return out[0..0];
+        var count: usize = 0;
+        var lower_bound = after_origin;
+        while (count < out.len) {
+            var candidate_origin: ?NodeId = null;
+            var candidate_nick: []const u8 = &.{};
+            var it = @constCast(&self.entries).iterator();
+            while (it.next()) |slot| {
+                if (!tokenEql(slot.key_ptr.token, token) or
+                    slot.value_ptr.quarantine_until_ms != null or
+                    now_ms > slot.value_ptr.expires_at_ms) continue;
+                const origin = slot.key_ptr.origin_node;
+                if (lower_bound) |lower| if (origin <= lower) continue;
+                if (candidate_origin == null or origin < candidate_origin.?) {
+                    candidate_origin = origin;
+                    candidate_nick = slot.value_ptr.nick;
+                }
+            }
+            const origin = candidate_origin orelse break;
+            out[count] = .{ .origin_node = origin, .nick = candidate_nick };
+            count += 1;
+            lower_bound = origin;
+        }
+        return out[0..count];
+    }
+
     pub const LiveIdentity = struct {
         token: Token,
         entry: *const Entry,
     };
 
-    /// Allocation-free exact lookup for a detached origin/nick projection.
-    /// Nick comparison is byte-exact; callers apply protocol casemapping before
-    /// this boundary. Null means no live match and `error.Ambiguous` means that
-    /// a token cannot be selected safely.
+    /// Allocation-free casemapped lookup for a detached origin/nick projection.
+    /// Compatibility roster identities are ASCII-case-insensitive throughout
+    /// the daemon; applying the same fold here prevents a peer from bypassing
+    /// exact-token binding with a wire-case variant. Null means no live match and
+    /// `error.Ambiguous` means that a token cannot be selected safely.
     pub fn uniqueLiveOriginNick(self: *const Store, origin_node: NodeId, nick: []const u8, now_ms: i64) error{Ambiguous}!?LiveIdentity {
         var match: ?LiveIdentity = null;
         var it = @constCast(&self.entries).iterator();
@@ -628,11 +1009,75 @@ pub const Store = struct {
             // Full quarantine removes token entries; the embedded marker is the
             // allocation-failure fallback and must be checked directly here.
             if (slot.value_ptr.quarantine_until_ms != null) continue;
-            if (!std.mem.eql(u8, slot.value_ptr.nick, nick)) continue;
+            if (!std.ascii.eqlIgnoreCase(slot.value_ptr.nick, nick)) continue;
             if (match != null) return error.Ambiguous;
             match = .{ .token = slot.key_ptr.token, .entry = slot.value_ptr };
         }
         return match;
+    }
+
+    /// Whether any authenticated origin retains live signed authority for the
+    /// logical IRC identity. Unlike `uniqueLiveOriginNick`, this predicate
+    /// deliberately applies the daemon's ASCII casemapping and does not require
+    /// a unique token: a capability downgrade or hop-by-hop reannouncement must
+    /// not widen one or several end-to-end v2 token authorities into a
+    /// token-less account-wide mutation.
+    pub fn hasLiveIdentity(
+        self: *const Store,
+        account: []const u8,
+        nick: []const u8,
+        now_ms: i64,
+    ) bool {
+        if (account.len == 0 or nick.len == 0) return false;
+        var it = @constCast(&self.entries).iterator();
+        while (it.next()) |slot| {
+            if (now_ms > slot.value_ptr.expires_at_ms) continue;
+            if (!std.ascii.eqlIgnoreCase(slot.value_ptr.account, account) or
+                !std.ascii.eqlIgnoreCase(slot.value_ptr.nick, nick)) continue;
+            return true;
+        }
+        // A full account-conflict quarantine removes ordinary entries, but its
+        // two verified OFFER wires remain receiver-owned fail-closed evidence.
+        // Either signed identity must continue blocking a token-less downgrade
+        // until the quarantine expires. Decoding borrows Store-owned memory and
+        // performs no allocation.
+        var quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            if (now_ms > quarantine.expires_at_ms) continue;
+            const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
+            for (wires) |wire| {
+                const signed = decodeOffer(wire) catch continue;
+                if (signed.offer.operation != .upsert) continue;
+                if (std.ascii.eqlIgnoreCase(signed.offer.account, account) and
+                    std.ascii.eqlIgnoreCase(signed.offer.nick, nick)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Fail-closed retained evidence lookup for peers that omitted the optional
+    /// account block as well as v2. This intentionally matches only the IRC nick
+    /// (ASCII-insensitive) across every origin/token, including deny markers and
+    /// both sides of a full account-conflict quarantine. Tombstones carry no nick
+    /// and therefore do not participate.
+    pub fn hasRetainedNick(self: *const Store, nick: []const u8, now_ms: i64) bool {
+        if (nick.len == 0) return false;
+        var it = @constCast(&self.entries).valueIterator();
+        while (it.next()) |entry| {
+            if (now_ms > entry.expires_at_ms) continue;
+            if (std.ascii.eqlIgnoreCase(entry.nick, nick)) return true;
+        }
+        var quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            if (now_ms > quarantine.expires_at_ms) continue;
+            const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
+            for (wires) |wire| {
+                const signed = decodeOffer(wire) catch continue;
+                if (signed.offer.operation == .upsert and
+                    std.ascii.eqlIgnoreCase(signed.offer.nick, nick)) return true;
+            }
+        }
+        return false;
     }
 
     /// Compatibility alias for the deterministic representative.
@@ -673,6 +1118,30 @@ pub const Store = struct {
 
     pub fn quarantineCount(self: *const Store) usize {
         return self.quarantines.count();
+    }
+
+    /// Highest authenticated causal revision retained anywhere in the Store.
+    /// This allocation-free scan includes ordinary rows, allocation-fallback
+    /// deny-marker rows, tombstones, and both signed sides of full quarantine.
+    /// A successor advances its MeshClock past this value before it can issue a
+    /// new local authority fact.
+    pub fn maxAuthorityRevision(self: *const Store) ?Revision {
+        var maximum: ?Revision = null;
+        var entry_it = @constCast(&self.entries).valueIterator();
+        while (entry_it.next()) |entry| checkpointRaiseRevision(&maximum, entry.revision);
+        var tombstone_it = @constCast(&self.tombstones).valueIterator();
+        while (tombstone_it.next()) |tombstone| checkpointRaiseRevision(&maximum, tombstone.revision);
+        var quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
+            for (wires) |wire| {
+                // Quarantine wires enter only through verified apply or strict
+                // checkpoint restore and remain Store-owned until removal.
+                const signed = decodeOffer(wire) catch unreachable;
+                checkpointRaiseRevision(&maximum, signed.offer.revision);
+            }
+        }
+        return maximum;
     }
 
     pub fn isQuarantined(self: *const Store, token: Token) bool {
@@ -967,6 +1436,7 @@ pub const Store = struct {
         validateOfferShape(offer) catch return error.InvalidOffer;
         if (offer.account.len > self.cfg.max_account_bytes or offer.nick.len > self.cfg.max_nick_bytes or offer.snapshot.len > self.cfg.max_snapshot_bytes) return error.InvalidOffer;
         try validateLifetime(offer.issued_at_ms, offer.expires_at_ms, now_ms, self.cfg.max_offer_lifetime_ms, self.cfg.max_future_skew_ms);
+        try validateRevisionAt(offer.revision, now_ms, self.cfg.max_future_skew_ms);
     }
 
     fn applyVerifiedOffer(self: *Store, signed: SignedOffer, digest: Digest, via_peer: NodeId, now_ms: i64) ApplyError!ApplyResult {
@@ -1337,7 +1807,172 @@ pub const Store = struct {
         }
         return removed;
     }
+
+    fn restoreCheckpointEntry(
+        self: *Store,
+        borrowed_wire: []const u8,
+        updated_at_ms: i64,
+        quarantine_until_ms: ?i64,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError!void {
+        const signed = try self.validateCheckpointSignedOffer(borrowed_wire, .upsert, captured_at_ms);
+        if (!checkpointTimeAtOrBefore(updated_at_ms, signed.offer.expires_at_ms) or
+            !checkpointTimeNearCapture(updated_at_ms, captured_at_ms, self.cfg.max_future_skew_ms) or
+            !checkpointOptionalUntilValid(quarantine_until_ms, signed.offer.expires_at_ms))
+            return error.InvalidMetadata;
+
+        const key = OriginKey{ .token = signed.offer.token, .origin_node = signed.offer.revision.origin_node };
+        if (self.entries.contains(key) or self.tombstones.contains(key)) return error.DuplicateState;
+
+        const wire = try self.allocator.dupe(u8, borrowed_wire);
+        errdefer self.allocator.free(wire);
+        const owned = decodeOffer(wire) catch unreachable;
+        self.entries.putAssumeCapacityNoClobber(key, .{
+            .wire = wire,
+            .account = owned.offer.account,
+            .nick = owned.offer.nick,
+            .snapshot = owned.offer.snapshot,
+            .revision = owned.offer.revision,
+            .issued_at_ms = owned.offer.issued_at_ms,
+            .expires_at_ms = owned.offer.expires_at_ms,
+            .updated_at_ms = updated_at_ms,
+            .digest = digestBytes(owned.transcript),
+            .ingress_peer = null,
+            .quarantine_until_ms = quarantine_until_ms,
+        });
+    }
+
+    fn restoreCheckpointTombstone(
+        self: *Store,
+        borrowed_wire: []const u8,
+        removed_at_ms: i64,
+        identity_digest: ?Digest,
+        quarantine_until_ms: ?i64,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError!void {
+        const signed = try self.validateCheckpointSignedOffer(borrowed_wire, .remove, captured_at_ms);
+        if (!checkpointTimeAtOrBefore(removed_at_ms, signed.offer.expires_at_ms) or
+            !checkpointTimeNearCapture(removed_at_ms, captured_at_ms, self.cfg.max_future_skew_ms) or
+            !checkpointOptionalUntilValid(quarantine_until_ms, signed.offer.expires_at_ms))
+            return error.InvalidMetadata;
+
+        const key = OriginKey{ .token = signed.offer.token, .origin_node = signed.offer.revision.origin_node };
+        if (self.entries.contains(key) or self.tombstones.contains(key)) return error.DuplicateState;
+
+        const wire = try self.allocator.dupe(u8, borrowed_wire);
+        errdefer self.allocator.free(wire);
+        const owned = decodeOffer(wire) catch unreachable;
+        self.tombstones.putAssumeCapacityNoClobber(key, .{
+            .wire = wire,
+            .revision = owned.offer.revision,
+            .removed_at_ms = removed_at_ms,
+            .offer_expires_at_ms = owned.offer.expires_at_ms,
+            .digest = digestBytes(owned.transcript),
+            .identity_digest = identity_digest,
+            .quarantine_until_ms = quarantine_until_ms,
+        });
+    }
+
+    fn restoreCheckpointQuarantine(
+        self: *Store,
+        borrowed_first_wire: []const u8,
+        borrowed_second_wire: []const u8,
+        expires_at_ms: i64,
+        detected_at_ms: i64,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError!void {
+        const first = try self.validateCheckpointSignedOffer(borrowed_first_wire, .upsert, captured_at_ms);
+        const second = try self.validateCheckpointSignedOffer(borrowed_second_wire, .upsert, captured_at_ms);
+        if (!tokenEql(first.offer.token, second.offer.token) or
+            std.mem.eql(u8, first.offer.account, second.offer.account)) return error.InvalidMetadata;
+        const first_digest = digestBytes(first.transcript);
+        const second_digest = digestBytes(second.transcript);
+        if (std.mem.order(u8, &first_digest, &second_digest) != .lt) return error.InvalidMetadata;
+        if (expires_at_ms != @min(first.offer.expires_at_ms, second.offer.expires_at_ms) or
+            !checkpointTimeAtOrBefore(detected_at_ms, expires_at_ms) or
+            !checkpointTimeNearCapture(detected_at_ms, captured_at_ms, self.cfg.max_future_skew_ms))
+            return error.InvalidMetadata;
+        if (self.quarantines.contains(first.offer.token) or self.hasAnyCheckpointState(first.offer.token))
+            return error.DuplicateState;
+
+        const first_wire = try self.allocator.dupe(u8, borrowed_first_wire);
+        errdefer self.allocator.free(first_wire);
+        const second_wire = try self.allocator.dupe(u8, borrowed_second_wire);
+        errdefer self.allocator.free(second_wire);
+        self.quarantines.putAssumeCapacityNoClobber(first.offer.token, .{
+            .first_wire = first_wire,
+            .second_wire = second_wire,
+            .expires_at_ms = expires_at_ms,
+            .detected_at_ms = detected_at_ms,
+        });
+    }
+
+    fn validateCheckpointSignedOffer(
+        self: *const Store,
+        wire: []const u8,
+        operation: OfferOperation,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError!SignedOffer {
+        const signed = decodeOffer(wire) catch return error.InvalidSignedObject;
+        verifyOffer(signed) catch return error.InvalidSignedObject;
+        const offer = signed.offer;
+        if (offer.operation != operation or
+            offer.account.len > self.cfg.max_account_bytes or
+            offer.nick.len > self.cfg.max_nick_bytes or
+            offer.snapshot.len > self.cfg.max_snapshot_bytes) return error.InvalidMetadata;
+        const lifetime: i128 = @as(i128, offer.expires_at_ms) - @as(i128, offer.issued_at_ms);
+        if (lifetime < 0 or lifetime > self.cfg.max_offer_lifetime_ms) return error.InvalidMetadata;
+        const latest: i128 = @as(i128, captured_at_ms) + @as(i128, self.cfg.max_future_skew_ms);
+        if (@as(i128, offer.issued_at_ms) > latest or @as(i128, offer.revision.epoch) > latest)
+            return error.InvalidMetadata;
+        return signed;
+    }
+
+    fn hasAnyCheckpointState(self: *const Store, token: Token) bool {
+        var entry_it = @constCast(&self.entries).keyIterator();
+        while (entry_it.next()) |key| if (tokenEql(key.token, token)) return true;
+        var tombstone_it = @constCast(&self.tombstones).keyIterator();
+        while (tombstone_it.next()) |key| if (tokenEql(key.token, token)) return true;
+        return false;
+    }
+
+    fn validateCheckpointIdentityState(self: *const Store) UpgradeCheckpointError!void {
+        var entry_it = @constCast(&self.entries).iterator();
+        while (entry_it.next()) |left| {
+            if (self.hasFullQuarantine(left.key_ptr.token)) return error.DuplicateState;
+            const expected = digestBytes(left.value_ptr.account);
+            var other_entry_it = @constCast(&self.entries).iterator();
+            while (other_entry_it.next()) |right| {
+                if (!tokenEql(left.key_ptr.token, right.key_ptr.token)) continue;
+                if (!std.mem.eql(u8, left.value_ptr.account, right.value_ptr.account)) return error.InvalidMetadata;
+            }
+            var tombstone_it = @constCast(&self.tombstones).iterator();
+            while (tombstone_it.next()) |tombstone| {
+                if (!tokenEql(left.key_ptr.token, tombstone.key_ptr.token)) continue;
+                if (tombstone.value_ptr.identity_digest) |actual| {
+                    if (!std.crypto.timing_safe.eql(Digest, expected, actual)) return error.InvalidMetadata;
+                }
+            }
+        }
+        var tombstone_it = @constCast(&self.tombstones).iterator();
+        while (tombstone_it.next()) |left| {
+            if (self.hasFullQuarantine(left.key_ptr.token)) return error.DuplicateState;
+            const expected = left.value_ptr.identity_digest orelse continue;
+            var other_it = @constCast(&self.tombstones).iterator();
+            while (other_it.next()) |right| {
+                if (!tokenEql(left.key_ptr.token, right.key_ptr.token)) continue;
+                if (right.value_ptr.identity_digest) |actual| {
+                    if (!std.crypto.timing_safe.eql(Digest, expected, actual)) return error.InvalidMetadata;
+                }
+            }
+        }
+    }
 };
+
+/// Module-level discriminator for callers that do not otherwise name Store.
+pub fn isUpgradeCheckpoint(bytes: []const u8) bool {
+    return Store.isUpgradeCheckpoint(bytes);
+}
 
 fn validateLifetime(issued_at_ms: i64, expires_at_ms: i64, now_ms: i64, max_lifetime_ms: u64, max_future_skew_ms: u64) error{ Expired, InvalidLifetime }!void {
     if (issued_at_ms < 0 or expires_at_ms < issued_at_ms) return error.InvalidLifetime;
@@ -1346,6 +1981,17 @@ fn validateLifetime(issued_at_ms: i64, expires_at_ms: i64, now_ms: i64, max_life
     const future_delta: i128 = @as(i128, issued_at_ms) - @as(i128, now_ms);
     if (future_delta > max_future_skew_ms) return error.InvalidLifetime;
     if (now_ms > expires_at_ms) return error.Expired;
+}
+
+/// A revision participates in the same wall-clock domain as its signed
+/// lifetime. Canonical shape is checked at encode/decode; the Store adds this
+/// apply-time bound so an otherwise-authentic peer cannot advance the
+/// restart-persistent causal clock beyond the configured skew window. i128 math
+/// keeps `now + skew` overflow-free for every i64/u64 input.
+fn validateRevisionAt(revision: Revision, now_ms: i64, max_future_skew_ms: u64) error{InvalidLifetime}!void {
+    if (!revision.isCanonical()) return error.InvalidLifetime;
+    const latest_physical: i128 = @as(i128, now_ms) + @as(i128, max_future_skew_ms);
+    if (@as(i128, revision.epoch) > latest_physical) return error.InvalidLifetime;
 }
 
 fn freeEntry(allocator: std.mem.Allocator, entry: Store.Entry) void {
@@ -1379,6 +2025,12 @@ fn retainedObjectFromWire(wire: []const u8) Store.RetainedObject {
         .expires_at_ms = signed.offer.expires_at_ms,
         .wire = wire,
     };
+}
+
+fn considerOrderedToken(token: Token, lower_bound: ?Token, candidate: *?Token) void {
+    if (lower_bound) |lower| if (std.mem.order(u8, &token, &lower) != .gt) return;
+    if (candidate.* == null or std.mem.order(u8, &token, &candidate.*.?) == .lt)
+        candidate.* = token;
 }
 
 fn tokenEql(a: Token, b: Token) bool {
@@ -1419,6 +2071,61 @@ fn nonNegativeAge(now_ms: i64, then_ms: i64) u64 {
     if (now_ms <= then_ms) return 0;
     const age: i128 = @as(i128, now_ms) - @as(i128, then_ms);
     return @intCast(age);
+}
+
+fn checkpointAddLen(total: *usize, amount: usize) UpgradeCheckpointError!void {
+    if (amount > std.math.maxInt(usize) - total.*) return error.TooLarge;
+    total.* += amount;
+}
+
+fn checkpointAddProduct(total: *usize, count: usize, unit: usize) UpgradeCheckpointError!void {
+    if (count != 0 and unit > std.math.maxInt(usize) / count) return error.TooLarge;
+    try checkpointAddLen(total, count * unit);
+}
+
+fn checkpointWriteWire(writer: *Writer, wire: []const u8) UpgradeCheckpointError!void {
+    if (wire.len == 0 or wire.len > std.math.maxInt(u32)) return error.TooLarge;
+    writer.writeU32(@intCast(wire.len));
+    writer.writeBytes(wire);
+}
+
+fn checkpointReadWire(reader: *UpgradeCheckpointReader) UpgradeCheckpointError![]const u8 {
+    const len: usize = try reader.readU32();
+    if (len == 0 or len > session_replica_transport.max_signed_payload_len) return error.InvalidMetadata;
+    return reader.take(len);
+}
+
+fn checkpointReadOptionalI64(reader: *UpgradeCheckpointReader) UpgradeCheckpointError!?i64 {
+    return switch (try reader.readByte()) {
+        0 => null,
+        1 => try reader.readI64(),
+        else => error.InvalidMetadata,
+    };
+}
+
+fn checkpointReadOptionalDigest(reader: *UpgradeCheckpointReader) UpgradeCheckpointError!?Digest {
+    return switch (try reader.readByte()) {
+        0 => null,
+        1 => (try reader.take(@sizeOf(Digest)))[0..@sizeOf(Digest)].*,
+        else => error.InvalidMetadata,
+    };
+}
+
+fn checkpointTimeAtOrBefore(value_ms: i64, limit_ms: i64) bool {
+    return value_ms >= 0 and value_ms <= limit_ms;
+}
+
+fn checkpointTimeNearCapture(value_ms: i64, captured_at_ms: i64, max_future_skew_ms: u64) bool {
+    return @as(i128, value_ms) <= @as(i128, captured_at_ms) + @as(i128, max_future_skew_ms);
+}
+
+fn checkpointOptionalUntilValid(until_ms: ?i64, expires_at_ms: i64) bool {
+    const value = until_ms orelse return true;
+    return checkpointTimeAtOrBefore(value, expires_at_ms);
+}
+
+fn checkpointRaiseRevision(maximum: *?Revision, candidate: Revision) void {
+    if (maximum.* == null or candidate.compare(maximum.*.?) == .gt) maximum.* = candidate;
 }
 
 const Writer = struct {
@@ -1502,6 +2209,30 @@ const Reader = struct {
     }
 };
 
+const UpgradeCheckpointReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn take(self: *UpgradeCheckpointReader, len: usize) UpgradeCheckpointError![]const u8 {
+        if (len > self.bytes.len -| self.pos) return error.Truncated;
+        const result = self.bytes[self.pos .. self.pos + len];
+        self.pos += len;
+        return result;
+    }
+
+    fn readByte(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readU32(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .big);
+    }
+
+    fn readI64(self: *UpgradeCheckpointReader) UpgradeCheckpointError!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .big);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1512,8 +2243,14 @@ fn testKey(seed: u8) !sign.KeyPair {
     return sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed)));
 }
 
-fn revisionFor(kp: *const sign.KeyPair, epoch: u64, sequence: u64) Revision {
-    return .{ .epoch = epoch, .sequence = sequence, .origin_node = signed_frame.originShortId(kp.public_key) };
+fn revisionFor(kp: *const sign.KeyPair, physical_ms: u64, logical: u64) Revision {
+    const stamp = (physical_ms << mesh_clock.seq_bits) |
+        (logical & ((@as(u64, 1) << mesh_clock.seq_bits) - 1));
+    return .{
+        .epoch = physical_ms,
+        .sequence = stamp,
+        .origin_node = signed_frame.originShortId(kp.public_key),
+    };
 }
 
 fn testToken(byte: u8) Token {
@@ -1550,6 +2287,21 @@ fn signedOffer(allocator: std.mem.Allocator, offer: Offer, kp: *const sign.KeyPa
     return .{ .wire = wire, .decoded = try decodeOffer(wire) };
 }
 
+fn rewriteUpgradeCheckpointChecksum(bytes: []u8) void {
+    std.debug.assert(bytes.len >= upgrade_checkpoint_checksum_len);
+    const body_end = bytes.len - upgrade_checkpoint_checksum_len;
+    const checksum = digestBytes(bytes[0..body_end]);
+    @memcpy(bytes[body_end..], &checksum);
+}
+
+fn expectUpgradeCheckpointRejected(cfg: Store.Config, bytes: []const u8, now_ms: i64) !void {
+    if (Store.restoreUpgradeCheckpoint(testing.allocator, cfg, bytes, now_ms)) |value| {
+        var restored = value;
+        restored.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
 fn nextTestPermutation(values: []u8) bool {
     if (values.len < 2) return false;
     var pivot = values.len - 1;
@@ -1571,11 +2323,12 @@ fn nextTestPermutation(values: []u8) bool {
 
 test "session replica revision comparison is a deterministic total order" {
     const values = [_]Revision{
-        .{ .epoch = 1, .sequence = 1, .origin_node = 1 },
-        .{ .epoch = 1, .sequence = 1, .origin_node = 2 },
-        .{ .epoch = 1, .sequence = 2, .origin_node = 1 },
-        .{ .epoch = 2, .sequence = 0, .origin_node = 1 },
+        .{ .epoch = 1, .sequence = (1 << mesh_clock.seq_bits) | 1, .origin_node = 1 },
+        .{ .epoch = 1, .sequence = (1 << mesh_clock.seq_bits) | 1, .origin_node = 2 },
+        .{ .epoch = 1, .sequence = (1 << mesh_clock.seq_bits) | 2, .origin_node = 1 },
+        .{ .epoch = 2, .sequence = (2 << mesh_clock.seq_bits), .origin_node = 1 },
     };
+    for (values) |revision| try testing.expect(revision.isCanonical());
     for (values, 0..) |left, i| {
         try testing.expectEqual(std.math.Order.eq, left.compare(left));
         for (values, 0..) |right, j| {
@@ -1604,6 +2357,22 @@ test "session replica signed OFFER upsert round-trips and verifies" {
     var forged_projection = decoded;
     forged_projection.offer.nick = "Mallory";
     try testing.expectError(error.TranscriptMismatch, verifyOffer(forged_projection));
+}
+
+test "session replica OFFER rejects non-canonical mesh-clock revisions" {
+    var kp = try testKey(0x0f);
+    defer kp.deinit();
+    var offer = upsertOffer(&kp, testToken(0xf0), 100, 7, "state");
+    offer.revision.epoch += 1;
+    try testing.expectError(error.InvalidOffer, encodeOffer(testing.allocator, offer, &kp));
+
+    const canonical = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xf0), 100, 7, "state"), &kp);
+    defer testing.allocator.free(canonical.wire);
+    var malformed = try testing.allocator.dupe(u8, canonical.wire);
+    defer testing.allocator.free(malformed);
+    const revision_epoch_offset = offer_magic.len + 1 + @sizeOf(Token);
+    std.mem.writeInt(u64, malformed[revision_epoch_offset..][0..8], 101, .big);
+    try testing.expectError(error.InvalidOffer, decodeOffer(malformed));
 }
 
 test "session replica maximum OFFER fits transport exactly and boundary plus one rejects" {
@@ -1723,6 +2492,29 @@ test "session replica signed ACK round-trips verifies and rejects tampering" {
     tampered[ack_magic.len] = 0xff;
     try testing.expectError(error.InvalidAck, decodeAck(tampered));
     try testing.expectError(error.Truncated, decodeAck(wire[0 .. wire.len - 1]));
+}
+
+test "session replica ACK rejects non-canonical offered and observed revisions" {
+    var origin = try testKey(0x34);
+    defer origin.deinit();
+    var receiver = try testKey(0x35);
+    defer receiver.deinit();
+    const revision = revisionFor(&origin, 200, 9);
+    var ack = Ack{
+        .status = .accepted,
+        .token = testToken(0xf1),
+        .offered_revision = revision,
+        .observed_revision = revision,
+        .ack_node = signed_frame.originShortId(receiver.public_key),
+        .issued_at_ms = 200,
+        .expires_at_ms = 300,
+    };
+
+    ack.offered_revision.epoch += 1;
+    try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, ack, &receiver));
+    ack.offered_revision = revision;
+    ack.observed_revision.epoch += 1;
+    try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, ack, &receiver));
 }
 
 test "session replica ACK signer must self-certify ack node and wire has no trailing tolerance" {
@@ -2004,6 +2796,166 @@ test "session replica retained enumeration is bounded across concurrent origins"
     try testing.expectEqual(@as(usize, 1), store.retainedObjectsRange(201, 1, &second));
     try verifyOffer(try decodeOffer(second[0].wire));
     try testing.expect(one[0].origin_node != second[0].origin_node);
+}
+
+test "session replica live token pages are unique stable and fair after cursor disappearance" {
+    var a_key = try testKey(0x9a);
+    defer a_key.deinit();
+    var b_key = try testKey(0x9b);
+    defer b_key.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const Apply = struct {
+        fn upsert(target: *Store, kp: *const sign.KeyPair, token: Token, logical: u64, now_ms: i64) !void {
+            const signed = try signedOffer(testing.allocator, upsertOffer(kp, token, 1, logical, "state"), kp);
+            defer testing.allocator.free(signed.wire);
+            _ = try target.applySignedOffer(signed.decoded, @intCast(logical + 100), now_ms);
+        }
+
+        fn remove(target: *Store, kp: *const sign.KeyPair, token: Token, logical: u64, now_ms: i64) !void {
+            const signed = try signedOffer(testing.allocator, removeOffer(kp, token, 2, logical), kp);
+            defer testing.allocator.free(signed.wire);
+            _ = try target.applySignedOffer(signed.decoded, @intCast(logical + 200), now_ms);
+        }
+    };
+
+    // Deliberately insert out of order. Token 0x20 has concurrent origins but
+    // must occupy only one page slot.
+    try Apply.upsert(&store, &a_key, testToken(0x30), 1, 150);
+    try Apply.upsert(&store, &a_key, testToken(0x10), 2, 150);
+    try Apply.upsert(&store, &a_key, testToken(0x50), 3, 150);
+    try Apply.upsert(&store, &a_key, testToken(0x20), 4, 150);
+    try Apply.upsert(&store, &b_key, testToken(0x20), 5, 150);
+    try Apply.upsert(&store, &a_key, testToken(0x40), 6, 150);
+
+    // An expired fact and a fully quarantined token never enter the live page.
+    var expired_offer = upsertOffer(&a_key, testToken(0x05), 1, 7, "expired");
+    expired_offer.expires_at_ms = 200;
+    const expired = try signedOffer(testing.allocator, expired_offer, &a_key);
+    defer testing.allocator.free(expired.wire);
+    _ = try store.applySignedOffer(expired.decoded, 107, 150);
+
+    try Apply.upsert(&store, &a_key, testToken(0x60), 8, 150);
+    var conflict_offer = upsertOffer(&b_key, testToken(0x60), 1, 9, "conflict");
+    conflict_offer.account = "mallory";
+    const conflict = try signedOffer(testing.allocator, conflict_offer, &b_key);
+    defer testing.allocator.free(conflict.wire);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(conflict.decoded, 109, 150)).disposition);
+
+    var first_buf: [3]Token = undefined;
+    const first = store.liveTokensAfter(201, null, &first_buf);
+    try testing.expectEqual(@as(usize, 3), first.len);
+    try testing.expect(tokenEql(testToken(0x10), first[0]));
+    try testing.expect(tokenEql(testToken(0x20), first[1]));
+    try testing.expect(tokenEql(testToken(0x30), first[2]));
+
+    // The value cursor remains useful after its entry disappears. A new token
+    // inserted behind it waits for wrap while later tokens keep progressing.
+    try Apply.remove(&store, &a_key, testToken(0x30), 10, 202);
+    try Apply.upsert(&store, &a_key, testToken(0x15), 11, 202);
+    var later_buf: [2]Token = undefined;
+    const later = store.liveTokensAfter(202, first[2], &later_buf);
+    try testing.expectEqual(@as(usize, 2), later.len);
+    try testing.expect(tokenEql(testToken(0x40), later[0]));
+    try testing.expect(tokenEql(testToken(0x50), later[1]));
+
+    var end_buf: [1]Token = undefined;
+    try testing.expectEqual(@as(usize, 0), store.liveTokensAfter(202, later[1], &end_buf).len);
+    var wrapped_buf: [2]Token = undefined;
+    const wrapped = store.liveTokensAfter(202, null, &wrapped_buf);
+    try testing.expectEqual(@as(usize, 2), wrapped.len);
+    try testing.expect(tokenEql(testToken(0x10), wrapped[0]));
+    try testing.expect(tokenEql(testToken(0x15), wrapped[1]));
+}
+
+test "session replica stored token and live origin pages preserve expiry cleanup keys" {
+    var a_key = try testKey(0xa1);
+    defer a_key.deinit();
+    var b_key = try testKey(0xa2);
+    defer b_key.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const shared = testToken(0x22);
+    const expired_token = testToken(0x11);
+    var expired_offer = upsertOffer(&a_key, expired_token, 1, 1, "expired");
+    expired_offer.expires_at_ms = 200;
+    const expired = try signedOffer(testing.allocator, expired_offer, &a_key);
+    defer testing.allocator.free(expired.wire);
+    _ = try store.applySignedOffer(expired.decoded, 1, 150);
+
+    var a_offer = upsertOffer(&a_key, shared, 2, 2, "a");
+    a_offer.nick = "Alice-A";
+    const a = try signedOffer(testing.allocator, a_offer, &a_key);
+    defer testing.allocator.free(a.wire);
+    _ = try store.applySignedOffer(a.decoded, 2, 150);
+    var b_offer = upsertOffer(&b_key, shared, 2, 3, "b");
+    b_offer.nick = "Alice-B";
+    const b = try signedOffer(testing.allocator, b_offer, &b_key);
+    defer testing.allocator.free(b.wire);
+    _ = try store.applySignedOffer(b.decoded, 3, 150);
+
+    var stored_buf: [4]Token = undefined;
+    const stored = store.storedTokensAfter(null, &stored_buf);
+    try testing.expectEqual(@as(usize, 2), stored.len);
+    try testing.expect(tokenEql(expired_token, stored[0]));
+    try testing.expect(tokenEql(shared, stored[1]));
+    var live_buf: [4]Token = undefined;
+    const live = store.authorityTokensAfter(201, null, &live_buf);
+    try testing.expectEqual(@as(usize, 1), live.len);
+    try testing.expect(tokenEql(shared, live[0]));
+    var sweep_buf: [2]Token = undefined;
+    const sweep_tokens = store.projectionSweepTokensAfter(201, null, &sweep_buf);
+    try testing.expectEqual(@as(usize, 1), sweep_tokens.len);
+    try testing.expect(tokenEql(expired_token, sweep_tokens[0]));
+
+    var origins_buf: [1]Store.OriginIdentity = undefined;
+    const first = store.liveOriginIdentitiesAfter(shared, 201, null, &origins_buf);
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const first_origin = first[0].origin_node;
+    const second = store.liveOriginIdentitiesAfter(shared, 201, first_origin, &origins_buf);
+    try testing.expectEqual(@as(usize, 1), second.len);
+    try testing.expect(first_origin < second[0].origin_node);
+    try testing.expectEqual(@as(usize, 0), store.liveOriginIdentitiesAfter(shared, 201, second[0].origin_node, &origins_buf).len);
+}
+
+test "session replica authority token pages include revoke and quarantine retry keys" {
+    var a_key = try testKey(0xb1);
+    defer a_key.deinit();
+    var b_key = try testKey(0xb2);
+    defer b_key.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const live_token = testToken(0x10);
+    const revoked_token = testToken(0x20);
+    const quarantined_token = testToken(0x30);
+    const live = try signedOffer(testing.allocator, upsertOffer(&a_key, live_token, 1, 1, "live"), &a_key);
+    defer testing.allocator.free(live.wire);
+    _ = try store.applySignedOffer(live.decoded, 1, 200);
+    const revoked_live = try signedOffer(testing.allocator, upsertOffer(&a_key, revoked_token, 1, 2, "before-revoke"), &a_key);
+    defer testing.allocator.free(revoked_live.wire);
+    _ = try store.applySignedOffer(revoked_live.decoded, 1, 200);
+    const revoke = try signedOffer(testing.allocator, removeOffer(&a_key, revoked_token, 2, 3), &a_key);
+    defer testing.allocator.free(revoke.wire);
+    _ = try store.applySignedOffer(revoke.decoded, 1, 201);
+
+    const first = try signedOffer(testing.allocator, upsertOffer(&a_key, quarantined_token, 1, 4, "first"), &a_key);
+    defer testing.allocator.free(first.wire);
+    _ = try store.applySignedOffer(first.decoded, 1, 200);
+    var conflict_offer = upsertOffer(&b_key, quarantined_token, 1, 5, "conflict");
+    conflict_offer.account = "mallory";
+    const conflict = try signedOffer(testing.allocator, conflict_offer, &b_key);
+    defer testing.allocator.free(conflict.wire);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(conflict.decoded, 2, 201)).disposition);
+
+    var page_buf: [4]Token = undefined;
+    const page = store.authorityTokensAfter(201, null, &page_buf);
+    try testing.expectEqual(@as(usize, 3), page.len);
+    try testing.expect(tokenEql(live_token, page[0]));
+    try testing.expect(tokenEql(revoked_token, page[1]));
+    try testing.expect(tokenEql(quarantined_token, page[2]));
 }
 
 test "session replica nick revisions evolve until account conflict quarantines the token" {
@@ -2409,6 +3361,23 @@ test "session replica store rejects expired overlong and far-future offers witho
     const boundary = try signedOffer(testing.allocator, boundary_offer, &kp);
     defer testing.allocator.free(boundary.wire);
     try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOffer(boundary.decoded, 0, 200)).disposition);
+
+    var revision_future_offer = upsertOffer(&kp, testToken(0xf2), 301, 1, "revision-future");
+    revision_future_offer.issued_at_ms = 200;
+    revision_future_offer.expires_at_ms = 300;
+    const revision_future = try signedOffer(testing.allocator, revision_future_offer, &kp);
+    defer testing.allocator.free(revision_future.wire);
+    try testing.expectError(error.InvalidLifetime, store.applySignedOffer(revision_future.decoded, 0, 200));
+
+    var revision_boundary_offer = upsertOffer(&kp, testToken(0xf3), 300, 1, "revision-boundary");
+    revision_boundary_offer.issued_at_ms = 200;
+    revision_boundary_offer.expires_at_ms = 300;
+    const revision_boundary = try signedOffer(testing.allocator, revision_boundary_offer, &kp);
+    defer testing.allocator.free(revision_boundary.wire);
+    try testing.expectEqual(
+        ApplyDisposition.inserted,
+        (try store.applySignedOffer(revision_boundary.decoded, 0, 200)).disposition,
+    );
 }
 
 test "session replica signed ACK is authenticated receipt metadata and never a route" {
@@ -2491,6 +3460,18 @@ test "session replica ACK ignores route capacity and rejects expiry and revision
     const boundary = try encodeAck(testing.allocator, boundary_ack, &receiver);
     defer testing.allocator.free(boundary);
     try testing.expectEqual(AckDisposition.accepted, try store.applySignedAck(try decodeAck(boundary), 5, 210));
+
+    var revision_future_ack = ack;
+    revision_future_ack.offered_revision = revisionFor(&origin, 311, 1);
+    revision_future_ack.observed_revision = revision_future_ack.offered_revision;
+    revision_future_ack.issued_at_ms = 210;
+    revision_future_ack.expires_at_ms = 310;
+    const revision_future = try encodeAck(testing.allocator, revision_future_ack, &receiver);
+    defer testing.allocator.free(revision_future);
+    try testing.expectError(
+        error.InvalidLifetime,
+        store.applySignedAck(try decodeAck(revision_future), 5, 210),
+    );
 }
 
 test "session replica line and triangle reflections never create OFFER or ACK route loops" {
@@ -2747,8 +3728,15 @@ test "session replica unique origin nick lookup is live ambiguity and quarantine
     defer store.deinit();
     _ = try store.applySignedOffer(first.decoded, 121, 200);
     _ = try store.applySignedOffer(second.decoded, 122, 200);
+    // Downgrade suppression is identity-wide, ASCII-case-insensitive, and must
+    // remain true when more than one exact token carries signed authority.
+    try testing.expect(store.hasLiveIdentity("ALICE", "aLiCe", 200));
+    try testing.expect(store.hasRetainedNick("aLiCe", 200));
+    try testing.expect(!store.hasLiveIdentity("mallory", "Alice", 200));
+    try testing.expect(!store.hasLiveIdentity("alice", "Alice", 501));
     try testing.expectError(error.Ambiguous, store.uniqueLiveOriginNick(origin_node, "Alice", 200));
-    try testing.expect((try store.uniqueLiveOriginNick(origin_node, "alice", 300)) == null);
+    const unique_case_variant = (try store.uniqueLiveOriginNick(origin_node, "alice", 300)).?;
+    try testing.expect(tokenEql(first_token, unique_case_variant.token));
     const unique = (try store.uniqueLiveOriginNick(origin_node, "Alice", 300)).?;
     try testing.expect(tokenEql(first_token, unique.token));
     try testing.expectEqualStrings("first", unique.entry.snapshot);
@@ -2759,6 +3747,24 @@ test "session replica unique origin nick lookup is live ambiguity and quarantine
     defer testing.allocator.free(conflicting.wire);
     try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(conflicting.decoded, 123, 301)).disposition);
     try testing.expect((try store.uniqueLiveOriginNick(origin_node, "Alice", 301)) == null);
+    // Full quarantine removes ordinary entries, but both signed identities stay
+    // fail-closed downgrade evidence until the shorter OFFER lifetime ends.
+    try testing.expect(store.hasLiveIdentity("ALICE", "aLiCe", 301));
+    try testing.expect(store.hasLiveIdentity("mallory", "ALICE", 301));
+    try testing.expect(!store.hasLiveIdentity("alice", "Alice", 501));
+    try testing.expect(!store.hasLiveIdentity("mallory", "Alice", 501));
+    try testing.expect(!store.hasRetainedNick("Alice", 501));
+
+    // If evidence allocation/capacity is unavailable, the embedded deny marker
+    // on the surviving entry must still guard its signed identity.
+    var capped = Store.initWithConfig(testing.allocator, .{ .max_quarantines = 0 });
+    defer capped.deinit();
+    _ = try capped.applySignedOffer(first.decoded, 121, 200);
+    try testing.expectError(error.QuarantineFull, capped.applySignedOffer(conflicting.decoded, 123, 301));
+    try testing.expect(capped.hasLiveIdentity("alice", "ALICE", 301));
+    try testing.expect(capped.hasRetainedNick("aLiCe", 301));
+    try testing.expect(!capped.hasLiveIdentity("alice", "ALICE", 501));
+    try testing.expect(!capped.hasRetainedNick("Alice", 501));
 }
 
 test "session replica retained REVOKE replacement is transactional at every allocation failure" {
@@ -2848,4 +3854,382 @@ test "session replica account quarantine is fail-closed at every allocation fail
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{ alice.decoded, mallory.decoded });
+}
+
+test "session replica upgrade checkpoint preserves exact authority and deny state without routes" {
+    var alice_key = try testKey(0xa1);
+    defer alice_key.deinit();
+    var second_key = try testKey(0xa2);
+    defer second_key.deinit();
+    var mallory_key = try testKey(0xa3);
+    defer mallory_key.deinit();
+
+    const live_token = testToken(0xa1);
+    const tombstone_token = testToken(0xa2);
+    const quarantine_token = testToken(0xa3);
+    const denied_entry_token = testToken(0xa4);
+    const denied_tombstone_token = testToken(0xa5);
+
+    const live = try signedOffer(testing.allocator, upsertOffer(&alice_key, live_token, 1, 1, "live"), &alice_key);
+    defer testing.allocator.free(live.wire);
+    const removed_live = try signedOffer(testing.allocator, upsertOffer(&second_key, tombstone_token, 2, 1, "removed"), &second_key);
+    defer testing.allocator.free(removed_live.wire);
+    const removed = try signedOffer(testing.allocator, removeOffer(&second_key, tombstone_token, 3, 1), &second_key);
+    defer testing.allocator.free(removed.wire);
+    const quarantined_alice = try signedOffer(testing.allocator, upsertOffer(&alice_key, quarantine_token, 4, 1, "alice-q"), &alice_key);
+    defer testing.allocator.free(quarantined_alice.wire);
+    var quarantined_mallory_offer = upsertOffer(&mallory_key, quarantine_token, 5, 1, "mallory-q");
+    quarantined_mallory_offer.account = "mallory";
+    const quarantined_mallory = try signedOffer(testing.allocator, quarantined_mallory_offer, &mallory_key);
+    defer testing.allocator.free(quarantined_mallory.wire);
+    const denied_entry_alice = try signedOffer(testing.allocator, upsertOffer(&alice_key, denied_entry_token, 6, 1, "alice-denied"), &alice_key);
+    defer testing.allocator.free(denied_entry_alice.wire);
+    var denied_entry_mallory_offer = upsertOffer(&mallory_key, denied_entry_token, 7, 1, "mallory-denied");
+    denied_entry_mallory_offer.account = "mallory";
+    const denied_entry_mallory = try signedOffer(testing.allocator, denied_entry_mallory_offer, &mallory_key);
+    defer testing.allocator.free(denied_entry_mallory.wire);
+    const denied_tombstone_alice = try signedOffer(testing.allocator, upsertOffer(&alice_key, denied_tombstone_token, 8, 1, "alice-removed"), &alice_key);
+    defer testing.allocator.free(denied_tombstone_alice.wire);
+    const denied_tombstone_remove = try signedOffer(testing.allocator, removeOffer(&alice_key, denied_tombstone_token, 9, 1), &alice_key);
+    defer testing.allocator.free(denied_tombstone_remove.wire);
+    var denied_tombstone_mallory_offer = upsertOffer(&mallory_key, denied_tombstone_token, 10, 1, "mallory-replay");
+    denied_tombstone_mallory_offer.account = "mallory";
+    const denied_tombstone_mallory = try signedOffer(testing.allocator, denied_tombstone_mallory_offer, &mallory_key);
+    defer testing.allocator.free(denied_tombstone_mallory.wire);
+
+    const cfg = Store.Config{ .max_quarantines = 1 };
+    var source = Store.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+    _ = try source.applySignedOffer(live.decoded, 501, 200);
+    _ = try source.applySignedOffer(removed_live.decoded, 502, 201);
+    _ = try source.applySignedOffer(removed.decoded, 502, 202);
+    _ = try source.applySignedOffer(quarantined_alice.decoded, 503, 203);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try source.applySignedOffer(quarantined_mallory.decoded, 504, 204)).disposition);
+    _ = try source.applySignedOffer(denied_entry_alice.decoded, 505, 205);
+    try testing.expectError(error.QuarantineFull, source.applySignedOffer(denied_entry_mallory.decoded, 506, 206));
+    _ = try source.applySignedOffer(denied_tombstone_alice.decoded, 507, 207);
+    _ = try source.applySignedOffer(denied_tombstone_remove.decoded, 507, 208);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try source.applySignedOffer(denied_tombstone_mallory.decoded, 508, 209)).disposition);
+
+    try testing.expectEqual(@as(usize, 2), source.entryCount());
+    try testing.expectEqual(@as(usize, 2), source.tombstoneCount());
+    try testing.expectEqual(@as(usize, 1), source.quarantineCount());
+    try testing.expectEqual(@as(usize, 1), source.routeCount());
+    const denied_entry_key = Store.OriginKey{ .token = denied_entry_token, .origin_node = denied_entry_alice.decoded.offer.revision.origin_node };
+    const denied_tombstone_key = Store.OriginKey{ .token = denied_tombstone_token, .origin_node = denied_tombstone_remove.decoded.offer.revision.origin_node };
+    try testing.expectEqual(@as(?i64, 10_000), source.entries.get(denied_entry_key).?.quarantine_until_ms);
+    try testing.expectEqual(@as(?i64, 10_000), source.tombstones.get(denied_tombstone_key).?.quarantine_until_ms);
+    try testing.expect(source.tombstones.get(denied_tombstone_key).?.identity_digest != null);
+
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 500);
+    defer testing.allocator.free(checkpoint);
+    try testing.expect(Store.isUpgradeCheckpoint(checkpoint));
+    try testing.expect(isUpgradeCheckpoint(checkpoint));
+
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint, 500);
+    defer restored.deinit();
+    try testing.expectEqual(source.entryCount(), restored.entryCount());
+    try testing.expectEqual(source.tombstoneCount(), restored.tombstoneCount());
+    try testing.expectEqual(source.quarantineCount(), restored.quarantineCount());
+    try testing.expectEqual(@as(usize, 0), restored.routeCount());
+
+    const restored_live = restored.entries.get(.{ .token = live_token, .origin_node = live.decoded.offer.revision.origin_node }).?;
+    try testing.expectEqualSlices(u8, live.wire, restored_live.wire);
+    try testing.expectEqual(@as(i64, 200), restored_live.updated_at_ms);
+    try testing.expectEqual(@as(?NodeId, null), restored_live.ingress_peer);
+    const restored_removed = restored.tombstones.get(.{ .token = tombstone_token, .origin_node = removed.decoded.offer.revision.origin_node }).?;
+    try testing.expectEqualSlices(u8, removed.wire, restored_removed.wire);
+    try testing.expectEqual(@as(i64, 202), restored_removed.removed_at_ms);
+    try testing.expect(restored_removed.identity_digest != null);
+    try testing.expectEqual(@as(?i64, 10_000), restored.entries.get(denied_entry_key).?.quarantine_until_ms);
+    try testing.expectEqual(@as(?i64, 10_000), restored.tombstones.get(denied_tombstone_key).?.quarantine_until_ms);
+
+    const source_quarantine = source.quarantines.get(quarantine_token).?;
+    const restored_quarantine = restored.quarantines.get(quarantine_token).?;
+    try testing.expectEqualSlices(u8, source_quarantine.first_wire, restored_quarantine.first_wire);
+    try testing.expectEqualSlices(u8, source_quarantine.second_wire, restored_quarantine.second_wire);
+    try testing.expectEqual(source_quarantine.expires_at_ms, restored_quarantine.expires_at_ms);
+    try testing.expectEqual(source_quarantine.detected_at_ms, restored_quarantine.detected_at_ms);
+
+    try testing.expectError(error.QuarantineFull, restored.applySignedOffer(denied_entry_mallory.decoded, 601, 501));
+    try testing.expectEqual(ApplyDisposition.quarantined, (try restored.applySignedOffer(denied_tombstone_mallory.decoded, 602, 501)).disposition);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try restored.applySignedOffer(quarantined_alice.decoded, 603, 501)).disposition);
+}
+
+test "session replica upgrade checkpoint strictly rejects truncation corruption duplicates and excess capacity" {
+    var first_key = try testKey(0xb1);
+    defer first_key.deinit();
+    var second_key = try testKey(0xb2);
+    defer second_key.deinit();
+    const first = try signedOffer(testing.allocator, upsertOffer(&first_key, testToken(0xb1), 1, 1, "same-size"), &first_key);
+    defer testing.allocator.free(first.wire);
+    const second = try signedOffer(testing.allocator, upsertOffer(&second_key, testToken(0xb2), 2, 1, "same-size"), &second_key);
+    defer testing.allocator.free(second.wire);
+
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedOffer(first.decoded, 701, 200);
+    _ = try source.applySignedOffer(second.decoded, 702, 201);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(checkpoint);
+
+    // Every strict prefix, including a complete body without its checksum, is
+    // invalid and must remain leak-free.
+    for (0..checkpoint.len) |len| try expectUpgradeCheckpointRejected(.{}, checkpoint[0..len], 300);
+
+    // The digest covers the complete header, every record byte, and every
+    // metadata flag. A one-bit fault at every possible byte position is always
+    // rejected (magic faults may fail before digest verification).
+    var bitflip = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(bitflip);
+    for (0..bitflip.len) |index| {
+        bitflip[index] ^= 1;
+        try expectUpgradeCheckpointRejected(.{}, bitflip, 300);
+        bitflip[index] ^= 1;
+    }
+
+    var damaged = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(damaged);
+    damaged[upgrade_checkpoint_header_len] ^= 0x80;
+    try testing.expectError(error.ChecksumMismatch, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    @memcpy(damaged, checkpoint);
+    damaged[0] ^= 0xff;
+    try testing.expectError(error.BadMagic, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    @memcpy(damaged, checkpoint);
+    damaged[upgrade_checkpoint_magic.len] = upgrade_checkpoint_version + 1;
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.UnsupportedVersion, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    // The first entry's optional-marker tag follows its wire and timestamp.
+    @memcpy(damaged, checkpoint);
+    const first_record = upgrade_checkpoint_header_len;
+    const first_wire_len: usize = std.mem.readInt(u32, damaged[first_record..][0..4], .big);
+    damaged[first_record + 4 + first_wire_len + 8] = 2;
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.InvalidMetadata, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    // A body with a valid checksum but one extra unclaimed byte is rejected.
+    var trailing = try testing.allocator.alloc(u8, checkpoint.len + 1);
+    defer testing.allocator.free(trailing);
+    const original_body_end = checkpoint.len - upgrade_checkpoint_checksum_len;
+    @memcpy(trailing[0..original_body_end], checkpoint[0..original_body_end]);
+    trailing[original_body_end] = 0;
+    @memcpy(trailing[original_body_end + 1 ..], checkpoint[original_body_end..]);
+    rewriteUpgradeCheckpointChecksum(trailing);
+    try testing.expectError(error.TrailingBytes, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, trailing, 300));
+
+    // Re-checksum a forged signature to prove verification is independent of
+    // the arena checksum.
+    @memcpy(damaged, checkpoint);
+    damaged[first_record + 4 + first_wire_len - 1] ^= 1;
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.InvalidSignedObject, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    // Both canonical wires have equal size. Replacing record two with record
+    // one produces an exact duplicate OriginKey that strict restore rejects.
+    @memcpy(damaged, checkpoint);
+    const second_record = first_record + 4 + first_wire_len + 8 + 1;
+    const second_wire_len: usize = std.mem.readInt(u32, damaged[second_record..][0..4], .big);
+    try testing.expectEqual(first_wire_len, second_wire_len);
+    @memcpy(damaged[second_record + 4 ..][0..second_wire_len], damaged[first_record + 4 ..][0..first_wire_len]);
+    rewriteUpgradeCheckpointChecksum(damaged);
+    try testing.expectError(error.DuplicateState, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, damaged, 300));
+
+    try testing.expectError(
+        error.CapacityExceeded,
+        Store.restoreUpgradeCheckpoint(testing.allocator, .{ .max_entries = 1 }, checkpoint, 300),
+    );
+}
+
+test "session replica upgrade checkpoint replacement is atomic under capacity corruption and OOM" {
+    var source_key = try testKey(0xc1);
+    defer source_key.deinit();
+    var second_key = try testKey(0xc2);
+    defer second_key.deinit();
+    const first = try signedOffer(testing.allocator, upsertOffer(&source_key, testToken(0xc1), 1, 1, "first"), &source_key);
+    defer testing.allocator.free(first.wire);
+    const second = try signedOffer(testing.allocator, upsertOffer(&second_key, testToken(0xc2), 2, 1, "second"), &second_key);
+    defer testing.allocator.free(second.wire);
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedOffer(first.decoded, 801, 200);
+    _ = try source.applySignedOffer(second.decoded, 802, 201);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(checkpoint);
+
+    var sentinel_key = try testKey(0xc3);
+    defer sentinel_key.deinit();
+    const sentinel = try signedOffer(testing.allocator, upsertOffer(&sentinel_key, testToken(0xcf), 3, 1, "sentinel"), &sentinel_key);
+    defer testing.allocator.free(sentinel.wire);
+    var capacity_target = Store.initWithConfig(testing.allocator, .{ .max_entries = 1 });
+    defer capacity_target.deinit();
+    _ = try capacity_target.applySignedOffer(sentinel.decoded, 803, 202);
+    try testing.expectError(error.CapacityExceeded, capacity_target.replaceFromUpgradeCheckpoint(checkpoint, 300));
+    try testing.expectEqualStrings("sentinel", capacity_target.get(sentinel.decoded.offer.token).?.snapshot);
+
+    var corrupt = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(corrupt);
+    corrupt[upgrade_checkpoint_header_len] ^= 1;
+    try testing.expectError(error.ChecksumMismatch, capacity_target.replaceFromUpgradeCheckpoint(corrupt, 300));
+    try testing.expectEqualStrings("sentinel", capacity_target.get(sentinel.decoded.offer.token).?.snapshot);
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var oom_target = Store.initWithConfig(failing.allocator(), .{ .max_entries = 3 });
+    defer oom_target.deinit();
+    _ = try oom_target.applySignedOffer(sentinel.decoded, 803, 202);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, oom_target.replaceFromUpgradeCheckpoint(checkpoint, 300));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(usize, 1), oom_target.entryCount());
+    try testing.expectEqualStrings("sentinel", oom_target.get(sentinel.decoded.offer.token).?.snapshot);
+}
+
+test "session replica upgrade checkpoint sweeps at restore time and tolerates wall rollback" {
+    var alice_key = try testKey(0xd1);
+    defer alice_key.deinit();
+    var mallory_key = try testKey(0xd2);
+    defer mallory_key.deinit();
+
+    var live_offer = upsertOffer(&alice_key, testToken(0xd1), 1, 1, "expires");
+    live_offer.expires_at_ms = 500;
+    const live = try signedOffer(testing.allocator, live_offer, &alice_key);
+    defer testing.allocator.free(live.wire);
+    var removed_offer = upsertOffer(&alice_key, testToken(0xd2), 2, 1, "removed");
+    removed_offer.expires_at_ms = 500;
+    const removed_live = try signedOffer(testing.allocator, removed_offer, &alice_key);
+    defer testing.allocator.free(removed_live.wire);
+    var revoke_offer = removeOffer(&alice_key, testToken(0xd2), 3, 1);
+    revoke_offer.expires_at_ms = 500;
+    const revoke = try signedOffer(testing.allocator, revoke_offer, &alice_key);
+    defer testing.allocator.free(revoke.wire);
+    var quarantine_alice_offer = upsertOffer(&alice_key, testToken(0xd3), 4, 1, "q-alice");
+    quarantine_alice_offer.expires_at_ms = 400;
+    const quarantine_alice = try signedOffer(testing.allocator, quarantine_alice_offer, &alice_key);
+    defer testing.allocator.free(quarantine_alice.wire);
+    var quarantine_mallory_offer = upsertOffer(&mallory_key, testToken(0xd3), 5, 1, "q-mallory");
+    quarantine_mallory_offer.account = "mallory";
+    quarantine_mallory_offer.expires_at_ms = 500;
+    const quarantine_mallory = try signedOffer(testing.allocator, quarantine_mallory_offer, &mallory_key);
+    defer testing.allocator.free(quarantine_mallory.wire);
+
+    const cfg = Store.Config{ .tombstone_ttl_ms = 5_000 };
+    var source = Store.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+    _ = try source.applySignedOffer(live.decoded, 901, 200);
+    _ = try source.applySignedOffer(removed_live.decoded, 902, 201);
+    _ = try source.applySignedOffer(revoke.decoded, 902, 202);
+    _ = try source.applySignedOffer(quarantine_alice.decoded, 903, 203);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try source.applySignedOffer(quarantine_mallory.decoded, 904, 204)).disposition);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(checkpoint);
+
+    // Restore wall time moving backward does not make already accepted signed
+    // facts look future-issued; capture time owns that validation boundary.
+    var rollback = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint, 150);
+    defer rollback.deinit();
+    try testing.expectEqual(@as(usize, 1), rollback.entryCount());
+    try testing.expectEqual(@as(usize, 1), rollback.tombstoneCount());
+    try testing.expectEqual(@as(usize, 1), rollback.quarantineCount());
+
+    var expired = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint, 600);
+    defer expired.deinit();
+    try testing.expectEqual(@as(usize, 0), expired.entryCount());
+    try testing.expectEqual(@as(usize, 0), expired.quarantineCount());
+    // A signed REVOKE remains replay protection after its own signed expiry
+    // until the independent tombstone retention TTL also matures.
+    try testing.expectEqual(@as(usize, 1), expired.tombstoneCount());
+    try testing.expect(expired.getTombstone(revoke.decoded.offer.token).?.identity_digest != null);
+
+    var mature = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint, 6_000);
+    defer mature.deinit();
+    try testing.expectEqual(@as(usize, 0), mature.entryCount());
+    try testing.expectEqual(@as(usize, 0), mature.tombstoneCount());
+    try testing.expectEqual(@as(usize, 0), mature.quarantineCount());
+}
+
+test "session replica upgrade checkpoint restore is leak-free at every allocation failure" {
+    var key = try testKey(0xe1);
+    defer key.deinit();
+    const offer = try signedOffer(testing.allocator, upsertOffer(&key, testToken(0xe1), 1, 1, "allocation-sweep"), &key);
+    defer testing.allocator.free(offer.wire);
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.applySignedOffer(offer.decoded, 1_001, 200);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(checkpoint);
+
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var restored = try Store.restoreUpgradeCheckpoint(allocator, .{}, bytes, 300);
+            defer restored.deinit();
+            try testing.expectEqual(@as(usize, 1), restored.entryCount());
+            try testing.expectEqualStrings("allocation-sweep", restored.get(testToken(0xe1)).?.snapshot);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{checkpoint});
+}
+
+test "session replica max authority revision scans entries tombstones quarantine and fallback rows" {
+    var alice_key = try testKey(0xf1);
+    defer alice_key.deinit();
+    var mallory_key = try testKey(0xf2);
+    defer mallory_key.deinit();
+    var store = Store.initWithConfig(testing.allocator, .{ .max_quarantines = 1 });
+    defer store.deinit();
+    try testing.expect(store.maxAuthorityRevision() == null);
+
+    const entry = try signedOffer(testing.allocator, upsertOffer(&alice_key, testToken(0xf1), 5, 1, "entry"), &alice_key);
+    defer testing.allocator.free(entry.wire);
+    _ = try store.applySignedOffer(entry.decoded, 1_101, 200);
+    try testing.expect(store.maxAuthorityRevision().?.eql(entry.decoded.offer.revision));
+
+    const tomb_live = try signedOffer(testing.allocator, upsertOffer(&alice_key, testToken(0xf2), 5, 2, "tomb"), &alice_key);
+    defer testing.allocator.free(tomb_live.wire);
+    const tomb = try signedOffer(testing.allocator, removeOffer(&alice_key, testToken(0xf2), 6, 1), &alice_key);
+    defer testing.allocator.free(tomb.wire);
+    _ = try store.applySignedOffer(tomb_live.decoded, 1_102, 201);
+    _ = try store.applySignedOffer(tomb.decoded, 1_102, 202);
+    try testing.expect(store.maxAuthorityRevision().?.eql(tomb.decoded.offer.revision));
+
+    const quarantine_alice = try signedOffer(testing.allocator, upsertOffer(&alice_key, testToken(0xf3), 9, 1, "q-alice"), &alice_key);
+    defer testing.allocator.free(quarantine_alice.wire);
+    var quarantine_mallory_offer = upsertOffer(&mallory_key, testToken(0xf3), 15, 1, "q-mallory");
+    quarantine_mallory_offer.account = "mallory";
+    const quarantine_mallory = try signedOffer(testing.allocator, quarantine_mallory_offer, &mallory_key);
+    defer testing.allocator.free(quarantine_mallory.wire);
+    _ = try store.applySignedOffer(quarantine_alice.decoded, 1_103, 203);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(quarantine_mallory.decoded, 1_104, 204)).disposition);
+    try testing.expect(store.maxAuthorityRevision().?.eql(quarantine_mallory.decoded.offer.revision));
+
+    const fallback_entry = try signedOffer(testing.allocator, upsertOffer(&alice_key, testToken(0xf4), 12, 1, "fallback-entry"), &alice_key);
+    defer testing.allocator.free(fallback_entry.wire);
+    var fallback_entry_conflict_offer = upsertOffer(&mallory_key, testToken(0xf4), 13, 1, "ignored-conflict");
+    fallback_entry_conflict_offer.account = "mallory";
+    const fallback_entry_conflict = try signedOffer(testing.allocator, fallback_entry_conflict_offer, &mallory_key);
+    defer testing.allocator.free(fallback_entry_conflict.wire);
+    _ = try store.applySignedOffer(fallback_entry.decoded, 1_105, 205);
+    try testing.expectError(error.QuarantineFull, store.applySignedOffer(fallback_entry_conflict.decoded, 1_106, 206));
+    try testing.expect(store.entries.get(.{ .token = fallback_entry.decoded.offer.token, .origin_node = fallback_entry.decoded.offer.revision.origin_node }).?.quarantine_until_ms != null);
+
+    const fallback_tomb_live = try signedOffer(testing.allocator, upsertOffer(&alice_key, testToken(0xf5), 13, 2, "fallback-tomb"), &alice_key);
+    defer testing.allocator.free(fallback_tomb_live.wire);
+    const fallback_tomb = try signedOffer(testing.allocator, removeOffer(&alice_key, testToken(0xf5), 14, 1), &alice_key);
+    defer testing.allocator.free(fallback_tomb.wire);
+    var fallback_tomb_conflict_offer = upsertOffer(&mallory_key, testToken(0xf5), 16, 1, "ignored-tomb-conflict");
+    fallback_tomb_conflict_offer.account = "mallory";
+    const fallback_tomb_conflict = try signedOffer(testing.allocator, fallback_tomb_conflict_offer, &mallory_key);
+    defer testing.allocator.free(fallback_tomb_conflict.wire);
+    _ = try store.applySignedOffer(fallback_tomb_live.decoded, 1_107, 207);
+    _ = try store.applySignedOffer(fallback_tomb.decoded, 1_107, 208);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(fallback_tomb_conflict.decoded, 1_108, 209)).disposition);
+    try testing.expect(store.tombstones.get(.{ .token = fallback_tomb.decoded.offer.token, .origin_node = fallback_tomb.decoded.offer.revision.origin_node }).?.quarantine_until_ms != null);
+    try testing.expect(store.maxAuthorityRevision().?.eql(quarantine_mallory.decoded.offer.revision));
+
+    const checkpoint = try store.encodeUpgradeCheckpoint(testing.allocator, 500);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, store.cfg, checkpoint, 500);
+    defer restored.deinit();
+    try testing.expect(restored.maxAuthorityRevision().?.eql(quarantine_mallory.decoded.offer.revision));
 }

@@ -107,6 +107,13 @@ pub const Options = struct {
 const Phase = enum { await_prekey, ake, established };
 
 pub const SecuredLink = struct {
+    pub const SessionToken = s2s_link.S2sLink.SessionToken;
+    pub const SessionTokenDecision = s2s_link.S2sLink.SessionTokenDecision;
+    pub const SessionTokenResolver = s2s_link.S2sLink.SessionTokenResolver;
+    pub const SessionTokenNickDecision = s2s_link.S2sLink.SessionTokenNickDecision;
+    pub const SessionTokenNickAuthorizer = s2s_link.S2sLink.SessionTokenNickAuthorizer;
+    pub const SessionTokenReconcileResult = s2s_link.S2sLink.SessionTokenReconcileResult;
+
     allocator: std.mem.Allocator,
     role: Role,
     identity: *const node_identity.NodeIdentity,
@@ -139,6 +146,12 @@ pub const SecuredLink = struct {
     /// the lazy `inner` stand-up and is re-applied when the inner peer is created.
     /// Null until the daemon installs it (then no account is ever trusted).
     residence_verifier: ?s2s_link.S2sLink.ResidenceVerifier = null,
+    /// Borrowed receiver-side exact-session resolver, retained across the lazy
+    /// inner-link stand-up exactly like the residence verifier.
+    session_token_resolver: ?SessionTokenResolver = null,
+    /// Borrowed exact-token NICKCHANGE authorizer, retained across lazy inner
+    /// link creation like the membership token resolver.
+    session_token_nick_authorizer: ?SessionTokenNickAuthorizer = null,
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     feed_seq: u64 = 0,
@@ -380,6 +393,33 @@ pub const SecuredLink = struct {
         self.residence_verifier = verifier;
         if (self.inner) |l| l.setResidenceVerifier(verifier);
     }
+
+    /// Install (or clear) the receiver-owned signed-session resolver. Retained
+    /// until the encrypted inner link exists, then applied immediately.
+    pub fn setSessionTokenResolver(self: *SecuredLink, resolver: ?SessionTokenResolver) void {
+        self.session_token_resolver = resolver;
+        if (self.inner) |l| l.setSessionTokenResolver(resolver);
+    }
+
+    pub fn setSessionTokenNickAuthorizer(self: *SecuredLink, authorizer: ?SessionTokenNickAuthorizer) void {
+        self.session_token_nick_authorizer = authorizer;
+        if (self.inner) |l| l.setSessionTokenNickAuthorizer(authorizer);
+    }
+
+    pub fn rebindSessionToken(self: *SecuredLink, origin_node: u64, nick: []const u8, token: ?SessionToken) anyerror!usize {
+        const link = self.inner orelse return 0;
+        return link.rebindSessionToken(origin_node, nick, token);
+    }
+
+    pub fn reconcileSessionToken(
+        self: *SecuredLink,
+        token: SessionToken,
+        desired_nick: ?[]const u8,
+        desired_channels: []const []const u8,
+    ) anyerror!SessionTokenReconcileResult {
+        const link = self.inner orelse return .{};
+        return link.reconcileSessionToken(token, desired_nick, desired_channels);
+    }
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         if (self.session) |s| return s.peerShortId();
         if (self.resumed_established) |e| return node_short_id.shortId(e.peer_node_id);
@@ -598,6 +638,16 @@ pub const SecuredLink = struct {
         return link.takeMembershipChanges();
     }
 
+    pub fn processDeferredResidenceFrames(self: *SecuredLink, now_ms: u64) void {
+        const link = self.inner orelse return;
+        link.processDeferredResidenceFrames(now_ms);
+    }
+
+    pub fn discardDeferredResidenceFrames(self: *SecuredLink) void {
+        const link = self.inner orelse return;
+        link.discardDeferredResidenceFrames();
+    }
+
     /// Drain remote channel MODE flag changes for the daemon to apply and
     /// surface to local members. Caller owns the slice + each delta's string.
     pub fn takeChannelModeFlagChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelModeFlagsDelta {
@@ -726,6 +776,11 @@ pub const SecuredLink = struct {
     pub fn takeSessionReplicaFrames(self: *SecuredLink) anyerror![]s2s_link.InboundSessionReplica {
         const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundSessionReplica, 0);
         return link.takeSessionReplicaFrames();
+    }
+
+    pub fn takeNextSessionReplicaFrame(self: *SecuredLink) ?s2s_link.InboundSessionReplica {
+        const link = self.inner orelse return null;
+        return link.takeNextSessionReplicaFrame();
     }
 
     pub fn takeDroppedSessionReplicaFrames(self: *SecuredLink) u64 {
@@ -938,6 +993,8 @@ pub const SecuredLink = struct {
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
+        if (self.session_token_resolver) |resolver| link.setSessionTokenResolver(resolver);
+        if (self.session_token_nick_authorizer) |authorizer| link.setSessionTokenNickAuthorizer(authorizer);
         self.inner = link;
         self.phase = .established;
         if (self.role == .initiator) {
@@ -1235,6 +1292,27 @@ const EstablishedPair = struct {
     }
 };
 
+const FixedSessionTokenResolver = struct {
+    token: s2s_link.S2sLink.SessionToken,
+    calls: usize = 0,
+
+    fn resolve(
+        ctx: *anyopaque,
+        _: u64,
+        _: []const u8,
+        _: []const u8,
+        present: bool,
+    ) s2s_link.S2sLink.SessionTokenDecision {
+        const self: *FixedSessionTokenResolver = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return if (present) .{ .bind = self.token } else .unbound;
+    }
+
+    fn resolver(self: *FixedSessionTokenResolver) s2s_link.S2sLink.SessionTokenResolver {
+        return .{ .ctx = self, .resolve_fn = resolve };
+    }
+};
+
 test "session replica v2 activates only inside established Tsumugi SecuredLink" {
     var p = try EstablishedPair.init();
     defer p.deinit();
@@ -1247,7 +1325,7 @@ test "session replica v2 activates only inside established Tsumugi SecuredLink" 
     token[15] = 0x42;
     const revision = session_replica.Revision{
         .epoch = 7,
-        .sequence = 1,
+        .sequence = (7 << 16) | 1,
         .origin_node = p.ida.shortId(),
     };
     const offer = try session_replica.encodeOffer(testing.allocator, .{
@@ -1274,7 +1352,7 @@ test "session replica v2 activates only inside established Tsumugi SecuredLink" 
     const revoke = try session_replica.encodeOffer(testing.allocator, .{
         .operation = .remove,
         .token = token,
-        .revision = .{ .epoch = 7, .sequence = 2, .origin_node = p.ida.shortId() },
+        .revision = .{ .epoch = 7, .sequence = (7 << 16) | 2, .origin_node = p.ida.shortId() },
         .issued_at_ms = 102,
         .expires_at_ms = 10_000,
     }, &p.ida.sign_kp);
@@ -1367,6 +1445,16 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
 
     // Pump the secured record(s) A->B (and any B->A acks) to convergence.
     try pump(&p.a, &p.b, false);
+    p.b.processDeferredResidenceFrames(300);
+
+    p.b.setSessionTokenResolver(null);
+    const token: s2s_link.S2sLink.SessionToken = @splat(0xD7);
+    try testing.expectEqual(@as(usize, 1), try p.b.rebindSessionToken(p.ida.shortId(), "ann", token));
+    const desired = [_][]const u8{"#suimyaku"};
+    const reconciled = try p.b.reconcileSessionToken(token, "ann", &desired);
+    try testing.expectEqual(@as(usize, 0), reconciled.removed);
+    try testing.expectEqual(@as(usize, 0), reconciled.renamed);
+    try testing.expect(std.crypto.timing_safe.eql(s2s_link.S2sLink.SessionToken, token, p.b.channelMembers("#suimyaku")[0].session_token.?));
 
     const changes = try p.b.takeMembershipChanges();
     defer {
@@ -1378,6 +1466,52 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
         if (std.mem.eql(u8, c.nick, "ann")) saw_ann = true;
     }
     try testing.expect(saw_ann);
+}
+
+test "secured link retains session token resolver across lazy inner establishment" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x62)), "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x6162 };
+    var a = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.orochi",
+    });
+    defer a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = &idb,
+        .local_prekey = pre_b,
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.orochi",
+    });
+    defer b.deinit();
+
+    const token: s2s_link.S2sLink.SessionToken = @splat(0xE6);
+    var resolver = FixedSessionTokenResolver{ .token = token };
+    b.setSessionTokenResolver(resolver.resolver());
+    try pump(&a, &b, false);
+    a.clearOutbound();
+    b.clearOutbound();
+
+    try a.sendMembership("#resume", "multi", 0, 400, true, .{}, "");
+    try pump(&a, &b, false);
+    b.processDeferredResidenceFrames(400);
+
+    try testing.expectEqual(@as(usize, 1), resolver.calls);
+    const members = b.channelMembers("#resume");
+    try testing.expectEqual(@as(usize, 1), members.len);
+    try testing.expect(std.crypto.timing_safe.eql(s2s_link.S2sLink.SessionToken, token, members[0].session_token.?));
 }
 
 test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
@@ -1419,6 +1553,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "Bob", .host = "h.b" };
     try b.sendMembership("#suimyaku", "bob", 0, 100, true, ident, "");
     try pump(&a, &b, false);
+    a.processDeferredResidenceFrames(100);
     try testing.expect(a.findRemoteMember("bob") != null);
 
     // --- Simulate a Helix hot upgrade of A: snapshot, tear down, resume. ---
@@ -1465,6 +1600,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
     // The daemon answers a RESYNC with a full membership burst. A2 reconverges.
     try b.sendMembership("#suimyaku", "bob", 0, 200, true, ident, "");
     try pump(&a2, &b, false);
+    a2.processDeferredResidenceFrames(200);
     try testing.expect(a2.findRemoteMember("bob") != null);
 
     // The encrypted stream truly continued (records flowed post-resume).

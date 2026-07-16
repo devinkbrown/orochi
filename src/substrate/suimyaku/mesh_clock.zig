@@ -38,6 +38,21 @@ const std = @import("std");
 pub const seq_bits: u6 = 16;
 const seq_mask: u64 = (1 << seq_bits) - 1;
 
+/// Maximum wall-clock lead accepted when an authenticated peer's HLC is folded
+/// into the local causal high-water mark. Keep this aligned with the default
+/// SESSION_REPLICA lifetime policy: a peer may be slightly ahead because of
+/// normal clock skew, but it may not pin this node's clock arbitrarily far into
+/// the future.
+pub const default_max_future_skew_ms: u64 = 5 * 60 * 1000;
+
+pub const ObserveError = error{
+    /// The observed physical component is beyond `now_ms + max_future_skew_ms`.
+    FutureSkew,
+    /// No strictly greater packed HLC exists, so accepting the observation would
+    /// make the next locally-authored event repeat the remote stamp.
+    ClockExhausted,
+};
+
 /// Per-node HLC generator. One instance lives on the server; `stamp` is called
 /// for every outbound mesh event. Not thread-safe on its own — callers stamp
 /// under the same serialization (world write lock) that guards the mesh state.
@@ -67,6 +82,30 @@ pub const MeshClock = struct {
         }
         self.last_stamp = candidate;
         return candidate;
+    }
+
+    /// Causally observe one authenticated packed HLC without allowing a remote
+    /// peer to poison this process's restart-persistent high-water mark.
+    ///
+    /// On success, the next call to `stamp` is guaranteed to return a value
+    /// strictly greater than `remote_stamp`. `maxInt(u64)` is rejected explicitly
+    /// because there is no representable successor. The future bound uses
+    /// saturating addition so an extreme caller-supplied `now_ms` cannot wrap the
+    /// admission window back toward zero.
+    pub fn observeChecked(
+        self: *MeshClock,
+        remote_stamp: u64,
+        now_ms: u64,
+        max_future_skew_ms: u64,
+    ) ObserveError!void {
+        if (self.last_stamp == std.math.maxInt(u64) or remote_stamp == std.math.maxInt(u64))
+            return error.ClockExhausted;
+
+        const latest_physical = std.math.add(u64, now_ms, max_future_skew_ms) catch std.math.maxInt(u64);
+        if (physicalOf(remote_stamp) > latest_physical) return error.FutureSkew;
+
+        if (remote_stamp > self.last_stamp) self.last_stamp = remote_stamp;
+        self.last_physical = @max(self.last_physical, physicalOf(self.last_stamp));
     }
 
     /// The physical (wall-clock ms) component of a packed hlc — for diagnostics
@@ -149,4 +188,43 @@ test "counter reset at the physical high-water mark still advances" {
     const before = c.stamp(1_700_000_000_000, 40_000);
     const after = c.stamp(1_700_000_000_000, 1);
     try testing.expect(after > before);
+}
+
+test "checked observation makes the next local stamp causally newer" {
+    const now_ms: u64 = 1_700_000_000_000;
+    const remote_physical = now_ms + default_max_future_skew_ms;
+    const remote = (remote_physical << seq_bits) | seq_mask;
+    var clock: MeshClock = .{};
+
+    try clock.observeChecked(remote, now_ms, default_max_future_skew_ms);
+    const local = clock.stamp(now_ms, 1);
+    try testing.expect(local > remote);
+    try testing.expect(MeshClock.physicalOf(local) > remote_physical);
+}
+
+test "checked observation rejects future and maximum poison without mutation" {
+    const now_ms: u64 = 1_700_000_000_000;
+    var clock: MeshClock = .{};
+    const baseline = clock.stamp(now_ms, 7);
+
+    const too_future = ((now_ms + default_max_future_skew_ms + 1) << seq_bits) | 1;
+    try testing.expectError(
+        error.FutureSkew,
+        clock.observeChecked(too_future, now_ms, default_max_future_skew_ms),
+    );
+    try testing.expectEqual(baseline, clock.last_stamp);
+
+    try testing.expectError(
+        error.ClockExhausted,
+        clock.observeChecked(std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64)),
+    );
+    try testing.expectEqual(baseline, clock.last_stamp);
+}
+
+test "checked observation reports an already exhausted local clock" {
+    var clock = MeshClock{
+        .last_physical = MeshClock.physicalOf(std.math.maxInt(u64)),
+        .last_stamp = std.math.maxInt(u64),
+    };
+    try testing.expectError(error.ClockExhausted, clock.observeChecked(1, 1, 1));
 }

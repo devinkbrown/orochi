@@ -25,7 +25,28 @@ const std = @import("std");
 const session_replica = @import("session_replica.zig");
 
 pub const Token = [16]u8;
-pub const Error = error{ Truncated, TooLong };
+pub const Error = error{ Truncated, TooLong, TrailingBytes, InvalidMetadata };
+
+/// Complete, atomic Helix checkpoint for `PendingMigrations`. This is separate
+/// from the S2S `Capsule` wire above: a hot upgrade must preserve the holding
+/// area's ordering/expiry metadata and consumed-token deny state, not merely
+/// re-stage each snapshot as an unordered legacy offer.
+pub const upgrade_checkpoint_magic = [_]u8{ 'P', 'M', 'S', 'T' };
+pub const upgrade_checkpoint_version: u8 = 2;
+const upgrade_checkpoint_checksum_len: usize = 32;
+const upgrade_checkpoint_header_len: usize = upgrade_checkpoint_magic.len + 1 + 8 + 4 + 4;
+
+pub const UpgradeCheckpointError = error{
+    BadMagic,
+    UnsupportedVersion,
+    Truncated,
+    TrailingBytes,
+    ChecksumMismatch,
+    CapacityExceeded,
+    DuplicateState,
+    InvalidMetadata,
+    TooLarge,
+} || std.mem.Allocator.Error;
 
 /// A migrated session in flight: who it is + its serialized state.
 pub const Capsule = struct {
@@ -67,6 +88,7 @@ pub fn decode(bytes: []const u8) Error!Capsule {
     const slen = std.mem.readInt(u32, bytes[pos..][0..4], .little);
     pos += 4;
     if (pos + slen > bytes.len) return error.Truncated;
+    if (pos + slen != bytes.len) return error.TrailingBytes;
     const snapshot = bytes[pos .. pos + slen];
     return .{ .token = token, .account = account, .snapshot = snapshot };
 }
@@ -88,7 +110,9 @@ pub fn decodeTombstone(bytes: []const u8) Error!Tombstone {
     if (bytes.len != tombstone_wire_len) return error.Truncated;
     var token: Token = undefined;
     @memcpy(&token, bytes[0..16]);
-    return .{ .token = token, .consumed_at_ms = std.mem.readInt(i64, bytes[16..24], .big) };
+    const consumed_at_ms = std.mem.readInt(i64, bytes[16..24], .big);
+    if (consumed_at_ms < 0) return error.InvalidMetadata;
+    return .{ .token = token, .consumed_at_ms = consumed_at_ms };
 }
 
 /// Target-node holding area: migrated sessions awaiting the client's reconnect.
@@ -116,6 +140,7 @@ pub const PendingMigrations = struct {
     };
 
     pub const PutError = error{ PendingFull, AlreadyConsumed, StaleOffer, TokenAccountMismatch } || std.mem.Allocator.Error;
+    pub const ConsumeError = error{ ConsumedFull, InvalidMetadata } || std.mem.Allocator.Error;
 
     pub const Entry = struct {
         account: []u8,
@@ -140,6 +165,214 @@ pub const PendingMigrations = struct {
 
     pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) PendingMigrations {
         return .{ .allocator = allocator, .cfg = cfg };
+    }
+
+    /// Encode the entire live holding area into one integrity-checked blob.
+    /// Entries retain their original monotonic staging clock, legacy epoch, v2
+    /// revision/lease, and exact account/snapshot bytes. Consumed tombstones are
+    /// included in the same transaction so restore cannot expose a replay window.
+    pub fn encodeUpgradeCheckpoint(
+        self: *const PendingMigrations,
+        allocator: std.mem.Allocator,
+        captured_at_ms: i64,
+    ) UpgradeCheckpointError![]u8 {
+        if (captured_at_ms < 0) return error.InvalidMetadata;
+        if (self.map.count() > self.cfg.max_entries or
+            self.consumed.count() > self.cfg.max_entries or
+            self.map.count() > std.math.maxInt(u32) or
+            self.consumed.count() > std.math.maxInt(u32))
+        {
+            return error.CapacityExceeded;
+        }
+
+        var total_len: usize = upgrade_checkpoint_header_len;
+        var entry_it = @constCast(&self.map).iterator();
+        while (entry_it.next()) |slot| {
+            const entry = slot.value_ptr;
+            if (self.consumed.contains(slot.key_ptr.*)) return error.DuplicateState;
+            if (self.countForAccount(entry.account) > self.cfg.max_per_account) return error.CapacityExceeded;
+            if (entry.account.len > std.math.maxInt(u16) or entry.snapshot.len > std.math.maxInt(u32))
+                return error.TooLarge;
+            if (!checkpointEntryMetadataValid(
+                entry.staged_at_ms,
+                entry.offer_epoch,
+                entry.replica_revision,
+                entry.replica_expires_at_ms,
+            ) or entry.staged_at_ms > captured_at_ms) return error.InvalidMetadata;
+
+            try checkpointAddLen(&total_len, @sizeOf(Token) + 2 + entry.account.len);
+            try checkpointAddLen(&total_len, 4 + entry.snapshot.len + 8 + 8 + 1);
+            if (entry.replica_revision != null) try checkpointAddLen(&total_len, 8 + 8 + 8 + 8);
+        }
+        var consumed_it = @constCast(&self.consumed).iterator();
+        while (consumed_it.next()) |slot| {
+            if (slot.value_ptr.* < 0 or slot.value_ptr.* > captured_at_ms) return error.InvalidMetadata;
+            if (self.map.contains(slot.key_ptr.*)) return error.DuplicateState;
+            try checkpointAddLen(&total_len, @sizeOf(Token) + 8);
+        }
+        try checkpointAddLen(&total_len, upgrade_checkpoint_checksum_len);
+
+        const out = try allocator.alloc(u8, total_len);
+        errdefer allocator.free(out);
+        var writer = UpgradeCheckpointWriter{ .bytes = out };
+        writer.writeBytes(&upgrade_checkpoint_magic);
+        writer.writeByte(upgrade_checkpoint_version);
+        writer.writeI64(captured_at_ms);
+        writer.writeU32(@intCast(self.map.count()));
+        writer.writeU32(@intCast(self.consumed.count()));
+
+        entry_it = @constCast(&self.map).iterator();
+        while (entry_it.next()) |slot| {
+            const entry = slot.value_ptr;
+            writer.writeBytes(slot.key_ptr);
+            writer.writeU16(@intCast(entry.account.len));
+            writer.writeBytes(entry.account);
+            writer.writeU32(@intCast(entry.snapshot.len));
+            writer.writeBytes(entry.snapshot);
+            writer.writeI64(entry.staged_at_ms);
+            writer.writeU64(entry.offer_epoch);
+            if (entry.replica_revision) |revision| {
+                writer.writeByte(1);
+                writer.writeU64(revision.epoch);
+                writer.writeU64(revision.sequence);
+                writer.writeU64(revision.origin_node);
+                writer.writeI64(entry.replica_expires_at_ms.?);
+            } else {
+                writer.writeByte(0);
+            }
+        }
+        consumed_it = @constCast(&self.consumed).iterator();
+        while (consumed_it.next()) |slot| {
+            writer.writeBytes(slot.key_ptr);
+            writer.writeI64(slot.value_ptr.*);
+        }
+
+        std.debug.assert(writer.pos + upgrade_checkpoint_checksum_len == out.len);
+        const checksum = upgradeCheckpointDigest(out[0..writer.pos]);
+        writer.writeBytes(&checksum);
+        std.debug.assert(writer.pos == out.len);
+        return out;
+    }
+
+    /// Decode and validate a complete checkpoint into a fresh holding area.
+    /// No caller-visible state exists until every entry, tombstone, bound, and
+    /// trailing byte has been checked successfully.
+    pub fn restoreUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        bytes: []const u8,
+        restore_now_ms: i64,
+        ttl_ms: u64,
+    ) UpgradeCheckpointError!PendingMigrations {
+        if (bytes.len < upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len)
+            return error.Truncated;
+        if (!std.mem.eql(u8, bytes[0..upgrade_checkpoint_magic.len], &upgrade_checkpoint_magic))
+            return error.BadMagic;
+
+        const body_end = bytes.len - upgrade_checkpoint_checksum_len;
+        const expected_checksum: [upgrade_checkpoint_checksum_len]u8 =
+            bytes[body_end..][0..upgrade_checkpoint_checksum_len].*;
+        const actual_checksum = upgradeCheckpointDigest(bytes[0..body_end]);
+        if (!std.crypto.timing_safe.eql(
+            [upgrade_checkpoint_checksum_len]u8,
+            expected_checksum,
+            actual_checksum,
+        )) return error.ChecksumMismatch;
+
+        var reader = UpgradeCheckpointReader{ .bytes = bytes[0..body_end] };
+        _ = try reader.take(upgrade_checkpoint_magic.len);
+        if (try reader.readByte() != upgrade_checkpoint_version) return error.UnsupportedVersion;
+        const captured_at_ms = try reader.readI64();
+        if (captured_at_ms < 0 or restore_now_ms < captured_at_ms) return error.InvalidMetadata;
+        const entry_count: usize = try reader.readU32();
+        const consumed_count: usize = try reader.readU32();
+        if (entry_count > cfg.max_entries or consumed_count > cfg.max_entries)
+            return error.CapacityExceeded;
+        var minimum_body: usize = 0;
+        try checkpointAddProduct(&minimum_body, entry_count, @sizeOf(Token) + 2 + 4 + 8 + 8 + 1);
+        try checkpointAddProduct(&minimum_body, consumed_count, @sizeOf(Token) + 8);
+        if (minimum_body > reader.bytes.len - reader.pos) return error.Truncated;
+
+        var restored = initWithConfig(allocator, cfg);
+        errdefer restored.deinit();
+        try restored.map.ensureTotalCapacity(allocator, @intCast(entry_count));
+        try restored.consumed.ensureTotalCapacity(allocator, @intCast(consumed_count));
+
+        for (0..entry_count) |_| {
+            const token_bytes = try reader.take(@sizeOf(Token));
+            const token: Token = token_bytes[0..@sizeOf(Token)].*;
+            if (restored.map.contains(token) or restored.consumed.contains(token))
+                return error.DuplicateState;
+
+            const account_len: usize = try reader.readU16();
+            const account_view = try reader.take(account_len);
+            const snapshot_len: usize = try reader.readU32();
+            const snapshot_view = try reader.take(snapshot_len);
+            const staged_at_ms = try reader.readI64();
+            const offer_epoch = try reader.readU64();
+            const replica_revision: ?session_replica.Revision = switch (try reader.readByte()) {
+                0 => null,
+                1 => .{
+                    .epoch = try reader.readU64(),
+                    .sequence = try reader.readU64(),
+                    .origin_node = try reader.readU64(),
+                },
+                else => return error.InvalidMetadata,
+            };
+            const replica_expires_at_ms: ?i64 = if (replica_revision != null)
+                try reader.readI64()
+            else
+                null;
+            if (!checkpointEntryMetadataValid(
+                staged_at_ms,
+                offer_epoch,
+                replica_revision,
+                replica_expires_at_ms,
+            ) or staged_at_ms > captured_at_ms) return error.InvalidMetadata;
+            if (restored.countForAccount(account_view) >= cfg.max_per_account)
+                return error.CapacityExceeded;
+
+            const account = try allocator.dupe(u8, account_view);
+            errdefer allocator.free(account);
+            const snapshot = try allocator.dupe(u8, snapshot_view);
+            errdefer allocator.free(snapshot);
+            restored.map.putAssumeCapacityNoClobber(token, .{
+                .account = account,
+                .snapshot = snapshot,
+                .staged_at_ms = staged_at_ms,
+                .offer_epoch = offer_epoch,
+                .replica_revision = replica_revision,
+                .replica_expires_at_ms = replica_expires_at_ms,
+            });
+        }
+
+        for (0..consumed_count) |_| {
+            const token_bytes = try reader.take(@sizeOf(Token));
+            const token: Token = token_bytes[0..@sizeOf(Token)].*;
+            const consumed_at_ms = try reader.readI64();
+            if (consumed_at_ms < 0 or consumed_at_ms > captured_at_ms) return error.InvalidMetadata;
+            if (restored.map.contains(token) or restored.consumed.contains(token))
+                return error.DuplicateState;
+            restored.consumed.putAssumeCapacityNoClobber(token, consumed_at_ms);
+        }
+        if (reader.pos != reader.bytes.len) return error.TrailingBytes;
+        _ = restored.sweep(restore_now_ms, ttl_ms);
+        return restored;
+    }
+
+    /// Atomically replace this holding area. Any corruption, capacity error, or
+    /// allocation failure leaves `self` and all of its owned bytes untouched.
+    pub fn replaceFromUpgradeCheckpoint(
+        self: *PendingMigrations,
+        bytes: []const u8,
+        restore_now_ms: i64,
+        ttl_ms: u64,
+    ) UpgradeCheckpointError!void {
+        var replacement = try restoreUpgradeCheckpoint(self.allocator, self.cfg, bytes, restore_now_ms, ttl_ms);
+        const previous = self.*;
+        self.* = replacement;
+        replacement = previous;
+        replacement.deinit();
     }
 
     pub fn deinit(self: *PendingMigrations) void {
@@ -255,35 +488,40 @@ pub const PendingMigrations = struct {
     }
 
     /// Evict every entry staged at least `ttl_ms` before `now_ms` (freeing its
-    /// copies). Returns the count evicted. Best-effort: if the scratch key list
-    /// cannot be allocated nothing is evicted this round — the next sweep
-    /// retries. Called periodically by the server (reactor 0's timer tick).
+    /// copies). The bounded repeated scan is allocation-free, so restore-time
+    /// expiry and replay protection cannot be postponed by allocator pressure.
     pub fn sweep(self: *PendingMigrations, now_ms: i64, ttl_ms: u64) usize {
-        var expired: std.ArrayList(Token) = .empty;
-        defer expired.deinit(self.allocator);
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            const age = now_ms -| e.value_ptr.staged_at_ms;
-            if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
-                expired.append(self.allocator, e.key_ptr.*) catch return 0;
+        var evicted: usize = 0;
+        while (true) {
+            var expired: ?Token = null;
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                const age = now_ms -| entry.value_ptr.staged_at_ms;
+                if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
+                    expired = entry.key_ptr.*;
+                    break;
+                }
             }
-        }
-        for (expired.items) |token| {
+            const token = expired orelse break;
             const kv = self.map.fetchRemove(token) orelse continue;
             self.allocator.free(kv.value.account);
             self.allocator.free(kv.value.snapshot);
+            evicted += 1;
         }
-        const pending_evicted = expired.items.len;
-        expired.clearRetainingCapacity();
-        var consumed_it = self.consumed.iterator();
-        while (consumed_it.next()) |entry| {
-            const age = now_ms -| entry.value_ptr.*;
-            if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
-                expired.append(self.allocator, entry.key_ptr.*) catch return pending_evicted;
+        while (true) {
+            var expired: ?Token = null;
+            var it = self.consumed.iterator();
+            while (it.next()) |entry| {
+                const age = now_ms -| entry.value_ptr.*;
+                if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
+                    expired = entry.key_ptr.*;
+                    break;
+                }
             }
+            const token = expired orelse break;
+            if (self.consumed.remove(token)) evicted += 1;
         }
-        for (expired.items) |token| _ = self.consumed.remove(token);
-        return pending_evicted + expired.items.len;
+        return evicted;
     }
 
     /// Whether a migrated session is waiting for `token`.
@@ -313,7 +551,7 @@ pub const PendingMigrations = struct {
     /// Legacy one-shot compatibility: remove a staged copy and retain a bounded
     /// token tombstone. Modern successful attachment deliberately does not call
     /// this because the signed replica is reusable by concurrent clients.
-    pub fn markConsumed(self: *PendingMigrations, token: Token, now_ms: i64) std.mem.Allocator.Error!void {
+    pub fn markConsumed(self: *PendingMigrations, token: Token, now_ms: i64) ConsumeError!void {
         // Remove the live copy first even if allocating the tombstone fails: a
         // memory-pressure event must not leave an immediately double-consumable
         // snapshot in place.
@@ -321,8 +559,11 @@ pub const PendingMigrations = struct {
             self.allocator.free(kv.value.account);
             self.allocator.free(kv.value.snapshot);
         }
+        if (now_ms < 0) return error.InvalidMetadata;
         if (self.consumed.contains(token)) return;
-        if (self.consumed.count() >= self.cfg.max_entries) self.evictOldestConsumed();
+        if (self.cfg.max_entries == 0) return error.ConsumedFull;
+        if (self.consumed.count() >= self.cfg.max_entries and !self.evictOldestConsumed())
+            return error.ConsumedFull;
         try self.consumed.put(self.allocator, token, now_ms);
     }
 
@@ -347,17 +588,17 @@ pub const PendingMigrations = struct {
         return self.consumed.count();
     }
 
-    fn evictOldestConsumed(self: *PendingMigrations) void {
+    fn evictOldestConsumed(self: *PendingMigrations) bool {
         var oldest_token: ?Token = null;
         var oldest_at: i64 = std.math.maxInt(i64);
         var it = self.consumed.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.* < oldest_at) {
+            if (oldest_token == null or entry.value_ptr.* < oldest_at) {
                 oldest_at = entry.value_ptr.*;
                 oldest_token = entry.key_ptr.*;
             }
         }
-        if (oldest_token) |token| _ = self.consumed.remove(token);
+        return if (oldest_token) |token| self.consumed.remove(token) else false;
     }
 
     fn countForAccount(self: *const PendingMigrations, account: []const u8) usize {
@@ -370,12 +611,117 @@ pub const PendingMigrations = struct {
     }
 };
 
+fn checkpointEntryMetadataValid(
+    staged_at_ms: i64,
+    offer_epoch: u64,
+    replica_revision: ?session_replica.Revision,
+    replica_expires_at_ms: ?i64,
+) bool {
+    if (staged_at_ms < 0) return false;
+    const revision = replica_revision orelse return replica_expires_at_ms == null;
+    const expires_at_ms = replica_expires_at_ms orelse return false;
+    return offer_epoch == 0 and
+        revision.origin_node != 0 and
+        revision.isCanonical() and
+        expires_at_ms >= 0;
+}
+
+fn checkpointAddLen(total: *usize, amount: usize) UpgradeCheckpointError!void {
+    if (amount > std.math.maxInt(usize) - total.*) return error.TooLarge;
+    total.* += amount;
+}
+
+fn checkpointAddProduct(total: *usize, count: usize, unit: usize) UpgradeCheckpointError!void {
+    if (count != 0 and unit > std.math.maxInt(usize) / count) return error.TooLarge;
+    try checkpointAddLen(total, count * unit);
+}
+
+fn upgradeCheckpointDigest(bytes: []const u8) [upgrade_checkpoint_checksum_len]u8 {
+    var digest: [upgrade_checkpoint_checksum_len]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    return digest;
+}
+
+const UpgradeCheckpointWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+
+    fn writeByte(self: *UpgradeCheckpointWriter, value: u8) void {
+        self.bytes[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn writeBytes(self: *UpgradeCheckpointWriter, value: []const u8) void {
+        @memcpy(self.bytes[self.pos .. self.pos + value.len], value);
+        self.pos += value.len;
+    }
+
+    fn writeU16(self: *UpgradeCheckpointWriter, value: u16) void {
+        std.mem.writeInt(u16, self.bytes[self.pos..][0..2], value, .big);
+        self.pos += 2;
+    }
+
+    fn writeU32(self: *UpgradeCheckpointWriter, value: u32) void {
+        std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .big);
+        self.pos += 4;
+    }
+
+    fn writeU64(self: *UpgradeCheckpointWriter, value: u64) void {
+        std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .big);
+        self.pos += 8;
+    }
+
+    fn writeI64(self: *UpgradeCheckpointWriter, value: i64) void {
+        std.mem.writeInt(i64, self.bytes[self.pos..][0..8], value, .big);
+        self.pos += 8;
+    }
+};
+
+const UpgradeCheckpointReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn take(self: *UpgradeCheckpointReader, len: usize) UpgradeCheckpointError![]const u8 {
+        if (len > self.bytes.len -| self.pos) return error.Truncated;
+        const result = self.bytes[self.pos .. self.pos + len];
+        self.pos += len;
+        return result;
+    }
+
+    fn readByte(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readU16(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u16 {
+        return std.mem.readInt(u16, (try self.take(2))[0..2], .big);
+    }
+
+    fn readU32(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .big);
+    }
+
+    fn readU64(self: *UpgradeCheckpointReader) UpgradeCheckpointError!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .big);
+    }
+
+    fn readI64(self: *UpgradeCheckpointReader) UpgradeCheckpointError!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .big);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const migration_relay = @import("migration_relay.zig");
+
+fn rewriteUpgradeCheckpointChecksum(bytes: []u8) void {
+    std.debug.assert(bytes.len >= upgrade_checkpoint_checksum_len);
+    const body_end = bytes.len - upgrade_checkpoint_checksum_len;
+    const checksum = upgradeCheckpointDigest(bytes[0..body_end]);
+    @memcpy(bytes[body_end..], &checksum);
+}
 
 test "migration capsule encode/decode round-trips" {
     const allocator = testing.allocator;
@@ -388,6 +734,12 @@ test "migration capsule encode/decode round-trips" {
     try testing.expectEqualSlices(u8, &token, &got.token);
     try testing.expectEqualStrings("alice", got.account);
     try testing.expectEqualStrings("snap-bytes-here", got.snapshot);
+
+    const trailing = try allocator.alloc(u8, bytes.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..bytes.len], bytes);
+    trailing[bytes.len] = 0xA5;
+    try testing.expectError(error.TrailingBytes, decode(trailing));
 }
 
 test "consumption tombstone wire round-trips exactly" {
@@ -397,6 +749,8 @@ test "consumption tombstone wire round-trips exactly" {
     try testing.expectEqualSlices(u8, &original.token, &got.token);
     try testing.expectEqual(original.consumed_at_ms, got.consumed_at_ms);
     try testing.expectError(error.Truncated, decodeTombstone(buf[0 .. buf.len - 1]));
+    _ = encodeTombstone(.{ .token = original.token, .consumed_at_ms = -1 }, &buf);
+    try testing.expectError(error.InvalidMetadata, decodeTombstone(&buf));
 }
 
 test "decode rejects truncated input" {
@@ -544,6 +898,31 @@ test "consumption tombstone blocks late migration resurrection and expires" {
     try testing.expect(pm.has(token));
 }
 
+test "consumption tombstones never exceed their configured capacity" {
+    const a: Token = @splat(0xA1);
+    const b: Token = @splat(0xB2);
+    var disabled = PendingMigrations.initWithConfig(testing.allocator, .{
+        .max_entries = 0,
+        .max_per_account = 0,
+    });
+    defer disabled.deinit();
+    try testing.expectError(error.ConsumedFull, disabled.markConsumed(a, 1));
+    try testing.expectEqual(@as(usize, 0), disabled.consumedCount());
+
+    var bounded = PendingMigrations.initWithConfig(testing.allocator, .{
+        .max_entries = 1,
+        .max_per_account = 1,
+    });
+    defer bounded.deinit();
+    try bounded.markConsumed(a, std.math.maxInt(i64));
+    try bounded.markConsumed(b, std.math.maxInt(i64));
+    try testing.expectEqual(@as(usize, 1), bounded.consumedCount());
+    try testing.expect(!bounded.isConsumed(a));
+    try testing.expect(bounded.isConsumed(b));
+    const checkpoint = try bounded.encodeUpgradeCheckpoint(testing.allocator, std.math.maxInt(i64));
+    testing.allocator.free(checkpoint);
+}
+
 test "verified reusable-session offer supersedes a legacy consumption tombstone" {
     var pm = PendingMigrations.init(testing.allocator);
     defer pm.deinit();
@@ -630,6 +1009,287 @@ test "v2 projection follows Store fallback when a higher origin disappears" {
     try testing.expect(low_first.get(token).?.replica_revision.?.eql(high));
     try testing.expect(low_first.getLive(token, 10_000) != null);
     try testing.expect(low_first.getLive(token, 10_001) == null);
+}
+
+test "pending migration upgrade checkpoint preserves legacy replay and v2 ordering" {
+    const cfg = PendingMigrations.Config{ .max_entries = 8, .max_per_account = 4 };
+    var source = PendingMigrations.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+
+    const legacy_token: Token = @splat(0x61);
+    const replica_token: Token = @splat(0x62);
+    const consumed_token: Token = @splat(0x63);
+    try source.putAtEpoch(.{
+        .token = legacy_token,
+        .account = "Alice",
+        .snapshot = "legacy-newest",
+    }, 111, 42);
+    const revision = session_replica.Revision{
+        .epoch = 500,
+        .sequence = (@as(u64, 500) << 16) | 7,
+        .origin_node = 0xabc,
+    };
+    try testing.expect(revision.isCanonical());
+    try source.putReplica(.{
+        .token = replica_token,
+        .account = "alice",
+        .snapshot = "v2-selected",
+    }, 222, revision, 9_999);
+    try source.markConsumed(consumed_token, 333);
+
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 333);
+    defer testing.allocator.free(checkpoint);
+    var restored = try PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint, 333, 10_000);
+    defer restored.deinit();
+
+    const legacy = restored.get(legacy_token).?;
+    try testing.expectEqualStrings("Alice", legacy.account);
+    try testing.expectEqualStrings("legacy-newest", legacy.snapshot);
+    try testing.expectEqual(@as(i64, 111), legacy.staged_at_ms);
+    try testing.expectEqual(@as(u64, 42), legacy.offer_epoch);
+    try testing.expect(legacy.replica_revision == null);
+    try testing.expect(legacy.replica_expires_at_ms == null);
+
+    const replica = restored.get(replica_token).?;
+    try testing.expectEqualStrings("v2-selected", replica.snapshot);
+    try testing.expectEqual(@as(i64, 222), replica.staged_at_ms);
+    try testing.expect(replica.replica_revision.?.eql(revision));
+    try testing.expectEqual(@as(?i64, 9_999), replica.replica_expires_at_ms);
+    try testing.expect(restored.isConsumed(consumed_token));
+
+    // The restored legacy high-water mark still rejects equal and older replay.
+    try testing.expectError(error.StaleOffer, restored.putAtEpoch(.{
+        .token = legacy_token,
+        .account = "alice",
+        .snapshot = "equal-replay",
+    }, 444, 42));
+    try testing.expectError(error.StaleOffer, restored.putAtEpoch(.{
+        .token = legacy_token,
+        .account = "alice",
+        .snapshot = "older-replay",
+    }, 444, 41));
+    try restored.putAtEpoch(.{
+        .token = legacy_token,
+        .account = "alice",
+        .snapshot = "new-generation",
+    }, 444, 43);
+    try testing.expectEqualStrings("new-generation", restored.get(legacy_token).?.snapshot);
+
+    // V2 remains in its incomparable authority domain; no legacy epoch can
+    // downgrade it, and the consumed deny state remains effective too.
+    try testing.expectError(error.StaleOffer, restored.putAtEpoch(.{
+        .token = replica_token,
+        .account = "alice",
+        .snapshot = "legacy-downgrade",
+    }, 445, std.math.maxInt(u64)));
+    try testing.expectError(error.AlreadyConsumed, restored.put(.{
+        .token = consumed_token,
+        .account = "alice",
+        .snapshot = "late-consumed-replay",
+    }, 445));
+}
+
+test "pending migration upgrade checkpoint preserves bounded monotonic age" {
+    const cfg = PendingMigrations.Config{ .max_entries = 4, .max_per_account = 4 };
+    const live_token: Token = @splat(0x68);
+    const consumed_token: Token = @splat(0x69);
+    var source = PendingMigrations.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+    try source.put(.{ .token = live_token, .account = "alice", .snapshot = "state" }, 100);
+    try source.markConsumed(consumed_token, 100);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 150);
+    defer testing.allocator.free(checkpoint);
+
+    var before_expiry = try PendingMigrations.restoreUpgradeCheckpoint(
+        testing.allocator,
+        cfg,
+        checkpoint,
+        199,
+        100,
+    );
+    defer before_expiry.deinit();
+    try testing.expect(before_expiry.has(live_token));
+    try testing.expect(before_expiry.isConsumed(consumed_token));
+
+    var at_expiry = try PendingMigrations.restoreUpgradeCheckpoint(
+        testing.allocator,
+        cfg,
+        checkpoint,
+        200,
+        100,
+    );
+    defer at_expiry.deinit();
+    try testing.expect(!at_expiry.has(live_token));
+    try testing.expect(!at_expiry.isConsumed(consumed_token));
+
+    // Future local timestamps cannot be hidden behind a forged capture time,
+    // and a capture itself cannot be ahead of the successor's monotonic clock.
+    var future = PendingMigrations.initWithConfig(testing.allocator, cfg);
+    defer future.deinit();
+    try future.put(.{ .token = live_token, .account = "alice", .snapshot = "future" }, 201);
+    try testing.expectError(error.InvalidMetadata, future.encodeUpgradeCheckpoint(testing.allocator, 200));
+
+    const future_capture = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(future_capture);
+    std.mem.writeInt(
+        i64,
+        future_capture[upgrade_checkpoint_magic.len + 1 ..][0..8],
+        250,
+        .big,
+    );
+    rewriteUpgradeCheckpointChecksum(future_capture);
+    try testing.expectError(
+        error.InvalidMetadata,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, future_capture, 249, 100),
+    );
+}
+
+test "pending migration upgrade checkpoint rejects corruption truncation trailing and duplicate state" {
+    const cfg = PendingMigrations.Config{ .max_entries = 4, .max_per_account = 4 };
+    var source = PendingMigrations.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+    const live_token: Token = @splat(0x71);
+    const consumed_token: Token = @splat(0x72);
+    // One-byte account/snapshot keeps the hand-built duplicate offset exact.
+    try source.put(.{ .token = live_token, .account = "a", .snapshot = "s" }, 10);
+    try source.markConsumed(consumed_token, 20);
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 20);
+    defer testing.allocator.free(checkpoint);
+
+    try testing.expectError(
+        error.Truncated,
+        PendingMigrations.restoreUpgradeCheckpoint(
+            testing.allocator,
+            cfg,
+            checkpoint[0 .. upgrade_checkpoint_header_len - 1],
+            20,
+            1_000,
+        ),
+    );
+    try testing.expectError(
+        error.ChecksumMismatch,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, checkpoint[0 .. checkpoint.len - 1], 20, 1_000),
+    );
+
+    const corrupted = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(corrupted);
+    corrupted[upgrade_checkpoint_header_len + @sizeOf(Token) + 2] ^= 0x40;
+    try testing.expectError(
+        error.ChecksumMismatch,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, corrupted, 20, 1_000),
+    );
+
+    const wrong_version = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(wrong_version);
+    wrong_version[upgrade_checkpoint_magic.len] +%= 1;
+    rewriteUpgradeCheckpointChecksum(wrong_version);
+    try testing.expectError(
+        error.UnsupportedVersion,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, wrong_version, 20, 1_000),
+    );
+
+    const over_capacity = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(over_capacity);
+    std.mem.writeInt(
+        u32,
+        over_capacity[upgrade_checkpoint_magic.len + 1 + 8 ..][0..4],
+        @intCast(cfg.max_entries + 1),
+        .big,
+    );
+    rewriteUpgradeCheckpointChecksum(over_capacity);
+    try testing.expectError(
+        error.CapacityExceeded,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, over_capacity, 20, 1_000),
+    );
+
+    // Header + one no-v2 entry with one-byte account/snapshot (41) points
+    // at the consumed token. Make it equal the live token while keeping a valid
+    // checksum; strict cross-map duplicate detection must reject the whole blob.
+    const duplicate = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(duplicate);
+    const entry_token_offset = upgrade_checkpoint_header_len;
+    const consumed_token_offset = entry_token_offset + 41;
+    @memcpy(
+        duplicate[consumed_token_offset .. consumed_token_offset + @sizeOf(Token)],
+        duplicate[entry_token_offset .. entry_token_offset + @sizeOf(Token)],
+    );
+    rewriteUpgradeCheckpointChecksum(duplicate);
+    try testing.expectError(
+        error.DuplicateState,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, duplicate, 20, 1_000),
+    );
+
+    // Insert one authenticated extra body byte before a freshly-computed
+    // checksum. All declared records decode, then strict EOF validation rejects.
+    const with_trailing = try testing.allocator.alloc(u8, checkpoint.len + 1);
+    defer testing.allocator.free(with_trailing);
+    const old_body_end = checkpoint.len - upgrade_checkpoint_checksum_len;
+    @memcpy(with_trailing[0..old_body_end], checkpoint[0..old_body_end]);
+    with_trailing[old_body_end] = 0xA5;
+    rewriteUpgradeCheckpointChecksum(with_trailing);
+    try testing.expectError(
+        error.TrailingBytes,
+        PendingMigrations.restoreUpgradeCheckpoint(testing.allocator, cfg, with_trailing, 20, 1_000),
+    );
+}
+
+test "pending migration upgrade checkpoint encode restore and replace survive every allocation failure" {
+    const cfg = PendingMigrations.Config{ .max_entries = 8, .max_per_account = 8 };
+    var source = PendingMigrations.initWithConfig(testing.allocator, cfg);
+    defer source.deinit();
+    const live_token: Token = @splat(0x81);
+    const replica_token: Token = @splat(0x82);
+    const consumed_token: Token = @splat(0x83);
+    try source.putAtEpoch(.{ .token = live_token, .account = "alice", .snapshot = "legacy" }, 10, 9);
+    const revision = session_replica.Revision{
+        .epoch = 700,
+        .sequence = (@as(u64, 700) << 16) | 3,
+        .origin_node = 7,
+    };
+    try source.putReplica(.{ .token = replica_token, .account = "bob", .snapshot = "replica" }, 20, revision, 30_000);
+    try source.markConsumed(consumed_token, 30);
+
+    const EncodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, state: *const PendingMigrations) !void {
+            const bytes = try state.encodeUpgradeCheckpoint(allocator, 30);
+            defer allocator.free(bytes);
+            try testing.expect(bytes.len > upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, EncodeSweep.run, .{&source});
+
+    const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 30);
+    defer testing.allocator.free(checkpoint);
+    const RestoreSweep = struct {
+        fn run(allocator: std.mem.Allocator, wire: []const u8, config: PendingMigrations.Config) !void {
+            var restored = try PendingMigrations.restoreUpgradeCheckpoint(allocator, config, wire, 30, 1_000);
+            defer restored.deinit();
+            try testing.expectEqual(@as(usize, 2), restored.count());
+            try testing.expectEqual(@as(usize, 1), restored.consumedCount());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, RestoreSweep.run, .{ checkpoint, cfg });
+
+    const ReplaceSweep = struct {
+        fn run(allocator: std.mem.Allocator, wire: []const u8, config: PendingMigrations.Config) !void {
+            const sentinel: Token = @splat(0xFE);
+            var target = PendingMigrations.initWithConfig(allocator, config);
+            defer target.deinit();
+            try target.put(.{ .token = sentinel, .account = "sentinel", .snapshot = "old" }, 1);
+            target.replaceFromUpgradeCheckpoint(wire, 30, 1_000) catch |err| {
+                // Setup completed, so this is a restore allocation failure. The
+                // target must still own its exact predecessor state.
+                try testing.expect(target.has(sentinel));
+                try testing.expectEqualStrings("old", target.get(sentinel).?.snapshot);
+                try testing.expectEqual(@as(usize, 1), target.count());
+                return err;
+            };
+            try testing.expect(!target.has(sentinel));
+            try testing.expectEqual(@as(usize, 2), target.count());
+            try testing.expectEqual(@as(usize, 1), target.consumedCount());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, ReplaceSweep.run, .{ checkpoint, cfg });
 }
 
 test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> PendingMigrations -> reclaim consume" {
@@ -738,37 +1398,43 @@ test "end-to-end: target rejects a capsule signed by the wrong key (no staging)"
 }
 
 test "a staged entry rides a Helix .pending_migration capsule across USR2 (round-trip)" {
-    // The seal side wraps each PendingMigrations entry as a session_migrate wire
-    // blob inside a `.pending_migration` Helix capsule (ordinal 1, exactly how
-    // helix_live.prepare frames every StatePiece); the adopt side decodes the
-    // capsule field and re-stages it. Prove the full byte path round-trips.
+    // Current Helix schema v2 wraps the complete PMST checkpoint in one capsule;
+    // the successor atomically replaces its holding area from that exact field.
     const allocator = testing.allocator;
     const helix_capsule = @import("capsule.zig");
 
     const token: Token = @as([15]u8, @splat(7)) ++ .{1};
-    const wire = try encode(allocator, .{ .token = token, .account = "kain", .snapshot = "verified-snapshot-bytes" });
-    defer allocator.free(wire);
+    var predecessor = PendingMigrations.init(allocator);
+    defer predecessor.deinit();
+    try predecessor.putAtEpoch(.{
+        .token = token,
+        .account = "kain",
+        .snapshot = "verified-snapshot-bytes",
+    }, 42, 7);
+    const checkpoint = try predecessor.encodeUpgradeCheckpoint(allocator, 42);
+    defer allocator.free(checkpoint);
 
-    var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = wire }};
-    const sealed = try helix_capsule.encode(allocator, helix_capsule.make(.pending_migration, fields[0..]));
+    var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = checkpoint }};
+    var capsule = helix_capsule.make(.pending_migration, fields[0..]);
+    capsule.header.min_supported = 2;
+    const sealed = try helix_capsule.encode(allocator, capsule);
     defer allocator.free(sealed);
 
     var adopted = try helix_capsule.decode(allocator, sealed);
     defer adopted.deinit(allocator);
     try testing.expectEqual(helix_capsule.CapsuleKind.pending_migration, adopted.header.kind);
-    try testing.expectEqual(@as(u16, 1), adopted.header.version);
+    try testing.expectEqual(@as(u16, 2), adopted.header.version);
+    try testing.expectEqual(@as(u16, 2), adopted.header.min_supported);
     try testing.expectEqual(@as(usize, 1), adopted.fields.len);
 
-    const got = try decode(adopted.fields[0].bytes);
-    try testing.expectEqualSlices(u8, &token, &got.token);
+    var successor = PendingMigrations.init(allocator);
+    defer successor.deinit();
+    try successor.replaceFromUpgradeCheckpoint(adopted.fields[0].bytes, 42, 1_000);
+    const got = successor.get(token) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("kain", got.account);
     try testing.expectEqualStrings("verified-snapshot-bytes", got.snapshot);
-
-    // Re-staging on the successor works and is consumable by token.
-    var pm = PendingMigrations.init(allocator);
-    defer pm.deinit();
-    try pm.put(got, 42);
-    try testing.expect(pm.has(token));
+    try testing.expectEqual(@as(i64, 42), got.staged_at_ms);
+    try testing.expectEqual(@as(u64, 7), got.offer_epoch);
 }
 
 test "adopting a truncated .pending_migration payload fails closed (tolerant decode)" {

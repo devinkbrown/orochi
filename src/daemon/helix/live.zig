@@ -20,6 +20,11 @@ const linux = std.os.linux;
 pub const StatePiece = struct {
     kind: capsule.CapsuleKind,
     bytes: []const u8,
+    /// Raise the minimum decoder version for a representation that cannot be
+    /// losslessly interpreted by an older binary. Most capsule families keep
+    /// the registry default; exact state checkpoints use this to make rollback
+    /// fail closed instead of being accepted and silently mis-decoded.
+    min_supported: ?u16 = null,
 };
 
 pub const PrepareInputs = struct {
@@ -62,7 +67,8 @@ pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Pre
     if (runtime.arena) |*arena| {
         for (inputs.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-            const cap = capsule.make(piece.kind, fields[0..]);
+            var cap = capsule.make(piece.kind, fields[0..]);
+            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
             const encoded = try capsule.encode(allocator, cap);
             defer allocator.free(encoded);
             try arena.writeAll(encoded);

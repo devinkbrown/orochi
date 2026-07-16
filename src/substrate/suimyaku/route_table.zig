@@ -14,6 +14,10 @@ const nick_collision = @import("nick_collision.zig");
 const uid_alloc = @import("uid_alloc.zig");
 
 pub const NodeId = u64;
+/// Receiver-owned reusable-session identity. MEMBERSHIP never carries this on
+/// the wire: the daemon resolves it from a unique live signed SESSION_REPLICA
+/// fact and hands it to the route table as trusted local metadata.
+pub const SessionToken = [16]u8;
 
 /// Value-only projection of the best roster-backed claim for a nick. Account is
 /// intentionally excluded so routing priority cannot become identity-dependent
@@ -235,6 +239,10 @@ pub const Member = struct {
     /// The member's TLS client-cert fingerprint ("" = none). Same sensitivity and
     /// gating as `real_host` (remote WHOIS 276).
     certfp: []u8,
+    /// Exact signed logical-session token resolved by this receiver, or null
+    /// when no unique authority exists. Never populated from peer-controlled
+    /// MEMBERSHIP bytes; null keeps legacy/ambiguous rows fail-closed.
+    session_token: ?SessionToken = null,
     node: NodeId,
     status: u4,
     hlc: u64,
@@ -269,6 +277,37 @@ pub const MemberIdentity = struct {
     real_host: []const u8 = "",
     /// TLS client-cert fingerprint — same sensitivity/gating as real_host. "" = none.
     certfp: []const u8 = "",
+    /// Receiver-derived exact token metadata. See `Member.session_token`.
+    session_token: ?SessionToken = null,
+};
+
+/// Receiver-visible effects that must be made durable by the caller before an
+/// exact-token reconciliation mutates the authoritative compatibility roster.
+/// All slices and `member` fields are borrowed from the RouteTable for the
+/// duration of the callback only.
+pub const SessionTokenReconcileObserver = struct {
+    ctx: *anyopaque,
+    part_fn: *const fn (ctx: *anyopaque, channel: []const u8, member: *const Member) std.mem.Allocator.Error!void,
+    rename_fn: *const fn (ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, member: *const Member) std.mem.Allocator.Error!void,
+
+    fn part(self: SessionTokenReconcileObserver, channel: []const u8, member: *const Member) std.mem.Allocator.Error!void {
+        return self.part_fn(self.ctx, channel, member);
+    }
+
+    fn rename(self: SessionTokenReconcileObserver, old_nick: []const u8, new_nick: []const u8, member: *const Member) std.mem.Allocator.Error!void {
+        return self.rename_fn(self.ctx, old_nick, new_nick, member);
+    }
+};
+
+pub const SessionTokenReconcileResult = struct {
+    removed: usize = 0,
+    renamed: usize = 0,
+};
+
+pub const SessionTokenNickMatch = union(enum) {
+    none,
+    unique: SessionToken,
+    ambiguous,
 };
 
 /// Two accounts identify the SAME authenticated user iff both are present and
@@ -281,6 +320,19 @@ fn sameAccount(incoming: []const u8, holder: ?[]const u8) bool {
     const h = holder orelse return false;
     if (incoming.len == 0 or h.len == 0) return false;
     return std.mem.eql(u8, incoming, h);
+}
+
+fn optionalSessionTokenEql(a: ?SessionToken, b: ?SessionToken) bool {
+    const left = a orelse return b == null;
+    const right = b orelse return false;
+    return std.crypto.timing_safe.eql(SessionToken, left, right);
+}
+
+fn channelInSet(channel: []const u8, channels: []const []const u8) bool {
+    for (channels) |candidate| {
+        if (std.ascii.eqlIgnoreCase(channel, candidate)) return true;
+    }
+    return false;
 }
 
 pub const ChannelListKind = channel_list_event.ListKind;
@@ -690,6 +742,583 @@ pub const RouteTable = struct {
         return nick_collision.loserUid(incumbent.node_id, nick);
     }
 
+    /// Resolve the stable UID under which this origin's earlier wire nick was
+    /// actually stored after losing a collision. PART is channel-scoped, so only
+    /// accept an alias row owned by the same origin in the requested channel.
+    pub fn channelLoserUid(self: *const Self, channel: []const u8, node: NodeId, wire_nick: []const u8) ?nick_collision.Uid {
+        const uid = nick_collision.loserUid(node, wire_nick);
+        const members = self.channelMembers(channel);
+        for (members) |member| {
+            if (member.node == node and std.ascii.eqlIgnoreCase(member.nick, &uid)) return uid;
+        }
+        return null;
+    }
+
+    /// Resolve a prior loser UID for a same-origin NICK change across any roster.
+    /// Checking the stored row prevents a peer from manufacturing an arbitrary UID
+    /// alias and prevents one origin from renaming another origin's collision row.
+    pub fn storedLoserUid(self: *const Self, node: NodeId, wire_nick: []const u8) ?nick_collision.Uid {
+        const uid = nick_collision.loserUid(node, wire_nick);
+        var it = @constCast(&self.channel_members).valueIterator();
+        while (it.next()) |list| {
+            for (list.entries.items) |member| {
+                if (member.node == node and std.ascii.eqlIgnoreCase(member.nick, &uid)) return uid;
+            }
+        }
+        return null;
+    }
+
+    /// Bind (or clear) receiver-owned exact-token metadata on every roster row
+    /// that represents `wire_nick` from `node`. Collision losers are stored under
+    /// a deterministic UID, so match that receiver-derived alias as well. This is
+    /// deliberately separate from `applyMembership`: an OFFER may arrive after a
+    /// compatibility roster row and must be able to tag it retroactively.
+    pub fn rebindSessionToken(
+        self: *Self,
+        node: NodeId,
+        wire_nick: []const u8,
+        token: ?SessionToken,
+    ) Error!usize {
+        try self.validateName(wire_nick);
+        try validateNode(node);
+        const uid = nick_collision.loserUid(node, wire_nick);
+        var changed: usize = 0;
+        var it = self.channel_members.valueIterator();
+        while (it.next()) |list| {
+            for (list.entries.items) |*member| {
+                if (member.node != node) continue;
+                if (!std.ascii.eqlIgnoreCase(member.nick, wire_nick) and
+                    !std.ascii.eqlIgnoreCase(member.nick, &uid)) continue;
+                if (optionalSessionTokenEql(member.session_token, token)) continue;
+                member.session_token = token;
+                changed += 1;
+            }
+        }
+        return changed;
+    }
+
+    /// Apply a Store-authorized wire rename to an identity that may have arrived
+    /// before receiver token tagging. All roster/route strings and the owned
+    /// observer delta are allocated first; binding and rename then commit
+    /// together. OOM therefore leaves both the old spelling and token tags intact.
+    pub fn renameNickBindingSessionToken(
+        self: *Self,
+        node: NodeId,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        token: SessionToken,
+        ident: MemberIdentity,
+        observer: ?SessionTokenReconcileObserver,
+    ) Error!bool {
+        return self.renameSessionTokenRows(token, node, old_nick, new_nick, observer, ident, true);
+    }
+
+    /// Atomically move a Store-authorized exact identity onto `new_nick` while
+    /// displacing that nick's foreign incumbent to its deterministic UID. Every
+    /// roster string and route key is staged before mutation; token binding is
+    /// part of the same no-fail commit. A collision, bound mismatch, route-table
+    /// limit, or OOM therefore leaves both identities and all routes unchanged.
+    /// Client-visible deltas are intentionally owned by the caller, which must
+    /// stage them before invoking this transaction and publish them only after a
+    /// true result.
+    pub fn renameNickBindingSessionTokenDisplacing(
+        self: *Self,
+        node: NodeId,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        token: SessionToken,
+        ident: MemberIdentity,
+        incumbent_node: NodeId,
+        incumbent_uid: []const u8,
+    ) Error!bool {
+        try self.validateName(new_nick);
+        try self.validateName(incumbent_uid);
+        try validateNode(node);
+        try validateNode(incumbent_node);
+        if (node == incumbent_node) return false;
+
+        const old_home = self.nick_to_node.get(old_nick);
+        if (old_home) |home| if (home != node) return false;
+        const target_home = self.nick_to_node.get(new_nick) orelse return false;
+        if (target_home != incumbent_node) return false;
+        const uid_home = self.nick_to_node.get(incumbent_uid);
+        if (uid_home) |home| if (home != incumbent_node) return false;
+
+        var exact_count: usize = 0;
+        var incumbent_count: usize = 0;
+        var lists = self.channel_members.valueIterator();
+        while (lists.next()) |list| {
+            for (list.entries.items) |*member| {
+                const is_exact_old = member.node == node and std.ascii.eqlIgnoreCase(member.nick, old_nick);
+                const is_incumbent = member.node == incumbent_node and std.ascii.eqlIgnoreCase(member.nick, new_nick);
+
+                if (is_exact_old) {
+                    if (member.session_token) |stored| {
+                        if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) return false;
+                    }
+                    exact_count += 1;
+                    continue;
+                }
+                if (is_incumbent) {
+                    incumbent_count += 1;
+                    continue;
+                }
+
+                // Both destinations must be vacant after removing precisely the
+                // two planned source identities. Never fold an unrelated alias
+                // or a contradictory same-node row into the transaction.
+                if (std.ascii.eqlIgnoreCase(member.nick, new_nick) or
+                    std.ascii.eqlIgnoreCase(member.nick, incumbent_uid)) return false;
+            }
+        }
+        if (exact_count == 0 or incumbent_count == 0) return false;
+
+        var exact_nicks: std.ArrayListUnmanaged([]u8) = .empty;
+        var exact_transferred: usize = 0;
+        defer {
+            for (exact_nicks.items[exact_transferred..]) |owned| self.allocator.free(owned);
+            exact_nicks.deinit(self.allocator);
+        }
+        try exact_nicks.ensureTotalCapacity(self.allocator, exact_count);
+        for (0..exact_count) |_| exact_nicks.appendAssumeCapacity(try self.allocator.dupe(u8, new_nick));
+
+        const OwnedIdentity = struct {
+            username: []u8,
+            realname: []u8,
+            host: []u8,
+            account: []u8,
+
+            fn init(allocator: std.mem.Allocator, identity: MemberIdentity) std.mem.Allocator.Error!@This() {
+                const username = try allocator.dupe(u8, identity.username);
+                errdefer allocator.free(username);
+                const realname = try allocator.dupe(u8, identity.realname);
+                errdefer allocator.free(realname);
+                const host = try allocator.dupe(u8, identity.host);
+                errdefer allocator.free(host);
+                const account = try allocator.dupe(u8, identity.account);
+                return .{ .username = username, .realname = realname, .host = host, .account = account };
+            }
+
+            fn deinit(owned: *@This(), allocator: std.mem.Allocator) void {
+                allocator.free(owned.username);
+                allocator.free(owned.realname);
+                allocator.free(owned.host);
+                allocator.free(owned.account);
+                owned.* = undefined;
+            }
+        };
+        var exact_identities: std.ArrayListUnmanaged(OwnedIdentity) = .empty;
+        var identities_transferred: usize = 0;
+        defer {
+            for (exact_identities.items[identities_transferred..]) |*owned| owned.deinit(self.allocator);
+            exact_identities.deinit(self.allocator);
+        }
+        try exact_identities.ensureTotalCapacity(self.allocator, exact_count);
+        for (0..exact_count) |_| exact_identities.appendAssumeCapacity(try OwnedIdentity.init(self.allocator, ident));
+
+        var incumbent_nicks: std.ArrayListUnmanaged([]u8) = .empty;
+        var incumbent_transferred: usize = 0;
+        defer {
+            for (incumbent_nicks.items[incumbent_transferred..]) |owned| self.allocator.free(owned);
+            incumbent_nicks.deinit(self.allocator);
+        }
+        try incumbent_nicks.ensureTotalCapacity(self.allocator, incumbent_count);
+        for (0..incumbent_count) |_| incumbent_nicks.appendAssumeCapacity(try self.allocator.dupe(u8, incumbent_uid));
+
+        const remove_old_route = old_home != null;
+        const install_uid_route = uid_home == null;
+        const projected_count = self.nick_count - @as(usize, @intFromBool(remove_old_route)) - 1 + 1 + @as(usize, @intFromBool(install_uid_route));
+        if (projected_count > self.cfg.max_nicks) return error.RouteTableFull;
+
+        // Reserve for both no-clobber inserts while the old keys are still
+        // present. This may over-reserve, but guarantees the commit cannot OOM.
+        try self.nick_to_node.ensureUnusedCapacity(2);
+        if (!self.claim_index_dirty) try self.best_nick_claims.ensureUnusedCapacity(3);
+        const owned_target_key = try self.allocator.dupe(u8, new_nick);
+        var target_key_transferred = false;
+        defer if (!target_key_transferred) self.allocator.free(owned_target_key);
+        var owned_uid_key: ?[]u8 = null;
+        if (install_uid_route) owned_uid_key = try self.allocator.dupe(u8, incumbent_uid);
+        var uid_key_transferred = false;
+        defer if (owned_uid_key) |owned| if (!uid_key_transferred) self.allocator.free(owned);
+
+        var next_exact: usize = 0;
+        var next_incumbent: usize = 0;
+        lists = self.channel_members.valueIterator();
+        while (lists.next()) |list| {
+            for (list.entries.items) |*member| {
+                if (member.node == node and std.ascii.eqlIgnoreCase(member.nick, old_nick)) {
+                    self.allocator.free(member.nick);
+                    member.nick = exact_nicks.items[next_exact];
+                    next_exact += 1;
+                    exact_transferred = next_exact;
+                    member.session_token = token;
+                    self.allocator.free(member.username);
+                    self.allocator.free(member.realname);
+                    self.allocator.free(member.host);
+                    self.allocator.free(member.account);
+                    const owned_ident = exact_identities.items[next_exact - 1];
+                    member.username = owned_ident.username;
+                    member.realname = owned_ident.realname;
+                    member.host = owned_ident.host;
+                    member.account = owned_ident.account;
+                    identities_transferred = next_exact;
+                } else if (member.node == incumbent_node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) {
+                    self.allocator.free(member.nick);
+                    member.nick = incumbent_nicks.items[next_incumbent];
+                    next_incumbent += 1;
+                    incumbent_transferred = next_incumbent;
+                }
+            }
+        }
+        std.debug.assert(next_exact == exact_count);
+        std.debug.assert(next_incumbent == incumbent_count);
+
+        if (remove_old_route) {
+            const removed = self.nick_to_node.fetchRemove(old_nick).?;
+            self.allocator.free(removed.key);
+        }
+        const removed_target = self.nick_to_node.fetchRemove(new_nick).?;
+        self.allocator.free(removed_target.key);
+        self.nick_to_node.putNoClobber(owned_target_key, node) catch unreachable;
+        target_key_transferred = true;
+        if (install_uid_route) {
+            self.nick_to_node.putNoClobber(owned_uid_key.?, incumbent_node) catch unreachable;
+            uid_key_transferred = true;
+        }
+        self.nick_count = projected_count;
+
+        const old_key = NickKey.init(old_nick);
+        const target_key = NickKey.init(new_nick);
+        const uid_key = NickKey.init(incumbent_uid);
+        if (old_key) |key| self.reselectBestNickKey(key);
+        if (!self.claim_index_dirty) if (target_key) |key| self.reselectBestNickKey(key);
+        if (!self.claim_index_dirty) if (uid_key) |key| self.reselectBestNickKey(key);
+        return true;
+    }
+
+    /// Resolve the receiver-owned exact token attached to one origin/nick
+    /// identity. Collision aliases derived from `wire_nick` are included. A
+    /// contradictory set of token tags is explicit ambiguity and must be denied
+    /// by callers before applying a peer-controlled NICKCHANGE.
+    pub fn sessionTokenForOriginNick(self: *const Self, node: NodeId, wire_nick: []const u8) SessionTokenNickMatch {
+        const uid = nick_collision.loserUid(node, wire_nick);
+        var found: ?SessionToken = null;
+        var it = @constCast(&self.channel_members).valueIterator();
+        while (it.next()) |list| {
+            for (list.entries.items) |member| {
+                if (member.node != node) continue;
+                if (!std.ascii.eqlIgnoreCase(member.nick, wire_nick) and
+                    !std.ascii.eqlIgnoreCase(member.nick, &uid)) continue;
+                const token = member.session_token orelse continue;
+                if (found) |existing| {
+                    if (!std.crypto.timing_safe.eql(SessionToken, existing, token)) return .ambiguous;
+                } else {
+                    found = token;
+                }
+            }
+        }
+        return if (found) |token| .{ .unique = token } else .none;
+    }
+
+    /// Reconcile compatibility-roster rows for exactly one signed logical
+    /// session. Desired-channel rows with an obsolete identity are renamed first
+    /// (one observer event per origin/old-nick identity); rows outside the desired
+    /// channels are then removed (one observer event per row).
+    /// `desired_nick=null` means no live Store projection (REVOKE/quarantine) and
+    /// therefore removes every row carrying the exact token. Rows without a
+    /// receiver-derived token, or bearing any other token, are never touched.
+    ///
+    /// Every observer callback runs before its corresponding mutation. A callback
+    /// or rename-plan allocation failure returns an error with that row/identity
+    /// still present, so callers can retry without losing the client-visible
+    /// PART/NICK event. Earlier successful mutations remain valid progress and
+    /// cannot be emitted twice on the retry.
+    pub fn reconcileSessionToken(
+        self: *Self,
+        token: SessionToken,
+        desired_nick: ?[]const u8,
+        desired_channels: []const []const u8,
+    ) Error!SessionTokenReconcileResult {
+        return self.reconcileSessionTokenObserved(token, desired_nick, desired_channels, null);
+    }
+
+    pub fn reconcileSessionTokenObserved(
+        self: *Self,
+        token: SessionToken,
+        desired_nick: ?[]const u8,
+        desired_channels: []const []const u8,
+        observer: ?SessionTokenReconcileObserver,
+    ) Error!SessionTokenReconcileResult {
+        var result = SessionTokenReconcileResult{};
+
+        // Rename every obsolete identity before removing stale channels. This
+        // preserves IRC ordering: clients see one global NICK, followed by any
+        // PARTs for channels absent from the new signed snapshot.
+        if (desired_nick) |nick| {
+            try self.validateName(nick);
+            while (true) {
+                var candidate_node: ?NodeId = null;
+                var candidate_old: ?[]const u8 = null;
+                var channels = self.channel_members.iterator();
+                find_candidate: while (channels.next()) |entry| {
+                    if (!channelInSet(entry.key_ptr.*, desired_channels)) continue;
+                    for (entry.value_ptr.entries.items) |*member| {
+                        const stored = member.session_token orelse continue;
+                        if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) continue;
+                        const uid = nick_collision.loserUid(member.node, nick);
+                        if (std.ascii.eqlIgnoreCase(member.nick, nick) or
+                            std.ascii.eqlIgnoreCase(member.nick, &uid)) continue;
+                        candidate_node = member.node;
+                        candidate_old = member.nick;
+                        break :find_candidate;
+                    }
+                }
+                const node = candidate_node orelse break;
+                const old_nick = candidate_old.?;
+                var target_uid: nick_collision.Uid = undefined;
+                const target = self.reconciledNickTarget(node, nick, &target_uid);
+                if (try self.renameSessionTokenRows(token, node, old_nick, target, observer, null, false)) {
+                    result.renamed += 1;
+                } else {
+                    // A target collision that cannot be represented safely is an
+                    // incomplete reconcile, never permission to delete the row.
+                    return error.RouteTableFull;
+                }
+            }
+        }
+
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr;
+            var i: usize = 0;
+            while (i < list.entries.items.len) {
+                const member = &list.entries.items[i];
+                const stored = member.session_token orelse {
+                    i += 1;
+                    continue;
+                };
+                if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) {
+                    i += 1;
+                    continue;
+                }
+                const nick_matches = if (desired_nick) |nick| matches: {
+                    if (std.ascii.eqlIgnoreCase(member.nick, nick)) break :matches true;
+                    // Collision losers are stored under a deterministic alias
+                    // derived by this receiver from the authoritative real nick
+                    // and origin. That alias is still the same signed logical
+                    // identity, so a repeat Store projection must retain it.
+                    const uid = nick_collision.loserUid(member.node, nick);
+                    break :matches std.ascii.eqlIgnoreCase(member.nick, &uid);
+                } else false;
+                if (nick_matches and channelInSet(entry.key_ptr.*, desired_channels)) {
+                    i += 1;
+                    continue;
+                }
+
+                if (observer) |sink| try sink.part(entry.key_ptr.*, member);
+
+                const claim_key = NickKey.init(member.nick);
+                const route_points_at_removed = self.nickNode(member.nick) == member.node;
+                const last_occurrence = self.memberNickOccurrences(member.nick) == 1;
+                // If this is the last roster occurrence, retire its best-effort
+                // nick route before freeing the only remaining spelling. If the
+                // route points at this row but another exact nick survives, clear
+                // the stale home now and re-home it to the best survivor below.
+                if (last_occurrence or route_points_at_removed) _ = self.removeNick(member.nick);
+                member.freeStrings(self.allocator);
+                _ = list.entries.swapRemove(i);
+                result.removed += 1;
+                if (claim_key) |key| {
+                    self.reselectBestNickKey(key);
+                    if (!last_occurrence and route_points_at_removed) {
+                        if (self.bestMemberForNickKey(key)) |survivor|
+                            self.setNickLocation(survivor.nick, survivor.node) catch {};
+                    }
+                }
+            }
+        }
+
+        // Map mutation cannot occur during the iterator above. Prune empty
+        // rosters afterward, one at a time, using the existing ownership helper.
+        while (true) {
+            var empty: ?[]const u8 = null;
+            var empties = self.channel_members.iterator();
+            while (empties.next()) |entry| {
+                if (entry.value_ptr.entries.items.len == 0) {
+                    empty = entry.key_ptr.*;
+                    break;
+                }
+            }
+            if (empty) |channel| self.pruneIfEmpty(channel) else break;
+        }
+        return result;
+    }
+
+    /// Choose the collision-safe stored spelling for an authoritative real nick.
+    /// An already-stored UID alias is accepted by the caller before this helper;
+    /// this path is for an obsolete old identity moving to the new authority.
+    fn reconciledNickTarget(self: *const Self, node: NodeId, desired_nick: []const u8, uid_out: *nick_collision.Uid) []const u8 {
+        var contested = if (self.nick_to_node.get(desired_nick)) |home| home != node else false;
+        if (!contested) {
+            var it = @constCast(&self.channel_members).valueIterator();
+            outer: while (it.next()) |list| {
+                for (list.entries.items) |member| {
+                    if (member.node != node and std.ascii.eqlIgnoreCase(member.nick, desired_nick)) {
+                        contested = true;
+                        break :outer;
+                    }
+                }
+            }
+        }
+        if (!contested) {
+            if (self.local_nicks) |resolver| contested = resolver.held(desired_nick);
+        }
+        if (!contested) return desired_nick;
+        uid_out.* = nick_collision.loserUid(node, desired_nick);
+        return uid_out;
+    }
+
+    /// Transactionally rename every exact-token row for one stored identity.
+    /// All route/roster strings and observer-owned delta state are allocated
+    /// before any RouteTable mutation; the commit phase itself cannot fail.
+    fn renameSessionTokenRows(
+        self: *Self,
+        token: SessionToken,
+        node: NodeId,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        observer: ?SessionTokenReconcileObserver,
+        ident: ?MemberIdentity,
+        bind_untagged: bool,
+    ) Error!bool {
+        try self.validateName(new_nick);
+        const stable_old_nick = try self.allocator.dupe(u8, old_nick);
+        defer self.allocator.free(stable_old_nick);
+        var count: usize = 0;
+        var representative: ?*const Member = null;
+        var lists = self.channel_members.valueIterator();
+        while (lists.next()) |list| {
+            for (list.entries.items) |*member| {
+                if (member.node != node or !std.ascii.eqlIgnoreCase(member.nick, stable_old_nick)) continue;
+                if (member.session_token) |stored| {
+                    if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) {
+                        if (bind_untagged) return false;
+                        continue;
+                    }
+                } else if (!bind_untagged) continue;
+                // Never create two same-spelling rows in one channel. Target
+                // selection normally prevents this; retain old state if a
+                // contradictory roster already occupies the destination.
+                if (list.find(new_nick)) |idx| {
+                    if (&list.entries.items[idx] != member) return false;
+                }
+                representative = representative orelse member;
+                count += 1;
+            }
+        }
+        if (count == 0) return false;
+
+        var owned_nicks: std.ArrayListUnmanaged([]u8) = .empty;
+        var transferred_nicks: usize = 0;
+        defer {
+            for (owned_nicks.items[transferred_nicks..]) |owned| self.allocator.free(owned);
+            owned_nicks.deinit(self.allocator);
+        }
+        try owned_nicks.ensureTotalCapacity(self.allocator, count);
+        for (0..count) |_| owned_nicks.appendAssumeCapacity(try self.allocator.dupe(u8, new_nick));
+
+        const old_route_home = self.nick_to_node.get(stable_old_nick);
+        const remove_old_route = old_route_home != null and old_route_home.? == node;
+        const new_route_home = self.nick_to_node.get(new_nick);
+        if (new_route_home != null and new_route_home.? != node) return false;
+        const install_new_route = new_route_home == null and (remove_old_route or self.nick_count < self.cfg.max_nicks);
+        var owned_route_key: ?[]u8 = null;
+        if (install_new_route) {
+            try self.nick_to_node.ensureUnusedCapacity(1);
+            owned_route_key = try self.allocator.dupe(u8, new_nick);
+        }
+        defer if (owned_route_key) |owned| self.allocator.free(owned);
+
+        const member = representative.?;
+        if (observer) |sink| try sink.rename(stable_old_nick, new_nick, member);
+
+        var next_owned: usize = 0;
+        lists = self.channel_members.valueIterator();
+        while (lists.next()) |list| {
+            for (list.entries.items) |*row| {
+                if (row.node != node or !std.ascii.eqlIgnoreCase(row.nick, stable_old_nick)) continue;
+                if (row.session_token) |stored| {
+                    if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) continue;
+                } else if (!bind_untagged) continue;
+                self.allocator.free(row.nick);
+                row.nick = owned_nicks.items[next_owned];
+                next_owned += 1;
+                transferred_nicks = next_owned;
+                if (bind_untagged) row.session_token = token;
+                if (ident) |identity| {
+                    // Token installation and the spelling change are the
+                    // authoritative atomic state. Identity refresh retains the
+                    // established best-effort semantics of wire NICKCHANGE.
+                    replaceOwned(self.allocator, &row.username, identity.username) catch {};
+                    replaceOwned(self.allocator, &row.realname, identity.realname) catch {};
+                    replaceOwned(self.allocator, &row.host, identity.host) catch {};
+                    replaceOwned(self.allocator, &row.account, identity.account) catch {};
+                }
+            }
+        }
+        std.debug.assert(next_owned == count);
+
+        var old_route_removed = false;
+        if (remove_old_route) {
+            const removed = self.nick_to_node.fetchRemove(stable_old_nick).?;
+            self.allocator.free(removed.key);
+            old_route_removed = true;
+        }
+        if (install_new_route) {
+            const key = owned_route_key.?;
+            self.nick_to_node.putNoClobber(key, node) catch unreachable;
+            owned_route_key = null;
+        }
+        if (old_route_removed and !install_new_route) self.nick_count -= 1;
+        if (!old_route_removed and install_new_route) self.nick_count += 1;
+
+        const old_key = NickKey.init(stable_old_nick);
+        const new_key = NickKey.init(new_nick);
+        if (old_key) |key| self.reselectBestNickKey(key);
+        if (!self.claim_index_dirty) {
+            if (new_key) |key| {
+                if (old_key == null or !std.meta.eql(old_key.?, key)) self.reselectBestNickKey(key);
+            }
+        }
+        return true;
+    }
+
+    fn memberNickOccurrences(self: *const Self, nick: []const u8) usize {
+        var count: usize = 0;
+        var it = @constCast(&self.channel_members).valueIterator();
+        while (it.next()) |list| {
+            for (list.entries.items) |member| {
+                if (!std.ascii.eqlIgnoreCase(member.nick, nick)) continue;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn bestMemberForNickKey(self: *const Self, key: NickKey) ?Member {
+        const best = self.scannedBestNickKey(key) orelse return null;
+        var it = @constCast(&self.channel_members).valueIterator();
+        while (it.next()) |list| {
+            for (list.entries.items) |member| {
+                const member_key = NickKey.init(member.nick) orelse continue;
+                if (!std.meta.eql(member_key, key)) continue;
+                if (member.node == best.node_id and member.hlc == best.hlc) return member;
+            }
+        }
+        return null;
+    }
+
     pub fn channelNodes(self: *const Self, chan: []const u8, out: []NodeId) Error!usize {
         try self.validateName(chan);
         const state = self.channels.getPtr(chan) orelse return 0;
@@ -788,6 +1417,22 @@ pub const RouteTable = struct {
         try validateNode(node);
 
         const list = try self.ensureMemberList(chan);
+        // A PART is origin-owned. If the wire nick currently names another
+        // node's row, never delete it; only follow this origin's deterministic
+        // loser UID in the same channel. This closes the authenticated
+        // cross-origin deletion path while preserving collision cleanup.
+        if (!present) {
+            if (list.find(nick)) |idx| {
+                if (list.entries.items[idx].node != node) {
+                    const uid = nick_collision.loserUid(node, nick);
+                    if (list.find(&uid)) |uid_idx| {
+                        if (list.entries.items[uid_idx].node == node)
+                            return self.applyMembership(chan, &uid, node, status, hlc, false, ident, now_ms);
+                    }
+                    return .{ .outcome = .unchanged };
+                }
+            }
+        }
         if (list.find(nick)) |idx| {
             const cur = &list.entries.items[idx];
             const prev = cur.status;
@@ -808,6 +1453,7 @@ pub const RouteTable = struct {
                 try replaceOwned(self.allocator, &cur.account, ident.account);
                 try replaceOwned(self.allocator, &cur.real_host, ident.real_host);
                 try replaceOwned(self.allocator, &cur.certfp, ident.certfp);
+                cur.session_token = ident.session_token;
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
@@ -877,6 +1523,7 @@ pub const RouteTable = struct {
             .account = owned_account,
             .real_host = owned_real_host,
             .certfp = owned_certfp,
+            .session_token = ident.session_token,
             .node = node,
             .status = status,
             .hlc = hlc,
@@ -1069,6 +1716,19 @@ pub const RouteTable = struct {
         return null;
     }
 
+    /// Return one roster row for the exact mesh owner of `nick`. This is used by
+    /// callers staging a collision displacement delta before the route-table
+    /// transaction; the returned strings remain borrowed until mutation.
+    pub fn findMemberOwnedBy(self: *const Self, nick: []const u8, node: NodeId) ?Member {
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.entries.items) |member| {
+                if (member.node == node and std.ascii.eqlIgnoreCase(member.nick, nick)) return member;
+            }
+        }
+        return null;
+    }
+
     pub const ApplyChannelModeFlagsOutcome = enum { changed, unchanged };
 
     /// Apply a CHANNEL_MODE_FLAGS event for a remote channel, last-writer-wins by
@@ -1165,6 +1825,19 @@ pub const RouteTable = struct {
         // entries it also owns (`m.node == node`).
         if (self.nick_to_node.get(old_nick)) |home| {
             if (home != node) return false;
+        }
+
+        // Collision resolution must move/disambiguate a foreign target before
+        // rename reaches this mutation layer. Never overwrite another origin's
+        // route or roster row (including a generated UID target).
+        if (self.nick_to_node.get(new_nick)) |home| {
+            if (home != node) return false;
+        }
+        var target_it = self.channel_members.valueIterator();
+        while (target_it.next()) |list| {
+            for (list.entries.items) |member| {
+                if (member.node != node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) return false;
+            }
         }
 
         var existed = false;
@@ -1377,7 +2050,7 @@ test "nick routing" {
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
 }
 
-test "mesh route_table renameNick keeps nick_count consistent across the collision path" {
+test "mesh route_table renameNick keeps nick_count consistent and never clobbers a foreign target" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
@@ -1390,21 +2063,19 @@ test "mesh route_table renameNick keeps nick_count consistent across the collisi
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
     try std.testing.expectEqual(@as(usize, 1), table.nickCount());
 
-    // Collision rename: "carol" renames onto "bob", which ALREADY routes to
-    // another node. The old "carol" mapping is removed and the pre-existing
-    // "bob" mapping is displaced, so exactly one nick_to_node entry disappears —
-    // nick_count MUST drop from 2 to 1, not stay at 2.
+    // A target homed on another node is never overwritten. Collision resolution
+    // must displace it first or select the caller's loser UID.
     try table.setNickLocation("bob", 20);
     try std.testing.expectEqual(@as(usize, 2), table.nickCount());
-    try std.testing.expect(try table.renameNick("carol", "bob", 10, .{}));
-    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("bob"));
-    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("carol"));
-    try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+    try std.testing.expect(!(try table.renameNick("carol", "bob", 10, .{})));
+    try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode("bob"));
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("carol"));
+    try std.testing.expectEqual(@as(usize, 2), table.nickCount());
 
     // The leaked counter must not wedge future inserts against max_nicks: with a
-    // consistent count of 1 there is room for more nicks up to the cap.
+    // consistent count of 2 there is room for more nicks up to the cap.
     try table.setNickLocation("dave", 30);
-    try std.testing.expectEqual(@as(usize, 2), table.nickCount());
+    try std.testing.expectEqual(@as(usize, 3), table.nickCount());
 }
 
 test "mesh route_table renameNick rejects hijacking a nick homed on another node" {
@@ -1424,6 +2095,32 @@ test "mesh route_table renameNick rejects hijacking a nick homed on another node
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("victim"));
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("pwned"));
     try std.testing.expectEqual(@as(usize, 1), table.nickCount());
+}
+
+test "mesh route_table PART cannot delete another origin's exact nick" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    _ = try table.applyMembership("#safe", "trev", 10, 0, 10, true, .{}, 0);
+
+    const result = try table.applyMembership("#safe", "trev", 20, 0, 999, false, .{}, 0);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, result.outcome);
+    const member = table.findMember("trev") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(NodeId, 10), member.node);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("trev"));
+}
+
+test "mesh route_table rename refuses an occupied generated UID target" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+    const uid = nick_collision.loserUid(10, "taken");
+    _ = try table.applyMembership("#old", "old", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#foreign", &uid, 20, 0, 1, true, .{}, 0);
+
+    try std.testing.expect(!(try table.renameNick("old", &uid, 10, .{})));
+    try std.testing.expectEqual(@as(NodeId, 10), table.findMember("old").?.node);
+    try std.testing.expectEqual(@as(NodeId, 20), table.findMember(&uid).?.node);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("old"));
+    try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode(&uid));
 }
 
 test "mesh route_table renameNick allows same-node rename but not cross-node roster hijack" {
@@ -1576,6 +2273,175 @@ test "applyMembership stores and LWW-updates the propagated identity" {
     // Part frees the identity strings (leak-checked by testing.allocator).
     _ = try table.applyMembership("#chat", "alice", 10, 0, 10, false, .{}, 0);
     try std.testing.expect(table.findMember("alice") == null);
+}
+
+test "session token metadata is receiver-owned, LWW copied, and explicitly rebound" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    var first: SessionToken = @splat(0x11);
+    first[15] = 0xA1;
+    var second: SessionToken = @splat(0x22);
+    second[15] = 0xB2;
+
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{ .session_token = first }, 0);
+    var member = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, first, member.session_token.?));
+
+    // A stale wire re-affirmation cannot overwrite receiver metadata through the
+    // LWW identity path. Token authority changes use the explicit rebind API.
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{ .session_token = second }, 1);
+    member = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, first, member.session_token.?));
+    try std.testing.expectEqual(@as(usize, 1), try table.rebindSessionToken(10, "ALICE", second));
+    member = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, second, member.session_token.?));
+    try std.testing.expectEqual(@as(usize, 0), try table.rebindSessionToken(10, "alice", second));
+    try std.testing.expectEqual(@as(usize, 1), try table.rebindSessionToken(10, "alice", null));
+    try std.testing.expect((table.findMember("alice") orelse return error.TestUnexpectedResult).session_token == null);
+}
+
+test "rebindSessionToken follows receiver-derived collision UID aliases" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const token: SessionToken = @splat(0xC3);
+    const uid = nick_collision.loserUid(10, "alice");
+    _ = try table.applyMembership("#chat", &uid, 10, 0, 1, true, .{}, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), try table.rebindSessionToken(10, "alice", token));
+    const member = table.findMember(&uid) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, token, member.session_token.?));
+}
+
+test "Store-authorized untagged rename binds every row and is retry-safe" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const token: SessionToken = @splat(0xC4);
+    _ = try table.applyMembership("#one", "old", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#two", "old", 10, 0, 1, true, .{}, 0);
+
+    const FailingObserver = struct {
+        calls: usize = 0,
+
+        fn part(_: *anyopaque, _: []const u8, _: *const Member) std.mem.Allocator.Error!void {
+            unreachable;
+        }
+
+        fn rename(ctx: *anyopaque, _: []const u8, _: []const u8, _: *const Member) std.mem.Allocator.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.OutOfMemory;
+        }
+    };
+    var failing = FailingObserver{};
+    try std.testing.expectError(error.OutOfMemory, table.renameNickBindingSessionToken(10, "old", "new", token, .{}, .{
+        .ctx = &failing,
+        .part_fn = FailingObserver.part,
+        .rename_fn = FailingObserver.rename,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), failing.calls);
+    for ([_][]const u8{ "#one", "#two" }) |channel| {
+        const member = table.channelMembers(channel)[0];
+        try std.testing.expectEqualStrings("old", member.nick);
+        try std.testing.expect(member.session_token == null);
+    }
+    try std.testing.expect(table.nickNode("old") != null);
+    try std.testing.expect(table.nickNode("new") == null);
+
+    // Retrying the same Store-authorized transaction binds and renames together;
+    // the failed attempt left no partial receiver metadata behind.
+    try std.testing.expect(try table.renameNickBindingSessionToken(10, "old", "new", token, .{}, null));
+    for ([_][]const u8{ "#one", "#two" }) |channel| {
+        const member = table.channelMembers(channel)[0];
+        try std.testing.expectEqualStrings("new", member.nick);
+        try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, token, member.session_token.?));
+    }
+    try std.testing.expect(table.nickNode("old") == null);
+    try std.testing.expect(table.nickNode("new") != null);
+}
+
+test "reconcileSessionToken replaces stale nick rows within desired channels without touching decoys" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 16, .max_channels = 16, .max_nodes_per_channel = 16 });
+    defer table.deinit();
+
+    const exact: SessionToken = @splat(0x31);
+    const other: SessionToken = @splat(0x32);
+    _ = try table.applyMembership("#keep", "old-alice", 10, 0, 2, true, .{ .session_token = exact }, 0);
+    _ = try table.applyMembership("#gone", "old-alice", 10, 0, 2, true, .{ .session_token = exact }, 0);
+    _ = try table.applyMembership("#other", "bob", 10, 0, 1, true, .{ .session_token = other }, 0);
+    _ = try table.applyMembership("#unbound", "carol", 10, 0, 1, true, .{}, 0);
+
+    const desired = [_][]const u8{"#KEEP"};
+    const reconciled = try table.reconcileSessionToken(exact, "alice", &desired);
+    try std.testing.expectEqual(@as(usize, 1), reconciled.renamed);
+    try std.testing.expectEqual(@as(usize, 1), reconciled.removed);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#keep").len);
+    try std.testing.expectEqualStrings("alice", table.channelMembers("#keep")[0].nick);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#gone").len);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#other").len);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#unbound").len);
+    try std.testing.expect(table.nickNode("alice") != null);
+    try std.testing.expect(table.nickNode("old-alice") == null);
+    const unchanged = try table.reconcileSessionToken(exact, "alice", &desired);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.renamed);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.removed);
+
+    // A missing Store projection retracts the final exact-token row without
+    // disturbing the distinct or deliberately-unbound compatibility rows.
+    const revoked = try table.reconcileSessionToken(exact, null, &desired);
+    try std.testing.expectEqual(@as(usize, 1), revoked.removed);
+    try std.testing.expect(table.nickNode("alice") == null);
+    const bob = table.findMember("bob") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, other, bob.session_token.?));
+    try std.testing.expect(table.findMember("carol") != null);
+}
+
+test "reconcileSessionToken rehomes a shared nick route to the best surviving claim" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const survivor_token: SessionToken = @splat(0x41);
+    const removed_token: SessionToken = @splat(0x42);
+    _ = try table.applyMembership("#survives", "shared", 10, 0, 10, true, .{ .session_token = survivor_token }, 0);
+    _ = try table.applyMembership("#removed", "shared", 20, 0, 20, true, .{ .session_token = removed_token }, 0);
+    try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode("shared"));
+
+    const reconciled = try table.reconcileSessionToken(removed_token, null, &.{});
+    try std.testing.expectEqual(@as(usize, 1), reconciled.removed);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("shared"));
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#survives").len);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#removed").len);
+    const survivor = table.findMember("shared") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.crypto.timing_safe.eql(SessionToken, survivor_token, survivor.session_token.?));
+}
+
+test "reconcileSessionToken retains the receiver-derived collision alias until authoritative nick changes" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const token: SessionToken = @splat(0x51);
+    const origin: NodeId = 42;
+    const uid = nick_collision.loserUid(origin, "alice");
+    _ = try table.applyMembership("#room", &uid, origin, 0, 10, true, .{ .session_token = token }, 0);
+
+    const desired = [_][]const u8{"#ROOM"};
+    const unchanged = try table.reconcileSessionToken(token, "ALICE", &desired);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.removed);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.renamed);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#room").len);
+    try std.testing.expectEqualStrings(&uid, table.channelMembers("#room")[0].nick);
+    try std.testing.expectEqual(@as(?NodeId, origin), table.nickNode(&uid));
+
+    // Once signed authority changes the real nick, the old collision alias is
+    // no longer derivable from the desired identity and must be retracted.
+    const renamed = try table.reconcileSessionToken(token, "alice-new", &desired);
+    try std.testing.expectEqual(@as(usize, 1), renamed.renamed);
+    try std.testing.expectEqual(@as(usize, 0), renamed.removed);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#room").len);
+    try std.testing.expect(table.nickNode(&uid) == null);
+    try std.testing.expectEqualStrings("alice-new", table.channelMembers("#room")[0].nick);
 }
 
 test "applyMembership stores the oper-info real_host + certfp (remote WHOIS 338/276/320)" {
@@ -2099,7 +2965,10 @@ test "bestNickClaim rename reselects old and contested new normalized keys" {
     defer table.deinit();
     _ = try table.applyMembership("#a", "old", 1, 0, 10, true, .{}, 0);
     _ = try table.applyMembership("#b", "old", 1, 0, 20, true, .{}, 0);
-    _ = try table.applyMembership("#c", "new", 2, 0, 15, true, .{}, 0);
+    // A same-origin target spelling is a legitimate multi-roster contest. A
+    // foreign-origin target is deliberately rejected by renameNick's ownership
+    // guard and belongs in the collision/UID fixtures instead.
+    _ = try table.applyMembership("#c", "new", 1, 0, 15, true, .{}, 0);
 
     try std.testing.expect(try table.renameNick("old", "new", 1, .{}));
     try std.testing.expect(table.bestNickClaim("old") == null);
@@ -2108,7 +2977,7 @@ test "bestNickClaim rename reselects old and contested new normalized keys" {
     try std.testing.expectEqual(@as(u64, 20), best.hlc);
 
     // A case-only rename is one normalized-key reselect and must retain the
-    // unrelated node's contested spelling in the same winner set.
+    // unrelated roster's contested spelling in the same winner set.
     try std.testing.expect(try table.renameNick("new", "NeW", 1, .{}));
     best = table.bestNickClaim("new").?;
     try std.testing.expectEqual(@as(NodeId, 1), best.node_id);

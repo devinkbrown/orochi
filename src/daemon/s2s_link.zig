@@ -258,6 +258,28 @@ pub const S2sLink = struct {
         self.peer.setResidenceVerifier(verifier);
     }
 
+    /// Install (or clear) the receiver-owned signed-session resolver.
+    pub fn setSessionTokenResolver(self: *S2sLink, resolver: ?SessionTokenResolver) void {
+        self.peer.setSessionTokenResolver(resolver);
+    }
+
+    pub fn setSessionTokenNickAuthorizer(self: *S2sLink, authorizer: ?SessionTokenNickAuthorizer) void {
+        self.peer.setSessionTokenNickAuthorizer(authorizer);
+    }
+
+    pub fn rebindSessionToken(self: *S2sLink, origin_node: NodeId, nick: []const u8, token: ?SessionToken) !usize {
+        return self.peer.rebindSessionToken(origin_node, nick, token);
+    }
+
+    pub fn reconcileSessionToken(
+        self: *S2sLink,
+        token: SessionToken,
+        desired_nick: ?[]const u8,
+        desired_channels: []const []const u8,
+    ) !SessionTokenReconcileResult {
+        return self.peer.reconcileSessionToken(token, desired_nick, desired_channels);
+    }
+
     /// Which remote node currently owns `nick`, per the route table.
     pub fn routeNickNode(self: *const S2sLink, nick: []const u8) ?NodeId {
         return self.peer.routeNickNode(nick);
@@ -306,7 +328,14 @@ pub const S2sLink = struct {
 
     pub const MemberIdentity = s2s_peer.MemberIdentity;
     pub const LocalNickResolver = s2s_peer.LocalNickResolver;
+    pub const ResidenceDecision = s2s_peer.ResidenceDecision;
     pub const ResidenceVerifier = s2s_peer.ResidenceVerifier;
+    pub const SessionToken = s2s_peer.SessionToken;
+    pub const SessionTokenDecision = s2s_peer.SessionTokenDecision;
+    pub const SessionTokenResolver = s2s_peer.SessionTokenResolver;
+    pub const SessionTokenNickDecision = s2s_peer.SessionTokenNickDecision;
+    pub const SessionTokenNickAuthorizer = s2s_peer.SessionTokenNickAuthorizer;
+    pub const SessionTokenReconcileResult = s2s_peer.SessionTokenReconcileResult;
 
     /// Announce a local member's presence/departure in `channel` to the peer,
     /// carrying the member's real username/realname/visible-host identity.
@@ -437,6 +466,14 @@ pub const S2sLink = struct {
         return self.peer.takeMembershipChanges();
     }
 
+    pub fn processDeferredResidenceFrames(self: *S2sLink, now_ms: u64) void {
+        self.peer.processDeferredResidenceFrames(now_ms);
+    }
+
+    pub fn discardDeferredResidenceFrames(self: *S2sLink) void {
+        self.peer.discardDeferredResidenceFrames();
+    }
+
     /// Announce aggregate local boolean MODE flags for `channel` to the peer.
     /// Outbound frames accumulate in `out`.
     pub fn sendChannelModeFlags(self: *S2sLink, channel: []const u8, flags: u16, hlc: u64) !void {
@@ -557,6 +594,10 @@ pub const S2sLink = struct {
     /// authenticated immediate hop as `via_peer` for future multipath storage.
     pub fn takeSessionReplicaFrames(self: *S2sLink) ![]InboundSessionReplica {
         return self.peer.takeSessionReplicaFrames();
+    }
+
+    pub fn takeNextSessionReplicaFrame(self: *S2sLink) ?InboundSessionReplica {
+        return self.peer.takeNextSessionReplicaFrame();
     }
 
     pub fn takeDroppedSessionReplicaFrames(self: *S2sLink) u64 {
@@ -745,6 +786,17 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     try std.testing.expectEqualStrings("alice", members[0].username);
     try std.testing.expectEqualStrings("Alice Liddell", members[0].realname);
     try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", members[0].host);
+
+    // The daemon-facing wrappers retain the receiver-only token contract; the
+    // compatibility frame itself arrived unbound, then signed authority tags it.
+    b.setSessionTokenResolver(null);
+    const token: S2sLink.SessionToken = @splat(0xA4);
+    try std.testing.expectEqual(@as(usize, 1), try b.rebindSessionToken(1, "alice", token));
+    try std.testing.expect(std.crypto.timing_safe.eql(S2sLink.SessionToken, token, b.channelMembers("#chat")[0].session_token.?));
+    const desired = [_][]const u8{"#chat"};
+    const reconciled = try b.reconcileSessionToken(token, "alice", &desired);
+    try std.testing.expectEqual(@as(usize, 0), reconciled.removed);
+    try std.testing.expectEqual(@as(usize, 0), reconciled.renamed);
 
     // The queued live-IRC delta carries the identity too (for the JOIN line).
     const deltas = try b.takeMembershipChanges();

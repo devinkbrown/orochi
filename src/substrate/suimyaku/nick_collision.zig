@@ -59,24 +59,25 @@ pub fn candidateWins(candidate: Claim, incumbent: Claim) bool {
 /// Derive the stable fallback nick a collision loser is renamed to. The mesh UID
 /// is canonical base-36 over `(node_id<<64 | counter)` (see `uid_alloc`); we use
 /// the OWNING node's id and a deterministic per-nick counter so the result is
-/// reproducible on every node and never collides with another node's fallback.
-/// `node_id` here is the mesh SHORT id (fits the u16 UID node field via low bits;
-/// the high bits of a 64-bit short id are masked, matching how short ids are
-/// derived). The counter folds the contested nick so two different nicks losing
-/// on the same node still get distinct fallbacks.
+/// reproducible on every node. The legacy UID node field is only u16, so the
+/// counter cryptographically binds the FULL u64 mesh short id plus the
+/// ASCII-folded contested nick. Nodes sharing the same low 16 bits therefore do
+/// not alias, and case variants of one IRC nick resolve to the same fallback.
 pub fn loserUid(node_id: NodeId, nick: []const u8) uid_alloc.Uid {
     const node16: u16 = @truncate(node_id);
-    const counter = fnv1a64(nick);
-    return uid_alloc.generate(node16, counter);
-}
-
-fn fnv1a64(bytes: []const u8) u64 {
-    var hash: u64 = 0xcbf29ce484222325;
-    for (bytes) |b| {
-        hash ^= b;
-        hash *%= 0x100000001b3;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("orochi-mesh-loser-uid-v2\x00");
+    var node_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &node_buf, node_id, .big);
+    hasher.update(&node_buf);
+    for (nick) |byte| {
+        const folded = [_]u8{std.ascii.toLower(byte)};
+        hasher.update(&folded);
     }
-    return hash;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const counter = std.mem.readInt(u64, digest[0..8], .big);
+    return uid_alloc.generate(node16, counter);
 }
 
 const testing = std.testing;
@@ -125,6 +126,11 @@ test "loserUid: stable, node-scoped, and per-nick distinct" {
 
     const d = loserUid(0x5678, "alice");
     try testing.expect(!std.mem.eql(u8, a[0..], d[0..])); // node-scoped distinct
+
+    const e = loserUid(0x1_1234, "alice");
+    try testing.expect(!std.mem.eql(u8, a[0..], e[0..])); // full node id, not low-u16 alias
+    const folded = loserUid(0x1234, "AlIcE");
+    try testing.expectEqualSlices(u8, a[0..], folded[0..]);
 
     // The fallback is a canonical mesh UID (parses + validates).
     try testing.expect(uid_alloc.validate(a[0..]));
