@@ -32,6 +32,9 @@ const meshpass = @import("../proto/meshpass.zig");
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
 pub const RelayVerb = s2s_peer.RelayVerb;
+pub const RelayMessageV2 = s2s_peer.RelayMessageV2;
+pub const RelayVerbV2 = s2s_peer.RelayVerbV2;
+pub const InboundMessageV2 = s2s_peer.InboundMessageV2;
 const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
 const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
@@ -71,6 +74,8 @@ pub const Options = struct {
     /// Internal outer-transport assertion. Only `SecuredLink` sets this after a
     /// successful Tsumugi AKE; standalone/plaintext links must leave it false.
     session_replica_transport_enabled: bool = false,
+    /// Independent Tsumugi transport assertion for secure relay v2.
+    secure_relay_transport_enabled: bool = false,
 };
 
 pub const S2sLink = struct {
@@ -129,6 +134,7 @@ pub const S2sLink = struct {
             .signing_key = opts.signing_key,
             .admitted_frame_families = opts.admitted_frame_families,
             .session_replica_transport_enabled = opts.session_replica_transport_enabled,
+            .secure_relay_transport_enabled = opts.secure_relay_transport_enabled,
         });
     }
 
@@ -226,6 +232,7 @@ pub const S2sLink = struct {
             .signing_key = opts.signing_key,
             .admitted_frame_families = opts.admitted_frame_families,
             .session_replica_transport_enabled = opts.session_replica_transport_enabled,
+            .secure_relay_transport_enabled = opts.secure_relay_transport_enabled,
         }, hdr, remote_name, opts.now_ms, rng_seed);
     }
 
@@ -448,6 +455,8 @@ pub const S2sLink = struct {
 
     pub const RelayMessage = s2s_peer.RelayMessage;
     pub const RelayVerb = s2s_peer.RelayVerb;
+    pub const RelayMessageV2 = s2s_peer.RelayMessageV2;
+    pub const RelayVerbV2 = s2s_peer.RelayVerbV2;
 
     /// Forward a cross-node user message (PRIVMSG/NOTICE/TAGMSG) to the peer.
     pub fn sendMessage(self: *S2sLink, msg: s2s_peer.RelayMessage) !void {
@@ -458,6 +467,26 @@ pub const S2sLink = struct {
     /// returned slice + each Owned (deinit each, free the slice).
     pub fn takeInbound(self: *S2sLink) ![]s2s_peer.InboundMessage {
         return self.peer.takeInbound();
+    }
+
+    pub fn supportsSecureRelayV2(self: *const S2sLink) bool {
+        return self.peer.supportsSecureRelayV2();
+    }
+
+    pub fn sendMessageV2(self: *S2sLink, msg: s2s_peer.RelayMessageV2) !void {
+        try self.peer.sendMessageV2(self.sink(), msg);
+    }
+
+    pub fn takeInboundV2(self: *S2sLink) ![]s2s_peer.InboundMessageV2 {
+        return self.peer.takeInboundV2();
+    }
+
+    pub fn takeDroppedRelayV2Frames(self: *S2sLink) u64 {
+        return self.peer.takeDroppedRelayV2Frames();
+    }
+
+    pub fn takeRejectedRelayV2Frames(self: *S2sLink) u64 {
+        return self.peer.takeRejectedRelayV2Frames();
     }
 
     /// Drain remote channel membership changes (JOIN/PART) the daemon should

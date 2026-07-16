@@ -20,6 +20,7 @@ const membership_view = @import("membership_view.zig");
 const merkle = @import("merkle.zig");
 const peer_link = @import("peer_link.zig");
 const message_relay = @import("message_relay.zig");
+const message_relay_v2 = @import("message_relay_v2.zig");
 const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,6 +36,8 @@ pub const ChannelNameIterator = route_table.RouteTable.ChannelNameIterator;
 pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
+pub const RelayMessageV2 = message_relay_v2.RelayMessage;
+pub const RelayVerbV2 = message_relay_v2.Verb;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 pub const LocalNickResolver = route_table.LocalNickResolver;
 pub const SessionReplicaKind = session_replica_frame.Kind;
@@ -176,6 +179,8 @@ const cap_member_oper_info: u8 = s2s_frame.cap_member_oper_info;
 const cap_repair_frames: u8 = s2s_frame.cap_repair_frames;
 /// The peer understands secured SESSION_REPLICA v2 OFFER/ACK/REVOKE frames.
 const cap_session_replica_v2: u8 = s2s_frame.cap_session_replica_v2;
+/// The peer understands secured MESSAGE_V2 origin-signed flooding frames.
+const cap_secure_relay_v2: u8 = s2s_frame.cap_secure_relay_v2;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const session_replica_frame = @import("../../proto/session_replica_frame.zig");
@@ -210,6 +215,12 @@ pub const Config = struct {
     /// Maximum decoded SESSION_REPLICA transport objects staged for the daemon.
     /// The queue fails closed at the bound; it never evicts an earlier fact.
     max_session_replica_frames: usize = 64,
+    /// Maximum verified MESSAGE_V2 objects staged for the daemon. The queue is
+    /// fail-closed and never evicts an earlier accepted user event.
+    max_relay_v2_frames: usize = 256,
+    /// Per-link exact-event reflection cache. This is intentionally only a loop
+    /// optimization; authoritative replay retirement is daemon-global.
+    relay_v2_seen_capacity: usize = 4096,
     link: link_session.Config = .{
         .gossip_interval_ms = 1_000,
         .repair_interval_ms = 2_000,
@@ -278,6 +289,10 @@ pub const Options = struct {
     /// Set only by the Tsumugi `SecuredLink` adapter after its AKE establishes.
     /// A standalone/plaintext S2sLink remains false even if it has a signing key.
     session_replica_transport_enabled: bool = false,
+    /// Independent outer-transport assertion for MESSAGE_V2. Only the Tsumugi
+    /// SecuredLink adapter sets this after its AKE; a keyed plaintext test/link
+    /// cannot activate secure flooding by advertising capability bits.
+    secure_relay_transport_enabled: bool = false,
 };
 
 const Handshake = struct {
@@ -296,6 +311,18 @@ pub const InboundSessionReplica = struct {
 
     pub fn deinit(self: *InboundSessionReplica, allocator: Allocator) void {
         allocator.free(self.signed_payload);
+        self.* = undefined;
+    }
+};
+
+pub const InboundMessageV2 = struct {
+    owned: message_relay_v2.Owned,
+    /// Authenticated immediate hop. The immutable inner origin may legitimately
+    /// name a different node on a pure-transit A-B-C path.
+    via_peer: NodeId,
+
+    pub fn deinit(self: *InboundMessageV2, allocator: Allocator) void {
+        self.owned.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -356,6 +383,8 @@ pub const S2sPeer = struct {
     /// Local transport authorization from the outer Tsumugi-secured adapter.
     /// Signing ability alone is insufficient: signed plaintext stays disabled.
     session_replica_transport_enabled: bool = false,
+    /// Local authorization from the outer Tsumugi-secured adapter for relay v2.
+    secure_relay_transport_enabled: bool = false,
     /// Whether the remote peer advertised the `frame_signing` capability in its
     /// handshake. Learned on `recvHandshake`; gates both outbound wrapping (only
     /// wrap for a signing-capable peer) and inbound enforcement (a signing-capable
@@ -378,6 +407,8 @@ pub const S2sPeer = struct {
     /// SESSION_REPLICA v2 capability. Local key presence is checked separately,
     /// so plaintext links cannot activate the transport by forging capability bits.
     peer_supports_session_replica_v2: bool = false,
+    /// Remote advertised frame signing plus the explicit secure-relay-v2 bit.
+    peer_supports_secure_relay_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
     /// and always on non-daemon/test peers) ⇒ no account is ever trusted ⇒ every
     /// same-account short-circuit stays on the conservative UID path.
@@ -400,6 +431,11 @@ pub const S2sPeer = struct {
     /// daemon to drain + deliver to local clients (the daemon owns delivery; the
     /// peer driver stays substrate-pure). Loop-guarded by `seen`.
     inbound: std.ArrayListUnmanaged(message_relay.Owned) = .empty,
+    /// Verified secured relay-v2 events awaiting daemon-global replay admission,
+    /// local delivery, and correctness-first re-flooding.
+    inbound_v2: std.ArrayListUnmanaged(InboundMessageV2) = .empty,
+    dropped_relay_v2_frames: u64 = 0,
+    rejected_relay_v2_frames: u64 = 0,
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
     /// from OPER_GRANT frames, awaiting the daemon to verify + ingest them.
     inbound_grants: std.ArrayListUnmanaged([]u8) = .empty,
@@ -475,6 +511,8 @@ pub const S2sPeer = struct {
     /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
     tegami_pushes: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
+    /// Per-link reflection cache only; not authoritative replay protection.
+    seen_v2: message_relay_v2.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
         const server_name = try options.allocator.dupe(u8, options.server_name);
@@ -524,7 +562,9 @@ pub const S2sPeer = struct {
             .signing_key = options.signing_key,
             .admitted_frame_families = options.admitted_frame_families,
             .session_replica_transport_enabled = options.session_replica_transport_enabled,
+            .secure_relay_transport_enabled = options.secure_relay_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
+            .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
         };
     }
 
@@ -648,13 +688,17 @@ pub const S2sPeer = struct {
             .signing_key = options.signing_key,
             .admitted_frame_families = options.admitted_frame_families,
             .session_replica_transport_enabled = options.session_replica_transport_enabled,
+            .secure_relay_transport_enabled = options.secure_relay_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
+            .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
         };
     }
 
     pub fn deinit(self: *S2sPeer) void {
         for (self.inbound.items) |*owned| owned.deinit(self.allocator);
         self.inbound.deinit(self.allocator);
+        for (self.inbound_v2.items) |*owned| owned.deinit(self.allocator);
+        self.inbound_v2.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
@@ -697,6 +741,7 @@ pub const S2sPeer = struct {
         for (self.tegami_pushes.items) |m| self.allocator.free(m);
         self.tegami_pushes.deinit(self.allocator);
         self.seen.deinit();
+        self.seen_v2.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
         self.allocator.free(self.description);
@@ -905,6 +950,7 @@ pub const S2sPeer = struct {
             else
                 try self.recvNickChange(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
+            .MESSAGE_V2 => self.recvMessageV2(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
@@ -1356,6 +1402,105 @@ pub const S2sPeer = struct {
     /// must `deinit` each `Owned` and free the returned slice. Resets the queue.
     pub fn takeInbound(self: *S2sPeer) ![]message_relay.Owned {
         return self.inbound.toOwnedSlice(self.allocator);
+    }
+
+    /// True only on an established Tsumugi-authorized, signing-key-backed link
+    /// where the remote negotiated frame signing and secure relay v2.
+    pub fn supportsSecureRelayV2(self: *const S2sPeer) bool {
+        return self.established and self.secure_relay_transport_enabled and
+            self.signing_key != null and self.peer_supports_signing and
+            self.peer_supports_secure_relay_v2;
+    }
+
+    /// Verify the hop envelope and immutable origin signature before touching
+    /// the per-link reflection cache. Invalid traffic can therefore never poison
+    /// the key of a later valid event. Malformed input is dropped, not link-fatal.
+    fn recvMessageV2(self: *S2sPeer, outer_payload: []const u8) void {
+        if (!self.supportsSecureRelayV2()) {
+            self.rejected_relay_v2_frames +|= 1;
+            return;
+        }
+        const payload = self.verifiedPayload(.MESSAGE_V2, outer_payload) orelse {
+            self.rejected_relay_v2_frames +|= 1;
+            return;
+        };
+        var owned = message_relay_v2.decode(self.allocator, payload) catch {
+            self.rejected_relay_v2_frames +|= 1;
+            return;
+        };
+        const outcome = message_relay_v2.verifyAndRelayId(self.allocator, owned.msg) catch {
+            self.rejected_relay_v2_frames +|= 1;
+            owned.deinit(self.allocator);
+            return;
+        };
+        const id = switch (outcome) {
+            .verified => |verified| verified,
+            .origin_mismatch, .bad_signature => {
+                self.rejected_relay_v2_frames +|= 1;
+                owned.deinit(self.allocator);
+                return;
+            },
+        };
+        if (self.seen_v2.contains(id)) {
+            owned.deinit(self.allocator);
+            return;
+        }
+        if (self.inbound_v2.items.len >= self.config.max_relay_v2_frames) {
+            self.dropped_relay_v2_frames +|= 1;
+            owned.deinit(self.allocator);
+            return;
+        }
+        self.inbound_v2.append(self.allocator, .{
+            .owned = owned,
+            .via_peer = self.remote_node_id,
+        }) catch {
+            self.dropped_relay_v2_frames +|= 1;
+            owned.deinit(self.allocator);
+            return;
+        };
+        // Record only after queue ownership transfers successfully. This is a
+        // per-link reflection cache, not the daemon's authoritative replay
+        // guard, so a rare cache allocation failure must not reject delivery.
+        _ = self.seen_v2.observe(id);
+    }
+
+    /// Send one immutable origin-signed relay over a negotiated secured leg.
+    /// The inner origin may be a third node on transit; `emitSignable` adds the
+    /// immediate hop's outer signature without rewriting the origin object.
+    pub fn sendMessageV2(self: *S2sPeer, sink: ByteSink, msg: message_relay_v2.RelayMessage) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.secure_relay_transport_enabled or self.signing_key == null or !self.peer_supports_signing)
+            return error.SecuredLinkRequired;
+        if (!self.peer_supports_secure_relay_v2) return error.CapabilityNotNegotiated;
+
+        const outcome = try message_relay_v2.verifyAndRelayId(self.allocator, msg);
+        const id = switch (outcome) {
+            .verified => |verified| verified,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+        };
+        const wire = try message_relay_v2.encode(self.allocator, msg);
+        defer self.allocator.free(wire);
+        const framed_len = s2s_frame.header_len + signed_frame.header_len + wire.len;
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
+        try self.emitSignable(sink, .MESSAGE_V2, wire);
+        _ = self.seen_v2.observe(id);
+    }
+
+    /// Transfer all verified v2 events to the daemon. Caller deinitializes each
+    /// item and frees the returned slice.
+    pub fn takeInboundV2(self: *S2sPeer) ![]InboundMessageV2 {
+        return self.inbound_v2.toOwnedSlice(self.allocator);
+    }
+
+    pub fn takeDroppedRelayV2Frames(self: *S2sPeer) u64 {
+        defer self.dropped_relay_v2_frames = 0;
+        return self.dropped_relay_v2_frames;
+    }
+
+    pub fn takeRejectedRelayV2Frames(self: *S2sPeer) u64 {
+        defer self.rejected_relay_v2_frames = 0;
+        return self.rejected_relay_v2_frames;
     }
 
     /// A remote channel membership transition the daemon should reflect as a live
@@ -2754,6 +2899,7 @@ pub const S2sPeer = struct {
         self.peer_supports_oper_info = (hs.caps & cap_member_oper_info) != 0;
         self.peer_supports_repair = (hs.caps & cap_repair_frames) != 0;
         self.peer_supports_session_replica_v2 = self.peer_supports_signing and (hs.caps & cap_session_replica_v2) != 0;
+        self.peer_supports_secure_relay_v2 = self.peer_supports_signing and (hs.caps & cap_secure_relay_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
         }
@@ -2803,6 +2949,7 @@ pub const S2sPeer = struct {
         if (self.signing_key != null) {
             caps |= cap_frame_signing | cap_member_oper_info;
             if (self.session_replica_transport_enabled) caps |= cap_session_replica_v2;
+            if (self.secure_relay_transport_enabled) caps |= cap_secure_relay_v2;
         }
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
@@ -3800,6 +3947,267 @@ fn newSigningPeer(
             },
         },
     });
+}
+
+fn stampedRelayV2(
+    allocator: Allocator,
+    kp: *const sign.KeyPair,
+    target: []const u8,
+    scope: message_relay_v2.ScopeKind,
+    hlc: u64,
+    pubkey: *[message_relay_v2.pubkey_len]u8,
+    signature: *[message_relay_v2.sig_len]u8,
+) !message_relay_v2.RelayMessage {
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = target,
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .tags = "+draft/reply=42",
+        .text = "secure relay v2",
+        .scope_kind = scope,
+        .sender_route_id = try message_relay_v2.routeId(@splat(0x31)),
+        .recipient_route_id = if (scope == .direct) try message_relay_v2.routeId(@splat(0x32)) else null,
+        .origin_node = signed_frame.originShortId(kp.public_key),
+        .hlc = hlc,
+    };
+    try message_relay_v2.stampOrigin(allocator, &msg, kp, pubkey, signature);
+    return msg;
+}
+
+test "secure relay v2 negotiates only on secured peers and round-trips once" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x71);
+    const kp_b = try signingKeyFor(0x72);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6100);
+    try std.testing.expect(a.supportsSecureRelayV2());
+    try std.testing.expect(b.supportsSecureRelayV2());
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    const msg = try stampedRelayV2(allocator, &a.signing_key.?, "#room", .channel, 100, &pubkey, &signature);
+    try a.sendMessageV2(a_to_b.sink(), msg);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6101);
+    var inbound = try b.takeInboundV2();
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqual(a_short, inbound[0].via_peer);
+    try std.testing.expectEqualStrings("#room", inbound[0].owned.msg.target);
+    try std.testing.expectEqual(message_relay_v2.ScopeKind.channel, inbound[0].owned.msg.scope_kind);
+    try std.testing.expectEqual(message_relay_v2.VerifyOutcome.verified, try message_relay_v2.verifyOrigin(allocator, inbound[0].owned.msg));
+    for (inbound) |*item| item.deinit(allocator);
+    allocator.free(inbound);
+
+    // A reflected duplicate is suppressed by the per-link cache.
+    try a.sendMessageV2(a_to_b.sink(), msg);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6102);
+    inbound = try b.takeInboundV2();
+    defer allocator.free(inbound);
+    try std.testing.expectEqual(@as(usize, 0), inbound.len);
+}
+
+test "secure relay v2 preserves the original signature across pure transit A B C" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_ab_state = ChannelCrdt.init(allocator, 2);
+    defer b_ab_state.deinit();
+    var b_bc_state = ChannelCrdt.init(allocator, 3);
+    defer b_bc_state.deinit();
+    var c_state = ChannelCrdt.init(allocator, 4);
+    defer c_state.deinit();
+
+    const kp_a = try signingKeyFor(0x73);
+    const kp_b_ab = try signingKeyFor(0x74);
+    const kp_b_bc = try signingKeyFor(0x74);
+    const kp_c = try signingKeyFor(0x75);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b_ab.public_key);
+    const c_node = signed_frame.originShortId(kp_c.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b_from_a = try newSigningPeer(allocator, &b_ab_state, &tc, kp_b_ab, a_short, 2000, "b.test");
+    defer b_from_a.deinit();
+    var b_to_c = try newSigningPeer(allocator, &b_bc_state, &tc, kp_b_bc, c_node, 2000, "b.test");
+    defer b_to_c.deinit();
+    var c = try newSigningPeer(allocator, &c_state, &tc, kp_c, b_short, 3000, "c.test");
+    defer c.deinit();
+    a.secure_relay_transport_enabled = true;
+    b_from_a.secure_relay_transport_enabled = true;
+    b_to_c.secure_relay_transport_enabled = true;
+    c.secure_relay_transport_enabled = true;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b_from_a.startHandshake(b_to_a.sink());
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x6200);
+    var b_to_c_wire = BufferSink{};
+    defer b_to_c_wire.deinit(allocator);
+    var c_to_b_wire = BufferSink{};
+    defer c_to_b_wire.deinit(allocator);
+    try b_to_c.startHandshake(b_to_c_wire.sink());
+    try c.startHandshake(c_to_b_wire.sink());
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6201);
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    const origin_msg = try stampedRelayV2(allocator, &a.signing_key.?, "bob", .direct, 101, &pubkey, &signature);
+    const origin_id = switch (try message_relay_v2.verifyAndRelayId(allocator, origin_msg)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    try a.sendMessageV2(a_to_b.sink(), origin_msg);
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x6202);
+    const at_b = try b_from_a.takeInboundV2();
+    defer {
+        for (at_b) |*item| item.deinit(allocator);
+        allocator.free(at_b);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_b.len);
+    try b_to_c.sendMessageV2(b_to_c_wire.sink(), at_b[0].owned.msg);
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6203);
+    const at_c = try c.takeInboundV2();
+    defer {
+        for (at_c) |*item| item.deinit(allocator);
+        allocator.free(at_c);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_c.len);
+    try std.testing.expectEqual(b_short, at_c[0].via_peer);
+    try std.testing.expectEqual(a_short, at_c[0].owned.msg.origin_node);
+    try std.testing.expectEqualSlices(u8, origin_msg.origin_pubkey, at_c[0].owned.msg.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, origin_msg.origin_sig, at_c[0].owned.msg.origin_sig);
+    const at_c_id = switch (try message_relay_v2.verifyAndRelayId(allocator, at_c[0].owned.msg)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(origin_id, at_c_id);
+}
+
+test "secure relay v2 forged input cannot poison dedup and queue bound fails closed" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x76);
+    const kp_b = try signingKeyFor(0x77);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    b.config.max_relay_v2_frames = 1;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6300);
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    const valid = try stampedRelayV2(allocator, &a.signing_key.?, "#room", .channel, 102, &pubkey, &signature);
+    const valid_wire = try message_relay_v2.encode(allocator, valid);
+    defer allocator.free(valid_wire);
+    // Once signing was negotiated, a raw MESSAGE_V2 payload is a bad outer
+    // envelope and must be visible in both generic and relay-specific telemetry.
+    try emitFrame(allocator, a_to_b.sink(), .MESSAGE_V2, valid_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6301);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedRelayV2Frames());
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+
+    var forged = valid;
+    forged.text = "tampered";
+    const forged_wire = try message_relay_v2.encode(allocator, forged);
+    defer allocator.free(forged_wire);
+    try a.emitSignable(a_to_b.sink(), .MESSAGE_V2, forged_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6302);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedRelayV2Frames());
+
+    // The valid object with the same claimed origin/HLC is still admitted.
+    try a.sendMessageV2(a_to_b.sink(), valid);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6303);
+
+    var pubkey2: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature2: [message_relay_v2.sig_len]u8 = undefined;
+    const second = try stampedRelayV2(allocator, &a.signing_key.?, "#room", .channel, 103, &pubkey2, &signature2);
+    try a.sendMessageV2(a_to_b.sink(), second);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6304);
+    try std.testing.expectEqual(@as(u64, 1), b.takeDroppedRelayV2Frames());
+    const inbound = try b.takeInboundV2();
+    defer allocator.free(inbound);
+    defer {
+        for (inbound) |*item| item.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqual(@as(u64, 102), inbound[0].owned.msg.hlc);
+
+    // Queue rejection is not a dedup decision. Once capacity is drained, the
+    // exact event that was dropped above must be accepted on retransmission.
+    try a.sendMessageV2(a_to_b.sink(), second);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6305);
+    const retried = try b.takeInboundV2();
+    defer {
+        for (retried) |*item| item.deinit(allocator);
+        allocator.free(retried);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retried.len);
+    try std.testing.expectEqual(@as(u64, 103), retried[0].owned.msg.hlc);
+    try std.testing.expectEqual(@as(u64, 0), b.takeDroppedRelayV2Frames());
+}
+
+test "secure relay v2 keyed plaintext and rolling-old peers stay inert" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    const kp_local = try signingKeyFor(0x78);
+    var kp_remote = try signingKeyFor(0x79);
+    defer kp_remote.deinit();
+    const remote_short = signed_frame.originShortId(kp_remote.public_key);
+    var peer = try newSigningPeer(allocator, &state, &tc, kp_local, remote_short, 1000, "local.test");
+    defer peer.deinit();
+    peer.established = true;
+    peer.peer_supports_signing = true;
+    peer.peer_supports_secure_relay_v2 = true;
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    const msg = try stampedRelayV2(allocator, &peer.signing_key.?, "#room", .channel, 104, &pubkey, &signature);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try std.testing.expectError(error.SecuredLinkRequired, peer.sendMessageV2(sink.sink(), msg));
+
+    peer.secure_relay_transport_enabled = true;
+    peer.peer_supports_secure_relay_v2 = false;
+    try std.testing.expectError(error.CapabilityNotNegotiated, peer.sendMessageV2(sink.sink(), msg));
+    try std.testing.expectEqual(@as(usize, 0), sink.bytes.items.len);
 }
 
 fn fakeSessionReplicaObject(allocator: Allocator, kind: session_replica_frame.Kind) ![]u8 {
@@ -5792,7 +6200,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP, .CLONE_COUNT,
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,        .RESYNC,
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .TEGAMI_PUSH, .SESSION_REPLICA_OFFER,
-        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE,
+        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

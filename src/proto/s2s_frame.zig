@@ -116,6 +116,9 @@ pub const FrameType = enum(u8) {
     SESSION_REPLICA_ACK = 0x1F,
     /// SESSION_REPLICA v2 signed removal tombstone (REVOKE).
     SESSION_REPLICA_REVOKE = 0x20,
+    /// Secured-only multi-hop user relay with immutable origin-signed routing
+    /// scope and non-bearer portable-session route identifiers.
+    MESSAGE_V2 = 0x21,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -155,6 +158,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.SESSION_REPLICA_OFFER) => .SESSION_REPLICA_OFFER,
             @intFromEnum(FrameType.SESSION_REPLICA_ACK) => .SESSION_REPLICA_ACK,
             @intFromEnum(FrameType.SESSION_REPLICA_REVOKE) => .SESSION_REPLICA_REVOKE,
+            @intFromEnum(FrameType.MESSAGE_V2) => .MESSAGE_V2,
             else => null,
         };
     }
@@ -168,6 +172,7 @@ pub const Capability = enum(u3) {
     member_oper_info = 2,
     repair_frames = 3,
     session_replica_v2 = 4,
+    secure_relay_v2 = 5,
 
     pub fn bit(self: Capability) u3 {
         return @intFromEnum(self);
@@ -183,6 +188,7 @@ pub const cap_member_account: u8 = Capability.member_account.mask();
 pub const cap_member_oper_info: u8 = Capability.member_oper_info.mask();
 pub const cap_repair_frames: u8 = Capability.repair_frames.mask();
 pub const cap_session_replica_v2: u8 = Capability.session_replica_v2.mask();
+pub const cap_secure_relay_v2: u8 = Capability.secure_relay_v2.mask();
 
 pub const CapabilitySpec = struct {
     cap: Capability,
@@ -223,6 +229,11 @@ pub const capability_catalog = [_]CapabilitySpec{
         .cap = .session_replica_v2,
         .token = "session-replica-v2",
         .summary = "Secured signed OFFER, ACK, and REVOKE transport for reusable session replicas.",
+    },
+    .{
+        .cap = .secure_relay_v2,
+        .token = "secure-relay-v2",
+        .summary = "Secured multi-hop user relay with immutable origin-signed routing scope.",
     },
 };
 
@@ -324,6 +335,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .SESSION_REPLICA_OFFER, .token = "SESSION_REPLICA_OFFER", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed upsert offer." },
     .{ .frame_type = .SESSION_REPLICA_ACK, .token = "SESSION_REPLICA_ACK", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed acknowledgment and route observation." },
     .{ .frame_type = .SESSION_REPLICA_REVOKE, .token = "SESSION_REPLICA_REVOKE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed removal tombstone." },
+    .{ .frame_type = .MESSAGE_V2, .token = "MESSAGE_V2", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured multi-hop user relay with immutable origin signature and routing scope." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -649,10 +661,12 @@ test "capability catalog exposes stable wire bits" {
     try testing.expectEqual(@as(u8, 0x04), cap_member_oper_info);
     try testing.expectEqual(@as(u8, 0x08), cap_repair_frames);
     try testing.expectEqual(@as(u8, 0x10), cap_session_replica_v2);
+    try testing.expectEqual(@as(u8, 0x20), cap_secure_relay_v2);
 
     try testing.expectEqual(@as(u3, 0), capabilitySpec(.frame_signing).bit());
     try testing.expectEqual(@as(u3, 1), capabilityByToken("member-account").?.bit());
     try testing.expectEqual(@as(u3, 4), capabilityByToken("session-replica-v2").?.bit());
+    try testing.expectEqual(@as(u3, 5), capabilityByToken("secure-relay-v2").?.bit());
     try testing.expect(capabilityByToken("does-not-exist") == null);
 }
 
@@ -695,4 +709,13 @@ test "session replica v2 frames are secured and capability gated" {
     try testing.expectEqual(FrameType.SESSION_REPLICA_OFFER, frameSpecByToken("SESSION_REPLICA_OFFER").?.frame_type);
     try testing.expectEqual(FrameType.SESSION_REPLICA_ACK, frameSpecByTag(0x1f).?.frame_type);
     try testing.expectEqual(FrameType.SESSION_REPLICA_REVOKE, FrameType.fromTag(0x20).?);
+}
+
+test "secure relay v2 frame is secured and capability gated" {
+    const spec = frameSpec(.MESSAGE_V2);
+    try testing.expectEqual(FrameFamily.relay, spec.family);
+    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+    try testing.expectEqual(cap_secure_relay_v2, spec.capability_mask);
+    try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByTag(0x21).?.frame_type);
+    try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByToken("MESSAGE_V2").?.frame_type);
 }

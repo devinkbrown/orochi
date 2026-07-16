@@ -32,6 +32,7 @@ const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
 const session_replica = @import("helix/session_replica.zig");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
+const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 
@@ -286,6 +287,7 @@ pub const SecuredLink = struct {
             .signing_key = self.identity.sign_kp,
             .admitted_frame_families = rs.established.admitted_frame_families,
             .session_replica_transport_enabled = true,
+            .secure_relay_transport_enabled = true,
         }, rs.inner, rs.remote_name, rs.rng_seed);
         self.inner = link;
         return self;
@@ -629,6 +631,32 @@ pub const SecuredLink = struct {
     pub fn takeInbound(self: *SecuredLink) anyerror![]s2s_peer.InboundMessage {
         const link = self.inner orelse return &.{};
         return link.takeInbound();
+    }
+
+    pub fn supportsSecureRelayV2(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsSecureRelayV2();
+    }
+
+    pub fn sendMessageV2(self: *SecuredLink, msg: s2s_link.RelayMessageV2) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendMessageV2(msg);
+        try self.drainInner();
+    }
+
+    pub fn takeInboundV2(self: *SecuredLink) anyerror![]s2s_link.InboundMessageV2 {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundMessageV2, 0);
+        return link.takeInboundV2();
+    }
+
+    pub fn takeDroppedRelayV2Frames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeDroppedRelayV2Frames();
+    }
+
+    pub fn takeRejectedRelayV2Frames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeRejectedRelayV2Frames();
     }
 
     /// Drain remote channel membership changes (JOIN/PART) for the daemon to
@@ -990,6 +1018,7 @@ pub const SecuredLink = struct {
             .signing_key = self.identity.sign_kp,
             .admitted_frame_families = self.establishedKeys().admitted_frame_families,
             .session_replica_transport_enabled = true,
+            .secure_relay_transport_enabled = true,
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
@@ -1312,6 +1341,48 @@ const FixedSessionTokenResolver = struct {
         return .{ .ctx = self, .resolve_fn = resolve };
     }
 };
+
+test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    try testing.expect(p.a.supportsSecureRelayV2());
+    try testing.expect(p.b.supportsSecureRelayV2());
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#secure",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .text = "secured relay payload",
+        .scope_kind = .channel,
+        .sender_route_id = try message_relay_v2.routeId(@splat(0x41)),
+        .origin_node = p.ida.shortId(),
+        .hlc = 500,
+    };
+    try message_relay_v2.stampOrigin(testing.allocator, &msg, &p.ida.sign_kp, &pubkey, &signature);
+    try p.a.sendMessageV2(msg);
+    try testing.expect(p.a.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), msg.text) == null);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), msg.target) == null);
+    try pump(&p.a, &p.b, false);
+
+    const inbound = try p.b.takeInboundV2();
+    defer {
+        for (inbound) |*item| item.deinit(testing.allocator);
+        testing.allocator.free(inbound);
+    }
+    try testing.expectEqual(@as(usize, 1), inbound.len);
+    try testing.expectEqual(p.ida.shortId(), inbound[0].via_peer);
+    try testing.expectEqualStrings("#secure", inbound[0].owned.msg.target);
+    try testing.expectEqual(
+        message_relay_v2.VerifyOutcome.verified,
+        try message_relay_v2.verifyOrigin(testing.allocator, inbound[0].owned.msg),
+    );
+}
 
 test "session replica v2 activates only inside established Tsumugi SecuredLink" {
     var p = try EstablishedPair.init();
