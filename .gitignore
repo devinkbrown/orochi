@@ -2,7 +2,12 @@
 zig-out/
 announce_bot.log
 .claude/worktrees/
+.worktrees/
 __pycache__/
+
+# Internal agent planning/handoff scratch (not product)
+CLAUDE_CSB_TAKEOVER_ROADMAP.md
+CODEX_ROADMAP.md
 
 # Mesh node signing key — never commit
 orochi-node.key
