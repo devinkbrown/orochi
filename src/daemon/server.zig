@@ -32722,23 +32722,39 @@ pub const LinuxServer = struct {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
         const now: u64 = self.grantNowU64();
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
+        // Whether this account ALREADY confers the derived `*` (+Y) before this
+        // grant lands. A live opered session is re-minted on a periodic cadence
+        // well inside the grant TTL (so its grant never lapses on a peer); each
+        // re-mint arrives here as a `superseded` upsert carrying identical
+        // privileges. Announcing +Y on every such refresh re-broadcasts
+        // `MODE #chan +Y <nick>` to every shared channel each cadence tick (the
+        // 30s "+Y" churn). Only a genuine transition should move the prefix;
+        // NAMES/WHO already render the derived `*` for anyone joining fresh.
+        const had_oper_override = if (self.oper_grants.lookup(fields.account, now)) |prev|
+            oper_mod.OperPrivileges.fromBits(prev.privilege_bits).has(.oper_override)
+        else
+            false;
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
             if (fields.privilege_bits == 0) {
                 // Revocation tombstone: drop oper from any connected sessions.
                 self.deElevateSessions(fields.account);
-                // Clear the derived `*` prefix from this nick's channels.
-                self.announceOperPrefixAllChannels(fields.account, false);
+                // Clear the derived `*` prefix — only if it was actually set.
+                if (had_oper_override) self.announceOperPrefixAllChannels(fields.account, false);
             } else {
                 // Retroactively elevate any already-connected sessions of this
                 // account so recognition is immediate, not deferred to next login.
                 self.elevateGrantedSessions(fields.account);
                 // Push the derived `*` (+Y) prefix to every channel this nick is
-                // in — local OR remote-projected — so a relink that re-applies a
-                // remote oper's grant restores the star without a fresh NAMES.
-                // Gated on the privilege that actually confers the `*`.
-                if (oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override)) {
+                // in — local OR remote-projected — but ONLY on a genuine
+                // transition INTO oper_override. The grant-after-join and the
+                // grant-expired-during-split relink cases still transition here;
+                // a relink that re-projects a still-granted oper is covered by the
+                // remote-JOIN prefix emit. A steady opered session's periodic
+                // re-mint no longer re-broadcasts +Y every refresh tick.
+                const now_oper_override = oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override);
+                if (now_oper_override and !had_oper_override) {
                     self.announceOperPrefixAllChannels(fields.account, true);
                 }
             }
