@@ -68,7 +68,11 @@ relay_v2_roster = ["env:NODE_A_PUBKEY", "env:NODE_B_PUBKEY", "env:NODE_C_PUBKEY"
 ```
 
 The roster is separate from `trust_roots`: the former is the complete mesh;
-the latter is the local node's direct-neighbor allowlist. Orochi canonicalizes
+the latter is the local node's direct-neighbor allowlist and, under a staged
+plan, its MESSAGE_V2 **custody membership** — the confirmed-node set each durable
+RVL2 accepted-event row collects ACKs from before it retires its retained wire
+(`src/daemon/config_format.zig:1855`, `src/daemon/relay_v2_event_log.zig:25`). It
+is also distinct from `admission_roots` (MeshPass signer roots). Orochi canonicalizes
 the full public keys into a roster digest and carries `{mode, epoch, digest}` in
 the mandatory MHLC v3 Helix checkpoint. Current handoff rejects an unstaged
 activation, a roster mismatch, active-to-compat downgrade, malformed state, or
@@ -103,6 +107,15 @@ u64 id, and every direct root must appear in the 2..4096-key full roster.
 and typed `DATA`/`REQUEST`/`REPLY`; direct-message variants additionally require
 an authenticated portable recipient-session token. Other IRC events stay on
 their existing paths.
+
+The durable MESSAGE_V2 custody plane (accepted-event log RVL2, per-hop outbox
+RVO2, replay guard RVG2, and rendered-record spool ADS1) is a
+retransmit-until-ACK obligation that survives a **[Helix](../reference/glossary.md)
+(`SIGUSR2`) hot-upgrade only** — its checkpoints ride the in-memory upgrade
+capsule, not a disk write-ahead log. A systemd cold restart (`systemctl restart`)
+or power loss drops any in-flight custody obligation, so hard-restart a node only
+from a drained boundary. See the [MESSAGE_V2 exact-once
+design](../design/message-v2-exact-once.md) and [Helix upgrade](upgrade.md).
 
 `[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:70`, `src/daemon/server.zig:1738`). The server binds it alongside the IRC listener when the value is non-zero (`src/daemon/server.zig:3298`, `src/daemon/server.zig:3299`).
 

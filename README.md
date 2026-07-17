@@ -58,7 +58,7 @@ verify it yourself (`packaging/verify-release.sh`).
 ## Highlights
 
 - **Pure Zig, top to bottom** — substrate, crypto, TLS, and daemon, with zero C dependencies.
-- **Post-quantum mesh** — a CRDT state mesh over an X25519 + ML-KEM-768 forward-secret ratchet, replacing TS6.
+- **Post-quantum mesh** — a CRDT state mesh with durable exact-once message delivery over an X25519 + ML-KEM-768 forward-secret ratchet, replacing TS6.
 - **Full IRCv3 + IRCX + SASL** — including CHATHISTORY, the Event Spine, and in-process channel/nick services (no pseudo-clients).
 - **Passwordless + interop-friendly** — WebAuthn/passkey login (with attestation verification), named conversations (topics) inside a channel, and Discord-compatible plus Block-Kit-lite incoming webhooks.
 - **Browser-native** — a first-class WebSocket listener and a voice/video media plane.
@@ -74,7 +74,10 @@ verify it yourself (`packaging/verify-release.sh`).
   forward-secret ratchet. No TS6. Operator surfaces are network-wide: the Event Spine
   (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every event to
   all nodes rendered with the origin server, and a cross-node `MODE` shows the setter's
-  nick, not the server.
+  nick, not the server. Message delivery across the mesh is **durable exact-once** —
+  per-origin ordered replay, a per-hop retransmit-until-ACK outbox, and a signed
+  replay/equivocation guard — with custody preserved across a session-preserving
+  `USR2` hot-upgrade.
 - **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
   compile error; TLS is **1.3 plus a hardened 1.2 profile** (AEAD/ECDHE-only; no RSA key
   exchange, CBC, compression, or renegotiation) with **Extended Master Secret (RFC 7627)

@@ -33,6 +33,24 @@ portable bit, detached snapshots, and staged signed replicas. Once preserved sec
 links are adopted, the successor re-offers portable state to rebuild the
 process-local token-to-authenticated-peer authorization bindings.
 
+Helix carry also includes the **converged mesh view**, so an upgrade no longer
+replays remote membership to local clients. Each secured link's converged
+remote-member roster rides the `.s2s_link` capsule's v4 roster block; the
+successor primes it before the post-upgrade RESYNC re-burst, which then dedups
+instead of re-announcing every surviving remote member as a spurious `JOIN`
+(`src/daemon/helix/s2s_snapshot.zig:12`, `src/daemon/secured_s2s_link.zig:225`).
+The server-wide cross-mesh oper-grant registry (magic `OGNT`) rides the
+`.mesh_checkpoint` capsule family and is primed at the adoption commit edge, so a
+peer's post-RESYNC grant re-mint sees the converged `had_oper_override` state and
+never re-broadcasts a false `MODE #chan +Y <nick>`; the resume log reports
+`primed N carried oper grant(s)` (`src/daemon/helix/oper_grant_snapshot.zig:4`,
+`src/daemon/server.zig:25619`). Topic re-bursts are diffed against the carried
+World topic, and an unchanged re-affirmation is neither applied nor emitted, so an
+upgrade also stops surfacing a spurious `TOPIC` line
+(`src/daemon/server.zig:15798`). A predecessor sealed before these carries simply
+lacks the pieces and adopts with an empty roster/registry — the earlier behavior,
+not an error.
+
 The Helix live path passes inherited fds through environment variables. A single-shard or legacy handoff uses `OROCHI_HELIX_LISTEN_FD`; a multi-shard predecessor additionally passes the full shard-ordered set in `OROCHI_HELIX_LISTEN_FDS`. The sealed arena uses `OROCHI_HELIX_ARENA_FD` (`src/daemon/helix/live.zig:119`, `src/daemon/helix/live.zig:135`, `src/daemon/helix/live.zig:276`).
 
 Current handoff also requires exactly one MHLC v3 mesh-clock capsule. Besides
@@ -48,6 +66,19 @@ image whose token predates `mesh-clock-v3` requires a planned cold restart.
 After activation, a successor must keep the exact active epoch/digest and mode;
 hot downgrade and plan replacement are rejected. Cold boot cannot recover the
 previous active tuple from Helix, so the deployment system must preserve it.
+
+## Custody-plane durability
+
+The carried roster/oper-grant registries above and the durable MESSAGE_V2 custody
+authorities — the accepted-event log (`RVL2`), per-hop outbox (`RVO2`), replay
+guard (`RVG2`), and rendered-record spool (`ADS1`) — are **in-memory checkpoints
+sealed only into the Helix upgrade capsule at re-exec**. They survive a `SIGUSR2`
+hot-upgrade (`systemctl reload orochi`), but there is no disk write-ahead log
+behind this plane: a power loss or systemd **cold** restart (`systemctl restart`)
+drops any in-flight custody obligation together with the carried roster and grant
+registries. Cold-restart a node only from a drained boundary with no un-ACKed
+custody obligations outstanding. See the [MESSAGE_V2 exact-once
+design](../design/message-v2-exact-once.md) for the full durability contract.
 
 ## Fail-closed boundary
 

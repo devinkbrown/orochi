@@ -73,7 +73,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## UPGRADE
 
 - Syntax: `UPGRADE`
-- Description: Helix hot in-place upgrade. The handler serializes the complete mandatory state into a sealed memfd arena, opens and probes the configured executable path's exact capability token (falling back to `/proc/self/exe` only when no path was recorded), and re-execs that pinned image with `--supervisor` while preserving listeners, clients, and mesh state. Incomplete state, sealing, capability, or adoption validation refuses the UPGRADE; the current path does not intentionally fall back to listener-only or partial adoption. It is Linux-only.
+- Description: Helix hot in-place upgrade. The handler serializes the complete mandatory state into a sealed memfd arena, opens and probes the configured executable path's exact capability token (falling back to `/proc/self/exe` only when no path was recorded), and re-execs that pinned image with `--supervisor` while preserving listeners, clients, and the converged mesh view (each link's remote-member roster and the cross-mesh oper-grant registry, so reconverge raises no spurious remote `JOIN`/`+Y`/`TOPIC`). Incomplete state, sealing, capability, or adoption validation refuses the UPGRADE; the current path does not intentionally fall back to listener-only or partial adoption. It is Linux-only.
 - Privileges: Registered command with oper check inside handler; non-opers receive `ERR_NOPRIVILEGES 481`.
 - Parameters: None.
 - Replies: Server notices such as sealed-session count or fail-closed refusal messages.

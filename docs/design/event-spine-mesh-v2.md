@@ -1,7 +1,12 @@
 # Event Spine full-mesh v2 wiring contract
 
-Status: protocol, replay substrate, and negotiated secured S2S transport
-implemented; live daemon delivery/flood wiring pending.
+Status: shipped end-to-end. The protocol, the ESG2 replay substrate, the
+negotiated secured S2S transport, and the live daemon publish/mesh/drain wiring
+(`deliverOperEventV2Local`, `meshBroadcastAuthoredOperEventV2`,
+`drainOperEventsV2`, `forwardOperEventV2`) are all implemented, and the ESG2
+checkpoint rides the Helix hot-upgrade capsule. Evidence:
+`src/daemon/server.zig:41782`, `src/daemon/server.zig:41980`,
+`src/daemon/server.zig:42068`, `src/daemon/server.zig:42091`.
 
 The v1 `OPER_EVENT` payload is a direct-peer compatibility format. It carries no
 stable identity or end-to-end proof, so an inbound v1 event may be delivered
@@ -108,12 +113,19 @@ reflections, but only the global durable guard authorizes delivery.
 
 `event_spine_replay_guard.Guard.encodeCheckpoint` produces a canonical,
 checksummed `ESG2` checkpoint whose inner greatest-W state permanently retires
-evicted HLCs. Store it in a dedicated Helix capsule, distinct from MESSAGE_V2
-replay state.
+evicted HLCs. It rides the shared, magic-discriminated `.mesh_checkpoint` Helix
+capsule family at `min_supported = 2` — distinct in magic from the RVG2
+MESSAGE_V2 replay authority carried in the same family, so a predecessor never
+lets a v1 successor ignore it and replay retired events
+(`src/daemon/server.zig:22932`).
 
 - Restore the guard before accepting OPER_EVENT v2 traffic.
 - Replace from a checkpoint transactionally through `replaceFromCheckpoint`.
-- Include the latest checkpoint in hot-upgrade capture/adoption.
+- Hot-upgrade capture and adoption are shipped: the predecessor seals the ESG2
+  checkpoint under the replay lock at UPGRADE (`src/daemon/server.zig:22921`),
+  and the successor validates, decodes, and swaps it into the live guard as
+  mandatory state before serving v2 traffic (`src/daemon/server.zig:24315`,
+  `src/daemon/server.zig:24432`, `src/daemon/server.zig:25554`).
 - Persist after accepted admissions according to the daemon durability policy;
   a restart from an older checkpoint widens the replay window and is therefore
   not an exact-once boundary.

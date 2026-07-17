@@ -43,25 +43,45 @@ Do not call `relayId` again after admission.
 
 ## Transactional guard and Lotus publication
 
-Serialize this lane under one daemon-owned replay/history mutation lock.
+Serialize this lane under one daemon-owned replay/history mutation lock
+(`relay_v2_replay_mu`). The shipped entry point is
+`admitRelayV2Detailed(msg, history, outbox, delivery)`
+(`src/daemon/server.zig:10443`); its `.accepted` is the only outcome that
+authorizes live delivery, SearchIndex projection, or exact-wire re-forwarding.
+Up to five authorities join one no-fail cut — the RVG2 replay guard, the Lotus
+history store, the RVL2 accepted-event log, the RVO2 per-hop outbox, and the
+ADS1 attachment delivery spool — and `outbox`/`delivery` are omitted only on the
+inbound history-only path.
 
 1. Decode the retained canonical wire and prevalidate every daemon-owned bound
    and policy input: scope, target/history key, command, sender prefix, client
    tags, text, timestamp conversion, and the final RelayId-to-msgid encoding.
    A value this build cannot preserve exactly is rejected before any authority
    moves.
-2. Stage a complete replay-guard candidate from the live RVG2 checkpoint and a
-   complete Lotus candidate from the live Lotus checkpoint. No live object has
-   changed yet.
-3. Call `guard_candidate.admitMessage(msg)` exactly once.
-4. On `accepted => relay_id`, build `lotus.ExactInputMessage` using the exact
-   accepted id and signed message fields, then call
-   `lotus_candidate.ingestExactOnce(history_target, input)`.
-5. Only the pair `accepted` plus Lotus `.inserted` may publish. While still
-   holding the mutation lock, swap both candidates into the live guard and
-   Lotus store as one unobservable critical section. All reservations and
-   fallible work must finish before the first swap.
-6. After that publication, update SearchIndex/metrics and perform local delivery
+2. Stage a complete RVG2 replay-guard candidate from the live checkpoint and
+   call `candidate.admitMessage(msg)` exactly once; only `accepted => relay_id`
+   proceeds (`src/daemon/server.zig:10457`, `src/daemon/server.zig:10466`). No
+   live object has changed yet.
+3. When an outbox reservation is present, require the configured direct-neighbor
+   membership (at least this node plus one neighbor) and stage a fully-allocated
+   RVL2 `prepareAccepted` plan over the live accepted-event log; it must report
+   `.inserted` (`src/daemon/server.zig:10481`, `src/daemon/server.zig:10482`,
+   `src/daemon/server.zig:10496`).
+4. When a history row is present, build the Lotus candidate from the live
+   history checkpoint and call `ingestExactOnce` with the exact accepted id and
+   signed fields; it must report `.inserted` (`src/daemon/server.zig:10507`,
+   `src/daemon/server.zig:10513`).
+5. Reserve every immediate-hop retransmission before any authority becomes live:
+   `relay_v2_outbox.putBatchExcluding` is itself failure-atomic and is the last
+   fallible step, copying the exact wire once per eligible neighbor and
+   excluding the ingress hop (`src/daemon/server.zig:10534`).
+6. No fallible work remains. Commit the prepared ADS1 delivery batch to publish
+   the exact per-attachment rendered records, then swap the Lotus and RVG2
+   candidates into their live stores and commit the RVL2 plan — every step here
+   is allocation-free and cannot fail (`src/daemon/server.zig:10550`,
+   `src/daemon/server.zig:10552`, `src/daemon/server.zig:10555`,
+   `src/daemon/server.zig:10560`).
+7. After that publication, update SearchIndex/metrics and perform local delivery
    and exact-wire mesh forwarding. Projection failure may be audited and
    repaired, but it must not roll back or duplicate the accepted authorities.
 
@@ -69,15 +89,74 @@ Every other combination is side-effect-free:
 
 - replay `duplicate`/`retired`: no Lotus, delivery, search, stats, or forwarding;
 - replay `equivocation` or proof/semantic/capacity rejection: audit and drop;
-- replay `accepted` with Lotus `.exact_duplicate` or `.equivocation`: the staged
-  authorities disagree, so publish neither candidate, audit the invariant
-  failure, and request repair;
-- OOM anywhere before both swaps: deinitialize candidates and leave both live
-  checkpoints byte-identical.
+- an RVL2 `.conflict`, an out-of-capacity reservation, or replay `accepted` with
+  Lotus `.exact_duplicate`/`.equivocation`: the staged authorities disagree, so
+  publish no candidate, audit the invariant failure, and request repair;
+- OOM anywhere before the first swap: deinitialize every candidate and leave all
+  live checkpoints byte-identical.
 
 A locally authored v2 message uses the same path before its first local delivery
 or peer send. Encode the accepted signed object once and give every eligible
 secured link that same canonical wire image.
+
+## Direct-neighbor custody graph
+
+Durable custody is scoped to the node's own direct neighbors, and three distinct
+`[mesh]` root sets must not be conflated:
+
+- `trust_roots` is the exact direct-neighbor set — the peer node identities this
+  node pins for secured S2S — and is deliberately not a broad transitive trust
+  list (`src/daemon/server.zig:3362`, `src/daemon/server.zig:3367`).
+- `admission_roots` are the MeshPass token *signer* roots, a separate authority
+  from peer node-identity pins (`src/daemon/server.zig:2020`).
+- `relay_v2_roster` is the full secured-mesh node-key inventory used for
+  activation; unlike `trust_roots` it is not limited to direct neighbors
+  (`src/daemon/server.zig:2033`).
+
+The RVL2 required-node set is derived once at init as this node plus the short
+ids of every `trust_roots` neighbor, sorted and de-duplicated; a set that
+contains the local node, a duplicate, or a short-id collision disables durable
+membership rather than shipping a wrong custody graph
+(`src/daemon/server.zig:3365`, `src/daemon/server.zig:4155`). A row in the
+accepted-event log retires — dropping its retained wire — only once every
+required node has durably confirmed it
+(`src/daemon/relay_v2_event_log.zig:16`); until then the RVO2 outbox retains the
+exact origin-signed wire per neighbor "until that peer authenticates an ACK"
+(`src/daemon/relay_v2_outbox.zig:4`).
+
+Custody advances only on an authenticated direct neighbor's ACK.
+`relayV2DirectNeighbor` gates every custody transition on membership in the
+required-node set (`src/daemon/server.zig:10681`). An inbound ACK records that
+neighbor in the RVL2 confirmed set and retires its RVO2 obligation
+(`commitRelayV2NeighborAck`, `src/daemon/server.zig:10870`); the receiver
+retransmits its own ACK until the origin returns an ACK_CONFIRM
+(`commitRelayV2IngressAckConfirm`, `src/daemon/server.zig:10895`), so a lost ACK
+cannot age a custody proof out behind unrelated traffic. A duplicate inbound
+edge in a cycle re-reserves that neighbor's receipt transactionally before
+re-ACKing (`retainRelayV2DuplicateIngress`, `src/daemon/server.zig:10592`).
+
+## Unified egress scheduler
+
+Every MESSAGE_V2 egress — the just-accepted live case and all retransmission —
+flows through one per-origin ordered scheduler; `forwardAcceptedRelayV2` does no
+direct forwarding of its own and instead wakes reactor 0, which owns the S2S
+links (`src/daemon/server.zig:10791`). Direct forwarding would let a newer
+same-origin event overtake a still-retained older one and let RVG2 retire the
+older event at the receiver.
+
+`collectRelayV2RetryWork` round-robins a durable per-target cursor over the
+required neighbors and asks the accepted-event log for one page per neighbor
+(`src/daemon/server.zig:11054`, `src/daemon/server.zig:11065`,
+`src/daemon/server.zig:11077`). `collectPageForNode` exposes at most the lowest
+missing HLC per origin for that target — "a higher event can never overtake a
+lower unconfirmed event and be retired by RVG2's greatest-W watermark" — and the
+fairness cursor rotates *between* origins but never advances *within* one
+(`src/daemon/relay_v2_event_log.zig:642`). The result is a strict per-origin
+FIFO: no newer-before-older same-origin frame ever reaches a neighbor, even
+across a backlog larger than the RVG2 per-origin window (a live-egress case the
+tests pin explicitly, `src/daemon/server.zig:50701`). `retryRelayV2Outbox`
+drains that work under a bounded per-pass frame/byte budget and applies the same
+bounded, fair shape to outstanding ACK receipts (`src/daemon/server.zig:11090`).
 
 ## Mesh-wide authoring barrier
 

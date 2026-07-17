@@ -229,6 +229,19 @@ Operators with `mesh_admin` privilege can inspect and manage the mesh:
 | `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
 | `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
 
+### Upgrade and mesh convergence
+
+A [Helix](../reference/glossary.md) in-place upgrade (`UPGRADE`) now carries the
+converged mesh view — each link's remote-member roster and the server-wide
+cross-mesh oper-grant registry — so reconverging after an upgrade no longer churns
+local clients with spurious remote `JOIN`, `+Y`, or `TOPIC` lines; earlier builds
+re-announced them on every upgrade. The resume log reports `primed N carried oper
+grant(s)` (`src/daemon/server.zig:25619`). This custody state is preserved across
+a hot-upgrade **only**: it rides the in-memory Helix capsule, not a disk WAL, so a
+cold restart (`systemctl restart`) or power loss drops it — hard-restart a node
+only from a drained boundary. See [Helix upgrade](upgrade.md#custody-plane-durability)
+and the [mesh guide](mesh.md#message_v2-bridge-and-activation).
+
 ## Network-wide operator events
 
 Operator-facing events are delivered over the **Event Spine**: an event raised on

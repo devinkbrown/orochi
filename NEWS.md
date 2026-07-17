@@ -10,6 +10,88 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.5.5 (2026-07-18)
+
+Two more Helix-upgrade re-announce artifacts fixed after a full audit of every
+RESYNC re-burst surface.
+
+- **The oper `*` (`+Y`) prefix no longer re-announces on a hot-upgrade.** The
+  server-wide `oper_grants` registry was not carried across USR2, so the
+  post-upgrade opers re-mint saw an empty registry (`had_oper_override = false`)
+  → a false transition → `MODE #chan +Y <nick>` on every upgrade (and every ~30 s
+  cadence re-mint). The registry — grants, zero-privilege revocation tombstones,
+  and the mint-incarnation high-water mark — now rides a new `OGNT`
+  `mesh_checkpoint` inner piece, so the re-mint sees the oper already granted and
+  emits nothing; a genuine grant still emits `+Y` once and a revoke `-Y` once, and
+  a stale re-mint loses to the carried tombstone.
+  (`src/daemon/helix/oper_grant_snapshot.zig`, `src/daemon/server.zig`)
+- **A spurious `TOPIC` re-announce is deduped.** `sendTopicBurstTo` stamps a fresh
+  HLC per burst, so route-table LWW always returned `.changed` and the receiver
+  re-applied and re-emitted an *unchanged* topic (`:setter TOPIC #chan :<same>`) on
+  every upgrade — and every cadence tick for any topic'd shared channel. The emit
+  is now deduped against the carried World topic (text + setter + set-time
+  equality); a genuine change (including a re-SET of identical text with a new
+  set-time) still applies and emits, and the `+t` defense is untouched.
+  (`src/daemon/server.zig`)
+- **Every other re-burst surface audited and confirmed already safe** —
+  membership/NICK/member-modes, channel mode flags and state, `+b`/`+e`/`+I`/`+q`
+  lists, channel and entity PROPs, oper events, wards, clones, and session replicas
+  already ride the World/roster/mandatory capsules and dedup. `OGNT` is
+  at-most-once (not required-exactly-once), so the first upgrade *from* a
+  pre-checkpoint 0.5.4 predecessor still adopts with an empty registry (= pre-fix
+  behavior); a downgrade to an old binary hits the unknown discriminator at
+  `min_supported = 2` and refuses the whole handoff rather than mis-decoding.
+
+## 0.5.4 (2026-07-17)
+
+Helix hot-upgrade no longer spuriously re-announces a remote member's JOIN.
+
+- **A USR2 hot-upgrade stops emitting a spurious remote-member `JOIN`.** The peer
+  link's converged remote-member roster was dropped and refilled by the
+  post-upgrade RESYNC; with an empty successor route table the re-burst made every
+  re-learned remote member return `.joined` from `applyMembership`, so local
+  clients whose view was preserved saw a fresh `:nick JOIN #chan` on every upgrade
+  ("trev has joined #root" every deploy) — cosmetic but wrong. The converged roster
+  is now carried in the `.s2s_link` capsule (schema v4) and primed into the route
+  table *before* the RESYNC, so the re-burst dedups (`applyMembership →
+  .unchanged`) for members whose view was preserved; NAMES for remote members is
+  also correct immediately after adoption instead of empty until the re-burst
+  lands. A genuine re-burst (newer HLC) still wins LWW and a `PART` still removes
+  the row. Backward compatible: a pre-v4 capsule decodes to an empty roster
+  (RESYNC-only, the old behavior), while a downgrade to a v3-max binary is refused
+  fatally rather than mis-decoded. (`src/daemon/helix/s2s_snapshot.zig`,
+  `src/daemon/server.zig`)
+
+## 0.5.3 (2026-07-17)
+
+Cross-mesh oper-prefix (`+Y`) churn fix, shipped alongside the now-live durable
+exact-once mesh delivery plane.
+
+- **A steady logged-in oper no longer re-broadcasts `+Y` every cadence tick.** A
+  live opered session's cross-mesh grant is re-minted on a ~30 s cadence (well
+  inside its TTL) so it never lapses on a peer; each re-mint reached the receiving
+  node's `applyMeshGrant` as a superseded upsert with identical privileges and
+  *unconditionally* re-announced the derived `*` (`+Y`) prefix to every shared
+  channel — spamming `MODE #chan +Y <nick>` every tick. The announce is now gated
+  on a genuine oper-override transition (captured from `oper_grants.lookup` before
+  the upsert): `+Y` is pushed only when the account newly gains override and
+  cleared only when it actually had it. NAMES/WHO still render the derived `*` for
+  fresh joiners, and the grant-after-join / grant-expired-during-split relink cases
+  still transition. (`src/daemon/server.zig`)
+- **Durable MESSAGE_V2 exact-once mesh delivery is now active on the mesh.** The
+  reusable-session mesh rewrite that landed in this window activates exact-once
+  message relay across the secured Suimyaku mesh: RVL2 per-origin ordered replay
+  with per-target cursors, an RVO2 per-hop retransmit-until-ACK outbox, an ADS1
+  per-attachment delivery spool, a direct-neighbor custody graph pinned by
+  `[mesh].trust_roots`, and a `relay_v2` activation state machine (`compat`/`active`
+  mode gated by a staged non-zero epoch + canonical public-key roster). Custody is
+  **retransmit-until-ACK durable across a Helix (USR2) upgrade — not crash-durable**:
+  a hard `systemctl restart` is safe only from a drained boundary (no un-ACKed
+  RVO2 rows, no unretired RVL2 wire); `systemctl reload` (USR2) preserves custody.
+  (`docs/design/message-v2-exact-once.md`, `src/daemon/relay_v2_event_log.zig`,
+  `relay_v2_outbox.zig`, `relay_v2_replay_guard.zig`, `relay_v2_activation.zig`,
+  `src/daemon/attachment_delivery_spool.zig`)
+
 ## 0.5.2 (2026-07-13)
 
 Multi-shard zero-drop hot-upgrades.
