@@ -45,6 +45,8 @@ pub const json_scratch: usize = 256 * 1024;
 pub const default_listen_backlog: u31 = 16;
 pub const default_accept_poll_ms: u32 = 250;
 pub const default_conn_read_timeout_sec: u32 = 5;
+const accept_retry_initial_ms: u32 = 1;
+const accept_retry_max_ms: u32 = 64;
 
 /// Loopback `127.0.0.1` in host byte order (the secure default bind).
 pub const loopback_addr: u32 = 0x7f00_0001;
@@ -54,6 +56,7 @@ pub const ListenerError = error{
     BindFailed,
     ListenFailed,
     AddrLookupFailed,
+    TimeoutSetupFailed,
 };
 
 /// Handler tunables (validation limits + rate policy).
@@ -204,6 +207,11 @@ pub const WebhookServer = struct {
     handler: HandlerConfig,
     listen_fd: linux.fd_t,
     port: u16,
+    /// Serializes the control-plane lifecycle. The accept thread never takes
+    /// this mutex; it observes only stop_flag and the listener fd, whose final
+    /// invalidation happens after join. Concurrent pause/resume/shutdown callers
+    /// therefore linearize without two of them spawning or joining one handle.
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
     conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
@@ -231,11 +239,12 @@ pub const WebhookServer = struct {
         if (posix.errno(linux.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
 
-        const tv = linux.timeval{
-            .sec = @intCast(config.accept_poll_ms / 1000),
-            .usec = @intCast((config.accept_poll_ms % 1000) * 1000),
-        };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        // A finite accept timeout is also the pause barrier's wake-up clock.
+        // Clamp a configured zero to one millisecond: on Linux a zero timeval
+        // disables SO_RCVTIMEO and could otherwise make pause() wait forever on
+        // an idle listener.
+        const accept_poll_ms = @max(config.accept_poll_ms, 1);
+        if (!installReceiveTimeoutMs(fd, accept_poll_ms)) return error.TimeoutSetupFailed;
 
         return .{
             .store = store,
@@ -243,38 +252,106 @@ pub const WebhookServer = struct {
             .handler = config.handler,
             .listen_fd = fd,
             .port = try boundPort(fd),
-            .conn_read_timeout_sec = config.conn_read_timeout_sec,
+            // A zero timeval disables SO_RCVTIMEO. The listener lifecycle needs
+            // every accepted request to remain join-bounded, so retain at least
+            // a one-second read timeout even for a zero-valued config.
+            .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
         };
     }
 
-    pub fn spawn(self: *WebhookServer) std.Thread.SpawnError!void {
-        self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    pub const ResumeError = std.Thread.SpawnError || error{ListenerClosed};
+
+    /// Start the listener thread for the first time. Kept as the boot-facing
+    /// name; lifecycle restarts use resumeServing() to make the retained-FD contract
+    /// explicit.
+    pub fn spawn(self: *WebhookServer) ResumeError!void {
+        try self.resumeServing();
     }
 
-    pub fn shutdown(self: *WebhookServer) void {
+    /// Stop accepting and wait for any already-accepted request to finish, but
+    /// retain the bound listener fd. Once this returns no HTTP thread can call
+    /// the sink until resumeServing(), making it an exact producer barrier for Helix.
+    /// TCP handshakes may remain queued in the kernel backlog while paused; no
+    /// request from them is parsed or acknowledged until the thread resumes.
+    pub fn pause(self: *WebhookServer) void {
+        lockLifecycle(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
         self.stop_flag.store(true, .release);
-        closeFd(self.listen_fd); // unblocks a blocking accept4 with EBADF
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
     }
 
+    /// Resume a paused listener on the same fd and therefore the same bound
+    /// address/port. Repeated resume calls while already running are harmless.
+    pub fn resumeServing(self: *WebhookServer) ResumeError!void {
+        lockLifecycle(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null) return;
+        if (self.listen_fd < 0) return error.ListenerClosed;
+        self.stop_flag.store(false, .release);
+        self.thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
+            // Preserve the paused invariant when a thread cannot be created so
+            // the caller may retry resumeServing() without reopening the listener.
+            self.stop_flag.store(true, .release);
+            return err;
+        };
+    }
+
+    /// Final, idempotent teardown. Unlike pause(), this releases the port and
+    /// permanently prevents resumeServing(). Closing first wakes a blocking accept;
+    /// listen_fd is invalidated only after the worker has joined, avoiding a
+    /// non-atomic field race with acceptLoop.
+    pub fn shutdown(self: *WebhookServer) void {
+        lockLifecycle(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.stop_flag.store(true, .release);
+        if (self.listen_fd >= 0) closeFd(self.listen_fd);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        self.listen_fd = -1;
+    }
+
     fn acceptLoop(self: *WebhookServer) void {
+        var retry_ms: u32 = accept_retry_initial_ms;
         while (!self.stop_flag.load(.acquire)) {
             const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
-            switch (posix.errno(rc)) {
-                .SUCCESS => self.serveConn(@intCast(rc)),
+            const err = posix.errno(rc);
+            switch (err) {
+                .SUCCESS => {
+                    retry_ms = accept_retry_initial_ms;
+                    self.serveConn(@intCast(rc));
+                },
                 .AGAIN, .INTR, .CONNABORTED => continue,
-                else => return,
+                else => if (isTransientAcceptResourceError(err)) {
+                    self.waitAcceptRetry(retry_ms);
+                    retry_ms = nextAcceptRetryMs(retry_ms);
+                    continue;
+                } else return,
             }
+        }
+    }
+
+    /// Resource exhaustion is process-wide and usually transient. Keep the
+    /// endpoint alive without a hot spin, but poll the lifecycle stop latch each
+    /// millisecond so pause()/shutdown() remain promptly joinable.
+    fn waitAcceptRetry(self: *WebhookServer, delay_ms: u32) void {
+        var elapsed: u32 = 0;
+        while (elapsed < delay_ms and !self.stop_flag.load(.acquire)) : (elapsed += 1) {
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
         }
     }
 
     fn serveConn(self: *WebhookServer, fd: linux.fd_t) void {
         defer closeFd(fd);
-        const tv = linux.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        // Never enter the blocking request reader without a verified finite
+        // timeout: pause() joins this thread and must not be hostage to a peer
+        // holding a partial request open.
+        if (!installReceiveTimeoutSec(fd, self.conn_read_timeout_sec)) return;
 
         // Read request headers + body (bounded). The read loop stops once the
         // full declared body is present, the buffer fills, or the socket idles.
@@ -344,6 +421,47 @@ fn readRequest(fd: linux.fd_t, buf: []u8, max_body: usize) ?usize {
 // Low-level helpers (raw linux syscalls), mirroring metrics_http.zig
 // ---------------------------------------------------------------------------
 
+fn lockLifecycle(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+fn installReceiveTimeout(fd: linux.fd_t, tv: linux.timeval) bool {
+    return posix.errno(linux.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+        @sizeOf(linux.timeval),
+    )) == .SUCCESS;
+}
+
+fn installReceiveTimeoutMs(fd: linux.fd_t, timeout_ms: u32) bool {
+    const finite_ms = @max(timeout_ms, 1);
+    return installReceiveTimeout(fd, .{
+        .sec = @intCast(finite_ms / 1000),
+        .usec = @intCast((finite_ms % 1000) * 1000),
+    });
+}
+
+fn installReceiveTimeoutSec(fd: linux.fd_t, timeout_sec: u32) bool {
+    return installReceiveTimeout(fd, .{
+        .sec = @intCast(@max(timeout_sec, 1)),
+        .usec = 0,
+    });
+}
+
+fn isTransientAcceptResourceError(err: posix.E) bool {
+    return switch (err) {
+        .MFILE, .NFILE, .NOBUFS, .NOMEM => true,
+        else => false,
+    };
+}
+
+fn nextAcceptRetryMs(current_ms: u32) u32 {
+    if (current_ms >= accept_retry_max_ms) return accept_retry_max_ms;
+    return @min(current_ms * 2, accept_retry_max_ms);
+}
+
 fn socketTcp() ListenerError!linux.fd_t {
     const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
@@ -397,6 +515,43 @@ const RecordingSink = struct {
     }
 };
 
+/// Thread-safe sink for listener lifecycle tests. Counting, rather than
+/// retaining a borrowed post, lets the test prove a queued connection is
+/// handled exactly once across a pause/resume boundary without a data race.
+const CountingSink = struct {
+    count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn submit(ctx: *anyopaque, post: *const webhook.PendingPost) bool {
+        _ = post;
+        const self: *CountingSink = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .acq_rel);
+        return true;
+    }
+
+    fn sink(self: *CountingSink) webhook.PostSink {
+        return .{ .ctx = self, .submit = submit };
+    }
+};
+
+const LifecycleRaceAction = enum { pause, resume_serving };
+
+const LifecycleRaceCtx = struct {
+    server: *WebhookServer,
+    action: LifecycleRaceAction,
+    ready: *std.atomic.Value(u32),
+    go: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+
+    fn run(self: *LifecycleRaceCtx) void {
+        _ = self.ready.fetchAdd(1, .acq_rel);
+        while (!self.go.load(.acquire)) std.Thread.yield() catch {};
+        switch (self.action) {
+            .pause => self.server.pause(),
+            .resume_serving => self.server.resumeServing() catch self.failed.store(true, .release),
+        }
+    }
+};
+
 fn seed(store: *webhook.WebhookStore) webhook.Credentials {
     const idm: [webhook.id_bytes]u8 = @splat(0xAB);
     const tkm: [webhook.token_bytes]u8 = @splat(0xCD);
@@ -419,6 +574,38 @@ fn buildRequestNoLen(buf: []u8, id: []const u8, token: []const u8, body: []const
         "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\r\n{s}",
         .{ id, token, body },
     ) catch unreachable;
+}
+
+fn connectLoopback(port: u16) !linux.fd_t {
+    const fd = try socketTcp();
+    errdefer closeFd(fd);
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, loopback_addr),
+    };
+    if (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.ConnectFailed;
+    // Bound a broken lifecycle test rather than leaving the test runner blocked
+    // forever waiting for a listener thread that did not resume.
+    const tv = linux.timeval{ .sec = 2, .usec = 0 };
+    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    return fd;
+}
+
+fn expectNoContent(fd: linux.fd_t) !void {
+    var buf: [512]u8 = undefined;
+    const rc = linux.read(fd, &buf, buf.len);
+    if (posix.errno(rc) != .SUCCESS) return error.ResponseReadFailed;
+    const got = buf[0..@intCast(rc)];
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 204 No Content\r\n"));
+}
+
+fn testSleepMs(ms: u64) void {
+    var req = linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&req, null);
 }
 
 test "handleRequest returns 204 and enqueues a post on a valid request" {
@@ -589,6 +776,49 @@ test "contentLength parses case-insensitively" {
     try testing.expectEqual(@as(?usize, null), contentLength("Host: x"));
 }
 
+test "WebhookServer installs finite lifecycle timeouts even when configured zero" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var store = webhook.WebhookStore.init();
+    var rec = RecordingSink{};
+    var server = WebhookServer.init(&store, rec.sink(), 0, .{
+        .accept_poll_ms = 0,
+        .conn_read_timeout_sec = 0,
+    }) catch return error.SkipZigTest;
+    defer server.shutdown();
+
+    try testing.expectEqual(@as(u32, 1), server.conn_read_timeout_sec);
+    var tv: linux.timeval = undefined;
+    var tv_len: posix.socklen_t = @sizeOf(linux.timeval);
+    const rc = linux.getsockopt(
+        server.listen_fd,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        @ptrCast(&tv),
+        &tv_len,
+    );
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
+    try testing.expect(tv.sec != 0 or tv.usec != 0);
+    try testing.expect(!installReceiveTimeoutSec(-1, 1));
+}
+
+test "WebhookServer transient accept errors use bounded exponential backoff" {
+    try testing.expect(isTransientAcceptResourceError(.MFILE));
+    try testing.expect(isTransientAcceptResourceError(.NFILE));
+    try testing.expect(isTransientAcceptResourceError(.NOBUFS));
+    try testing.expect(isTransientAcceptResourceError(.NOMEM));
+    try testing.expect(!isTransientAcceptResourceError(.BADF));
+
+    var delay = accept_retry_initial_ms;
+    try testing.expectEqual(@as(u32, 1), delay);
+    delay = nextAcceptRetryMs(delay);
+    try testing.expectEqual(@as(u32, 2), delay);
+    delay = nextAcceptRetryMs(delay);
+    try testing.expectEqual(@as(u32, 4), delay);
+    while (delay < accept_retry_max_ms) delay = nextAcceptRetryMs(delay);
+    try testing.expectEqual(accept_retry_max_ms, delay);
+    try testing.expectEqual(accept_retry_max_ms, nextAcceptRetryMs(delay));
+}
+
 test "WebhookServer serves a POST over loopback and enqueues a post" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
@@ -622,6 +852,132 @@ test "WebhookServer serves a POST over loopback and enqueues a post" {
     while (rec.got == null and tries < 1000) : (tries += 1) std.Thread.yield() catch {};
     try testing.expect(rec.got != null);
     try testing.expectEqualStrings("loop", rec.got.?.body());
+}
+
+test "WebhookServer pause and resume retain the port and handle each POST once" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var counted = CountingSink{};
+
+    var server = WebhookServer.init(&store, counted.sink(), 0, .{
+        .accept_poll_ms = 10,
+        .conn_read_timeout_sec = 1,
+    }) catch return error.SkipZigTest;
+    try server.spawn();
+    defer server.shutdown();
+
+    const original_fd = server.listen_fd;
+    const original_port = server.port;
+
+    // Establish one ordinary delivery before the first lifecycle boundary.
+    var reqbuf: [512]u8 = undefined;
+    const first = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"first\"}");
+    const first_fd = try connectLoopback(original_port);
+    writeAll(first_fd, first);
+    try expectNoContent(first_fd);
+    closeFd(first_fd);
+    try testing.expectEqual(@as(u32, 1), counted.count.load(.acquire));
+
+    // pause() joins the only producer thread but retains the exact listening
+    // socket. A request may complete its TCP handshake into the kernel backlog,
+    // yet it cannot reach the sink while the listener is paused.
+    server.pause();
+    try testing.expect(server.thread == null);
+    try testing.expectEqual(original_fd, server.listen_fd);
+    try testing.expectEqual(original_port, server.port);
+    try testing.expectEqual(original_port, try boundPort(server.listen_fd));
+
+    const queued_fd = try connectLoopback(original_port);
+    const queued = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"queued\"}");
+    writeAll(queued_fd, queued);
+    try testing.expectEqual(@as(u32, 1), counted.count.load(.acquire));
+
+    try server.resumeServing();
+    try testing.expect(server.thread != null);
+    try testing.expectEqual(original_fd, server.listen_fd);
+    try testing.expectEqual(original_port, server.port);
+    try expectNoContent(queued_fd);
+    closeFd(queued_fd);
+    try testing.expectEqual(@as(u32, 2), counted.count.load(.acquire));
+
+    // A second complete cycle must neither replay either closed connection nor
+    // allocate a replacement listener. A fresh POST remains serviceable once.
+    server.pause();
+    try testing.expectEqual(@as(u32, 2), counted.count.load(.acquire));
+    try server.resumeServing();
+    const third_fd = try connectLoopback(original_port);
+    const third = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"third\"}");
+    writeAll(third_fd, third);
+    try expectNoContent(third_fd);
+    closeFd(third_fd);
+    try testing.expectEqual(@as(u32, 3), counted.count.load(.acquire));
+
+    // Final teardown closes once and is safe to repeat; a closed listener is
+    // deliberately not resumable.
+    server.shutdown();
+    server.shutdown();
+    try testing.expectEqual(@as(linux.fd_t, -1), server.listen_fd);
+    try testing.expectError(error.ListenerClosed, server.resumeServing());
+}
+
+test "WebhookServer concurrent pause and resume never leave a duplicate producer" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var counted = CountingSink{};
+
+    var server = WebhookServer.init(&store, counted.sink(), 0, .{
+        .accept_poll_ms = 5,
+        .conn_read_timeout_sec = 1,
+        .handler = .{ .rate = .{ .per_min = 60_000, .burst = 100 } },
+    }) catch return error.SkipZigTest;
+    try server.spawn();
+    defer server.shutdown();
+    const original_fd = server.listen_fd;
+    const original_port = server.port;
+
+    var delivered: u32 = 0;
+    for (0..32) |_| {
+        var ready = std.atomic.Value(u32).init(0);
+        var go = std.atomic.Value(bool).init(false);
+        var failed = std.atomic.Value(bool).init(false);
+        var contexts = [_]LifecycleRaceCtx{
+            .{ .server = &server, .action = .resume_serving, .ready = &ready, .go = &go, .failed = &failed },
+            .{ .server = &server, .action = .pause, .ready = &ready, .go = &go, .failed = &failed },
+            .{ .server = &server, .action = .resume_serving, .ready = &ready, .go = &go, .failed = &failed },
+        };
+        var controllers: [contexts.len]std.Thread = undefined;
+        for (&controllers, &contexts) |*thread, *ctx| {
+            thread.* = try std.Thread.spawn(.{}, LifecycleRaceCtx.run, .{ctx});
+        }
+        while (ready.load(.acquire) != contexts.len) std.Thread.yield() catch {};
+        go.store(true, .release);
+        for (controllers) |thread| thread.join();
+        try testing.expect(!failed.load(.acquire));
+
+        // Establish a final paused linearization point. If concurrent resume
+        // callers spawned two accept loops and overwrote one handle, pause would
+        // join only the recorded thread and the orphan would consume this POST.
+        server.pause();
+        try testing.expect(server.thread == null);
+        try testing.expectEqual(original_fd, server.listen_fd);
+        try testing.expectEqual(original_port, server.port);
+
+        var reqbuf: [512]u8 = undefined;
+        const req = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"race\"}");
+        const fd = try connectLoopback(original_port);
+        writeAll(fd, req);
+        testSleepMs(10);
+        try testing.expectEqual(delivered, counted.count.load(.acquire));
+
+        try server.resumeServing();
+        try expectNoContent(fd);
+        closeFd(fd);
+        delivered += 1;
+        try testing.expectEqual(delivered, counted.count.load(.acquire));
+    }
+    server.pause();
 }
 
 test "WebhookServer answers 411 promptly for a length-less POST body over loopback" {

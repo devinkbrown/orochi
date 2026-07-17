@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Deterministic-Ocean coverage for the Helix `.s2s_link` capsule adoption path
-//! at the CAPSULE-STREAM level — the exact old→new UPGRADE that the v2 bump (adding
+//! at the CAPSULE-STREAM level — the exact old→new UPGRADEs that the v2 bump (adding
 //! `admitted_frame_families` to `Established`, growing the embedded blob by 4 bytes)
-//! had to survive without a netsplit. "Upgrades are where panics live," so this
+//! and v3 bump (adding `caps_ext`, growing the blob by one byte) must survive without
+//! a netsplit. "Upgrades are where panics live," so this
 //! models the successor's `adoptInheritedSessions` loop (server.zig, Pass 0 + Pass 4)
 //! and asserts the invariant that matters: every inherited s2s socket fd is
 //! ACCOUNTED FOR — adopted onto a live link or recovered+closed on a clean drop —
@@ -36,6 +37,14 @@ const testing = std.testing;
 /// a v2 blob minus exactly those 4 bytes.
 const est_field_off: usize = @sizeOf(i32) + 1 + 1;
 
+/// Byte offset of the v3-only `caps_ext` field. Keep this written in terms of the
+/// preceding wire fields so a future layout change cannot silently make the
+/// predecessor fixtures exercise the current layout under an old header.
+const caps_ext_field_off_v2: usize = est_field_off + s2s_snapshot.est_len +
+    8 + 8 + 8 +
+    8 + 8 + 4 + 4 + 8 + 8 + 8 +
+    8 + 8 + 1;
+
 /// A synthetic-but-structurally-valid snapshot for the link on `fd`. The
 /// `established` region gets a recognizable, fd-derived pattern and a NON-ZERO
 /// trailing `admitted_frame_families` so a v1 splice/decode is observable.
@@ -61,23 +70,44 @@ fn sampleSnap(fd: i32) s2s_snapshot.Snapshot {
     return snap;
 }
 
-/// Encode a current-schema (v2) `.s2s_link` capsule, exactly as this binary seals
-/// a preserved link at UPGRADE. Caller owns the returned bytes.
+/// Encode an actual schema-v2 `.s2s_link` capsule. The current encoder writes v3,
+/// so remove the v3-only `caps_ext` byte and advertise the exact v2 range.
+/// Caller owns the returned bytes.
 fn v2Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
-    const blob = try s2s_snapshot.encode(allocator, snap);
-    defer allocator.free(blob);
-    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
-    return capsule.encode(allocator, capsule.make(.s2s_link, fields[0..]));
+    const current_blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(current_blob);
+
+    const v2_blob = try allocator.alloc(u8, current_blob.len - 1);
+    defer allocator.free(v2_blob);
+    @memcpy(v2_blob[0..caps_ext_field_off_v2], current_blob[0..caps_ext_field_off_v2]);
+    @memcpy(v2_blob[caps_ext_field_off_v2..], current_blob[caps_ext_field_off_v2 + 1 ..]);
+
+    const d = capsule.descriptor(.s2s_link);
+    const v2_header = capsule.Header{
+        .schema_id = d.schema_id,
+        .kind = .s2s_link,
+        .version = 2,
+        .min_supported = 1,
+        .max_supported = 2,
+    };
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = v2_blob }};
+    return capsule.encode(allocator, .{ .header = v2_header, .fields = fields[0..] });
 }
 
 /// Encode a v1 `.s2s_link` capsule as a PRE-BUMP binary would have sealed it: the
 /// embedded `Established` blob is 4 bytes shorter (no `admitted_frame_families`)
 /// and the capsule header advertises `version=1, min=1, max=1`. Built by encoding
 /// the v2 blob and splicing out the trailing u32, then wrapping in a hand-crafted
-/// v1 header the current binary still accepts (`min_supported = 1`).
+/// v1 header the current binary still accepts (`min_supported = 1`). Both later
+/// additions are removed: v2's trailing Established u32 and v3's `caps_ext` byte.
 fn v1Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
-    const v2_blob = try s2s_snapshot.encode(allocator, snap);
+    const current_blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(current_blob);
+
+    const v2_blob = try allocator.alloc(u8, current_blob.len - 1);
     defer allocator.free(v2_blob);
+    @memcpy(v2_blob[0..caps_ext_field_off_v2], current_blob[0..caps_ext_field_off_v2]);
+    @memcpy(v2_blob[caps_ext_field_off_v2..], current_blob[caps_ext_field_off_v2 + 1 ..]);
 
     const cut_at = est_field_off + s2s_snapshot.est_len - 4;
     var v1_blob: std.ArrayList(u8) = .empty;
@@ -99,8 +129,8 @@ fn v1Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
 }
 
 /// Encode a FORWARD-VERSIONED (too-new) `.s2s_link` capsule: a hypothetical future
-/// binary sealed it at `version=3` after growing `Established` again. The current
-/// capsule layer forward-accepts it (its `[1,2]` range overlaps `[1,3]`), so the
+/// binary sealed it at `schema_version + 1`. The current capsule layer
+/// forward-accepts it (the advertised range overlaps the local `[1,3]` range), so the
 /// blob survives the stream walk and reaches `s2s_snapshot.decode`, which then
 /// rejects the unknown version fail-closed — the fd must still be recovered.
 fn tooNewCapsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
@@ -110,9 +140,9 @@ fn tooNewCapsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const future_header = capsule.Header{
         .schema_id = d.schema_id,
         .kind = .s2s_link,
-        .version = 3,
+        .version = s2s_snapshot.schema_version + 1,
         .min_supported = 1,
-        .max_supported = 3,
+        .max_supported = s2s_snapshot.schema_version + 1,
     };
     var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
     return capsule.encode(allocator, .{ .header = future_header, .fields = fields[0..] });

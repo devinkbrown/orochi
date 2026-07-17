@@ -204,6 +204,11 @@ pub const WebhookStore = struct {
         defer self.mutex.unlock();
 
         if (self.count >= max_bindings) return error.Full;
+        const id_hex = std.fmt.bytesToHex(id_material, .lower);
+        // A public id is the lookup key, so even a vanishingly unlikely CSPRNG
+        // collision must not make an older binding ambiguous. `Full` is the
+        // existing fail-closed admission result understood by the command layer.
+        if (self.findIndex(&id_hex) != null) return error.Full;
         // Enforce the per-channel cap.
         var chan_count: usize = 0;
         for (self.bindings[0..self.count]) |*b| {
@@ -211,7 +216,6 @@ pub const WebhookStore = struct {
         }
         if (chan_count >= max_per_channel) return error.ChannelFull;
 
-        const id_hex = std.fmt.bytesToHex(id_material, .lower);
         const token_hex = std.fmt.bytesToHex(token_material, .lower);
         var token_hash: [hash_len]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&token_hex, &token_hash, .{});
@@ -354,9 +358,18 @@ pub const WebhookStore = struct {
             const name = f.next() orelse "";
             const creator = f.next() orelse "";
             const created_s = f.next() orelse "0";
-            if (id.len != id_hex_len or !isHex(id)) continue;
+            // IDs are serialized verbatim, while the exact Helix image requires
+            // their canonical lowercase representation. Reject non-canonical
+            // disk rows here instead of admitting state a successor cannot read.
+            if (id.len != id_hex_len or !isLowerHex(id)) continue;
             if (hash_hex.len != hash_hex_len or !isHex(hash_hex)) continue;
             if (channel_name.len == 0 or channel_name.len > max_channel) continue;
+            if (self.findIndex(id) != null) continue;
+            var same_channel: usize = 0;
+            for (self.bindings[0..self.count]) |*prior| {
+                if (std.mem.eql(u8, prior.channel(), channel_name)) same_channel += 1;
+            }
+            if (same_channel >= max_per_channel) continue;
 
             var b: Binding = .{};
             @memcpy(&b.id, id[0..id_hex_len]);
@@ -374,6 +387,167 @@ pub const WebhookStore = struct {
         return restored;
     }
 
+    pub const CheckpointError = std.mem.Allocator.Error || error{
+        InvalidCheckpoint,
+        ChecksumMismatch,
+        NonCanonicalOrder,
+        DuplicateBinding,
+        ChannelFull,
+        SizeOverflow,
+    };
+
+    const checkpoint_checksum_len = std.crypto.hash.Blake3.digest_length;
+    const checkpoint_checksum_domain = "orochi.webhook-store.checkpoint.v1";
+
+    /// Encode the complete in-memory binding image for a Helix exec handoff.
+    /// Unlike the human-readable TSV file, this carries the live token-bucket
+    /// state. Records are sorted by public id so identical stores produce
+    /// byte-identical checkpoints regardless of swap-remove order. Validate the
+    /// live image before allocating so an impossible state refuses the upgrade
+    /// in the predecessor rather than killing the successor after exec.
+    pub fn encodeUpgradeCheckpoint(self: *WebhookStore, allocator: std.mem.Allocator) CheckpointError![]u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+
+        try self.validateCheckpointImageLocked();
+
+        var order: [max_bindings]u16 = undefined;
+        for (0..self.count) |i| order[i] = @intCast(i);
+        const SortCtx = struct {
+            store: *WebhookStore,
+            fn lessThan(ctx: @This(), a: u16, b: u16) bool {
+                return std.mem.order(u8, &ctx.store.bindings[a].id, &ctx.store.bindings[b].id) == .lt;
+            }
+        };
+        std.mem.sort(u16, order[0..self.count], SortCtx{ .store = self }, SortCtx.lessThan);
+
+        // magic + version + count, then fixed id/hash/scalars plus three u8
+        // length-prefixed strings per binding.
+        var total: usize = 4 + 1 + 2;
+        for (order[0..self.count]) |index| {
+            const b = &self.bindings[index];
+            total = std.math.add(usize, total, id_hex_len + hash_len + 3 + 8 + 8 + 8) catch
+                return error.SizeOverflow;
+            total = std.math.add(usize, total, b.channel_len) catch return error.SizeOverflow;
+            total = std.math.add(usize, total, b.name_len) catch return error.SizeOverflow;
+            total = std.math.add(usize, total, b.creator_len) catch return error.SizeOverflow;
+        }
+
+        const prefix_len = total;
+        total = std.math.add(usize, total, checkpoint_checksum_len) catch
+            return error.SizeOverflow;
+        const out = try allocator.alloc(u8, total);
+        errdefer allocator.free(out);
+        var pos: usize = 0;
+        checkpointWriteBytes(out, &pos, "WHST");
+        checkpointWriteByte(out, &pos, 1);
+        checkpointWriteU16(out, &pos, @intCast(self.count));
+        for (order[0..self.count]) |index| {
+            const b = &self.bindings[index];
+            checkpointWriteBytes(out, &pos, &b.id);
+            checkpointWriteBytes(out, &pos, &b.token_hash);
+            checkpointWriteTiny(out, &pos, b.channel());
+            checkpointWriteTiny(out, &pos, b.name());
+            checkpointWriteTiny(out, &pos, b.creator());
+            checkpointWriteI64(out, &pos, b.created_at);
+            checkpointWriteI64(out, &pos, b.bucket_milli);
+            checkpointWriteI64(out, &pos, b.bucket_last_ms);
+        }
+        std.debug.assert(pos == prefix_len);
+        checkpointHash(out[0..prefix_len], out[prefix_len..][0..checkpoint_checksum_len]);
+        return out;
+    }
+
+    /// Decode a complete Helix binding image into an unpublished replacement.
+    /// No live store is mutated on malformed input; callers publish the returned
+    /// fixed-capacity value only after every other authoritative checkpoint has
+    /// also validated.
+    pub fn restoreUpgradeCheckpoint(bytes: []const u8) CheckpointError!WebhookStore {
+        if (bytes.len < 4 + 1 + 2 + checkpoint_checksum_len)
+            return error.InvalidCheckpoint;
+        const prefix_len = bytes.len - checkpoint_checksum_len;
+        var actual_checksum: [checkpoint_checksum_len]u8 = undefined;
+        checkpointHash(bytes[0..prefix_len], &actual_checksum);
+        if (!std.crypto.timing_safe.eql(
+            [checkpoint_checksum_len]u8,
+            actual_checksum,
+            bytes[prefix_len..][0..checkpoint_checksum_len].*,
+        )) return error.ChecksumMismatch;
+        const payload = bytes[0..prefix_len];
+        var pos: usize = 0;
+        if (!std.mem.eql(u8, try checkpointReadBytes(payload, &pos, 4), "WHST"))
+            return error.InvalidCheckpoint;
+        if (try checkpointReadByte(payload, &pos) != 1) return error.InvalidCheckpoint;
+        const count = try checkpointReadU16(payload, &pos);
+        if (count > max_bindings) return error.InvalidCheckpoint;
+
+        var restored = WebhookStore.init();
+        while (restored.count < count) : (restored.count += 1) {
+            var b: Binding = .{};
+            const id = try checkpointReadBytes(payload, &pos, id_hex_len);
+            if (!isLowerHex(id)) return error.InvalidCheckpoint;
+            @memcpy(&b.id, id);
+            @memcpy(&b.token_hash, try checkpointReadBytes(payload, &pos, hash_len));
+            const channel_name = try checkpointReadTiny(payload, &pos, max_channel);
+            const name = try checkpointReadTiny(payload, &pos, max_name);
+            const creator = try checkpointReadTiny(payload, &pos, max_creator);
+            if (channel_name.len == 0) return error.InvalidCheckpoint;
+            copyInto(&b.channel_buf, &b.channel_len, channel_name);
+            copyInto(&b.name_buf, &b.name_len, name);
+            copyInto(&b.creator_buf, &b.creator_len, creator);
+            b.created_at = try checkpointReadI64(payload, &pos);
+            b.bucket_milli = try checkpointReadI64(payload, &pos);
+            b.bucket_last_ms = try checkpointReadI64(payload, &pos);
+
+            var same_channel: usize = 0;
+            for (restored.bindings[0..restored.count]) |*prior| {
+                if (std.mem.eql(u8, &prior.id, &b.id)) return error.DuplicateBinding;
+                if (std.mem.eql(u8, prior.channel(), b.channel())) same_channel += 1;
+            }
+            if (restored.count != 0 and
+                std.mem.order(u8, &restored.bindings[restored.count - 1].id, &b.id) != .lt)
+                return error.NonCanonicalOrder;
+            if (same_channel >= max_per_channel) return error.ChannelFull;
+            restored.bindings[restored.count] = b;
+        }
+        if (pos != payload.len) return error.InvalidCheckpoint;
+        return restored;
+    }
+
+    /// Publish a fully validated Helix replacement without copying or moving
+    /// either store's mutex. Bindings are fixed-storage values, so the complete
+    /// visible transition is a no-fail copy followed by the authoritative count
+    /// update under the destination's existing lock. `replacement` remains a
+    /// valid independent value after publication.
+    pub fn publishUpgradeReplacement(self: *WebhookStore, replacement: *const WebhookStore) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (replacement.count != 0) {
+            @memcpy(
+                self.bindings[0..replacement.count],
+                replacement.bindings[0..replacement.count],
+            );
+        }
+        self.count = replacement.count;
+    }
+
+    fn validateCheckpointImageLocked(self: *WebhookStore) CheckpointError!void {
+        if (self.count > max_bindings) return error.InvalidCheckpoint;
+        for (self.bindings[0..self.count], 0..) |*binding, index| {
+            if (!isLowerHex(&binding.id) or
+                binding.channel_len == 0 or binding.channel_len > max_channel or
+                binding.name_len > max_name or binding.creator_len > max_creator)
+                return error.InvalidCheckpoint;
+
+            var same_channel: usize = 0;
+            for (self.bindings[0..index]) |*prior| {
+                if (std.mem.eql(u8, &prior.id, &binding.id)) return error.DuplicateBinding;
+                if (std.mem.eql(u8, prior.channel(), binding.channel())) same_channel += 1;
+            }
+            if (same_channel >= max_per_channel) return error.ChannelFull;
+        }
+    }
+
     /// Linear id lookup. The id is PUBLIC (it rides in the URL), so a
     /// short-circuiting scan leaks nothing secret; only the token compare must
     /// be constant time.
@@ -385,6 +559,76 @@ pub const WebhookStore = struct {
         return null;
     }
 };
+
+fn checkpointWriteBytes(out: []u8, pos: *usize, value: []const u8) void {
+    std.debug.assert(pos.* + value.len <= out.len);
+    @memcpy(out[pos.* .. pos.* + value.len], value);
+    pos.* += value.len;
+}
+
+fn checkpointHash(prefix: []const u8, out: *[WebhookStore.checkpoint_checksum_len]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(WebhookStore.checkpoint_checksum_domain);
+    hasher.update(prefix);
+    hasher.final(out);
+}
+
+fn rewriteCheckpointHash(bytes: []u8) void {
+    if (bytes.len < WebhookStore.checkpoint_checksum_len) return;
+    const prefix_len = bytes.len - WebhookStore.checkpoint_checksum_len;
+    checkpointHash(
+        bytes[0..prefix_len],
+        bytes[prefix_len..][0..WebhookStore.checkpoint_checksum_len],
+    );
+}
+
+fn checkpointWriteByte(out: []u8, pos: *usize, value: u8) void {
+    out[pos.*] = value;
+    pos.* += 1;
+}
+
+fn checkpointWriteU16(out: []u8, pos: *usize, value: u16) void {
+    std.mem.writeInt(u16, out[pos.*..][0..2], value, .big);
+    pos.* += 2;
+}
+
+fn checkpointWriteI64(out: []u8, pos: *usize, value: i64) void {
+    std.mem.writeInt(i64, out[pos.*..][0..8], value, .big);
+    pos.* += 8;
+}
+
+fn checkpointWriteTiny(out: []u8, pos: *usize, value: []const u8) void {
+    std.debug.assert(value.len <= std.math.maxInt(u8));
+    checkpointWriteByte(out, pos, @intCast(value.len));
+    checkpointWriteBytes(out, pos, value);
+}
+
+fn checkpointReadBytes(bytes: []const u8, pos: *usize, len: usize) error{InvalidCheckpoint}![]const u8 {
+    const end = std.math.add(usize, pos.*, len) catch return error.InvalidCheckpoint;
+    if (end > bytes.len) return error.InvalidCheckpoint;
+    const value = bytes[pos.*..end];
+    pos.* = end;
+    return value;
+}
+
+fn checkpointReadByte(bytes: []const u8, pos: *usize) error{InvalidCheckpoint}!u8 {
+    const value = try checkpointReadBytes(bytes, pos, 1);
+    return value[0];
+}
+
+fn checkpointReadU16(bytes: []const u8, pos: *usize) error{InvalidCheckpoint}!u16 {
+    return std.mem.readInt(u16, (try checkpointReadBytes(bytes, pos, 2))[0..2], .big);
+}
+
+fn checkpointReadI64(bytes: []const u8, pos: *usize) error{InvalidCheckpoint}!i64 {
+    return std.mem.readInt(i64, (try checkpointReadBytes(bytes, pos, 8))[0..8], .big);
+}
+
+fn checkpointReadTiny(bytes: []const u8, pos: *usize, max: usize) error{InvalidCheckpoint}![]const u8 {
+    const len = try checkpointReadByte(bytes, pos);
+    if (len > max) return error.InvalidCheckpoint;
+    return checkpointReadBytes(bytes, pos, len);
+}
 
 /// Token-bucket refill: accrue milli-tokens for the elapsed monotonic interval,
 /// clamped to the burst ceiling. Never accrues on clock regression.
@@ -522,6 +766,13 @@ fn isHex(s: []const u8) bool {
     return true;
 }
 
+fn isLowerHex(s: []const u8) bool {
+    for (s) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return true;
+}
+
 fn hexDecode(hex: []const u8, out: []u8) void {
     var i: usize = 0;
     while (i < out.len and (i * 2 + 1) < hex.len) : (i += 1) {
@@ -595,6 +846,41 @@ test "create mints unique credentials and verify matches the token" {
     try testing.expectEqual(VerifyStatus.ok, r.status);
     try testing.expectEqualStrings("#ops", out.channel());
     try testing.expectEqualStrings("ci", out.name());
+}
+
+test "create rejects an id collision without mutating the original binding" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    const id_material = fixedMaterial(id_bytes, 0x31);
+    const original = try store.create(
+        "#original",
+        "first",
+        "alice",
+        1,
+        2,
+        rate,
+        id_material,
+        fixedMaterial(token_bytes, 0x41),
+    );
+    try testing.expectError(error.Full, store.create(
+        "#collision",
+        "second",
+        "bob",
+        3,
+        4,
+        rate,
+        id_material,
+        fixedMaterial(token_bytes, 0x51),
+    ));
+    try testing.expectEqual(@as(usize, 1), store.len());
+
+    var resolved: Resolved = .{};
+    try testing.expectEqual(
+        VerifyStatus.ok,
+        store.verify(&original.id, &original.token, 2, rate, &resolved).status,
+    );
+    try testing.expectEqualStrings("#original", resolved.channel());
+    try testing.expectEqualStrings("first", resolved.name());
 }
 
 test "verify rejects a wrong token and an unknown id fail-closed" {
@@ -701,6 +987,291 @@ test "persistence round-trips bindings and verify still succeeds after reload" {
     try testing.expectEqualStrings("logger", out.name());
     // A wrong token still fails after reload.
     try testing.expectEqual(VerifyStatus.bad_token, reloaded.verify(&creds.id, "nope", 0, rate, &out).status);
+}
+
+test "persistence serialization is allocation-failure safe and unlocks the store" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    const creds = try store.create(
+        "#persist",
+        "logger",
+        "bob",
+        1_700_000_123,
+        0,
+        rate,
+        fixedMaterial(id_bytes, 42),
+        fixedMaterial(token_bytes, 43),
+    );
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, target: *WebhookStore) !void {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try target.serialize(allocator, &out);
+            try testing.expect(out.items.len != 0);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{&store});
+
+    try testing.expectEqual(@as(usize, 1), store.len());
+    var resolved: Resolved = .{};
+    try testing.expectEqual(
+        VerifyStatus.ok,
+        store.verify(&creds.id, &creds.token, 0, rate, &resolved).status,
+    );
+    try testing.expectEqualStrings("#persist", resolved.channel());
+}
+
+test "load atomically skips uppercase and duplicate ids including repeated loads" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    const original = try store.create(
+        "#original",
+        "first",
+        "alice",
+        1,
+        2,
+        rate,
+        fixedMaterial(id_bytes, 0x21),
+        fixedMaterial(token_bytes, 0x31),
+    );
+    const hash_hex: [hash_hex_len]u8 = @splat('0');
+    const new_id: [id_hex_len]u8 = @splat('b');
+    var uppercase_id: [id_hex_len]u8 = @splat('a');
+    uppercase_id[0] = 'A';
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.print(testing.allocator, "{s}\t{s}\t#upper\tbad\top\t1\n", .{ &uppercase_id, &hash_hex });
+    try text.print(testing.allocator, "{s}\t{s}\t#duplicate\tbad\top\t2\n", .{ &original.id, &hash_hex });
+    try text.print(testing.allocator, "{s}\t{s}\t#new\tvalid\top\t3\n", .{ &new_id, &hash_hex });
+    try text.print(testing.allocator, "{s}\t{s}\t#duplicate-new\tbad\top\t4\n", .{ &new_id, &hash_hex });
+
+    try testing.expectEqual(@as(usize, 1), store.load(text.items, 5, rate));
+    try testing.expectEqual(@as(usize, 2), store.len());
+    try testing.expectEqual(@as(usize, 0), store.load(text.items, 6, rate));
+    try testing.expectEqual(@as(usize, 2), store.len());
+
+    var entries: [2]ListEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), store.list("#new", &entries));
+    try testing.expectEqualStrings("valid", entries[0].name());
+    var resolved: Resolved = .{};
+    try testing.expectEqual(
+        VerifyStatus.ok,
+        store.verify(&original.id, &original.token, 2, rate, &resolved).status,
+    );
+    try testing.expectEqualStrings("#original", resolved.channel());
+}
+
+test "load enforces the channel cap and leaves an exact encodable image" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    const hash_hex: [hash_hex_len]u8 = @splat('0');
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..max_per_channel + 2) |i| {
+        const id = std.fmt.bytesToHex(fixedMaterial(id_bytes, @intCast(i)), .lower);
+        try text.print(testing.allocator, "{s}\t{s}\t#capped\tn\top\t{d}\n", .{ &id, &hash_hex, i });
+    }
+
+    try testing.expectEqual(@as(usize, max_per_channel), store.load(text.items, 10, rate));
+    try testing.expectEqual(@as(usize, max_per_channel), store.len());
+    try testing.expectEqual(@as(usize, 0), store.load(text.items, 11, rate));
+    try testing.expectEqual(@as(usize, max_per_channel), store.len());
+
+    const wire = try store.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    var restored = try WebhookStore.restoreUpgradeCheckpoint(wire);
+    try testing.expectEqual(@as(usize, max_per_channel), restored.len());
+}
+
+test "Helix checkpoint round-trips bindings and live rate buckets exactly" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{ .per_min = 60, .burst = 2 };
+    const a = try store.create("#zeta", "deploy", "alice", 11, 100, rate, fixedMaterial(id_bytes, 70), fixedMaterial(token_bytes, 80));
+    const b = try store.create("#alpha", "alerts", "bob", 22, 200, rate, fixedMaterial(id_bytes, 10), fixedMaterial(token_bytes, 20));
+    var resolved: Resolved = .{};
+    try testing.expectEqual(VerifyStatus.ok, store.verify(&a.id, &a.token, 100, rate, &resolved).status);
+    try testing.expectEqual(VerifyStatus.ok, store.verify(&a.id, &a.token, 100, rate, &resolved).status);
+    try testing.expectEqual(VerifyStatus.rate_limited, store.verify(&a.id, &a.token, 100, rate, &resolved).status);
+
+    const wire = try store.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    var restored = try WebhookStore.restoreUpgradeCheckpoint(wire);
+    try testing.expectEqual(@as(usize, 2), restored.len());
+    try testing.expectEqual(VerifyStatus.rate_limited, restored.verify(&a.id, &a.token, 100, rate, &resolved).status);
+    try testing.expectEqual(VerifyStatus.ok, restored.verify(&b.id, &b.token, 200, rate, &resolved).status);
+    try testing.expectEqualStrings("#alpha", resolved.channel());
+    try testing.expectEqualStrings("alerts", resolved.name());
+
+    // Deterministic id sorting makes the checkpoint independent of insertion
+    // and swap-remove order.
+    var reordered = WebhookStore.init();
+    _ = try reordered.create("#alpha", "alerts", "bob", 22, 200, rate, fixedMaterial(id_bytes, 10), fixedMaterial(token_bytes, 20));
+    const reordered_a = try reordered.create("#zeta", "deploy", "alice", 11, 100, rate, fixedMaterial(id_bytes, 70), fixedMaterial(token_bytes, 80));
+    _ = reordered.verify(&reordered_a.id, &reordered_a.token, 100, rate, &resolved);
+    _ = reordered.verify(&reordered_a.id, &reordered_a.token, 100, rate, &resolved);
+    _ = reordered.verify(&reordered_a.id, &reordered_a.token, 100, rate, &resolved);
+    const reordered_wire = try reordered.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(reordered_wire);
+    try testing.expectEqualSlices(u8, wire, reordered_wire);
+}
+
+test "Helix checkpoint rejects truncation trailing bytes and duplicate ids" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    _ = try store.create("#one", "one", "alice", 1, 2, rate, fixedMaterial(id_bytes, 1), fixedMaterial(token_bytes, 2));
+    const wire = try store.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    try testing.expectError(error.ChecksumMismatch, WebhookStore.restoreUpgradeCheckpoint(wire[0 .. wire.len - 1]));
+    const trailing = try testing.allocator.alloc(u8, wire.len + 1);
+    defer testing.allocator.free(trailing);
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try testing.expectError(error.ChecksumMismatch, WebhookStore.restoreUpgradeCheckpoint(trailing));
+
+    // Duplicate the sole record and raise the count from one to two.
+    const header_len: usize = 7;
+    const checksum_len = WebhookStore.checkpoint_checksum_len;
+    const record_len = wire.len - header_len - checksum_len;
+    const duplicate = try testing.allocator.alloc(u8, header_len + 2 * record_len + checksum_len);
+    defer testing.allocator.free(duplicate);
+    @memcpy(duplicate[0 .. header_len + record_len], wire[0 .. header_len + record_len]);
+    std.mem.writeInt(u16, duplicate[5..7], 2, .big);
+    @memcpy(duplicate[header_len + record_len ..][0..record_len], wire[header_len..][0..record_len]);
+    rewriteCheckpointHash(duplicate);
+    try testing.expectError(error.DuplicateBinding, WebhookStore.restoreUpgradeCheckpoint(duplicate));
+
+    // A same-length payload mutation is authenticated even when the resulting
+    // byte remains structurally valid.
+    const corrupted = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(corrupted);
+    corrupted[header_len] = if (corrupted[header_len] == 'a') 'b' else 'a';
+    try testing.expectError(error.ChecksumMismatch, WebhookStore.restoreUpgradeCheckpoint(corrupted));
+
+    // The encoder's lowercase public-id representation is part of the exact
+    // wire shape; an authenticated uppercase variant is still non-canonical.
+    const uppercase = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(uppercase);
+    uppercase[header_len] = 'A';
+    rewriteCheckpointHash(uppercase);
+    try testing.expectError(error.InvalidCheckpoint, WebhookStore.restoreUpgradeCheckpoint(uppercase));
+}
+
+test "Helix checkpoint rejects non-canonical binding order" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    _ = try store.create("#one", "one", "alice", 1, 2, rate, fixedMaterial(id_bytes, 1), fixedMaterial(token_bytes, 2));
+    _ = try store.create("#two", "two", "bob", 3, 4, rate, fixedMaterial(id_bytes, 3), fixedMaterial(token_bytes, 4));
+    const wire = try store.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const malformed = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(malformed);
+    // The first fixed-width id begins directly after WHST/version/count. Make
+    // it greater than the second id without changing any record length.
+    @memset(malformed[7 .. 7 + id_hex_len], 'f');
+    rewriteCheckpointHash(malformed);
+    try testing.expectError(error.NonCanonicalOrder, WebhookStore.restoreUpgradeCheckpoint(malformed));
+}
+
+test "Helix checkpoint publication preserves live mutex ownership" {
+    const rate = RateConfig{};
+    var source = WebhookStore.init();
+    const carried = try source.create("#carried", "deploy", "alice", 7, 11, rate, fixedMaterial(id_bytes, 8), fixedMaterial(token_bytes, 9));
+    const wire = try source.encodeUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    var replacement = try WebhookStore.restoreUpgradeCheckpoint(wire);
+
+    var live = WebhookStore.init();
+    const displaced = try live.create("#old", "old", "bob", 1, 2, rate, fixedMaterial(id_bytes, 1), fixedMaterial(token_bytes, 2));
+    live.publishUpgradeReplacement(&replacement);
+
+    // Both mutexes remain independently usable after publication. The live
+    // image contains only the carried binding; the staged value is unchanged.
+    try testing.expectEqual(@as(usize, 1), live.len());
+    try testing.expectEqual(@as(usize, 1), replacement.len());
+    var resolved: Resolved = .{};
+    try testing.expectEqual(VerifyStatus.ok, live.verify(&carried.id, &carried.token, 11, rate, &resolved).status);
+    try testing.expectEqualStrings("#carried", resolved.channel());
+    try testing.expectEqual(VerifyStatus.not_found, live.verify(&displaced.id, &displaced.token, 11, rate, &resolved).status);
+}
+
+test "Helix encoder rejects impossible live images before allocation" {
+    const rate = RateConfig{};
+    var store = WebhookStore.init();
+    _ = try store.create("#one", "one", "alice", 1, 2, rate, fixedMaterial(id_bytes, 1), fixedMaterial(token_bytes, 2));
+    _ = try store.create("#two", "two", "bob", 3, 4, rate, fixedMaterial(id_bytes, 3), fixedMaterial(token_bytes, 4));
+
+    const canonical_first = store.bindings[0].id;
+    const canonical_second = store.bindings[1].id;
+    store.bindings[0].id[0] = 'A';
+    try testing.expectError(error.InvalidCheckpoint, store.encodeUpgradeCheckpoint(testing.allocator));
+    store.bindings[0].id = canonical_first;
+    store.bindings[1].id = canonical_first;
+    try testing.expectError(error.DuplicateBinding, store.encodeUpgradeCheckpoint(testing.allocator));
+    store.bindings[1].id = canonical_second;
+
+    var capped = WebhookStore.init();
+    for (0..max_per_channel) |i| {
+        _ = try capped.create(
+            "#capped",
+            "n",
+            "op",
+            0,
+            0,
+            rate,
+            fixedMaterial(id_bytes, @intCast(i)),
+            fixedMaterial(token_bytes, @intCast(i)),
+        );
+    }
+    _ = try capped.create(
+        "#other",
+        "n",
+        "op",
+        0,
+        0,
+        rate,
+        fixedMaterial(id_bytes, 200),
+        fixedMaterial(token_bytes, 200),
+    );
+    copyInto(
+        &capped.bindings[max_per_channel].channel_buf,
+        &capped.bindings[max_per_channel].channel_len,
+        "#capped",
+    );
+    try testing.expectError(error.ChannelFull, capped.encodeUpgradeCheckpoint(testing.allocator));
+}
+
+test "Helix encode is allocation-failure safe and leaves the store usable" {
+    var store = WebhookStore.init();
+    const rate = RateConfig{};
+    const creds = try store.create(
+        "#stable",
+        "ci",
+        "alice",
+        1,
+        2,
+        rate,
+        fixedMaterial(id_bytes, 8),
+        fixedMaterial(token_bytes, 9),
+    );
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, target: *WebhookStore) !void {
+            const wire = try target.encodeUpgradeCheckpoint(allocator);
+            defer allocator.free(wire);
+            var restored = try WebhookStore.restoreUpgradeCheckpoint(wire);
+            try testing.expectEqual(@as(usize, 1), restored.len());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{&store});
+
+    try testing.expectEqual(@as(usize, 1), store.len());
+    var resolved: Resolved = .{};
+    try testing.expectEqual(
+        VerifyStatus.ok,
+        store.verify(&creds.id, &creds.token, 2, rate, &resolved).status,
+    );
+    try testing.expectEqualStrings("#stable", resolved.channel());
 }
 
 test "load skips malformed lines fail-closed" {

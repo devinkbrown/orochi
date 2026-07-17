@@ -31,6 +31,7 @@
 const std = @import("std");
 
 const sign = @import("../../crypto/sign.zig");
+const session_portability = @import("../../proto/session_portability.zig");
 const session_replica_transport = @import("../../proto/session_replica_frame.zig");
 const mesh_clock = @import("../../substrate/suimyaku/mesh_clock.zig");
 const signed_frame = @import("../../substrate/suimyaku/signed_frame.zig");
@@ -55,10 +56,17 @@ const signature_wire_len: usize = sign.public_key_len + sign.signature_len;
 const offer_fixed_len: usize = offer_magic.len + 1 + @sizeOf(Token) + revision_wire_len + 8 + 8 + 2 + 2 + 4;
 const ack_fixed_len: usize = ack_magic.len + 1 + @sizeOf(Token) + revision_wire_len + revision_wire_len + 8 + 8 + 8;
 const attachment_lease_fixed_len: usize = attachment_lease_magic.len + @sizeOf(Token) + revision_wire_len + 8 + 8;
-/// Largest snapshot for which every legal max-length account/nick OFFER still
-/// fits the secured SESSION_REPLICA transport envelope exactly.
-pub const max_snapshot_len: usize = session_replica_transport.max_signed_payload_len -
+/// Transport-derived ceiling before the cross-version portability cap is
+/// applied. Kept explicit so the compile-time minimum proves both envelopes.
+const transport_max_snapshot_len: usize = session_replica_transport.max_signed_payload_len -
     offer_fixed_len - signature_wire_len - max_account_len - max_nick_len;
+
+/// Largest snapshot accepted by both current SESSION_REPLICA and rolling-old
+/// SESSION_MIGRATE paths.
+pub const max_snapshot_len: usize = @min(
+    transport_max_snapshot_len,
+    session_portability.max_snapshot_len,
+);
 
 /// A restart-safe, deterministic total-order revision. `sequence` is the full
 /// packed MeshClock stamp and `epoch` is its canonical physical projection.
@@ -672,6 +680,42 @@ pub const Store = struct {
         attachment_lease,
     };
 
+    fn retainedKindRank(kind: RetainedKind) u8 {
+        return switch (kind) {
+            .offer => 0,
+            .revoke => 1,
+            .attachment_lease => 2,
+        };
+    }
+
+    /// Mutation-independent position in the retained signed-object order.
+    /// Every field is a value: callers never retain a hash-map iterator or a
+    /// pointer into Store-owned memory between pages. The transcript digest is
+    /// the final discriminator for equal-revision equivocation witnesses.
+    pub const RetainedCursor = struct {
+        token: Token,
+        kind: RetainedKind,
+        origin_node: NodeId,
+        revision: Revision,
+        digest: Digest,
+
+        pub fn compare(a: RetainedCursor, b: RetainedCursor) std.math.Order {
+            const token_order = std.mem.order(u8, &a.token, &b.token);
+            if (token_order != .eq) return token_order;
+            const kind_order = std.math.order(retainedKindRank(a.kind), retainedKindRank(b.kind));
+            if (kind_order != .eq) return kind_order;
+            const origin_order = std.math.order(a.origin_node, b.origin_node);
+            if (origin_order != .eq) return origin_order;
+            const revision_order = a.revision.compare(b.revision);
+            if (revision_order != .eq) return revision_order;
+            return std.mem.order(u8, &a.digest, &b.digest);
+        }
+
+        pub fn eql(a: RetainedCursor, b: RetainedCursor) bool {
+            return a.compare(b) == .eq;
+        }
+    };
+
     /// Borrowed retransmission view. `wire` stays valid until the corresponding
     /// Store origin is superseded, swept, or the Store is deinitialized.
     pub const RetainedObject = struct {
@@ -681,6 +725,17 @@ pub const Store = struct {
         revision: Revision,
         expires_at_ms: i64,
         wire: []const u8,
+        digest: Digest,
+
+        pub fn cursor(self: RetainedObject) RetainedCursor {
+            return .{
+                .token = self.token,
+                .kind = self.kind,
+                .origin_node = self.origin_node,
+                .revision = self.revision,
+                .digest = self.digest,
+            };
+        }
     };
 
     pub const SweepResult = struct {
@@ -912,6 +967,25 @@ pub const Store = struct {
         try restored.validateCheckpointIdentityState();
         _ = restored.sweep(restore_now_ms);
         return restored;
+    }
+
+    /// Restore only the exact current v2 checkpoint shape.
+    ///
+    /// `restoreUpgradeCheckpoint` intentionally retains the v1 rolling-upgrade
+    /// arm for explicit legacy capsules. A current outer Helix wrapper must use
+    /// this entry point so an inner v1 payload cannot omit the attachment-lease
+    /// count/state while presenting itself as current.
+    pub fn restoreCurrentUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        bytes: []const u8,
+        restore_now_ms: i64,
+    ) UpgradeCheckpointError!Store {
+        if (bytes.len < upgrade_checkpoint_magic.len + 1) return error.Truncated;
+        if (!Store.isUpgradeCheckpoint(bytes)) return error.BadMagic;
+        if (bytes[upgrade_checkpoint_magic.len] != upgrade_checkpoint_version)
+            return error.UnsupportedVersion;
+        return restoreUpgradeCheckpoint(allocator, cfg, bytes, restore_now_ms);
     }
 
     /// Atomically replace this Store. On corruption, capacity pressure, or OOM,
@@ -1494,6 +1568,7 @@ pub const Store = struct {
                 .revision = slot.value_ptr.revision,
                 .expires_at_ms = slot.value_ptr.expires_at_ms,
                 .wire = slot.value_ptr.wire,
+                .digest = slot.value_ptr.digest,
             };
             count += 1;
         }
@@ -1528,8 +1603,68 @@ pub const Store = struct {
                 .revision = slot.value_ptr.revision,
                 .expires_at_ms = slot.value_ptr.offer_expires_at_ms,
                 .wire = slot.value_ptr.wire,
+                .digest = slot.value_ptr.digest,
             };
             count += 1;
+        }
+        return count;
+    }
+
+    /// Return the smallest retained signed objects strictly greater than the
+    /// supplied value cursor. Results are deterministic and strictly ordered
+    /// even when the Store's hash maps rehash or the object named by `after`
+    /// disappears between calls. Returned wires remain borrowed Store memory.
+    pub fn retainedObjectsAfter(
+        self: *const Store,
+        now_ms: i64,
+        after: ?RetainedCursor,
+        out: []RetainedObject,
+    ) usize {
+        if (out.len == 0) return 0;
+        var count: usize = 0;
+
+        var quarantine_it = @constCast(&self.quarantines).valueIterator();
+        while (quarantine_it.next()) |quarantine| {
+            if (now_ms > quarantine.expires_at_ms) continue;
+            considerRetainedObject(after, retainedObjectFromWire(quarantine.first_wire), out, &count);
+            considerRetainedObject(after, retainedObjectFromWire(quarantine.second_wire), out, &count);
+        }
+
+        var entry_it = @constCast(&self.entries).iterator();
+        while (entry_it.next()) |slot| {
+            if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
+            considerRetainedObject(after, .{
+                .kind = .offer,
+                .token = slot.key_ptr.token,
+                .origin_node = slot.key_ptr.origin_node,
+                .revision = slot.value_ptr.revision,
+                .expires_at_ms = slot.value_ptr.expires_at_ms,
+                .wire = slot.value_ptr.wire,
+                .digest = slot.value_ptr.digest,
+            }, out, &count);
+        }
+
+        var lease_it = @constCast(&self.attachment_leases).iterator();
+        while (lease_it.next()) |slot| {
+            const lease = slot.value_ptr;
+            if (now_ms > lease.replay_until_ms or (lease.conflicted and lease.conflict_wire == null)) continue;
+            considerRetainedObject(after, retainedAttachmentLeaseObjectFromWire(lease.wire), out, &count);
+            if (lease.conflict_wire) |wire|
+                considerRetainedObject(after, retainedAttachmentLeaseObjectFromWire(wire), out, &count);
+        }
+
+        var tombstone_it = @constCast(&self.tombstones).iterator();
+        while (tombstone_it.next()) |slot| {
+            if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.offer_expires_at_ms) continue;
+            considerRetainedObject(after, .{
+                .kind = .revoke,
+                .token = slot.key_ptr.token,
+                .origin_node = slot.key_ptr.origin_node,
+                .revision = slot.value_ptr.revision,
+                .expires_at_ms = slot.value_ptr.offer_expires_at_ms,
+                .wire = slot.value_ptr.wire,
+                .digest = slot.value_ptr.digest,
+            }, out, &count);
         }
         return count;
     }
@@ -2504,6 +2639,7 @@ fn retainedObjectFromWire(wire: []const u8) Store.RetainedObject {
         .revision = signed.offer.revision,
         .expires_at_ms = signed.offer.expires_at_ms,
         .wire = wire,
+        .digest = digestBytes(signed.transcript),
     };
 }
 
@@ -2516,7 +2652,43 @@ fn retainedAttachmentLeaseObjectFromWire(wire: []const u8) Store.RetainedObject 
         .revision = signed.lease.revision,
         .expires_at_ms = signed.lease.expires_at_ms,
         .wire = wire,
+        .digest = digestBytes(signed.transcript),
     };
+}
+
+/// Insert one candidate into the bounded ascending prefix in `out`. Once full,
+/// candidates above the current largest value are ignored and smaller values
+/// displace that largest value. This produces the first N objects after a
+/// cursor without allocating or depending on hash-map iteration order.
+fn considerRetainedObject(
+    after: ?Store.RetainedCursor,
+    candidate: Store.RetainedObject,
+    out: []Store.RetainedObject,
+    count: *usize,
+) void {
+    if (out.len == 0) return;
+    const cursor = candidate.cursor();
+    if (after) |lower| if (cursor.compare(lower) != .gt) return;
+
+    var insert_at: usize = 0;
+    while (insert_at < count.*) : (insert_at += 1) {
+        switch (cursor.compare(out[insert_at].cursor())) {
+            .lt => break,
+            .eq => return,
+            .gt => {},
+        }
+    }
+    if (insert_at == out.len) return;
+
+    if (count.* < out.len) {
+        var shift = count.*;
+        while (shift > insert_at) : (shift -= 1) out[shift] = out[shift - 1];
+        count.* += 1;
+    } else {
+        var shift = out.len - 1;
+        while (shift > insert_at) : (shift -= 1) out[shift] = out[shift - 1];
+    }
+    out[insert_at] = candidate;
 }
 
 fn considerOrderedToken(token: Token, lower_bound: ?Token, candidate: *?Token) void {
@@ -2763,6 +2935,13 @@ fn revisionFor(kp: *const sign.KeyPair, physical_ms: u64, logical: u64) Revision
 fn testToken(byte: u8) Token {
     var result: Token = @splat(0);
     result[15] = byte;
+    return result;
+}
+
+fn testWideToken(value: u16) Token {
+    var result: Token = @splat(0);
+    result[14] = @intCast(value >> 8);
+    result[15] = @intCast(value & 0xff);
     return result;
 }
 
@@ -3249,7 +3428,7 @@ test "session replica OFFER rejects non-canonical mesh-clock revisions" {
     try testing.expectError(error.InvalidOffer, decodeOffer(malformed));
 }
 
-test "session replica maximum OFFER fits transport exactly and boundary plus one rejects" {
+test "session replica portable snapshot fits transport and boundary plus one rejects" {
     var kp = try testKey(0x10);
     defer kp.deinit();
     const account: [max_account_len]u8 = @splat('a');
@@ -3269,7 +3448,8 @@ test "session replica maximum OFFER fits transport exactly and boundary plus one
     };
     const signed_wire = try encodeOffer(testing.allocator, offer, &kp);
     defer testing.allocator.free(signed_wire);
-    try testing.expectEqual(session_replica_transport.max_signed_payload_len, signed_wire.len);
+    try testing.expect(signed_wire.len <= session_replica_transport.max_signed_payload_len);
+    try testing.expectEqual(session_portability.max_snapshot_len, max_snapshot_len);
     const transport_buf = try testing.allocator.alloc(u8, session_replica_transport.header_len + signed_wire.len);
     defer testing.allocator.free(transport_buf);
     const transport_wire = try session_replica_transport.encode(.offer, signed_wire, transport_buf);
@@ -3670,6 +3850,159 @@ test "session replica retained enumeration is bounded across concurrent origins"
     try testing.expectEqual(@as(usize, 1), store.retainedObjectsRange(201, 1, &second));
     try verifyOffer(try decodeOffer(second[0].wire));
     try testing.expect(one[0].origin_node != second[0].origin_node);
+}
+
+test "session replica retained value cursor survives 182 objects replacement and rehash" {
+    var key = try testKey(0x91);
+    defer key.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const Apply = struct {
+        fn upsert(target: *Store, kp: *const sign.KeyPair, token: Token, epoch: u64, logical: u64) !void {
+            const signed = try signedOffer(testing.allocator, upsertOffer(kp, token, epoch, logical, "state"), kp);
+            defer testing.allocator.free(signed.wire);
+            _ = try target.applySignedOffer(signed.decoded, logical + 1_000, 200);
+        }
+    };
+
+    // A wide two-byte token space leaves values on both sides of every page
+    // boundary while the entry count is large enough to force map growth.
+    for (0..140) |index| {
+        const value: u16 = @intCast((index + 1) * 2);
+        try Apply.upsert(&store, &key, testWideToken(value), 100, index + 1);
+    }
+    try testing.expectEqual(@as(usize, 140), store.retainedCount(200));
+
+    var first_page: [7]Store.RetainedObject = undefined;
+    try testing.expectEqual(@as(usize, first_page.len), store.retainedObjectsAfter(200, null, &first_page));
+    for (first_page[1..], 1..) |object, index|
+        try testing.expect(object.cursor().compare(first_page[index - 1].cursor()) == .gt);
+    try testing.expect(tokenEql(testWideToken(2), first_page[0].token));
+    try testing.expect(tokenEql(testWideToken(14), first_page[first_page.len - 1].token));
+    const removed_cursor = first_page[first_page.len - 1].cursor();
+
+    // Superseding the cursor's exact object frees its borrowed wire. Only the
+    // cursor value is retained. Insertions behind and ahead of it plus another
+    // growth wave must not duplicate, strand, or reorder later objects.
+    try Apply.upsert(&store, &key, testWideToken(14), 101, 500);
+    try Apply.upsert(&store, &key, testWideToken(3), 100, 501);
+    try Apply.upsert(&store, &key, testWideToken(15), 100, 502);
+    for (0..40) |index| {
+        const value: u16 = @intCast(282 + index * 2);
+        try Apply.upsert(&store, &key, testWideToken(value), 100, 600 + index);
+    }
+    try testing.expectEqual(@as(usize, 182), store.retainedCount(200));
+
+    var page: [7]Store.RetainedObject = undefined;
+    var after = removed_cursor;
+    var returned: usize = 0;
+    while (true) {
+        const count = store.retainedObjectsAfter(200, after, &page);
+        for (page[0..count]) |object| {
+            const current = object.cursor();
+            try testing.expect(current.compare(after) == .gt);
+            after = current;
+            returned += 1;
+        }
+        if (count < page.len) break;
+    }
+    // Replacement token 14, new token 15, the 133 untouched original values
+    // after 14, and the 40 growth-wave values are all visited exactly once.
+    try testing.expectEqual(@as(usize, 175), returned);
+    try testing.expectEqual(@as(usize, 0), store.retainedObjectsAfter(200, after, &page));
+    try testing.expectEqual(@as(usize, 0), store.retainedObjectsAfter(200, null, page[0..0]));
+
+    // Restarting from null wraps to the beginning and sees the behind-cursor
+    // insertion without disturbing forward progress in the prior traversal.
+    var restarted: [2]Store.RetainedObject = undefined;
+    try testing.expectEqual(@as(usize, 2), store.retainedObjectsAfter(200, null, &restarted));
+    try testing.expect(tokenEql(testWideToken(2), restarted[0].token));
+    try testing.expect(tokenEql(testWideToken(3), restarted[1].token));
+}
+
+test "session replica retained value cursor orders all kinds and conflict witnesses" {
+    var alice_key = try testKey(0x92);
+    defer alice_key.deinit();
+    var mallory_key = try testKey(0x93);
+    defer mallory_key.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const live = try signedOffer(testing.allocator, upsertOffer(&alice_key, testWideToken(0x10), 100, 1, "live"), &alice_key);
+    defer testing.allocator.free(live.wire);
+    _ = try store.applySignedOffer(live.decoded, 1, 150);
+
+    const removed_live = try signedOffer(testing.allocator, upsertOffer(&alice_key, testWideToken(0x20), 100, 2, "remove-me"), &alice_key);
+    defer testing.allocator.free(removed_live.wire);
+    _ = try store.applySignedOffer(removed_live.decoded, 1, 150);
+    const removed = try signedOffer(testing.allocator, removeOffer(&alice_key, testWideToken(0x20), 101, 1), &alice_key);
+    defer testing.allocator.free(removed.wire);
+    _ = try store.applySignedOffer(removed.decoded, 1, 150);
+
+    const quarantined_alice = try signedOffer(testing.allocator, upsertOffer(&alice_key, testWideToken(0x30), 100, 3, "alice"), &alice_key);
+    defer testing.allocator.free(quarantined_alice.wire);
+    var mallory_offer = upsertOffer(&mallory_key, testWideToken(0x30), 100, 4, "mallory");
+    mallory_offer.account = "mallory";
+    const quarantined_mallory = try signedOffer(testing.allocator, mallory_offer, &mallory_key);
+    defer testing.allocator.free(quarantined_mallory.wire);
+    _ = try store.applySignedOffer(quarantined_alice.decoded, 2, 150);
+    try testing.expectEqual(
+        ApplyDisposition.quarantined,
+        (try store.applySignedOffer(quarantined_mallory.decoded, 3, 150)).disposition,
+    );
+
+    const lease_token = testWideToken(0x40);
+    const first_lease = try signedAttachmentLease(testing.allocator, .{
+        .token = lease_token,
+        .revision = revisionFor(&alice_key, 120, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 300,
+    }, &alice_key);
+    defer testing.allocator.free(first_lease.wire);
+    const conflicting_lease = try signedAttachmentLease(testing.allocator, .{
+        .token = lease_token,
+        .revision = revisionFor(&alice_key, 120, 1),
+        .issued_at_ms = 101,
+        .expires_at_ms = 300,
+    }, &alice_key);
+    defer testing.allocator.free(conflicting_lease.wire);
+    _ = try store.applySignedAttachmentLease(first_lease.decoded, 150);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.conflict,
+        try store.applySignedAttachmentLease(conflicting_lease.decoded, 150),
+    );
+
+    try testing.expectEqual(@as(usize, 6), store.retainedCount(150));
+    var page: [1]Store.RetainedObject = undefined;
+    var after: ?Store.RetainedCursor = null;
+    var kinds = [_]usize{ 0, 0, 0 };
+    var quarantine_witnesses: usize = 0;
+    var lease_cursors: [2]Store.RetainedCursor = undefined;
+    var lease_witnesses: usize = 0;
+    var total: usize = 0;
+    while (store.retainedObjectsAfter(150, after, &page) == 1) {
+        const cursor = page[0].cursor();
+        if (after) |previous| try testing.expect(cursor.compare(previous) == .gt);
+        kinds[Store.retainedKindRank(page[0].kind)] += 1;
+        if (tokenEql(page[0].token, testWideToken(0x30))) quarantine_witnesses += 1;
+        if (page[0].kind == .attachment_lease) {
+            lease_cursors[lease_witnesses] = cursor;
+            lease_witnesses += 1;
+        }
+        after = cursor;
+        total += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), total);
+    try testing.expectEqualSlices(usize, &[_]usize{ 3, 1, 2 }, &kinds);
+    try testing.expectEqual(@as(usize, 2), quarantine_witnesses);
+    try testing.expectEqual(@as(usize, 2), lease_witnesses);
+    try testing.expect(lease_cursors[0].compare(lease_cursors[1]) == .lt);
+    try testing.expect(tokenEql(lease_cursors[0].token, lease_cursors[1].token));
+    try testing.expectEqual(lease_cursors[0].origin_node, lease_cursors[1].origin_node);
+    try testing.expect(lease_cursors[0].revision.eql(lease_cursors[1].revision));
+    try testing.expect(!std.mem.eql(u8, &lease_cursors[0].digest, &lease_cursors[1].digest));
+    try testing.expectEqual(@as(usize, 0), store.retainedObjectsAfter(150, after, &page));
 }
 
 test "session replica live token pages are unique stable and fair after cursor disappearance" {
@@ -4879,7 +5212,7 @@ test "session replica upgrade checkpoint v2 preserves attachment leases and acce
 
     const checkpoint = try source.encodeUpgradeCheckpoint(testing.allocator, 250);
     defer testing.allocator.free(checkpoint);
-    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 250);
+    var restored = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 250);
     defer restored.deinit();
     try testing.expectEqual(@as(usize, 2), restored.attachmentLeaseCount());
     try testing.expect(restored.hasAttachedOriginOtherThan(live_token, 999, 250));
@@ -4921,6 +5254,10 @@ test "session replica upgrade checkpoint v2 preserves attachment leases and acce
     defer testing.allocator.free(v2_without_leases);
     const v1 = try testDowngradeEmptyLeaseCheckpointToV1(testing.allocator, v2_without_leases);
     defer testing.allocator.free(v1);
+    try testing.expectError(
+        error.UnsupportedVersion,
+        Store.restoreCurrentUpgradeCheckpoint(testing.allocator, .{}, v1, 250),
+    );
     var legacy = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, v1, 250);
     defer legacy.deinit();
     try testing.expectEqual(@as(usize, 1), legacy.entryCount());

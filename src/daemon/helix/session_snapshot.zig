@@ -25,6 +25,7 @@
 //!   [u8 was_secured]      OPTIONAL trailing secured-flag (past the username)
 //!   [u8 tlen][token]      OPTIONAL trailing session reclaim token (past the flag)
 //!   [u64 umode_bits][u32 ilen][pending_in][u32 olen][pending_out]  OPTIONAL v4 tail
+//!   [u8 was_websocket]    current-schema transport flag (past the v4 tail)
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -91,9 +92,24 @@
 //! All three default to 0/empty on a pre-v4 capsule — exactly the historical
 //! behavior. Growing the payload is why the `.clients` descriptor is at
 //! version 4 (capsule.zig).
+//!
+//! The current-schema transport flag records whether the inherited client was a
+//! WebSocket connection. It is append-only after the complete v4 tail. `decode`
+//! remains deliberately tolerant for explicitly-versioned legacy capsules;
+//! `decodeCurrent` requires this byte and every preceding current block exactly,
+//! so a current capsule can never silently downgrade a WebSocket to raw IRC.
+//! The `.clients` descriptor is consequently exact version 5: legacy payloads
+//! remain testable through `decode`, but are never negotiated as current state.
 const std = @import("std");
 
-pub const Error = error{ Truncated, TooLong };
+pub const Error = error{
+    Truncated,
+    TooLong,
+    InvalidBoolean,
+    InvalidTokenLength,
+    UnknownFlags,
+    TrailingData,
+};
 
 /// One channel membership carried for a client: the channel name + the member's
 /// status-mode bits (chanmode.MemberModes.bits).
@@ -124,6 +140,10 @@ pub const Snapshot = struct {
     /// rather than adopted as plaintext — a secured socket never falls back to
     /// cleartext.
     was_secured: bool = false,
+    /// True when this connection used the WebSocket transport at seal time.
+    /// The current-schema decoder requires the canonical trailing 0/1 byte so
+    /// adoption cannot silently reinterpret a WebSocket as a raw IRC stream.
+    was_websocket: bool = false,
     /// The client's 16-byte multi-session reclaim token (sessions.zig `Token`),
     /// carried as an OPTIONAL trailing block so the successor re-tracks the
     /// adopted connection in the SessionStore under the SAME token. Empty = no
@@ -170,6 +190,9 @@ pub const Snapshot = struct {
 const flag_logged_in: u8 = 1 << 0;
 const flag_away_active: u8 = 1 << 1;
 const flag_is_oper: u8 = 1 << 2;
+const known_flags = flag_logged_in | flag_away_active | flag_is_oper;
+const known_member_mode_flags: u8 = 0x0f;
+const session_token_len: usize = 16;
 
 /// Encode `snap` into a freshly-allocated buffer the caller owns.
 pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Allocator.Error)![]u8 {
@@ -196,6 +219,7 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     std.mem.writeInt(u16, &nch_le, @intCast(snap.channels.len), .little);
     try out.appendSlice(allocator, &nch_le);
     for (snap.channels) |ch| {
+        if (ch.modes & ~known_member_mode_flags != 0) return error.UnknownFlags;
         if (ch.name.len > std.math.maxInt(u16)) return error.TooLong;
         var len_le: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_le, @intCast(ch.name.len), .little);
@@ -246,7 +270,8 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     // client's multi-session reclaim token. APPEND-ONLY past the secured flag; a
     // pre-token (v2) capsule omits it and the successor mints a fresh token.
     // Growing the payload is why the `.clients` descriptor is at version 3.
-    if (snap.session_token.len > std.math.maxInt(u8)) return error.TooLong;
+    if (snap.session_token.len != 0 and snap.session_token.len != session_token_len)
+        return error.InvalidTokenLength;
     try out.append(allocator, @intCast(snap.session_token.len));
     try out.appendSlice(allocator, snap.session_token);
     // v4 tail (see header): umode bitset + partial inbound line + plaintext
@@ -263,6 +288,10 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.appendSlice(allocator, &plen_le);
         try out.appendSlice(allocator, pend);
     }
+    // Current-schema transport discriminator. This byte is intentionally after
+    // the complete v4 tail, making every strict prefix unambiguously incomplete.
+    // It is the payload change guarded by the exact `.clients` v5 descriptor.
+    try out.append(allocator, @intFromBool(snap.was_websocket));
     return out.toOwnedSlice(allocator);
 }
 
@@ -292,6 +321,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var oper_title: []const u8 = "";
     var username: []const u8 = "";
     var was_secured: bool = false;
+    var was_websocket: bool = false;
     var session_token: []const u8 = &.{};
     var umode_bits: u64 = 0;
     var pending_in: []const u8 = &.{};
@@ -359,14 +389,26 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                             if (r.buf.len - p >= 8) {
                                 umode_bits = std.mem.readInt(u64, r.buf[p..][0..8], .little);
                                 p += 8;
-                                inline for (.{ &pending_in, &pending_out }) |dst| {
-                                    if (r.buf.len - p >= 4) {
-                                        const n = std.mem.readInt(u32, r.buf[p..][0..4], .little);
-                                        p += 4;
-                                        if (r.buf.len - p >= n) {
-                                            dst.* = r.buf[p .. p + n];
-                                            p += n;
-                                        } else p = r.buf.len; // malformed length → stop
+                                if (r.buf.len - p >= 4) {
+                                    const ilen = std.mem.readInt(u32, r.buf[p..][0..4], .little);
+                                    p += 4;
+                                    if (r.buf.len - p >= ilen) {
+                                        pending_in = r.buf[p .. p + ilen];
+                                        p += ilen;
+                                        if (r.buf.len - p >= 4) {
+                                            const olen = std.mem.readInt(u32, r.buf[p..][0..4], .little);
+                                            p += 4;
+                                            if (r.buf.len - p >= olen) {
+                                                pending_out = r.buf[p .. p + olen];
+                                                p += olen;
+                                                // Current transport byte. Legacy
+                                                // v4 ends exactly before it and
+                                                // therefore defaults to false.
+                                                if (r.buf.len - p >= 1) {
+                                                    was_websocket = r.buf[p] != 0;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -396,7 +438,89 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .oper_title = oper_title,
         .username = username,
         .was_secured = was_secured,
+        .was_websocket = was_websocket,
         .session_token = session_token,
+        .umode_bits = umode_bits,
+        .pending_in = pending_in,
+        .pending_out = pending_out,
+    };
+}
+
+/// Decode exactly the schema emitted by this binary.
+///
+/// Unlike `decode`, this entry point is intentionally not cross-version
+/// tolerant: every block through `was_websocket` must be present, every bounded
+/// region must end where its declared length says it ends, flag values must be
+/// canonical, and no byte may follow the final transport discriminator. It is
+/// allocation-free and returns views borrowing `bytes`.
+pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    var r = Reader{ .buf = bytes };
+    const nick = try r.lenPrefixed();
+    const realname = try r.lenPrefixed();
+    const account = try r.lenPrefixed();
+    const real_host = try r.lenPrefixed();
+    const host = try r.lenPrefixed();
+    const away = try r.lenPrefixed();
+
+    const flags = try r.byte();
+    if (flags & ~known_flags != 0) return error.UnknownFlags;
+    const fd = try r.i32le();
+
+    // Preserve only the counted channel region in the strict view. This keeps a
+    // malformed count from swallowing a later block and makes channel iteration
+    // independent of every current tail field.
+    const channels_start = r.pos;
+    const nchan = try r.u16le();
+    var channel_index: u16 = 0;
+    while (channel_index < nchan) : (channel_index += 1) {
+        _ = try r.lenPrefixed();
+        const modes = try r.byte();
+        if (modes & ~known_member_mode_flags != 0) return error.UnknownFlags;
+    }
+    const channels_blob = bytes[channels_start..r.pos];
+
+    const connected_at_ms = try r.i64le();
+    const last_message_ms = try r.i64le();
+    const caps = try r.lenPrefixed();
+    const oper_priv_bits = try r.u64le();
+    const oper_class = try r.lenPrefixed();
+    const oper_title = try r.lenPrefixed();
+    const username = try r.lenPrefixed();
+    const was_secured = try r.boolean();
+
+    const token_length: usize = try r.byte();
+    if (token_length != 0 and token_length != session_token_len)
+        return error.InvalidTokenLength;
+    const session_token = try r.take(token_length);
+
+    const umode_bits = try r.u64le();
+    const pending_in = try r.lenPrefixed32();
+    const pending_out = try r.lenPrefixed32();
+    const was_websocket = try r.boolean();
+    if (r.pos != bytes.len) return error.TrailingData;
+
+    return .{
+        .nick = nick,
+        .realname = realname,
+        .account = account,
+        .real_host = real_host,
+        .host = host,
+        .away = away,
+        .username = username,
+        .logged_in = flags & flag_logged_in != 0,
+        .away_active = flags & flag_away_active != 0,
+        .is_oper = flags & flag_is_oper != 0,
+        .was_secured = was_secured,
+        .was_websocket = was_websocket,
+        .session_token = session_token,
+        .fd = fd,
+        .channels_blob = channels_blob,
+        .connected_at_ms = connected_at_ms,
+        .last_message_ms = last_message_ms,
+        .caps = caps,
+        .oper_priv_bits = oper_priv_bits,
+        .oper_class = oper_class,
+        .oper_title = oper_title,
         .umode_bits = umode_bits,
         .pending_in = pending_in,
         .pending_out = pending_out,
@@ -486,26 +610,51 @@ const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    fn byte(self: *Reader) Error!u8 {
-        if (self.pos + 1 > self.buf.len) return error.Truncated;
-        const b = self.buf[self.pos];
-        self.pos += 1;
-        return b;
-    }
-    fn i32le(self: *Reader) Error!i32 {
-        if (self.pos + 4 > self.buf.len) return error.Truncated;
-        const v = std.mem.readInt(i32, self.buf[self.pos..][0..4], .little);
-        self.pos += 4;
-        return v;
-    }
-    fn lenPrefixed(self: *Reader) Error![]const u8 {
-        if (self.pos + 2 > self.buf.len) return error.Truncated;
-        const n = std.mem.readInt(u16, self.buf[self.pos..][0..2], .little);
-        self.pos += 2;
-        if (self.pos + n > self.buf.len) return error.Truncated;
-        const s = self.buf[self.pos .. self.pos + n];
+    fn take(self: *Reader, n: usize) Error![]const u8 {
+        if (n > self.buf.len - self.pos) return error.Truncated;
+        const out = self.buf[self.pos .. self.pos + n];
         self.pos += n;
-        return s;
+        return out;
+    }
+
+    fn byte(self: *Reader) Error!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn boolean(self: *Reader) Error!bool {
+        return switch (try self.byte()) {
+            0 => false,
+            1 => true,
+            else => error.InvalidBoolean,
+        };
+    }
+
+    fn u16le(self: *Reader) Error!u16 {
+        return std.mem.readInt(u16, (try self.take(2))[0..2], .little);
+    }
+
+    fn u32le(self: *Reader) Error!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    fn u64le(self: *Reader) Error!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
+    }
+
+    fn i32le(self: *Reader) Error!i32 {
+        return std.mem.readInt(i32, (try self.take(4))[0..4], .little);
+    }
+
+    fn i64le(self: *Reader) Error!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
+    }
+
+    fn lenPrefixed(self: *Reader) Error![]const u8 {
+        return self.take(try self.u16le());
+    }
+
+    fn lenPrefixed32(self: *Reader) Error![]const u8 {
+        return self.take(try self.u32le());
     }
 };
 
@@ -595,8 +744,9 @@ test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
     });
     defer allocator.free(bytes);
     // Strip every trailing block: signon(16) + empty caps(2) + oper(12) +
-    // empty username(2) + secured(1) + empty token(1) + v4 tail(16) = 50 bytes.
-    const old = bytes[0 .. bytes.len - 50];
+    // empty username(2) + secured(1) + empty token(1) + v4 tail(16) + current
+    // WebSocket flag(1) = 51 bytes.
+    const old = bytes[0 .. bytes.len - 51];
 
     const got = try decode(old);
     try testing.expectEqualStrings("bob", got.nick);
@@ -631,7 +781,8 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const secured_block = 1; // trailing was_secured flag byte
     const token_block = 1; // empty session-token len prefix
     const v4_tail = 8 + 4 + 4; // umode bits + two empty pending len prefixes
-    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block - v4_tail];
+    const websocket_block = 1; // current transport discriminator
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block - v4_tail - websocket_block];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);
@@ -665,10 +816,11 @@ test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absen
     const allocator = testing.allocator;
     // A capsule from the caps-carry build: signon + caps blocks, but no oper block.
     // Strip the oper block onward: 8+2+2 oper + 2 username + 1 secured + 1 token
-    // + 16 v4 tail (the decoder needs < 8 bytes after caps to default the rest).
+    // + 16 v4 tail + 1 current WebSocket flag (the decoder needs < 8 bytes
+    // after caps to default the rest).
     const bytes = try encode(allocator, .{ .nick = "dan", .caps = "echo-message", .is_oper = true });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 32];
+    const old = bytes[0 .. bytes.len - 33];
     const got = try decode(old);
     try testing.expectEqualStrings("dan", got.nick);
     try testing.expectEqualStrings("echo-message", got.caps);
@@ -712,9 +864,9 @@ test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrad
         .was_secured = true,
     });
     defer allocator.free(bytes);
-    // Strip the v4 tail (16), the trailing session-token block (1 empty len
-    // byte) AND the was_secured byte to emulate the pre-flag (v1) layout.
-    const old = bytes[0 .. bytes.len - 18];
+    // Strip the current WebSocket byte (1), v4 tail (16), trailing session-token
+    // block (1 empty len byte), and was_secured byte to emulate pre-flag v1.
+    const old = bytes[0 .. bytes.len - 19];
 
     const got = try decode(old);
     try testing.expect(!got.was_secured); // legacy blob → defaults false
@@ -764,10 +916,9 @@ test "cross-version: a v2 (pre-token) capsule decodes with an empty token (v2→
         .session_token = &tok,
     });
     defer allocator.free(bytes);
-    // A v2 build's blob is exactly this one minus the v4 tail (16) and the
-    // trailing token block ([u8 tlen=16][16 bytes]) — strip both to emulate
-    // the pre-token layout.
-    const v2 = bytes[0 .. bytes.len - 33];
+    // A v2 build's blob is exactly this one minus the current WebSocket byte,
+    // v4 tail (16), and trailing token block ([u8 tlen=16][16 bytes]).
+    const v2 = bytes[0 .. bytes.len - 34];
 
     const got = try decode(v2);
     try testing.expectEqual(@as(usize, 0), got.session_token.len); // defaults empty
@@ -845,9 +996,9 @@ test "cross-version: a v3 (pre-v4-tail) capsule decodes with defaults (v3->v4)" 
         .pending_out = "tear",
     });
     defer allocator.free(bytes);
-    // A v3 build's blob is exactly this one minus the v4 tail:
-    // [u64 umode][u32 ilen=4]["torn"][u32 olen=4]["tear"] = 8+4+4+4+4 = 24.
-    const v3 = bytes[0 .. bytes.len - 24];
+    // A v3 build's blob is this one minus the v4 tail and current WebSocket byte:
+    // [u64 umode][u32 ilen=4]["torn"][u32 olen=4]["tear"] + bool = 24+1.
+    const v3 = bytes[0 .. bytes.len - 25];
 
     const got = try decode(v3);
     try testing.expectEqual(@as(u64, 0), got.umode_bits); // defaults
@@ -859,4 +1010,230 @@ test "cross-version: a v3 (pre-v4-tail) capsule decodes with defaults (v3->v4)" 
     try testing.expectEqualStrings("kilo", got.nick);
     try testing.expectEqual(@as(i32, 71), got.fd);
     try testing.expect(got.logged_in);
+}
+
+test "decodeCurrent round-trips every current block including WebSocket transport" {
+    const allocator = testing.allocator;
+    const token: [session_token_len]u8 = @splat(0xC5);
+    const bytes = try encode(allocator, .{
+        .nick = "lotus",
+        .realname = "Lotus Current",
+        .account = "lotus",
+        .real_host = "192.0.2.4",
+        .host = "cloak-current.orochi",
+        .away = "migrating",
+        .username = "ocean",
+        .logged_in = true,
+        .away_active = true,
+        .is_oper = true,
+        .was_secured = true,
+        .was_websocket = true,
+        .session_token = &token,
+        .fd = 91,
+        .channels = &.{
+            .{ .name = "#mesh", .modes = known_member_mode_flags },
+            .{ .name = "#roadmap", .modes = 0 },
+        },
+        .connected_at_ms = 123_456,
+        .last_message_ms = 123_999,
+        .caps = "message-tags server-time",
+        .oper_priv_bits = 0xA5,
+        .oper_class = "admin",
+        .oper_title = "Mesh Operator",
+        .umode_bits = 0x55,
+        .pending_in = "PRIVMSG #mesh :partial",
+        .pending_out = ":orochi NOTICE lotus :queued\r\n",
+    });
+    defer allocator.free(bytes);
+
+    const got = try decodeCurrent(bytes);
+    try testing.expectEqualStrings("lotus", got.nick);
+    try testing.expectEqualStrings("Lotus Current", got.realname);
+    try testing.expectEqualStrings("lotus", got.account);
+    try testing.expectEqualStrings("192.0.2.4", got.real_host);
+    try testing.expectEqualStrings("cloak-current.orochi", got.host);
+    try testing.expectEqualStrings("migrating", got.away);
+    try testing.expectEqualStrings("ocean", got.username);
+    try testing.expect(got.logged_in and got.away_active and got.is_oper);
+    try testing.expect(got.was_secured and got.was_websocket);
+    try testing.expectEqualSlices(u8, &token, got.session_token);
+    try testing.expectEqual(@as(i32, 91), got.fd);
+    try testing.expectEqual(@as(i64, 123_456), got.connected_at_ms);
+    try testing.expectEqual(@as(i64, 123_999), got.last_message_ms);
+    try testing.expectEqualStrings("message-tags server-time", got.caps);
+    try testing.expectEqual(@as(u64, 0xA5), got.oper_priv_bits);
+    try testing.expectEqualStrings("admin", got.oper_class);
+    try testing.expectEqualStrings("Mesh Operator", got.oper_title);
+    try testing.expectEqual(@as(u64, 0x55), got.umode_bits);
+    try testing.expectEqualStrings("PRIVMSG #mesh :partial", got.pending_in);
+    try testing.expectEqualStrings(":orochi NOTICE lotus :queued\r\n", got.pending_out);
+
+    var channels = channelIter(got.channels_blob);
+    const first = channels.next().?;
+    try testing.expectEqualStrings("#mesh", first.name);
+    try testing.expectEqual(known_member_mode_flags, first.modes);
+    try testing.expectEqualStrings("#roadmap", channels.next().?.name);
+    try testing.expect(channels.next() == null);
+    // The tolerant legacy decoder also observes the append-only current byte.
+    try testing.expect((try decode(bytes)).was_websocket);
+}
+
+test "current snapshot encoding is leak-free across every allocation failure" {
+    const token: [session_token_len]u8 = @splat(0xD4);
+    const channels = [_]ChannelMembership{
+        .{ .name = "#mesh", .modes = known_member_mode_flags },
+        .{ .name = "#roadmap", .modes = 0 },
+    };
+    const snap = Snapshot{
+        .nick = "lotus",
+        .realname = "Lotus OOM Sweep",
+        .account = "lotus",
+        .real_host = "192.0.2.9",
+        .host = "cloak-oom.orochi",
+        .away = "migrating",
+        .username = "ocean",
+        .logged_in = true,
+        .away_active = true,
+        .is_oper = true,
+        .was_secured = true,
+        .was_websocket = true,
+        .session_token = &token,
+        .fd = 92,
+        .channels = &channels,
+        .connected_at_ms = 321_000,
+        .last_message_ms = 321_999,
+        .caps = "message-tags server-time batch",
+        .oper_priv_bits = 0x5A,
+        .oper_class = "admin",
+        .oper_title = "Mesh Operator",
+        .umode_bits = 0xAA,
+        .pending_in = "PRIVMSG #mesh :partial",
+        .pending_out = ":orochi NOTICE lotus :queued\r\n",
+    };
+
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, snapshot: Snapshot) !void {
+            const bytes = try encode(allocator, snapshot);
+            defer allocator.free(bytes);
+            const restored = try decodeCurrent(bytes);
+            try testing.expectEqualStrings(snapshot.nick, restored.nick);
+            try testing.expectEqualSlices(u8, snapshot.session_token, restored.session_token);
+            try testing.expectEqualStrings(snapshot.pending_out, restored.pending_out);
+            try testing.expect(restored.was_websocket);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{snap});
+}
+
+test "decodeCurrent rejects every proper prefix and every trailing byte" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{});
+    defer allocator.free(bytes);
+
+    // Empty current snapshot has a deliberately stable structural minimum:
+    // every proper prefix, including a complete v4 blob without was_websocket,
+    // is incomplete for the current decoder.
+    try testing.expectEqual(@as(usize, 70), bytes.len);
+    for (0..bytes.len) |end| {
+        try testing.expectError(error.Truncated, decodeCurrent(bytes[0..end]));
+    }
+    _ = try decodeCurrent(bytes);
+
+    var with_trailing: [71]u8 = undefined;
+    @memcpy(with_trailing[0..bytes.len], bytes);
+    with_trailing[bytes.len] = 0;
+    try testing.expectError(error.TrailingData, decodeCurrent(&with_trailing));
+}
+
+test "decodeCurrent rejects noncanonical booleans and unknown flag bits" {
+    const allocator = testing.allocator;
+    const empty = try encode(allocator, .{});
+    defer allocator.free(empty);
+    try testing.expectEqual(@as(usize, 70), empty.len);
+
+    // Six empty u16 strings precede the primary flag byte.
+    empty[12] = 0x08;
+    try testing.expectError(error.UnknownFlags, decodeCurrent(empty));
+    empty[12] = 0;
+
+    // Empty-current exact offsets: secured=51, websocket=69.
+    empty[51] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(empty));
+    empty[51] = 0;
+    empty[69] = 0xff;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(empty));
+
+    const channel_bytes = try encode(allocator, .{ .channels = &.{.{ .name = "#c", .modes = 0 }} });
+    defer allocator.free(channel_bytes);
+    // count starts at 17; [u16 name-len]["#c"] puts member flags at 23.
+    channel_bytes[23] = 0x10;
+    try testing.expectError(error.UnknownFlags, decodeCurrent(channel_bytes));
+
+    try testing.expectError(
+        error.UnknownFlags,
+        encode(allocator, .{ .channels = &.{.{ .name = "#c", .modes = 0x80 }} }),
+    );
+}
+
+test "decodeCurrent enforces exact channel token and pending length regions" {
+    const allocator = testing.allocator;
+    const pristine = try encode(allocator, .{});
+    defer allocator.free(pristine);
+    var malformed = try allocator.dupe(u8, pristine);
+    defer allocator.free(malformed);
+
+    // Claimed identity bytes cannot overlap the mandatory grammar.
+    std.mem.writeInt(u16, malformed[0..2], std.math.maxInt(u16), .little);
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+    @memcpy(malformed, pristine);
+
+    // A fabricated channel entry shifts the exact tail boundary and is rejected.
+    std.mem.writeInt(u16, malformed[17..19], 1, .little);
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+    @memcpy(malformed, pristine);
+
+    // Empty-current exact offsets: caps len=35, token len=52, inbound len=61,
+    // outbound len=65. Oversized declarations must never be clamped/tolerated.
+    std.mem.writeInt(u16, malformed[35..37], std.math.maxInt(u16), .little);
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+    @memcpy(malformed, pristine);
+
+    inline for (.{ 1, 15, 17, 255 }) |bad_token_len| {
+        malformed[52] = bad_token_len;
+        try testing.expectError(error.InvalidTokenLength, decodeCurrent(malformed));
+        malformed[52] = 0;
+    }
+    // A canonical 16-byte declaration is still truncated unless all 16 bytes
+    // and the blocks after them actually exist at their shifted positions.
+    malformed[52] = session_token_len;
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+    @memcpy(malformed, pristine);
+
+    std.mem.writeInt(u32, malformed[61..65], std.math.maxInt(u32), .little);
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+    @memcpy(malformed, pristine);
+    std.mem.writeInt(u32, malformed[65..69], std.math.maxInt(u32), .little);
+    try testing.expectError(error.Truncated, decodeCurrent(malformed));
+
+    try testing.expectError(error.InvalidTokenLength, encode(allocator, .{ .session_token = "short" }));
+}
+
+test "decodeCurrent is statically allocation-free and cannot return OutOfMemory" {
+    const fn_info = @typeInfo(@TypeOf(decodeCurrent)).@"fn";
+    comptime {
+        if (fn_info.param_types.len != 1) @compileError("decodeCurrent must accept only borrowed bytes");
+        const return_type = fn_info.return_type orelse @compileError("decodeCurrent must return a value");
+        const decode_errors = @typeInfo(return_type).error_union.error_set;
+        const names = @typeInfo(decode_errors).error_set.error_names orelse
+            @compileError("decodeCurrent must retain a concrete error set");
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "OutOfMemory"))
+                @compileError("decodeCurrent must remain allocation-free");
+        }
+    }
+
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{ .was_websocket = true });
+    defer allocator.free(bytes);
+    try testing.expect((try decodeCurrent(bytes)).was_websocket);
 }

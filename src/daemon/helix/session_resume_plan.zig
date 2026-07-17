@@ -19,9 +19,10 @@
 //!
 //! Inconsistencies detected:
 //!   - `error.TooMany`        when the flattened session count exceeds `out.len`
-//!   - `error.DuplicateToken` when two sessions (anywhere in the set) share a
-//!                            token; tokens are the registry's unique key, so a
-//!                            collision means a corrupt or merged registry.
+//!   - `error.DuplicateToken` when one token crosses ASCII-folded account
+//!                            boundaries. Multiple physical attachments within
+//!                            the same account deliberately share one token and
+//!                            remain distinct rows in the returned plan.
 
 const std = @import("std");
 const session_capsule = @import("session_capsule.zig");
@@ -30,7 +31,7 @@ const session_capsule = @import("session_capsule.zig");
 pub const Error = error{
     /// The flattened session count exceeded the caller-supplied `out` slice.
     TooMany,
-    /// Two sessions in the set shared a token; tokens must be globally unique.
+    /// One token appeared under two different ASCII-folded accounts.
     DuplicateToken,
 };
 
@@ -59,29 +60,46 @@ pub const SessionState = struct {
 ///
 /// Returns:
 ///   - `error.TooMany`        if the total session count exceeds `out.len`
-///   - `error.DuplicateToken` if any two sessions share a token
+///   - `error.DuplicateToken` if a token crosses folded account boundaries
 ///
-/// On success returns the written prefix of `out`.
+/// Validation is transactional: on either error, `out` is unchanged. On success
+/// returns the written prefix of `out` in capsule-then-session order, including
+/// every physical attachment in a same-account reusable-token group.
 pub fn plan(
     capsules: []const session_capsule.SessionCapsule,
     live_client_ids: []const u64,
     out: []SessionState,
 ) Error![]SessionState {
-    var n: usize = 0;
-
+    // Size and token-authority validation happen before the first output write.
+    // This makes a failed handoff retry safe even when the caller reuses `out`.
+    var total: usize = 0;
     for (capsules) |capsule| {
-        for (capsule.sessions) |entry| {
-            if (n >= out.len) return error.TooMany;
+        if (capsule.sessions.len > out.len - total) return error.TooMany;
+        total += capsule.sessions.len;
+    }
 
-            // Bounded duplicate-token check against everything written so far.
-            // O(n^2) but allocation-free and fine for realistic session counts.
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                if (std.mem.eql(u8, out[i].token, entry.token)) {
-                    return error.DuplicateToken;
+    // A reusable token is one logical session with potentially many physical
+    // attachments. It may therefore repeat under the same folded account, but
+    // it must never grant authority across account boundaries. Entries within
+    // one capsule necessarily share its account, so only earlier capsules need
+    // comparison.
+    for (capsules, 0..) |capsule, capsule_index| {
+        for (capsule.sessions) |entry| {
+            for (capsules[0..capsule_index]) |previous_capsule| {
+                for (previous_capsule.sessions) |previous_entry| {
+                    if (std.mem.eql(u8, previous_entry.token, entry.token) and
+                        !std.ascii.eqlIgnoreCase(previous_capsule.account, capsule.account))
+                    {
+                        return error.DuplicateToken;
+                    }
                 }
             }
+        }
+    }
 
+    var n: usize = 0;
+    for (capsules) |capsule| {
+        for (capsule.sessions) |entry| {
             out[n] = .{
                 .account = capsule.account,
                 .token = entry.token,
@@ -198,7 +216,40 @@ test "plan with empty live set detaches everything" {
     try std.testing.expectEqual(@as(usize, 2), countDetached(states));
 }
 
-test "plan returns DuplicateToken when two sessions share a token" {
+test "plan preserves same-account reusable-token attachments in input order" {
+    const first = [_]SessionEntry{
+        .{ .token = "shared-tok", .signon_unix = 1, .detached = false, .client = 1 },
+        .{ .token = "shared-tok", .signon_unix = 2, .detached = true, .client = 2 },
+    };
+    const later_case_variant = [_]SessionEntry{
+        .{ .token = "shared-tok", .signon_unix = 3, .detached = false, .client = 3 },
+    };
+    const capsules = [_]SessionCapsule{
+        .{ .account = "Alice", .sessions = &first },
+        .{ .account = "ALICE", .sessions = &later_case_variant },
+    };
+    const live = [_]u64{ 1, 3 };
+
+    var out: [3]SessionState = undefined;
+    const states = try plan(&capsules, &live, &out);
+    try std.testing.expectEqual(@as(usize, 3), states.len);
+    try std.testing.expectEqual(@as(i64, 1), states[0].signon_unix);
+    try std.testing.expectEqual(@as(i64, 2), states[1].signon_unix);
+    try std.testing.expectEqual(@as(i64, 3), states[2].signon_unix);
+    try std.testing.expectEqualStrings("Alice", states[0].account);
+    try std.testing.expectEqualStrings("Alice", states[1].account);
+    try std.testing.expectEqualStrings("ALICE", states[2].account);
+    try std.testing.expectEqualStrings("shared-tok", states[0].token);
+    try std.testing.expectEqualStrings("shared-tok", states[1].token);
+    try std.testing.expectEqualStrings("shared-tok", states[2].token);
+    try std.testing.expect(states[0].attached);
+    try std.testing.expect(!states[1].attached);
+    try std.testing.expect(states[2].attached);
+    try std.testing.expectEqual(@as(usize, 2), countAttached(states));
+    try std.testing.expectEqual(@as(usize, 1), countDetached(states));
+}
+
+test "plan rejects reusable-token authority crossing account boundaries without partial output" {
     const alice_sessions = [_]SessionEntry{
         .{ .token = "shared-tok", .signon_unix = 1, .detached = false, .client = 1 },
     };
@@ -212,8 +263,16 @@ test "plan returns DuplicateToken when two sessions share a token" {
 
     const live = [_]u64{ 1, 2 };
 
-    var out: [8]SessionState = undefined;
+    const sentinel = SessionState{
+        .account = "untouched",
+        .token = "sentinel",
+        .signon_unix = -9,
+        .attached = false,
+        .snapshot = "still-here",
+    };
+    var out: [8]SessionState = @splat(sentinel);
     try std.testing.expectError(error.DuplicateToken, plan(&capsules, &live, &out));
+    for (out) |state| try std.testing.expectEqualDeep(sentinel, state);
 }
 
 test "plan returns TooMany when out is too small" {
@@ -228,8 +287,16 @@ test "plan returns TooMany when out is too small" {
 
     const live = [_]u64{1};
 
-    var out: [2]SessionState = undefined; // too small for 3 sessions
+    const sentinel = SessionState{
+        .account = "untouched",
+        .token = "sentinel",
+        .signon_unix = -9,
+        .attached = false,
+        .snapshot = "still-here",
+    };
+    var out: [2]SessionState = @splat(sentinel); // too small for 3 sessions
     try std.testing.expectError(error.TooMany, plan(&capsules, &live, &out));
+    for (out) |state| try std.testing.expectEqualDeep(sentinel, state);
 }
 
 test "plan over zero capsules yields an empty plan" {

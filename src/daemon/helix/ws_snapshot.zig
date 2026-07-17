@@ -34,7 +34,7 @@
 //! empty partial state (it was sealed at a clean boundary by construction).
 const std = @import("std");
 
-pub const Error = error{ Truncated, TooLong, UnsupportedVersion };
+pub const Error = error{ Truncated, TrailingBytes, InvalidFlags, TooLong, UnsupportedVersion };
 
 /// flags bit0: the carried adapter had completed its HTTP Upgrade (phase=open).
 /// A capsule without it is ignored on adopt (a handshake-phase WS is never
@@ -95,6 +95,8 @@ pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
     if (bytes.len < 5) return error.Truncated;
     const fd = std.mem.readInt(i32, bytes[0..4], .little);
     const flags = bytes[4];
+    if ((flags & ~(flag_phase_open | flag_fragmented | flag_msg_binary)) != 0)
+        return error.InvalidFlags;
     var snap = Snapshot{
         .fd = fd,
         .phase_open = (flags & flag_phase_open) != 0,
@@ -102,7 +104,10 @@ pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
         .msg_binary = (flags & flag_msg_binary) != 0,
     };
     switch (version) {
-        1 => {}, // clean-boundary seal: no partial state on the wire
+        1 => {
+            // Clean-boundary seal: no partial state on the wire.
+            if (bytes.len != 5) return error.TrailingBytes;
+        },
         2 => {
             var p: usize = 5;
             inline for (.{ &snap.deframer, &snap.tx }) |dst| {
@@ -113,9 +118,21 @@ pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
                 dst.* = bytes[p .. p + n];
                 p += n;
             }
+            if (p != bytes.len) return error.TrailingBytes;
         },
         else => return error.UnsupportedVersion,
     }
+    return snap;
+}
+
+/// Decode the exact current v2 adapter state.
+///
+/// Current sealing only carries an open WebSocket adapter. The version-aware
+/// `decode` remains available for explicit v1 fixtures; authoritative current
+/// adoption must use this semantic gate.
+pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    const snap = try decode(bytes, 2);
+    if (!snap.phase_open) return error.InvalidFlags;
     return snap;
 }
 
@@ -186,4 +203,72 @@ test "decode rejects truncation and unknown versions" {
     try testing.expectError(error.Truncated, decode(&bad, 2));
     // Unknown future version fails closed.
     try testing.expectError(error.UnsupportedVersion, decode(&[_]u8{ 1, 0, 0, 0, 1 }, 3));
+}
+
+test "decode rejects reserved flags and trailing bytes" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{ .fd = 7, .phase_open = true });
+    defer allocator.free(bytes);
+
+    const trailing = try allocator.alloc(u8, bytes.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..bytes.len], bytes);
+    trailing[bytes.len] = 0;
+    try testing.expectError(error.TrailingBytes, decode(trailing, 2));
+
+    const bad_flags = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad_flags);
+    bad_flags[4] |= 0x80;
+    try testing.expectError(error.InvalidFlags, decode(bad_flags, 2));
+}
+
+test "ws decodeCurrent requires an open v2 adapter" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{
+        .fd = 17,
+        .phase_open = true,
+        .fragmented = true,
+        .msg_binary = true,
+        .deframer = "partial",
+        .tx = "line",
+    });
+    defer allocator.free(bytes);
+    const got = try decodeCurrent(bytes);
+    try testing.expect(got.phase_open and got.fragmented and got.msg_binary);
+
+    const closed = try encode(allocator, .{ .fd = 17, .phase_open = false });
+    defer allocator.free(closed);
+    try testing.expectError(error.InvalidFlags, decodeCurrent(closed));
+
+    // The deframer intentionally retains the last data frame's opcode after a
+    // completed message, so binary=true while fragmented=false is canonical.
+    const completed_binary = try encode(allocator, .{
+        .fd = 17,
+        .phase_open = true,
+        .fragmented = false,
+        .msg_binary = true,
+    });
+    defer allocator.free(completed_binary);
+    const completed = try decodeCurrent(completed_binary);
+    try testing.expect(!completed.fragmented and completed.msg_binary);
+}
+
+test "ws decodeCurrent rejects every prefix and is allocation-free" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{ .fd = 17, .phase_open = true });
+    defer allocator.free(bytes);
+    for (0..bytes.len) |end| {
+        try testing.expectError(error.Truncated, decodeCurrent(bytes[0..end]));
+    }
+
+    const fn_info = @typeInfo(@TypeOf(decodeCurrent)).@"fn";
+    comptime {
+        const return_type = fn_info.return_type orelse @compileError("decodeCurrent must return a value");
+        const decode_errors = @typeInfo(return_type).error_union.error_set;
+        for (@typeInfo(decode_errors).error_set.error_names.?) |name| {
+            if (std.mem.eql(u8, name, "OutOfMemory"))
+                @compileError("decodeCurrent must remain allocation-free");
+        }
+    }
+    _ = try decodeCurrent(bytes);
 }

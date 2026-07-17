@@ -46,6 +46,9 @@ pub const ScopeKind = enum(u8) {
 };
 
 pub const RelayMessage = struct {
+    /// Transcript schema selected by decode. Not encoded as a map field: field
+    /// presence itself distinguishes legacy 16-field v2 from current v2.1.
+    wire_schema: u8 = 2,
     verb: Verb,
     target: []const u8,
     min_rank: u8 = 0,
@@ -58,6 +61,11 @@ pub const RelayMessage = struct {
     scope_kind: ScopeKind,
     /// One-way identifier for the author's exact portable logical session.
     sender_route_id: ?RouteId = null,
+    /// Origin-signed channel membership/status assertion for this event. A
+    /// present zero value means an ordinary member; null carries no membership
+    /// authority. This lets multi-hop receivers enforce +n/+m without granting
+    /// topology-based trust to an intermediate relay.
+    sender_member_modes: ?u8 = null,
     /// One-way identifier for the direct recipient's exact logical session.
     /// Present for `direct` and `channel_whisper`; absent for `channel`.
     recipient_route_id: ?RouteId = null,
@@ -121,6 +129,7 @@ fn routeIdIsNull(id: RouteId) bool {
 /// rendered fields. Signature presence is checked separately so an origin can
 /// validate the body before stamping it.
 fn validateBody(msg: RelayMessage) SemanticError!void {
+    if (msg.wire_schema != 1 and msg.wire_schema != 2) return error.InvalidSemantic;
     const nick = msg.sourceNick() orelse return error.InvalidSemantic;
     relay_v1.validateSemantic(.{
         .verb = msg.verb,
@@ -141,6 +150,9 @@ fn validateBody(msg: RelayMessage) SemanticError!void {
     if (msg.sender_route_id) |id| {
         if (routeIdIsNull(id)) return error.InvalidSemantic;
     }
+    if (msg.sender_member_modes) |modes| {
+        if ((modes & 0xF0) != 0) return error.InvalidSemantic;
+    }
     if (msg.recipient_route_id) |id| {
         if (routeIdIsNull(id)) return error.InvalidSemantic;
     }
@@ -150,7 +162,8 @@ fn validateBody(msg: RelayMessage) SemanticError!void {
                 return error.InvalidSemantic;
         },
         .direct => {
-            if (isChannelTarget(msg.target) or msg.recipient.len != 0 or msg.recipient_route_id == null)
+            if (isChannelTarget(msg.target) or msg.recipient.len != 0 or msg.recipient_route_id == null or
+                msg.sender_member_modes != null)
                 return error.InvalidSemantic;
         },
         .channel_whisper => {
@@ -201,6 +214,7 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
         .{ .key = "recipient", .value = .{ .string = msg.recipient } },
         .{ .key = "recipient_route_id", .value = .{ .bytes = recipient_route } },
         .{ .key = "scope_kind", .value = .{ .unsigned = @intFromEnum(msg.scope_kind) } },
+        .{ .key = "sender_member_modes", .value = .{ .unsigned = if (msg.sender_member_modes) |m| m else 256 } },
         .{ .key = "sender_route_id", .value = .{ .bytes = sender_route } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
         .{ .key = "tags", .value = .{ .string = msg.tags } },
@@ -222,6 +236,7 @@ const Field = enum(u5) {
     recipient,
     recipient_route_id,
     scope_kind,
+    sender_member_modes,
     sender_route_id,
     source_prefix,
     tags,
@@ -237,9 +252,13 @@ fn claimField(seen: *u32, field: Field) DecodeError!void {
 }
 
 fn allFieldsMask() u32 {
-    // The canonical v2 map has exactly the 16 fields enumerated above. Keep the
+    // The canonical v2 map has exactly the 17 fields enumerated above. Keep the
     // mask explicit: Zig 0.17 deliberately removed generic enum-field reflection.
-    return std.math.maxInt(u16);
+    return (@as(u32, 1) << 17) - 1;
+}
+
+fn legacyFieldsMask() u32 {
+    return allFieldsMask() & ~(@as(u32, 1) << @intFromEnum(Field.sender_member_modes));
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
@@ -292,6 +311,11 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         } else if (std.mem.eql(u8, entry.key, "scope_kind")) {
             try claimField(&seen, .scope_kind);
             msg.scope_kind = try readScope(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "sender_member_modes")) {
+            try claimField(&seen, .sender_member_modes);
+            const modes = try readU64(entry.value);
+            if (modes > 256) return error.InvalidFieldType;
+            msg.sender_member_modes = if (modes == 256) null else @intCast(modes);
         } else if (std.mem.eql(u8, entry.key, "sender_route_id")) {
             try claimField(&seen, .sender_route_id);
             msg.sender_route_id = try readRouteId(entry.value);
@@ -312,7 +336,12 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
             msg.verb = try readVerb(entry.value);
         } else return error.UnknownField;
     }
-    if (seen != allFieldsMask()) return error.MissingField;
+    // The original secure-relay-v2 schema had 16 fields. Decode it as an
+    // authority-free membership assertion; emission of the 17-field current
+    // schema is separately capability-probed so a strict old decoder never sees
+    // an unknown key during a rolling upgrade.
+    if (seen != allFieldsMask() and seen != legacyFieldsMask()) return error.MissingField;
+    msg.wire_schema = if (seen == legacyFieldsMask()) 1 else 2;
     if (msg.origin_pubkey.len != pubkey_len or msg.origin_sig.len != sig_len)
         return error.InvalidFieldType;
     try validateSemantic(msg);
@@ -373,6 +402,10 @@ pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     try out.append(allocator, @intFromEnum(msg.verb));
     try out.append(allocator, @intFromEnum(msg.scope_kind));
     try out.append(allocator, msg.min_rank);
+    if (msg.wire_schema >= 2) {
+        try out.append(allocator, @intFromBool(msg.sender_member_modes != null));
+        if (msg.sender_member_modes) |modes| try out.append(allocator, modes);
+    }
     try appendRoute(&out, allocator, msg.sender_route_id);
     try appendRoute(&out, allocator, msg.recipient_route_id);
     try appendLenPrefixed(&out, allocator, msg.source_prefix);
@@ -441,14 +474,36 @@ pub const VerifyAndIdOutcome = union(enum) {
     verified: RelayId,
     origin_mismatch,
     bad_signature,
+    invalid_semantic,
 };
 
-pub fn verifyAndRelayId(allocator: std.mem.Allocator, msg: RelayMessage) !VerifyAndIdOutcome {
-    return switch (try verifyOrigin(allocator, msg)) {
-        .verified => .{ .verified = try relayId(allocator, msg) },
-        .origin_mismatch => .origin_mismatch,
-        .bad_signature => .bad_signature,
+pub fn verifyAndRelayId(
+    allocator: std.mem.Allocator,
+    msg: RelayMessage,
+) std.mem.Allocator.Error!VerifyAndIdOutcome {
+    validateSemantic(msg) catch return .invalid_semantic;
+    const pubkey: sign.PublicKey = msg.origin_pubkey[0..pubkey_len].*;
+    if (signed_frame.originShortId(pubkey) != msg.origin_node) return .origin_mismatch;
+    const signature: sign.Signature = msg.origin_sig[0..sig_len].*;
+    // Build the canonical transcript once. The same authenticated bytes feed
+    // both Ed25519 verification and the exact relay identity, so admission
+    // callers never need a second derivation pass that could drift.
+    const transcript = originTranscript(allocator, msg) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .invalid_semantic,
     };
+    defer allocator.free(transcript);
+    const valid = sign.verifyCtx(sign_domain, transcript, signature, pubkey) catch false;
+    if (!valid) return .bad_signature;
+
+    var h = std.crypto.hash.Blake3.init(.{});
+    h.update(relay_id_domain);
+    h.update(msg.origin_pubkey);
+    h.update(msg.origin_sig);
+    h.update(transcript);
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    return .{ .verified = digest[0..relay_id_len].* };
 }
 
 /// Bounded per-link exact-event loop cache. This suppresses immediate mesh
@@ -840,22 +895,22 @@ test "secure relay v2 decoder rejects missing unknown and wrong-width fields" {
         .map => |map| map,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(usize, 16), entries.len);
+    try std.testing.expectEqual(@as(usize, 17), entries.len);
 
-    var missing: [15]cpv.MapEntry = undefined;
-    @memcpy(&missing, entries[0..15]);
+    var missing: [16]cpv.MapEntry = undefined;
+    @memcpy(&missing, entries[0..16]);
     const missing_wire = try cpv.Encoder.encode(allocator, .{ .map = &missing });
     defer allocator.free(missing_wire);
     try std.testing.expectError(error.MissingField, decode(allocator, missing_wire));
 
-    var unknown: [17]cpv.MapEntry = undefined;
-    @memcpy(unknown[0..16], entries);
-    unknown[16] = .{ .key = "zzz", .value = .{ .unsigned = 0 } };
+    var unknown: [18]cpv.MapEntry = undefined;
+    @memcpy(unknown[0..17], entries);
+    unknown[17] = .{ .key = "zzz", .value = .{ .unsigned = 0 } };
     const unknown_wire = try cpv.Encoder.encode(allocator, .{ .map = &unknown });
     defer allocator.free(unknown_wire);
     try std.testing.expectError(error.UnknownField, decode(allocator, unknown_wire));
 
-    var wrong_route: [16]cpv.MapEntry = undefined;
+    var wrong_route: [17]cpv.MapEntry = undefined;
     @memcpy(&wrong_route, entries);
     for (&wrong_route) |*entry| {
         if (std.mem.eql(u8, entry.key, "sender_route_id")) {
@@ -867,7 +922,7 @@ test "secure relay v2 decoder rejects missing unknown and wrong-width fields" {
     defer allocator.free(wrong_route_wire);
     try std.testing.expectError(error.InvalidFieldType, decode(allocator, wrong_route_wire));
 
-    var zero_route: [16]cpv.MapEntry = undefined;
+    var zero_route: [17]cpv.MapEntry = undefined;
     @memcpy(&zero_route, entries);
     const zero_id: RouteId = @splat(0);
     for (&zero_route) |*entry| {
@@ -880,7 +935,7 @@ test "secure relay v2 decoder rejects missing unknown and wrong-width fields" {
     defer allocator.free(zero_route_wire);
     try std.testing.expectError(error.InvalidFieldType, decode(allocator, zero_route_wire));
 
-    var wrong_key: [16]cpv.MapEntry = undefined;
+    var wrong_key: [17]cpv.MapEntry = undefined;
     @memcpy(&wrong_key, entries);
     const short_key: [pubkey_len - 1]u8 = @splat(0x01);
     for (&wrong_key) |*entry| {

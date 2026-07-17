@@ -61,6 +61,12 @@ pub const DeliverMsg = struct {
     /// for a locally-raised event). Capped at `broadcast_origin_max`.
     broadcast_origin: [broadcast_origin_max]u8 = @splat(0),
     broadcast_origin_len: u16 = 0,
+    /// Stable signed Event Spine v2 identity/timestamp. When present, every
+    /// destination shard renders the same msgid and origin-HLC server-time as
+    /// the publishing shard. Legacy v1 fan-out leaves this false/zeroed.
+    broadcast_event_id: [16]u8 = @splat(0),
+    broadcast_event_time_ms: u64 = 0,
+    broadcast_has_event_identity: bool = false,
     /// Cross-shard OBSERVE fan-out: when true, `buf` holds an encoded
     /// `observe_event` payload (action + origin + structured subject), and the
     /// owning reactor decodes it, matches its OWN clients' standing OBSERVE filters,

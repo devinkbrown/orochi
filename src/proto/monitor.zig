@@ -282,6 +282,82 @@ pub const MonitorStore = struct {
         try self.notifyWatchers(.RPL_MONOFFLINE, normalized, removed.value.slice(), sink);
     }
 
+    /// Restore one online nick without notifying watchers. Helix rebuilds this
+    /// derived index before any carried client becomes operational; emitting a
+    /// transition would duplicate state the clients already observed before
+    /// exec. Repeated exact-token attachments are intentionally idempotent.
+    pub fn restoreOnline(self: *MonitorStore, nick: []const u8) MonitorError!void {
+        const normalized = try NickKey.init(nick, true);
+        if (self.online.contains(normalized)) return;
+        const display = try NickKey.init(nick, false);
+        try self.online.put(normalized, display);
+    }
+
+    /// Apply a nick occupancy transition without watcher output. All fallible
+    /// validation/reservation precedes mutation, so an OOM leaves the candidate
+    /// index unchanged. Removing a present old row supplies the slot needed for
+    /// the replacement and is therefore allocation-free.
+    pub fn transitionOnlineSilent(
+        self: *MonitorStore,
+        old: []const u8,
+        new: []const u8,
+        old_remains_online: bool,
+    ) MonitorError!void {
+        const old_normalized = try NickKey.init(old, true);
+        const new_normalized = try NickKey.init(new, true);
+        const old_display = try NickKey.init(old, false);
+        const new_display = try NickKey.init(new, false);
+        if (std.mem.eql(u8, old_normalized.slice(), new_normalized.slice())) {
+            if (self.online.getPtr(old_normalized)) |display| {
+                display.* = new_display;
+            } else {
+                try self.online.put(new_normalized, new_display);
+            }
+            return;
+        }
+
+        const old_present = self.online.contains(old_normalized);
+        const new_present = self.online.contains(new_normalized);
+        const removal_supplies_slot = old_present and !old_remains_online;
+        const needed: u32 = @intFromBool(!old_present and old_remains_online) +
+            @intFromBool(!new_present and !removal_supplies_slot);
+        if (needed != 0) try self.online.ensureUnusedCapacity(needed);
+        if (!old_present and old_remains_online)
+            self.online.putAssumeCapacity(old_normalized, old_display);
+        if (!old_remains_online) _ = self.online.remove(old_normalized);
+        if (!new_present) self.online.putAssumeCapacity(new_normalized, new_display);
+    }
+
+    /// Preflight the online-index portion of a physical nick occupancy change.
+    /// Callers that commit World/session identity before emitting MONITOR can
+    /// reserve here while that larger transaction is still abortable. Once this
+    /// succeeds, removing `old` (when required) and inserting `new` cannot
+    /// allocate. `new_was_online` is the caller's pre-transaction occupancy
+    /// snapshot; the store is also checked defensively so duplicate 730s remain
+    /// suppressed if derived state was already repaired.
+    pub fn reserveOnlineTransition(
+        self: *MonitorStore,
+        old: []const u8,
+        new: []const u8,
+        old_remains_online: bool,
+        new_was_online: bool,
+    ) MonitorError!void {
+        const old_normalized = try NickKey.init(old, true);
+        const new_normalized = try NickKey.init(new, true);
+        if (std.mem.eql(u8, old_normalized.slice(), new_normalized.slice())) {
+            if (!self.online.contains(new_normalized)) try self.online.ensureUnusedCapacity(1);
+            return;
+        }
+        const old_will_remove = !old_remains_online and self.online.contains(old_normalized);
+        const new_will_insert = !new_was_online and !self.online.contains(new_normalized);
+        if (new_will_insert and !old_will_remove) try self.online.ensureUnusedCapacity(1);
+    }
+
+    pub fn isOnline(self: *const MonitorStore, nick: []const u8) bool {
+        const normalized = NickKey.init(nick, true) catch return false;
+        return self.online.contains(normalized);
+    }
+
     /// Fill `out` with the clients currently monitoring `nick` (case-insensitive),
     /// returning how many were written (truncated to `out.len`). Used by the
     /// extended-monitor cap to fan a target's state changes to its watchers.
@@ -587,6 +663,85 @@ test "online transition notifies only watching clients" {
         try std.testing.expect(reply.client == 1 or reply.client == 3);
         try expectReply(reply, .RPL_MONONLINE, reply.client, "ALICE");
     }
+}
+
+test "silent online restore and occupancy transition preserve exact monitor state" {
+    var store = MonitorStore.init(std.testing.allocator, 8);
+    defer store.deinit();
+
+    try store.restoreOnline("Alice");
+    try store.restoreOnline("ALICE");
+    try std.testing.expect(store.isOnline("alice"));
+
+    var replies: [16]MonitorReply = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+    try store.addTargets(1, "alice", &sink);
+    try expectReply(sink.replies[0], .RPL_MONONLINE, 1, "Alice");
+
+    // A surviving old occupant keeps the old row while the renamed attachment
+    // adds the new row, all without watcher transition output.
+    try store.transitionOnlineSilent("Alice", "Bob", true);
+    try std.testing.expect(store.isOnline("alice"));
+    try std.testing.expect(store.isOnline("BOB"));
+
+    // Once the old occupant is gone, the same transition removes only old.
+    try store.transitionOnlineSilent("Alice", "Carol", false);
+    try std.testing.expect(!store.isOnline("alice"));
+    try std.testing.expect(store.isOnline("bob"));
+    try std.testing.expect(store.isOnline("carol"));
+
+    // Case-only rename changes display spelling without a false offline/online
+    // notification. A later watcher observes the new canonical display.
+    try store.transitionOnlineSilent("Carol", "CAROL", true);
+    sink.count = 0;
+    sink.used = 0;
+    try store.addTargets(2, "carol", &sink);
+    try expectReply(sink.replies[0], .RPL_MONONLINE, 2, "CAROL");
+}
+
+test "online transition reservation covers replacement and missing case-only display" {
+    var store = MonitorStore.init(std.testing.allocator, 16);
+    defer store.deinit();
+
+    try store.restoreOnline("Alice");
+    try store.reserveOnlineTransition("Alice", "Bob", false, false);
+    var replies: [2]MonitorReply = undefined;
+    var storage: [32]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+    try store.setOffline("Alice", &sink);
+    try store.setOnline("Bob", &sink);
+    try std.testing.expect(!store.isOnline("Alice"));
+    try std.testing.expect(store.isOnline("Bob"));
+
+    var empty = MonitorStore.init(std.testing.allocator, 16);
+    defer empty.deinit();
+    try empty.reserveOnlineTransition("Carol", "CAROL", true, false);
+    try empty.transitionOnlineSilent("Carol", "CAROL", true);
+    try std.testing.expect(empty.isOnline("carol"));
+}
+
+test "online transition reservation is the only allocation before live mutation" {
+    var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var denied_store = MonitorStore.init(denied.allocator(), 16);
+    defer denied_store.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        denied_store.reserveOnlineTransition("Alice", "Bob", true, false),
+    );
+    try std.testing.expect(!denied_store.isOnline("Alice"));
+    try std.testing.expect(!denied_store.isOnline("Bob"));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = MonitorStore.init(failing.allocator(), 16);
+    defer store.deinit();
+    try store.reserveOnlineTransition("Alice", "Bob", true, false);
+    failing.fail_index = failing.alloc_index;
+    var replies: [1]MonitorReply = undefined;
+    var storage: [8]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+    try store.setOnline("Bob", &sink);
+    try std.testing.expect(store.isOnline("Bob"));
 }
 
 test "watchersOf lists the clients monitoring a nick (case-insensitive)" {

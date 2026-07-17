@@ -100,6 +100,10 @@ pub fn decodeConsumeNotice(bytes: []const u8) ConsumeNoticeError!ConsumeNotice {
     pos += 1;
     const raw_nonce = std.mem.readInt(u64, bytes[pos..][0..8], .big);
     pos += 8;
+    // The fixed nonce slot must be zero when the presence flag is clear. A
+    // hidden nonzero value would create multiple signed encodings of the same
+    // local-token claim and undermine byte-level replay/equivocation checks.
+    if (flags & 1 == 0 and raw_nonce != 0) return error.BadFormat;
     const account_len = std.mem.readInt(u16, bytes[pos..][0..2], .big);
     pos += 2;
     if (pos + account_len != bytes.len) return error.BadFormat;
@@ -401,6 +405,36 @@ test "consume notice round-trips local and portable claims" {
     const local = try encodeConsumeNotice(.{ .session_token = token, .account = "alice" }, &buf);
     try testing.expectEqual(@as(?u64, null), (try decodeConsumeNotice(local)).nonce);
     try testing.expectError(error.BadFormat, decodeConsumeNotice(local[0 .. local.len - 1]));
+}
+
+test "consume notice decoder requires one canonical exact wire image" {
+    const notice = ConsumeNotice{
+        .session_token = @splat(0x42),
+        .account = "alice",
+    };
+    var storage: [128]u8 = undefined;
+    const wire = try encodeConsumeNotice(notice, &storage);
+
+    for (0..wire.len) |end| {
+        try testing.expectError(error.BadFormat, decodeConsumeNotice(wire[0..end]));
+    }
+    _ = try decodeConsumeNotice(wire);
+
+    var trailing: [128]u8 = undefined;
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try testing.expectError(error.BadFormat, decodeConsumeNotice(trailing[0 .. wire.len + 1]));
+
+    var malformed: [128]u8 = undefined;
+    @memcpy(malformed[0..wire.len], wire);
+    // magic(4) + token(16) places flags at offset 20 and nonce at 21.
+    malformed[20] = 0x02;
+    try testing.expectError(error.BadFormat, decodeConsumeNotice(malformed[0..wire.len]));
+    malformed[20] = 0;
+    malformed[28] = 1;
+    try testing.expectError(error.BadFormat, decodeConsumeNotice(malformed[0..wire.len]));
+
+    try testing.expectError(error.BufferTooSmall, encodeConsumeNotice(notice, storage[0 .. wire.len - 1]));
 }
 
 test "seal is deterministic for identical inputs" {

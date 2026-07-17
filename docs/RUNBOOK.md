@@ -18,6 +18,9 @@ Orochi runs as a long-lived network daemon with:
 - session-preserving reload via SIGUSR2/Helix, exposed as `systemctl reload orochi`.
 
 Cold restart is the fallback path and drops sessions. Reload is the normal upgrade path.
+Cold restart is also **not crash-durable for the MESSAGE_V2 custody plane** and can lose an
+intermediate node's last un-repaired custody copy — see [Cold Restart](#cold-restart) and the
+[cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
 
 ## Build And Stage
 
@@ -110,10 +113,57 @@ verify systemd, logs, `/INFO`, `/STATS l`, and that node's
 `[stats].channel_dir/status.json`, then repeat on the peer. Do not cold-restart
 both nodes together unless accepting session loss and a temporary mesh partition.
 
+### MESSAGE_V2 activation runbook
+
+MESSAGE_V2 authoring has two configuration reloads after the bridge binary is
+deployed. Keep these as separate, fully verified passes:
+
+1. Deploy the exact bridge binary everywhere with `relay_v2_authoring = "compat"`
+   and no plan. `--check-config` every node before reloading it. A running image
+   whose exact Helix token predates `mesh-clock-v3` requires a planned cold
+   restart for this first bridge deployment.
+2. Select a strictly increasing, never-reused activation epoch and one complete
+   public-key roster. Add the exact epoch/roster everywhere while leaving the
+   mode `compat`; run the new binary's `--check-config` against that final staged
+   config, then Helix-reload every node.
+3. On every roster member, inspect `jq '.relay_v2' status.json` and
+   `/quote MESH ADMISSION`. Require `bridge_implemented=true`, `authoring=compat`, the
+   same non-zero epoch/digest/count, and healthy links. This is an inventory-wide
+   operator gate; direct neighbors and the roster itself do not prove hidden
+   nodes are ready.
+4. For each node in sequence, change only the mode to `active`, run
+   `--check-config`, Helix-reload it, and require `authoring_eligible=true` with
+   the exact epoch/digest/count unchanged. Before advancing to the next node,
+   negotiate message-tags/server-time on controlled clients, send channel and
+   shared portable-session events from the newly active node, and confirm every
+   live attachment sees one copy with one msgid/server-time identity.
+
+The activation plan requires an explicit `[node].secret_key` or a
+`[node].public_key` for persisted-keyfile deployments, secured S2S, signed
+frames, 1..255 valid direct trust roots, and a 2..4096-key full roster containing
+both the local key and every direct root. Direct roots and their compact u64 ids
+must be unique and must not collide with the local identity. For a persisted
+keyfile, derive `public_key` from the already-created `orochi-node.key` identity.
+`--check-config` non-mutatingly reads that existing keyfile and proves the match;
+runtime initialization repeats the binding against the identity it actually
+loaded. A missing, corrupt, or mismatched keyfile rejects preflight. The first
+compat bridge boot without a plan is the natural identity-generation step.
+`bridge_implemented` is a local build marker, not proof that any peer or the full
+mesh is ready.
+
+Once any node is active, neither hot nor cold rollback may change that active
+tuple, return it to `compat`, or boot an image that lacks the exact activation
+and capability semantics. Current Helix handoff
+enforces the boundary in memory, but cold boot has no durable previous-active
+floor. Preserve the exact active configuration and binary through deployment
+automation. Roster change after activation is not implemented and requires a
+future protocol/release. A higher epoch can replace a staged plan only while its
+predecessor remains `compat`; never reuse or rebind an existing epoch.
+
 ## Cold Restart
 
-Use cold restart only when changing host-level unit constraints, recovering from a bad
-state, or accepting session loss:
+Before MESSAGE_V2 activation, use cold restart only when changing host-level unit
+constraints, recovering from a bad state, or accepting session loss:
 
 ```sh
 systemctl restart orochi
@@ -121,11 +171,23 @@ systemctl status orochi --no-pager
 ```
 
 Cold restart drops live client sessions and mesh links. Mesh peers should redial through
-the configured `[mesh].connect` and listener paths.
+the configured `[mesh].connect` and listener paths. After any mesh member activates,
+a cold restart is allowed only with a compatible binary and the exact active tuple.
+
+Cold restart is **not crash-durable for the MESSAGE_V2 custody plane**. The RVL2/RVO2/RVG2/ADS1
+custody authorities are in-memory and survive only a connection-preserving Helix reload, whose
+checkpoints ride the upgrade capsule across re-exec. A cold restart (or power loss) discards them,
+so an intermediate node that has ACKed upstream but not yet repaired a message downstream can lose
+that message's last custody copy. Prefer `systemctl reload orochi`; hard-restart only from a drained
+node with no outstanding custody obligations. See the
+[cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
 
 ## Rollback
 
-Keep the previous known-good binary before replacing `/usr/local/bin/orochi`:
+The generic procedures below apply only before any MESSAGE_V2 member activates.
+After activation, rollback is restricted to a compatible binary that preserves
+the exact active tuple. Keep the previous known-good binary before replacing
+`/usr/local/bin/orochi`:
 
 ```sh
 install -m 0755 /usr/local/bin/orochi /usr/local/bin/orochi.prev
@@ -133,8 +195,9 @@ install -m 0755 /tmp/orochi-stage/bin/orochi /usr/local/bin/orochi
 systemctl reload orochi
 ```
 
-If the new image fails after reload and the previous binary supports the same
-multi-shard listener handoff (Orochi 0.5.2 or newer), a second reload is allowed:
+If the new image fails after reload and the previous binary exposes the exact
+full Helix capability token required by the running image, a second reload is
+allowed. Multi-shard listener compatibility is necessary but not sufficient:
 
 ```sh
 install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
@@ -179,10 +242,10 @@ the configured stats directory with nginx or another static file server if neede
 
 | Symptom | Likely Cause | Action |
 |---|---|---|
-| `--check-config` fails | Bad TOML, missing `[node].id`, missing `[listen].irc`, invalid range, missing `@file:` target | Fix config and rerun `--check-config`; do not reload until clean. |
+| `--check-config` fails | Bad TOML, missing required fields, invalid range/`@file:` target, or a MESSAGE_V2 activation keyfile that is missing, corrupt, or mismatched | Fix config/identity and rerun `--check-config`; do not reload until clean. |
 | systemd starts then loops | Binary crash or invalid runtime dependency | Check `journalctl -u orochi`; restore previous binary and restart/reload. |
 | Privileged port bind fails | Unit lacks `CAP_NET_BIND_SERVICE` or port already bound | Add capability lines from unit or move listeners to high ports; inspect `ss -ltnup`. |
-| Reload drops sessions | Helix fallback or adoption failure | Check logs for `SIGUSR2 UPGRADE failed` or adoption errors; run `tools/upgrade_smoke.py` locally. |
+| Reload drops sessions | Helix exact-handoff invariant violation | Stop the rollout, preserve evidence, check logs for `SIGUSR2 UPGRADE failed` or adoption errors, and run `tools/upgrade_smoke.py` locally. Current UPGRADE does not intentionally fall back to listener-only or partial adoption. |
 | Mesh peer absent after reload | Peer link not reattached or redial still pending | Inspect `/INFO`, `/STATS l`, status feed, and `[mesh].connect`; verify peer listener reachability. |
 | Metrics unavailable | `[metrics].listen = 0`, bind failure, or loopback-only bind | Check config and startup logs; default bind is loopback unless widened deliberately. |
 | WebSocket/WebTransport disabled | TLS cert/key material missing or listener disabled | Check `[tls]`, `[listen].ws`, `[listen].webtransport`, and boot logs. |

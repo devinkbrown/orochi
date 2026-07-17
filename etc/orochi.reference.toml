@@ -25,8 +25,10 @@
 id = 1
 
 # Optional Ed25519 identity keypair (hex), enabling PQ-secured S2S links. When
-# secret_key is set the daemon derives its node identity and runs the Tsumugi
-# (X-Wing + Ed25519) handshake for secured peers. Omit for plaintext-only mesh.
+# secret_key is set the daemon derives its node identity. Otherwise it loads or
+# creates `orochi-node.key` beside this config. Set public_key when a keyfile-backed
+# node needs MESSAGE_V2 activation preflight; runtime requires it to match the
+# loaded private identity.
 # public_key = "env:OROCHI_NODE_PUBKEY"
 # secret_key = "env:OROCHI_NODE_SECKEY"
 
@@ -257,6 +259,27 @@ realm = "local"
 # admission_token = "env:OROCHI_MESHPASS_TOKEN"
 # admission_roots = ["env:OROCHI_MESHPASS_ROOT"]
 # admission_min_revocation_epoch = 0
+# MESSAGE_V2 authoring uses an explicit two-phase rollout. `compat` (the safe
+# default) still receives, ACKs, retains, and forwards MESSAGE_V2 but authors
+# legacy events only. First deploy the bridge binary everywhere, then stage the
+# same never-reused non-zero generation and COMPLETE secured-mesh public-key
+# roster on every node while all nodes remain `compat`, and Helix-reload every
+# node once to publish that staged plan. A plan also requires an explicit
+# [node].secret_key OR matching [node].public_key for a persisted keyfile,
+# require_secured=true, require_signed_frames=true, 1..255 unique direct roots,
+# and a 2..4096-key full roster containing the local key and every direct root.
+# Roots/local compact node ids must not collide. Only after verifying every live
+# roster member reports the same epoch/digest/count and bridge_implemented=true may
+# operators switch ONLY the mode to `active` and Helix-reload sequentially.
+# Active nodes author each V2-eligible event as MESSAGE_V2 only and never emit a
+# legacy twin for an admitted event. V2-eligible means channel PRIVMSG, NOTICE,
+# TAGMSG, DATA, REQUEST, and REPLY; direct variants require a portable recipient
+# token. Never cold-start an image that lacks the exact activation/capability
+# semantics or changes the active tuple. Roster change after activation is not
+# implemented.
+# relay_v2_authoring = "compat"
+# relay_v2_activation_epoch = 1
+# relay_v2_roster = ["env:NODE_A_PUBKEY", "env:NODE_B_PUBKEY"]
 # Auto-connect peers: each "host:port" is dialed at boot and re-dialed while
 # its S2S link is down, so the mesh stays linked without an oper CONNECT.
 # Hostnames resolve via DNS (A record); IPv6 hosts are bracketed ("[::1]:6900").

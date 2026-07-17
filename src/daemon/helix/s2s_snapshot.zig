@@ -29,10 +29,17 @@
 //!     [u64 local_epoch][u64 remote_epoch][u32 send_credit][u32 pending_credit]
 //!     [u64 next_out_seq][u64 next_in_seq][u64 last_acked]
 //!   inner identity/caps:
-//!     [u64 remote_node_id][u64 remote_epoch_ms][u8 caps]  (bit0 signing, bit1
+//!     [u64 remote_node_id][u64 remote_epoch_ms][u8 caps][u8 caps_ext]
+//!                                                        (caps bit0 signing, bit1
 //!                                                          account, bit2 oper_info,
 //!                                                          bit3 repair_frames,
-//!                                                          bit4 session_replica_v2)
+//!                                                          bit4 session_replica_v2,
+//!                                                          bit5 secure_relay_v2,
+//!                                                          bit6 attachment_lease_v2,
+//!                                                          bit7 event_spine_v2;
+//!                                                         caps_ext bit0 relay-v2.1
+//!                                                                  bit1 ACK confirm
+//!                                                         schema + ACK support)
 //!   [u16 len][remote_name]
 //!   [u16 len][connect_addr] raw sockaddr.in6 of the dial target (initiator only)
 //!   [u32 len][rec_inbuf]    partial inbound record buffered at export
@@ -42,14 +49,22 @@ const std = @import("std");
 const hs = @import("../../crypto/tsumugi_handshake.zig");
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 
-pub const Error = error{ Truncated, TooLong, UnsupportedVersion };
+pub const Error = error{
+    Truncated,
+    TooLong,
+    UnsupportedVersion,
+    InvalidRole,
+    InvalidBoolean,
+    UnknownCaps,
+    TrailingBytes,
+};
 
 pub const est_len = hs.Established.serialized_len;
 
 /// Current `.s2s_link` capsule schema version whose blob layout `encode` writes.
 /// The blob carries no inline version — it rides the capsule header — so this
 /// MIRRORS the descriptor in `capsule.zig`; bump both together.
-pub const schema_version: u16 = 2;
+pub const schema_version: u16 = 3;
 
 /// Length of the embedded `Established` blob in schema v1 capsules. v2 appended a
 /// trailing `admitted_frame_families` (u32) to `Established.serialize`, so a v1
@@ -62,7 +77,11 @@ pub const cap_account: u8 = s2s_frame.cap_member_account;
 pub const cap_oper_info: u8 = s2s_frame.cap_member_oper_info;
 pub const cap_repair: u8 = s2s_frame.cap_repair_frames;
 pub const cap_session_replica_v2: u8 = s2s_frame.cap_session_replica_v2;
+pub const cap_secure_relay_v2: u8 = s2s_frame.cap_secure_relay_v2;
 pub const cap_session_attachment_lease_v2: u8 = s2s_frame.cap_session_attachment_lease_v2;
+pub const cap_event_spine_v2: u8 = s2s_frame.cap_event_spine_v2;
+pub const cap_ext_relay_v2_current: u8 = 1 << 0;
+pub const cap_ext_relay_v2_ack_confirm: u8 = 1 << 1;
 
 /// A plain view of one carried secured link. `remote_name`/`rec_inbuf`/`pending_out`
 /// borrow the source (encode input) or the decoded buffer (decode output); the
@@ -90,6 +109,7 @@ pub const Snapshot = struct {
     remote_node_id: u64 = 0,
     remote_epoch_ms: u64 = 0,
     caps: u8 = 0,
+    caps_ext: u8 = 0,
     remote_name: []const u8 = &.{},
     /// Raw `posix.sockaddr.in6` bytes of the dial target (initiator links only),
     /// so the successor's `[mesh].connect` sweep recognizes the preserved link and
@@ -130,6 +150,7 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try appendInt(&out, allocator, u64, snap.remote_node_id);
     try appendInt(&out, allocator, u64, snap.remote_epoch_ms);
     try out.append(allocator, snap.caps);
+    try out.append(allocator, snap.caps_ext);
 
     try appendInt(&out, allocator, u16, @intCast(snap.remote_name.len));
     try out.appendSlice(allocator, snap.remote_name);
@@ -153,17 +174,34 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
 /// schema version is rejected fail-closed (a too-new blob may have grown the
 /// `Established` region again and cannot be parsed here).
 pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
+    // Every supported predecessor layout is still an authority-bearing Helix
+    // image. Version tolerance must not imply tolerance for non-boolean flags,
+    // reserved roles, or trailing bytes.
+    return decodeInternal(bytes, version, true);
+}
+
+/// Decode exactly the current schema emitted by `encode`. Current-generation
+/// whole handoffs must not accept reserved roles/capabilities, non-boolean
+/// flags, legacy layouts, or bytes after the final bounded field.
+pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    return decodeInternal(bytes, schema_version, true);
+}
+
+fn decodeInternal(bytes: []const u8, version: u16, strict_current: bool) Error!Snapshot {
     var r = Reader{ .buf = bytes };
     var snap = Snapshot{};
     snap.fd = try r.int(i32);
     snap.role = try r.byte();
-    snap.s2s_initiator = (try r.byte()) != 0;
+    if (strict_current and snap.role > 1) return error.InvalidRole;
+    const initiator = try r.byte();
+    if (strict_current and initiator > 1) return error.InvalidBoolean;
+    snap.s2s_initiator = initiator != 0;
     switch (version) {
         1 => {
             @memcpy(snap.established[0..est_len_v1], try r.take(est_len_v1));
             @memset(snap.established[est_len_v1..], 0); // admitted_frame_families = 0
         },
-        schema_version => @memcpy(&snap.established, try r.take(est_len)),
+        2, schema_version => @memcpy(&snap.established, try r.take(est_len)),
         // Fail-closed: only v1 and the current schema are parseable here. MAINTENANCE
         // TRAP — each future schema bump that keeps `min_supported = 1` in the capsule
         // descriptor MUST add an explicit legacy arm above for EVERY still-accepted
@@ -186,11 +224,25 @@ pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
     snap.remote_node_id = try r.int(u64);
     snap.remote_epoch_ms = try r.int(u64);
     snap.caps = try r.byte();
+    if (version >= 3) snap.caps_ext = try r.byte();
+    const known_caps = cap_signing | cap_account | cap_oper_info | cap_repair |
+        cap_session_replica_v2 | cap_secure_relay_v2 |
+        cap_session_attachment_lease_v2 | cap_event_spine_v2;
+    if (strict_current and snap.caps & ~known_caps != 0) return error.UnknownCaps;
+    if (strict_current and snap.caps_ext &
+        ~(cap_ext_relay_v2_current | cap_ext_relay_v2_ack_confirm) != 0)
+        return error.UnknownCaps;
+    if (strict_current and snap.caps_ext & cap_ext_relay_v2_ack_confirm != 0 and
+        snap.caps_ext & cap_ext_relay_v2_current == 0) return error.UnknownCaps;
+    if (strict_current and snap.caps_ext & cap_ext_relay_v2_current != 0 and
+        (snap.caps & (cap_signing | cap_secure_relay_v2)) !=
+            (cap_signing | cap_secure_relay_v2)) return error.UnknownCaps;
 
     snap.remote_name = try r.take(try r.int(u16));
     snap.connect_addr = try r.take(try r.int(u16));
     snap.rec_inbuf = try r.take(try r.int(u32));
     snap.pending_out = try r.take(try r.int(u32));
+    if (strict_current and r.pos != bytes.len) return error.TrailingBytes;
     return snap;
 }
 
@@ -255,7 +307,8 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
         .pl_last_acked = 66,
         .remote_node_id = 0xDEADBEEFCAFEF00D,
         .remote_epoch_ms = 2000,
-        .caps = cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2 | cap_session_attachment_lease_v2,
+        .caps = cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2 | cap_secure_relay_v2 | cap_session_attachment_lease_v2 | cap_event_spine_v2,
+        .caps_ext = cap_ext_relay_v2_current | cap_ext_relay_v2_ack_confirm,
         .remote_name = "ircx.us",
         .connect_addr = &@as([28]u8, @splat('\x0a')),
         .rec_inbuf = "\x04\x00\x00\x00partial",
@@ -280,7 +333,8 @@ test "s2s link snapshot round-trips fd, keys, counters, framing header + buffers
     try testing.expectEqual(@as(u64, 77), got.pl_next_in_seq);
     try testing.expectEqual(@as(u64, 66), got.pl_last_acked);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEF00D), got.remote_node_id);
-    try testing.expectEqual(cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2 | cap_session_attachment_lease_v2, got.caps);
+    try testing.expectEqual(cap_signing | cap_oper_info | cap_repair | cap_session_replica_v2 | cap_secure_relay_v2 | cap_session_attachment_lease_v2 | cap_event_spine_v2, got.caps);
+    try testing.expectEqual(cap_ext_relay_v2_current | cap_ext_relay_v2_ack_confirm, got.caps_ext);
     try testing.expectEqualStrings("ircx.us", got.remote_name);
     try testing.expectEqualStrings(&@as([28]u8, @splat('\x0a')), got.connect_addr);
     try testing.expectEqualStrings("\x04\x00\x00\x00partial", got.rec_inbuf);
@@ -291,10 +345,64 @@ test "s2s link snapshot decode rejects truncation" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }, schema_version));
 }
 
+test "current s2s decode rejects noncanonical flags capabilities legacy and trailing bytes" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{ .fd = 41, .remote_node_id = 9 });
+    defer allocator.free(bytes);
+    _ = try decodeCurrent(bytes);
+
+    const bad_role = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad_role);
+    bad_role[4] = 2;
+    try testing.expectError(error.InvalidRole, decodeCurrent(bad_role));
+    const bad_bool = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad_bool);
+    bad_bool[5] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(bad_bool));
+
+    const trailing = try allocator.alloc(u8, bytes.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..bytes.len], bytes);
+    trailing[bytes.len] = 0;
+    try testing.expectError(error.TrailingBytes, decodeCurrent(trailing));
+    try testing.expectError(error.Truncated, decodeCurrent(bytes[0 .. bytes.len - 1]));
+}
+
 /// Byte offset of the embedded `Established` region: `fd`(i32) + `role`(u8) +
 /// `s2s_initiator`(u8). The trailing `admitted_frame_families`(u32) that v2 added
 /// lives at the END of that region.
 const est_field_off: usize = @sizeOf(i32) + 1 + 1;
+const caps_ext_field_off_v2: usize = est_field_off + est_len +
+    8 + 8 + 8 +
+    8 + 8 + 4 + 4 + 8 + 8 + 8 +
+    8 + 8 + 1;
+
+test "current s2s decode rejects inconsistent relay-v2 capability combinations" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{
+        .fd = 41,
+        .remote_node_id = 9,
+        .caps = cap_signing | cap_secure_relay_v2,
+        .caps_ext = cap_ext_relay_v2_current | cap_ext_relay_v2_ack_confirm,
+    });
+    defer allocator.free(bytes);
+    _ = try decodeCurrent(bytes);
+
+    const confirm_without_current = try allocator.dupe(u8, bytes);
+    defer allocator.free(confirm_without_current);
+    confirm_without_current[caps_ext_field_off_v2] = cap_ext_relay_v2_ack_confirm;
+    try testing.expectError(error.UnknownCaps, decodeCurrent(confirm_without_current));
+
+    const current_without_secure_relay = try allocator.dupe(u8, bytes);
+    defer allocator.free(current_without_secure_relay);
+    current_without_secure_relay[caps_ext_field_off_v2 - 1] = cap_signing;
+    try testing.expectError(error.UnknownCaps, decodeCurrent(current_without_secure_relay));
+
+    const current_without_signing = try allocator.dupe(u8, bytes);
+    defer allocator.free(current_without_signing);
+    current_without_signing[caps_ext_field_off_v2 - 1] = cap_secure_relay_v2;
+    try testing.expectError(error.UnknownCaps, decodeCurrent(current_without_signing));
+}
 
 test "s2s link snapshot v2 round-trip preserves admitted_frame_families" {
     const allocator = testing.allocator;
@@ -315,7 +423,12 @@ test "s2s link snapshot v2 round-trip preserves admitted_frame_families" {
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
 
-    const got = try decode(bytes, schema_version);
+    var legacy_v2 = try allocator.alloc(u8, bytes.len - 1);
+    defer allocator.free(legacy_v2);
+    @memcpy(legacy_v2[0..caps_ext_field_off_v2], bytes[0..caps_ext_field_off_v2]);
+    @memcpy(legacy_v2[caps_ext_field_off_v2..], bytes[caps_ext_field_off_v2 + 1 ..]);
+
+    const got = try decode(legacy_v2, 2);
     try testing.expectEqualSlices(u8, &snap.established, &got.established);
     try testing.expectEqual(
         @as(u32, 0x1122_3344),
@@ -326,6 +439,18 @@ test "s2s link snapshot v2 round-trip preserves admitted_frame_families" {
     try testing.expectEqualStrings("peer.example", got.remote_name);
     try testing.expectEqualStrings("inbuf", got.rec_inbuf);
     try testing.expectEqualStrings("pending", got.pending_out);
+    try testing.expectEqual(@as(u8, 0), got.caps_ext);
+
+    const trailing = try allocator.alloc(u8, legacy_v2.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..legacy_v2.len], legacy_v2);
+    trailing[legacy_v2.len] = 0;
+    try testing.expectError(error.TrailingBytes, decode(trailing, 2));
+
+    const bad_bool = try allocator.dupe(u8, legacy_v2);
+    defer allocator.free(bad_bool);
+    bad_bool[5] = 2;
+    try testing.expectError(error.InvalidBoolean, decode(bad_bool, 2));
 }
 
 test "s2s link snapshot v1 blob decodes with admitted_frame_families=0 and all following fields intact" {
@@ -360,8 +485,12 @@ test "s2s link snapshot v1 blob decodes with admitted_frame_families=0 and all f
     // Encode at v2, then synthesize the v1 wire format by SPLICING OUT the trailing
     // admitted_frame_families(u32) at the end of the Established region — exactly
     // what a pre-bump binary would have produced.
-    const v2 = try encode(allocator, snap);
+    const current = try encode(allocator, snap);
+    defer allocator.free(current);
+    var v2 = try allocator.alloc(u8, current.len - 1);
     defer allocator.free(v2);
+    @memcpy(v2[0..caps_ext_field_off_v2], current[0..caps_ext_field_off_v2]);
+    @memcpy(v2[caps_ext_field_off_v2..], current[caps_ext_field_off_v2 + 1 ..]);
     const cut_at = est_field_off + est_len - 4;
     var v1: std.ArrayList(u8) = .empty;
     defer v1.deinit(allocator);

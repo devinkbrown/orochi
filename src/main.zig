@@ -229,6 +229,30 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("config ERROR in {s}: meshed node ([mesh] connect or [listen] s2s set) has no shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence — set the SAME [cloak] secret on every mesh node\n", .{path});
                         std.process.exit(1);
                     }
+                    // A public-key-only activation plan relies on the persisted
+                    // node seed used by normal boot. Validate that exact existing
+                    // identity without generating or changing the keyfile, so a
+                    // pre-deploy check cannot pass and then fail at restart.
+                    if (l.parsed.mesh.relay_v2_activation_epoch != 0 and
+                        l.parsed.node.secret_key == null)
+                    {
+                        const key_path = orochi.daemon.node_keyfile.derivePath(allocator, path) catch |err| {
+                            std.debug.print("config ERROR in {s}: cannot derive node keyfile path: {s}\n", .{ path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                        defer allocator.free(key_path);
+                        orochi.daemon.node_keyfile.validateExistingPublicKey(
+                            allocator,
+                            init.io,
+                            std.Io.Dir.cwd(),
+                            key_path,
+                            l.parsed.mesh.realm,
+                            l.parsed.node.public_key orelse unreachable,
+                        ) catch |err| {
+                            std.debug.print("config ERROR in {s}: activation node identity in {s}: {s}\n", .{ path, key_path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                    }
                     std.debug.print("config OK: {s}\n", .{path});
                     return;
                 } else |err| {
@@ -882,6 +906,12 @@ pub fn main(init: std.process.Init) !void {
     };
     defer srv.deinit();
 
+    // Helix successor adoption must finish before start() launches any
+    // off-reactor producer (webhook/media/metrics workers). Starting first left
+    // a window in which a new-process webhook could acknowledge and enqueue an
+    // event behind the still-unapplied inherited World/session boundary.
+    if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
+
     // Drive the SerpentRegistry module init→ready lifecycle now that the server
     // is at its final address (init() returns by value, so `self` is not stable
     // inside it). No-op until a module declares lifecycle fns.
@@ -1019,10 +1049,6 @@ pub fn main(init: std.process.Init) !void {
 
     // OroWasm: load any *.wasm control-plane plugins from [wasm] plugin_dir.
     srv.loadWasmPlugins();
-
-    // Helix UPGRADE successor: re-attach the carried-over client connections
-    // (inherited socket fds + restored sessions) now that the ring exists.
-    if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
 
     // SIGUSR2 → connection-preserving Helix UPGRADE: lets a shell-driven deploy
     // (`systemctl kill -s USR2 orochi`, after staging the new binary) hot-swap

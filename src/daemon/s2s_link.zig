@@ -28,6 +28,7 @@ const sign = @import("../crypto/sign.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const meshpass = @import("../proto/meshpass.zig");
+const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -35,6 +36,8 @@ pub const RelayVerb = s2s_peer.RelayVerb;
 pub const RelayMessageV2 = s2s_peer.RelayMessageV2;
 pub const RelayVerbV2 = s2s_peer.RelayVerbV2;
 pub const InboundMessageV2 = s2s_peer.InboundMessageV2;
+pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
+pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
 const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
 const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
@@ -76,6 +79,8 @@ pub const Options = struct {
     session_replica_transport_enabled: bool = false,
     /// Independent Tsumugi transport assertion for secure relay v2.
     secure_relay_transport_enabled: bool = false,
+    /// Independent Tsumugi transport assertion for Event Spine v2.
+    event_spine_v2_transport_enabled: bool = false,
 };
 
 pub const S2sLink = struct {
@@ -101,6 +106,13 @@ pub const S2sLink = struct {
 
     fn sink(self: *S2sLink) s2s_peer.ByteSink {
         return .{ .ptr = self, .write_fn = sinkWrite };
+    }
+
+    /// Reserve the exact inner-wire bytes for a transactional secured-link
+    /// emission. Once this succeeds, the ByteSink append at the end of the pure
+    /// peer encoder cannot fail after the peer has finished signing the frame.
+    pub fn reserveOutboundCapacity(self: *S2sLink, additional: usize) !void {
+        try self.out.ensureUnusedCapacity(self.allocator, additional);
     }
 
     /// Initialize in place. `self` must already live at its final address.
@@ -135,6 +147,7 @@ pub const S2sLink = struct {
             .admitted_frame_families = opts.admitted_frame_families,
             .session_replica_transport_enabled = opts.session_replica_transport_enabled,
             .secure_relay_transport_enabled = opts.secure_relay_transport_enabled,
+            .event_spine_v2_transport_enabled = opts.event_spine_v2_transport_enabled,
         });
     }
 
@@ -233,6 +246,7 @@ pub const S2sLink = struct {
             .admitted_frame_families = opts.admitted_frame_families,
             .session_replica_transport_enabled = opts.session_replica_transport_enabled,
             .secure_relay_transport_enabled = opts.secure_relay_transport_enabled,
+            .event_spine_v2_transport_enabled = opts.event_spine_v2_transport_enabled,
         }, hdr, remote_name, opts.now_ms, rng_seed);
     }
 
@@ -484,12 +498,44 @@ pub const S2sLink = struct {
         return self.peer.supportsSecureRelayV2();
     }
 
+    pub fn supportsRelayV2AckConfirm(self: *const S2sLink) bool {
+        return self.peer.supportsRelayV2AckConfirm();
+    }
+
     pub fn sendMessageV2(self: *S2sLink, msg: s2s_peer.RelayMessageV2) !void {
         try self.peer.sendMessageV2(self.sink(), msg);
     }
 
+    pub fn forwardMessageV2(self: *S2sLink, wire: []const u8) !bool {
+        return self.peer.forwardMessageV2(self.sink(), wire);
+    }
+
+    pub fn replayRetainedMessageV2Wire(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.replayRetainedMessageV2Wire(self.sink(), wire);
+    }
+
     pub fn takeInboundV2(self: *S2sLink) ![]s2s_peer.InboundMessageV2 {
         return self.peer.takeInboundV2();
+    }
+
+    pub fn sendMessageV2Ack(self: *S2sLink, id: message_relay_v2.RelayId) !void {
+        try self.peer.sendMessageV2Ack(self.sink(), id);
+    }
+
+    pub fn sendMessageV2AckConfirm(self: *S2sLink, id: message_relay_v2.RelayId) !void {
+        try self.peer.sendMessageV2AckConfirm(self.sink(), id);
+    }
+
+    pub fn probeRelayV2Current(self: *S2sLink) !void {
+        try self.peer.probeRelayV2Current(self.sink());
+    }
+
+    pub fn takeInboundV2Acks(self: *S2sLink) ![]message_relay_v2.RelayId {
+        return self.peer.takeInboundV2Acks();
+    }
+
+    pub fn takeInboundV2AckConfirms(self: *S2sLink) ![]message_relay_v2.RelayId {
+        return self.peer.takeInboundV2AckConfirms();
     }
 
     pub fn takeDroppedRelayV2Frames(self: *S2sLink) u64 {
@@ -668,10 +714,42 @@ pub const S2sLink = struct {
         try self.peer.sendOperEvent(self.sink(), category, severity, origin_server, message);
     }
 
+    pub fn sendLegacyOperEvent(self: *S2sLink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
+        try self.peer.sendLegacyOperEvent(self.sink(), category, severity, origin_server, message);
+    }
+
     /// Drain queued inbound OPER_EVENT payloads from this peer (caller owns +
     /// frees each slice and the outer slice; decode with `oper_event.decode`).
     pub fn takeOperEvents(self: *S2sLink) ![][]u8 {
         return self.peer.takeOperEvents();
+    }
+
+    pub fn supportsEventSpineV2(self: *const S2sLink) bool {
+        return self.peer.supportsEventSpineV2();
+    }
+
+    pub fn sendOperEventV2Authored(self: *S2sLink, category: u6, severity: u8, hlc: u64, origin_server: []const u8, subject: []const u8, message: []const u8) !bool {
+        return self.peer.sendOperEventV2Authored(self.sink(), category, severity, hlc, origin_server, subject, message);
+    }
+
+    pub fn sendOperEventV2(self: *S2sLink, event: SignedOperEventV2) !bool {
+        return self.peer.sendOperEventV2(self.sink(), event);
+    }
+
+    pub fn forwardOperEventV2(self: *S2sLink, wire: []const u8) !bool {
+        return self.peer.forwardOperEventV2(self.sink(), wire);
+    }
+
+    pub fn takeOperEventsV2(self: *S2sLink) ![]InboundOperEventV2 {
+        return self.peer.takeOperEventsV2();
+    }
+
+    pub fn takeDroppedOperEventV2Frames(self: *S2sLink) u64 {
+        return self.peer.takeDroppedOperEventV2Frames();
+    }
+
+    pub fn takeRejectedOperEventV2Frames(self: *S2sLink) u64 {
+        return self.peer.takeRejectedOperEventV2Frames();
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).

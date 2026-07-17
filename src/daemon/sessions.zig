@@ -15,10 +15,13 @@
 //! supplies the reclaim token (generated from the daemon CSPRNG). A flat per-
 //! account list keeps ownership trivial (one owned account-name key per account).
 const std = @import("std");
+const builtin = @import("builtin");
 const rwlock = @import("../substrate/rwlock.zig");
+const attachment_id_mod = @import("attachment_id.zig");
 
 pub const ClientId = u64;
 pub const Token = [16]u8;
+pub const AttachmentId = attachment_id_mod.AttachmentId;
 
 /// The all-zero value records a locally tracked session when no CSPRNG was
 /// available. It is deliberately not a reclaim credential and therefore must
@@ -43,6 +46,9 @@ pub const Error = std.mem.Allocator.Error || error{
     TooManyAccounts,
     TooManySessions,
     TokenAccountMismatch,
+    InvalidAttachmentId,
+    DuplicateAttachmentId,
+    AttachmentIdMismatch,
 };
 
 pub const Config = struct {
@@ -91,6 +97,17 @@ pub const LocalChannelProjectionWork = struct {
     projection: LocalChannelProjection,
 };
 
+pub const AttachmentReplicaWork = struct {
+    token: Token,
+    attachment_id: AttachmentId,
+};
+
+pub const AttachmentLocalChannelProjectionWork = struct {
+    token: Token,
+    attachment_id: AttachmentId,
+    projection: LocalChannelProjection,
+};
+
 /// One accepted arm plus the exact same-channel intent it replaced. Producers
 /// that can still reject before their first live mutation use this to restore
 /// older accepted work instead of accidentally erasing it.
@@ -102,21 +119,27 @@ pub const LocalChannelProjectionArm = struct {
 pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
     InvalidChannel,
     NoSuchToken,
+    NoSuchAttachment,
     TooManyPendingChannels,
 };
 
 pub const Session = struct {
     client: ClientId,
     token: Token,
+    /// Stable identity of this physical attachment across reconnects, node
+    /// moves, and Helix upgrades. Null marks a legacy row created through the
+    /// compatibility API; current attachment-aware protocols must reject it
+    /// rather than deriving identity from `client`, fd, or the reusable token.
+    attachment_id: ?AttachmentId = null,
     signon_ms: i64,
     /// True while the underlying connection is attached; false when the client
     /// dropped but the session is retained for reclaim/bouncer buffering.
     attached: bool = true,
     /// Optional server-owned encoded restore snapshot for detached sessions.
     snapshot: ?[]u8 = null,
-    /// True after a portable (mesh-sealed) resume credential has been revealed
-    /// for this exact session. Only opted-in sessions need their detached state
-    /// replicated to mesh peers.
+    /// Durable group-portability bit. Once any sibling reveals a portable
+    /// credential, every exact-token row carries true so issuer removal cannot
+    /// silently disable renewal or detached publication.
     portable_resume: bool = false,
     /// A local state mutation for this reusable token has not yet been accepted
     /// by the signed replica store. Dirty is a token-group property: whenever
@@ -126,14 +149,44 @@ pub const Session = struct {
     /// local attachment's live state. This receive-side retry lane is separate
     /// from `replica_dirty` so projection never mints or republishes a replica.
     replica_projection_dirty: bool = false,
+    /// Current-generation SRA3 retry lanes are exact-row properties. They stay
+    /// separate from the legacy token-group bits above so compatibility replay
+    /// cannot clear or deduplicate sibling attachment work.
+    attachment_replica_dirty: bool = false,
+    attachment_replica_projection_dirty: bool = false,
     /// Lazily allocated retry journal. Each row owns a complete copy so sibling
     /// removal cannot erase pending work; null means no channel is pending.
     local_channel_projections: ?*LocalChannelProjectionSet = null,
+    /// SRA3/local current projection journal for this physical attachment only.
+    /// It must never be copied to siblings sharing the reusable token.
+    attachment_channel_projections: ?*LocalChannelProjectionSet = null,
 };
+
+fn sessionMatchesAttachment(session: Session, token: Token, attachment_id: AttachmentId) bool {
+    const current = session.attachment_id orelse return false;
+    return std.crypto.timing_safe.eql(Token, session.token, token) and
+        current.eql(attachment_id);
+}
 
 pub const ResumeHandle = struct {
     token: Token,
+    attachment_id: ?AttachmentId = null,
     portable: bool,
+};
+
+pub const EvictedSession = struct {
+    client: ClientId,
+    token: Token,
+    attachment_id: ?AttachmentId = null,
+    portable: bool,
+
+    pub fn resumeHandle(self: EvictedSession) ResumeHandle {
+        return .{
+            .token = self.token,
+            .attachment_id = self.attachment_id,
+            .portable = self.portable,
+        };
+    }
 };
 
 pub const AttachOutcome = struct {
@@ -141,7 +194,7 @@ pub const AttachOutcome = struct {
     /// Authority silently displaced to make room for the new live attachment.
     /// The daemon uses this to publish a mesh REVOKE if this was the last local
     /// row for an opted-in portable token.
-    evicted: ?ResumeHandle = null,
+    evicted: ?EvictedSession = null,
 };
 
 pub const DetachedSnapshot = struct {
@@ -156,6 +209,21 @@ pub const PortableDetachedSnapshot = struct {
     snapshot: []u8,
 
     pub fn deinit(self: *PortableDetachedSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.account);
+        allocator.free(self.snapshot);
+        self.* = undefined;
+    }
+};
+
+/// One exact current-generation detached attachment for SRA3 publication.
+/// Unlike the legacy token-group snapshot above, siblings are never deduped.
+pub const PortableDetachedAttachmentSnapshot = struct {
+    account: []u8,
+    token: Token,
+    attachment_id: AttachmentId,
+    snapshot: []u8,
+
+    pub fn deinit(self: *PortableDetachedAttachmentSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.account);
         allocator.free(self.snapshot);
         self.* = undefined;
@@ -178,6 +246,38 @@ const SessionList = struct {
     }
 };
 
+const AttachmentLocator = struct {
+    /// Store-owned account key. The index entry is removed before this slice is
+    /// freed by account deletion.
+    account: []const u8,
+    client: ClientId,
+};
+
+/// One indexed reusable-token group. Row locators borrow store-owned account
+/// keys and remain valid across SessionList reallocations because client id, not
+/// an array index or pointer, is the join key. The cached state is the exact OR
+/// (or newest local-projection image) of the listed rows.
+const TokenIndexEntry = struct {
+    rows: std.ArrayListUnmanaged(AttachmentLocator) = .empty,
+    portable_rows: usize = 0,
+    dirty_rows: usize = 0,
+    projection_dirty_rows: usize = 0,
+    local_projections: LocalChannelProjectionSet = .{},
+
+    fn deinit(self: *TokenIndexEntry, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Deterministic complexity evidence used by high-cardinality tests. These
+/// counters measure index operations and exact group-row visits, never wall
+/// time, so slow or contended builders cannot make the assertions flaky.
+pub const TokenIndexComplexity = struct {
+    lookups: usize = 0,
+    group_row_visits: usize = 0,
+};
+
 /// Authority used to bind one already-tracked attachment to a reusable token.
 /// `join_existing` requires that the exact account already contains a row with
 /// the target token. `adopt_verified` is reserved for callers that established
@@ -195,6 +295,7 @@ pub const TokenBindKind = union(enum) {
 pub const TokenBindRowSnapshot = struct {
     client: ClientId,
     token: Token,
+    attachment_id: ?AttachmentId,
     attached: bool,
     portable_resume: bool,
 };
@@ -239,6 +340,9 @@ pub const PreparedTokenBind = struct {
     /// Missing per-row journals allocated during preparation. They remain
     /// detached from store state until commit and are destroyed on abort.
     staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null,
+    /// A rowless target token cannot publish an empty index entry during
+    /// preparation. Its fully reserved entry stays ticket-owned until commit.
+    staged_target_token_entry: ?TokenIndexEntry = null,
     result_portable: bool,
     state: State = .prepared,
 
@@ -313,10 +417,9 @@ pub const PreparedTokenBind = struct {
 
         var staged_index: usize = 0;
         if (!self.merged_local_projections.isEmpty()) {
-            var accounts = self.store.accounts.iterator();
-            while (accounts.next()) |entry| {
-                for (entry.value_ptr.items.items) |*session| {
-                    if (!std.crypto.timing_safe.eql(Token, session.token, self.target_token)) continue;
+            if (self.store.tokenEntryLocked(self.target_token)) |target_entry| {
+                for (target_entry.rows.items) |locator| {
+                    const session = self.store.sessionForTokenLocatorLocked(locator) orelse unreachable;
                     if (session.local_channel_projections != null) continue;
                     session.local_channel_projections = self.staged_local_projection_sets.?[staged_index];
                     staged_index += 1;
@@ -335,8 +438,25 @@ pub const PreparedTokenBind = struct {
             self.staged_local_projection_sets = null;
         }
 
+        const previous_claimant = claimant.*;
+        const keep_empty_target = !tokenIsSentinel(previous_claimant.token) and
+            std.crypto.timing_safe.eql(Token, previous_claimant.token, self.target_token);
+        self.store.removeTokenRowLocked(self.account, previous_claimant, keep_empty_target);
         claimant.token = self.target_token;
         claimant.portable_resume = self.result_portable;
+        self.store.addTokenRowLocked(
+            self.account,
+            claimant.*,
+            &self.staged_target_token_entry,
+        );
+        if (self.result_portable) {
+            self.store.setTokenGroupPortableLocked(self.target_token, true);
+            if (!self.target_portable) {
+                _ = self.store.markTokenAttachmentReplicasDirtyLocked(self.target_token);
+            } else if (claimant.attachment_id != null) {
+                self.store.setAttachmentReplicaDirtyLocked(claimant, true);
+            }
+        }
         self.store.setTokenGroupDirtyLocked(
             self.target_token,
             self.expected_dirty or self.target_dirty,
@@ -376,6 +496,7 @@ pub const PreparedTokenBind = struct {
         std.debug.assert(self.state == .prepared);
         if (self.state != .prepared) return;
         self.destroyStagedLocalProjectionSets();
+        self.destroyStagedTargetTokenEntry();
         self.destroyLockedAccountRows();
         self.state = .aborted;
         self.store.lock.unlockExclusive();
@@ -388,6 +509,7 @@ pub const PreparedTokenBind = struct {
         switch (self.state) {
             .prepared => self.abort(),
             .committed => {
+                self.destroyStagedTargetTokenEntry();
                 self.destroyLockedAccountRows();
                 self.state = .finished;
                 self.store.lock.unlockExclusive();
@@ -404,6 +526,11 @@ pub const PreparedTokenBind = struct {
         self.staged_local_projection_sets = null;
     }
 
+    fn destroyStagedTargetTokenEntry(self: *PreparedTokenBind) void {
+        if (self.staged_target_token_entry) |*entry| entry.deinit(self.store.allocator);
+        self.staged_target_token_entry = null;
+    }
+
     fn destroyLockedAccountRows(self: *PreparedTokenBind) void {
         if (self.locked_account_rows.len == 0) return;
         self.store.allocator.free(self.locked_account_rows);
@@ -411,11 +538,145 @@ pub const PreparedTokenBind = struct {
     }
 };
 
+pub const AttachmentClientRemap = struct {
+    old_client: ClientId,
+    new_client: ClientId,
+};
+
+/// Prepared replacement of one exact detached physical attachment by a new
+/// runtime connection. Preparation retains the exclusive store lock and borrows
+/// the ghost snapshot; commit is allocation-free and cannot partially consume
+/// identity. This is intentionally separate from create-new/token-group join.
+pub const PreparedAttachmentRebind = struct {
+    const State = enum { prepared, committed, aborted, finished };
+
+    store: *SessionStore,
+    claimant_list: *SessionList,
+    claimant_account: []const u8,
+    ghost_list: *SessionList,
+    /// Store-owned source account key, stable while the retained lock is held.
+    ghost_account: []const u8,
+    claimant_index: usize,
+    ghost_index: usize,
+    claimant_client: ClientId,
+    ghost_client: ClientId,
+    token: Token,
+    attachment_id: AttachmentId,
+    state: State = .prepared,
+
+    /// Borrowed exact restore bytes. The retained store lock keeps them stable
+    /// until commit/abort; commit consumes/frees the stored snapshot.
+    pub fn snapshot(self: *const PreparedAttachmentRebind) ?[]const u8 {
+        std.debug.assert(self.state == .prepared);
+        if (self.state != .prepared) return null;
+        return self.ghost_list.items.items[self.ghost_index].snapshot;
+    }
+
+    pub fn remap(self: *const PreparedAttachmentRebind) AttachmentClientRemap {
+        return .{ .old_client = self.ghost_client, .new_client = self.claimant_client };
+    }
+
+    /// Replace the claimant bootstrap row with the exact detached row, retaining
+    /// its token, stable id, signon, portability and retry journals. The stored
+    /// snapshot is retired only at this no-fail commit boundary.
+    pub fn commit(self: *PreparedAttachmentRebind) bool {
+        if (self.state != .prepared) return false;
+        if (self.claimant_index >= self.claimant_list.items.items.len or
+            self.ghost_index >= self.ghost_list.items.items.len or
+            (self.claimant_list == self.ghost_list and self.claimant_index == self.ghost_index))
+        {
+            return false;
+        }
+
+        const claimant = &self.claimant_list.items.items[self.claimant_index];
+        const ghost = &self.ghost_list.items.items[self.ghost_index];
+        if (claimant.client != self.claimant_client or
+            ghost.client != self.ghost_client or ghost.attached or
+            !sessionMatchesAttachment(ghost.*, self.token, self.attachment_id))
+        {
+            return false;
+        }
+        const claimant_attachment_id = claimant.attachment_id orelse return false;
+
+        // Remove both rows from exact scheduler counts before ownership moves.
+        // The replacement contributes the ghost's flags once, below.
+        self.store.removeDirtyRowLocked(claimant);
+        self.store.removeDirtyRowLocked(ghost);
+        self.store.removeTokenRowLocked(self.claimant_account, claimant.*, false);
+
+        var replacement = ghost.*;
+        replacement.client = self.claimant_client;
+        replacement.attached = true;
+        replacement.snapshot = null;
+
+        // Discard the claimant bootstrap state. The target ghost's journal is
+        // moved, never copied, so no allocation or failure remains.
+        freeSessionOwned(self.store.allocator, claimant);
+        freeSnapshot(self.store.allocator, ghost);
+        ghost.local_channel_projections = null;
+        ghost.attachment_channel_projections = null;
+
+        const removed_claimant_index = self.store.attachment_index.remove(claimant_attachment_id.raw);
+        std.debug.assert(removed_claimant_index);
+        const ghost_locator = self.store.attachment_index.getPtr(self.attachment_id.raw) orelse unreachable;
+        ghost_locator.* = .{ .account = self.claimant_account, .client = self.claimant_client };
+        self.store.remapTokenRowLocatorLocked(
+            self.token,
+            self.ghost_account,
+            self.ghost_client,
+            self.claimant_account,
+            self.claimant_client,
+        );
+
+        self.claimant_list.items.items[self.claimant_index] = replacement;
+        _ = self.ghost_list.items.swapRemove(self.ghost_index);
+        self.store.addDirtyRowLocked(&replacement);
+        if (self.ghost_list.items.items.len == 0) {
+            const entry = self.store.accounts.getEntry(self.ghost_account) orelse unreachable;
+            self.store.dropAccount(entry);
+        }
+        self.state = .committed;
+        return true;
+    }
+
+    pub fn finish(self: *PreparedAttachmentRebind) void {
+        if (self.state == .finished) return;
+        std.debug.assert(self.state == .committed);
+        if (self.state != .committed) return;
+        self.state = .finished;
+        self.store.lock.unlockExclusive();
+    }
+
+    pub fn abort(self: *PreparedAttachmentRebind) void {
+        if (self.state == .aborted or self.state == .finished) return;
+        std.debug.assert(self.state == .prepared);
+        if (self.state != .prepared) return;
+        self.state = .aborted;
+        self.store.lock.unlockExclusive();
+    }
+
+    pub fn deinit(self: *PreparedAttachmentRebind) void {
+        switch (self.state) {
+            .prepared => self.abort(),
+            .committed => {
+                self.state = .finished;
+                self.store.lock.unlockExclusive();
+                std.debug.assert(false);
+            },
+            .aborted, .finished => {},
+        }
+    }
+};
+
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
+    attachment_index: std.AutoHashMap([attachment_id_mod.byte_len]u8, AttachmentLocator),
+    token_index: std.AutoHashMap(Token, TokenIndexEntry),
     lock: rwlock.RwLock = .{},
+    token_index_lookups: std.atomic.Value(usize) = .init(0),
+    token_index_group_row_visits: std.atomic.Value(usize) = .init(0),
     /// Number of rows carrying `replica_dirty`, maintained under `lock`. This is
     /// deliberately a row count (not a token count), so every mutation remains
     /// O(1) once the affected row is known and collection can skip an empty
@@ -429,6 +690,13 @@ pub const SessionStore = struct {
     /// independently; a blocked local projection cannot perturb publish order.
     dirty_projection_rows: usize = 0,
     projection_scan_cursor: ?Token = null,
+    /// SRA3 retry bookkeeping is keyed by (token, stable attachment id), never
+    /// by token alone. This lets two siblings independently publish/revoke and
+    /// prevents one successful row from clearing the other's work.
+    dirty_attachment_replica_rows: usize = 0,
+    attachment_replica_scan_cursor: ?AttachmentReplicaWork = null,
+    dirty_attachment_projection_rows: usize = 0,
+    attachment_projection_scan_cursor: ?AttachmentReplicaWork = null,
     /// Local exact-token channel projection is a third, independent retry lane.
     /// It is row-backed so removing one sibling cannot erase pending work while
     /// another exact attachment remains.
@@ -437,6 +705,8 @@ pub const SessionStore = struct {
     /// Keeping the full owned channel makes removal and re-arm safe without a
     /// pointer into the account map.
     local_projection_scan_cursor: ?LocalChannelProjectionWork = null,
+    dirty_attachment_local_projection_rows: usize = 0,
+    attachment_local_projection_scan_cursor: ?AttachmentLocalChannelProjectionWork = null,
     /// Generation zero is reserved for "never armed". Wrap is practically
     /// unreachable, but skipping zero keeps the invariant total even under a
     /// synthetic overflow test.
@@ -447,7 +717,176 @@ pub const SessionStore = struct {
     }
 
     pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) SessionStore {
-        return .{ .allocator = allocator, .cfg = cfg, .accounts = std.StringHashMap(SessionList).init(allocator) };
+        return .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .accounts = std.StringHashMap(SessionList).init(allocator),
+            .attachment_index = std.AutoHashMap([attachment_id_mod.byte_len]u8, AttachmentLocator).init(allocator),
+            .token_index = std.AutoHashMap(Token, TokenIndexEntry).init(allocator),
+        };
+    }
+
+    const AttachmentOwner = struct {
+        account: []const u8,
+        client: ClientId,
+    };
+
+    /// Lock-held, allocation-free uniqueness probe. Attachment ids identify one
+    /// physical row across the whole local store, including account case aliases.
+    fn attachmentOwnerLocked(self: *const SessionStore, attachment_id: AttachmentId) ?AttachmentOwner {
+        const locator = self.attachment_index.get(attachment_id.raw) orelse return null;
+        return .{ .account = locator.account, .client = locator.client };
+    }
+
+    fn removeAttachmentIndexLocked(self: *SessionStore, session: Session) void {
+        const attachment_id = session.attachment_id orelse return;
+        const removed = self.attachment_index.remove(attachment_id.raw);
+        std.debug.assert(removed);
+    }
+
+    fn noteTokenIndexLookup(self: *const SessionStore) void {
+        if (builtin.is_test) _ = @constCast(&self.token_index_lookups).fetchAdd(1, .monotonic);
+    }
+
+    fn noteTokenGroupRowVisit(self: *const SessionStore) void {
+        if (builtin.is_test) _ = @constCast(&self.token_index_group_row_visits).fetchAdd(1, .monotonic);
+    }
+
+    /// Reset deterministic index-work instrumentation. Production builds keep
+    /// the counters dormant; tests may call this between bounded operations.
+    pub fn resetTokenIndexComplexity(self: *SessionStore) void {
+        if (!builtin.is_test) return;
+        self.token_index_lookups.store(0, .monotonic);
+        self.token_index_group_row_visits.store(0, .monotonic);
+    }
+
+    pub fn tokenIndexComplexitySnapshot(self: *const SessionStore) TokenIndexComplexity {
+        if (!builtin.is_test) return .{};
+        return .{
+            .lookups = self.token_index_lookups.load(.monotonic),
+            .group_row_visits = self.token_index_group_row_visits.load(.monotonic),
+        };
+    }
+
+    fn tokenEntryLocked(self: *const SessionStore, token: Token) ?*const TokenIndexEntry {
+        if (tokenIsSentinel(token)) return null;
+        self.noteTokenIndexLookup();
+        return @constCast(&self.token_index).getPtr(token);
+    }
+
+    fn tokenEntryMutLocked(self: *SessionStore, token: Token) ?*TokenIndexEntry {
+        if (tokenIsSentinel(token)) return null;
+        self.noteTokenIndexLookup();
+        return self.token_index.getPtr(token);
+    }
+
+    fn tokenLocatorIndex(
+        self: *const SessionStore,
+        entry: *const TokenIndexEntry,
+        account: []const u8,
+        client: ClientId,
+    ) ?usize {
+        for (entry.rows.items, 0..) |locator, index| {
+            self.noteTokenGroupRowVisit();
+            if (locator.client == client and std.mem.eql(u8, locator.account, account)) return index;
+        }
+        return null;
+    }
+
+    fn sessionForTokenLocatorLocked(self: *SessionStore, locator: AttachmentLocator) ?*Session {
+        const list = self.accounts.getPtr(locator.account) orelse return null;
+        const index = list.indexOfClient(locator.client) orelse return null;
+        return &list.items.items[index];
+    }
+
+    /// Reserve every allocation needed to add one row to `token`. A rowless
+    /// token returns a staged entry that the caller owns until the no-fail commit
+    /// edge; an existing entry merely retains one unused locator slot.
+    fn reserveTokenRowInsertLocked(self: *SessionStore, token: Token) std.mem.Allocator.Error!?TokenIndexEntry {
+        if (tokenIsSentinel(token)) return null;
+        if (self.tokenEntryMutLocked(token)) |entry| {
+            try entry.rows.ensureUnusedCapacity(self.allocator, 1);
+            return null;
+        }
+        try self.token_index.ensureUnusedCapacity(1);
+        var staged: TokenIndexEntry = .{};
+        errdefer staged.deinit(self.allocator);
+        try staged.rows.ensureUnusedCapacity(self.allocator, 1);
+        return staged;
+    }
+
+    fn addTokenRowLocked(
+        self: *SessionStore,
+        account: []const u8,
+        session: Session,
+        staged: *?TokenIndexEntry,
+    ) void {
+        if (tokenIsSentinel(session.token)) return;
+        var entry = self.tokenEntryMutLocked(session.token);
+        if (entry == null) {
+            var fresh = staged.* orelse unreachable;
+            staged.* = null;
+            fresh.rows.appendAssumeCapacity(.{ .account = account, .client = session.client });
+            self.token_index.putAssumeCapacity(session.token, fresh);
+            entry = self.token_index.getPtr(session.token).?;
+        } else {
+            entry.?.rows.appendAssumeCapacity(.{ .account = account, .client = session.client });
+        }
+        const group = entry.?;
+        if (session.portable_resume) group.portable_rows += 1;
+        if (session.replica_dirty) group.dirty_rows += 1;
+        if (session.replica_projection_dirty) group.projection_dirty_rows += 1;
+        if (session.local_channel_projections) |set| {
+            if (set.revision >= group.local_projections.revision)
+                group.local_projections = set.*;
+        }
+    }
+
+    fn removeTokenRowLocked(
+        self: *SessionStore,
+        account: []const u8,
+        session: Session,
+        keep_empty: bool,
+    ) void {
+        if (tokenIsSentinel(session.token)) return;
+        const entry = self.tokenEntryMutLocked(session.token) orelse unreachable;
+        const index = self.tokenLocatorIndex(entry, account, session.client) orelse unreachable;
+        if (session.portable_resume) {
+            std.debug.assert(entry.portable_rows != 0);
+            entry.portable_rows -= 1;
+        }
+        if (session.replica_dirty) {
+            std.debug.assert(entry.dirty_rows != 0);
+            entry.dirty_rows -= 1;
+        }
+        if (session.replica_projection_dirty) {
+            std.debug.assert(entry.projection_dirty_rows != 0);
+            entry.projection_dirty_rows -= 1;
+        }
+        _ = entry.rows.swapRemove(index);
+        if (entry.rows.items.len != 0) return;
+        entry.portable_rows = 0;
+        entry.dirty_rows = 0;
+        entry.projection_dirty_rows = 0;
+        entry.local_projections = .{};
+        if (keep_empty) return;
+        entry.deinit(self.allocator);
+        const removed = self.token_index.remove(session.token);
+        std.debug.assert(removed);
+    }
+
+    fn remapTokenRowLocatorLocked(
+        self: *SessionStore,
+        token: Token,
+        old_account: []const u8,
+        old_client: ClientId,
+        new_account: []const u8,
+        new_client: ClientId,
+    ) void {
+        if (tokenIsSentinel(token)) return;
+        const entry = self.tokenEntryMutLocked(token) orelse unreachable;
+        const index = self.tokenLocatorIndex(entry, old_account, old_client) orelse unreachable;
+        entry.rows.items[index] = .{ .account = new_account, .client = new_client };
     }
 
     pub fn deinit(self: *SessionStore) void {
@@ -455,6 +894,10 @@ pub const SessionStore = struct {
             self.lock.lockExclusive();
             defer self.lock.unlockExclusive();
 
+            self.attachment_index.deinit();
+            var token_entries = self.token_index.valueIterator();
+            while (token_entries.next()) |entry| entry.deinit(self.allocator);
+            self.token_index.deinit();
             var it = self.accounts.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
@@ -467,25 +910,122 @@ pub const SessionStore = struct {
 
     /// Register a live session for `account`. Idempotent on `client` (re-attach
     /// refreshes its token/signon and marks it attached). Returns the session.
+    ///
+    /// Compatibility-only: the resulting row has no stable attachment id and
+    /// is therefore ineligible for attachment-aware replica/reclaim protocols.
+    /// Production callers should use `attachWithAttachment`.
     pub fn attach(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!Session {
         return (try self.attachReportingEviction(account, client, token, signon_ms)).session;
+    }
+
+    /// Register a current physical attachment with its independently minted,
+    /// stable identity. The id is never inferred from the reusable token or the
+    /// ephemeral runtime client handle.
+    pub fn attachWithAttachment(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        attachment_id: AttachmentId,
+        signon_ms: i64,
+    ) Error!Session {
+        return (try self.attachWithAttachmentReportingEviction(
+            account,
+            client,
+            token,
+            attachment_id,
+            signon_ms,
+        )).session;
     }
 
     /// `attach`, plus the portable authority of an oldest detached row evicted
     /// at the per-account cap. Keeping the legacy `attach` wrapper makes pure
     /// callers simple while letting the live daemon close the mesh lifecycle.
     pub fn attachReportingEviction(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!AttachOutcome {
+        return self.attachReportingEvictionInternal(account, client, token, null, signon_ms);
+    }
+
+    pub fn attachWithAttachmentReportingEviction(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        attachment_id: AttachmentId,
+        signon_ms: i64,
+    ) Error!AttachOutcome {
+        if (attachment_id.isZero()) return error.InvalidAttachmentId;
+        return self.attachReportingEvictionInternal(
+            account,
+            client,
+            token,
+            attachment_id,
+            signon_ms,
+        );
+    }
+
+    fn attachReportingEvictionInternal(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        attachment_id: ?AttachmentId,
+        signon_ms: i64,
+    ) Error!AttachOutcome {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
+
+        var insert_attachment_index = false;
+        if (attachment_id) |candidate| {
+            if (self.attachmentOwnerLocked(candidate)) |owner| {
+                // Permit only an idempotent refresh of the exact existing map
+                // row. A case-variant account key is a distinct row here and
+                // must not duplicate the stable identity.
+                if (!std.mem.eql(u8, owner.account, account) or owner.client != client)
+                    return error.DuplicateAttachmentId;
+            } else {
+                // Reserve before any row replacement/eviction. Publication into
+                // the index is then allocation-free at the same commit edge.
+                try self.attachment_index.ensureUnusedCapacity(1);
+                insert_attachment_index = true;
+            }
+        }
 
         // An exact reusable token is a global capability. Bind it to exactly one
         // ASCII-casefolded account before ensureAccount can allocate/publish an
         // empty map entry or replacement can merge dirty/journal state.
         const inherited = self.tokenGroupStateForAccountLocked(account, token) orelse
             return error.TokenAccountMismatch;
+        const account_preexisting = self.accounts.contains(account);
         const list = try self.ensureAccount(account);
+        errdefer if (!account_preexisting) {
+            const empty_entry = self.accounts.getEntry(account) orelse unreachable;
+            std.debug.assert(empty_entry.value_ptr.items.items.len == 0);
+            self.dropAccount(empty_entry);
+        };
+        const account_key = self.accounts.getEntry(account).?.key_ptr.*;
+        var staged_token_entry = try self.reserveTokenRowInsertLocked(token);
+        defer if (staged_token_entry) |*entry| entry.deinit(self.allocator);
         if (list.indexOfClient(client)) |idx| {
             const displaced = list.items.items[idx];
+            if (attachment_id) |requested| {
+                if (displaced.attachment_id) |current| {
+                    if (!current.eql(requested)) return error.AttachmentIdMismatch;
+                }
+            }
+            // A compatibility refresh of an already-current row must not erase
+            // the stable id. Only an explicit current attach may replace it,
+            // and global uniqueness was checked above while holding the lock.
+            const effective_attachment_id = attachment_id orelse displaced.attachment_id;
+            const same_attachment = if (effective_attachment_id) |effective|
+                if (displaced.attachment_id) |prior| effective.eql(prior) else false
+            else
+                false;
+            const preserve_attachment_authority = same_attachment and
+                std.crypto.timing_safe.eql(Token, displaced.token, token);
+            const attachment_projection_storage = if (preserve_attachment_authority)
+                displaced.attachment_channel_projections
+            else
+                null;
             const old_projection_storage = list.items.items[idx].local_channel_projections;
             var projection_storage = old_projection_storage;
             if (!inherited.local_projections.isEmpty() and projection_storage == null) {
@@ -499,28 +1039,57 @@ pub const SessionStore = struct {
                 }
             }
             self.removeDirtyRowLocked(&list.items.items[idx]);
+            self.removeTokenRowLocked(
+                account_key,
+                displaced,
+                !tokenIsSentinel(token) and std.crypto.timing_safe.eql(Token, displaced.token, token),
+            );
             if (projection_storage == null) {
                 if (old_projection_storage) |storage| self.allocator.destroy(storage);
+            }
+            if (!preserve_attachment_authority) {
+                if (displaced.attachment_channel_projections) |storage| self.allocator.destroy(storage);
             }
             freeSnapshot(self.allocator, &list.items.items[idx]);
             list.items.items[idx] = .{
                 .client = client,
                 .token = token,
+                .attachment_id = effective_attachment_id,
                 .signon_ms = signon_ms,
                 .attached = true,
+                .portable_resume = inherited.portable,
                 .replica_dirty = inherited.dirty,
                 .replica_projection_dirty = inherited.projection_dirty,
+                .attachment_replica_dirty = (preserve_attachment_authority and displaced.attachment_replica_dirty) or
+                    (effective_attachment_id != null and inherited.portable),
+                .attachment_replica_projection_dirty = preserve_attachment_authority and displaced.attachment_replica_projection_dirty,
                 .local_channel_projections = projection_storage,
+                .attachment_channel_projections = attachment_projection_storage,
             };
             if (inherited.dirty) self.dirty_replica_rows += 1;
             if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+            if (list.items.items[idx].attachment_replica_dirty) self.dirty_attachment_replica_rows += 1;
+            if (list.items.items[idx].attachment_replica_projection_dirty) self.dirty_attachment_projection_rows += 1;
             if (projection_storage != null) self.dirty_local_projection_rows += 1;
-            self.setTokenGroupDirtyLocked(token, inherited.dirty);
-            self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
-            self.setTokenGroupLocalProjectionsLocked(token, &inherited.local_projections);
+            if (attachment_projection_storage) |storage| {
+                if (!storage.isEmpty()) self.dirty_attachment_local_projection_rows += 1;
+            }
+            self.addTokenRowLocked(account_key, list.items.items[idx], &staged_token_entry);
+            if (insert_attachment_index) {
+                const current = list.items.items[idx].attachment_id orelse unreachable;
+                self.attachment_index.putAssumeCapacity(current.raw, .{
+                    .account = account_key,
+                    .client = client,
+                });
+            }
             return .{
                 .session = list.items.items[idx],
-                .evicted = .{ .token = displaced.token, .portable = displaced.portable_resume },
+                .evicted = .{
+                    .client = displaced.client,
+                    .token = displaced.token,
+                    .attachment_id = displaced.attachment_id,
+                    .portable = displaced.portable_resume,
+                },
             };
         }
         // Capture destination retry state before capacity eviction: if the new
@@ -532,14 +1101,25 @@ pub const SessionStore = struct {
             break :blk storage;
         } else null;
         errdefer if (projection_storage) |storage| self.allocator.destroy(storage);
-        var evicted: ?ResumeHandle = null;
+        var evicted: ?EvictedSession = null;
         if (list.items.items.len >= self.cfg.max_sessions_per_account) {
             // At cap: evict the oldest *detached* ghost to make room for the live
             // session. Never evict an attached session (that would drop a peer).
             if (oldestDetached(list)) |evict| {
                 const displaced = list.items.items[evict];
-                evicted = .{ .token = displaced.token, .portable = displaced.portable_resume };
+                evicted = .{
+                    .client = displaced.client,
+                    .token = displaced.token,
+                    .attachment_id = displaced.attachment_id,
+                    .portable = displaced.portable_resume,
+                };
                 self.removeDirtyRowLocked(&list.items.items[evict]);
+                self.removeTokenRowLocked(
+                    account_key,
+                    displaced,
+                    !tokenIsSentinel(token) and std.crypto.timing_safe.eql(Token, displaced.token, token),
+                );
+                self.removeAttachmentIndexLocked(list.items.items[evict]);
                 freeSessionOwned(self.allocator, &list.items.items[evict]);
                 _ = list.items.swapRemove(evict);
             } else return error.TooManySessions;
@@ -547,19 +1127,28 @@ pub const SessionStore = struct {
         const session = Session{
             .client = client,
             .token = token,
+            .attachment_id = attachment_id,
             .signon_ms = signon_ms,
             .attached = true,
+            .portable_resume = inherited.portable,
             .replica_dirty = inherited.dirty,
             .replica_projection_dirty = inherited.projection_dirty,
+            .attachment_replica_dirty = attachment_id != null and inherited.portable,
             .local_channel_projections = projection_storage,
         };
         try list.items.append(self.allocator, session);
         if (inherited.dirty) self.dirty_replica_rows += 1;
         if (inherited.projection_dirty) self.dirty_projection_rows += 1;
+        if (session.attachment_replica_dirty) self.dirty_attachment_replica_rows += 1;
         if (projection_storage != null) self.dirty_local_projection_rows += 1;
-        self.setTokenGroupDirtyLocked(token, inherited.dirty);
-        self.setTokenGroupProjectionDirtyLocked(token, inherited.projection_dirty);
-        self.setTokenGroupLocalProjectionsLocked(token, &inherited.local_projections);
+        self.addTokenRowLocked(account_key, session, &staged_token_entry);
+        if (insert_attachment_index) {
+            const current = session.attachment_id orelse unreachable;
+            self.attachment_index.putAssumeCapacity(current.raw, .{
+                .account = account_key,
+                .client = client,
+            });
+        }
         return .{ .session = session, .evicted = evicted };
     }
 
@@ -627,7 +1216,10 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
         if (tokenIsSentinel(list.items.items[idx].token)) return false;
-        list.items.items[idx].portable_resume = true;
+        self.setTokenGroupPortableLocked(list.items.items[idx].token, true);
+        // The first portable credential exposes the reusable group. Every
+        // current physical sibling therefore needs its own initial SRA3 OFFER.
+        _ = self.markTokenAttachmentReplicasDirtyLocked(list.items.items[idx].token);
         return true;
     }
 
@@ -644,8 +1236,35 @@ pub const SessionStore = struct {
             list.items.items[idx].portable_resume = false;
             return !issued;
         }
-        list.items.items[idx].portable_resume = issued;
+        const session = &list.items.items[idx];
+        self.setPortableLocked(session, issued);
+        if (issued and session.attachment_id != null)
+            self.setAttachmentReplicaDirtyLocked(session, true);
         return true;
+    }
+
+    /// One O(N) post-adoption normalization pass for legacy/Helix row images.
+    /// Per-row restore stays O(1); after all rows are staged this propagates each
+    /// observed portable token and arms every stable sibling exactly once. The
+    /// maintained index makes this allocation-free and visits each indexed row
+    /// at most once, so an OOM cannot expose a partially normalized registry.
+    pub fn normalizePortableGroupsAfterRestore(self: *SessionStore) std.mem.Allocator.Error!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var entries = self.token_index.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.portable_rows == 0) continue;
+            for (entry.rows.items) |locator| {
+                self.noteTokenGroupRowVisit();
+                const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+                session.portable_resume = true;
+                if (session.attachment_id != null) {
+                    self.setAttachmentReplicaDirtyLocked(session, true);
+                }
+            }
+            entry.portable_rows = entry.rows.items.len;
+        }
     }
 
     /// Return the stable local token and portability state for one tracked
@@ -657,11 +1276,11 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return null;
         const idx = list.indexOfClient(client) orelse return null;
         const session = list.items.items[idx];
-        // Issuance remains an exact-row audit fact, but the credential authorizes
-        // the whole reusable token group. A sibling must therefore stay portable
-        // after the issuing attachment detaches or disappears.
+        // The durable bit is propagated to every sibling when portability is
+        // issued; the group read remains defensive for restored legacy rows.
         return .{
             .token = session.token,
+            .attachment_id = session.attachment_id,
             .portable = self.tokenGroupStateLocked(session.token).portable,
         };
     }
@@ -696,6 +1315,70 @@ pub const SessionStore = struct {
         }
         prepared.finish();
         return true;
+    }
+
+    /// Prepare exact physical-attachment restoration. The selected id must own
+    /// one detached row under the caller's exact account and token, while the
+    /// reconnecting runtime client must already have its separate bootstrap row.
+    /// No token-only or newest-sibling fallback is performed.
+    pub fn prepareExactAttachmentRebind(
+        self: *SessionStore,
+        account: []const u8,
+        claimant_client: ClientId,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) ?PreparedAttachmentRebind {
+        if (tokenIsSentinel(token) or attachment_id.isZero()) return null;
+        self.lock.lockExclusive();
+        var keep_locked = false;
+        defer if (!keep_locked) self.lock.unlockExclusive();
+
+        const claimant_entry = self.accounts.getEntry(account) orelse return null;
+        const claimant_list = claimant_entry.value_ptr;
+        const claimant_index = claimant_list.indexOfClient(claimant_client) orelse return null;
+        const claimant = claimant_list.items.items[claimant_index];
+        // Exact restore may discard only the fresh, clean bootstrap row created
+        // for this reconnecting socket. Any existing authority/retry state needs
+        // an explicit revoke/transfer transaction, never silent destruction.
+        if (!claimant.attached or claimant.attachment_id == null or claimant.snapshot != null or
+            claimant.portable_resume or claimant.replica_dirty or claimant.replica_projection_dirty or
+            claimant.attachment_replica_dirty or claimant.attachment_replica_projection_dirty or
+            claimant.local_channel_projections != null or claimant.attachment_channel_projections != null)
+        {
+            return null;
+        }
+        if (!tokenIsSentinel(claimant.token)) {
+            const claimant_group = self.tokenEntryLocked(claimant.token) orelse return null;
+            if (claimant_group.rows.items.len != 1) return null;
+        }
+        // The maintained stable-id index makes exact reconnect independent of
+        // global account/session cardinality. Folded account and token checks
+        // still fail closed at the located row.
+        const ghost_locator = self.attachment_index.get(attachment_id.raw) orelse return null;
+        if (!std.ascii.eqlIgnoreCase(ghost_locator.account, account)) return null;
+        const target_list = self.accounts.getPtr(ghost_locator.account) orelse return null;
+        const target_index = target_list.indexOfClient(ghost_locator.client) orelse return null;
+        if (!sessionMatchesAttachment(target_list.items.items[target_index], token, attachment_id)) return null;
+        if ((target_list == claimant_list and target_index == claimant_index) or
+            target_list.items.items[target_index].attached)
+        {
+            return null;
+        }
+
+        keep_locked = true;
+        return .{
+            .store = self,
+            .claimant_list = claimant_list,
+            .claimant_account = claimant_entry.key_ptr.*,
+            .ghost_list = target_list,
+            .ghost_account = ghost_locator.account,
+            .claimant_index = claimant_index,
+            .ghost_index = target_index,
+            .claimant_client = claimant_client,
+            .ghost_client = target_list.items.items[target_index].client,
+            .token = token,
+            .attachment_id = attachment_id,
+        };
     }
 
     /// Prepare an exact account/client/token bind and retain the exclusive lock
@@ -733,6 +1416,11 @@ pub const SessionStore = struct {
         // A bind that would exceed the fixed retry budget is refused before the
         // caller stages World changes. No pending channel may be discarded.
         if (!mergeLocalProjectionSets(&merged_local_projections, &claimant_set, &target_set)) return null;
+        var staged_target_token_entry = self.reserveTokenRowInsertLocked(token) catch return null;
+        var target_token_entry_transferred = false;
+        defer if (!target_token_entry_transferred) {
+            if (staged_target_token_entry) |*entry| entry.deinit(self.allocator);
+        };
 
         // Capture every row under every ASCII-fold-equivalent account key, not
         // merely `account_entry`'s exact spelling. Account maps intentionally
@@ -764,6 +1452,7 @@ pub const SessionStore = struct {
                 locked_account_rows[locked_row_index] = .{
                     .client = session.client,
                     .token = session.token,
+                    .attachment_id = session.attachment_id,
                     .attached = session.attached,
                     .portable_resume = session.portable_resume,
                 };
@@ -793,10 +1482,9 @@ pub const SessionStore = struct {
         var staged_local_projection_sets: ?[]*LocalChannelProjectionSet = null;
         if (!merged_local_projections.isEmpty()) {
             var missing: usize = 0;
-            var accounts = self.accounts.iterator();
-            while (accounts.next()) |entry| {
-                for (entry.value_ptr.items.items) |session| {
-                    if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
+            if (self.tokenEntryLocked(token)) |target_entry| {
+                for (target_entry.rows.items) |locator| {
+                    const session = self.sessionForTokenLocatorLocked(locator) orelse return null;
                     if (session.local_channel_projections == null) missing += 1;
                 }
             }
@@ -821,10 +1509,11 @@ pub const SessionStore = struct {
         }
         const result_portable = switch (kind) {
             .join_existing => claimant.portable_resume or target.portable,
-            .adopt_verified => |portable| portable,
+            .adopt_verified => |portable| portable or target.portable,
         };
         keep_locked = true;
         rows_transferred = true;
+        target_token_entry_transferred = true;
         return .{
             .store = self,
             .account = account_key,
@@ -845,6 +1534,7 @@ pub const SessionStore = struct {
             .merged_local_projections = merged_local_projections,
             .locked_account_rows = locked_account_rows,
             .staged_local_projection_sets = staged_local_projection_sets,
+            .staged_target_token_entry = staged_target_token_entry,
             .result_portable = result_portable,
         };
     }
@@ -903,6 +1593,282 @@ pub const SessionStore = struct {
         defer self.lock.unlockExclusive();
 
         return self.dirtyTokensIntoLocked(out, .publish);
+    }
+
+    /// Mark one exact current attachment for SRA3 publication. Group
+    /// portability remains the credential gate, but retry ownership is per row.
+    pub fn markAttachmentReplicaDirty(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (attachment_id.isZero() or !self.tokenGroupStateLocked(token).portable) return false;
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        if (!session.attachment_replica_dirty) {
+            session.attachment_replica_dirty = true;
+            self.dirty_attachment_replica_rows += 1;
+        }
+        return true;
+    }
+
+    /// Arm every current physical sibling when a group first becomes portable.
+    /// Allocation-free and idempotent; legacy null-id rows are deliberately
+    /// skipped because they cannot be represented by SRA3.
+    pub fn markTokenAttachmentReplicasDirty(self: *SessionStore, token: Token) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        return self.markTokenAttachmentReplicasDirtyLocked(token);
+    }
+
+    pub fn clearAttachmentReplicaDirty(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        if (session.attachment_replica_dirty) {
+            session.attachment_replica_dirty = false;
+            std.debug.assert(self.dirty_attachment_replica_rows != 0);
+            self.dirty_attachment_replica_rows -= 1;
+        }
+        return true;
+    }
+
+    pub fn dirtyPortableAttachmentsInto(
+        self: *SessionStore,
+        out: []AttachmentReplicaWork,
+    ) []const AttachmentReplicaWork {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        return self.dirtyAttachmentsIntoLocked(out, .publish);
+    }
+
+    pub fn markAttachmentReplicaProjectionDirty(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        if (!session.attachment_replica_projection_dirty) {
+            session.attachment_replica_projection_dirty = true;
+            self.dirty_attachment_projection_rows += 1;
+        }
+        return true;
+    }
+
+    pub fn clearAttachmentReplicaProjectionDirty(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        if (session.attachment_replica_projection_dirty) {
+            session.attachment_replica_projection_dirty = false;
+            std.debug.assert(self.dirty_attachment_projection_rows != 0);
+            self.dirty_attachment_projection_rows -= 1;
+        }
+        return true;
+    }
+
+    pub fn dirtyAttachmentProjectionsInto(
+        self: *SessionStore,
+        out: []AttachmentReplicaWork,
+    ) []const AttachmentReplicaWork {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        return self.dirtyAttachmentsIntoLocked(out, .projection);
+    }
+
+    /// Arm one physical attachment's channel projection journal. Siblings with
+    /// the same reusable token are deliberately untouched.
+    pub fn armAttachmentLocalChannelProjectionWithPrevious(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+        channel: []const u8,
+        present: bool,
+        member_mode_bits: u8,
+    ) LocalProjectionArmError!LocalChannelProjectionArm {
+        if (channel.len == 0 or channel.len > local_channel_name_capacity)
+            return error.InvalidChannel;
+        if (attachment_id.isZero()) return error.NoSuchAttachment;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const session = self.findAttachmentLocked(token, attachment_id) orelse
+            return error.NoSuchAttachment;
+        var next = if (session.attachment_channel_projections) |set| set.* else LocalChannelProjectionSet{};
+        const existing_index = localProjectionIndex(&next, channel);
+        const previous = if (existing_index) |index| next.items[index] else null;
+        if (existing_index == null and next.len == local_channel_projection_capacity)
+            return error.TooManyPendingChannels;
+
+        // Allocate the first journal before consuming a generation or changing
+        // counters. Replacement and later retry/clear remain allocation-free.
+        const staged = if (session.attachment_channel_projections == null) blk: {
+            const storage = try self.allocator.create(LocalChannelProjectionSet);
+            storage.* = .{};
+            break :blk storage;
+        } else null;
+        errdefer if (staged) |storage| self.allocator.destroy(storage);
+
+        const generation = self.nextLocalProjectionGenerationLocked();
+        var intent = LocalChannelProjection{
+            .generation = generation,
+            .channel_len = @intCast(channel.len),
+            .channel_bytes = @splat(0),
+            .present = present,
+            .member_mode_bits = member_mode_bits,
+        };
+        @memcpy(intent.channel_bytes[0..channel.len], channel);
+        localProjectionUpsert(&next, intent) catch unreachable;
+        next.revision = generation;
+        if (staged) |storage| session.attachment_channel_projections = storage;
+        self.setAttachmentLocalProjectionsLocked(session, &next);
+        return .{ .intent = intent, .previous = previous };
+    }
+
+    pub fn armAttachmentLocalChannelProjection(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+        channel: []const u8,
+        present: bool,
+        member_mode_bits: u8,
+    ) LocalProjectionArmError!LocalChannelProjection {
+        return (try self.armAttachmentLocalChannelProjectionWithPrevious(
+            token,
+            attachment_id,
+            channel,
+            present,
+            member_mode_bits,
+        )).intent;
+    }
+
+    pub fn attachmentLocalChannelProjection(
+        self: *const SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+        channel: []const u8,
+    ) ?LocalChannelProjection {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        const session = @constCast(self).findAttachmentLocked(token, attachment_id) orelse return null;
+        const set = session.attachment_channel_projections orelse return null;
+        const index = localProjectionIndex(set, channel) orelse return null;
+        return set.items[index];
+    }
+
+    pub fn clearAttachmentLocalChannelProjection(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+        channel: []const u8,
+        generation: u64,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        const storage = session.attachment_channel_projections orelse return false;
+        var next = storage.*;
+        const index = localProjectionIndex(&next, channel) orelse return false;
+        if (next.items[index].generation != generation) return false;
+        localProjectionRemoveAt(&next, index);
+        next.revision = self.nextLocalProjectionGenerationLocked();
+        self.setAttachmentLocalProjectionsLocked(session, &next);
+        return true;
+    }
+
+    pub fn rollbackAttachmentLocalChannelProjectionArm(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+        armed_generation: u64,
+        previous: ?LocalChannelProjection,
+    ) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const session = self.findAttachmentLocked(token, attachment_id) orelse return false;
+        const storage = session.attachment_channel_projections orelse return false;
+        var next = storage.*;
+        const armed_channel = if (previous) |prior| prior.channel() else blk: {
+            for (next.slice()) |projection| {
+                if (projection.generation == armed_generation) break :blk projection.channel();
+            }
+            return false;
+        };
+        const index = localProjectionIndex(&next, armed_channel) orelse return false;
+        if (next.items[index].generation != armed_generation) return false;
+        if (previous) |prior| {
+            if (!std.ascii.eqlIgnoreCase(prior.channel(), next.items[index].channel())) return false;
+            next.items[index] = prior;
+        } else {
+            localProjectionRemoveAt(&next, index);
+        }
+        next.revision = self.nextLocalProjectionGenerationLocked();
+        self.setAttachmentLocalProjectionsLocked(session, &next);
+        return true;
+    }
+
+    pub fn dirtyAttachmentLocalProjectionsInto(
+        self: *SessionStore,
+        out: []AttachmentLocalChannelProjectionWork,
+    ) []const AttachmentLocalChannelProjectionWork {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (self.dirty_attachment_local_projection_rows == 0 or out.len == 0) return out[0..0];
+
+        var n: usize = 0;
+        const original_cursor = self.attachment_local_projection_scan_cursor;
+        var wrapped = original_cursor == null;
+        var lower_bound = original_cursor;
+        while (n < out.len) {
+            var candidate: ?AttachmentLocalChannelProjectionWork = null;
+            var accounts = self.accounts.valueIterator();
+            while (accounts.next()) |list| {
+                for (list.items.items) |session| {
+                    const attachment_id = session.attachment_id orelse continue;
+                    const set = session.attachment_channel_projections orelse continue;
+                    for (set.slice()) |projection| {
+                        const work = AttachmentLocalChannelProjectionWork{
+                            .token = session.token,
+                            .attachment_id = attachment_id,
+                            .projection = projection,
+                        };
+                        if (attachmentLocalWorkInSlice(out[0..n], work)) continue;
+                        if (lower_bound) |lower| {
+                            if (attachmentLocalWorkOrder(work, lower) != .gt) continue;
+                        }
+                        if (wrapped) {
+                            if (original_cursor) |upper| {
+                                if (attachmentLocalWorkOrder(work, upper) == .gt) continue;
+                            }
+                        }
+                        if (candidate == null or attachmentLocalWorkOrder(work, candidate.?) == .lt)
+                            candidate = work;
+                    }
+                }
+            }
+            if (candidate) |work| {
+                out[n] = work;
+                n += 1;
+                lower_bound = work;
+                continue;
+            }
+            if (wrapped) break;
+            wrapped = true;
+            lower_bound = null;
+        }
+        if (n != 0) self.attachment_local_projection_scan_cursor = out[n - 1];
+        return out[0..n];
     }
 
     /// Mark receive-side projection pending after a signed replica was accepted.
@@ -984,16 +1950,12 @@ pub const SessionStore = struct {
         if (existing_index == null and next.len == local_channel_projection_capacity)
             return error.TooManyPendingChannels;
 
+        const token_entry = self.tokenEntryMutLocked(token) orelse return error.NoSuchToken;
         var missing: usize = 0;
-        var accounts = self.accounts.iterator();
-        while (accounts.next()) |entry| {
-            for (entry.value_ptr.items.items) |session| {
-                if (std.crypto.timing_safe.eql(Token, session.token, token) and
-                    session.local_channel_projections == null)
-                {
-                    missing += 1;
-                }
-            }
+        for (token_entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            if (session.local_channel_projections == null) missing += 1;
         }
 
         var staged: ?[]*LocalChannelProjectionSet = null;
@@ -1028,14 +1990,12 @@ pub const SessionStore = struct {
 
         if (staged) |sets| {
             var staged_index: usize = 0;
-            accounts = self.accounts.iterator();
-            while (accounts.next()) |entry| {
-                for (entry.value_ptr.items.items) |*session| {
-                    if (!std.crypto.timing_safe.eql(Token, session.token, token) or
-                        session.local_channel_projections != null) continue;
-                    session.local_channel_projections = sets[staged_index];
-                    staged_index += 1;
-                }
+            for (token_entry.rows.items) |locator| {
+                self.noteTokenGroupRowVisit();
+                const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+                if (session.local_channel_projections != null) continue;
+                session.local_channel_projections = sets[staged_index];
+                staged_index += 1;
             }
             std.debug.assert(staged_index == sets.len);
             staged_transferred = true;
@@ -1176,6 +2136,81 @@ pub const SessionStore = struct {
     }
 
     const DirtyKind = enum { publish, projection };
+    const AttachmentDirtyKind = enum { publish, projection };
+
+    fn findAttachmentLocked(
+        self: *SessionStore,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) ?*Session {
+        const locator = self.attachment_index.get(attachment_id.raw) orelse return null;
+        const list = self.accounts.getPtr(locator.account) orelse return null;
+        const index = list.indexOfClient(locator.client) orelse return null;
+        const session = &list.items.items[index];
+        if (!sessionMatchesAttachment(session.*, token, attachment_id)) return null;
+        return session;
+    }
+
+    fn dirtyAttachmentsIntoLocked(
+        self: *SessionStore,
+        out: []AttachmentReplicaWork,
+        kind: AttachmentDirtyKind,
+    ) []const AttachmentReplicaWork {
+        const dirty_rows = switch (kind) {
+            .publish => self.dirty_attachment_replica_rows,
+            .projection => self.dirty_attachment_projection_rows,
+        };
+        if (dirty_rows == 0 or out.len == 0) return out[0..0];
+        const cursor = switch (kind) {
+            .publish => &self.attachment_replica_scan_cursor,
+            .projection => &self.attachment_projection_scan_cursor,
+        };
+
+        var n: usize = 0;
+        const original_cursor = cursor.*;
+        var wrapped = original_cursor == null;
+        var lower_bound = original_cursor;
+        while (n < out.len) {
+            var candidate: ?AttachmentReplicaWork = null;
+            var accounts = self.accounts.valueIterator();
+            while (accounts.next()) |list| {
+                for (list.items.items) |session| {
+                    const attachment_id = session.attachment_id orelse continue;
+                    const dirty = switch (kind) {
+                        .publish => session.attachment_replica_dirty,
+                        .projection => session.attachment_replica_projection_dirty,
+                    };
+                    if (!dirty) continue;
+                    const work = AttachmentReplicaWork{
+                        .token = session.token,
+                        .attachment_id = attachment_id,
+                    };
+                    if (attachmentWorkInSlice(out[0..n], work)) continue;
+                    if (lower_bound) |lower| {
+                        if (attachmentWorkOrder(work, lower) != .gt) continue;
+                    }
+                    if (wrapped) {
+                        if (original_cursor) |upper| {
+                            if (attachmentWorkOrder(work, upper) == .gt) continue;
+                        }
+                    }
+                    if (candidate == null or attachmentWorkOrder(work, candidate.?) == .lt)
+                        candidate = work;
+                }
+            }
+            if (candidate) |work| {
+                out[n] = work;
+                n += 1;
+                lower_bound = work;
+                continue;
+            }
+            if (wrapped) break;
+            wrapped = true;
+            lower_bound = null;
+        }
+        if (n != 0) cursor.* = out[n - 1];
+        return out[0..n];
+    }
 
     fn dirtyTokensIntoLocked(self: *SessionStore, out: []Token, kind: DirtyKind) []const Token {
         const dirty_rows = switch (kind) {
@@ -1266,6 +2301,12 @@ pub const SessionStore = struct {
         return self.dirty_local_projection_rows;
     }
 
+    pub fn dirtyAttachmentLocalProjectionRowCount(self: *const SessionStore) usize {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return self.dirty_attachment_local_projection_rows;
+    }
+
     /// Whether this exact attached client already belongs to `token`'s logical
     /// session. Kept separate from token lookup because duplicate tokens across
     /// live attachments are intentional.
@@ -1278,6 +2319,34 @@ pub const SessionStore = struct {
         return std.crypto.timing_safe.eql(Token, list.items.items[idx].token, token);
     }
 
+    /// Exact current-identity probe. Unlike `clientHasToken`, this cannot
+    /// collapse two sibling physical attachments sharing one reusable token.
+    pub fn clientHasAttachment(
+        self: *const SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        if (attachment_id.isZero()) return false;
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(client) orelse return false;
+        return sessionMatchesAttachment(list.items.items[idx], token, attachment_id);
+    }
+
+    /// Whether this stable id is already owned anywhere in the local store.
+    /// Current claim/create paths use this to distinguish exact restore from an
+    /// identity collision without exposing the owning account or token.
+    pub fn containsAttachment(self: *const SessionStore, attachment_id: AttachmentId) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        if (attachment_id.isZero()) return false;
+        return self.attachmentOwnerLocked(attachment_id) != null;
+    }
+
     /// Whether any live attachment currently holds this exact logical token.
     /// Positive mesh attachment leases must cross this allocation-free boundary
     /// instead of trusting a caller that may already have detached its row.
@@ -1285,16 +2354,12 @@ pub const SessionStore = struct {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
-        var has_attached = false;
-        var has_portable = false;
-        var it = self.accounts.valueIterator();
-        while (it.next()) |list| {
-            for (list.items.items) |session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                has_attached = has_attached or session.attached;
-                has_portable = has_portable or session.portable_resume;
-                if (has_attached and has_portable) return true;
-            }
+        const entry = self.tokenEntryLocked(token) orelse return false;
+        if (entry.portable_rows == 0) return false;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = @constCast(self).sessionForTokenLocatorLocked(locator) orelse unreachable;
+            if (session.attached) return true;
         }
         return false;
     }
@@ -1307,13 +2372,7 @@ pub const SessionStore = struct {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
-        var it = self.accounts.valueIterator();
-        while (it.next()) |list| {
-            for (list.items.items) |session| {
-                if (std.crypto.timing_safe.eql(Token, session.token, token)) return true;
-            }
-        }
-        return false;
+        return self.tokenEntryLocked(token) != null;
     }
 
     /// Exact client membership probe that does not truncate at the public list
@@ -1336,6 +2395,8 @@ pub const SessionStore = struct {
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
         self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
+        self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
+        self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
         freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
         _ = entry.value_ptr.items.swapRemove(idx);
         if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
@@ -1352,6 +2413,8 @@ pub const SessionStore = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
                 self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
+                self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
+                self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
                 freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
                 _ = entry.value_ptr.items.swapRemove(idx);
                 if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
@@ -1362,7 +2425,8 @@ pub const SessionStore = struct {
     }
 
     /// Copy a snapshot of the session list for `account` into caller-owned
-    /// storage (empty if none). The returned slice borrows `out`, not the store.
+    /// storage (empty if none). The returned slice borrows `out`, not the store;
+    /// every store-owned snapshot/journal pointer is stripped.
     pub fn sessionsInto(self: *const SessionStore, account: []const u8, out: []Session) []const Session {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
@@ -1370,13 +2434,13 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return out[0..0];
         const n = @min(list.items.items.len, out.len);
         @memcpy(out[0..n], list.items.items[0..n]);
-        for (out[0..n]) |*session| session.snapshot = null;
+        for (out[0..n]) |*session| sanitizeCopiedSession(session);
         return out[0..n];
     }
 
     /// Allocate an exact, complete snapshot for callers whose correctness cannot
-    /// depend on a fixed stack buffer. Snapshot payload pointers are deliberately
-    /// stripped; use the dedicated detached-snapshot APIs for owned payload data.
+    /// depend on a fixed stack buffer. All owned payload/journal pointers are
+    /// stripped; use the dedicated copy/value APIs for their state.
     pub fn copySessionsAlloc(self: *const SessionStore, allocator: std.mem.Allocator, account: []const u8) std.mem.Allocator.Error![]Session {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
@@ -1384,11 +2448,52 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return try allocator.alloc(Session, 0);
         const out = try allocator.alloc(Session, list.items.items.len);
         @memcpy(out, list.items.items);
-        for (out) |*session| session.snapshot = null;
+        for (out) |*session| sanitizeCopiedSession(session);
         return out;
     }
 
     pub const Match = struct { account: []const u8, client: ClientId };
+
+    pub const TokenMatch = struct { account: []const u8, token: Token };
+
+    pub const TokenPredicate = struct {
+        context: *const anyopaque,
+        matches_fn: *const fn (context: *const anyopaque, token: Token) bool,
+
+        pub fn matches(self: TokenPredicate, token: Token) bool {
+            return self.matches_fn(self.context, token);
+        }
+    };
+
+    /// Select one exact portable token by an opaque caller-owned capability
+    /// predicate. Multiple attachment rows carrying the SAME token are one
+    /// logical session; two distinct matching tokens are ambiguous and fail
+    /// closed. The returned account borrows `account_out`, never store memory.
+    pub fn findUniquePortableTokenInto(
+        self: *const SessionStore,
+        predicate: TokenPredicate,
+        account_out: []u8,
+    ) ?TokenMatch {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        var matched_token: ?Token = null;
+        var matched_account_len: usize = 0;
+        var it = self.token_index.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.portable_rows == 0 or !predicate.matches(entry.key_ptr.*)) continue;
+            if (matched_token != null) return null;
+            const account = entry.value_ptr.rows.items[0].account;
+            if (account.len > account_out.len) return null;
+            @memcpy(account_out[0..account.len], account);
+            matched_account_len = account.len;
+            matched_token = entry.key_ptr.*;
+        }
+        return .{
+            .account = account_out[0..matched_account_len],
+            .token = matched_token orelse return null,
+        };
+    }
 
     /// Find the session bearing `token` (for reclaim). The returned `account`
     /// borrows `account_out`, not the store.
@@ -1396,17 +2501,11 @@ pub const SessionStore = struct {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |s| {
-                if (std.crypto.timing_safe.eql(Token, s.token, token)) {
-                    if (entry.key_ptr.*.len > account_out.len) return null;
-                    @memcpy(account_out[0..entry.key_ptr.*.len], entry.key_ptr.*);
-                    return .{ .account = account_out[0..entry.key_ptr.*.len], .client = s.client };
-                }
-            }
-        }
-        return null;
+        const entry = self.tokenEntryLocked(token) orelse return null;
+        const locator = entry.rows.items[0];
+        if (locator.account.len > account_out.len) return null;
+        @memcpy(account_out[0..locator.account.len], locator.account);
+        return .{ .account = account_out[0..locator.account.len], .client = locator.client };
     }
 
     /// Look up a session by token *within* `account` (reclaim is scoped to the
@@ -1426,11 +2525,45 @@ pub const SessionStore = struct {
         for (list.items.items) |s| {
             if (std.crypto.timing_safe.eql(Token, s.token, token)) {
                 var copied = s;
-                copied.snapshot = null;
+                sanitizeCopiedSession(&copied);
                 return copied;
             }
         }
         return null;
+    }
+
+    /// Look up one exact physical attachment within a reusable token group.
+    /// Legacy rows (no id) never match and must use the compatibility APIs.
+    pub fn findAttachmentSessionInAccount(
+        self: *const SessionStore,
+        account: []const u8,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) ?Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        if (attachment_id.isZero()) return null;
+        const list = self.accounts.getPtr(account) orelse return null;
+        for (list.items.items) |session| {
+            if (!sessionMatchesAttachment(session, token, attachment_id)) continue;
+            var copied = session;
+            sanitizeCopiedSession(&copied);
+            return copied;
+        }
+        return null;
+    }
+
+    /// Find the exact detached attachment selected by a current resume claim.
+    /// No newest/oldest heuristic is permitted: sibling rows are independent.
+    pub fn findDetachedAttachmentSessionInAccount(
+        self: *const SessionStore,
+        account: []const u8,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) ?Session {
+        const session = self.findAttachmentSessionInAccount(account, token, attachment_id) orelse return null;
+        return if (!session.attached) session else null;
     }
 
     /// Find a LIVE attachment to `token`, excluding the caller. A stable session
@@ -1450,7 +2583,7 @@ pub const SessionStore = struct {
             if (s.client == exclude_client or !s.attached) continue;
             if (!std.crypto.timing_safe.eql(Token, s.token, token)) continue;
             var copied = s;
-            copied.snapshot = null;
+            sanitizeCopiedSession(&copied);
             return copied;
         }
         return null;
@@ -1468,7 +2601,7 @@ pub const SessionStore = struct {
             if (s.attached or !std.crypto.timing_safe.eql(Token, s.token, token)) continue;
             if (best == null or s.signon_ms >= best.?.signon_ms) {
                 best = s;
-                best.?.snapshot = null;
+                sanitizeCopiedSession(&best.?);
             }
         }
         return best;
@@ -1501,6 +2634,30 @@ pub const SessionStore = struct {
         }
         const bytes = (matched orelse return null).snapshot.?;
         return try allocator.dupe(u8, bytes);
+    }
+
+    /// Copy only the snapshot owned by the requested physical attachment.
+    /// This is the restore primitive for SRM2 `exact_restore`; it never falls
+    /// back to another detached sibling bearing the same group token.
+    pub fn copyDetachedAttachmentSnapshotInAccount(
+        self: *const SessionStore,
+        allocator: std.mem.Allocator,
+        account: []const u8,
+        token: Token,
+        attachment_id: AttachmentId,
+    ) std.mem.Allocator.Error!?[]u8 {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        if (attachment_id.isZero()) return null;
+        const list = self.accounts.getPtr(account) orelse return null;
+        for (list.items.items) |session| {
+            if (!sessionMatchesAttachment(session, token, attachment_id)) continue;
+            if (session.attached) return null;
+            const bytes = session.snapshot orelse return null;
+            return try allocator.dupe(u8, bytes);
+        }
+        return null;
     }
 
     /// Copy the newest detached restore snapshot for `account`, excluding the
@@ -1539,7 +2696,7 @@ pub const SessionStore = struct {
 
     /// Deep-copy one canonical detached snapshot per portable exact-token group.
     /// Used when a secured peer (re)establishes after missing the detach-time
-    /// broadcast. Group portability is the OR of per-row issuance; selection is
+    /// broadcast. Group portability is redundantly carried by every row; selection is
     /// newest signon, then highest client id, so insertion/hash iteration order
     /// cannot make anti-entropy sign an arbitrary older ghost. The returned
     /// records and outer slice are caller-owned.
@@ -1601,6 +2758,68 @@ pub const SessionStore = struct {
         return out;
     }
 
+    /// Deep-copy every detached current-generation physical attachment. Sibling
+    /// rows sharing one token remain distinct and carry their stable ids.
+    pub fn copyPortableDetachedAttachmentSnapshots(
+        self: *const SessionStore,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error![]PortableDetachedAttachmentSnapshot {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
+        // Build group portability once. Calling tokenGroupStateLocked per row
+        // would rescan the whole store and turn peer anti-entropy into O(N^2).
+        var portable_tokens: std.AutoHashMapUnmanaged(Token, void) = .empty;
+        defer portable_tokens.deinit(allocator);
+        var row_count: usize = 0;
+        var rows = self.accounts.valueIterator();
+        while (rows.next()) |list| row_count = std.math.add(usize, row_count, list.items.items.len) catch return error.OutOfMemory;
+        const set_capacity = std.math.cast(u32, row_count) orelse return error.OutOfMemory;
+        try portable_tokens.ensureTotalCapacity(allocator, set_capacity);
+        var portable_it = self.accounts.valueIterator();
+        while (portable_it.next()) |list| {
+            for (list.items.items) |session| {
+                if (session.portable_resume)
+                    portable_tokens.putAssumeCapacity(session.token, {});
+            }
+        }
+
+        var count: usize = 0;
+        var count_it = self.accounts.valueIterator();
+        while (count_it.next()) |list| {
+            for (list.items.items) |session| {
+                if (session.attached or session.snapshot == null or session.attachment_id == null) continue;
+                if (!portable_tokens.contains(session.token)) continue;
+                count = std.math.add(usize, count, 1) catch return error.OutOfMemory;
+            }
+        }
+
+        const out = try allocator.alloc(PortableDetachedAttachmentSnapshot, count);
+        errdefer allocator.free(out);
+        var n: usize = 0;
+        errdefer for (out[0..n]) |*record| record.deinit(allocator);
+        var accounts = self.accounts.iterator();
+        while (accounts.next()) |entry| {
+            for (entry.value_ptr.items.items) |session| {
+                const attachment_id = session.attachment_id orelse continue;
+                const snapshot = session.snapshot orelse continue;
+                if (session.attached or !portable_tokens.contains(session.token)) continue;
+                const account = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(account);
+                const copied = try allocator.dupe(u8, snapshot);
+                out[n] = .{
+                    .account = account,
+                    .token = session.token,
+                    .attachment_id = attachment_id,
+                    .snapshot = copied,
+                };
+                n += 1;
+            }
+        }
+        std.debug.assert(n == out.len);
+        return out;
+    }
+
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
         if (self.accounts.getPtr(account)) |list| return list;
         if (self.accounts.count() >= self.cfg.max_accounts) return error.TooManyAccounts;
@@ -1618,25 +2837,17 @@ pub const SessionStore = struct {
         local_projections: LocalChannelProjectionSet = .{},
     };
 
-    /// Caller holds `lock` exclusively or shared for the duration of the scan.
+    /// Caller holds `lock` exclusively or shared. Cached group state makes this
+    /// lookup independent of total registry cardinality.
     fn tokenGroupStateLocked(self: *const SessionStore, token: Token) TokenGroupState {
-        var state: TokenGroupState = .{};
-        if (tokenIsSentinel(token)) return state;
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                state.found = true;
-                state.portable = state.portable or session.portable_resume;
-                state.dirty = state.dirty or session.replica_dirty;
-                state.projection_dirty = state.projection_dirty or session.replica_projection_dirty;
-                if (session.local_channel_projections) |set| {
-                    if (set.revision >= state.local_projections.revision)
-                        state.local_projections = set.*;
-                }
-            }
-        }
-        return state;
+        const entry = self.tokenEntryLocked(token) orelse return .{};
+        return .{
+            .found = entry.rows.items.len != 0,
+            .portable = entry.portable_rows != 0,
+            .dirty = entry.dirty_rows != 0,
+            .projection_dirty = entry.projection_dirty_rows != 0,
+            .local_projections = entry.local_projections,
+        };
     }
 
     /// Return exact-token group state only when every matching row belongs to
@@ -1648,52 +2859,41 @@ pub const SessionStore = struct {
         account: []const u8,
         token: Token,
     ) ?TokenGroupState {
-        var state: TokenGroupState = .{};
         // The sentinel is a per-row absence marker, not a bearer capability.
         // Returning an empty non-conflicting state lets independent accounts be
         // tracked without merging their retry/portable state or authorizing a
         // later token-group bind.
-        if (tokenIsSentinel(token)) return state;
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) return null;
-                state.found = true;
-                state.portable = state.portable or session.portable_resume;
-                state.dirty = state.dirty or session.replica_dirty;
-                state.projection_dirty = state.projection_dirty or session.replica_projection_dirty;
-                if (session.local_channel_projections) |set| {
-                    if (set.revision >= state.local_projections.revision)
-                        state.local_projections = set.*;
-                }
-            }
-        }
-        return state;
+        if (tokenIsSentinel(token)) return .{};
+        const entry = self.tokenEntryLocked(token) orelse return .{};
+        const representative = entry.rows.items[0];
+        if (!std.ascii.eqlIgnoreCase(representative.account, account)) return null;
+        return .{
+            .found = true,
+            .portable = entry.portable_rows != 0,
+            .dirty = entry.dirty_rows != 0,
+            .projection_dirty = entry.projection_dirty_rows != 0,
+            .local_projections = entry.local_projections,
+        };
     }
 
     /// Apply token-group dirty state and keep `dirty_replica_rows` exact. Caller
-    /// holds `lock` exclusively. Portability remains a per-row issuance fact;
-    /// token-group eligibility is computed by OR in `tokenGroupStateLocked`.
+    /// holds `lock` exclusively. Portability is a durable group property carried
+    /// redundantly by every row.
     fn setTokenGroupDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
-        if (tokenIsSentinel(token)) return;
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |*session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                self.setReplicaDirtyLocked(session, dirty);
-            }
+        const entry = self.tokenEntryMutLocked(token) orelse return;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            self.setReplicaDirtyLocked(session, dirty);
         }
     }
 
     fn setTokenGroupProjectionDirtyLocked(self: *SessionStore, token: Token, dirty: bool) void {
-        if (tokenIsSentinel(token)) return;
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |*session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                self.setReplicaProjectionDirtyLocked(session, dirty);
-            }
+        const entry = self.tokenEntryMutLocked(token) orelse return;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            self.setReplicaProjectionDirtyLocked(session, dirty);
         }
     }
 
@@ -1702,14 +2902,13 @@ pub const SessionStore = struct {
         token: Token,
         projections: *const LocalChannelProjectionSet,
     ) void {
-        if (tokenIsSentinel(token)) return;
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items.items) |*session| {
-                if (!std.crypto.timing_safe.eql(Token, session.token, token)) continue;
-                self.setLocalProjectionsLocked(session, projections);
-            }
+        const entry = self.tokenEntryMutLocked(token) orelse return;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            self.setLocalProjectionsLocked(session, projections);
         }
+        entry.local_projections = projections.*;
     }
 
     fn nextLocalProjectionGenerationLocked(self: *SessionStore) u64 {
@@ -1721,13 +2920,65 @@ pub const SessionStore = struct {
 
     fn setReplicaDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
         if (session.replica_dirty == dirty) return;
+        const entry = self.tokenEntryMutLocked(session.token);
         session.replica_dirty = dirty;
         if (dirty) {
             self.dirty_replica_rows += 1;
+            if (entry) |group| group.dirty_rows += 1;
         } else {
             std.debug.assert(self.dirty_replica_rows != 0);
             self.dirty_replica_rows -= 1;
+            if (entry) |group| {
+                std.debug.assert(group.dirty_rows != 0);
+                group.dirty_rows -= 1;
+            }
         }
+    }
+
+    fn setAttachmentReplicaDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
+        if (session.attachment_replica_dirty == dirty) return;
+        session.attachment_replica_dirty = dirty;
+        if (dirty) {
+            self.dirty_attachment_replica_rows += 1;
+        } else {
+            std.debug.assert(self.dirty_attachment_replica_rows != 0);
+            self.dirty_attachment_replica_rows -= 1;
+        }
+    }
+
+    fn setPortableLocked(self: *SessionStore, session: *Session, portable: bool) void {
+        if (session.portable_resume == portable) return;
+        const entry = self.tokenEntryMutLocked(session.token);
+        session.portable_resume = portable;
+        if (portable) {
+            if (entry) |group| group.portable_rows += 1;
+        } else if (entry) |group| {
+            std.debug.assert(group.portable_rows != 0);
+            group.portable_rows -= 1;
+        }
+    }
+
+    fn setTokenGroupPortableLocked(self: *SessionStore, token: Token, portable: bool) void {
+        const entry = self.tokenEntryMutLocked(token) orelse return;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            self.setPortableLocked(session, portable);
+        }
+    }
+
+    fn markTokenAttachmentReplicasDirtyLocked(self: *SessionStore, token: Token) bool {
+        if (!self.tokenGroupStateLocked(token).portable) return false;
+        var marked = false;
+        const entry = self.tokenEntryMutLocked(token) orelse return false;
+        for (entry.rows.items) |locator| {
+            self.noteTokenGroupRowVisit();
+            const session = self.sessionForTokenLocatorLocked(locator) orelse unreachable;
+            if (session.attachment_id == null) continue;
+            self.setAttachmentReplicaDirtyLocked(session, true);
+            marked = true;
+        }
+        return marked;
     }
 
     fn removeDirtyRowLocked(self: *SessionStore, session: *const Session) void {
@@ -1739,21 +2990,55 @@ pub const SessionStore = struct {
             std.debug.assert(self.dirty_projection_rows != 0);
             self.dirty_projection_rows -= 1;
         }
+        if (session.attachment_replica_dirty) {
+            std.debug.assert(self.dirty_attachment_replica_rows != 0);
+            self.dirty_attachment_replica_rows -= 1;
+        }
+        if (session.attachment_replica_projection_dirty) {
+            std.debug.assert(self.dirty_attachment_projection_rows != 0);
+            self.dirty_attachment_projection_rows -= 1;
+        }
         if (session.local_channel_projections) |set| {
-            if (set.isEmpty()) return;
-            std.debug.assert(self.dirty_local_projection_rows != 0);
-            self.dirty_local_projection_rows -= 1;
+            if (!set.isEmpty()) {
+                std.debug.assert(self.dirty_local_projection_rows != 0);
+                self.dirty_local_projection_rows -= 1;
+            }
+        }
+        if (session.attachment_channel_projections) |set| {
+            if (!set.isEmpty()) {
+                std.debug.assert(self.dirty_attachment_local_projection_rows != 0);
+                self.dirty_attachment_local_projection_rows -= 1;
+            }
+        }
+    }
+
+    fn addDirtyRowLocked(self: *SessionStore, session: *const Session) void {
+        if (session.replica_dirty) self.dirty_replica_rows += 1;
+        if (session.replica_projection_dirty) self.dirty_projection_rows += 1;
+        if (session.attachment_replica_dirty) self.dirty_attachment_replica_rows += 1;
+        if (session.attachment_replica_projection_dirty) self.dirty_attachment_projection_rows += 1;
+        if (session.local_channel_projections) |set| {
+            if (!set.isEmpty()) self.dirty_local_projection_rows += 1;
+        }
+        if (session.attachment_channel_projections) |set| {
+            if (!set.isEmpty()) self.dirty_attachment_local_projection_rows += 1;
         }
     }
 
     fn setReplicaProjectionDirtyLocked(self: *SessionStore, session: *Session, dirty: bool) void {
         if (session.replica_projection_dirty == dirty) return;
+        const entry = self.tokenEntryMutLocked(session.token);
         session.replica_projection_dirty = dirty;
         if (dirty) {
             self.dirty_projection_rows += 1;
+            if (entry) |group| group.projection_dirty_rows += 1;
         } else {
             std.debug.assert(self.dirty_projection_rows != 0);
             self.dirty_projection_rows -= 1;
+            if (entry) |group| {
+                std.debug.assert(group.projection_dirty_rows != 0);
+                group.projection_dirty_rows -= 1;
+            }
         }
     }
 
@@ -1780,9 +3065,36 @@ pub const SessionStore = struct {
         }
     }
 
+    fn setAttachmentLocalProjectionsLocked(
+        self: *SessionStore,
+        session: *Session,
+        projections: *const LocalChannelProjectionSet,
+    ) void {
+        const was_dirty = if (session.attachment_channel_projections) |set| !set.isEmpty() else false;
+        const now_dirty = !projections.isEmpty();
+        if (now_dirty) {
+            const storage = session.attachment_channel_projections orelse unreachable;
+            storage.* = projections.*;
+        } else if (session.attachment_channel_projections) |storage| {
+            self.allocator.destroy(storage);
+            session.attachment_channel_projections = null;
+        }
+        if (was_dirty == now_dirty) return;
+        if (now_dirty) {
+            self.dirty_attachment_local_projection_rows += 1;
+        } else {
+            std.debug.assert(self.dirty_attachment_local_projection_rows != 0);
+            self.dirty_attachment_local_projection_rows -= 1;
+        }
+    }
+
     fn dropAccount(self: *SessionStore, entry: std.StringHashMap(SessionList).Entry) void {
         const owned_key = entry.key_ptr.*;
-        for (entry.value_ptr.items.items) |session| self.removeDirtyRowLocked(&session);
+        for (entry.value_ptr.items.items) |session| {
+            self.removeDirtyRowLocked(&session);
+            self.removeTokenRowLocked(owned_key, session, false);
+            self.removeAttachmentIndexLocked(session);
+        }
         entry.value_ptr.deinit(self.allocator);
         self.accounts.removeByPtr(entry.key_ptr);
         self.allocator.free(owned_key);
@@ -1883,15 +3195,69 @@ fn localWorkInSlice(
     return false;
 }
 
+fn attachmentWorkOrder(a: AttachmentReplicaWork, b: AttachmentReplicaWork) std.math.Order {
+    const token_order = std.mem.order(u8, &a.token, &b.token);
+    if (token_order != .eq) return token_order;
+    return std.mem.order(u8, &a.attachment_id.raw, &b.attachment_id.raw);
+}
+
+fn attachmentWorkInSlice(work: []const AttachmentReplicaWork, needle: AttachmentReplicaWork) bool {
+    for (work) |candidate| {
+        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
+            candidate.attachment_id.eql(needle.attachment_id))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn attachmentLocalWorkOrder(
+    a: AttachmentLocalChannelProjectionWork,
+    b: AttachmentLocalChannelProjectionWork,
+) std.math.Order {
+    const attachment_order = attachmentWorkOrder(
+        .{ .token = a.token, .attachment_id = a.attachment_id },
+        .{ .token = b.token, .attachment_id = b.attachment_id },
+    );
+    if (attachment_order != .eq) return attachment_order;
+    return localChannelOrder(a.projection.channel(), b.projection.channel());
+}
+
+fn attachmentLocalWorkInSlice(
+    work: []const AttachmentLocalChannelProjectionWork,
+    needle: AttachmentLocalChannelProjectionWork,
+) bool {
+    for (work) |candidate| {
+        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
+            candidate.attachment_id.eql(needle.attachment_id) and
+            std.ascii.eqlIgnoreCase(candidate.projection.channel(), needle.projection.channel()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn freeSnapshot(allocator: std.mem.Allocator, session: *Session) void {
     if (session.snapshot) |bytes| allocator.free(bytes);
     session.snapshot = null;
+}
+
+fn sanitizeCopiedSession(session: *Session) void {
+    // Public Session values own no store memory. Dedicated snapshot/projection
+    // APIs copy or inline the required state while holding the appropriate lock.
+    session.snapshot = null;
+    session.local_channel_projections = null;
+    session.attachment_channel_projections = null;
 }
 
 fn freeSessionOwned(allocator: std.mem.Allocator, session: *Session) void {
     freeSnapshot(allocator, session);
     if (session.local_channel_projections) |set| allocator.destroy(set);
     session.local_channel_projections = null;
+    if (session.attachment_channel_projections) |set| allocator.destroy(set);
+    session.attachment_channel_projections = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,6 +3268,876 @@ const testing = std.testing;
 
 fn tok(b: u8) Token {
     return @as([16]u8, @splat(b));
+}
+
+fn aid(b: u8) AttachmentId {
+    return AttachmentId.fromBytes(@as([16]u8, @splat(b))) catch unreachable;
+}
+
+fn aidNumber(value: u64) AttachmentId {
+    var raw: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, raw[8..16], value, .big);
+    return AttachmentId.fromBytes(raw) catch unreachable;
+}
+
+fn tokenNumber(value: u64) Token {
+    std.debug.assert(value != 0);
+    var raw: Token = @splat(0);
+    std.mem.writeInt(u64, raw[8..16], value, .big);
+    return raw;
+}
+
+fn expectTokenIndexCoherent(store: *SessionStore) !void {
+    store.lock.lockShared();
+    defer store.lock.unlockShared();
+
+    var indexed_rows: usize = 0;
+    var entries = store.token_index.iterator();
+    while (entries.next()) |map_entry| {
+        const token = map_entry.key_ptr.*;
+        const entry = map_entry.value_ptr;
+        try testing.expect(!tokenIsSentinel(token));
+        try testing.expect(entry.rows.items.len != 0);
+        indexed_rows += entry.rows.items.len;
+
+        var portable_rows: usize = 0;
+        var dirty_rows: usize = 0;
+        var projection_dirty_rows: usize = 0;
+        const owner = entry.rows.items[0].account;
+        for (entry.rows.items, 0..) |locator, locator_index| {
+            try testing.expect(std.ascii.eqlIgnoreCase(owner, locator.account));
+            const session = store.sessionForTokenLocatorLocked(locator) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqual(token, session.token);
+            if (session.portable_resume) portable_rows += 1;
+            if (session.replica_dirty) dirty_rows += 1;
+            if (session.replica_projection_dirty) projection_dirty_rows += 1;
+            if (session.local_channel_projections) |set| {
+                try testing.expectEqualDeep(entry.local_projections, set.*);
+            } else {
+                try testing.expect(entry.local_projections.isEmpty());
+            }
+            for (entry.rows.items[locator_index + 1 ..]) |later| {
+                try testing.expect(locator.client != later.client or
+                    !std.mem.eql(u8, locator.account, later.account));
+            }
+        }
+        try testing.expectEqual(portable_rows, entry.portable_rows);
+        try testing.expectEqual(dirty_rows, entry.dirty_rows);
+        try testing.expectEqual(projection_dirty_rows, entry.projection_dirty_rows);
+    }
+
+    var registry_rows: usize = 0;
+    var accounts = store.accounts.iterator();
+    while (accounts.next()) |account_entry| {
+        for (account_entry.value_ptr.items.items) |session| {
+            if (tokenIsSentinel(session.token)) continue;
+            registry_rows += 1;
+            const entry = store.token_index.getPtr(session.token) orelse
+                return error.TestUnexpectedResult;
+            try testing.expect(store.tokenLocatorIndex(
+                entry,
+                account_entry.key_ptr.*,
+                session.client,
+            ) != null);
+        }
+    }
+    try testing.expectEqual(registry_rows, indexed_rows);
+}
+
+test "token index keeps distinct-token attachment work bounded at high cardinality" {
+    const row_count = 512;
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    s.resetTokenIndexComplexity();
+
+    for (0..row_count) |index| {
+        var account_buf: [32]u8 = undefined;
+        const account = try std.fmt.bufPrint(&account_buf, "account-{d}", .{index});
+        _ = try s.attach(account, @intCast(index + 1), tokenNumber(index + 1), @intCast(index));
+    }
+
+    const complexity = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, row_count * 3), complexity.lookups);
+    try testing.expectEqual(@as(usize, 0), complexity.group_row_visits);
+    try testing.expectEqual(@as(usize, row_count), s.token_index.count());
+    try expectTokenIndexCoherent(&s);
+}
+
+test "token index reconstruction normalizes one high-cardinality group linearly without allocation" {
+    const sibling_count = 257;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = sibling_count });
+    defer s.deinit();
+    const token = tokenNumber(0xA11CE);
+    s.resetTokenIndexComplexity();
+
+    for (0..sibling_count) |index| {
+        _ = try s.attachWithAttachment(
+            "Alice",
+            @intCast(index + 1),
+            token,
+            aidNumber(index + 1),
+            @intCast(index),
+        );
+    }
+    const reconstruction = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, sibling_count * 3), reconstruction.lookups);
+    try testing.expectEqual(@as(usize, 0), reconstruction.group_row_visits);
+    try testing.expect(s.restorePortableResumeIssued("Alice", 1, true));
+
+    s.resetTokenIndexComplexity();
+    failing.fail_index = failing.alloc_index;
+    try s.normalizePortableGroupsAfterRestore();
+    try testing.expect(!failing.has_induced_failure);
+    const complexity = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, 0), complexity.lookups);
+    try testing.expectEqual(@as(usize, sibling_count), complexity.group_row_visits);
+
+    var rows: [sibling_count]Session = undefined;
+    const restored = s.sessionsInto("Alice", &rows);
+    try testing.expectEqual(@as(usize, sibling_count), restored.len);
+    for (restored) |session| try testing.expect(session.portable_resume);
+    var work: [sibling_count]AttachmentReplicaWork = undefined;
+    try testing.expectEqual(@as(usize, sibling_count), s.dirtyPortableAttachmentsInto(&work).len);
+}
+
+test "token index reservation OOM never publishes a row or empty account" {
+    var saw_success = false;
+    for (0..8) |failure_offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.init(failing.allocator());
+        defer s.deinit();
+        _ = try s.attach("seed", 1, @as(Token, @splat(0)), 1);
+
+        const target = tokenNumber(0xB1AD);
+        failing.fail_index = failing.alloc_index + failure_offset;
+        const result = s.attach("fresh", 2, target, 2);
+        if (result) |_| {
+            try testing.expect(!failing.has_induced_failure);
+            try testing.expect(s.containsToken(target));
+            saw_success = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expect(failing.has_induced_failure);
+            try testing.expect(!s.containsToken(target));
+            try testing.expect(s.accounts.getPtr("fresh") == null);
+            var rows: [1]Session = undefined;
+            try testing.expectEqual(@as(usize, 1), s.sessionsInto("seed", &rows).len);
+        }
+    }
+    try testing.expect(saw_success);
+}
+
+test "token index stays coherent across eviction replacement bind and removal" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+    const evicted_token = tokenNumber(0xE01);
+    const sibling_token = tokenNumber(0xE02);
+    const target_token = tokenNumber(0xE03);
+    const replacement_token = tokenNumber(0xE04);
+
+    _ = try s.attach("alice", 1, evicted_token, 1);
+    _ = try s.attach("alice", 2, sibling_token, 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markDetached("alice", 1));
+    try expectTokenIndexCoherent(&s);
+
+    const outcome = try s.attachReportingEviction("alice", 3, target_token, 3);
+    try testing.expectEqual(evicted_token, outcome.evicted.?.token);
+    try testing.expect(!s.containsToken(evicted_token));
+    try testing.expect(s.containsToken(sibling_token));
+    try testing.expect(s.containsToken(target_token));
+    try expectTokenIndexCoherent(&s);
+
+    _ = try s.attach("alice", 2, replacement_token, 4);
+    try testing.expect(!s.containsToken(sibling_token));
+    try testing.expect(s.containsToken(replacement_token));
+    try expectTokenIndexCoherent(&s);
+
+    try testing.expect(s.joinTokenGroup("alice", 2, target_token));
+    try testing.expect(!s.containsToken(replacement_token));
+    try testing.expect(s.containsToken(target_token));
+    try expectTokenIndexCoherent(&s);
+
+    try testing.expect(s.remove("alice", 3));
+    try testing.expect(s.containsToken(target_token));
+    try expectTokenIndexCoherent(&s);
+    try testing.expect(s.remove("alice", 2));
+    try testing.expect(!s.containsToken(target_token));
+    try expectTokenIndexCoherent(&s);
+}
+
+test "rowless token-index adoption is leak-clean at every allocation boundary" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.init(allocator);
+            defer s.deinit();
+            const source = tokenNumber(0xA0A0);
+            const target = tokenNumber(0xB0B0);
+            _ = try s.attach("alice", 1, source, 1);
+            try testing.expect(s.markPortableResumeIssued("alice", 1));
+            _ = try s.armTokenLocalChannelProjection(source, "#pending", true, 3);
+
+            var prepared = s.prepareTokenBind(
+                "alice",
+                1,
+                target,
+                .{ .adopt_verified = true },
+            ) orelse return error.OutOfMemory;
+            defer prepared.deinit();
+            try testing.expect(prepared.commit());
+            prepared.finish();
+            try testing.expect(!s.containsToken(source));
+            try testing.expect(s.containsToken(target));
+            try testing.expect(s.tokenLocalChannelProjection(target, "#pending") != null);
+            try expectTokenIndexCoherent(&s);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
+}
+
+test "exact rebind token-index work ignores unrelated registry cardinality" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const resume_token = tokenNumber(0xCA11);
+    const bootstrap_token = tokenNumber(0xCA12);
+    const stable = aidNumber(0xCA11);
+    _ = try s.attachWithAttachment("Alice", 9001, resume_token, stable, 1);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 9001, "state"));
+    _ = try s.attachWithAttachment("alice", 9002, bootstrap_token, aidNumber(0xCA12), 2);
+    for (0..512) |index| {
+        var account_buf: [32]u8 = undefined;
+        const account = try std.fmt.bufPrint(&account_buf, "unrelated-{d}", .{index});
+        _ = try s.attach(
+            account,
+            @intCast(index + 1),
+            tokenNumber(0xD000 + index),
+            @intCast(index),
+        );
+    }
+
+    s.resetTokenIndexComplexity();
+    var prepared = s.prepareExactAttachmentRebind("alice", 9002, resume_token, stable) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expect(prepared.commit());
+    prepared.finish();
+    const complexity = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, 3), complexity.lookups);
+    try testing.expectEqual(@as(usize, 2), complexity.group_row_visits);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "stable attachment ids isolate sibling restore state within one token" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x51);
+    const first_id = aid(0xA1);
+    const second_id = aid(0xB2);
+    _ = try s.attachWithAttachment("alice", 1, token, first_id, 10);
+    _ = try s.attachWithAttachment("alice", 2, token, second_id, 20);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "first-state"));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "second-state"));
+
+    const first = s.findDetachedAttachmentSessionInAccount("alice", token, first_id) orelse
+        return error.TestUnexpectedResult;
+    const second = s.findDetachedAttachmentSessionInAccount("alice", token, second_id) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ClientId, 1), first.client);
+    try testing.expectEqual(@as(ClientId, 2), second.client);
+    try testing.expect(first.attachment_id.?.eql(first_id));
+    try testing.expect(second.attachment_id.?.eql(second_id));
+
+    const first_snapshot = (try s.copyDetachedAttachmentSnapshotInAccount(
+        testing.allocator,
+        "alice",
+        token,
+        first_id,
+    )) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(first_snapshot);
+    const second_snapshot = (try s.copyDetachedAttachmentSnapshotInAccount(
+        testing.allocator,
+        "alice",
+        token,
+        second_id,
+    )) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(second_snapshot);
+    try testing.expectEqualStrings("first-state", first_snapshot);
+    try testing.expectEqualStrings("second-state", second_snapshot);
+
+    // Removing one exact ghost never consumes or aliases its sibling.
+    try testing.expect(s.remove("alice", first.client));
+    try testing.expect(s.findAttachmentSessionInAccount("alice", token, first_id) == null);
+    try testing.expect(s.findDetachedAttachmentSessionInAccount("alice", token, second_id) != null);
+}
+
+test "stable attachment id uniqueness fails before eviction or row mutation" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+
+    const stable = aid(0xCC);
+    _ = try s.attachWithAttachment("alice", 1, tok(1), stable, 10);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "retained"));
+
+    try testing.expectError(
+        error.DuplicateAttachmentId,
+        s.attachWithAttachment("alice", 2, tok(2), stable, 20),
+    );
+    try testing.expectError(
+        error.DuplicateAttachmentId,
+        s.attachWithAttachment("ALICE", 1, tok(1), stable, 30),
+    );
+    var rows: [2]Session = undefined;
+    try testing.expectEqual(@as(usize, 1), s.sessionsInto("alice", &rows).len);
+    const retained = (try s.copyDetachedAttachmentSnapshotInAccount(
+        testing.allocator,
+        "alice",
+        tok(1),
+        stable,
+    )) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(retained);
+    try testing.expectEqualStrings("retained", retained);
+
+    const zero = AttachmentId{ .raw = @splat(0) };
+    try testing.expectError(
+        error.InvalidAttachmentId,
+        s.attachWithAttachment("bob", 7, tok(7), zero, 1),
+    );
+    try testing.expect(!s.containsAttachment(zero));
+}
+
+test "stable attachment index reservation OOM publishes no partial row" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const token = tok(0xCD);
+    const stable = aid(0xCD);
+    _ = try s.attach("alice", 1, token, 10);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        s.attachWithAttachment("alice", 1, token, stable, 20),
+    );
+    const unchanged = s.findTokenSessionInAccount("alice", token).?;
+    try testing.expectEqual(@as(ClientId, 1), unchanged.client);
+    try testing.expectEqual(@as(i64, 10), unchanged.signon_ms);
+    try testing.expect(unchanged.attachment_id == null);
+    try testing.expect(!s.containsAttachment(stable));
+
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try s.attachWithAttachment("alice", 1, token, stable, 20);
+    try testing.expect(s.clientHasAttachment("alice", 1, token, stable));
+    try testing.expect(s.remove("alice", 1));
+    try testing.expect(!s.containsAttachment(stable));
+}
+
+test "legacy refresh preserves an already-current attachment id" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const stable = aid(0xD4);
+    _ = try s.attachWithAttachment("alice", 9, tok(9), stable, 1);
+    _ = try s.attach("alice", 9, tok(8), 2);
+    const refreshed = s.findAttachmentSessionInAccount("alice", tok(8), stable) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ClientId, 9), refreshed.client);
+    try testing.expect(s.clientHasAttachment("alice", 9, tok(8), stable));
+    try testing.expect(s.resumeHandleForClient("alice", 9).?.attachment_id.?.eql(stable));
+}
+
+test "idempotent current attach rejects stable identity rotation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const stable = aid(0xD5);
+    const reminted = aid(0xD6);
+    _ = try s.attachWithAttachment("alice", 9, tok(9), stable, 1);
+    try testing.expectError(
+        error.AttachmentIdMismatch,
+        s.attachWithAttachment("alice", 9, tok(8), reminted, 2),
+    );
+    try testing.expect(s.clientHasAttachment("alice", 9, tok(9), stable));
+    try testing.expect(!s.containsAttachment(reminted));
+
+    // Explicit current adoption may upgrade a legacy null-id row once.
+    _ = try s.attach("bob", 10, tok(10), 1);
+    _ = try s.attachWithAttachment("bob", 10, tok(10), reminted, 2);
+    try testing.expect(s.clientHasAttachment("bob", 10, tok(10), reminted));
+}
+
+test "same attachment token rotation never rekeys receive projection work" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const old_token = tok(0xD7);
+    const new_token = tok(0xD8);
+    const stable = aid(0xD7);
+    _ = try s.attachWithAttachment("alice", 1, old_token, stable, 1);
+    try testing.expect(s.markAttachmentReplicaProjectionDirty(old_token, stable));
+    _ = try s.armAttachmentLocalChannelProjection(old_token, stable, "#old", true, 3);
+
+    _ = try s.attachWithAttachment("alice", 1, new_token, stable, 2);
+    var work: [1]AttachmentReplicaWork = undefined;
+    try testing.expectEqual(@as(usize, 0), s.dirtyAttachmentProjectionsInto(&work).len);
+    try testing.expect(s.attachmentLocalChannelProjection(new_token, stable, "#old") == null);
+    try testing.expect(s.attachmentLocalChannelProjection(old_token, stable, "#old") == null);
+    try testing.expect(s.clientHasAttachment("alice", 1, new_token, stable));
+}
+
+test "public Session copies never expose store-owned journal pointers" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const token = tok(0xD9);
+    const stable = aid(0xD9);
+    _ = try s.attachWithAttachment("alice", 1, token, stable, 1);
+    _ = try s.armTokenLocalChannelProjection(token, "#group", true, 1);
+    _ = try s.armAttachmentLocalChannelProjection(token, stable, "#exact", true, 2);
+
+    var rows: [1]Session = undefined;
+    const listed = s.sessionsInto("alice", &rows);
+    try testing.expect(listed[0].local_channel_projections == null);
+    try testing.expect(listed[0].attachment_channel_projections == null);
+    const exact = s.findAttachmentSessionInAccount("alice", token, stable).?;
+    try testing.expect(exact.local_channel_projections == null);
+    try testing.expect(exact.attachment_channel_projections == null);
+    const allocated = try s.copySessionsAlloc(testing.allocator, "alice");
+    defer testing.allocator.free(allocated);
+    try testing.expect(allocated[0].local_channel_projections == null);
+    try testing.expect(allocated[0].attachment_channel_projections == null);
+
+    // Dedicated value APIs remain usable after the copies leave the lock.
+    try testing.expect(s.tokenLocalChannelProjection(token, "#group") != null);
+    try testing.expect(s.attachmentLocalChannelProjection(token, stable, "#exact") != null);
+}
+
+test "prepared exact attachment rebind aborts cleanly then commits without allocation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const resume_token = tok(0x31);
+    const bootstrap_token = tok(0x32);
+    const stable = aid(0xE1);
+    const bootstrap_id = aid(0xE2);
+    _ = try s.attachWithAttachment("alice", 10, resume_token, stable, 100);
+    try testing.expect(s.markPortableResumeIssued("alice", 10));
+    try testing.expect(s.markTokenReplicaDirty(resume_token));
+    _ = try s.armTokenLocalChannelProjection(resume_token, "#pending", true, 3);
+    const attachment_intent = try s.armAttachmentLocalChannelProjection(
+        resume_token,
+        stable,
+        "#only-this-client",
+        true,
+        5,
+    );
+    try testing.expect(s.markDetachedWithSnapshot("alice", 10, "exact-state"));
+    _ = try s.attachWithAttachment("alice", 20, bootstrap_token, bootstrap_id, 200);
+    try expectTokenIndexCoherent(&s);
+
+    var aborted = s.prepareExactAttachmentRebind("alice", 20, resume_token, stable) orelse
+        return error.TestUnexpectedResult;
+    defer aborted.deinit();
+    try testing.expectEqualStrings("exact-state", aborted.snapshot().?);
+    try testing.expectEqual(@as(ClientId, 10), aborted.remap().old_client);
+    try testing.expectEqual(@as(ClientId, 20), aborted.remap().new_client);
+    aborted.abort();
+
+    // Abort consumes nothing and leaves both identities independently owned.
+    try testing.expect(s.findDetachedAttachmentSessionInAccount("alice", resume_token, stable) != null);
+    try testing.expect(s.clientHasAttachment("alice", 20, bootstrap_token, bootstrap_id));
+
+    var committed = s.prepareExactAttachmentRebind("alice", 20, resume_token, stable) orelse
+        return error.TestUnexpectedResult;
+    defer committed.deinit();
+    try testing.expect(committed.commit());
+    committed.finish();
+
+    var rows: [2]Session = undefined;
+    const current = s.sessionsInto("alice", &rows);
+    try testing.expectEqual(@as(usize, 1), current.len);
+    try testing.expectEqual(@as(ClientId, 20), current[0].client);
+    try testing.expect(current[0].attached);
+    try testing.expectEqual(resume_token, current[0].token);
+    try testing.expect(current[0].attachment_id.?.eql(stable));
+    try testing.expect(current[0].snapshot == null);
+    try testing.expect(current[0].portable_resume);
+    try testing.expect(!s.containsAttachment(bootstrap_id));
+    try testing.expect(!s.containsToken(bootstrap_token));
+    try testing.expect(s.containsToken(resume_token));
+    try testing.expect(s.clientHasAttachment("alice", 20, resume_token, stable));
+    try testing.expectEqual(@as(usize, 1), s.dirtyReplicaRowCount());
+    try testing.expectEqual(@as(usize, 1), s.dirtyLocalProjectionRowCount());
+    try testing.expect(s.tokenLocalChannelProjection(resume_token, "#pending") != null);
+    try testing.expectEqual(@as(usize, 1), s.dirtyAttachmentLocalProjectionRowCount());
+    try testing.expectEqual(
+        attachment_intent.generation,
+        s.attachmentLocalChannelProjection(resume_token, stable, "#only-this-client").?.generation,
+    );
+    try expectTokenIndexCoherent(&s);
+}
+
+test "exact attachment rebind rejects live wrong-token and sibling selectors" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x41);
+    const first = aid(0xF1);
+    const second = aid(0xF2);
+    _ = try s.attachWithAttachment("alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, second, 2);
+    _ = try s.attachWithAttachment("alice", 3, tok(0x43), aid(0xF3), 3);
+
+    // An exact restore never steals a live sibling.
+    try testing.expect(s.prepareExactAttachmentRebind("alice", 3, token, first) == null);
+    try testing.expect(s.markDetached("alice", 1));
+    try testing.expect(s.prepareExactAttachmentRebind("alice", 3, tok(0x44), first) == null);
+    try testing.expect(s.prepareExactAttachmentRebind("alice", 3, token, second) == null);
+    try testing.expect(s.clientHasAttachment("alice", 1, token, first));
+    try testing.expect(s.clientHasAttachment("alice", 2, token, second));
+}
+
+test "exact attachment rebind refuses non-bootstrap claimant authority" {
+    const Cases = struct {
+        fn seed(store: *SessionStore) !void {
+            _ = try store.attachWithAttachment("alice", 1, tok(0x45), aid(0x45), 1);
+            try testing.expect(store.markDetachedWithSnapshot("alice", 1, "ghost"));
+            _ = try store.attachWithAttachment("alice", 2, tok(0x46), aid(0x46), 2);
+        }
+    };
+
+    {
+        var s = SessionStore.init(testing.allocator);
+        defer s.deinit();
+        try Cases.seed(&s);
+        try testing.expect(s.markDetached("alice", 2));
+        try testing.expect(s.prepareExactAttachmentRebind("alice", 2, tok(0x45), aid(0x45)) == null);
+    }
+    {
+        var s = SessionStore.init(testing.allocator);
+        defer s.deinit();
+        try Cases.seed(&s);
+        try testing.expect(s.markPortableResumeIssued("alice", 2));
+        try testing.expect(s.prepareExactAttachmentRebind("alice", 2, tok(0x45), aid(0x45)) == null);
+    }
+    {
+        var s = SessionStore.init(testing.allocator);
+        defer s.deinit();
+        try Cases.seed(&s);
+        _ = try s.armAttachmentLocalChannelProjection(tok(0x46), aid(0x46), "#bootstrap", true, 1);
+        try testing.expect(s.prepareExactAttachmentRebind("alice", 2, tok(0x45), aid(0x45)) == null);
+    }
+}
+
+test "exact attachment rebind crosses folded account display aliases atomically" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x61);
+    const stable = aid(0x61);
+    _ = try s.attachWithAttachment("alice", 1, token, stable, 10);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "folded-state"));
+    _ = try s.attachWithAttachment("ALICE", 2, tok(0x62), aid(0x62), 20);
+
+    var prepared = s.prepareExactAttachmentRebind("ALICE", 2, token, stable) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expectEqualStrings("folded-state", prepared.snapshot().?);
+    try testing.expect(prepared.commit());
+    prepared.finish();
+
+    var old_rows: [1]Session = undefined;
+    try testing.expectEqual(@as(usize, 0), s.sessionsInto("alice", &old_rows).len);
+    try testing.expect(s.clientHasAttachment("ALICE", 2, token, stable));
+    try testing.expect(!s.containsClient("ALICE", 1));
+    try testing.expect(!s.containsToken(tok(0x62)));
+    var account_buf: [16]u8 = undefined;
+    const match = s.findByTokenInto(token, &account_buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("ALICE", match.account);
+    try testing.expectEqual(@as(ClientId, 2), match.client);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "portable group arms and retries every stable sibling independently" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x71);
+    const first = aid(0x71);
+    const second = aid(0x72);
+    const third = aid(0x73);
+    _ = try s.attachWithAttachment("alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, second, 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+
+    var work: [4]AttachmentReplicaWork = undefined;
+    const initial = s.dirtyPortableAttachmentsInto(&work);
+    try testing.expectEqual(@as(usize, 2), initial.len);
+    try testing.expectEqual(token, initial[0].token);
+    try testing.expectEqual(token, initial[1].token);
+    try testing.expect(!initial[0].attachment_id.eql(initial[1].attachment_id));
+
+    try testing.expect(s.clearAttachmentReplicaDirty(token, first));
+    const retained = s.dirtyPortableAttachmentsInto(&work);
+    try testing.expectEqual(@as(usize, 1), retained.len);
+    try testing.expect(retained[0].attachment_id.eql(second));
+
+    // A later create-new sibling entering an already-portable token is armed at
+    // bind commit without re-dirtying or consuming its existing siblings.
+    _ = try s.attachWithAttachment("alice", 3, tok(0x74), third, 3);
+    try testing.expect(s.joinTokenGroup("alice", 3, token));
+    const after_join = s.dirtyPortableAttachmentsInto(&work);
+    try testing.expectEqual(@as(usize, 2), after_join.len);
+    var saw_second = false;
+    var saw_third = false;
+    for (after_join) |item| {
+        saw_second = saw_second or item.attachment_id.eql(second);
+        saw_third = saw_third or item.attachment_id.eql(third);
+    }
+    try testing.expect(saw_second and saw_third);
+}
+
+test "portable authority survives issuer removal on every sibling row" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x75);
+    const issuer = aid(0x75);
+    const sibling = aid(0x76);
+    _ = try s.attachWithAttachment("alice", 1, token, issuer, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, sibling, 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.resumeHandleForClient("alice", 1).?.portable);
+    try testing.expect(s.resumeHandleForClient("alice", 2).?.portable);
+    try testing.expect(s.clearAttachmentReplicaDirty(token, issuer));
+    try testing.expect(s.clearAttachmentReplicaDirty(token, sibling));
+
+    try testing.expect(s.remove("alice", 1));
+    try testing.expect(s.resumeHandleForClient("alice", 2).?.portable);
+    try testing.expect(s.markAttachmentReplicaDirty(token, sibling));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "sibling-state"));
+    const copies = try s.copyPortableDetachedAttachmentSnapshots(testing.allocator);
+    defer {
+        for (copies) |*copy| copy.deinit(testing.allocator);
+        testing.allocator.free(copies);
+    }
+    try testing.expectEqual(@as(usize, 1), copies.len);
+    try testing.expect(copies[0].attachment_id.eql(sibling));
+}
+
+test "portable claimant joining a nonportable group arms every target sibling" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const source = tok(0x79);
+    const target = tok(0x7A);
+    const claimant_id = aid(0x79);
+    const target_a = aid(0x7A);
+    const target_b = aid(0x7B);
+    _ = try s.attachWithAttachment("alice", 1, source, claimant_id, 1);
+    _ = try s.attachWithAttachment("alice", 2, target, target_a, 2);
+    _ = try s.attachWithAttachment("alice", 3, target, target_b, 3);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.clearAttachmentReplicaDirty(source, claimant_id));
+
+    try testing.expect(s.joinTokenGroup("alice", 1, target));
+    var work: [3]AttachmentReplicaWork = undefined;
+    const dirty = s.dirtyPortableAttachmentsInto(&work);
+    try testing.expectEqual(@as(usize, 3), dirty.len);
+    var saw_claimant = false;
+    var saw_a = false;
+    var saw_b = false;
+    for (dirty) |item| {
+        try testing.expectEqual(target, item.token);
+        saw_claimant = saw_claimant or item.attachment_id.eql(claimant_id);
+        saw_a = saw_a or item.attachment_id.eql(target_a);
+        saw_b = saw_b or item.attachment_id.eql(target_b);
+    }
+    try testing.expect(saw_claimant and saw_a and saw_b);
+}
+
+test "post-restore portability normalization is linear transactional and complete" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const token = tok(0x77);
+    const first = aid(0x77);
+    const second = aid(0x78);
+    _ = try s.attachWithAttachment("alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, second, 2);
+    try testing.expect(s.restorePortableResumeIssued("alice", 1, true));
+    try testing.expect(s.restorePortableResumeIssued("alice", 2, false));
+
+    s.resetTokenIndexComplexity();
+    failing.fail_index = failing.alloc_index;
+    try s.normalizePortableGroupsAfterRestore();
+    try testing.expect(!failing.has_induced_failure);
+    const complexity = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, 0), complexity.lookups);
+    try testing.expectEqual(@as(usize, 2), complexity.group_row_visits);
+    try testing.expect(s.findAttachmentSessionInAccount("alice", token, first).?.portable_resume);
+    try testing.expect(s.findAttachmentSessionInAccount("alice", token, second).?.portable_resume);
+    var work: [2]AttachmentReplicaWork = undefined;
+    try testing.expectEqual(@as(usize, 2), s.dirtyPortableAttachmentsInto(&work).len);
+}
+
+test "portable detached attachment enumeration never dedupes same-token siblings" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x81);
+    const first = aid(0x81);
+    const second = aid(0x82);
+    _ = try s.attachWithAttachment("Alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("Alice", 2, token, second, 2);
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "first"));
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 2, "second"));
+
+    const copies = try s.copyPortableDetachedAttachmentSnapshots(testing.allocator);
+    defer {
+        for (copies) |*copy| copy.deinit(testing.allocator);
+        testing.allocator.free(copies);
+    }
+    try testing.expectEqual(@as(usize, 2), copies.len);
+    var saw_first = false;
+    var saw_second = false;
+    for (copies) |copy| {
+        try testing.expectEqualStrings("Alice", copy.account);
+        try testing.expectEqual(token, copy.token);
+        if (copy.attachment_id.eql(first)) {
+            saw_first = true;
+            try testing.expectEqualStrings("first", copy.snapshot);
+        } else if (copy.attachment_id.eql(second)) {
+            saw_second = true;
+            try testing.expectEqualStrings("second", copy.snapshot);
+        } else return error.TestUnexpectedResult;
+    }
+    try testing.expect(saw_first and saw_second);
+}
+
+test "portable detached attachment enumeration is complete at high cardinality" {
+    const sibling_count = 257;
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = sibling_count });
+    defer s.deinit();
+    const token = tok(0x83);
+
+    for (0..sibling_count) |index| {
+        const client: ClientId = @intCast(index + 1);
+        _ = try s.attachWithAttachment("wide", client, token, aidNumber(index + 1), @intCast(index));
+        try testing.expect(s.markDetachedWithSnapshot("wide", client, "x"));
+    }
+    try testing.expect(s.markPortableResumeIssued("wide", 1));
+
+    const copies = try s.copyPortableDetachedAttachmentSnapshots(testing.allocator);
+    defer {
+        for (copies) |*copy| copy.deinit(testing.allocator);
+        testing.allocator.free(copies);
+    }
+    try testing.expectEqual(@as(usize, sibling_count), copies.len);
+    var seen: [sibling_count]bool = @splat(false);
+    for (copies) |copy| {
+        const value = std.mem.readInt(u64, copy.attachment_id.raw[8..16], .big);
+        if (value == 0 or value > sibling_count) return error.TestUnexpectedResult;
+        try testing.expect(!seen[value - 1]);
+        seen[value - 1] = true;
+    }
+    for (seen) |present| try testing.expect(present);
+}
+
+test "attachment channel projection journals preserve divergent siblings" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0x91);
+    const first = aid(0x91);
+    const second = aid(0x92);
+    _ = try s.attachWithAttachment("alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, second, 2);
+
+    const first_same = try s.armAttachmentLocalChannelProjection(token, first, "#same", true, 0x01);
+    _ = try s.armAttachmentLocalChannelProjection(token, first, "#first", true, 0x02);
+    const second_same = try s.armAttachmentLocalChannelProjection(token, second, "#same", false, 0x40);
+    _ = try s.armAttachmentLocalChannelProjection(token, second, "#second", true, 0x20);
+
+    const second_before = s.attachmentLocalChannelProjection(token, second, "#same").?;
+    try testing.expect(second_before.generation == second_same.generation);
+    try testing.expect(!second_before.present);
+    try testing.expectEqual(@as(u8, 0x40), second_before.member_mode_bits);
+    try testing.expect(s.tokenLocalChannelProjection(token, "#same") == null);
+
+    // Completing A cannot clear, replace, or even change B's generation.
+    try testing.expect(s.clearAttachmentLocalChannelProjection(
+        token,
+        first,
+        "#same",
+        first_same.generation,
+    ));
+    try testing.expect(s.attachmentLocalChannelProjection(token, first, "#same") == null);
+    const second_after = s.attachmentLocalChannelProjection(token, second, "#same").?;
+    try testing.expectEqualDeep(second_before, second_after);
+
+    var work: [4]AttachmentLocalChannelProjectionWork = undefined;
+    const pending = s.dirtyAttachmentLocalProjectionsInto(&work);
+    try testing.expectEqual(@as(usize, 3), pending.len);
+    var first_count: usize = 0;
+    var second_count: usize = 0;
+    for (pending) |item| {
+        if (item.attachment_id.eql(first)) first_count += 1;
+        if (item.attachment_id.eql(second)) second_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), first_count);
+    try testing.expectEqual(@as(usize, 2), second_count);
+    try testing.expectEqual(@as(usize, 2), s.dirtyAttachmentLocalProjectionRowCount());
+}
+
+test "attachment channel projection first-arm OOM is isolated and retryable" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+
+    const token = tok(0x93);
+    const first = aid(0x93);
+    const second = aid(0x94);
+    _ = try s.attachWithAttachment("alice", 1, token, first, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, second, 2);
+    const generation_before = s.next_local_projection_generation;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        s.armAttachmentLocalChannelProjection(token, first, "#oom", true, 1),
+    );
+    try testing.expectEqual(generation_before, s.next_local_projection_generation);
+    try testing.expectEqual(@as(usize, 0), s.dirtyAttachmentLocalProjectionRowCount());
+    try testing.expect(s.attachmentLocalChannelProjection(token, first, "#oom") == null);
+    try testing.expect(s.attachmentLocalChannelProjection(token, second, "#oom") == null);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const armed = try s.armAttachmentLocalChannelProjection(token, first, "#oom", true, 1);
+    try testing.expectEqual(@as(usize, 1), s.dirtyAttachmentLocalProjectionRowCount());
+    failing.has_induced_failure = false;
+    failing.fail_index = failing.alloc_index;
+    const replaced = try s.armAttachmentLocalChannelProjectionWithPrevious(
+        token,
+        first,
+        "#OOM",
+        false,
+        7,
+    );
+    try testing.expectEqual(armed.generation, replaced.previous.?.generation);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(s.rollbackAttachmentLocalChannelProjectionArm(
+        token,
+        first,
+        replaced.intent.generation,
+        replaced.previous,
+    ));
+    const restored = s.attachmentLocalChannelProjection(token, first, "#oom").?;
+    try testing.expect(restored.present);
+    try testing.expectEqual(@as(u8, 1), restored.member_mode_bits);
 }
 
 test "local channel projection journals overlapping channels and CAS clears independently" {
@@ -1953,11 +4189,8 @@ test "local channel projection rejected arm restores prior intent without erasin
     try testing.expectEqual(@as(usize, 3), s.dirtyLocalProjectionRowCount());
     var rows: [3]Session = undefined;
     for (s.sessionsInto("alice", &rows)) |row| {
-        const set = row.local_channel_projections orelse return error.TestUnexpectedResult;
-        const index = localProjectionIndex(set, "#keep") orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(prior.generation, set.items[index].generation);
-        try testing.expect(set.items[index].present);
-        try testing.expectEqual(@as(u8, 0x0D), set.items[index].member_mode_bits);
+        try testing.expect(row.local_channel_projections == null);
+        try testing.expect(row.attachment_channel_projections == null);
     }
 
     const prior_absent = try s.armTokenLocalChannelProjection(token, "#absent", false, 0x06);
@@ -2243,11 +4476,15 @@ test "prepared token bind preview is complete at capacity and keeps newest targe
     var rows: [2]Session = undefined;
     for (s.sessionsInto("alice", &rows)) |row| {
         try testing.expect(std.crypto.timing_safe.eql(Token, row.token, target));
-        const set = row.local_channel_projections orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(local_channel_projection_capacity, set.slice().len);
-        const index = localProjectionIndex(set, "#case") orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(newer_collision.generation, set.items[index].generation);
+        try testing.expect(row.local_channel_projections == null);
+        try testing.expect(row.attachment_channel_projections == null);
     }
+    var committed_projection_buf: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    const committed_projections = s.tokenLocalChannelProjectionsInto(target, &committed_projection_buf);
+    try testing.expectEqual(local_channel_projection_capacity, committed_projections.len);
+    const committed_index = localProjectionIndex(&prepared.merged_local_projections, "#case") orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(newer_collision.generation, committed_projections[committed_index].generation);
 }
 
 test "prepared token bind row snapshot supersedes stale exact-case copy and freezes folded account" {
@@ -2632,6 +4869,7 @@ test "attach reports portable authority displaced by same-client replacement" {
     try testing.expect(s.markPortableResumeIssued("alice", 1));
     const outcome = try s.attachReportingEviction("alice", 1, tok(2), 20);
     const evicted = outcome.evicted orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ClientId, 1), evicted.client);
     try testing.expectEqualSlices(u8, &tok(1), &evicted.token);
     try testing.expect(evicted.portable);
     try testing.expectEqualSlices(u8, &tok(2), &outcome.session.token);
@@ -2646,6 +4884,7 @@ test "attach reports portable detached authority evicted at account cap" {
     try testing.expect(s.markDetached("alice", 1));
     const outcome = try s.attachReportingEviction("alice", 2, tok(2), 20);
     const evicted = outcome.evicted orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ClientId, 1), evicted.client);
     try testing.expectEqualSlices(u8, &tok(1), &evicted.token);
     try testing.expect(evicted.portable);
     try testing.expectEqualSlices(u8, &tok(2), &outcome.session.token);
@@ -2873,12 +5112,13 @@ test "token group stays portable when issuing sibling detaches" {
     try testing.expect(s.markPortableResumeIssued("alice", 1));
     try testing.expect(s.markDetached("alice", 1));
 
-    // Per-row issuance remains exact for checkpoint/audit purposes.
+    // Portability is copied to every row so removing the issuer cannot disable
+    // a surviving attachment's lease or detach publication.
     var rows: [2]Session = undefined;
     const sessions = s.sessionsInto("alice", &rows);
     try testing.expectEqual(@as(usize, 2), sessions.len);
     for (sessions) |session| {
-        try testing.expectEqual(session.client == 1, session.portable_resume);
+        try testing.expect(session.portable_resume);
     }
 
     // Group-facing APIs combine "any portable" with "any attached". Client B
@@ -3057,12 +5297,16 @@ test "sentinel tracks independent accounts without becoming a token group" {
     try testing.expect(s.prepareTokenBind("alice", 3, sentinel, .join_existing) == null);
     try testing.expect(s.prepareTokenBind("alice", 3, sentinel, .{ .adopt_verified = true }) == null);
     try testing.expect(!s.markTokenReplicaDirty(sentinel));
+    try testing.expect(!s.containsToken(sentinel));
+    var account_buf: [16]u8 = undefined;
+    try testing.expect(s.findByTokenInto(sentinel, &account_buf) == null);
     try testing.expectError(
         error.NoSuchToken,
         s.armTokenLocalChannelProjection(sentinel, "#sentinel", true, 0),
     );
     try testing.expectEqual(@as(usize, 0), s.dirtyReplicaRowCount());
     try testing.expectEqual(@as(usize, 0), s.dirtyLocalProjectionRowCount());
+    try expectTokenIndexCoherent(&s);
 }
 
 test "prepared bind enforces folded token account and rolls back staged case-variant journal OOM" {
@@ -3211,7 +5455,7 @@ test "detached snapshot replacement OOM preserves prior retry state" {
     try testing.expectEqualStrings("last-good-snapshot", retained);
 }
 
-test "portable and dirty state are exact token group properties" {
+test "portable and dirty state remain durable token group properties" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
 
@@ -3220,12 +5464,12 @@ test "portable and dirty state are exact token group properties" {
     _ = try s.attach("bob", 3, tok(0xB2), 3);
     _ = try s.attach("carol", 4, tok(0xC3), 4);
 
-    // Issuance remains an exact-row fact; token-group eligibility is its OR.
+    // Issuance durably propagates to every exact-token row.
     try testing.expect(s.markPortableResumeIssued("alice", 2));
     try testing.expect(s.markPortableResumeIssued("bob", 3));
     var alice_rows: [4]Session = undefined;
     for (s.sessionsInto("alice", &alice_rows)) |session| {
-        try testing.expectEqual(session.client == 2, session.portable_resume);
+        try testing.expect(session.portable_resume);
     }
 
     // A non-portable token is rejected without leaving a partial dirty mark.
@@ -3243,18 +5487,17 @@ test "portable and dirty state are exact token group properties" {
         try testing.expect(session.replica_dirty);
     }
 
-    // Dirty is the durable eligibility proof after marking: removing the only
-    // row that received the credential must not strand the surviving sibling's
-    // pending group publication.
+    // Removing the original issuer leaves both the group credential and pending
+    // publication durable on the surviving sibling.
     try testing.expect(s.remove("alice", 2));
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
     const surviving = s.sessionsInto("alice", &alice_rows);
     try testing.expectEqual(@as(usize, 1), surviving.len);
-    try testing.expect(!surviving[0].portable_resume);
+    try testing.expect(surviving[0].portable_resume);
     try testing.expect(surviving[0].replica_dirty);
 
     // Collection is caller-bounded, allocation-free, and unique even though
-    // token A's credential-issuing row has already disappeared.
+    // token A's original credential-issuing row has already disappeared.
     var one: [1]Token = undefined;
     try testing.expectEqual(@as(usize, 1), s.dirtyPortableTokensInto(&one).len);
     var all: [4]Token = undefined;
@@ -3291,14 +5534,14 @@ test "join and adopt OR dirty portable state across token groups" {
     try testing.expect(s.markTokenReplicaDirty(tok(0x11)));
 
     // Moving the dirty source into an existing clean group dirties every
-    // destination sibling without losing its pending retry. Per-row portable
-    // issuance stays exact.
+    // destination sibling without losing its pending retry. Portability becomes
+    // durable on the whole destination group.
     try testing.expect(s.joinTokenGroup("alice", 1, tok(0x22)));
     var rows: [8]Session = undefined;
     const joined = s.sessionsInto("alice", &rows);
     for (joined) |session| {
         if (!std.mem.eql(u8, &session.token, &tok(0x22))) continue;
-        try testing.expectEqual(session.client == 1, session.portable_resume);
+        try testing.expect(session.portable_resume);
         try testing.expect(session.replica_dirty);
     }
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
@@ -3308,7 +5551,7 @@ test "join and adopt OR dirty portable state across token groups" {
     try testing.expectEqual(@as(usize, 3), s.dirtyReplicaRowCount());
     for (s.sessionsInto("alice", &rows)) |session| {
         try testing.expectEqualSlices(u8, &tok(0x22), &session.token);
-        try testing.expectEqual(session.client == 1, session.portable_resume);
+        try testing.expect(session.portable_resume);
         try testing.expect(session.replica_dirty);
     }
 }

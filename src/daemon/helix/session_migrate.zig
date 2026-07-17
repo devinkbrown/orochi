@@ -139,7 +139,12 @@ pub const PendingMigrations = struct {
         max_per_account: usize = 64,
     };
 
-    pub const PutError = error{ PendingFull, AlreadyConsumed, StaleOffer, TokenAccountMismatch } || std.mem.Allocator.Error;
+    pub const PutError = error{
+        PendingFull,
+        AlreadyConsumed,
+        StaleOffer,
+        TokenAccountMismatch,
+    } || std.mem.Allocator.Error;
     pub const ConsumeError = error{ ConsumedFull, InvalidMetadata } || std.mem.Allocator.Error;
 
     pub const Entry = struct {
@@ -398,6 +403,7 @@ pub const PendingMigrations = struct {
     /// a newer snapshot for the same resume token, while different authenticated
     /// origin peers never collide merely because their local nonce counters match.
     pub fn putAtEpoch(self: *PendingMigrations, cap: Capsule, now_ms: i64, offer_epoch: u64) PutError!void {
+        if (now_ms < 0) return error.StaleOffer;
         // Legacy one-shot peers may have converged a consume tombstone during a
         // rolling upgrade. An unsigned/legacy restage must still respect it;
         // only a newly verified, ordered relay offer proves that the reusable
@@ -420,17 +426,25 @@ pub const PendingMigrations = struct {
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
         errdefer self.allocator.free(snapshot);
+        if (!replacing) try self.map.ensureUnusedCapacity(self.allocator, 1);
         // v3+ session credentials are reusable multi-attachment capabilities.
         // A freshly verified signed offer reactivates a token tombstoned by an
         // older one-shot peer during a rolling upgrade. Do this only after all
         // bounds/allocation checks pass so a failed stage preserves old state.
         if (offer_epoch != 0) _ = self.consumed.remove(cap.token);
-        const gop = try self.map.getOrPut(self.allocator, cap.token);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.account);
-            self.allocator.free(gop.value_ptr.snapshot);
+        if (replacing) {
+            const current = self.map.getPtr(cap.token).?;
+            self.allocator.free(current.account);
+            self.allocator.free(current.snapshot);
+            current.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms, .offer_epoch = offer_epoch };
+        } else {
+            self.map.putAssumeCapacityNoClobber(cap.token, .{
+                .account = account,
+                .snapshot = snapshot,
+                .staged_at_ms = now_ms,
+                .offer_epoch = offer_epoch,
+            });
         }
-        gop.value_ptr.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms, .offer_epoch = offer_epoch };
     }
 
     /// Project the Store's already-selected best v2 identity into the token-keyed
@@ -445,6 +459,8 @@ pub const PendingMigrations = struct {
         revision: session_replica.Revision,
         expires_at_ms: i64,
     ) PutError!void {
+        if (!checkpointEntryMetadataValid(now_ms, 0, revision, expires_at_ms))
+            return error.StaleOffer;
         const replacing = self.map.contains(cap.token);
         if (replacing) {
             const current = self.map.getPtr(cap.token).?;
@@ -457,14 +473,10 @@ pub const PendingMigrations = struct {
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
         errdefer self.allocator.free(snapshot);
+        if (!replacing) try self.map.ensureUnusedCapacity(self.allocator, 1);
 
         _ = self.consumed.remove(cap.token);
-        const gop = try self.map.getOrPut(self.allocator, cap.token);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.account);
-            self.allocator.free(gop.value_ptr.snapshot);
-        }
-        gop.value_ptr.* = .{
+        const replacement = Entry{
             .account = account,
             .snapshot = snapshot,
             .staged_at_ms = now_ms,
@@ -472,6 +484,14 @@ pub const PendingMigrations = struct {
             .replica_revision = revision,
             .replica_expires_at_ms = expires_at_ms,
         };
+        if (replacing) {
+            const current = self.map.getPtr(cap.token).?;
+            self.allocator.free(current.account);
+            self.allocator.free(current.snapshot);
+            current.* = replacement;
+        } else {
+            self.map.putAssumeCapacityNoClobber(cap.token, replacement);
+        }
     }
 
     /// Remove only a v2-derived reconnect projection after the Store reports no
@@ -552,19 +572,20 @@ pub const PendingMigrations = struct {
     /// token tombstone. Modern successful attachment deliberately does not call
     /// this because the signed replica is reusable by concurrent clients.
     pub fn markConsumed(self: *PendingMigrations, token: Token, now_ms: i64) ConsumeError!void {
-        // Remove the live copy first even if allocating the tombstone fails: a
-        // memory-pressure event must not leave an immediately double-consumable
-        // snapshot in place.
-        if (self.map.fetchRemove(token)) |kv| {
-            self.allocator.free(kv.value.account);
-            self.allocator.free(kv.value.snapshot);
-        }
         if (now_ms < 0) return error.InvalidMetadata;
-        if (self.consumed.contains(token)) return;
+        if (self.consumed.contains(token)) {
+            self.removeLiveEntry(token);
+            return;
+        }
         if (self.cfg.max_entries == 0) return error.ConsumedFull;
+        // Reserve before evicting an older tombstone or removing the live
+        // snapshot. Once this succeeds, publication and removal are no-fail, so
+        // OOM leaves both replay authority and reusable state byte-identical.
+        try self.consumed.ensureUnusedCapacity(self.allocator, 1);
         if (self.consumed.count() >= self.cfg.max_entries and !self.evictOldestConsumed())
             return error.ConsumedFull;
-        try self.consumed.put(self.allocator, token, now_ms);
+        self.consumed.putAssumeCapacityNoClobber(token, now_ms);
+        self.removeLiveEntry(token);
     }
 
     /// Legacy destructive access used by compatibility tests/capsule adoption.
@@ -599,6 +620,13 @@ pub const PendingMigrations = struct {
             }
         }
         return if (oldest_token) |token| self.consumed.remove(token) else false;
+    }
+
+    fn removeLiveEntry(self: *PendingMigrations, token: Token) void {
+        if (self.map.fetchRemove(token)) |kv| {
+            self.allocator.free(kv.value.account);
+            self.allocator.free(kv.value.snapshot);
+        }
     }
 
     fn countForAccount(self: *const PendingMigrations, account: []const u8) usize {
@@ -742,6 +770,24 @@ test "migration capsule encode/decode round-trips" {
     try testing.expectError(error.TrailingBytes, decode(trailing));
 }
 
+test "migration capsule encoding is leak-free across every allocation failure" {
+    const cap = Capsule{
+        .token = @splat(0x39),
+        .account = "Alice",
+        .snapshot = "complete-session-snapshot",
+    };
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, capsule: Capsule) !void {
+            const wire = try encode(allocator, capsule);
+            defer allocator.free(wire);
+            const restored = try decode(wire);
+            try testing.expectEqualStrings(capsule.account, restored.account);
+            try testing.expectEqualStrings(capsule.snapshot, restored.snapshot);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{cap});
+}
+
 test "consumption tombstone wire round-trips exactly" {
     const original = Tombstone{ .token = @splat(0x5A), .consumed_at_ms = 123_456 };
     var buf: [tombstone_wire_len]u8 = undefined;
@@ -796,6 +842,31 @@ test "put replaces an existing token snapshot without leaking" {
     try testing.expectEqualStrings("yy", e.snapshot);
 }
 
+test "put replacement preserves exact prior state at every allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var pm = PendingMigrations.init(allocator);
+            defer pm.deinit();
+            const token: Token = @splat(0x3A);
+            try pm.putAtEpoch(.{ .token = token, .account = "Alice", .snapshot = "old" }, 10, 1);
+
+            pm.putAtEpoch(.{ .token = token, .account = "ALICE", .snapshot = "new" }, 20, 2) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                const prior = pm.get(token).?;
+                try testing.expectEqualStrings("Alice", prior.account);
+                try testing.expectEqualStrings("old", prior.snapshot);
+                try testing.expectEqual(@as(i64, 10), prior.staged_at_ms);
+                try testing.expectEqual(@as(u64, 1), prior.offer_epoch);
+                try pm.putAtEpoch(.{ .token = token, .account = "ALICE", .snapshot = "new" }, 20, 2);
+                try testing.expectEqualStrings("new", pm.get(token).?.snapshot);
+                return err;
+            };
+            try testing.expectEqualStrings("new", pm.get(token).?.snapshot);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
+}
+
 test "signed offer epoch rejects replay and stale replacement per token" {
     const allocator = testing.allocator;
     var pm = PendingMigrations.init(allocator);
@@ -820,6 +891,47 @@ test "signed offer epoch rejects replay and stale replacement per token" {
     const entry = pm.get(token).?;
     try testing.expectEqual(@as(u64, 43), entry.offer_epoch);
     try testing.expectEqualStrings("newer", entry.snapshot);
+}
+
+test "staging rejects invalid clocks and replica origins before allocation or mutation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var pm = PendingMigrations.init(failing.allocator());
+    defer pm.deinit();
+    const token: Token = @splat(0x3B);
+
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "state" }, -1, 1),
+    );
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putReplica(
+            .{ .token = token, .account = "alice", .snapshot = "state" },
+            1,
+            .{ .epoch = 1, .sequence = 1, .origin_node = 0 },
+            10,
+        ),
+    );
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putReplica(
+            .{ .token = token, .account = "alice", .snapshot = "state" },
+            1,
+            .{ .epoch = 1, .sequence = 1, .origin_node = 7 },
+            10,
+        ),
+    );
+    try testing.expectError(
+        error.StaleOffer,
+        pm.putReplica(
+            .{ .token = token, .account = "alice", .snapshot = "state" },
+            1,
+            .{ .epoch = 1, .sequence = 1, .origin_node = 7 },
+            -1,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), pm.count());
+    try testing.expect(!failing.has_induced_failure);
 }
 
 test "put fails closed at max_entries; a replacement of an existing token still succeeds" {
@@ -939,6 +1051,112 @@ test "verified reusable-session offer supersedes a legacy consumption tombstone"
     try testing.expect(pm.has(token));
     try testing.expect(!pm.isConsumed(token));
     try testing.expectEqualStrings("fresh-signed-state", pm.get(token).?.snapshot);
+
+    // A reusable replica is one logical token with any number of physical
+    // clients. Repeated attachment reads never consume or tombstone it.
+    const first_client = pm.get(token).?;
+    const second_client = pm.get(token).?;
+    try testing.expectEqual(first_client, second_client);
+    try testing.expect(pm.has(token));
+    try testing.expect(!pm.isConsumed(token));
+}
+
+test "legacy consume and signed reactivation are retryable at every allocation failure" {
+    const ConsumeSweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var pm = PendingMigrations.initWithConfig(allocator, .{ .max_entries = 8, .max_per_account = 8 });
+            defer pm.deinit();
+            const token: Token = @splat(0xB1);
+            try pm.put(.{ .token = token, .account = "Alice", .snapshot = "live-state" }, 10);
+            try testing.expectError(error.InvalidMetadata, pm.markConsumed(token, -1));
+            try testing.expect(pm.has(token));
+            try testing.expect(!pm.isConsumed(token));
+
+            pm.markConsumed(token, 20) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expect(pm.has(token));
+                try testing.expect(!pm.isConsumed(token));
+                try testing.expectEqualStrings("Alice", pm.get(token).?.account);
+                try testing.expectEqualStrings("live-state", pm.get(token).?.snapshot);
+                try pm.markConsumed(token, 20);
+                try testing.expect(!pm.has(token));
+                try testing.expect(pm.isConsumed(token));
+                return err;
+            };
+            try testing.expect(!pm.has(token));
+            try testing.expect(pm.isConsumed(token));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, ConsumeSweep.run, .{});
+
+    const ReactivateSweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var pm = PendingMigrations.initWithConfig(allocator, .{ .max_entries = 8, .max_per_account = 8 });
+            defer pm.deinit();
+            const token: Token = @splat(0xB2);
+            try pm.markConsumed(token, 20);
+
+            pm.putAtEpoch(.{
+                .token = token,
+                .account = "Alice",
+                .snapshot = "fresh-signed-state",
+            }, 21, 7) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expect(!pm.has(token));
+                try testing.expect(pm.isConsumed(token));
+                try pm.putAtEpoch(.{
+                    .token = token,
+                    .account = "ALICE",
+                    .snapshot = "fresh-signed-state",
+                }, 21, 7);
+                try testing.expect(pm.has(token));
+                try testing.expect(!pm.isConsumed(token));
+                return err;
+            };
+            try testing.expect(pm.has(token));
+            try testing.expect(!pm.isConsumed(token));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, ReactivateSweep.run, .{});
+}
+
+test "v2 reconnect projection publication is retryable at every allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var pm = PendingMigrations.initWithConfig(allocator, .{ .max_entries = 8, .max_per_account = 8 });
+            defer pm.deinit();
+            const token: Token = @splat(0xB3);
+            try pm.markConsumed(token, 20);
+            const revision = session_replica.Revision{
+                .epoch = 100,
+                .sequence = (@as(u64, 100) << 16) | 1,
+                .origin_node = 7,
+            };
+
+            pm.putReplica(
+                .{ .token = token, .account = "Alice", .snapshot = "replica" },
+                21,
+                revision,
+                10_000,
+            ) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expect(!pm.has(token));
+                try testing.expect(pm.isConsumed(token));
+                try pm.putReplica(
+                    .{ .token = token, .account = "ALICE", .snapshot = "replica" },
+                    21,
+                    revision,
+                    10_000,
+                );
+                try testing.expect(pm.has(token));
+                try testing.expect(!pm.isConsumed(token));
+                return err;
+            };
+            try testing.expect(pm.has(token));
+            try testing.expect(!pm.isConsumed(token));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
 }
 
 test "sweep evicts entries past the TTL and keeps fresh ones" {
@@ -973,7 +1191,11 @@ test "v2 projection supersedes legacy and legacy can never downgrade it" {
     const token: Token = @splat(0x41);
     try pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "legacy-high-clock" }, 1, std.math.maxInt(u64));
 
-    const revision = session_replica.Revision{ .epoch = 10, .sequence = 20, .origin_node = 30 };
+    const revision = session_replica.Revision{
+        .epoch = 10,
+        .sequence = (@as(u64, 10) << 16) | 20,
+        .origin_node = 30,
+    };
     try pm.putReplica(.{ .token = token, .account = "alice", .snapshot = "v2-authority" }, 2, revision, 10_000);
     try testing.expectEqualStrings("v2-authority", pm.get(token).?.snapshot);
     try testing.expect(pm.get(token).?.replica_revision.?.eql(revision));
@@ -989,8 +1211,16 @@ test "v2 projection supersedes legacy and legacy can never downgrade it" {
 test "v2 projection follows Store fallback when a higher origin disappears" {
     const allocator = testing.allocator;
     const token: Token = @splat(0x52);
-    const low = session_replica.Revision{ .epoch = 100, .sequence = 200, .origin_node = 3 };
-    const high = session_replica.Revision{ .epoch = 100, .sequence = 200, .origin_node = 9 };
+    const low = session_replica.Revision{
+        .epoch = 100,
+        .sequence = (@as(u64, 100) << 16) | 200,
+        .origin_node = 3,
+    };
+    const high = session_replica.Revision{
+        .epoch = 100,
+        .sequence = (@as(u64, 100) << 16) | 200,
+        .origin_node = 9,
+    };
 
     var projection = PendingMigrations.init(allocator);
     defer projection.deinit();

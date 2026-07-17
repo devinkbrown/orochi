@@ -188,6 +188,14 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             return self.len;
         }
 
+        /// Whether this inline cross-leg roster has no participant state that an
+        /// in-place exec would discard. ChannelBridge has no internal mutex: the
+        /// owner must hold the same lock used for register/unregister while
+        /// consulting this allocation-free predicate.
+        pub fn upgradeContinuityReady(self: *const Self) bool {
+            return self.count() == 0;
+        }
+
         fn recomputeCodec(self: *Self) void {
             self.session = .{};
             self.ssrcs = .{};
@@ -438,6 +446,17 @@ test "crossTargets returns only opposite-leg members, excluding the sender" {
     const n2 = br.crossTargets(.webrtc, "mob", &out);
     try testing.expectEqual(@as(usize, 2), n2);
     for (out[0..n2]) |m| try testing.expectEqual(Leg.native, m.leg);
+}
+
+test "upgrade continuity: ChannelBridge is ready again after its roster empties" {
+    var br = ChannelBridge(8).init();
+    try testing.expect(br.upgradeContinuityReady());
+
+    try br.register("alice", .{ .leg = .native, .stream_id = 11 });
+    try testing.expect(!br.upgradeContinuityReady());
+
+    try testing.expect(br.unregister("alice"));
+    try testing.expect(br.upgradeContinuityReady());
 }
 
 test "unregister drops a member; register updates in place" {

@@ -14,6 +14,7 @@
 //! regenerating would change the node's mesh identity behind the operator's
 //! back and orphan every TOFU pin peers hold for it.
 const std = @import("std");
+const node_identity = @import("node_identity.zig");
 
 pub const seed_len = 32;
 pub const hex_len = seed_len * 2;
@@ -38,6 +39,11 @@ pub const Source = enum { loaded, generated };
 pub const LoadResult = struct {
     seed: [seed_len]u8,
     source: Source,
+};
+
+pub const IdentityValidationError = error{
+    BadPublicKey,
+    PublicKeyMismatch,
 };
 
 /// Derive the keyfile path: alongside the config file when one was used,
@@ -88,6 +94,49 @@ pub fn loadOrCreate(
         else => return err,
     };
     return .{ .seed = seed, .source = .generated };
+}
+
+/// Read an already-provisioned keyfile without creating or mutating anything.
+/// Deployment preflight uses this path so `--check-config` cannot report an
+/// activation plan as safe when normal boot would load a different identity.
+pub fn loadExisting(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+) ![seed_len]u8 {
+    return readSeed(allocator, io, dir, path);
+}
+
+/// Prove that an explicit activation public key belongs to the persisted seed.
+/// This is deliberately side-effect free: a missing key is an error rather than
+/// an invitation to generate a new identity during config validation.
+pub fn validateExistingPublicKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    realm: []const u8,
+    configured_public_key: []const u8,
+) !void {
+    var seed = try loadExisting(allocator, io, dir, path);
+    defer std.crypto.secureZero(u8, &seed);
+    var identity = try node_identity.fromSeed(seed, realm);
+    defer identity.deinit();
+
+    var expected: [32]u8 = undefined;
+    if (configured_public_key.len == expected.len * 2) {
+        _ = std.fmt.hexToBytes(&expected, configured_public_key) catch
+            return error.BadPublicKey;
+    } else {
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(configured_public_key) catch
+            return error.BadPublicKey;
+        if (decoded_len != expected.len) return error.BadPublicKey;
+        std.base64.standard.Decoder.decode(&expected, configured_public_key) catch
+            return error.BadPublicKey;
+    }
+    if (!std.crypto.timing_safe.eql([32]u8, expected, identity.sign_kp.public_key))
+        return error.PublicKeyMismatch;
 }
 
 fn readSeed(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![seed_len]u8 {
@@ -191,6 +240,55 @@ test "loadOrCreate refuses to clobber a corrupt keyfile" {
     const text = try tmp.dir.readFileAlloc(testing.io, "orochi-node.key", testing.allocator, .limited(max_keyfile_bytes));
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("not a seed\n", text);
+}
+
+test "activation preflight binds public key to an existing persisted seed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const seed = @as([seed_len]u8, @splat(0x42));
+    var identity = try node_identity.fromSeed(seed, "activation-test");
+    defer identity.deinit();
+    const public_hex = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+
+    try testing.expectError(
+        error.FileNotFound,
+        validateExistingPublicKey(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            default_basename,
+            "activation-test",
+            &public_hex,
+        ),
+    );
+
+    var seed_line: [hex_len + 1]u8 = undefined;
+    const seed_hex = std.fmt.bytesToHex(seed, .lower);
+    @memcpy(seed_line[0..hex_len], &seed_hex);
+    seed_line[hex_len] = '\n';
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = default_basename, .data = &seed_line });
+
+    try validateExistingPublicKey(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        default_basename,
+        "activation-test",
+        &public_hex,
+    );
+    const wrong_public = std.fmt.bytesToHex(@as([32]u8, @splat(0xaa)), .lower);
+    try testing.expectError(
+        error.PublicKeyMismatch,
+        validateExistingPublicKey(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            default_basename,
+            "activation-test",
+            &wrong_public,
+        ),
+    );
 }
 
 fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {

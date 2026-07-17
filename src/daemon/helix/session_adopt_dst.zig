@@ -7,7 +7,7 @@
 //! loop and asserts the two invariants the recent hardening added:
 //!
 //!   1. Every inherited client socket fd is ACCOUNTED FOR — adopted onto a live slot,
-//!      or recovered+closed on a clean drop — never leaked. When `session_snapshot.decode`
+//!      or recovered+closed on a clean drop — never leaked. When `session_snapshot.decodeCurrent`
 //!      fails, the fd (which sits past the identity strings, not at the front) is still
 //!      recovered via `session_snapshot.peekFd` and closed, mirroring the `.s2s_link` path.
 //!   2. A client sealed as `was_secured` that arrives WITHOUT a restored TLS engine is
@@ -17,7 +17,7 @@
 //! This is a TEST-ONLY faithful model of the real Pass 1 (TLS index) + Pass 2 (client
 //! adoption): the real loop needs a bound reactor, an inherited memfd arena, and live
 //! sockets, none of which belong in a deterministic unit test. The model drives the REAL
-//! production decoders — `capsule.decodeStream`, `session_snapshot.decode`, and
+//! production decoders — `capsule.decodeStream`, `session_snapshot.decodeCurrent`, and
 //! `session_snapshot.peekFd` (the fd-recovery seam) — and injects faults with `fault_loom`
 //! at the model's decode site, standing in for the production decode that has no fault site
 //! of its own. The TLS index is modeled as the set of fds whose `.tls_session` capsule
@@ -48,36 +48,45 @@ fn sampleSnap(fd: i32, secured: bool) session_snapshot.Snapshot {
     };
 }
 
-/// Encode a current-schema (v2) `.clients` capsule, exactly as this binary seals a
+/// Encode an exact current-schema v5 `.clients` capsule, exactly as this binary seals a
 /// carried client at UPGRADE. Caller owns the returned bytes.
-fn v2Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
+fn v5Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
     const blob = try session_snapshot.encode(allocator, snap);
     defer allocator.free(blob);
     var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
     return capsule.encode(allocator, capsule.make(.clients, fields[0..]));
 }
 
-/// Encode a v1 `.clients` capsule as a PRE-BUMP binary would have sealed it: the
-/// session blob is 1 byte shorter (no trailing `was_secured` flag) and the header
-/// advertises `version=1, min=1, max=1`. Built by encoding the v2 blob, splicing off
-/// the trailing byte, and wrapping in a v1 header the current binary still accepts
-/// (`min_supported = 1`). Such a client is necessarily NOT secured (the flag defaults
-/// false), which is the historical never-drop behavior.
-fn v1Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
-    const v2_blob = try session_snapshot.encode(allocator, snap);
-    defer allocator.free(v2_blob);
-    const v1_blob = v2_blob[0 .. v2_blob.len - 1]; // strip trailing was_secured byte
+/// Construct an old-version wire without asking the current encoder to bless it.
+/// The exact v5 registry intentionally makes `capsule.encode` reject v1..v4, so
+/// tests start from a valid current wire and rewrite only its fixed header range.
+/// Payload bytes are immaterial: negotiation rejects the outer header first.
+fn legacyCapsuleWire(
+    allocator: Allocator,
+    snap: session_snapshot.Snapshot,
+    version: u16,
+) ![]u8 {
+    std.debug.assert(version >= 1 and version < 5);
+    const wire = try v5Capsule(allocator, snap);
+    // Capsule header: magic[4], schema[4], kind[1], then version/min/max u16.
+    std.mem.writeInt(u16, wire[9..11], version, .little);
+    std.mem.writeInt(u16, wire[11..13], version, .little);
+    std.mem.writeInt(u16, wire[13..15], version, .little);
+    return wire;
+}
 
-    const d = capsule.descriptor(.clients);
-    const v1_header = capsule.Header{
-        .schema_id = d.schema_id,
-        .kind = .clients,
-        .version = 1,
-        .min_supported = 1,
-        .max_supported = 1,
-    };
-    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = v1_blob }};
-    return capsule.encode(allocator, .{ .header = v1_header, .fields = fields[0..] });
+/// Encode a v5 outer capsule whose client payload omits the mandatory final
+/// `was_websocket` byte. Outer negotiation succeeds, but `decodeCurrent` must
+/// reject the structurally truncated client and recover its inherited fd.
+fn truncatedTransportCapsule(
+    allocator: Allocator,
+    snap: session_snapshot.Snapshot,
+) ![]u8 {
+    const current = try session_snapshot.encode(allocator, snap);
+    defer allocator.free(current);
+    std.debug.assert(current.len > 0);
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = current[0 .. current.len - 1] }};
+    return capsule.encode(allocator, capsule.make(.clients, fields[0..]));
 }
 
 /// A sibling (non-clients) capsule used purely as an "unrelated capsule still adopts"
@@ -100,6 +109,7 @@ const AdoptResult = struct {
     siblings_seen: usize = 0,
     adopted: usize = 0,
     adopted_tls: usize = 0,
+    adopted_websocket: usize = 0,
     /// Clients dropped because they were sealed secured but had no restored TLS engine.
     secured_dropped: usize = 0,
     /// Clients dropped because their session blob failed to decode.
@@ -157,7 +167,7 @@ fn adoptStream(
                 const site = clientsDecodeSite(&site_buf, cap_fd);
                 l.maybeFail(site, error{Injected}) catch break :decode_blk null;
             }
-            break :decode_blk session_snapshot.decode(c.fields[0].bytes) catch null;
+            break :decode_blk session_snapshot.decodeCurrent(c.fields[0].bytes) catch null;
         };
 
         const snap = decoded orelse {
@@ -191,6 +201,7 @@ fn adoptStream(
         _ = open.remove(snap.fd);
         res.adopted += 1;
         if (tls_present) res.adopted_tls += 1;
+        if (snap.was_websocket) res.adopted_websocket += 1;
     }
 
     res.fds_leaked = open.count();
@@ -212,7 +223,7 @@ fn joinCaps(allocator: Allocator, parts: []const []u8) ![]u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "clients capsule adoption recovers fd under injected decode fault (resume DST)" {
+test "clients v5 decodeCurrent preserves WebSocket state and recovers fd under decode fault" {
     const allocator = testing.allocator;
 
     var loom: fault_loom.Registry = .{};
@@ -223,10 +234,12 @@ test "clients capsule adoption recovers fd under injected decode fault (resume D
     var site_buf: [40]u8 = undefined;
     try loom.arm(allocator, clientsDecodeSite(&site_buf, 41), 1, error.Injected);
 
+    var websocket = sampleSnap(40, false);
+    websocket.was_websocket = true;
     const parts = [_][]u8{
-        try v2Capsule(allocator, sampleSnap(40, false)),
+        try v5Capsule(allocator, websocket),
         try siblingCapsule(allocator, 0xA1),
-        try v2Capsule(allocator, sampleSnap(41, false)),
+        try v5Capsule(allocator, sampleSnap(41, false)),
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -237,6 +250,7 @@ test "clients capsule adoption recovers fd under injected decode fault (resume D
     const res = try adoptStream(allocator, stream, &.{}, &loom, &open);
     try testing.expectEqual(@as(usize, 1), res.siblings_seen);
     try testing.expectEqual(@as(usize, 1), res.adopted);
+    try testing.expectEqual(@as(usize, 1), res.adopted_websocket);
     try testing.expectEqual(@as(usize, 1), res.decode_dropped);
     try testing.expectEqual(@as(usize, 1), res.fds_recovered);
     try testing.expectEqual(@as(usize, 0), res.fds_leaked); // clean abort, no leak
@@ -250,9 +264,9 @@ test "session_snapshot was_secured client without TLS engine is dropped not adop
     // dropped, never adopted as plaintext; (c) a plaintext client → adopts. Every fd is
     // accounted for; the secured-but-engineless socket is closed, not leaked.
     const parts = [_][]u8{
-        try v2Capsule(allocator, sampleSnap(50, true)), // secured, tls present
-        try v2Capsule(allocator, sampleSnap(51, true)), // secured, NO tls → drop
-        try v2Capsule(allocator, sampleSnap(52, false)), // plaintext
+        try v5Capsule(allocator, sampleSnap(50, true)), // secured, tls present
+        try v5Capsule(allocator, sampleSnap(51, true)), // secured, NO tls → drop
+        try v5Capsule(allocator, sampleSnap(52, false)), // plaintext
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -270,16 +284,25 @@ test "session_snapshot was_secured client without TLS engine is dropped not adop
     try testing.expectEqual(@as(usize, 0), res.fds_leaked);
 }
 
-test "clients v1 capsule adopts across upgrade while a v2 secured client co-adopts" {
+test "clients exact v5 descriptor rejects every legacy v1 through v4 range" {
     const allocator = testing.allocator;
 
-    // A mid-fleet upgrade: a v1 client (pre-bump binary, no was_secured byte → plaintext
-    // by definition) rides beside a v2 secured client with its TLS engine. Both adopt via
-    // the version-tolerant decode (the whole point of `min_supported = 1`); no fd leaks.
+    inline for (.{ 1, 2, 3, 4 }) |legacy_version| {
+        const wire = try legacyCapsuleWire(allocator, sampleSnap(60 + legacy_version, false), legacy_version);
+        defer allocator.free(wire);
+        try testing.expectError(error.VersionUnsupported, capsule.decodeStream(allocator, wire));
+    }
+}
+
+test "clients v5 missing WebSocket tail fails closed while current sibling adopts" {
+    const allocator = testing.allocator;
+
+    var websocket = sampleSnap(61, false);
+    websocket.was_websocket = true;
     const parts = [_][]u8{
-        try v1Capsule(allocator, sampleSnap(60, false)),
+        try truncatedTransportCapsule(allocator, sampleSnap(60, false)),
         try siblingCapsule(allocator, 0xC3),
-        try v2Capsule(allocator, sampleSnap(61, true)),
+        try v5Capsule(allocator, websocket),
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -287,12 +310,13 @@ test "clients v1 capsule adopts across upgrade while a v2 secured client co-adop
     var open: std.AutoHashMapUnmanaged(i32, void) = .empty;
     defer open.deinit(allocator);
 
-    const tls_fds = [_]i32{61};
-    const res = try adoptStream(allocator, stream, tls_fds[0..], null, &open);
+    const res = try adoptStream(allocator, stream, &.{}, null, &open);
     try testing.expectEqual(@as(usize, 1), res.siblings_seen);
-    try testing.expectEqual(@as(usize, 2), res.adopted);
+    try testing.expectEqual(@as(usize, 1), res.adopted);
+    try testing.expectEqual(@as(usize, 1), res.adopted_websocket);
     try testing.expectEqual(@as(usize, 0), res.secured_dropped);
-    try testing.expectEqual(@as(usize, 0), res.decode_dropped);
+    try testing.expectEqual(@as(usize, 1), res.decode_dropped);
+    try testing.expectEqual(@as(usize, 1), res.fds_recovered);
     try testing.expectEqual(@as(usize, 0), res.fds_leaked);
 }
 
@@ -333,9 +357,9 @@ fn runCampaign(allocator: Allocator, seed: u64) !void {
     // at decode is recovered; whatever survives adopts. All three fds must be accounted for.
     const parts = [_][]u8{
         try siblingCapsule(allocator, 0xE5),
-        try v2Capsule(allocator, sampleSnap(70, true)),
-        try v2Capsule(allocator, sampleSnap(71, false)),
-        try v2Capsule(allocator, sampleSnap(72, true)),
+        try v5Capsule(allocator, sampleSnap(70, true)),
+        try v5Capsule(allocator, sampleSnap(71, false)),
+        try v5Capsule(allocator, sampleSnap(72, true)),
         try siblingCapsule(allocator, 0xF6),
     };
     const stream = try joinCaps(allocator, parts[0..]);

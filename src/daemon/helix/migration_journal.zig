@@ -67,6 +67,9 @@ pub const Journal = struct {
     /// Remove terminal entries whose `last_ms` is older than `ttl_ms`.
     /// Offered/transferring entries are kept regardless of age.
     pub fn prune(self: *Journal, now_ms: i64, ttl_ms: i64) void {
+        // Invalid policy must fail closed by retaining replay evidence, never by
+        // treating a negative TTL as permission to erase every terminal token.
+        if (ttl_ms < 0) return;
         var it = self.map.iterator();
         while (it.next()) |slot| {
             if (isTerminal(slot.value_ptr.phase) and isExpired(now_ms, slot.value_ptr.last_ms, ttl_ms)) {
@@ -253,4 +256,31 @@ test "prune uses last timestamp and requires age greater than ttl" {
 
     journal.prune(201, 50);
     try testing.expect(journal.get(boundary) == null);
+}
+
+test "negative TTL fails closed and record insertion is retryable under OOM" {
+    const allocator = testing.allocator;
+    var retained: Journal = .{};
+    defer retained.deinit(allocator);
+    const terminal = tokenWithLast(13);
+    try retained.record(allocator, terminal, .committed, 1);
+    retained.prune(std.math.maxInt(i64), -1);
+    try testing.expect(retained.get(terminal) != null);
+
+    const Sweep = struct {
+        fn run(failing_allocator: std.mem.Allocator) !void {
+            var journal: Journal = .{};
+            defer journal.deinit(failing_allocator);
+            const token = tokenWithLast(14);
+            journal.record(failing_allocator, token, .offered, 10) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(usize, 0), journal.count());
+                try journal.record(failing_allocator, token, .offered, 10);
+                try testing.expectEqual(@as(usize, 1), journal.count());
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 1), journal.count());
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, Sweep.run, .{});
 }

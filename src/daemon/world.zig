@@ -172,6 +172,7 @@ const extban = @import("../proto/extban.zig");
 
 /// Per-member channel status modes (op @, voice + — no halfop) keyed by client.
 const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
+const InviteMap = std.AutoHashMapUnmanaged(ClientId, void);
 pub const MemberIterator = MemberMap.KeyIterator;
 pub const MemberMode = chanmode.MemberMode;
 pub const MemberModes = chanmode.MemberModes;
@@ -217,7 +218,7 @@ const Channel = struct {
     /// does not spam the Event Spine. 0 = never alerted.
     throttle_alert_ms: i64 = 0,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
-    invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
+    invites: InviteMap = .empty,
     /// +f forward target: when a join here is refused (+i/+k/+b/+l), the user is
     /// redirected to JOIN this channel instead. Allocator-owned; null = no forward.
     forward: ?[]u8 = null,
@@ -280,6 +281,48 @@ fn defaultChannelModes() chanmode.ChannelModes {
     return modes;
 }
 
+const checkpoint_base_mode_mask: u16 = (1 << 14) - 1;
+const checkpoint_ext_mode_mask: u32 = (1 << 20) - 1;
+
+fn checkpointBaseModeBits(modes: chanmode.ChannelModes) u16 {
+    var bits: u16 = 0;
+    if (modes.invite_only) bits |= 1 << 0;
+    if (modes.moderated) bits |= 1 << 1;
+    if (modes.no_external) bits |= 1 << 2;
+    if (modes.topic_ops) bits |= 1 << 3;
+    if (modes.secret) bits |= 1 << 4;
+    if (modes.no_ctcp) bits |= 1 << 5;
+    if (modes.no_notice) bits |= 1 << 6;
+    if (modes.no_nick) bits |= 1 << 7;
+    if (modes.free_invite) bits |= 1 << 8;
+    if (modes.tls_only) bits |= 1 << 9;
+    if (modes.mod_reg) bits |= 1 << 10;
+    if (modes.news_wire) bits |= 1 << 11;
+    if (modes.oper_only) bits |= 1 << 12;
+    if (modes.admin_only) bits |= 1 << 13;
+    return bits;
+}
+
+fn checkpointBaseModes(bits: u16) ?chanmode.ChannelModes {
+    if ((bits & ~checkpoint_base_mode_mask) != 0) return null;
+    var modes = chanmode.ChannelModes.empty();
+    modes.invite_only = (bits & (1 << 0)) != 0;
+    modes.moderated = (bits & (1 << 1)) != 0;
+    modes.no_external = (bits & (1 << 2)) != 0;
+    modes.topic_ops = (bits & (1 << 3)) != 0;
+    modes.secret = (bits & (1 << 4)) != 0;
+    modes.no_ctcp = (bits & (1 << 5)) != 0;
+    modes.no_notice = (bits & (1 << 6)) != 0;
+    modes.no_nick = (bits & (1 << 7)) != 0;
+    modes.free_invite = (bits & (1 << 8)) != 0;
+    modes.tls_only = (bits & (1 << 9)) != 0;
+    modes.mod_reg = (bits & (1 << 10)) != 0;
+    modes.news_wire = (bits & (1 << 11)) != 0;
+    modes.oper_only = (bits & (1 << 12)) != 0;
+    modes.admin_only = (bits & (1 << 13)) != 0;
+    return modes;
+}
+
 pub const ListEntry = struct {
     mask: []u8,
     setter: []u8,
@@ -303,6 +346,19 @@ fn deinitListEntries(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged
     for (list.items) |*entry| entry.deinit(allocator);
     list.deinit(allocator);
     list.* = .empty;
+}
+
+fn restoreCheckpointList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ListEntry),
+    source: []const World.CheckpointListEntry,
+) std.mem.Allocator.Error!void {
+    try list.ensureTotalCapacity(allocator, source.len);
+    for (source) |entry| {
+        var owned = try ListEntry.init(allocator, entry.mask, entry.setter, entry.set_at);
+        list.appendAssumeCapacity(owned);
+        owned = undefined;
+    }
 }
 
 pub const TopicInfo = struct {
@@ -3130,6 +3186,286 @@ pub const World = struct {
 
     pub fn channelIterator(self: *World) ChannelViewIterator {
         return .{ .inner = self.channels.iterator() };
+    }
+
+    /// Every logical field of one channel that participates in a Helix world
+    /// checkpoint. Slices borrow World storage and are valid only while the
+    /// caller keeps the World read-locked and does not mutate it.
+    pub const CheckpointChannelView = struct {
+        name: []const u8,
+        topic: ?[]const u8,
+        topic_setter: ?[]const u8,
+        topic_time: i64,
+        base_mode_bits: u16,
+        ext_mode_bits: u32,
+        private: bool,
+        hidden: bool,
+        key: ?[]const u8,
+        limit: ?u32,
+        forward: ?[]const u8,
+        oid: u32,
+        created_unix: i64,
+        bans: []const ListEntry,
+        exempts: []const ListEntry,
+        invex: []const ListEntry,
+        mutes: []const ListEntry,
+        throttle_joins: u16,
+        throttle_secs: u32,
+        throttle_times: []const i64,
+        throttle_alert_ms: i64,
+        member_count: usize,
+        invite_count: usize,
+    };
+
+    pub const CheckpointChannelIterator = struct {
+        inner: CiStringHashMap(Channel).Iterator,
+
+        pub fn next(self: *CheckpointChannelIterator) ?CheckpointChannelView {
+            const entry = self.inner.next() orelse return null;
+            const channel = entry.value_ptr;
+            return .{
+                .name = entry.key_ptr.*,
+                .topic = channel.topic,
+                .topic_setter = channel.topic_setter,
+                .topic_time = channel.topic_time,
+                .base_mode_bits = checkpointBaseModeBits(channel.modes),
+                .ext_mode_bits = @bitCast(channel.ext_modes),
+                .private = channel.private,
+                .hidden = channel.hidden,
+                .key = channel.key,
+                .limit = channel.limit,
+                .forward = channel.forward,
+                .oid = channel.oid,
+                .created_unix = channel.created_unix,
+                .bans = channel.bans.items,
+                .exempts = channel.exempts.items,
+                .invex = channel.invex.items,
+                .mutes = channel.mutes.items,
+                .throttle_joins = channel.throttle_joins,
+                .throttle_secs = channel.throttle_secs,
+                .throttle_times = channel.throttle_times.items,
+                .throttle_alert_ms = channel.throttle_alert_ms,
+                .member_count = channel.members.count(),
+                .invite_count = channel.invites.count(),
+            };
+        }
+    };
+
+    /// Checkpoint traversal intentionally exposes no ClientId on the wire.
+    /// A missing reverse nick is a corrupt live invariant and must fail the
+    /// upgrade rather than silently dropping the member or invite.
+    pub const CheckpointRelationError = error{MissingClientNick};
+
+    pub const CheckpointMemberView = struct {
+        nick: []const u8,
+        modes: MemberModes,
+    };
+
+    /// Raw process-local relation used only while constructing a Helix
+    /// checkpoint.  A reusable logical session deliberately has one global
+    /// nick lookup owner but may have several real channel-member transports;
+    /// those sibling ids therefore need the server's ConnState resolver rather
+    /// than the single-owner `client_nicks` mirror.
+    pub const CheckpointMemberIdView = struct {
+        client: ClientId,
+        modes: MemberModes,
+    };
+
+    pub const CheckpointMemberIdIterator = struct {
+        inner: MemberMap.Iterator,
+
+        pub fn next(self: *CheckpointMemberIdIterator) ?CheckpointMemberIdView {
+            const entry = self.inner.next() orelse return null;
+            return .{ .client = entry.key_ptr.*, .modes = entry.value_ptr.* };
+        }
+    };
+
+    pub const CheckpointMemberIterator = struct {
+        world: *World,
+        inner: MemberMap.Iterator,
+
+        pub fn next(self: *CheckpointMemberIterator) CheckpointRelationError!?CheckpointMemberView {
+            const entry = self.inner.next() orelse return null;
+            const nick = self.world.client_nicks.get(entry.key_ptr.*) orelse
+                return error.MissingClientNick;
+            return .{ .nick = nick, .modes = entry.value_ptr.* };
+        }
+    };
+
+    pub const CheckpointInviteIterator = struct {
+        world: *World,
+        inner: InviteMap.Iterator,
+
+        pub fn next(self: *CheckpointInviteIterator) CheckpointRelationError!?[]const u8 {
+            const entry = self.inner.next() orelse return null;
+            return self.world.client_nicks.get(entry.key_ptr.*) orelse
+                error.MissingClientNick;
+        }
+    };
+
+    pub const CheckpointInviteIdIterator = struct {
+        inner: InviteMap.Iterator,
+
+        pub fn next(self: *CheckpointInviteIdIterator) ?ClientId {
+            const entry = self.inner.next() orelse return null;
+            return entry.key_ptr.*;
+        }
+    };
+
+    pub fn checkpointChannelIterator(self: *World) CheckpointChannelIterator {
+        return .{ .inner = self.channels.iterator() };
+    }
+
+    pub fn checkpointMemberIterator(self: *World, name: []const u8) ?CheckpointMemberIterator {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return .{ .world = self, .inner = channel.members.iterator() };
+    }
+
+    pub fn checkpointMemberIdIterator(self: *World, name: []const u8) ?CheckpointMemberIdIterator {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return .{ .inner = channel.members.iterator() };
+    }
+
+    pub fn checkpointInviteIterator(self: *World, name: []const u8) ?CheckpointInviteIterator {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return .{ .world = self, .inner = channel.invites.iterator() };
+    }
+
+    pub fn checkpointInviteIdIterator(self: *World, name: []const u8) ?CheckpointInviteIdIterator {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return .{ .inner = channel.invites.iterator() };
+    }
+
+    pub fn checkpointNextOid(self: *const World) u32 {
+        return self.next_oid;
+    }
+
+    pub fn checkpointClockUnix(self: *const World) i64 {
+        return self.clock_unix;
+    }
+
+    pub fn checkpointMaxListEntries(self: *const World) usize {
+        return self.max_list_entries;
+    }
+
+    pub const CheckpointListEntry = struct {
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+    };
+
+    /// Borrowed decoded input used only while constructing a detached World.
+    /// Memberships and invites are deliberately absent: their ClientIds change
+    /// at exec and are applied later from the codec's opaque physical join-key
+    /// expectations (the live daemon uses inherited socket fds).
+    pub const CheckpointChannelState = struct {
+        name: []const u8,
+        topic: ?[]const u8,
+        topic_setter: ?[]const u8,
+        topic_time: i64,
+        base_mode_bits: u16,
+        ext_mode_bits: u32,
+        private: bool,
+        hidden: bool,
+        key: ?[]const u8,
+        limit: ?u32,
+        forward: ?[]const u8,
+        oid: u32,
+        created_unix: i64,
+        bans: []const CheckpointListEntry,
+        exempts: []const CheckpointListEntry,
+        invex: []const CheckpointListEntry,
+        mutes: []const CheckpointListEntry,
+        throttle_joins: u16,
+        throttle_secs: u32,
+        throttle_times: []const i64,
+        throttle_alert_ms: i64,
+    };
+
+    pub const CheckpointRestoreError = std.mem.Allocator.Error || error{
+        ActiveWorld,
+        DuplicateChannel,
+        InvalidChannelName,
+        InvalidModeBits,
+        ListFull,
+    };
+
+    /// Set the World-wide scalars on a fresh, detached replacement image.
+    /// Refusing an already-active World prevents a decoder from publishing a
+    /// half-restored image through existing RCU mirrors.
+    pub fn initializeCheckpointImage(
+        self: *World,
+        max_list_entries: usize,
+        next_oid: u32,
+        clock_unix: i64,
+    ) CheckpointRestoreError!void {
+        if (self.channels.count() != 0 or self.nicks.count() != 0 or
+            self.client_nicks.count() != 0 or self.rcu_nicks != null or
+            self.rcu_channels != null)
+            return error.ActiveWorld;
+        self.max_list_entries = max_list_entries;
+        self.next_oid = next_oid;
+        self.clock_unix = clock_unix;
+    }
+
+    /// Add one fully-owned channel to a fresh detached checkpoint image. The
+    /// channel's RCU existence and empty-membership mirrors are built here too,
+    /// so successor relation application can immediately call restoreMember.
+    /// This detached image is the atomicity boundary: the outer decoder destroys
+    /// the complete image on any error and publishes it only after full decode.
+    pub fn restoreCheckpointChannel(
+        self: *World,
+        state: CheckpointChannelState,
+    ) CheckpointRestoreError![]const u8 {
+        if (self.nicks.count() != 0 or self.client_nicks.count() != 0 or self.rcu_nicks != null)
+            return error.ActiveWorld;
+        if (!isChannelName(state.name)) return error.InvalidChannelName;
+        if (self.channels.contains(state.name)) return error.DuplicateChannel;
+        if (state.bans.len > self.max_list_entries or
+            state.exempts.len > self.max_list_entries or
+            state.invex.len > self.max_list_entries or
+            state.mutes.len > self.max_list_entries)
+            return error.ListFull;
+
+        var channel = Channel.init(self.allocator);
+        errdefer channel.deinit();
+        channel.modes = checkpointBaseModes(state.base_mode_bits) orelse
+            return error.InvalidModeBits;
+        if ((state.ext_mode_bits & ~checkpoint_ext_mode_mask) != 0)
+            return error.InvalidModeBits;
+        channel.ext_modes = @bitCast(state.ext_mode_bits);
+        channel.private = state.private;
+        channel.hidden = state.hidden;
+        channel.topic = if (state.topic) |value| try self.allocator.dupe(u8, value) else null;
+        channel.topic_setter = if (state.topic_setter) |value| try self.allocator.dupe(u8, value) else null;
+        channel.topic_time = state.topic_time;
+        channel.key = if (state.key) |value| try self.allocator.dupe(u8, value) else null;
+        channel.limit = state.limit;
+        channel.forward = if (state.forward) |value| try self.allocator.dupe(u8, value) else null;
+        channel.oid = state.oid;
+        channel.created_unix = state.created_unix;
+        try restoreCheckpointList(self.allocator, &channel.bans, state.bans);
+        try restoreCheckpointList(self.allocator, &channel.exempts, state.exempts);
+        try restoreCheckpointList(self.allocator, &channel.invex, state.invex);
+        try restoreCheckpointList(self.allocator, &channel.mutes, state.mutes);
+        channel.throttle_joins = state.throttle_joins;
+        channel.throttle_secs = state.throttle_secs;
+        try channel.throttle_times.appendSlice(self.allocator, state.throttle_times);
+        channel.throttle_alert_ms = state.throttle_alert_ms;
+
+        // Build the authoritative map entry and both RCU mirrors through the
+        // normal failure-safe creation path. Its provisional OID consumption is
+        // undone because the checkpoint's scalar and per-channel OID are exact.
+        const checkpoint_next_oid = self.next_oid;
+        const destination = try self.ensureChannel(state.name);
+        destination.deinit();
+        destination.* = channel;
+        channel = Channel.init(self.allocator);
+        self.next_oid = checkpoint_next_oid;
+        const c = self.rcu_channels orelse unreachable;
+        try c.names.set(c.writer_participant, state.name, state.oid);
+        self.noteRcuChannelWrite(c);
+        return self.channels.getEntry(state.name).?.key_ptr.*;
     }
 
     /// Fill `out` with the names of channels `client` is a member of (scan; no

@@ -30,6 +30,10 @@ const media_room = @import("media_room.zig");
 const multiline_mod = @import("../proto/multiline.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
+const relay_v2_activation = @import("relay_v2_activation.zig");
+const relay_v2_event_log = @import("relay_v2_event_log.zig");
+const node_identity = @import("node_identity.zig");
+const node_short_id = @import("../crypto/node_short_id.zig");
 const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 
@@ -317,6 +321,18 @@ pub const Config = struct {
         /// Distinct from `trust_roots`, which pins peer node identities.
         admission_roots: []const []const u8 = &.{},
         admission_min_revocation_epoch: u64 = 0,
+        /// MESSAGE_V2 rollout phase. `compat` receives and forwards V2 but
+        /// authors legacy only. `active` authors V2-eligible events as V2 only.
+        /// Operators stage the
+        /// epoch and full-mesh roster everywhere while still in compatibility
+        /// mode, then flip only this field after the bridge is universal.
+        relay_v2_authoring: relay_v2_activation.Mode = .compat,
+        /// Monotonic operator-assigned rollout generation, not wall-clock time.
+        /// Zero means no activation plan is staged.
+        relay_v2_activation_epoch: u64 = 0,
+        /// Full secured-mesh Ed25519 node-key roster for the staged generation.
+        /// This is deliberately distinct from direct-neighbor `trust_roots`.
+        relay_v2_roster: []const []const u8 = &.{},
         /// Runtime Suimyaku peer-driver limits/timers/capacities projected from
         /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]`.
         s2s: s2s_peer_mod.Config = .{},
@@ -860,15 +876,25 @@ pub const Config = struct {
         errdefer allocator.free(webpush_subject);
         const webpush_vapid_key_path = try allocator.dupe(u8, "orochi-webpush-vapid.key");
         errdefer allocator.free(webpush_vapid_key_path);
+        const network_name = try allocator.dupe(u8, "Onyx");
+        errdefer allocator.free(network_name);
+        const admin_location = try allocator.dupe(u8, "Orochi IRC network");
+        errdefer allocator.free(admin_location);
+        const admin_email = try allocator.dupe(u8, "admin@orochi.local");
+        errdefer allocator.free(admin_email);
+        const mesh_realm = try allocator.dupe(u8, "local");
+        errdefer allocator.free(mesh_realm);
+        const tls_dns_name = try allocator.dupe(u8, "localhost");
+        errdefer allocator.free(tls_dns_name);
         return .{
-            .network = .{ .name = try allocator.dupe(u8, "Onyx") },
+            .network = .{ .name = network_name },
             .admin = .{
-                .location = try allocator.dupe(u8, "Orochi IRC network"),
-                .email = try allocator.dupe(u8, "admin@orochi.local"),
+                .location = admin_location,
+                .email = admin_email,
             },
             .listen = .{ .host = host, .media_host = media_host },
-            .mesh = .{ .realm = try allocator.dupe(u8, "local") },
-            .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
+            .mesh = .{ .realm = mesh_realm },
+            .tls = .{ .dns_name = tls_dns_name },
             .stats = .{ .dir = stats_dir, .channel_dir = stats_channel_dir },
             .backup = .{ .dir = backup_dir },
             .metrics = .{ .bind = metrics_bind },
@@ -928,6 +954,7 @@ pub const Config = struct {
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.admission_roots);
+        freeStringList(allocator, self.mesh.relay_v2_roster);
         freeStringList(allocator, self.mesh.connect);
         freeStringList(allocator, self.dnsbl.zones);
         if (self.mail.relay_host) |value| allocator.free(value);
@@ -988,7 +1015,10 @@ pub const TomlError = error{ParseError} || std.mem.Allocator.Error;
 
 /// Parse standard TOML and project it onto a defaulted `Config`.
 pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Resolver) TomlError!Config {
-    var doc = toml.parse(allocator, source) catch return error.ParseError;
+    var doc = toml.parse(allocator, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ParseError,
+    };
     defer doc.deinit(allocator);
 
     var cfg = try Config.initDefaults(allocator);
@@ -1093,12 +1123,40 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         0,
         std.math.maxInt(u64),
     );
+    if (doc.get("mesh.relay_v2_authoring")) |value| {
+        cfg.mesh.relay_v2_authoring = switch (value.*) {
+            .string => |raw| parseRelayV2Authoring(raw) orelse return error.ParseError,
+            else => return error.ParseError,
+        };
+    }
+    if (doc.get("mesh.relay_v2_activation_epoch")) |value| {
+        cfg.mesh.relay_v2_activation_epoch = switch (value.*) {
+            .integer => |raw| if (raw >= 0) @intCast(raw) else return error.ParseError,
+            else => return error.ParseError,
+        };
+    }
+    if (doc.get("mesh.relay_v2_roster")) |value| {
+        const items = switch (value.*) {
+            .array => |items| items,
+            else => return error.ParseError,
+        };
+        freeStringList(allocator, cfg.mesh.relay_v2_roster);
+        cfg.mesh.relay_v2_roster = try ownStringArray(allocator, resolver, items);
+    }
+    const relay_v2_plan_empty = cfg.mesh.relay_v2_activation_epoch == 0 and
+        cfg.mesh.relay_v2_roster.len == 0;
+    const relay_v2_plan_complete = cfg.mesh.relay_v2_activation_epoch != 0 and
+        cfg.mesh.relay_v2_roster.len != 0;
+    if (!relay_v2_plan_empty and !relay_v2_plan_complete) return error.ParseError;
+    if (cfg.mesh.relay_v2_authoring == .active and !relay_v2_plan_complete)
+        return error.ParseError;
     if (doc.getArray("mesh.connect")) |arr| {
         freeStringList(allocator, cfg.mesh.connect);
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
     if (doc.getBool("mesh.require_secured")) |b| cfg.mesh.require_secured = b;
     if (doc.getBool("mesh.require_signed_frames")) |b| cfg.mesh.require_signed_frames = b;
+    try validateRelayV2ActivationConfig(allocator, cfg);
     try parseMeshS2sConfig(doc, &cfg.mesh.s2s);
     cfg.mesh.s2s.require_signed_frames = cfg.mesh.require_signed_frames;
 
@@ -1624,7 +1682,11 @@ fn ownStringArray(allocator: std.mem.Allocator, resolver: Resolver, arr: []const
             .string => |s| s,
             else => return error.ParseError,
         };
-        try list.append(allocator, try resolveStr(allocator, resolver, raw));
+        const owned = try resolveStr(allocator, resolver, raw);
+        list.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1743,6 +1805,65 @@ fn parseKtlsMode(s: []const u8) ?Config.KtlsMode {
     if (std.mem.eql(u8, s, "tx")) return .tx;
     if (std.mem.eql(u8, s, "txrx")) return .txrx;
     return null;
+}
+
+fn parseRelayV2Authoring(s: []const u8) ?relay_v2_activation.Mode {
+    if (std.mem.eql(u8, s, "compat")) return .compat;
+    if (std.mem.eql(u8, s, "active")) return .active;
+    return null;
+}
+
+/// Non-mutating deployment validation for every MESSAGE_V2 activation input.
+/// An explicit seed or public identity makes the local roster identity knowable
+/// to `--check-config`. Runtime init then binds a configured public identity to
+/// the private identity loaded from the persisted keyfile.
+fn validateRelayV2ActivationConfig(allocator: std.mem.Allocator, cfg: Config) TomlError!void {
+    if (cfg.mesh.relay_v2_activation_epoch == 0) return;
+    if (!cfg.mesh.require_secured or !cfg.mesh.require_signed_frames or
+        cfg.mesh.trust_roots.len == 0 or
+        cfg.mesh.trust_roots.len + 1 > relay_v2_event_log.default_max_confirmed_nodes_per_row or
+        cfg.mesh.relay_v2_roster.len < 2 or cfg.mesh.relay_v2_roster.len > 4096)
+        return error.ParseError;
+
+    var derived_local: ?node_identity.NodeIdentity = null;
+    defer if (derived_local) |*local| local.deinit();
+    const local_key: [32]u8 = if (cfg.node.secret_key) |configured_seed| blk: {
+        derived_local = node_identity.fromConfig(configured_seed, cfg.mesh.realm) catch
+            return error.ParseError;
+        const derived_key = derived_local.?.sign_kp.public_key;
+        if (cfg.node.public_key) |encoded| {
+            const expected = relay_v2_activation.decodePublicKey(encoded) catch return error.ParseError;
+            if (!std.crypto.timing_safe.eql([32]u8, expected, derived_key))
+                return error.ParseError;
+        }
+        break :blk derived_key;
+    } else relay_v2_activation.decodePublicKey(cfg.node.public_key orelse return error.ParseError) catch
+        return error.ParseError;
+
+    var roster = relay_v2_activation.canonicalizeRoster(allocator, cfg.mesh.relay_v2_roster) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ParseError,
+    };
+    defer roster.deinit();
+    if (!roster.contains(local_key)) return error.ParseError;
+    relay_v2_activation.validate(.{
+        .mode = cfg.mesh.relay_v2_authoring,
+        .activation_epoch = cfg.mesh.relay_v2_activation_epoch,
+        .roster_digest = roster.digest,
+    }) catch return error.ParseError;
+
+    const direct_nodes = try allocator.alloc(u64, cfg.mesh.trust_roots.len + 1);
+    defer allocator.free(direct_nodes);
+    direct_nodes[0] = node_short_id.shortId(node_identity.nodeIdFromPublicKey(local_key));
+    for (cfg.mesh.trust_roots, direct_nodes[1..]) |encoded, *short_id| {
+        const key = relay_v2_activation.decodePublicKey(encoded) catch return error.ParseError;
+        if (!roster.contains(key)) return error.ParseError;
+        short_id.* = node_short_id.shortId(node_identity.nodeIdFromPublicKey(key));
+    }
+    std.mem.sort(u64, direct_nodes, {}, std.sort.asc(u64));
+    for (direct_nodes[1..], direct_nodes[0 .. direct_nodes.len - 1]) |node, prior| {
+        if (node == prior) return error.ParseError;
+    }
 }
 
 fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!void {
@@ -2641,6 +2762,160 @@ test "parseToml: [mesh].require_secured projects onto Config and defaults false"
         try testing.expect(cfg.mesh.require_signed_frames);
         try testing.expect(cfg.mesh.s2s.require_signed_frames);
     }
+}
+
+test "parseToml: MESSAGE_V2 activation plan is explicit complete and type-strict" {
+    const allocator = testing.allocator;
+    const local_seed: [32]u8 = @splat(0x11);
+    const local_seed_hex = std.fmt.bytesToHex(local_seed, .lower);
+    var local = try node_identity.fromSeed(local_seed, "activation-test");
+    defer local.deinit();
+    var peer = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "activation-test");
+    defer peer.deinit();
+    var third = try node_identity.fromSeed(@as([32]u8, @splat(0x33)), "activation-test");
+    defer third.deinit();
+    const local_key = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+    const peer_key = std.fmt.bytesToHex(peer.sign_kp.public_key, .lower);
+    const third_key = std.fmt.bytesToHex(third.sign_kp.public_key, .lower);
+    const base =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    ;
+
+    {
+        var cfg = try parseToml(allocator, base, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(relay_v2_activation.Mode.compat, cfg.mesh.relay_v2_authoring);
+        try testing.expectEqual(@as(u64, 0), cfg.mesh.relay_v2_activation_epoch);
+        try testing.expectEqual(@as(usize, 0), cfg.mesh.relay_v2_roster.len);
+    }
+
+    inline for (.{ relay_v2_activation.Mode.compat, .active }) |mode| {
+        const mode_text = if (mode == .compat) "compat" else "active";
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_authoring = \"{s}\"\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &local_seed_hex, &peer_key, mode_text, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(mode, cfg.mesh.relay_v2_authoring);
+        try testing.expectEqual(@as(u64, 7), cfg.mesh.relay_v2_activation_epoch);
+        try testing.expectEqual(@as(usize, 2), cfg.mesh.relay_v2_roster.len);
+    }
+
+    // Persisted-keyfile deployments preflight with the matching public key;
+    // runtime init binds it to the private identity loaded by main.
+    {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\npublic_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &local_key, &peer_key, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqualStrings(&local_key, cfg.node.public_key.?);
+    }
+    {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\npublic_key = \"{s}\"\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &peer_key, &local_seed_hex, &peer_key, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+
+    // A preflight must reject an unsecured activation plan.
+    {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = false\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &local_seed_hex, &peer_key, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+    // Direct roots are mandatory and bind every configured neighbor.
+    {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &local_seed_hex, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+    {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+            .{ &peer_key, &local_key, &peer_key },
+        );
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+    const duplicate_roster = try std.fmt.allocPrint(allocator, "[\"{s}\", \"{s}\"]", .{ &local_key, &local_key });
+    defer allocator.free(duplicate_roster);
+    const missing_local_roster = try std.fmt.allocPrint(allocator, "[\"{s}\", \"{s}\"]", .{ &peer_key, &third_key });
+    defer allocator.free(missing_local_roster);
+    for ([_][]const u8{ "[\"aa\", \"bb\"]", duplicate_roster, missing_local_roster }) |roster_text| {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "[node]\nid = 1\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-test\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = {s}\n",
+            .{ &local_seed_hex, &peer_key, roster_text },
+        );
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+
+    const invalid_mesh = [_][]const u8{
+        "relay_v2_authoring = 1\n",
+        "relay_v2_authoring = \"ACTIVE\"\n",
+        "relay_v2_activation_epoch = \"7\"\n",
+        "relay_v2_activation_epoch = -1\nrelay_v2_roster = [\"aa\"]\n",
+        "relay_v2_activation_epoch = 7\n",
+        "relay_v2_roster = [\"aa\"]\n",
+        "relay_v2_roster = \"aa\"\n",
+        "relay_v2_activation_epoch = 7\nrelay_v2_roster = [1]\n",
+        "relay_v2_authoring = \"active\"\n",
+    };
+    for (invalid_mesh) |mesh| {
+        const text = try std.fmt.allocPrint(allocator, "{s}[mesh]\n{s}", .{ base, mesh });
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+}
+
+test "parseToml: MESSAGE_V2 activation plan survives every allocation failure" {
+    const AllocationSweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const local_seed: [32]u8 = @splat(0x61);
+            const local_seed_hex = std.fmt.bytesToHex(local_seed, .lower);
+            var local = try node_identity.fromSeed(local_seed, "activation-oom");
+            defer local.deinit();
+            var peer = try node_identity.fromSeed(@as([32]u8, @splat(0x62)), "activation-oom");
+            defer peer.deinit();
+            const local_key = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+            const peer_key = std.fmt.bytesToHex(peer.sign_kp.public_key, .lower);
+            const text = try std.fmt.allocPrint(
+                allocator,
+                "[node]\nid = 1\nsecret_key = \"{s}\"\n[listen]\nirc = 6680\n[mesh]\nrealm = \"activation-oom\"\nrequire_secured = true\nrequire_signed_frames = true\ntrust_roots = [\"{s}\"]\nrelay_v2_activation_epoch = 7\nrelay_v2_roster = [\"{s}\", \"{s}\"]\n",
+                .{ &local_seed_hex, &peer_key, &peer_key, &local_key },
+            );
+            defer allocator.free(text);
+            var cfg = try parseToml(allocator, text, .{});
+            defer cfg.deinit(allocator);
+            try testing.expectEqual(@as(u64, 7), cfg.mesh.relay_v2_activation_epoch);
+            try testing.expectEqual(@as(usize, 2), cfg.mesh.relay_v2_roster.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, AllocationSweep.run, .{});
 }
 
 test "parseToml: live mesh S2S sub-sections project onto peer driver config" {

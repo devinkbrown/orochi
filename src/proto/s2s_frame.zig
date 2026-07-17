@@ -122,6 +122,13 @@ pub const FrameType = enum(u8) {
     /// Short-lived positive proof that one SESSION_REPLICA origin still has a
     /// live exact-token attachment. Separately negotiated for rolling upgrades.
     SESSION_REPLICA_ATTACHMENT_LEASE = 0x22,
+    /// Secured multi-hop Event Spine object. The inner OEVT v2 bytes retain the
+    /// original author's signature and are forwarded without rewriting; the
+    /// signed-frame envelope authenticates only the immediate transport peer.
+    OPER_EVENT_V2 = 0x23,
+    /// Hop receipt for a daemon-admitted immutable MESSAGE_V2 RelayId. A sender
+    /// retains the exact wire until this secured, signed acknowledgment arrives.
+    MESSAGE_V2_ACK = 0x24,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -163,6 +170,8 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.SESSION_REPLICA_REVOKE) => .SESSION_REPLICA_REVOKE,
             @intFromEnum(FrameType.MESSAGE_V2) => .MESSAGE_V2,
             @intFromEnum(FrameType.SESSION_REPLICA_ATTACHMENT_LEASE) => .SESSION_REPLICA_ATTACHMENT_LEASE,
+            @intFromEnum(FrameType.OPER_EVENT_V2) => .OPER_EVENT_V2,
+            @intFromEnum(FrameType.MESSAGE_V2_ACK) => .MESSAGE_V2_ACK,
             else => null,
         };
     }
@@ -178,6 +187,7 @@ pub const Capability = enum(u3) {
     session_replica_v2 = 4,
     secure_relay_v2 = 5,
     session_attachment_lease_v2 = 6,
+    event_spine_v2 = 7,
 
     pub fn bit(self: Capability) u3 {
         return @intFromEnum(self);
@@ -195,6 +205,7 @@ pub const cap_repair_frames: u8 = Capability.repair_frames.mask();
 pub const cap_session_replica_v2: u8 = Capability.session_replica_v2.mask();
 pub const cap_secure_relay_v2: u8 = Capability.secure_relay_v2.mask();
 pub const cap_session_attachment_lease_v2: u8 = Capability.session_attachment_lease_v2.mask();
+pub const cap_event_spine_v2: u8 = Capability.event_spine_v2.mask();
 
 pub const CapabilitySpec = struct {
     cap: Capability,
@@ -245,6 +256,11 @@ pub const capability_catalog = [_]CapabilitySpec{
         .cap = .session_attachment_lease_v2,
         .token = "session-attachment-lease-v2",
         .summary = "Secured short-lived positive attachment evidence for SESSION_REPLICA v2.",
+    },
+    .{
+        .cap = .event_spine_v2,
+        .token = "event-spine-v2",
+        .summary = "Secured multi-hop operator events with immutable origin signatures.",
     },
 };
 
@@ -348,6 +364,8 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .SESSION_REPLICA_REVOKE, .token = "SESSION_REPLICA_REVOKE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed removal tombstone." },
     .{ .frame_type = .MESSAGE_V2, .token = "MESSAGE_V2", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured multi-hop user relay with immutable origin signature and routing scope." },
     .{ .frame_type = .SESSION_REPLICA_ATTACHMENT_LEASE, .token = "SESSION_REPLICA_ATTACHMENT_LEASE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2 | cap_session_attachment_lease_v2, .summary = "SESSION_REPLICA v2 signed positive attachment lease." },
+    .{ .frame_type = .OPER_EVENT_V2, .token = "OPER_EVENT_V2", .family = .oper, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .summary = "Secured multi-hop Event Spine notification with immutable origin signature." },
+    .{ .frame_type = .MESSAGE_V2_ACK, .token = "MESSAGE_V2_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured hop receipt for an admitted MESSAGE_V2 RelayId." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -675,12 +693,14 @@ test "capability catalog exposes stable wire bits" {
     try testing.expectEqual(@as(u8, 0x10), cap_session_replica_v2);
     try testing.expectEqual(@as(u8, 0x20), cap_secure_relay_v2);
     try testing.expectEqual(@as(u8, 0x40), cap_session_attachment_lease_v2);
+    try testing.expectEqual(@as(u8, 0x80), cap_event_spine_v2);
 
     try testing.expectEqual(@as(u3, 0), capabilitySpec(.frame_signing).bit());
     try testing.expectEqual(@as(u3, 1), capabilityByToken("member-account").?.bit());
     try testing.expectEqual(@as(u3, 4), capabilityByToken("session-replica-v2").?.bit());
     try testing.expectEqual(@as(u3, 5), capabilityByToken("secure-relay-v2").?.bit());
     try testing.expectEqual(@as(u3, 6), capabilityByToken("session-attachment-lease-v2").?.bit());
+    try testing.expectEqual(@as(u3, 7), capabilityByToken("event-spine-v2").?.bit());
     try testing.expect(capabilityByToken("does-not-exist") == null);
 }
 
@@ -737,4 +757,13 @@ test "secure relay v2 frame is secured and capability gated" {
     try testing.expectEqual(cap_secure_relay_v2, spec.capability_mask);
     try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByTag(0x21).?.frame_type);
     try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByToken("MESSAGE_V2").?.frame_type);
+}
+
+test "event spine v2 frame is secured and capability gated" {
+    const spec = frameSpec(.OPER_EVENT_V2);
+    try testing.expectEqual(FrameFamily.oper, spec.family);
+    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+    try testing.expectEqual(cap_event_spine_v2, spec.capability_mask);
+    try testing.expectEqual(FrameType.OPER_EVENT_V2, frameSpecByTag(0x23).?.frame_type);
+    try testing.expectEqual(FrameType.OPER_EVENT_V2, frameSpecByToken("OPER_EVENT_V2").?.frame_type);
 }

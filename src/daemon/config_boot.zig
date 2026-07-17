@@ -187,6 +187,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         .max_pattern_len = @intCast(cfg.filter.koshi_pattern_max_len),
     };
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
+    if (cfg.node.public_key) |v| out.node_public_key = v;
     out.s2s_config = cfg.mesh.s2s;
     if (cfg.mesh.realm.len != 0) out.mesh_realm = cfg.mesh.realm;
     if (cfg.mesh.mesh_pass) |v| out.mesh_pass = v;
@@ -194,6 +195,18 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     if (cfg.mesh.admission_roots.len != 0) out.mesh_admission_roots = cfg.mesh.admission_roots;
     out.mesh_admission_min_revocation_epoch = cfg.mesh.admission_min_revocation_epoch;
+    // The activation tuple is one authority. An empty projection cannot remove
+    // a staged plan or hot-downgrade an active base (both are forbidden state
+    // transitions); a meaningful plan replaces all three fields together.
+    // Never mix generations.
+    if (cfg.mesh.relay_v2_authoring == .active or
+        cfg.mesh.relay_v2_activation_epoch != 0 or
+        cfg.mesh.relay_v2_roster.len != 0)
+    {
+        out.relay_v2_authoring = cfg.mesh.relay_v2_authoring;
+        out.relay_v2_activation_epoch = cfg.mesh.relay_v2_activation_epoch;
+        out.relay_v2_roster = cfg.mesh.relay_v2_roster;
+    }
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
     out.sasl_decode_max_bytes = cfg.limits.sasl_decode_max_bytes;
@@ -234,6 +247,39 @@ test "parseIp4Host parses loopback and rejects junk" {
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("127.0.0"));
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("not-an-ip"));
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("256.0.0.1"));
+}
+
+test "MESSAGE_V2 activation fields map without reparsing deployment identities" {
+    const roster = [_][]const u8{ "local-key", "peer-key" };
+    var parsed = config_format.Config{};
+    parsed.node.public_key = "local-public-key";
+    parsed.mesh.relay_v2_authoring = .active;
+    parsed.mesh.relay_v2_activation_epoch = 17;
+    parsed.mesh.relay_v2_roster = &roster;
+
+    const mapped = mapToServerConfig(parsed, .{ .port = 0 });
+    try testing.expectEqualStrings("local-public-key", mapped.node_public_key.?);
+    try testing.expect(mapped.relay_v2_authoring == .active);
+    try testing.expectEqual(@as(u64, 17), mapped.relay_v2_activation_epoch);
+    try testing.expectEqual(@as(usize, 2), mapped.relay_v2_roster.len);
+    try testing.expectEqualStrings("local-key", mapped.relay_v2_roster[0]);
+    try testing.expectEqualStrings("peer-key", mapped.relay_v2_roster[1]);
+}
+
+test "MESSAGE_V2 empty projection cannot downgrade a base plan" {
+    const stale_roster = [_][]const u8{ "stale-local", "stale-peer" };
+    const mapped = mapToServerConfig(.{}, .{
+        .port = 0,
+        .node_public_key = "established-key",
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 42,
+        .relay_v2_roster = &stale_roster,
+    });
+
+    try testing.expectEqualStrings("established-key", mapped.node_public_key.?);
+    try testing.expect(mapped.relay_v2_authoring == .active);
+    try testing.expectEqual(@as(u64, 42), mapped.relay_v2_activation_epoch);
+    try testing.expectEqual(@as(usize, 2), mapped.relay_v2_roster.len);
 }
 
 /// Neutral STS boot projection consumed by `main.zig` to enable IRCv3 STS per
@@ -622,6 +668,9 @@ test "config text overlays the server config" {
     try testing.expectEqualStrings("aabbcc", loaded.config.mesh_admission_token);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_admission_roots.len);
     try testing.expectEqual(@as(u64, 9), loaded.config.mesh_admission_min_revocation_epoch);
+    try testing.expect(loaded.config.relay_v2_authoring == .compat);
+    try testing.expectEqual(@as(u64, 0), loaded.config.relay_v2_activation_epoch);
+    try testing.expectEqual(@as(usize, 0), loaded.config.relay_v2_roster.len);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_connect.len);
     try testing.expectEqualStrings("ircx.us:6900", loaded.config.mesh_connect[0]);
     try testing.expectEqual(@as(usize, 8192), loaded.config.s2s_config.routes.max_nicks);

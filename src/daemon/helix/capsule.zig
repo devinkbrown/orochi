@@ -42,6 +42,9 @@ pub const CapsuleKind = enum(u8) {
     monitor_list = 12,
     silence_list = 13,
     session_tombstone = 14,
+    history = 15,
+    webhook_store = 16,
+    handoff_manifest = 17,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -59,6 +62,9 @@ pub const CapsuleKind = enum(u8) {
             12 => .monitor_list,
             13 => .silence_list,
             14 => .session_tombstone,
+            15 => .history,
+            16 => .webhook_store,
+            17 => .handoff_manifest,
             else => error.UnknownKind,
         };
     }
@@ -90,14 +96,18 @@ pub const registry = [_]Descriptor{
     // than adopting it as plaintext. v3 (2026-07) appends a trailing session-token
     // block ([u8 tlen][bytes]) so a carried client re-tracks in the SessionStore
     // under the SAME reclaim token instead of becoming a registry orphan.
-    // `min_supported = 1` keeps accepting v1/v2 capsules sealed by pre-bump
-    // binaries; `session_snapshot.decode` reads both tails tolerantly. v4
-    // (2026-07) appends a trailing [u64 umode_bits][u32 ilen][pending_in]
+    // v4 (2026-07) appends a trailing [u64 umode_bits][u32 ilen][pending_in]
     // [u32 olen][pending_out] block so client-set umodes, the partial inbound
     // line, and a plaintext connection's unsent SendQ tail all survive the
-    // swap (previously silently reset/dropped).
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 4, .min_supported = 1, .max_supported = 4 },
-    .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // swap (previously silently reset/dropped). v5 appends the canonical
+    // `was_websocket` byte. This is now an exact manifest contract: a successor
+    // must understand every current transport/join field, so legacy ranges do
+    // not overlap and the predecessor cold-refuses instead of degrading state.
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 5, .min_supported = 5, .max_supported = 5 },
+    // v2 is the first exact World image: every channel field plus nick-keyed
+    // member/invite expectations. v1 silently omitted material channel state,
+    // so there is intentionally no overlap and rollback is a cold restart.
+    .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 2, .min_supported = 2, .max_supported = 2 },
     // v2 (2026-07): each session record appends the attached connection's join
     // fd (i32) and the detached restore snapshot (u32 len + bytes), so bouncer
     // sessions restore byte-identically across USR2 instead of degrading to a
@@ -119,7 +129,7 @@ pub const registry = [_]Descriptor{
     // v2 (2026-07): `Established.serialize` gained a trailing `admitted_frame_families`
     // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
     // v1 capsules sealed by pre-bump binaries; `s2s_snapshot.decode` is version-aware.
-    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 2, .min_supported = 1, .max_supported = 2 },
+    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 3, .min_supported = 1, .max_supported = 3 },
     // v2 (2026-07): appends the WS adapter's partial framing state — the
     // deframer's buffered partial inbound frame + fragmentation flags and the tx
     // accumulator's partial outbound line — so a mid-frame wss client is carried
@@ -150,6 +160,13 @@ pub const registry = [_]Descriptor{
     // Consumed migration-token tombstones carried across USR2 so a delayed peer
     // offer cannot resurrect a session immediately after the swap.
     .{ .kind = .session_tombstone, .schema_id = 0x4853_544d, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // Exact-only whole-store checkpoints. Partial or per-row adoption would
+    // lose history cursors or webhook delivery ownership across an exec.
+    .{ .kind = .history, .schema_id = 0x4848_4953, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    .{ .kind = .webhook_store, .schema_id = 0x4857_484b, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // Canonical final capsule committing to every preceding capsule header,
+    // field, byte, order, total count, and per-kind count in the arena.
+    .{ .kind = .handoff_manifest, .schema_id = 0x4848_4d46, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
@@ -423,6 +440,42 @@ test "negotiation is per capsule schema range" {
     local.current_version = 2;
 
     try std.testing.expectEqual(@as(u16, 2), try negotiate(local, header));
+}
+
+test "exact clients world history webhook and handoff descriptors fail closed" {
+    const clients = descriptor(.clients);
+    try std.testing.expectEqual(@as(u16, 5), clients.current_version);
+    try std.testing.expectEqual(@as(u16, 5), clients.min_supported);
+    try std.testing.expectEqual(@as(u16, 5), clients.max_supported);
+    var legacy_clients = clients;
+    legacy_clients.current_version = 4;
+    legacy_clients.min_supported = 1;
+    legacy_clients.max_supported = 4;
+    try std.testing.expectError(
+        error.VersionUnsupported,
+        negotiate(legacy_clients, Header.init(.clients)),
+    );
+
+    const channels = descriptor(.channels);
+    try std.testing.expectEqual(@as(u16, 2), channels.current_version);
+    try std.testing.expectEqual(@as(u16, 2), channels.min_supported);
+    try std.testing.expectEqual(@as(u16, 2), channels.max_supported);
+    var legacy_channels = channels;
+    legacy_channels.current_version = 1;
+    legacy_channels.min_supported = 1;
+    legacy_channels.max_supported = 1;
+    try std.testing.expectError(
+        error.VersionUnsupported,
+        negotiate(legacy_channels, Header.init(.channels)),
+    );
+
+    inline for (.{ CapsuleKind.history, CapsuleKind.webhook_store, CapsuleKind.handoff_manifest }) |kind| {
+        const exact = descriptor(kind);
+        try std.testing.expectEqual(@as(u16, 1), exact.current_version);
+        try std.testing.expectEqual(@as(u16, 1), exact.min_supported);
+        try std.testing.expectEqual(@as(u16, 1), exact.max_supported);
+        try std.testing.expectEqual(kind, try CapsuleKind.fromByte(@intFromEnum(kind)));
+    }
 }
 
 test "mesh checkpoint v2 keeps ordinary pieces compatible and exact pieces fail closed" {

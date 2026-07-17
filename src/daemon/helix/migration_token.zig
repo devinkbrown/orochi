@@ -27,7 +27,14 @@ pub const Claims = struct {
 };
 
 pub const EncodeError = error{AccountTooLong} || std.mem.Allocator.Error;
-pub const VerifyError = error{ BadTag, Expired, Truncated };
+pub const VerifyError = error{
+    BadTag,
+    Expired,
+    NotYetValid,
+    InvalidLifetime,
+    Truncated,
+    TrailingBytes,
+};
 
 pub fn encodeClaims(allocator: std.mem.Allocator, claims: Claims) EncodeError![]u8 {
     if (claims.account.len > max_account_len) return error.AccountTooLong;
@@ -69,6 +76,8 @@ pub fn verify(key: []const u8, token_blob: []const u8, now_ms: i64) VerifyError!
         return error.BadTag;
     }
 
+    if (parsed.claims.expires_ms < parsed.claims.issued_ms) return error.InvalidLifetime;
+    if (now_ms < parsed.claims.issued_ms) return error.NotYetValid;
     if (now_ms > parsed.claims.expires_ms) return error.Expired;
     return parsed.claims;
 }
@@ -127,6 +136,7 @@ fn parseCanonicalPrefix(token_blob: []const u8) VerifyError!Parsed {
 
     const claim_len = canonicalLen(account_len);
     if (token_blob.len < claim_len + tag_len) return error.Truncated;
+    if (token_blob.len > claim_len + tag_len) return error.TrailingBytes;
 
     var offset: usize = 2;
     const account = token_blob[offset..][0..account_len];
@@ -207,6 +217,26 @@ test "tampered byte is rejected with BadTag" {
     try std.testing.expectError(error.BadTag, verify(key, token.items, claims.issued_ms));
 }
 
+test "HMAC binds every account origin destination timing and nonce claim byte" {
+    const allocator = std.testing.allocator;
+    const key = "migration-key";
+    const claims = makeClaims();
+    const canonical = try encodeClaims(allocator, claims);
+    defer allocator.free(canonical);
+    const tag = try sign(key, claims);
+    const token = try std.mem.concat(allocator, u8, &.{ canonical, &tag });
+    defer allocator.free(token);
+
+    // Keep the two-byte account length structurally valid; mutate every actual
+    // claim byte after it, spanning account, source/destination, both clocks,
+    // and the complete nonce. The unchanged tag must reject every mutation.
+    for (2..canonical.len) |index| {
+        token[index] ^= 1;
+        try std.testing.expectError(error.BadTag, verify(key, token, claims.issued_ms));
+        token[index] ^= 1;
+    }
+}
+
 test "expired token is rejected after tag validation" {
     const allocator = std.testing.allocator;
     const key = "migration-key";
@@ -222,6 +252,32 @@ test "expired token is rejected after tag validation" {
     try token.appendSlice(allocator, &tag);
 
     try std.testing.expectError(error.Expired, verify(key, token.items, claims.expires_ms + 1));
+    _ = try verify(key, token.items, claims.expires_ms);
+}
+
+test "migration token enforces issued and expiry lifetime boundaries" {
+    const allocator = std.testing.allocator;
+    const key = "migration-key";
+    const claims = makeClaims();
+    const canonical = try encodeClaims(allocator, claims);
+    defer allocator.free(canonical);
+    const tag = try sign(key, claims);
+    const token = try std.mem.concat(allocator, u8, &.{ canonical, &tag });
+    defer allocator.free(token);
+
+    try std.testing.expectError(error.NotYetValid, verify(key, token, claims.issued_ms - 1));
+    _ = try verify(key, token, claims.issued_ms);
+    _ = try verify(key, token, claims.expires_ms);
+    try std.testing.expectError(error.Expired, verify(key, token, claims.expires_ms + 1));
+
+    var invalid = claims;
+    invalid.issued_ms = claims.expires_ms + 1;
+    const invalid_canonical = try encodeClaims(allocator, invalid);
+    defer allocator.free(invalid_canonical);
+    const invalid_tag = try sign(key, invalid);
+    const invalid_token = try std.mem.concat(allocator, u8, &.{ invalid_canonical, &invalid_tag });
+    defer allocator.free(invalid_token);
+    try std.testing.expectError(error.InvalidLifetime, verify(key, invalid_token, invalid.expires_ms));
 }
 
 test "truncated tokens are rejected" {
@@ -241,6 +297,37 @@ test "truncated tokens are rejected" {
     try std.testing.expectError(error.Truncated, verify(key, token.items[0..0], claims.issued_ms));
     try std.testing.expectError(error.Truncated, verify(key, token.items[0..1], claims.issued_ms));
     try std.testing.expectError(error.Truncated, verify(key, token.items[0 .. token.items.len - 1], claims.issued_ms));
+}
+
+test "verified migration token requires one exact canonical wire image" {
+    const allocator = std.testing.allocator;
+    const key = "migration-key";
+    const claims = makeClaims();
+    const canonical = try encodeClaims(allocator, claims);
+    defer allocator.free(canonical);
+    const tag = try sign(key, claims);
+    const token = try std.mem.concat(allocator, u8, &.{ canonical, &tag });
+    defer allocator.free(token);
+
+    for (0..token.len) |end| {
+        try std.testing.expectError(error.Truncated, verify(key, token[0..end], claims.issued_ms));
+    }
+    _ = try verify(key, token, claims.issued_ms);
+
+    const trailing = try std.mem.concat(allocator, u8, &.{ token, "\x00" });
+    defer allocator.free(trailing);
+    try std.testing.expectError(error.TrailingBytes, verify(key, trailing, claims.issued_ms));
+}
+
+test "migration claim encoding is leak-free across every allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, claims: Claims) !void {
+            const canonical = try encodeClaims(allocator, claims);
+            defer allocator.free(canonical);
+            try std.testing.expectEqual(canonicalLen(claims.account.len), canonical.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{makeClaims()});
 }
 
 test "canonical encoding uses little endian fields" {

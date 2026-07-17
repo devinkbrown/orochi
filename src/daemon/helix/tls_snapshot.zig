@@ -33,7 +33,7 @@ const tls_conn = @import("../tls_conn.zig");
 const tls_server = @import("../../crypto/tls_server.zig");
 const tls12_server = @import("../../crypto/tls12_server.zig");
 
-pub const Error = error{ Truncated, TooLong, BadEngine, BadLength };
+pub const Error = error{ Truncated, TrailingBytes, InvalidFlags, BadCertfp, TooLong, BadEngine, BadLength };
 
 const engine_tls13: u8 = 1;
 const engine_tls12: u8 = 2;
@@ -118,6 +118,18 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
 
 /// Decode a snapshot; byte-slice fields borrow `bytes`.
 pub fn decode(bytes: []const u8) Error!Snapshot {
+    return decodeInternal(bytes, false);
+}
+
+/// Decode the exact payload emitted by the current encoder. Unlike the legacy
+/// compatibility decoder, both kTLS flag bytes are mandatory booleans, trailing
+/// bytes are rejected, and a present certificate fingerprint must be canonical
+/// lowercase SHA-256 hex.
+pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    return decodeInternal(bytes, true);
+}
+
+fn decodeInternal(bytes: []const u8, strict_current: bool) Error!Snapshot {
     var r = Reader{ .buf = bytes };
     const fd = try r.int(i32);
     const engine = try r.byte();
@@ -163,9 +175,27 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     state.pending_recv = try r.take(try r.int(u32));
     const pending_out = try r.take(try r.int(u32));
     const certfp = try r.take(try r.byte());
-    // Trailing kTLS offload flags; absent in older snapshots ⇒ not offloaded.
-    const tx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
-    const rx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
+    var tx_offloaded = false;
+    var rx_offloaded = false;
+    if (strict_current) {
+        const tx = try r.byte();
+        const rx = try r.byte();
+        if (tx > 1 or rx > 1) return error.InvalidFlags;
+        tx_offloaded = tx == 1;
+        rx_offloaded = rx == 1;
+        if (r.pos != r.buf.len) return error.TrailingBytes;
+        if (certfp.len != 0) {
+            if (certfp.len != 64) return error.BadCertfp;
+            for (certfp) |byte| {
+                if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')))
+                    return error.BadCertfp;
+            }
+        }
+    } else {
+        // Trailing kTLS offload flags; absent in older snapshots ⇒ not offloaded.
+        tx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
+        rx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
+    }
     return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx_offloaded, .rx_offloaded = rx_offloaded };
 }
 
@@ -282,6 +312,41 @@ test "decode rejects truncation and unknown engines" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }));
     // fd(4) + engine byte 9 = unknown.
     try testing.expectError(error.BadEngine, decode(&[_]u8{ 1, 0, 0, 0, 9, 0x01, 0x13 }));
+}
+
+test "current decode requires canonical flags fingerprint and exact EOF" {
+    const allocator = testing.allocator;
+    const s13 = tls_server.Server.ResumeState{
+        .suite = 0x1301,
+        .client_app_secret = @splat(1),
+        .server_app_secret = @splat(2),
+        .app_read_seq = 1,
+        .app_write_seq = 2,
+    };
+    const bytes = try encode(allocator, .{
+        .fd = 17,
+        .state = .{ .engine = .{ .tls13 = s13 } },
+        .certfp = &repeatBytes("ab", 32),
+    });
+    defer allocator.free(bytes);
+    _ = try decodeCurrent(bytes);
+    try testing.expectError(error.Truncated, decodeCurrent(bytes[0 .. bytes.len - 1]));
+
+    const trailing = try allocator.alloc(u8, bytes.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..bytes.len], bytes);
+    trailing[bytes.len] = 0;
+    try testing.expectError(error.TrailingBytes, decodeCurrent(trailing));
+
+    const bad_flag = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad_flag);
+    bad_flag[bad_flag.len - 1] = 2;
+    try testing.expectError(error.InvalidFlags, decodeCurrent(bad_flag));
+
+    const bad_certfp = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad_certfp);
+    bad_certfp[bad_certfp.len - 2 - 64] = 'A';
+    try testing.expectError(error.BadCertfp, decodeCurrent(bad_certfp));
 }
 
 fn repeatBytes(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {

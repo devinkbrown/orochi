@@ -223,6 +223,13 @@ pub const Registry = struct {
         return out[0..n];
     }
 
+    /// Borrow every active row without imposing a caller scratch-buffer cap.
+    /// Anti-entropy must not silently report completion after a truncated list;
+    /// the slice remains valid until the next Registry mutation.
+    pub fn all(self: *const Registry) []const Ward {
+        return self.wards.items;
+    }
+
     /// The active Ward identified by (match, pattern), or null. A direct registry
     /// lookup (no bounded copy) so a caller can read an entry's `scope`/`action`
     /// regardless of how many Wards share the same `match`.

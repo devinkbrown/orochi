@@ -38,6 +38,8 @@ const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const cpv = @import("../../proto/coilpack_value.zig");
+const s2s_frame = @import("../../proto/s2s_frame.zig");
+const session_portability = @import("../../proto/session_portability.zig");
 const signed_object = @import("../../proto/signed_object.zig");
 const secure_fns = @import("../../proto/secure_fns.zig");
 const usermode = @import("../../proto/usermode.zig");
@@ -73,12 +75,12 @@ pub const frame_header_len: usize = 1 + 1 + 1 + 4;
 
 /// Upper bound on a decoded relay frame, mirroring the S2S frame ceiling. Large
 /// enough for a full session snapshot, small enough to reject hostile inputs.
-pub const max_frame_len: usize = 1024 * 1024;
+pub const max_frame_len: usize = s2s_frame.default_max_frame_size - s2s_frame.header_len;
 
 /// Snapshot schema limits mirror the daemon's inline session storage and hard
 /// protocol ceilings. The 10k channel ceiling matches the maximum configured
 /// CHANLIMIT and, critically, bounds both the CPV tree and owned restore image.
-pub const max_snapshot_wire_len: usize = max_frame_len;
+pub const max_snapshot_wire_len: usize = session_portability.max_snapshot_len;
 pub const max_snapshot_channels: usize = 10_000;
 pub const max_snapshot_nick_len: usize = 64;
 pub const max_snapshot_username_len: usize = 16;
@@ -442,7 +444,12 @@ pub const Snapshot = struct {
             .{ .key = "umodes", .value = .{ .string = self.umodes } },
             .{ .key = "username", .value = .{ .string = self.username } },
         };
-        return canonicalEncode(allocator, .{ .map = entries[0..] });
+        const encoded = try canonicalEncode(allocator, .{ .map = entries[0..] });
+        if (encoded.len > max_snapshot_wire_len) {
+            allocator.free(encoded);
+            return error.OversizeFrame;
+        }
+        return encoded;
     }
 
     /// Decode an owned snapshot from CoilPack bytes. The returned snapshot owns
@@ -627,6 +634,7 @@ pub const Token = struct {
         epoch: u64,
         capsule_hash: CapsuleHash,
     ) Error!Token {
+        if (account.len > max_snapshot_account_len) return error.MalformedToken;
         var entries = canonicalValue(account, nonce, fsm_state, epoch, capsule_hash[0..]);
         var obj = signed_object.sign(allocator, .{ .map = entries[0..] }, kp) catch |err| {
             return narrowSignError(err);
@@ -647,9 +655,12 @@ pub const Token = struct {
 
     /// Verify this token's signature against `expected_signer` by recomputing
     /// the canonical bytes from its fields. Returns `false` on any mismatch.
-    pub fn verify(self: Token, allocator: std.mem.Allocator, expected_signer: PublicKey) bool {
+    pub fn verify(self: Token, allocator: std.mem.Allocator, expected_signer: PublicKey) Error!bool {
         var entries = canonicalValue(self.account, self.nonce, self.fsm_state, self.epoch, self.capsule_hash[0..]);
-        const canonical = cpv.Encoder.encode(allocator, .{ .map = entries[0..] }) catch return false;
+        const canonical = cpv.Encoder.encode(allocator, .{ .map = entries[0..] }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
         defer allocator.free(canonical);
 
         const obj = signed_object.SignedObject{
@@ -672,6 +683,7 @@ pub const Token = struct {
 
     /// Serialize the token to owned CoilPack bytes for embedding in a frame.
     pub fn encode(self: Token, allocator: std.mem.Allocator) Error![]u8 {
+        if (self.account.len > max_snapshot_account_len) return error.MalformedToken;
         var entries = [_]cpv.MapEntry{
             .{ .key = "account", .value = .{ .string = self.account } },
             .{ .key = "capsule_hash", .value = .{ .bytes = self.capsule_hash[0..] } },
@@ -686,7 +698,10 @@ pub const Token = struct {
 
     /// Decode an owned token from CoilPack bytes.
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Token {
-        var value = cpv.Decoder.decode(allocator, bytes) catch return error.MalformedToken;
+        var value = cpv.Decoder.decode(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedToken,
+        };
         defer value.deinit(allocator);
         if (value != .map) return error.MalformedToken;
 
@@ -698,6 +713,7 @@ pub const Token = struct {
         const sig_src = mapBytes(value.map, "sig") orelse return error.MalformedToken;
         const signer_src = mapBytes(value.map, "signer") orelse return error.MalformedToken;
 
+        if (account_src.len > max_snapshot_account_len) return error.MalformedToken;
         if (fsm_raw > std.math.maxInt(u8)) return error.MalformedToken;
         const fsm_state = FsmState.fromTag(@intCast(fsm_raw)) orelse return error.MalformedToken;
         if (capsule_hash_src.len != Sha256.digest_length) return error.MalformedToken;
@@ -763,6 +779,7 @@ pub const Capsule = struct {
     /// CoilPack bytes. The token is embedded as its own encoded blob so the
     /// outer capsule and the token evolve independently.
     pub fn encode(self: Capsule, allocator: std.mem.Allocator) Error![]u8 {
+        if (self.account.len > max_snapshot_account_len) return error.MalformedCapsule;
         const token_bytes = try self.token.encode(allocator);
         defer allocator.free(token_bytes);
         const snapshot_bytes = try self.snapshot.encode(allocator);
@@ -778,7 +795,10 @@ pub const Capsule = struct {
 
     /// Decode an owned capsule from CoilPack bytes.
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Capsule {
-        var value = cpv.Decoder.decode(allocator, bytes) catch return error.MalformedCapsule;
+        var value = cpv.Decoder.decode(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedCapsule,
+        };
         defer value.deinit(allocator);
         if (value != .map) return error.MalformedCapsule;
 
@@ -786,6 +806,7 @@ pub const Capsule = struct {
         const snapshot_src = mapBytes(value.map, "snapshot") orelse return error.MalformedCapsule;
         const token_src = mapBytes(value.map, "token") orelse return error.MalformedCapsule;
 
+        if (account_src.len > max_snapshot_account_len) return error.MalformedCapsule;
         var token = try Token.decode(allocator, token_src);
         errdefer token.deinit(allocator);
 
@@ -916,6 +937,10 @@ pub const Journal = struct {
     pub fn contains(self: *const Journal, nonce: u64) bool {
         return self.seen.contains(nonce);
     }
+
+    fn remove(self: *Journal, nonce: u64) void {
+        _ = self.seen.remove(nonce);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -938,8 +963,14 @@ pub const Policy = struct {
 
     /// Admit `epoch` for `account`. Returns `true` if it is strictly newer than
     /// any previously admitted epoch (or the first for this account); `false` if
-    /// it is stale or a repeat. Owns a copy of `account` on first admission.
+    /// it is stale or a repeat. Account authority follows the daemon's ASCII-
+    /// folded identity boundary. Owns a copy of `account` on first admission.
     pub fn admit(self: *Policy, allocator: std.mem.Allocator, account: []const u8, epoch: u64) Error!bool {
+        if (self.findEpochPtr(account)) |current_epoch| {
+            if (epoch <= current_epoch.*) return false;
+            current_epoch.* = epoch;
+            return true;
+        }
         const gop = try self.epochs.getOrPut(allocator, account);
         if (!gop.found_existing) {
             const owned = allocator.dupe(u8, account) catch |err| {
@@ -957,7 +988,32 @@ pub const Policy = struct {
 
     /// Highest epoch admitted for `account`, if any.
     pub fn current(self: *const Policy, account: []const u8) ?u64 {
-        return self.epochs.get(account);
+        return if (@constCast(self).findEpochPtr(account)) |epoch| epoch.* else null;
+    }
+
+    fn findEpochPtr(self: *Policy, account: []const u8) ?*u64 {
+        var it = self.epochs.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) return entry.value_ptr;
+        }
+        return null;
+    }
+
+    /// Undo exactly one successful admission. Used only by the surrounding
+    /// transaction when a later allocation fails before an offer is published.
+    fn rollback(self: *Policy, allocator: std.mem.Allocator, account: []const u8, prior: ?u64) void {
+        if (prior) |epoch| {
+            self.findEpochPtr(account).?.* = epoch;
+            return;
+        }
+        var it = self.epochs.iterator();
+        while (it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            const owned_key = entry.key_ptr.*;
+            _ = self.epochs.remove(owned_key);
+            allocator.free(owned_key);
+            return;
+        }
     }
 };
 
@@ -1035,9 +1091,12 @@ pub const MigrationOrigin = struct {
         nonce: u64,
         epoch: u64,
     ) Error!PreparedMigration {
-        // Policy + journal first, so a rejected offer mints nothing.
-        if (!try self.policy.admit(self.allocator, account, epoch)) return error.Replay;
-        if (!try self.journal.record(self.allocator, nonce)) return error.Replay;
+        if (account.len > max_snapshot_account_len) return error.MalformedCapsule;
+        // Reject known stale/replay state before doing expensive work, but do
+        // not mutate either ledger until every frame allocation has succeeded.
+        const prior_epoch = self.policy.current(account);
+        if (prior_epoch) |current_epoch| if (epoch <= current_epoch) return error.Replay;
+        if (self.journal.contains(nonce)) return error.Replay;
 
         const capsule_hash = try capsulePayloadHash(self.allocator, account, snapshot);
 
@@ -1072,6 +1131,12 @@ pub const MigrationOrigin = struct {
 
         const frame_bytes = try encodeFrame(self.allocator, .offered, capsule);
         errdefer self.allocator.free(frame_bytes);
+
+        // Commit the two replay ledgers last. If journal allocation fails, put
+        // policy back exactly so the same valid migration can be retried.
+        if (!try self.policy.admit(self.allocator, account, epoch)) return error.Replay;
+        errdefer self.policy.rollback(self.allocator, account, prior_epoch);
+        if (!try self.journal.record(self.allocator, nonce)) return error.Replay;
 
         self.metrics.prepared += 1;
         return .{ .frame_bytes = frame_bytes, .token = token };
@@ -1125,7 +1190,7 @@ pub const MigrationTarget = struct {
         errdefer frame.deinit(self.allocator);
 
         // Signature verification against the pinned origin key.
-        if (!frame.token.verify(self.allocator, self.expected_signer)) {
+        if (!try frame.token.verify(self.allocator, self.expected_signer)) {
             self.metrics.rejected_signature += 1;
             return error.BadSignature;
         }
@@ -1142,18 +1207,30 @@ pub const MigrationTarget = struct {
             return error.BadSignature;
         }
 
-        // Stale-epoch rejection (policy), then replay rejection (journal).
-        if (!try self.policy.admit(self.allocator, frame.token.account, frame.token.epoch)) {
+        // Preflight replay state without mutation. Every allocation after this
+        // point is covered by rollback until reclaim publication succeeds.
+        const prior_epoch = self.policy.current(frame.token.account);
+        if (prior_epoch) |current_epoch| if (frame.token.epoch <= current_epoch) {
             self.metrics.rejected_replay += 1;
             return error.Replay;
-        }
-        if (!try self.journal.record(self.allocator, frame.token.nonce)) {
+        };
+        if (self.journal.contains(frame.token.nonce)) {
             self.metrics.rejected_replay += 1;
             return error.Replay;
         }
 
-        // Store a reclaim token (a fresh owned copy) keyed by account so a
-        // reconnecting client can prove ownership.
+        if (!try self.policy.admit(self.allocator, frame.token.account, frame.token.epoch)) {
+            self.metrics.rejected_replay += 1;
+            return error.Replay;
+        }
+        errdefer self.policy.rollback(self.allocator, frame.token.account, prior_epoch);
+        if (!try self.journal.record(self.allocator, frame.token.nonce)) {
+            self.metrics.rejected_replay += 1;
+            return error.Replay;
+        }
+        errdefer self.journal.remove(frame.token.nonce);
+
+        // Store a reclaim token only after staging rollback for both ledgers.
         try self.storeReclaim(frame.token);
 
         self.metrics.accepted += 1;
@@ -1171,13 +1248,13 @@ pub const MigrationTarget = struct {
         var copy = try cloneToken(self.allocator, token);
         errdefer copy.deinit(self.allocator);
 
-        const gop = try self.reclaimable.getOrPut(self.allocator, token.account);
-        if (gop.found_existing) {
-            // Replace the previously-stored token; reuse the existing owned key.
-            gop.value_ptr.deinit(self.allocator);
-            gop.value_ptr.* = copy;
+        if (self.reclaimPtrFolded(token.account)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = copy;
             return;
         }
+        const gop = try self.reclaimable.getOrPut(self.allocator, token.account);
+        std.debug.assert(!gop.found_existing);
         const owned_key = self.allocator.dupe(u8, token.account) catch |err| {
             self.reclaimable.removeByPtr(gop.key_ptr);
             return err;
@@ -1191,7 +1268,7 @@ pub const MigrationTarget = struct {
     /// no migration is pending for that account. The returned token is owned by
     /// the caller and must be `deinit`'d.
     pub fn reclaimToken(self: *MigrationTarget, account: []const u8) Error!?Token {
-        const stored = self.reclaimable.getPtr(account) orelse return null;
+        const stored = self.reclaimPtrFolded(account) orelse return null;
         self.metrics.reclaimed += 1;
         return try cloneToken(self.allocator, stored.*);
     }
@@ -1200,10 +1277,19 @@ pub const MigrationTarget = struct {
     /// using a constant-time proof comparison. Returns `false` if no migration
     /// is pending or the proof does not match.
     pub fn verifyReclaim(self: *MigrationTarget, account: []const u8, presented: Token) bool {
-        const stored = self.reclaimable.getPtr(account) orelse return false;
-        // Account must also match the presented token, constant-time.
-        if (!secure_fns.ctEq(account, presented.account)) return false;
+        const stored = self.reclaimPtrFolded(account) orelse return false;
+        // Account authority uses the daemon's public ASCII-folded identity;
+        // the secret-bearing signature/signer proof remains constant-time.
+        if (!std.ascii.eqlIgnoreCase(account, presented.account)) return false;
         return stored.sameProof(presented);
+    }
+
+    fn reclaimPtrFolded(self: *MigrationTarget, account: []const u8) ?*Token {
+        var it = self.reclaimable.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) return entry.value_ptr;
+        }
+        return null;
     }
 };
 
@@ -1372,6 +1458,63 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqual(@as(u64, 1), target.metrics.accepted);
 }
 
+test "portable migration outer account is bounded at every codec boundary" {
+    const allocator = testing.allocator;
+    const kp = try testKey(0x12);
+    const capsule_hash: CapsuleHash = @splat(0x12);
+    const overlong_account: [max_snapshot_account_len + 1]u8 = @splat('a');
+
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    try testing.expectError(
+        error.MalformedCapsule,
+        origin.prepare(&overlong_account, sampleSnapshot(), 1, 1),
+    );
+    try testing.expectError(
+        error.MalformedToken,
+        Token.mint(allocator, kp, &overlong_account, 1, .offered, 1, capsule_hash),
+    );
+
+    var token = try Token.mint(allocator, kp, "alice", 1, .offered, 1, capsule_hash);
+    defer token.deinit(allocator);
+    var invalid_token = token;
+    invalid_token.account = &overlong_account;
+    try testing.expectError(error.MalformedToken, invalid_token.encode(allocator));
+
+    var token_entries = [_]cpv.MapEntry{
+        .{ .key = "account", .value = .{ .string = &overlong_account } },
+        .{ .key = "capsule_hash", .value = .{ .bytes = token.capsule_hash[0..] } },
+        .{ .key = "epoch", .value = .{ .unsigned = token.epoch } },
+        .{ .key = "fsm", .value = .{ .unsigned = token.fsm_state.tag() } },
+        .{ .key = "nonce", .value = .{ .unsigned = token.nonce } },
+        .{ .key = "sig", .value = .{ .bytes = token.signature[0..] } },
+        .{ .key = "signer", .value = .{ .bytes = token.signer[0..] } },
+    };
+    const invalid_token_wire = try canonicalEncode(allocator, .{ .map = &token_entries });
+    defer allocator.free(invalid_token_wire);
+    try testing.expectError(error.MalformedToken, Token.decode(allocator, invalid_token_wire));
+
+    const snapshot = sampleSnapshot();
+    try testing.expectError(error.MalformedCapsule, (Capsule{
+        .token = token,
+        .account = &overlong_account,
+        .snapshot = snapshot,
+    }).encode(allocator));
+
+    const token_wire = try token.encode(allocator);
+    defer allocator.free(token_wire);
+    const snapshot_wire = try snapshot.encode(allocator);
+    defer allocator.free(snapshot_wire);
+    var capsule_entries = [_]cpv.MapEntry{
+        .{ .key = "account", .value = .{ .string = &overlong_account } },
+        .{ .key = "snapshot", .value = .{ .bytes = snapshot_wire } },
+        .{ .key = "token", .value = .{ .bytes = token_wire } },
+    };
+    const invalid_capsule_wire = try canonicalEncode(allocator, .{ .map = &capsule_entries });
+    defer allocator.free(invalid_capsule_wire);
+    try testing.expectError(error.MalformedCapsule, Capsule.decode(allocator, invalid_capsule_wire));
+}
+
 test "accept rejects a forged token signed by the wrong key" {
     // Arrange
     const allocator = testing.allocator;
@@ -1452,6 +1595,193 @@ test "policy/journal reject a replayed duplicate migration" {
 
     // And the origin refuses to re-prepare the same nonce/epoch.
     try testing.expectError(error.Replay, origin.prepare("kain", snapshot, 0xFEED, 1));
+}
+
+test "migration account policy and reclaim authority are ASCII-folded" {
+    const allocator = testing.allocator;
+    const kp = try testKey(0x3A);
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    var target = MigrationTarget.init(allocator, origin.publicKey());
+    defer target.deinit();
+
+    var first = try origin.prepare("Alice", sampleSnapshot(), 0xA1, 1);
+    defer first.deinit(allocator);
+    var first_capsule = try target.accept(first.frame_bytes);
+    defer first_capsule.deinit(allocator);
+
+    try testing.expectError(error.Replay, origin.prepare("ALICE", sampleSnapshot(), 0xA2, 1));
+    var second = try origin.prepare("ALICE", sampleSnapshot(), 0xA2, 2);
+    defer second.deinit(allocator);
+    var second_capsule = try target.accept(second.frame_bytes);
+    defer second_capsule.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), origin.policy.epochs.count());
+    try testing.expectEqual(@as(usize, 1), target.policy.epochs.count());
+    try testing.expectEqual(@as(usize, 1), target.reclaimable.count());
+    try testing.expectEqual(@as(?u64, 2), origin.policy.current("aLiCe"));
+    try testing.expectEqual(@as(?u64, 2), target.policy.current("alice"));
+    var token = (try target.reclaimToken("aLiCe")).?;
+    defer token.deinit(allocator);
+    try testing.expectEqual(@as(u64, 0xA2), token.nonce);
+    try testing.expect(target.verifyReclaim("alice", token));
+}
+
+test "origin prepare is retryable and logically unchanged at every allocation failure" {
+    const kp = try testKey(0x3B);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, keypair: KeyPair) !void {
+            var origin = MigrationOrigin.init(allocator, keypair);
+            defer origin.deinit();
+            const nonce: u64 = 0xBEEF;
+            const epoch: u64 = 7;
+
+            var prepared = origin.prepare("Alice", sampleSnapshot(), nonce, epoch) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(?u64, null), origin.policy.current("alice"));
+                try testing.expect(!origin.journal.contains(nonce));
+                try testing.expectEqual(@as(u64, 0), origin.metrics.prepared);
+
+                // The failing allocator trips only once. A byte-identical retry
+                // must succeed, proving OOM did not burn nonce/epoch authority.
+                var retry = try origin.prepare("ALICE", sampleSnapshot(), nonce, epoch);
+                retry.deinit(allocator);
+                try testing.expectEqual(@as(?u64, epoch), origin.policy.current("alice"));
+                try testing.expect(origin.journal.contains(nonce));
+                return err;
+            };
+            defer prepared.deinit(allocator);
+            try testing.expectEqual(@as(?u64, epoch), origin.policy.current("alice"));
+            try testing.expect(origin.journal.contains(nonce));
+            try testing.expectEqual(@as(u64, 1), origin.metrics.prepared);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{kp});
+}
+
+test "target accept is retryable and logically unchanged at every allocation failure" {
+    const allocator = testing.allocator;
+    const kp = try testKey(0x3C);
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    var prepared = try origin.prepare("Alice", sampleSnapshot(), 0xCAFE, 9);
+    defer prepared.deinit(allocator);
+
+    const Sweep = struct {
+        fn run(
+            failing_allocator: std.mem.Allocator,
+            signer: PublicKey,
+            wire: []const u8,
+        ) !void {
+            var target = MigrationTarget.init(failing_allocator, signer);
+            defer target.deinit();
+
+            var capsule = target.accept(wire) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(?u64, null), target.policy.current("alice"));
+                try testing.expect(!target.journal.contains(0xCAFE));
+                try testing.expectEqual(@as(usize, 0), target.reclaimable.count());
+                try testing.expectEqual(@as(u64, 0), target.metrics.accepted);
+
+                var retry = try target.accept(wire);
+                retry.deinit(failing_allocator);
+                try testing.expectEqual(@as(?u64, 9), target.policy.current("ALICE"));
+                try testing.expect(target.journal.contains(0xCAFE));
+                try testing.expectEqual(@as(usize, 1), target.reclaimable.count());
+                return err;
+            };
+            defer capsule.deinit(failing_allocator);
+            try testing.expectEqual(@as(?u64, 9), target.policy.current("alice"));
+            try testing.expect(target.journal.contains(0xCAFE));
+            try testing.expectEqual(@as(usize, 1), target.reclaimable.count());
+            try testing.expectEqual(@as(u64, 1), target.metrics.accepted);
+        }
+    };
+    try testing.checkAllAllocationFailures(
+        allocator,
+        Sweep.run,
+        .{ origin.publicKey(), @as([]const u8, prepared.frame_bytes) },
+    );
+}
+
+test "newer case-variant migration replacement rolls back to prior authority on every OOM" {
+    const allocator = testing.allocator;
+    const kp = try testKey(0x3D);
+    var source = MigrationOrigin.init(allocator, kp);
+    defer source.deinit();
+    var first = try source.prepare("Alice", sampleSnapshot(), 0xD1, 1);
+    defer first.deinit(allocator);
+    var second = try source.prepare("ALICE", sampleSnapshot(), 0xD2, 2);
+    defer second.deinit(allocator);
+
+    const TargetSweep = struct {
+        fn run(
+            failing_allocator: std.mem.Allocator,
+            signer: PublicKey,
+            first_wire: []const u8,
+            second_wire: []const u8,
+        ) !void {
+            var target = MigrationTarget.init(failing_allocator, signer);
+            defer target.deinit();
+            var initial = try target.accept(first_wire);
+            defer initial.deinit(failing_allocator);
+
+            var replacement = target.accept(second_wire) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(?u64, 1), target.policy.current("alice"));
+                try testing.expect(target.journal.contains(0xD1));
+                try testing.expect(!target.journal.contains(0xD2));
+                try testing.expectEqual(@as(u64, 0xD1), target.reclaimPtrFolded("ALICE").?.nonce);
+                try testing.expectEqual(@as(u64, 1), target.metrics.accepted);
+
+                var retry = try target.accept(second_wire);
+                retry.deinit(failing_allocator);
+                try testing.expectEqual(@as(?u64, 2), target.policy.current("alice"));
+                try testing.expectEqual(@as(u64, 0xD2), target.reclaimPtrFolded("Alice").?.nonce);
+                return err;
+            };
+            defer replacement.deinit(failing_allocator);
+            try testing.expectEqual(@as(?u64, 2), target.policy.current("alice"));
+            try testing.expect(target.journal.contains(0xD2));
+            try testing.expectEqual(@as(u64, 0xD2), target.reclaimPtrFolded("alice").?.nonce);
+            try testing.expectEqual(@as(u64, 2), target.metrics.accepted);
+        }
+    };
+    try testing.checkAllAllocationFailures(
+        allocator,
+        TargetSweep.run,
+        .{
+            source.publicKey(),
+            @as([]const u8, first.frame_bytes),
+            @as([]const u8, second.frame_bytes),
+        },
+    );
+
+    const OriginSweep = struct {
+        fn run(failing_allocator: std.mem.Allocator, keypair: KeyPair) !void {
+            var origin = MigrationOrigin.init(failing_allocator, keypair);
+            defer origin.deinit();
+            var initial = try origin.prepare("Alice", sampleSnapshot(), 0xE1, 1);
+            defer initial.deinit(failing_allocator);
+
+            var replacement = origin.prepare("ALICE", sampleSnapshot(), 0xE2, 2) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(?u64, 1), origin.policy.current("alice"));
+                try testing.expect(origin.journal.contains(0xE1));
+                try testing.expect(!origin.journal.contains(0xE2));
+                try testing.expectEqual(@as(u64, 1), origin.metrics.prepared);
+                var retry = try origin.prepare("alice", sampleSnapshot(), 0xE2, 2);
+                retry.deinit(failing_allocator);
+                try testing.expectEqual(@as(?u64, 2), origin.policy.current("ALICE"));
+                return err;
+            };
+            defer replacement.deinit(failing_allocator);
+            try testing.expectEqual(@as(?u64, 2), origin.policy.current("alice"));
+            try testing.expect(origin.journal.contains(0xE2));
+            try testing.expectEqual(@as(u64, 2), origin.metrics.prepared);
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, OriginSweep.run, .{kp});
 }
 
 test "reclaimToken matches only the right account" {
@@ -1760,6 +2090,123 @@ test "snapshot wire preflight rejects amplification before allocator use" {
     @memset(oversize, 0);
     try testing.expectError(error.OversizeFrame, Snapshot.decode(failing.allocator(), oversize));
     try testing.expect(!failing.has_induced_failure);
+}
+
+test "snapshot encode rejects the shared portable wire boundary" {
+    const allocator = testing.allocator;
+    var max_channel: [max_snapshot_channel_len]u8 = @splat('x');
+    max_channel[0] = '#';
+    const channel_count = max_snapshot_wire_len / max_snapshot_channel_len + 1;
+    try testing.expect(channel_count <= max_snapshot_channels);
+    const channels = try allocator.alloc([]const u8, channel_count);
+    defer allocator.free(channels);
+    for (channels) |*channel| channel.* = &max_channel;
+
+    try testing.expectError(error.OversizeFrame, (Snapshot{
+        .nick = "alice",
+        .umodes = "+i",
+        .channels = channels,
+    }).encode(allocator));
+}
+
+test "near-cap portable snapshot fits relay legacy capsule and S2S frame" {
+    const session_migrate = @import("session_migrate.zig");
+    const allocator = testing.allocator;
+
+    // For the fixed maximum-width identity below, canonical CoilPack contributes
+    // 1,019 non-channel bytes. Each 200-byte channel plus its aligned one-byte
+    // member mode contributes 205 bytes. This is the largest whole-channel
+    // shape below the shared cap and currently leaves only six bytes unused.
+    const fixed_snapshot_wire_len: usize = 1019;
+    const encoded_channel_len: usize = max_snapshot_channel_len + 5;
+    const channel_count = (max_snapshot_wire_len - fixed_snapshot_wire_len) /
+        encoded_channel_len;
+    try testing.expect(channel_count <= max_snapshot_channels);
+
+    const channel_storage = try allocator.alloc([max_snapshot_channel_len]u8, channel_count);
+    defer allocator.free(channel_storage);
+    const channels = try allocator.alloc([]const u8, channel_count);
+    defer allocator.free(channels);
+    const channel_modes = try allocator.alloc(u8, channel_count);
+    defer allocator.free(channel_modes);
+    @memset(channel_modes, valid_snapshot_member_mode_mask);
+    for (channel_storage, 0..) |*storage, index| {
+        @memset(storage, 'x');
+        storage[0] = '#';
+        var value = index;
+        for (0..4) |digit| {
+            storage[1 + digit] = 'a' + @as(u8, @intCast(value % 26));
+            value /= 26;
+        }
+        channels[index] = storage;
+    }
+
+    const account: [max_snapshot_account_len]u8 = @splat('a');
+    const away: [max_snapshot_away_len]u8 = @splat('a');
+    const host: [max_snapshot_host_len]u8 = @splat('h');
+    const nick: [max_snapshot_nick_len]u8 = @splat('n');
+    const realname: [max_snapshot_realname_len]u8 = @splat('r');
+    const username: [max_snapshot_username_len]u8 = @splat('u');
+    const snapshot = Snapshot{
+        .nick = &nick,
+        .umodes = "+i",
+        .channels = channels,
+        .channel_modes = channel_modes,
+        .realname = &realname,
+        .host = &host,
+        .account = &account,
+        .away = &away,
+        .username = &username,
+        .is_oper = true,
+    };
+    const snapshot_wire = try snapshot.encode(allocator);
+    defer allocator.free(snapshot_wire);
+    try testing.expect(snapshot_wire.len <= max_snapshot_wire_len);
+    try testing.expect(max_snapshot_wire_len - snapshot_wire.len < encoded_channel_len);
+
+    const kp = try testKey(0x5A);
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    // Max-width counters force the largest possible token varints, so the
+    // wrapper measurement below is a true upper bound rather than a friendly
+    // small-counter fixture.
+    var prepared = try origin.prepare(
+        &account,
+        snapshot,
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+    );
+    defer prepared.deinit(allocator);
+    const session_token: session_migrate.Token = @splat(0xA5);
+    const legacy_wire = try session_migrate.encode(allocator, .{
+        .token = session_token,
+        .account = &account,
+        .snapshot = prepared.frame_bytes,
+    });
+    defer allocator.free(legacy_wire);
+    const framed_len = try s2s_frame.encodedLen(legacy_wire.len);
+    try testing.expect(framed_len <= s2s_frame.default_max_frame_size);
+
+    // Both the actual near-cap snapshot and the exact shared cap occupy the
+    // same three-byte CoilPack length-varint class. With every other variable
+    // field at its maximum above, this measured envelope is therefore also the
+    // exact-cap worst case. Prove the wrapper itself fits the reserved 4 KiB,
+    // then prove a hypothetical exact-cap snapshot still fits the full frame.
+    try testing.expect(snapshot_wire.len >= 1 << 14);
+    try testing.expect(max_snapshot_wire_len < 1 << 21);
+    try testing.expect(framed_len >= snapshot_wire.len + s2s_frame.header_len);
+    const legacy_envelope_len = framed_len - snapshot_wire.len - s2s_frame.header_len;
+    try testing.expect(legacy_envelope_len <= session_portability.legacy_envelope_reserve);
+    const exact_cap_framed_len = try std.math.add(
+        usize,
+        max_snapshot_wire_len,
+        legacy_envelope_len + s2s_frame.header_len,
+    );
+    try testing.expect(exact_cap_framed_len <= s2s_frame.default_max_frame_size);
+    try testing.expect(
+        s2s_frame.default_max_frame_size - framed_len <
+            session_portability.legacy_envelope_reserve,
+    );
 }
 
 test "snapshot decode is leak-free across every allocation failure" {

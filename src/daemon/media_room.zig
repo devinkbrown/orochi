@@ -148,6 +148,23 @@ pub const MediaRooms = struct {
         self.* = undefined;
     }
 
+    /// Whether this control plane has no live media state that would be lost by
+    /// an in-place exec. The server serializes every MediaRooms mutation under
+    /// its World write lock; callers must hold that same ownership boundary
+    /// while consulting this allocation-free snapshot.
+    ///
+    /// Check every map, not only `rooms`: an interrupted signaling operation can
+    /// leave a negotiated profile or participant metadata before a Room exists.
+    /// Treating any such state as idle would make the upgrade gate fail open.
+    pub fn upgradeContinuityReady(self: *const MediaRooms) bool {
+        return self.rooms.count() == 0 and
+            self.breakouts.count() == 0 and
+            self.positions.count() == 0 and
+            self.hands.count() == 0 and
+            self.profiles.count() == 0 and
+            self.participant_profiles.count() == 0;
+    }
+
     /// Build the "channel\x00participant" composite key into `buf`.
     fn breakoutKey(buf: []u8, channel: []const u8, pid: []const u8) ?[]const u8 {
         if (channel.len + 1 + pid.len > buf.len) return null;
@@ -420,6 +437,25 @@ test "join/roster/leave lifecycle prunes empty rooms" {
     try testing.expectEqual(@as(usize, 1), m.roster("#c").len);
     try testing.expect(m.leaveAll("#c", "bob"));
     try testing.expect(m.room("#c") == null); // pruned
+}
+
+test "upgrade continuity: MediaRooms is ready only without live control state" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+
+    try testing.expect(m.upgradeContinuityReady());
+
+    try m.join("#c", "alice", .voice);
+    const codecs = [_]sdp.Codec{.{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }};
+    try m.setProfile("#c", &codecs, .{ .scheme = .none, .redundancy = 0 });
+    try m.setParticipantProfile("#c", "alice", &codecs, .{ .scheme = .none, .redundancy = 0 });
+    try m.setBreakout("#c", "alice", "stage");
+    try m.setPosition("#c", "alice", .{ .x = 4, .y = -2 });
+    try m.setHand("#c", "alice", true);
+    try testing.expect(!m.upgradeContinuityReady());
+
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.upgradeContinuityReady());
 }
 
 test "call profile persists then clears when the call ends" {

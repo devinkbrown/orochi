@@ -38,6 +38,7 @@ pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
 pub const RelayMessageV2 = message_relay_v2.RelayMessage;
 pub const RelayVerbV2 = message_relay_v2.Verb;
+pub const SignedOperEventV2 = oper_event.SignedOperEventV2;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 pub const LocalNickResolver = route_table.LocalNickResolver;
 pub const SessionReplicaKind = session_replica_frame.Kind;
@@ -157,6 +158,12 @@ const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 /// a v2 peer that sees an unknown future version still reads the caps byte it
 /// understands. Bumping this is backward-compatible — see `decodeHandshake`.
 const handshake_version: u8 = 2;
+const relay_v2_extension_probe = "orochi-xcap-relay-v2-1?";
+const relay_v2_extension_reply = "orochi-xcap-relay-v2-1!";
+const relay_v2_ack_confirm_probe = "orochi-xcap-relay-v2-ack-confirm?";
+const relay_v2_ack_confirm_reply = "orochi-xcap-relay-v2-ack-confirm!";
+const session_replica_v3_probe = "orochi-xcap-session-replica-v3?";
+const session_replica_v3_reply = "orochi-xcap-session-replica-v3!";
 
 /// Handshake capability bits (forward-compatible bitfield). Unknown bits are
 /// ignored on decode, so future capabilities never break an older peer. The
@@ -183,6 +190,8 @@ const cap_session_replica_v2: u8 = s2s_frame.cap_session_replica_v2;
 const cap_secure_relay_v2: u8 = s2s_frame.cap_secure_relay_v2;
 /// The peer understands positive short-lived SESSION_REPLICA attachment leases.
 const cap_session_attachment_lease_v2: u8 = s2s_frame.cap_session_attachment_lease_v2;
+/// The peer understands secured immutable-origin Event Spine v2 frames.
+const cap_event_spine_v2: u8 = s2s_frame.cap_event_spine_v2;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const session_replica_frame = @import("../../proto/session_replica_frame.zig");
@@ -223,6 +232,12 @@ pub const Config = struct {
     /// Per-link exact-event reflection cache. This is intentionally only a loop
     /// optimization; authoritative replay retirement is daemon-global.
     relay_v2_seen_capacity: usize = 4096,
+    /// Maximum verified OPER_EVENT_V2 wires staged for daemon-global replay
+    /// admission. This per-link queue never evicts an earlier accepted event.
+    max_oper_event_v2_frames: usize = 256,
+    /// Per-link exact-event reflection cache for Event Spine v2. The daemon's
+    /// durable global guard remains the only replay/delivery authority.
+    oper_event_v2_seen_capacity: usize = 4096,
     link: link_session.Config = .{
         .gossip_interval_ms = 1_000,
         .repair_interval_ms = 2_000,
@@ -291,10 +306,17 @@ pub const Options = struct {
     /// Set only by the Tsumugi `SecuredLink` adapter after its AKE establishes.
     /// A standalone/plaintext S2sLink remains false even if it has a signing key.
     session_replica_transport_enabled: bool = false,
+    /// Enables the attachment-scoped SRTF3 schema only after the base secured
+    /// replica transport is active. Kept separate so a rolling deployment can
+    /// ship codecs before switching the live authority store.
+    session_replica_attachment_transport_enabled: bool = false,
     /// Independent outer-transport assertion for MESSAGE_V2. Only the Tsumugi
     /// SecuredLink adapter sets this after its AKE; a keyed plaintext test/link
     /// cannot activate secure flooding by advertising capability bits.
     secure_relay_transport_enabled: bool = false,
+    /// Independent outer-transport assertion for OPER_EVENT_V2. Only the
+    /// Tsumugi SecuredLink adapter may enable this after its AKE completes.
+    event_spine_v2_transport_enabled: bool = false,
 };
 
 const Handshake = struct {
@@ -307,6 +329,7 @@ const Handshake = struct {
 };
 
 pub const InboundSessionReplica = struct {
+    version: session_replica_frame.WireVersion,
     kind: session_replica_frame.Kind,
     via_peer: NodeId,
     signed_payload: []u8,
@@ -319,12 +342,29 @@ pub const InboundSessionReplica = struct {
 
 pub const InboundMessageV2 = struct {
     owned: message_relay_v2.Owned,
+    /// Exact canonical inner MESSAGE_V2 bytes received after immediate-hop
+    /// authentication. Accepted mesh forwarding reuses this image verbatim.
+    wire: []u8,
     /// Authenticated immediate hop. The immutable inner origin may legitimately
     /// name a different node on a pure-transit A-B-C path.
     via_peer: NodeId,
 
     pub fn deinit(self: *InboundMessageV2, allocator: Allocator) void {
         self.owned.deinit(allocator);
+        allocator.free(self.wire);
+        self.* = undefined;
+    }
+};
+
+/// One verified immutable Event Spine object plus the authenticated immediate
+/// transport hop. `wire` is the exact canonical OEVT v2 byte image received and
+/// is suitable for byte-identical forwarding after daemon-global admission.
+pub const InboundOperEventV2 = struct {
+    wire: []u8,
+    via_peer: NodeId,
+
+    pub fn deinit(self: *InboundOperEventV2, allocator: Allocator) void {
+        allocator.free(self.wire);
         self.* = undefined;
     }
 };
@@ -385,8 +425,14 @@ pub const S2sPeer = struct {
     /// Local transport authorization from the outer Tsumugi-secured adapter.
     /// Signing ability alone is insufficient: signed plaintext stays disabled.
     session_replica_transport_enabled: bool = false,
+    /// Local authorization to negotiate and accept only SRTF3 attachment-scoped
+    /// objects on this link. False keeps the established v2 behavior intact.
+    session_replica_attachment_transport_enabled: bool = false,
     /// Local authorization from the outer Tsumugi-secured adapter for relay v2.
     secure_relay_transport_enabled: bool = false,
+    /// Local authorization from the outer Tsumugi-secured adapter for Event
+    /// Spine v2. A signing key alone cannot activate this transport.
+    event_spine_v2_transport_enabled: bool = false,
     /// Whether the remote peer advertised the `frame_signing` capability in its
     /// handshake. Learned on `recvHandshake`; gates both outbound wrapping (only
     /// wrap for a signing-capable peer) and inbound enforcement (a signing-capable
@@ -412,8 +458,22 @@ pub const S2sPeer = struct {
     /// Remote advertised signing, SESSION_REPLICA v2, and the independently
     /// rolling-upgrade-safe attachment-lease extension.
     peer_supports_session_attachment_lease_v2: bool = false,
+    /// Remote answered the append-only SRTF3 extension probe. Once true, every
+    /// replica frame on this link must carry version 3; no decoder fallback is
+    /// allowed after malformed or mismatched input.
+    peer_supports_session_replica_v3: bool = false,
     /// Remote advertised frame signing plus the explicit secure-relay-v2 bit.
     peer_supports_secure_relay_v2: bool = false,
+    /// Negotiated safely over the legacy PING/PONG extension probe. Old peers
+    /// merely echo/ignore these payloads, so they never receive the 17-field
+    /// relay schema or MESSAGE_V2_ACK tag they cannot decode.
+    peer_supports_relay_v2_current: bool = false,
+    /// Remote negotiated the ACK-confirm extension. This lets admitted receipts
+    /// remain durable until the original sender explicitly confirms ACK receipt,
+    /// instead of relying on a finite replay-window guess.
+    peer_supports_relay_v2_ack_confirm: bool = false,
+    /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
+    peer_supports_event_spine_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
     /// and always on non-daemon/test peers) ⇒ no account is ever trusted ⇒ every
     /// same-account short-circuit stays on the conservative UID path.
@@ -439,6 +499,9 @@ pub const S2sPeer = struct {
     /// Verified secured relay-v2 events awaiting daemon-global replay admission,
     /// local delivery, and correctness-first re-flooding.
     inbound_v2: std.ArrayListUnmanaged(InboundMessageV2) = .empty,
+    /// Secured hop receipts awaiting daemon-global retained-outbox removal.
+    inbound_v2_acks: std.ArrayListUnmanaged(message_relay_v2.RelayId) = .empty,
+    inbound_v2_ack_confirms: std.ArrayListUnmanaged(message_relay_v2.RelayId) = .empty,
     dropped_relay_v2_frames: u64 = 0,
     rejected_relay_v2_frames: u64 = 0,
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
@@ -504,6 +567,11 @@ pub const S2sPeer = struct {
     /// to decode + deliver to its local oper subscribers. Substrate-pure: never
     /// decoded here.
     oper_events: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified OEVT v2 wires awaiting daemon-global replay admission, local
+    /// delivery, and correctness-first forwarding across other secured legs.
+    oper_events_v2: std.ArrayListUnmanaged(InboundOperEventV2) = .empty,
+    dropped_oper_event_v2_frames: u64 = 0,
+    rejected_oper_event_v2_frames: u64 = 0,
     /// Verified OBSERVE_EVENT payloads received from this peer, awaiting the daemon
     /// to decode + match against its local OBSERVE registry. Substrate-pure: never
     /// decoded here.
@@ -523,6 +591,8 @@ pub const S2sPeer = struct {
     seen: message_relay.SeenSet,
     /// Per-link reflection cache only; not authoritative replay protection.
     seen_v2: message_relay_v2.SeenSet,
+    /// Event Spine v2 per-link reflection cache only. Never a replay authority.
+    seen_oper_event_v2: message_relay_v2.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
         const server_name = try options.allocator.dupe(u8, options.server_name);
@@ -572,9 +642,12 @@ pub const S2sPeer = struct {
             .signing_key = options.signing_key,
             .admitted_frame_families = options.admitted_frame_families,
             .session_replica_transport_enabled = options.session_replica_transport_enabled,
+            .session_replica_attachment_transport_enabled = options.session_replica_attachment_transport_enabled,
             .secure_relay_transport_enabled = options.secure_relay_transport_enabled,
+            .event_spine_v2_transport_enabled = options.event_spine_v2_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
             .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
+            .seen_oper_event_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.oper_event_v2_seen_capacity),
         };
     }
 
@@ -593,6 +666,13 @@ pub const S2sPeer = struct {
         peer_supports_repair: bool,
         peer_supports_session_replica_v2: bool,
         peer_supports_session_attachment_lease_v2: bool,
+        peer_supports_session_replica_v3: bool = false,
+        /// Defaults preserve source compatibility for older snapshot producers;
+        /// current Helix capture must set both fields explicitly.
+        peer_supports_secure_relay_v2: bool = false,
+        peer_supports_event_spine_v2: bool = false,
+        peer_supports_relay_v2_current: bool = false,
+        peer_supports_relay_v2_ack_confirm: bool = false,
     };
 
     pub fn snapshotResume(self: *const S2sPeer) ResumeHeader {
@@ -606,6 +686,11 @@ pub const S2sPeer = struct {
             .peer_supports_repair = self.peer_supports_repair,
             .peer_supports_session_replica_v2 = self.peer_supports_session_replica_v2,
             .peer_supports_session_attachment_lease_v2 = self.peer_supports_session_attachment_lease_v2,
+            .peer_supports_session_replica_v3 = self.peer_supports_session_replica_v3,
+            .peer_supports_secure_relay_v2 = self.peer_supports_secure_relay_v2,
+            .peer_supports_event_spine_v2 = self.peer_supports_event_spine_v2,
+            .peer_supports_relay_v2_current = self.peer_supports_relay_v2_current,
+            .peer_supports_relay_v2_ack_confirm = self.peer_supports_relay_v2_ack_confirm,
         };
     }
 
@@ -699,13 +784,26 @@ pub const S2sPeer = struct {
             .peer_supports_session_attachment_lease_v2 = hdr.peer_supports_signing and
                 hdr.peer_supports_session_replica_v2 and
                 hdr.peer_supports_session_attachment_lease_v2,
+            .peer_supports_session_replica_v3 = options.session_replica_attachment_transport_enabled and
+                hdr.peer_supports_signing and hdr.peer_supports_session_replica_v2 and
+                hdr.peer_supports_session_replica_v3,
+            .peer_supports_secure_relay_v2 = hdr.peer_supports_signing and hdr.peer_supports_secure_relay_v2,
+            .peer_supports_event_spine_v2 = hdr.peer_supports_signing and hdr.peer_supports_event_spine_v2,
+            .peer_supports_relay_v2_current = hdr.peer_supports_signing and
+                hdr.peer_supports_secure_relay_v2 and hdr.peer_supports_relay_v2_current,
+            .peer_supports_relay_v2_ack_confirm = hdr.peer_supports_signing and
+                hdr.peer_supports_secure_relay_v2 and hdr.peer_supports_relay_v2_current and
+                hdr.peer_supports_relay_v2_ack_confirm,
             .config = options.config,
             .signing_key = options.signing_key,
             .admitted_frame_families = options.admitted_frame_families,
             .session_replica_transport_enabled = options.session_replica_transport_enabled,
+            .session_replica_attachment_transport_enabled = options.session_replica_attachment_transport_enabled,
             .secure_relay_transport_enabled = options.secure_relay_transport_enabled,
+            .event_spine_v2_transport_enabled = options.event_spine_v2_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
             .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
+            .seen_oper_event_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.oper_event_v2_seen_capacity),
         };
     }
 
@@ -714,6 +812,8 @@ pub const S2sPeer = struct {
         self.inbound.deinit(self.allocator);
         for (self.inbound_v2.items) |*owned| owned.deinit(self.allocator);
         self.inbound_v2.deinit(self.allocator);
+        self.inbound_v2_acks.deinit(self.allocator);
+        self.inbound_v2_ack_confirms.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
@@ -748,6 +848,8 @@ pub const S2sPeer = struct {
         self.clone_counts.deinit(self.allocator);
         for (self.oper_events.items) |m| self.allocator.free(m);
         self.oper_events.deinit(self.allocator);
+        for (self.oper_events_v2.items) |*event| event.deinit(self.allocator);
+        self.oper_events_v2.deinit(self.allocator);
         for (self.observe_events.items) |m| self.allocator.free(m);
         self.observe_events.deinit(self.allocator);
         for (self.kills.items) |m| self.allocator.free(m);
@@ -758,6 +860,7 @@ pub const S2sPeer = struct {
         self.tegami_pushes.deinit(self.allocator);
         self.seen.deinit();
         self.seen_v2.deinit();
+        self.seen_oper_event_v2.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
         self.allocator.free(self.description);
@@ -956,8 +1059,33 @@ pub const S2sPeer = struct {
             .PING => {
                 self.ping_rx_count += 1;
                 try emitFrame(self.allocator, sink, .PONG, frame.payload);
+                if (std.mem.eql(u8, frame.payload, relay_v2_extension_probe))
+                    try emitFrame(self.allocator, sink, .PONG, relay_v2_extension_reply);
+                if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_probe))
+                    try emitFrame(self.allocator, sink, .PONG, relay_v2_ack_confirm_reply);
+                if (std.mem.eql(u8, frame.payload, session_replica_v3_probe) and
+                    self.session_replica_attachment_transport_enabled and
+                    self.session_replica_transport_enabled and self.signing_key != null and
+                    self.peer_supports_signing and self.peer_supports_session_replica_v2)
+                {
+                    try emitFrame(self.allocator, sink, .PONG, session_replica_v3_reply);
+                }
             },
-            .PONG => self.pong_rx_count += 1,
+            .PONG => {
+                self.pong_rx_count += 1;
+                if (std.mem.eql(u8, frame.payload, relay_v2_extension_reply) and
+                    self.peer_supports_secure_relay_v2)
+                    self.peer_supports_relay_v2_current = true;
+                if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_reply) and
+                    self.peer_supports_secure_relay_v2)
+                    self.peer_supports_relay_v2_ack_confirm = true;
+                if (std.mem.eql(u8, frame.payload, session_replica_v3_reply) and
+                    self.session_replica_attachment_transport_enabled and
+                    self.peer_supports_signing and self.peer_supports_session_replica_v2)
+                {
+                    self.peer_supports_session_replica_v3 = true;
+                }
+            },
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => if (self.supportsSessionReplicaV2())
                 self.deferResidenceFrame(.membership, frame.payload)
@@ -971,7 +1099,8 @@ pub const S2sPeer = struct {
             else
                 try self.recvNickChange(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
-            .MESSAGE_V2 => self.recvMessageV2(frame.payload),
+            .MESSAGE_V2 => try self.recvMessageV2(frame.payload),
+            .MESSAGE_V2_ACK => try self.recvMessageV2Ack(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
@@ -984,6 +1113,7 @@ pub const S2sPeer = struct {
             .SESSION_REPLICA_ATTACHMENT_LEASE => self.recvSessionReplica(.attachment_lease, frame.payload),
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
+            .OPER_EVENT_V2 => self.recvOperEventV2(frame.payload),
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
             .KILL => try self.recvKill(frame.payload),
             .WARD => try self.recvWard(frame.payload),
@@ -1044,6 +1174,8 @@ pub const S2sPeer = struct {
     /// daemon stamps + signs the capsule; this peer only frames + ships it.
     /// Best-effort; only meaningful once established.
     pub fn sendSessionMigrate(self: *S2sPeer, sink: ByteSink, frame_bytes: []const u8) !void {
+        const framed_len = try s2s_frame.encodedLen(frame_bytes.len);
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
         try emitFrame(self.allocator, sink, .SESSION_MIGRATE, frame_bytes);
     }
 
@@ -1061,7 +1193,7 @@ pub const S2sPeer = struct {
         try emitFrame(self.allocator, sink, .SESSION_MIGRATE_CONSUMED, payload);
     }
 
-    /// Stage one SESSION_REPLICA v2 object after both negotiated-capability and
+    /// Stage one exactly-negotiated SESSION_REPLICA object after capability and
     /// direct-peer outer-signature checks. The Helix object remains opaque here;
     /// the daemon callback verifies its inner origin signature and applies it to
     /// the future per-destination replica store. Malformed, unnegotiated, and
@@ -1075,7 +1207,20 @@ pub const S2sPeer = struct {
         }
         const frame_type = replicaFrameType(kind);
         const authenticated = self.verifiedPayload(frame_type, frame_payload) orelse return;
-        const decoded = session_replica_frame.decode(kind, authenticated) catch {
+        const version = session_replica_frame.inspectVersion(authenticated) catch {
+            self.rejected_session_replica_frames +|= 1;
+            return;
+        };
+        const expected_version: session_replica_frame.WireVersion =
+            if (self.peer_supports_session_replica_v3) .attachment_v3 else .token_v2;
+        if (version != expected_version) {
+            self.rejected_session_replica_frames +|= 1;
+            return;
+        }
+        const decoded = switch (version) {
+            .token_v2 => session_replica_frame.decode(kind, authenticated),
+            .attachment_v3 => session_replica_frame.decodeAttachment(kind, authenticated),
+        } catch {
             self.rejected_session_replica_frames +|= 1;
             return;
         };
@@ -1088,6 +1233,7 @@ pub const S2sPeer = struct {
             return;
         };
         self.session_replica_frames.append(self.allocator, .{
+            .version = version,
             .kind = kind,
             .via_peer = self.remote_node_id,
             .signed_payload = owned,
@@ -1186,12 +1332,22 @@ pub const S2sPeer = struct {
         return self.supportsSessionReplicaV2() and self.peer_supports_session_attachment_lease_v2;
     }
 
+    /// Once negotiated, version 3 is the only accepted replica schema for this
+    /// preserved link. The v2 base bit still proves the outer frame family and
+    /// signing support; this append-only extension selects the inner schema.
+    pub fn supportsSessionReplicaV3(self: *const S2sPeer) bool {
+        return self.supportsSessionReplicaV2() and
+            self.session_replica_attachment_transport_enabled and
+            self.peer_supports_session_replica_v3;
+    }
+
     /// Encode, capability-gate, outer-sign, and emit one opaque Helix object.
     /// This never falls back to plaintext or legacy SESSION_MIGRATE frames.
     pub fn sendSessionReplica(self: *S2sPeer, sink: ByteSink, kind: session_replica_frame.Kind, signed_payload: []const u8) !void {
         if (!self.established) return error.NotEstablished;
         if (!self.session_replica_transport_enabled or self.signing_key == null or !self.peer_supports_signing) return error.SecuredLinkRequired;
         if (!self.peer_supports_session_replica_v2) return error.CapabilityNotNegotiated;
+        if (self.peer_supports_session_replica_v3) return error.CapabilityVersionMismatch;
         if (kind == .attachment_lease and !self.peer_supports_session_attachment_lease_v2)
             return error.CapabilityNotNegotiated;
 
@@ -1201,6 +1357,34 @@ pub const S2sPeer = struct {
         const transport = try self.allocator.alloc(u8, len);
         defer self.allocator.free(transport);
         const encoded = try session_replica_frame.encode(kind, signed_payload, transport);
+        try self.emitSignable(sink, replicaFrameType(kind), encoded);
+    }
+
+    /// Attachment-scoped counterpart to `sendSessionReplica`. There is no
+    /// compatibility fallback: until the distinct extension reply is observed,
+    /// SRA3 objects remain local and the caller retries later.
+    pub fn sendAttachmentSessionReplica(
+        self: *S2sPeer,
+        sink: ByteSink,
+        kind: session_replica_frame.Kind,
+        signed_payload: []const u8,
+    ) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.session_replica_transport_enabled or
+            !self.session_replica_attachment_transport_enabled or
+            self.signing_key == null or !self.peer_supports_signing)
+        {
+            return error.SecuredLinkRequired;
+        }
+        if (!self.peer_supports_session_replica_v2 or !self.peer_supports_session_replica_v3)
+            return error.CapabilityNotNegotiated;
+
+        const len = try session_replica_frame.encodedLen(signed_payload.len);
+        const framed_len = s2s_frame.header_len + signed_frame.header_len + len;
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
+        const transport = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(transport);
+        const encoded = try session_replica_frame.encodeAttachment(kind, signed_payload, transport);
         try self.emitSignable(sink, replicaFrameType(kind), encoded);
     }
 
@@ -1243,11 +1427,12 @@ pub const S2sPeer = struct {
         try emitFrame(self.allocator, sink, .CLONE_COUNT, payload);
     }
 
-    /// Queue a verified inbound OPER_EVENT for the daemon to decode and deliver to
-    /// its local oper subscribers. Signed-frame gated (a peer cannot inject
-    /// unsigned alerts); a copy is taken, oversize/alloc failures drop it.
+    /// Queue a verified legacy OPER_EVENT v1 for local daemon delivery only.
+    /// It has no immutable event identity or end-to-end origin signature and
+    /// therefore has deliberately no forwarding API.
     fn recvOperEvent(self: *S2sPeer, frame_payload: []const u8) !void {
         const payload = self.verifiedPayload(.OPER_EVENT, frame_payload) orelse return;
+        _ = oper_event.decodeLegacyV1(payload) catch return;
         const owned = self.allocator.dupe(u8, payload) catch return;
         self.oper_events.append(self.allocator, owned) catch self.allocator.free(owned);
     }
@@ -1258,9 +1443,9 @@ pub const S2sPeer = struct {
         return self.oper_events.toOwnedSlice(self.allocator);
     }
 
-    /// Emit a signed OPER_EVENT to this peer (network-wide Event-Spine fan-out).
-    /// Best-effort; only meaningful once established.
-    pub fn sendOperEvent(self: *S2sPeer, sink: ByteSink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
+    /// Emit a direct-leaf legacy OPER_EVENT v1. It is retained for rolling
+    /// compatibility but receivers must never re-flood it.
+    pub fn sendLegacyOperEvent(self: *S2sPeer, sink: ByteSink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
         const ev = oper_event.OperEvent{
             .category = category,
             .severity = severity,
@@ -1270,6 +1455,160 @@ pub const S2sPeer = struct {
         var buf: [oper_event.max_encoded_len]u8 = undefined;
         const wire = try oper_event.encode(ev, &buf);
         try self.emitSignable(sink, .OPER_EVENT, wire);
+    }
+
+    /// Source-compatible name for the deployed v1 direct-leaf API. New mesh
+    /// flooding must use the explicit v2 author/forward methods below.
+    pub fn sendOperEvent(self: *S2sPeer, sink: ByteSink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
+        try self.sendLegacyOperEvent(sink, category, severity, origin_server, message);
+    }
+
+    /// True only on an established Tsumugi-authorized link where both ends
+    /// negotiated frame signing and Event Spine v2.
+    pub fn supportsEventSpineV2(self: *const S2sPeer) bool {
+        return self.established and self.event_spine_v2_transport_enabled and
+            self.signing_key != null and self.peer_supports_signing and
+            self.peer_supports_event_spine_v2;
+    }
+
+    /// Verify immediate-hop authentication and the immutable author's signature
+    /// before touching the per-link reflection cache. Invalid or unnegotiated
+    /// traffic therefore cannot poison a later valid event's replay identity.
+    fn recvOperEventV2(self: *S2sPeer, outer_payload: []const u8) void {
+        if (!self.supportsEventSpineV2()) {
+            self.rejected_oper_event_v2_frames +|= 1;
+            return;
+        }
+        const payload = self.verifiedPayload(.OPER_EVENT_V2, outer_payload) orelse {
+            self.rejected_oper_event_v2_frames +|= 1;
+            return;
+        };
+        const event = oper_event.decodeV2(payload) catch {
+            self.rejected_oper_event_v2_frames +|= 1;
+            return;
+        };
+        const verified = switch (oper_event.verifyAndEventId(event)) {
+            .verified => |value| value,
+            .origin_mismatch, .bad_signature, .invalid_semantic => {
+                self.rejected_oper_event_v2_frames +|= 1;
+                return;
+            },
+        };
+        // Never suppress verified ingress with this non-authoritative cache.
+        // The daemon may have rejected a prior queued copy recoverably, so a
+        // same-leg retry must reach the durable global guard again. The cache
+        // only suppresses outbound reflection.
+        if (self.oper_events_v2.items.len >= self.config.max_oper_event_v2_frames) {
+            self.dropped_oper_event_v2_frames +|= 1;
+            return;
+        }
+        const wire = self.allocator.dupe(u8, payload) catch {
+            self.dropped_oper_event_v2_frames +|= 1;
+            return;
+        };
+        self.oper_events_v2.append(self.allocator, .{
+            .wire = wire,
+            .via_peer = self.remote_node_id,
+        }) catch {
+            self.dropped_oper_event_v2_frames +|= 1;
+            self.allocator.free(wire);
+            return;
+        };
+        // Record only after queue ownership succeeds. This remains a per-link
+        // reflection optimization; daemon-global replay admission is authoritative.
+        _ = self.seen_oper_event_v2.observe(verified.event_id);
+    }
+
+    fn requireEventSpineV2(self: *const S2sPeer) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.event_spine_v2_transport_enabled or self.signing_key == null or !self.peer_supports_signing)
+            return error.SecuredLinkRequired;
+        if (!self.peer_supports_event_spine_v2) return error.CapabilityNotNegotiated;
+    }
+
+    /// Emit canonical v2 bytes from an already-stamped event object. The inner
+    /// author may be this node or a third node; no origin field is rewritten.
+    pub fn sendOperEventV2(self: *S2sPeer, sink: ByteSink, event: oper_event.SignedOperEventV2) !bool {
+        try self.requireEventSpineV2();
+        const verified = switch (oper_event.verifyAndEventId(event)) {
+            .verified => |value| value,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidOperEvent,
+        };
+        if (self.seen_oper_event_v2.contains(verified.event_id)) return false;
+        var buf: [oper_event.max_v2_encoded_len]u8 = undefined;
+        const wire = try oper_event.encodeV2(event, &buf);
+        try self.sendOperEventV2Wire(sink, wire, verified.event_id);
+        return true;
+    }
+
+    /// Author, origin-sign, and send one canonical Event Spine v2 object. Signed
+    /// fields are never truncated: oversize/invalid input fails before emission.
+    pub fn sendOperEventV2Authored(
+        self: *S2sPeer,
+        sink: ByteSink,
+        category: u6,
+        severity: u8,
+        hlc: u64,
+        origin_server: []const u8,
+        subject: []const u8,
+        message: []const u8,
+    ) !bool {
+        try self.requireEventSpineV2();
+        var pubkey: [oper_event.pubkey_len]u8 = undefined;
+        var signature: [oper_event.sig_len]u8 = undefined;
+        var event = oper_event.SignedOperEventV2{
+            .category = category,
+            .severity = severity,
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .origin_server = origin_server,
+            .subject = subject,
+            .message = message,
+        };
+        try oper_event.stampOrigin(&event, &self.signing_key.?, &pubkey, &signature);
+        return self.sendOperEventV2(sink, event);
+    }
+
+    /// Relay the exact received OEVT v2 byte image under this immediate hop's
+    /// outer signed envelope. Strict decode and origin verification occur before
+    /// the reflection cache is consulted or mutated.
+    pub fn forwardOperEventV2(self: *S2sPeer, sink: ByteSink, wire: []const u8) !bool {
+        try self.requireEventSpineV2();
+        const event = oper_event.decodeV2(wire) catch return error.InvalidOperEvent;
+        const verified = switch (oper_event.verifyAndEventId(event)) {
+            .verified => |value| value,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidOperEvent,
+        };
+        if (self.seen_oper_event_v2.contains(verified.event_id)) return false;
+        try self.sendOperEventV2Wire(sink, wire, verified.event_id);
+        return true;
+    }
+
+    fn sendOperEventV2Wire(self: *S2sPeer, sink: ByteSink, wire: []const u8, event_id: oper_event.EventId) !void {
+        const framed_len = s2s_frame.header_len + signed_frame.header_len + wire.len;
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
+        try self.emitSignable(sink, .OPER_EVENT_V2, wire);
+        _ = self.seen_oper_event_v2.observe(event_id);
+    }
+
+    /// Transfer verified immutable wires to the daemon. Caller deinitializes each
+    /// item and frees the returned slice.
+    pub fn takeOperEventsV2(self: *S2sPeer) ![]InboundOperEventV2 {
+        return self.oper_events_v2.toOwnedSlice(self.allocator);
+    }
+
+    pub fn takeDroppedOperEventV2Frames(self: *S2sPeer) u64 {
+        defer self.dropped_oper_event_v2_frames = 0;
+        return self.dropped_oper_event_v2_frames;
+    }
+
+    pub fn takeRejectedOperEventV2Frames(self: *S2sPeer) u64 {
+        defer self.rejected_oper_event_v2_frames = 0;
+        return self.rejected_oper_event_v2_frames;
     }
 
     /// Queue a verified inbound OBSERVE_EVENT for the daemon to decode and match
@@ -1447,16 +1786,25 @@ pub const S2sPeer = struct {
 
     /// True only on an established Tsumugi-authorized, signing-key-backed link
     /// where the remote negotiated frame signing and secure relay v2.
-    pub fn supportsSecureRelayV2(self: *const S2sPeer) bool {
+    fn supportsSecureRelayV2Base(self: *const S2sPeer) bool {
         return self.established and self.secure_relay_transport_enabled and
             self.signing_key != null and self.peer_supports_signing and
             self.peer_supports_secure_relay_v2;
     }
 
+    pub fn supportsSecureRelayV2(self: *const S2sPeer) bool {
+        return self.supportsSecureRelayV2Base() and self.peer_supports_relay_v2_current and
+            self.peer_supports_relay_v2_ack_confirm;
+    }
+
+    pub fn supportsRelayV2AckConfirm(self: *const S2sPeer) bool {
+        return self.supportsSecureRelayV2() and self.peer_supports_relay_v2_ack_confirm;
+    }
+
     /// Verify the hop envelope and immutable origin signature before touching
     /// the per-link reflection cache. Invalid traffic can therefore never poison
     /// the key of a later valid event. Malformed input is dropped, not link-fatal.
-    fn recvMessageV2(self: *S2sPeer, outer_payload: []const u8) void {
+    fn recvMessageV2(self: *S2sPeer, outer_payload: []const u8) !void {
         if (!self.supportsSecureRelayV2()) {
             self.rejected_relay_v2_frames +|= 1;
             return;
@@ -1476,33 +1824,62 @@ pub const S2sPeer = struct {
         };
         const id = switch (outcome) {
             .verified => |verified| verified,
-            .origin_mismatch, .bad_signature => {
+            .origin_mismatch, .bad_signature, .invalid_semantic => {
                 self.rejected_relay_v2_frames +|= 1;
                 owned.deinit(self.allocator);
                 return;
             },
         };
-        if (self.seen_v2.contains(id)) {
-            owned.deinit(self.allocator);
-            return;
-        }
+        // A verified same-leg retry must reach daemon-global admission again:
+        // the prior queued copy may have failed recoverably after drain. This
+        // cache is only an outbound reflection optimization.
         if (self.inbound_v2.items.len >= self.config.max_relay_v2_frames) {
             self.dropped_relay_v2_frames +|= 1;
             owned.deinit(self.allocator);
-            return;
+            return error.RelayV2Backpressure;
         }
-        self.inbound_v2.append(self.allocator, .{
-            .owned = owned,
-            .via_peer = self.remote_node_id,
-        }) catch {
+        const wire = self.allocator.dupe(u8, payload) catch |err| {
             self.dropped_relay_v2_frames +|= 1;
             owned.deinit(self.allocator);
-            return;
+            return err;
+        };
+        self.inbound_v2.append(self.allocator, .{
+            .owned = owned,
+            .wire = wire,
+            .via_peer = self.remote_node_id,
+        }) catch |err| {
+            self.dropped_relay_v2_frames +|= 1;
+            self.allocator.free(wire);
+            owned.deinit(self.allocator);
+            return err;
         };
         // Record only after queue ownership transfers successfully. This is a
         // per-link reflection cache, not the daemon's authoritative replay
         // guard, so a rare cache allocation failure must not reject delivery.
         _ = self.seen_v2.observe(id);
+    }
+
+    fn recvMessageV2Ack(self: *S2sPeer, outer_payload: []const u8) !void {
+        if (!self.supportsSecureRelayV2()) return error.SecuredLinkRequired;
+        const payload = self.verifiedPayload(.MESSAGE_V2_ACK, outer_payload) orelse
+            return error.BadFrameSignature;
+        const is_confirm = payload.len == message_relay_v2.relay_id_len + 1;
+        if (payload.len != message_relay_v2.relay_id_len and !is_confirm)
+            return error.InvalidRelayMessage;
+        if (is_confirm and
+            (!self.supportsRelayV2AckConfirm() or payload[message_relay_v2.relay_id_len] != 1))
+            return error.CapabilityNotNegotiated;
+        const id: message_relay_v2.RelayId = payload[0..message_relay_v2.relay_id_len].*;
+        const queue = if (is_confirm) &self.inbound_v2_ack_confirms else &self.inbound_v2_acks;
+        for (queue.items) |queued| {
+            if (std.crypto.timing_safe.eql(message_relay_v2.RelayId, queued, id)) return;
+        }
+        // ACK is advisory retransmission progress, not delivery authority. A
+        // coalesced feed may legitimately contain more ACKs than the bounded
+        // daemon handoff queue; soft-drop excess so the sender retries instead
+        // of faulting an otherwise healthy secured stream.
+        if (queue.items.len >= self.config.max_relay_v2_frames) return;
+        try queue.append(self.allocator, id);
     }
 
     /// Send one immutable origin-signed relay over a negotiated secured leg.
@@ -1513,25 +1890,120 @@ pub const S2sPeer = struct {
         if (!self.secure_relay_transport_enabled or self.signing_key == null or !self.peer_supports_signing)
             return error.SecuredLinkRequired;
         if (!self.peer_supports_secure_relay_v2) return error.CapabilityNotNegotiated;
+        if (!self.peer_supports_relay_v2_current or !self.peer_supports_relay_v2_ack_confirm)
+            return error.CapabilityNotNegotiated;
 
         const outcome = try message_relay_v2.verifyAndRelayId(self.allocator, msg);
         const id = switch (outcome) {
             .verified => |verified| verified,
             .origin_mismatch => return error.OriginMismatch,
             .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidRelayMessage,
         };
         const wire = try message_relay_v2.encode(self.allocator, msg);
         defer self.allocator.free(wire);
+        try self.sendMessageV2Wire(sink, wire);
+        _ = self.seen_v2.observe(id);
+    }
+
+    /// Forward an accepted immutable MESSAGE_V2 object without decode/re-encode
+    /// drift. Strict canonical decode and origin verification precede the
+    /// per-link reflection probe; the daemon-global replay guard remains the
+    /// only delivery authority.
+    pub fn forwardMessageV2(self: *S2sPeer, sink: ByteSink, wire: []const u8) !bool {
+        if (!self.established) return error.NotEstablished;
+        if (!self.secure_relay_transport_enabled or self.signing_key == null or !self.peer_supports_signing)
+            return error.SecuredLinkRequired;
+        if (!self.peer_supports_secure_relay_v2) return error.CapabilityNotNegotiated;
+        if (!self.peer_supports_relay_v2_current or !self.peer_supports_relay_v2_ack_confirm)
+            return error.CapabilityNotNegotiated;
+        var owned = message_relay_v2.decode(self.allocator, wire) catch return error.InvalidRelayMessage;
+        defer owned.deinit(self.allocator);
+        const id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, owned.msg)) {
+            .verified => |verified| verified,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidRelayMessage,
+        };
+        if (self.seen_v2.contains(id)) return false;
+        try self.sendMessageV2Wire(sink, wire);
+        _ = self.seen_v2.observe(id);
+        return true;
+    }
+
+    /// Retransmit an outbox-retained exact wire after a lost ACK. This validates
+    /// the immutable origin object and negotiated transport exactly like first
+    /// forwarding, but deliberately bypasses the link-local reflection cache:
+    /// that cache was populated by the first send and is not delivery proof.
+    pub fn replayRetainedMessageV2Wire(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.secure_relay_transport_enabled or self.signing_key == null or !self.peer_supports_signing)
+            return error.SecuredLinkRequired;
+        if (!self.peer_supports_secure_relay_v2 or !self.peer_supports_relay_v2_current or
+            !self.peer_supports_relay_v2_ack_confirm)
+            return error.CapabilityNotNegotiated;
+        var owned = message_relay_v2.decode(self.allocator, wire) catch return error.InvalidRelayMessage;
+        defer owned.deinit(self.allocator);
+        const id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, owned.msg)) {
+            .verified => |verified| verified,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidRelayMessage,
+        };
+        try self.sendMessageV2Wire(sink, wire);
+        _ = self.seen_v2.observe(id);
+    }
+
+    fn sendMessageV2Wire(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
         const framed_len = s2s_frame.header_len + signed_frame.header_len + wire.len;
         if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
         try self.emitSignable(sink, .MESSAGE_V2, wire);
-        _ = self.seen_v2.observe(id);
     }
 
     /// Transfer all verified v2 events to the daemon. Caller deinitializes each
     /// item and frees the returned slice.
     pub fn takeInboundV2(self: *S2sPeer) ![]InboundMessageV2 {
         return self.inbound_v2.toOwnedSlice(self.allocator);
+    }
+
+    pub fn sendMessageV2Ack(self: *S2sPeer, sink: ByteSink, id: message_relay_v2.RelayId) !void {
+        if (!self.supportsSecureRelayV2()) return error.SecuredLinkRequired;
+        try self.emitSignable(sink, .MESSAGE_V2_ACK, &id);
+    }
+
+    pub fn sendMessageV2AckConfirm(self: *S2sPeer, sink: ByteSink, id: message_relay_v2.RelayId) !void {
+        if (!self.supportsRelayV2AckConfirm()) return error.CapabilityNotNegotiated;
+        var payload: [message_relay_v2.relay_id_len + 1]u8 = undefined;
+        @memcpy(payload[0..message_relay_v2.relay_id_len], &id);
+        payload[message_relay_v2.relay_id_len] = 1;
+        try self.emitSignable(sink, .MESSAGE_V2_ACK, &payload);
+    }
+
+    /// Re-negotiate the append-only relay-v2 extension on an already-established
+    /// stream restored from a legacy Helix capsule. This is an ordinary PING to
+    /// an older peer and therefore safe across rolling upgrades.
+    pub fn probeRelayV2Current(self: *S2sPeer, sink: ByteSink) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.supportsSecureRelayV2Base()) return;
+        try emitFrame(self.allocator, sink, .PING, relay_v2_extension_probe);
+        try emitFrame(self.allocator, sink, .PING, relay_v2_ack_confirm_probe);
+    }
+
+    /// Negotiate SRTF3 on an already-established preserved stream. An older
+    /// peer sees only an ordinary PING and never receives a v3 replica frame.
+    pub fn probeSessionReplicaV3(self: *S2sPeer, sink: ByteSink) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.session_replica_attachment_transport_enabled or
+            !self.supportsSessionReplicaV2()) return;
+        try emitFrame(self.allocator, sink, .PING, session_replica_v3_probe);
+    }
+
+    pub fn takeInboundV2Acks(self: *S2sPeer) ![]message_relay_v2.RelayId {
+        return self.inbound_v2_acks.toOwnedSlice(self.allocator);
+    }
+
+    pub fn takeInboundV2AckConfirms(self: *S2sPeer) ![]message_relay_v2.RelayId {
+        return self.inbound_v2_ack_confirms.toOwnedSlice(self.allocator);
     }
 
     pub fn takeDroppedRelayV2Frames(self: *S2sPeer) u64 {
@@ -3002,6 +3474,10 @@ pub const S2sPeer = struct {
         self.peer_supports_session_replica_v2 = self.peer_supports_signing and (hs.caps & cap_session_replica_v2) != 0;
         self.peer_supports_session_attachment_lease_v2 = self.peer_supports_session_replica_v2 and
             (hs.caps & cap_session_attachment_lease_v2) != 0;
+        // The base caps byte cannot represent another version (all eight bits
+        // are assigned). A new handshake therefore returns to v2 until the
+        // authenticated append-only PING/PONG extension is observed again.
+        self.peer_supports_session_replica_v3 = false;
         // A preserved established stream can transition from the old negotiated
         // capability set without receiving another RESYNC in this direction.
         // Surface that false->true edge through the daemon's existing gated
@@ -3010,6 +3486,7 @@ pub const S2sPeer = struct {
         if (self.established and !had_attachment_lease_v2 and self.peer_supports_session_attachment_lease_v2)
             self.resync_requested = true;
         self.peer_supports_secure_relay_v2 = self.peer_supports_signing and (hs.caps & cap_secure_relay_v2) != 0;
+        self.peer_supports_event_spine_v2 = self.peer_supports_signing and (hs.caps & cap_event_spine_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
         }
@@ -3061,6 +3538,7 @@ pub const S2sPeer = struct {
             if (self.session_replica_transport_enabled)
                 caps |= cap_session_replica_v2 | cap_session_attachment_lease_v2;
             if (self.secure_relay_transport_enabled) caps |= cap_secure_relay_v2;
+            if (self.event_spine_v2_transport_enabled) caps |= cap_event_spine_v2;
         }
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
@@ -3071,6 +3549,18 @@ pub const S2sPeer = struct {
         });
         defer self.allocator.free(payload);
         try emitFrame(self.allocator, sink, .HANDSHAKE, payload);
+        // Safe extension negotiation: a legacy peer treats this as an ordinary
+        // PING and echoes it. Only a current peer sends the distinct reply that
+        // authorizes current MESSAGE_V2 schema and ACK emission.
+        if (self.secure_relay_transport_enabled and self.signing_key != null) {
+            try emitFrame(self.allocator, sink, .PING, relay_v2_extension_probe);
+            try emitFrame(self.allocator, sink, .PING, relay_v2_ack_confirm_probe);
+        }
+        if (self.session_replica_transport_enabled and
+            self.session_replica_attachment_transport_enabled and self.signing_key != null)
+        {
+            try emitFrame(self.allocator, sink, .PING, session_replica_v3_probe);
+        }
         self.handshake_sent = true;
     }
 
@@ -4020,6 +4510,17 @@ test "SESSION_MIGRATE frame is dispatched and staged for the daemon to drain" {
     const again = try b.takeSessionMigrations();
     defer allocator.free(again);
     try std.testing.expectEqual(@as(usize, 0), again.len);
+
+    // The configured decoder ceiling is also the egress ceiling. An exact-fit
+    // frame is emitted; one byte less rejects before allocation or sink output.
+    const framed_len = try s2s_frame.encodedLen(capsule_bytes.len);
+    a.config.max_frame_size = framed_len;
+    try a.sendSessionMigrate(a_to_b.sink(), capsule_bytes);
+    try std.testing.expectEqual(framed_len, a_to_b.bytes.items.len);
+    a_to_b.clear();
+    a.config.max_frame_size = framed_len - 1;
+    try std.testing.expectError(error.PayloadTooLarge, a.sendSessionMigrate(a_to_b.sink(), capsule_bytes));
+    try std.testing.expectEqual(@as(usize, 0), a_to_b.bytes.items.len);
 }
 
 test "SESSION_MIGRATE_CONSUMED is dispatched to its convergence queue" {
@@ -4172,6 +4673,25 @@ fn stampedRelayV2(
     return msg;
 }
 
+fn stampedOperEventV2(
+    kp: *const sign.KeyPair,
+    hlc: u64,
+    pubkey: *[oper_event.pubkey_len]u8,
+    signature: *[oper_event.sig_len]u8,
+) !oper_event.SignedOperEventV2 {
+    var event = oper_event.SignedOperEventV2{
+        .category = 13,
+        .severity = 2,
+        .origin_node = oper_event.originShortId(kp.public_key),
+        .hlc = hlc,
+        .origin_server = "a.test",
+        .subject = "#mesh",
+        .message = "raid threshold crossed in #mesh",
+    };
+    try oper_event.stampOrigin(&event, kp, pubkey, signature);
+    return event;
+}
+
 test "secure relay v2 negotiates only on secured peers and round-trips once" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
@@ -4213,12 +4733,149 @@ test "secure relay v2 negotiates only on secured peers and round-trips once" {
     for (inbound) |*item| item.deinit(allocator);
     allocator.free(inbound);
 
-    // A reflected duplicate is suppressed by the per-link cache.
+    // Draining without daemon-global admission must not make a retry disappear.
+    // The per-link cache is outbound-only; the durable guard classifies this.
     try a.sendMessageV2(a_to_b.sink(), msg);
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6102);
     inbound = try b.takeInboundV2();
-    defer allocator.free(inbound);
-    try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    defer {
+        for (inbound) |*item| item.deinit(allocator);
+        allocator.free(inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expect(!(try b.forwardMessageV2(b_to_a.sink(), inbound[0].wire)));
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+}
+
+test "secure relay v2 ACK is authenticated deduplicated bounded and capability gated" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x41);
+    const kp_b = try signingKeyFor(0x42);
+    var a = try newSigningPeer(
+        allocator,
+        &a_state,
+        &tc,
+        kp_a,
+        signed_frame.originShortId(kp_b.public_key),
+        1000,
+        "a.test",
+    );
+    defer a.deinit();
+    var b = try newSigningPeer(
+        allocator,
+        &b_state,
+        &tc,
+        kp_b,
+        signed_frame.originShortId(kp_a.public_key),
+        2000,
+        "b.test",
+    );
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6150);
+
+    const first: message_relay_v2.RelayId = @splat(0x55);
+    try b.sendMessageV2Ack(b_to_a.sink(), first);
+    try b.sendMessageV2Ack(b_to_a.sink(), first);
+    const ack_batch = try allocator.dupe(u8, b_to_a.bytes.items);
+    defer allocator.free(ack_batch);
+    b_to_a.clear();
+    try a.feed(ack_batch, a_to_b.sink(), tc.now_ms, 0x6151);
+    var acks = try a.takeInboundV2Acks();
+    try std.testing.expectEqual(@as(usize, 1), acks.len);
+    try std.testing.expectEqualSlices(u8, &first, &acks[0]);
+    allocator.free(acks);
+
+    try std.testing.expect(a.supportsRelayV2AckConfirm());
+    try std.testing.expect(b.supportsRelayV2AckConfirm());
+    try b.sendMessageV2AckConfirm(b_to_a.sink(), first);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6155);
+    const confirms = try a.takeInboundV2AckConfirms();
+    defer allocator.free(confirms);
+    try std.testing.expectEqual(@as(usize, 1), confirms.len);
+    try std.testing.expectEqualSlices(u8, &first, &confirms[0]);
+
+    // One coalesced socket read can exceed the handoff queue. Excess ACKs are
+    // safely soft-dropped (the exact sender outbox retries) and never fault the
+    // authenticated stream.
+    for (0..a.config.max_relay_v2_frames + 32) |index| {
+        var id: message_relay_v2.RelayId = @splat(0);
+        std.mem.writeInt(u64, id[0..8], index + 1, .little);
+        try b.sendMessageV2Ack(b_to_a.sink(), id);
+    }
+    const large_batch = try allocator.dupe(u8, b_to_a.bytes.items);
+    defer allocator.free(large_batch);
+    b_to_a.clear();
+    try a.feed(large_batch, a_to_b.sink(), tc.now_ms, 0x6152);
+    acks = try a.takeInboundV2Acks();
+    try std.testing.expectEqual(a.config.max_relay_v2_frames, acks.len);
+    allocator.free(acks);
+
+    // A rolling predecessor that negotiated the v2.1 schema but not durable
+    // ACK confirmation must not enter this generation's daemon admission queue:
+    // the receiver could otherwise retain a receipt it is unable to retire.
+    var legacy_pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var legacy_signature: [message_relay_v2.sig_len]u8 = undefined;
+    const legacy_msg = try stampedRelayV2(
+        allocator,
+        &b.signing_key.?,
+        "#legacy-current",
+        .channel,
+        77,
+        &legacy_pubkey,
+        &legacy_signature,
+    );
+    const legacy_wire = try message_relay_v2.encode(allocator, legacy_msg);
+    defer allocator.free(legacy_wire);
+    a.peer_supports_relay_v2_ack_confirm = false;
+    try b.emitSignable(b_to_a.sink(), .MESSAGE_V2, legacy_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6156);
+    const refused = try a.takeInboundV2();
+    defer allocator.free(refused);
+    try std.testing.expectEqual(@as(usize, 0), refused.len);
+    try std.testing.expectEqual(@as(u64, 1), a.takeRejectedRelayV2Frames());
+    a.peer_supports_relay_v2_ack_confirm = true;
+
+    b.peer_supports_relay_v2_current = false;
+    try std.testing.expectError(error.SecuredLinkRequired, b.sendMessageV2Ack(b_to_a.sink(), first));
+    b.peer_supports_relay_v2_current = true;
+    b.peer_supports_relay_v2_ack_confirm = false;
+    try std.testing.expectError(
+        error.CapabilityNotNegotiated,
+        b.sendMessageV2AckConfirm(b_to_a.sink(), first),
+    );
+    b.peer_supports_relay_v2_ack_confirm = true;
+
+    try b.emitSignable(b_to_a.sink(), .MESSAGE_V2_ACK, "short");
+    const malformed = try allocator.dupe(u8, b_to_a.bytes.items);
+    defer allocator.free(malformed);
+    b_to_a.clear();
+    try std.testing.expectError(
+        error.InvalidRelayMessage,
+        a.feed(malformed, a_to_b.sink(), tc.now_ms, 0x6153),
+    );
+
+    try b.sendMessageV2Ack(b_to_a.sink(), first);
+    b_to_a.bytes.items[b_to_a.bytes.items.len - 1] ^= 1;
+    const forged = try allocator.dupe(u8, b_to_a.bytes.items);
+    defer allocator.free(forged);
+    b_to_a.clear();
+    try std.testing.expectError(
+        error.BadFrameSignature,
+        a.feed(forged, a_to_b.sink(), tc.now_ms, 0x6154),
+    );
 }
 
 test "secure relay v2 preserves the original signature across pure transit A B C" {
@@ -4283,7 +4940,12 @@ test "secure relay v2 preserves the original signature across pure transit A B C
         allocator.free(at_b);
     }
     try std.testing.expectEqual(@as(usize, 1), at_b.len);
-    try b_to_c.sendMessageV2(b_to_c_wire.sink(), at_b[0].owned.msg);
+    // The ingress leg suppresses reflection without emitting an outer frame.
+    try std.testing.expect(!(try b_from_a.forwardMessageV2(b_to_a.sink(), at_b[0].wire)));
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+
+    // A distinct B-C leg forwards the exact immutable canonical inner image.
+    try std.testing.expect(try b_to_c.forwardMessageV2(b_to_c_wire.sink(), at_b[0].wire));
     try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6203);
     const at_c = try c.takeInboundV2();
     defer {
@@ -4291,6 +4953,7 @@ test "secure relay v2 preserves the original signature across pure transit A B C
         allocator.free(at_c);
     }
     try std.testing.expectEqual(@as(usize, 1), at_c.len);
+    try std.testing.expectEqualSlices(u8, at_b[0].wire, at_c[0].wire);
     try std.testing.expectEqual(b_short, at_c[0].via_peer);
     try std.testing.expectEqual(a_short, at_c[0].owned.msg.origin_node);
     try std.testing.expectEqualSlices(u8, origin_msg.origin_pubkey, at_c[0].owned.msg.origin_pubkey);
@@ -4356,7 +5019,13 @@ test "secure relay v2 forged input cannot poison dedup and queue bound fails clo
     var signature2: [message_relay_v2.sig_len]u8 = undefined;
     const second = try stampedRelayV2(allocator, &a.signing_key.?, "#room", .channel, 103, &pubkey2, &signature2);
     try a.sendMessageV2(a_to_b.sink(), second);
-    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6304);
+    try std.testing.expectError(
+        error.RelayV2Backpressure,
+        pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6304),
+    );
+    // A real feed closes on backpressure. Model that transport boundary before
+    // the retained sender replays on a fresh connection.
+    a_to_b.clear();
     try std.testing.expectEqual(@as(u64, 1), b.takeDroppedRelayV2Frames());
     const inbound = try b.takeInboundV2();
     defer allocator.free(inbound);
@@ -4407,6 +5076,236 @@ test "secure relay v2 keyed plaintext and rolling-old peers stay inert" {
     try std.testing.expectEqual(@as(usize, 0), sink.bytes.items.len);
 }
 
+test "event spine v2 preserves exact wire through non-clique A B C and never reflects" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_ab_state = ChannelCrdt.init(allocator, 2);
+    defer b_ab_state.deinit();
+    var b_bc_state = ChannelCrdt.init(allocator, 3);
+    defer b_bc_state.deinit();
+    var c_state = ChannelCrdt.init(allocator, 4);
+    defer c_state.deinit();
+
+    const kp_a = try signingKeyFor(0x81);
+    const kp_b_ab = try signingKeyFor(0x82);
+    const kp_b_bc = try signingKeyFor(0x82);
+    const kp_c = try signingKeyFor(0x83);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b_ab.public_key);
+    const c_node = signed_frame.originShortId(kp_c.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b_from_a = try newSigningPeer(allocator, &b_ab_state, &tc, kp_b_ab, a_short, 2000, "b.test");
+    defer b_from_a.deinit();
+    var b_to_c = try newSigningPeer(allocator, &b_bc_state, &tc, kp_b_bc, c_node, 2000, "b.test");
+    defer b_to_c.deinit();
+    var c = try newSigningPeer(allocator, &c_state, &tc, kp_c, b_short, 3000, "c.test");
+    defer c.deinit();
+    a.event_spine_v2_transport_enabled = true;
+    b_from_a.event_spine_v2_transport_enabled = true;
+    b_to_c.event_spine_v2_transport_enabled = true;
+    c.event_spine_v2_transport_enabled = true;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b_from_a.startHandshake(b_to_a.sink());
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x7100);
+    var b_to_c_wire = BufferSink{};
+    defer b_to_c_wire.deinit(allocator);
+    var c_to_b_wire = BufferSink{};
+    defer c_to_b_wire.deinit(allocator);
+    try b_to_c.startHandshake(b_to_c_wire.sink());
+    try c.startHandshake(c_to_b_wire.sink());
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x7101);
+    try std.testing.expect(a.supportsEventSpineV2());
+    try std.testing.expect(b_from_a.supportsEventSpineV2());
+    try std.testing.expect(b_to_c.supportsEventSpineV2());
+    try std.testing.expect(c.supportsEventSpineV2());
+
+    try std.testing.expect(try a.sendOperEventV2Authored(
+        a_to_b.sink(),
+        13,
+        2,
+        0x100_000,
+        "a.test",
+        "#mesh",
+        "raid threshold crossed in #mesh",
+    ));
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x7102);
+    const at_b = try b_from_a.takeOperEventsV2();
+    defer {
+        for (at_b) |*item| item.deinit(allocator);
+        allocator.free(at_b);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_b.len);
+    try std.testing.expectEqual(a_short, at_b[0].via_peer);
+
+    // The ingress cache suppresses a reflection onto the same A-B leg without
+    // writing even an outer frame.
+    try std.testing.expect(!(try b_from_a.forwardOperEventV2(b_to_a.sink(), at_b[0].wire)));
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+
+    // B has a separate B-C leg and forwards the exact immutable inner bytes.
+    try std.testing.expect(try b_to_c.forwardOperEventV2(b_to_c_wire.sink(), at_b[0].wire));
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x7103);
+    const at_c = try c.takeOperEventsV2();
+    defer {
+        for (at_c) |*item| item.deinit(allocator);
+        allocator.free(at_c);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_c.len);
+    try std.testing.expectEqual(b_short, at_c[0].via_peer);
+    try std.testing.expectEqualSlices(u8, at_b[0].wire, at_c[0].wire);
+    const decoded = try oper_event.decodeV2(at_c[0].wire);
+    try std.testing.expectEqual(a_short, decoded.origin_node);
+    try std.testing.expectEqualStrings("#mesh", decoded.subject);
+    try std.testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(decoded));
+
+    // Legacy v1 is accepted for local compatibility delivery, but it cannot be
+    // fed to the v2 forwarder and never appears in the v2 queue on C.
+    try a.sendLegacyOperEvent(a_to_b.sink(), 3, 1, "a.test", "legacy leaf only");
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x7104);
+    const legacy = try b_from_a.takeOperEvents();
+    defer {
+        for (legacy) |wire| allocator.free(wire);
+        allocator.free(legacy);
+    }
+    try std.testing.expectEqual(@as(usize, 1), legacy.len);
+    try std.testing.expectError(error.InvalidOperEvent, b_to_c.forwardOperEventV2(b_to_c_wire.sink(), legacy[0]));
+    try std.testing.expectEqual(@as(usize, 0), b_to_c_wire.bytes.items.len);
+}
+
+test "event spine v2 tamper and unnegotiated traffic cannot poison reflection state" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x84);
+    const kp_b = try signingKeyFor(0x85);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.event_spine_v2_transport_enabled = true;
+    b.event_spine_v2_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7200);
+
+    var pubkey: [oper_event.pubkey_len]u8 = undefined;
+    var signature: [oper_event.sig_len]u8 = undefined;
+    const valid = try stampedOperEventV2(&a.signing_key.?, 0x200_000, &pubkey, &signature);
+    const verified = switch (oper_event.verifyAndEventId(valid)) {
+        .verified => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    var valid_buf: [oper_event.max_v2_encoded_len]u8 = undefined;
+    const valid_wire = try oper_event.encodeV2(valid, &valid_buf);
+    var tampered_buf: [oper_event.max_v2_encoded_len]u8 = undefined;
+    @memcpy(tampered_buf[0..valid_wire.len], valid_wire);
+    tampered_buf[valid_wire.len - 1] ^= 1;
+    try a.emitSignable(a_to_b.sink(), .OPER_EVENT_V2, tampered_buf[0..valid_wire.len]);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7201);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOperEventV2Frames());
+    try std.testing.expect(!b.seen_oper_event_v2.contains(verified.event_id));
+    const rejected = try b.takeOperEventsV2();
+    defer allocator.free(rejected);
+    try std.testing.expectEqual(@as(usize, 0), rejected.len);
+
+    // The later valid object with the same author/HLC remains admissible.
+    try std.testing.expect(try a.sendOperEventV2(a_to_b.sink(), valid));
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7202);
+    const accepted = try b.takeOperEventsV2();
+    defer {
+        for (accepted) |*item| item.deinit(allocator);
+        allocator.free(accepted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), accepted.len);
+
+    // Simulate a recoverable daemon rejection after drain. An identical
+    // same-leg retry is queued again, while outbound reflection on that leg is
+    // still suppressed without writing a frame.
+    try a.emitSignable(a_to_b.sink(), .OPER_EVENT_V2, valid_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7203);
+    const retried = try b.takeOperEventsV2();
+    defer {
+        for (retried) |*item| item.deinit(allocator);
+        allocator.free(retried);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retried.len);
+    try std.testing.expectEqualSlices(u8, valid_wire, retried[0].wire);
+    try std.testing.expect(!(try b.forwardOperEventV2(b_to_a.sink(), retried[0].wire)));
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+
+    // A rolling-old peer neither negotiates nor mutates its reflection cache.
+    b.peer_supports_event_spine_v2 = false;
+    b.seen_oper_event_v2.deinit();
+    b.seen_oper_event_v2 = message_relay_v2.SeenSet.init(allocator, b.config.oper_event_v2_seen_capacity);
+    try a.emitSignable(a_to_b.sink(), .OPER_EVENT_V2, valid_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7204);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOperEventV2Frames());
+    try std.testing.expect(!b.seen_oper_event_v2.contains(verified.event_id));
+}
+
+test "event spine v2 resume header preserves negotiated capability" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x86);
+    const kp_b = try signingKeyFor(0x87);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.event_spine_v2_transport_enabled = true;
+    b.event_spine_v2_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7300);
+
+    const hdr = a.snapshotResume();
+    try std.testing.expect(hdr.peer_supports_event_spine_v2);
+    var resumed_state = ChannelCrdt.init(allocator, 1);
+    defer resumed_state.deinit();
+    var resumed = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &resumed_state,
+        .clock = tc.clock(),
+        .local_node_id = a_short,
+        .remote_node_id = b_short,
+        .local_epoch_ms = 3000,
+        .server_name = "a.test",
+        .description = "test",
+        .config = a.config,
+        .signing_key = try signingKeyFor(0x86),
+        .event_spine_v2_transport_enabled = true,
+    }, hdr, a.remoteName(), tc.now_ms + 1, 0x7301);
+    defer resumed.deinit();
+    try std.testing.expect(resumed.supportsEventSpineV2());
+}
+
 fn fakeSessionReplicaObject(allocator: Allocator, kind: session_replica_frame.Kind) ![]u8 {
     const offer_fixed_len: usize = 69;
     const inner_signature_len: usize = 96;
@@ -4441,6 +5340,199 @@ fn fakeSessionReplicaObject(allocator: Allocator, kind: session_replica_frame.Ki
             break :blk out;
         },
     };
+}
+
+fn fakeAttachmentSessionReplicaObject(
+    allocator: Allocator,
+    kind: session_replica_frame.Kind,
+) ![]u8 {
+    const signature_len: usize = 96;
+    const identity_len: usize = 32;
+    const revision_len: usize = 24;
+    return switch (kind) {
+        .offer => blk: {
+            const fixed_len: usize = 4 + identity_len + revision_len + 8 + 8 + 2 + 2 + 4;
+            const account_len_offset: usize = 4 + identity_len + revision_len + 8 + 8;
+            const variable = "ans";
+            const out = try allocator.alloc(u8, fixed_len + variable.len + signature_len);
+            @memset(out, 0);
+            @memcpy(out[0..4], "SRO3");
+            out[4] = 1;
+            out[20] = 2;
+            std.mem.writeInt(u16, out[account_len_offset..][0..2], 1, .big);
+            std.mem.writeInt(u16, out[account_len_offset + 2 ..][0..2], 1, .big);
+            std.mem.writeInt(u32, out[account_len_offset + 4 ..][0..4], 1, .big);
+            @memcpy(out[fixed_len .. fixed_len + variable.len], variable);
+            break :blk out;
+        },
+        .revoke => blk: {
+            const account = "a";
+            const identity_offset = 4 + 1 + account.len;
+            const tail_len = identity_len + revision_len + 8 + 8 + signature_len;
+            const out = try allocator.alloc(u8, identity_offset + tail_len);
+            @memset(out, 0);
+            @memcpy(out[0..4], "SRV3");
+            out[4] = @intCast(account.len);
+            @memcpy(out[5 .. 5 + account.len], account);
+            out[identity_offset] = 1;
+            out[identity_offset + 16] = 2;
+            break :blk out;
+        },
+        .ack => blk: {
+            const out = try allocator.alloc(u8, 4 + 1 + identity_len + revision_len * 2 + 8 + 8 + 8 + signature_len);
+            @memset(out, 0);
+            @memcpy(out[0..4], "SRA3");
+            out[4] = 1;
+            out[5] = 1;
+            out[21] = 2;
+            break :blk out;
+        },
+        .attachment_lease => blk: {
+            const out = try allocator.alloc(u8, 4 + identity_len + revision_len + 8 + 8 + signature_len);
+            @memset(out, 0);
+            @memcpy(out[0..4], "SRL3");
+            out[4] = 1;
+            out[20] = 2;
+            break :blk out;
+        },
+    };
+}
+
+test "session replica v3 negotiates one strict attachment schema per secured link" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0xa1);
+    const kp_b = try signingKeyFor(0xa2);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.session_replica_transport_enabled = true;
+    b.session_replica_transport_enabled = true;
+    a.session_replica_attachment_transport_enabled = true;
+    b.session_replica_attachment_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5250);
+    try std.testing.expect(a.supportsSessionReplicaV3());
+    try std.testing.expect(b.supportsSessionReplicaV3());
+
+    const kinds = [_]session_replica_frame.Kind{ .offer, .ack, .revoke, .attachment_lease };
+    var objects: [kinds.len][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (objects[0..initialized]) |object| allocator.free(object);
+    for (kinds, 0..) |kind, index| {
+        objects[index] = try fakeAttachmentSessionReplicaObject(allocator, kind);
+        initialized += 1;
+        try a.sendAttachmentSessionReplica(a_to_b.sink(), kind, objects[index]);
+    }
+    // Version choice is link-wide: a negotiated-v3 sender must not put a v2
+    // object on the same outer frame tags.
+    const v2_offer = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(v2_offer);
+    try std.testing.expectError(error.CapabilityVersionMismatch, a.sendSessionReplicaOffer(a_to_b.sink(), v2_offer));
+
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5251);
+    const frames = try b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(kinds.len, frames.len);
+    for (frames, kinds, objects) |frame, kind, object| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.attachment_v3, frame.version);
+        try std.testing.expectEqual(kind, frame.kind);
+        try std.testing.expectEqualSlices(u8, object, frame.signed_payload);
+    }
+
+    // A malicious or stale same-link v2 object is rejected at the version gate;
+    // the receiver never tries a second decoder or faults the established link.
+    const v2_transport = try allocator.alloc(u8, try session_replica_frame.encodedLen(v2_offer.len));
+    defer allocator.free(v2_transport);
+    const v2_wire = try session_replica_frame.encode(.offer, v2_offer, v2_transport);
+    try a.emitSignable(a_to_b.sink(), .SESSION_REPLICA_OFFER, v2_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5252);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+    try std.testing.expectEqual(peer_link.State.established, b.linkState());
+    const rejected = try b.takeSessionReplicaFrames();
+    defer allocator.free(rejected);
+    try std.testing.expectEqual(@as(usize, 0), rejected.len);
+
+    // A preserved link retains its exact negotiated schema; a successor cannot
+    // silently reset to v2 and reinterpret the next queued frame.
+    const hdr = a.snapshotResume();
+    try std.testing.expect(hdr.peer_supports_session_replica_v3);
+    var resumed_state = ChannelCrdt.init(allocator, 1);
+    defer resumed_state.deinit();
+    var resumed = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &resumed_state,
+        .clock = tc.clock(),
+        .local_node_id = a_short,
+        .remote_node_id = b_short,
+        .local_epoch_ms = 3000,
+        .server_name = "a.test",
+        .description = "test",
+        .config = a.config,
+        .signing_key = try signingKeyFor(0xa1),
+        .session_replica_transport_enabled = true,
+        .session_replica_attachment_transport_enabled = true,
+    }, hdr, a.remoteName(), tc.now_ms + 1, 0x5253);
+    defer resumed.deinit();
+    try std.testing.expect(resumed.supportsSessionReplicaV3());
+}
+
+test "session replica v3 probe leaves a rolling v2 peer on v2" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0xa3);
+    const kp_b = try signingKeyFor(0xa4);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.session_replica_transport_enabled = true;
+    b.session_replica_transport_enabled = true;
+    a.session_replica_attachment_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5260);
+    try std.testing.expect(a.supportsSessionReplicaV2());
+    try std.testing.expect(b.supportsSessionReplicaV2());
+    try std.testing.expect(!a.supportsSessionReplicaV3());
+    try std.testing.expect(!b.supportsSessionReplicaV3());
+
+    const offer = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(offer);
+    try a.sendSessionReplicaOffer(a_to_b.sink(), offer);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5261);
+    const frames = try b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.token_v2, frames[0].version);
 }
 
 test "session replica v2 inner peer transports offers acks revokes and attachment leases" {
@@ -4498,6 +5590,7 @@ test "session replica v2 inner peer transports offers acks revokes and attachmen
     const expected = [_]session_replica_frame.Kind{ .offer, .ack, .revoke, .attachment_lease };
     const payloads = [_][]const u8{ offer, ack, revoke, lease };
     for (frames, 0..) |frame, i| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.token_v2, frame.version);
         try std.testing.expectEqual(expected[i], frame.kind);
         try std.testing.expectEqual(a_short, frame.via_peer);
         try std.testing.expectEqualSlices(u8, payloads[i], frame.signed_payload);
@@ -6524,7 +7617,8 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP,                      .CLONE_COUNT,
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .TEGAMI_PUSH,                      .SESSION_REPLICA_OFFER,
-        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE,
+        .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
+        .MESSAGE_V2_ACK,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

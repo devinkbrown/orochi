@@ -70,7 +70,8 @@ pub const Outcome = struct {
 };
 
 /// One account's decoded session capsule with allocator-owned backing for every
-/// string slice (account + each token) and for the `SessionEntry` array.
+/// byte slice (account + each token + each restore snapshot) and for the
+/// `SessionEntry` array.
 ///
 /// `SessionCapsule.decode` borrows account/token strings from the input bytes
 /// and the `SessionEntry` array from a caller-supplied buffer; both the transient
@@ -125,9 +126,10 @@ fn decodeOwned(allocator: Allocator, record: []const u8) Error!OwnedCapsule {
     var scratch_entries: [4096]session_capsule.SessionEntry = undefined;
     const view = try session_capsule.SessionCapsule.decode(record, &scratch_entries);
 
-    // Total string bytes = account + every token.
+    // Total borrowed bytes = account + every token + every restore snapshot.
+    // Current entries also carry fd and portable-resume state by value below.
     var string_total: usize = view.account.len;
-    for (view.sessions) |e| string_total += e.token.len;
+    for (view.sessions) |e| string_total += e.token.len + e.snapshot.len;
 
     const strings = try allocator.alloc(u8, string_total);
     errdefer allocator.free(strings);
@@ -151,6 +153,9 @@ fn decodeOwned(allocator: Allocator, record: []const u8) Error!OwnedCapsule {
             .signon_unix = e.signon_unix,
             .detached = e.detached,
             .client = e.client,
+            .fd = e.fd,
+            .snapshot = take(strings, &off, e.snapshot),
+            .portable_resume = e.portable_resume,
         };
     }
 
@@ -299,6 +304,45 @@ pub fn roundTrip(
 const SessionEntry = session_capsule.SessionEntry;
 const SessionCapsule = session_capsule.SessionCapsule;
 
+test "decodeOwned preserves and owns every current session entry field" {
+    const entries = [_]SessionEntry{
+        .{
+            .token = "shared-token",
+            .signon_unix = 123,
+            .detached = true,
+            .client = 44,
+            .fd = -1,
+            .snapshot = "detached-restore-image",
+            .portable_resume = true,
+        },
+        .{
+            .token = "shared-token",
+            .signon_unix = 124,
+            .detached = false,
+            .client = 45,
+            .fd = 91,
+            .portable_resume = true,
+        },
+    };
+    var wire_buf: [1024]u8 = undefined;
+    const wire = try (SessionCapsule{ .account = "Alice", .sessions = &entries }).encode(&wire_buf);
+    var owned = try decodeOwned(std.testing.allocator, wire);
+    defer owned.deinit(std.testing.allocator);
+
+    @memset(wire_buf[0..wire.len], 0);
+    try std.testing.expectEqualStrings("Alice", owned.capsule.account);
+    try std.testing.expectEqual(@as(usize, 2), owned.capsule.sessions.len);
+    try std.testing.expectEqualStrings("shared-token", owned.capsule.sessions[0].token);
+    try std.testing.expectEqual(@as(i64, 123), owned.capsule.sessions[0].signon_unix);
+    try std.testing.expect(owned.capsule.sessions[0].detached);
+    try std.testing.expectEqual(@as(u64, 44), owned.capsule.sessions[0].client);
+    try std.testing.expectEqual(@as(i32, -1), owned.capsule.sessions[0].fd);
+    try std.testing.expectEqualStrings("detached-restore-image", owned.capsule.sessions[0].snapshot);
+    try std.testing.expect(owned.capsule.sessions[0].portable_resume);
+    try std.testing.expectEqual(@as(i32, 91), owned.capsule.sessions[1].fd);
+    try std.testing.expectEqual(@as(usize, 0), owned.capsule.sessions[1].snapshot.len);
+}
+
 test "session migration round-trip recovers every session and splits attach/detach by live client set" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
@@ -332,6 +376,77 @@ test "session migration round-trip recovers every session and splits attach/deta
     try std.testing.expectEqual(@as(usize, 3), outcome.attached);
     try std.testing.expectEqual(@as(usize, 2), outcome.detached);
     try std.testing.expectEqual(total_sessions, outcome.attached + outcome.detached);
+}
+
+test "session migration round-trip preserves a same-account shared-token attachment group" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const first = [_]SessionEntry{
+        .{ .token = "shared-token", .signon_unix = 10, .detached = false, .client = 10 },
+        .{ .token = "shared-token", .signon_unix = 20, .detached = false, .client = 20 },
+    };
+    const case_variant = [_]SessionEntry{
+        .{ .token = "shared-token", .signon_unix = 30, .detached = false, .client = 30 },
+    };
+    const capsules = [_]SessionCapsule{
+        .{ .account = "Alice", .sessions = &first },
+        .{ .account = "ALICE", .sessions = &case_variant },
+    };
+    const live = [_]u64{ 10, 30 };
+
+    const outcome = try roundTrip(std.testing.allocator, &capsules, &live);
+    try std.testing.expectEqual(@as(usize, 3), outcome.recovered);
+    try std.testing.expectEqual(@as(usize, 2), outcome.attached);
+    try std.testing.expectEqual(@as(usize, 1), outcome.detached);
+}
+
+test "session migration round-trip rejects cross-account shared-token authority" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const alice = [_]SessionEntry{
+        .{ .token = "shared-token", .signon_unix = 10, .detached = false, .client = 10 },
+    };
+    const mallory = [_]SessionEntry{
+        .{ .token = "shared-token", .signon_unix = 20, .detached = false, .client = 20 },
+    };
+    const capsules = [_]SessionCapsule{
+        .{ .account = "alice", .sessions = &alice },
+        .{ .account = "mallory", .sessions = &mallory },
+    };
+    try std.testing.expectError(
+        error.DuplicateToken,
+        roundTrip(std.testing.allocator, &capsules, &.{ 10, 20 }),
+    );
+}
+
+test "session migration shared-token round-trip survives every allocation failure" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const entries = [_]SessionEntry{
+        .{ .token = "shared-token", .signon_unix = 10, .detached = false, .client = 10 },
+        .{ .token = "shared-token", .signon_unix = 20, .detached = true, .client = 20, .snapshot = "restore" },
+    };
+    const capsules = [_]SessionCapsule{
+        .{ .account = "alice", .sessions = &entries },
+    };
+    const live = [_]u64{10};
+    const Sweep = struct {
+        fn run(
+            allocator: Allocator,
+            records: []const SessionCapsule,
+            live_clients: []const u64,
+        ) !void {
+            const outcome = try roundTrip(allocator, records, live_clients);
+            try std.testing.expectEqual(@as(usize, 2), outcome.recovered);
+            try std.testing.expectEqual(@as(usize, 1), outcome.attached);
+            try std.testing.expectEqual(@as(usize, 1), outcome.detached);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Sweep.run,
+        .{ @as([]const SessionCapsule, &capsules), @as([]const u64, &live) },
+    );
 }
 
 test "session migration round-trip with empty live set detaches every recovered session" {

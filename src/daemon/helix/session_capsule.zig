@@ -39,6 +39,9 @@
 //! trailing fields and reconstructs them at their defaults (fd = -1, empty
 //! snapshot). v3 appends whether a portable resume credential was issued, so a
 //! hot-upgraded live session still replicates its snapshot on a later detach.
+//! `decodeCurrent` is the fail-closed v3 entry point: it requires every v3 field,
+//! canonical boolean bytes, exact declared regions/count, and EOF. The tolerant
+//! `decode` remains available only for explicitly-versioned legacy records.
 
 const std = @import("std");
 
@@ -69,6 +72,10 @@ pub const Error = error{
     /// The decoded session count exceeded the caller-supplied output slice,
     /// or a field exceeded its maximum encodable length on encode.
     TooMany,
+    /// A wire boolean was not encoded canonically as exactly 0 or 1.
+    InvalidBoolean,
+    /// Bytes remained after the exact current record.
+    TrailingData,
 };
 
 /// Durable per-session state. Maps to a `sessions.zig` `Session`:
@@ -192,6 +199,47 @@ pub const SessionCapsule = struct {
 
         return .{ .account = account, .sessions = sessions_out[0..count] };
     }
+
+    /// Parse exactly the v3 layout emitted by this binary.
+    ///
+    /// This decoder is allocation-free and returns only borrowed views. Unlike
+    /// `decode`, it does not reconstruct omitted legacy fields: fd, snapshot,
+    /// and portable-resume must be structurally present for every counted row,
+    /// both boolean bytes must be canonical, and EOF must follow the final row.
+    pub fn decodeCurrent(bytes: []const u8, sessions_out: []SessionEntry) Error!SessionCapsule {
+        var pos: usize = 0;
+
+        const got_magic = try readBytes(bytes, &pos, magic.len);
+        if (!std.mem.eql(u8, got_magic, &magic)) return error.BadMagic;
+        if (try readByte(bytes, &pos) != version) return error.BadVersion;
+
+        const account = try readStr(bytes, &pos);
+        const count = try readU16(bytes, &pos);
+        if (count > sessions_out.len) return error.TooMany;
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const token = try readStr(bytes, &pos);
+            const client = try readU64(bytes, &pos);
+            const signon_unix = try readI64(bytes, &pos);
+            const detached = try readBoolean(bytes, &pos);
+            const fd = try readI32(bytes, &pos);
+            const snapshot = try readLongStr(bytes, &pos);
+            const portable_resume = try readBoolean(bytes, &pos);
+            sessions_out[i] = .{
+                .token = token,
+                .signon_unix = signon_unix,
+                .detached = detached,
+                .client = client,
+                .fd = fd,
+                .snapshot = snapshot,
+                .portable_resume = portable_resume,
+            };
+        }
+
+        if (pos != bytes.len) return error.TrailingData;
+        return .{ .account = account, .sessions = sessions_out[0..count] };
+    }
 };
 
 /// Read only the fixed header/account prefix and return the encoded session
@@ -278,6 +326,14 @@ fn readByte(bytes: []const u8, pos: *usize) Error!u8 {
     const val = bytes[pos.*];
     pos.* += 1;
     return val;
+}
+
+fn readBoolean(bytes: []const u8, pos: *usize) Error!bool {
+    return switch (try readByte(bytes, pos)) {
+        0 => false,
+        1 => true,
+        else => error.InvalidBoolean,
+    };
 }
 
 fn readU16(bytes: []const u8, pos: *usize) Error!u16 {
@@ -525,4 +581,164 @@ test "decode returns TooMany when sessions_out is too small" {
 
     var out: [2]SessionEntry = undefined; // too small for 3 sessions
     try std.testing.expectError(error.TooMany, SessionCapsule.decode(wire, &out));
+}
+
+test "decodeCurrent round-trips every exact v3 session field" {
+    const sessions = [_]SessionEntry{
+        .{
+            .token = "shared-token-001",
+            .signon_unix = 1_700_000_001,
+            .detached = false,
+            .client = 101,
+            .fd = 41,
+            .portable_resume = true,
+        },
+        .{
+            .token = "shared-token-001",
+            .signon_unix = 1_700_000_002,
+            .detached = true,
+            .client = 202,
+            .fd = -1,
+            .snapshot = "byte-exact detached restore state",
+            .portable_resume = false,
+        },
+    };
+    const original = SessionCapsule{ .account = "mesh-account", .sessions = &sessions };
+    var wire_buf: [512]u8 = undefined;
+    const wire = try original.encode(&wire_buf);
+    var out: [2]SessionEntry = undefined;
+    const decoded = try SessionCapsule.decodeCurrent(wire, &out);
+
+    try std.testing.expectEqualStrings("mesh-account", decoded.account);
+    try std.testing.expectEqual(@as(usize, 2), decoded.sessions.len);
+    for (decoded.sessions, sessions) |got, want| {
+        try std.testing.expectEqualStrings(want.token, got.token);
+        try std.testing.expectEqual(want.client, got.client);
+        try std.testing.expectEqual(want.signon_unix, got.signon_unix);
+        try std.testing.expectEqual(want.detached, got.detached);
+        try std.testing.expectEqual(want.fd, got.fd);
+        try std.testing.expectEqualSlices(u8, want.snapshot, got.snapshot);
+        try std.testing.expectEqual(want.portable_resume, got.portable_resume);
+    }
+}
+
+test "decodeCurrent rejects every proper v3 prefix and trailing data" {
+    const sessions = [_]SessionEntry{.{
+        .token = "",
+        .signon_unix = 0,
+        .detached = false,
+        .client = 0,
+        .fd = -1,
+        .snapshot = "",
+        .portable_resume = false,
+    }};
+    const original = SessionCapsule{ .account = "", .sessions = &sessions };
+    var wire_buf: [64]u8 = undefined;
+    const wire = try original.encode(&wire_buf);
+    try std.testing.expectEqual(@as(usize, 37), wire.len);
+
+    var out: [1]SessionEntry = undefined;
+    for (0..wire.len) |end| {
+        try std.testing.expectError(error.Truncated, SessionCapsule.decodeCurrent(wire[0..end], &out));
+    }
+    _ = try SessionCapsule.decodeCurrent(wire, &out);
+
+    var trailing: [38]u8 = undefined;
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try std.testing.expectError(error.TrailingData, SessionCapsule.decodeCurrent(&trailing, &out));
+}
+
+test "decodeCurrent rejects noncanonical detached and portable flags" {
+    const sessions = [_]SessionEntry{.{
+        .token = "",
+        .signon_unix = 0,
+        .detached = false,
+        .client = 0,
+        .fd = -1,
+        .portable_resume = false,
+    }};
+    var wire_buf: [64]u8 = undefined;
+    const wire = try (SessionCapsule{ .account = "", .sessions = &sessions }).encode(&wire_buf);
+    try std.testing.expectEqual(@as(usize, 37), wire.len);
+    var out: [1]SessionEntry = undefined;
+
+    // Empty-account/empty-token v3 exact offsets: detached=27, portable=36.
+    wire_buf[27] = 2;
+    try std.testing.expectError(
+        error.InvalidBoolean,
+        SessionCapsule.decodeCurrent(wire_buf[0..wire.len], &out),
+    );
+    wire_buf[27] = 0;
+    wire_buf[36] = 0xff;
+    try std.testing.expectError(
+        error.InvalidBoolean,
+        SessionCapsule.decodeCurrent(wire_buf[0..wire.len], &out),
+    );
+}
+
+test "decodeCurrent enforces current version lengths and count exactly" {
+    const sessions = [_]SessionEntry{.{
+        .token = "",
+        .signon_unix = 0,
+        .detached = false,
+        .client = 0,
+        .fd = -1,
+        .portable_resume = false,
+    }};
+    var pristine_buf: [64]u8 = undefined;
+    const pristine = try (SessionCapsule{ .account = "", .sessions = &sessions }).encode(&pristine_buf);
+    try std.testing.expectEqual(@as(usize, 37), pristine.len);
+    var malformed: [37]u8 = undefined;
+    @memcpy(&malformed, pristine);
+    var out: [1]SessionEntry = undefined;
+
+    malformed[magic.len] = version - 1;
+    try std.testing.expectError(error.BadVersion, SessionCapsule.decodeCurrent(&malformed, &out));
+    // The explicitly legacy reader remains version-tolerant and ignores the v3
+    // byte after the complete v2 row.
+    _ = try SessionCapsule.decode(&malformed, &out);
+    @memcpy(&malformed, pristine);
+
+    // Empty-account/empty-token exact offsets: account len=5, count=7,
+    // token len=9, and snapshot len=32.
+    std.mem.writeInt(u16, malformed[5..7], std.math.maxInt(u16), .big);
+    try std.testing.expectError(error.Truncated, SessionCapsule.decodeCurrent(&malformed, &out));
+    @memcpy(&malformed, pristine);
+
+    std.mem.writeInt(u16, malformed[7..9], 2, .big);
+    var two_rows: [2]SessionEntry = undefined;
+    try std.testing.expectError(error.Truncated, SessionCapsule.decodeCurrent(&malformed, &two_rows));
+    @memcpy(&malformed, pristine);
+
+    std.mem.writeInt(u16, malformed[9..11], std.math.maxInt(u16), .big);
+    try std.testing.expectError(error.Truncated, SessionCapsule.decodeCurrent(&malformed, &out));
+    @memcpy(&malformed, pristine);
+
+    std.mem.writeInt(u32, malformed[32..36], std.math.maxInt(u32), .big);
+    try std.testing.expectError(error.Truncated, SessionCapsule.decodeCurrent(&malformed, &out));
+
+    var no_rows: [0]SessionEntry = .{};
+    try std.testing.expectError(error.TooMany, SessionCapsule.decodeCurrent(pristine, &no_rows));
+}
+
+test "decodeCurrent is statically allocation-free and excludes OutOfMemory" {
+    const fn_info = @typeInfo(@TypeOf(SessionCapsule.decodeCurrent)).@"fn";
+    comptime {
+        if (fn_info.param_types.len != 2)
+            @compileError("decodeCurrent must accept only borrowed wire and caller storage");
+        const return_type = fn_info.return_type orelse @compileError("decodeCurrent must return a value");
+        const decode_errors = @typeInfo(return_type).error_union.error_set;
+        const names = @typeInfo(decode_errors).error_set.error_names orelse
+            @compileError("decodeCurrent must retain a concrete error set");
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "OutOfMemory"))
+                @compileError("decodeCurrent must remain allocation-free");
+        }
+    }
+
+    var wire_buf: [16]u8 = undefined;
+    const wire = try (SessionCapsule{ .account = "", .sessions = &.{} }).encode(&wire_buf);
+    var out: [0]SessionEntry = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try SessionCapsule.decodeCurrent(wire, &out)).sessions.len);
 }

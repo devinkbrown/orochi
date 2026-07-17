@@ -10,12 +10,16 @@ pub const attest = @import("attest.zig");
 pub const capsule = @import("capsule.zig");
 pub const handoff = @import("handoff.zig");
 pub const live = @import("live.zig");
+pub const handoff_manifest = @import("handoff_manifest.zig");
+pub const handoff_relations = @import("handoff_relations.zig");
 pub const supervisor = @import("supervisor.zig");
 pub const conduit = @import("conduit.zig");
 
 // State-migration capsules (one schema per resumable subsystem).
 pub const conn_capsule = @import("conn_capsule.zig");
 pub const world_capsule = @import("world_capsule.zig");
+pub const world_checkpoint = @import("world_checkpoint.zig");
+pub const history_checkpoint = @import("history_checkpoint.zig");
 pub const account_capsule = @import("account_capsule.zig");
 pub const listener_capsule = @import("listener_capsule.zig");
 pub const session_capsule = @import("session_capsule.zig");
@@ -28,6 +32,7 @@ pub const mesh_redial = @import("mesh_redial.zig");
 pub const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
 pub const session_replica = @import("session_replica.zig");
+pub const session_replica_attachment = @import("session_replica_attachment.zig");
 pub const migration_relay = @import("migration_relay.zig");
 pub const prop_checkpoint = @import("prop_checkpoint.zig");
 // S2S migration support modules (fsm + signed token + journal + policy + metrics).

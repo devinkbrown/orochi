@@ -57,6 +57,18 @@ pub fn fromMeshEvent(origin_node: u64, hlc: u64, buf: []u8) []const u8 {
     return encode128(hi, lo, buf[0..id_len]);
 }
 
+/// Render an already-authenticated 128-bit mesh identity (for example the
+/// RelayId returned by MESSAGE_V2 admission) in the canonical IRC msgid
+/// alphabet without hashing or re-deriving identity from mutable hop fields.
+pub fn fromStableId(id: [16]u8, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= id_len);
+    return encode128(
+        std.mem.readInt(u64, id[0..8], .big),
+        std.mem.readInt(u64, id[8..16], .big),
+        buf[0..id_len],
+    );
+}
+
 fn splitmix64(x0: u64) u64 {
     var z = x0 +% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -126,4 +138,15 @@ test "mesh event ids are deterministic and bind both origin and hlc" {
     try testing.expect(!std.mem.eql(u8, fromMeshEvent(8, 11, &c), a[0..]));
     try testing.expect(!std.mem.eql(u8, fromMeshEvent(7, 12, &d), a[0..]));
     try testing.expect(msgedit.isValidMsgid(a[0..]));
+}
+
+test "stable ids render byte-exact deterministic valid msgids" {
+    const id: [16]u8 = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    var a: [id_len]u8 = undefined;
+    var b: [id_len]u8 = undefined;
+    try testing.expectEqualStrings(fromStableId(id, &a), fromStableId(id, &b));
+    try testing.expect(msgedit.isValidMsgid(a[0..]));
+    var changed = id;
+    changed[15] ^= 1;
+    try testing.expect(!std.mem.eql(u8, fromStableId(changed, &b), a[0..]));
 }

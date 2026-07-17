@@ -46,7 +46,7 @@ pub const Event = union(enum) {
     abort,
 };
 
-pub const TransitionError = error{InvalidTransition};
+pub const TransitionError = error{ InvalidTransition, InvalidTiming };
 
 pub const Model = struct {
     state: State = .idle,
@@ -55,11 +55,12 @@ pub const Model = struct {
 
     /// Creates the offered model exactly as if an idle model received
     /// `.request_migrate`.
-    pub fn begin(epoch: u64, now_ms: i64, timeout_ms: i64) Model {
+    pub fn begin(epoch: u64, now_ms: i64, timeout_ms: i64) TransitionError!Model {
+        if (now_ms < 0 or timeout_ms < 0) return error.InvalidTiming;
         return .{
             .state = .offered,
             .epoch = epoch,
-            .deadline_ms = now_ms + timeout_ms,
+            .deadline_ms = std.math.add(i64, now_ms, timeout_ms) catch return error.InvalidTiming,
         };
     }
 
@@ -112,7 +113,7 @@ pub const Model = struct {
 };
 
 test "begin starts offered migration with deterministic deadline" {
-    const model = Model.begin(42, 1_000, 250);
+    const model = try Model.begin(42, 1_000, 250);
 
     try testing.expectEqual(State.offered, model.state);
     try testing.expectEqual(@as(u64, 42), model.epoch);
@@ -153,7 +154,7 @@ test "full happy path reaches done from idle" {
 }
 
 test "peer rejection aborts a non-terminal migration" {
-    var model = Model.begin(9, 100, 5);
+    var model = try Model.begin(9, 100, 5);
     model = try Model.transition(model, .peer_reject);
 
     try testing.expectEqual(State.aborted, model.state);
@@ -164,7 +165,7 @@ test "peer rejection aborts a non-terminal migration" {
 test "timeout aborts from every non-terminal state" {
     const cases = [_]Model{
         Model.idle(),
-        Model.begin(1, 10, 10),
+        try Model.begin(1, 10, 10),
         .{ .state = .accepted, .epoch = 1, .deadline_ms = 20 },
         .{ .state = .transferring, .epoch = 1, .deadline_ms = 20 },
         .{ .state = .committed, .epoch = 1, .deadline_ms = 20 },
@@ -182,7 +183,7 @@ test "timeout aborts from every non-terminal state" {
 test "abort aborts from every non-terminal state" {
     const cases = [_]Model{
         Model.idle(),
-        Model.begin(2, 10, 10),
+        try Model.begin(2, 10, 10),
         .{ .state = .accepted, .epoch = 2, .deadline_ms = 20 },
         .{ .state = .transferring, .epoch = 2, .deadline_ms = 20 },
         .{ .state = .committed, .epoch = 2, .deadline_ms = 20 },
@@ -198,7 +199,7 @@ test "abort aborts from every non-terminal state" {
 }
 
 test "invalid transition rejection preserves source model" {
-    const model = Model.begin(11, 100, 10);
+    const model = try Model.begin(11, 100, 10);
 
     try testing.expectError(error.InvalidTransition, Model.transition(model, .capsule_sent));
     try testing.expectEqual(State.offered, model.state);
@@ -239,7 +240,7 @@ test "request_migrate is only accepted from idle" {
     try testing.expectEqual(@as(i64, 600), offered.deadline_ms);
 
     const non_idle = [_]Model{
-        Model.begin(1, 1, 1),
+        try Model.begin(1, 1, 1),
         .{ .state = .accepted, .epoch = 1, .deadline_ms = 2 },
         .{ .state = .transferring, .epoch = 1, .deadline_ms = 2 },
         .{ .state = .committed, .epoch = 1, .deadline_ms = 2 },
@@ -248,5 +249,19 @@ test "request_migrate is only accepted from idle" {
 
     for (non_idle) |model| {
         try testing.expectError(error.InvalidTransition, Model.transition(model, event));
+    }
+}
+
+test "request_migrate rejects negative and overflowing timing without a state change" {
+    const idle = Model.idle();
+    const invalid = [_]RequestMigrate{
+        .{ .epoch = 1, .now_ms = -1, .timeout_ms = 1 },
+        .{ .epoch = 2, .now_ms = 1, .timeout_ms = -1 },
+        .{ .epoch = 3, .now_ms = std.math.maxInt(i64), .timeout_ms = 1 },
+    };
+    for (invalid) |request| {
+        try testing.expectError(error.InvalidTiming, Model.begin(request.epoch, request.now_ms, request.timeout_ms));
+        try testing.expectError(error.InvalidTiming, Model.transition(idle, .{ .request_migrate = request }));
+        try testing.expectEqual(Model.idle(), idle);
     }
 }

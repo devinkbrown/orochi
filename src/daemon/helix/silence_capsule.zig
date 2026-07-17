@@ -41,6 +41,8 @@ pub const Error = error{
     BadVersion,
     /// The record holds more masks than the caller-supplied buffer can hold.
     TooMany,
+    /// A complete record was followed by unauthenticated/unknown bytes.
+    TrailingBytes,
 };
 
 /// A client's resumable SILENCE list.
@@ -95,6 +97,7 @@ pub const SilenceCapsule = struct {
         while (i < mask_count) : (i += 1) {
             masks_out[i] = try readStr(bytes, &pos);
         }
+        if (pos != bytes.len) return error.TrailingBytes;
 
         return .{
             .client_id = client_id,
@@ -267,6 +270,15 @@ test "decode returns BadVersion on a future version" {
 
     var out_masks: [8][]const u8 = undefined;
     try std.testing.expectError(error.BadVersion, SilenceCapsule.decode(bumped[0..wire.len], &out_masks));
+}
+
+test "decode rejects trailing bytes" {
+    const original = SilenceCapsule{ .client_id = 9, .masks = &.{} };
+    var buf: [64]u8 = undefined;
+    const wire = try original.encode(&buf);
+    buf[wire.len] = 0;
+    var out: [1][]const u8 = undefined;
+    try std.testing.expectError(error.TrailingBytes, SilenceCapsule.decode(buf[0 .. wire.len + 1], &out));
 }
 
 test "decode returns TooMany when masks_out is too small" {

@@ -114,6 +114,17 @@ pub const NativeMediaTransport = struct {
         self.* = undefined;
     }
 
+    /// Whether this native transport has no registered call state that would be
+    /// lost by an in-place exec. A bound/idle UDP socket and configured MAC or
+    /// cross-leg policy are process configuration, not an active media session.
+    /// Both registries are checked under their native mutex so an unregister or
+    /// pump address learn cannot race the fail-closed decision.
+    pub fn upgradeContinuityReady(self: *NativeMediaTransport) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.channels.count() == 0 and self.stream_index.count() == 0;
+    }
+
     /// Bind on `bind_be`:`port` (port 0 = ephemeral) and spawn the pump thread.
     /// No-op if already started.
     pub fn start(self: *NativeMediaTransport, bind_be: u32, port: u16) !void {
@@ -491,6 +502,20 @@ test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the
     var rbuf: [media_socket.max_datagram]u8 = undefined;
     const got = bob.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, frame, got.data);
+}
+
+test "upgrade continuity: NativeMediaTransport ignores idle socket and gates registrations" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+
+    try testing.expect(nmt.upgradeContinuityReady());
+    try nmt.start(loopback_be, 0);
+    try testing.expect(nmt.upgradeContinuityReady());
+
+    try nmt.register("#c", "alice", .voice, 0xA11CE, .{});
+    try testing.expect(!nmt.upgradeContinuityReady());
+    nmt.unregister("#c", "alice");
+    try testing.expect(nmt.upgradeContinuityReady());
 }
 
 test "NativeMediaTransport: required MAC drops untagged and accepts valid tagged datagrams" {

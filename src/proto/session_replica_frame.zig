@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Versioned transport envelope for SESSION_REPLICA v2 S2S frames.
+//! Versioned transport envelopes for SESSION_REPLICA S2S frames.
 //!
 //! The daemon's Helix `session_replica` module owns the self-certifying signed
 //! OFFER/ACK objects and their semantic verification. This protocol module adds
@@ -9,26 +9,36 @@
 //! frame kind, and enforces a bound that still fits inside the default S2S frame
 //! after the direct-peer signed envelope is added.
 //!
-//! Wire format:
+//! Wire format (the payload schema is selected explicitly by the version):
 //!   magic[4] = "SRTF"
-//!   version u8 = 2
+//!   version u8 = 2 | 3
 //!   kind u8 = OFFER(1) | ACK(2) | REVOKE(3) | ATTACHMENT_LEASE(4)
 //!   signed_payload_len u32 (big endian)
 //!   signed_payload bytes
 //!
-//! OFFER and REVOKE both carry the Helix `SRO2` signed object, but the operation
-//! byte must respectively be upsert(1) or remove(2). ACK carries `SRA2`; a
-//! positive attachment lease carries fixed-size `SRL2`. This
-//! redundant kind binding prevents a valid object being reclassified merely by
-//! changing the outer S2S frame tag. Cryptographic verification remains the
-//! daemon callback's responsibility.
+//! The v2 API carries the legacy token-scoped SRO2/SRA2/SRL2 objects. The
+//! attachment API carries the current SRO3/SRV3/SRA3/SRL3 objects, whose
+//! authority key includes a stable physical attachment id. Callers must choose
+//! one API after capability negotiation; decode never guesses from inner magic
+//! and never falls back across versions. Redundant kind binding prevents a
+//! valid object being reclassified merely by changing the outer S2S frame tag.
+//! Cryptographic verification remains the daemon callback's responsibility.
 
 const std = @import("std");
 const s2s_frame = @import("s2s_frame.zig");
+const session_portability = @import("session_portability.zig");
 
 pub const magic = [_]u8{ 'S', 'R', 'T', 'F' };
-pub const version: u8 = 2;
+pub const token_version: u8 = 2;
+pub const attachment_version: u8 = 3;
+/// Compatibility name retained for the live v2 call sites.
+pub const version: u8 = token_version;
 pub const header_len: usize = magic.len + 1 + 1 + 4;
+
+pub const WireVersion = enum(u8) {
+    token_v2 = token_version,
+    attachment_v3 = attachment_version,
+};
 
 /// `[Ed25519 public key:32][signature:64]` added by `signed_frame` on the S2S
 /// direct-peer authentication layer. Kept explicit here to make the frame-size
@@ -52,7 +62,26 @@ const attachment_lease_signed_len: usize = 4 + 16 + 24 + 8 + 8 + inner_signature
 const account_len_offset: usize = 4 + 1 + 16 + 24 + 8 + 8;
 const max_account_len: usize = 128;
 const max_nick_len: usize = 64;
-const max_snapshot_len: usize = 1024 * 1024;
+const max_snapshot_len: usize = session_portability.max_snapshot_len;
+
+const attachment_offer_magic = [_]u8{ 'S', 'R', 'O', '3' };
+const attachment_ack_magic = [_]u8{ 'S', 'R', 'A', '3' };
+const attachment_revoke_magic = [_]u8{ 'S', 'R', 'V', '3' };
+const attachment_lease_magic_v3 = [_]u8{ 'S', 'R', 'L', '3' };
+const attachment_identity_len: usize = 16 + 16;
+const attachment_revision_len: usize = 8 + 8 + 8;
+const attachment_offer_fixed_len: usize = 4 + attachment_identity_len + attachment_revision_len + 8 + 8 + 2 + 2 + 4;
+const attachment_offer_account_len_offset: usize = 4 + attachment_identity_len + attachment_revision_len + 8 + 8;
+const attachment_ack_signed_len: usize = 4 + 1 + attachment_identity_len + attachment_revision_len + attachment_revision_len + 8 + 8 + 8 + inner_signature_len;
+const attachment_lease_signed_len_v3: usize = 4 + attachment_identity_len + attachment_revision_len + 8 + 8 + inner_signature_len;
+const attachment_revoke_tail_len: usize = attachment_identity_len + attachment_revision_len + 8 + 8 + inner_signature_len;
+
+comptime {
+    // The shared portability ceiling deliberately reserves more than every v3
+    // signed-object and transport wrapper combined.
+    std.debug.assert(attachment_offer_fixed_len + inner_signature_len +
+        max_account_len + max_nick_len + max_snapshot_len <= max_signed_payload_len);
+}
 
 pub const Kind = enum(u8) {
     offer = 1,
@@ -94,18 +123,49 @@ pub const DecodeError = error{
     WrongKind,
 };
 
+/// Inspect only the authenticated transport discriminator so a negotiated link
+/// can route to one exact decoder. This never validates or returns the payload;
+/// callers must immediately invoke `decode` or `decodeAttachment` and must not
+/// try the other decoder after a failure.
+pub fn inspectVersion(bytes: []const u8) DecodeError!WireVersion {
+    if (bytes.len < header_len) return error.Truncated;
+    if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
+    return switch (bytes[magic.len]) {
+        token_version => .token_v2,
+        attachment_version => .attachment_v3,
+        else => error.UnsupportedVersion,
+    };
+}
+
 pub fn encodedLen(signed_payload_len: usize) EncodeError!usize {
     if (signed_payload_len > max_signed_payload_len) return error.PayloadTooLarge;
     return header_len + signed_payload_len;
 }
 
 pub fn encode(kind: Kind, signed_payload: []const u8, out: []u8) EncodeError![]const u8 {
-    try validatePayload(kind, signed_payload);
+    return encodeVersioned(token_version, validatePayload, kind, signed_payload, out);
+}
+
+/// Encode one attachment-scoped v3 object. This is intentionally a separate
+/// entry point from `encode`: negotiated v2 peers must never receive an SRA3
+/// object inside a version-2 transport header.
+pub fn encodeAttachment(kind: Kind, signed_payload: []const u8, out: []u8) EncodeError![]const u8 {
+    return encodeVersioned(attachment_version, validateAttachmentPayload, kind, signed_payload, out);
+}
+
+fn encodeVersioned(
+    comptime wire_version: u8,
+    comptime validate: fn (Kind, []const u8) EncodeError!void,
+    kind: Kind,
+    signed_payload: []const u8,
+    out: []u8,
+) EncodeError![]const u8 {
+    try validate(kind, signed_payload);
     const total = try encodedLen(signed_payload.len);
     if (out.len < total) return error.BufferTooSmall;
 
     @memcpy(out[0..magic.len], &magic);
-    out[magic.len] = version;
+    out[magic.len] = wire_version;
     out[magic.len + 1] = @intFromEnum(kind);
     std.mem.writeInt(u32, out[magic.len + 2 ..][0..4], @intCast(signed_payload.len), .big);
     @memcpy(out[header_len..total], signed_payload);
@@ -116,9 +176,24 @@ pub fn encode(kind: Kind, signed_payload: []const u8, out: []u8) EncodeError![]c
 /// outer S2S frame tag and prevents cross-tag replay. Returned bytes borrow
 /// `bytes` and still require Helix signature + semantic verification.
 pub fn decode(expected_kind: Kind, bytes: []const u8) DecodeError!Frame {
+    return decodeVersioned(token_version, validatePayload, expected_kind, bytes);
+}
+
+/// Strict v3 counterpart to `decode`. There is no v2 compatibility fallback;
+/// the caller selects this only after negotiating attachment-scoped replicas.
+pub fn decodeAttachment(expected_kind: Kind, bytes: []const u8) DecodeError!Frame {
+    return decodeVersioned(attachment_version, validateAttachmentPayload, expected_kind, bytes);
+}
+
+fn decodeVersioned(
+    comptime wire_version: u8,
+    comptime validate: fn (Kind, []const u8) EncodeError!void,
+    expected_kind: Kind,
+    bytes: []const u8,
+) DecodeError!Frame {
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
-    if (bytes[magic.len] != version) return error.UnsupportedVersion;
+    if (bytes[magic.len] != wire_version) return error.UnsupportedVersion;
     const kind = Kind.fromByte(bytes[magic.len + 1]) orelse return error.InvalidKind;
     if (kind != expected_kind) return error.WrongKind;
 
@@ -128,11 +203,89 @@ pub fn decode(expected_kind: Kind, bytes: []const u8) DecodeError!Frame {
     const total = header_len + payload_len;
     if (bytes.len != total) return error.TrailingBytes;
     const signed_payload = bytes[header_len..total];
-    validatePayload(kind, signed_payload) catch |err| return switch (err) {
+    validate(kind, signed_payload) catch |err| return switch (err) {
         error.PayloadTooLarge => error.PayloadTooLarge,
         else => error.InvalidPayload,
     };
     return .{ .kind = kind, .signed_payload = signed_payload };
+}
+
+fn validateAttachmentPayload(kind: Kind, payload: []const u8) EncodeError!void {
+    if (payload.len > max_signed_payload_len) return error.PayloadTooLarge;
+    switch (kind) {
+        .offer => try validateAttachmentOffer(payload),
+        .revoke => try validateAttachmentRevoke(payload),
+        .ack => {
+            if (payload.len != attachment_ack_signed_len or
+                !std.mem.eql(u8, payload[0..attachment_ack_magic.len], &attachment_ack_magic) or
+                payload[attachment_ack_magic.len] < 1 or payload[attachment_ack_magic.len] > 7 or
+                !validAttachmentIdentity(payload, attachment_ack_magic.len + 1))
+            {
+                return error.InvalidPayload;
+            }
+        },
+        .attachment_lease => {
+            if (payload.len != attachment_lease_signed_len_v3 or
+                !std.mem.eql(u8, payload[0..attachment_lease_magic_v3.len], &attachment_lease_magic_v3) or
+                !validAttachmentIdentity(payload, attachment_lease_magic_v3.len))
+            {
+                return error.InvalidPayload;
+            }
+        },
+    }
+}
+
+fn validateAttachmentOffer(payload: []const u8) EncodeError!void {
+    if (payload.len < attachment_offer_fixed_len + inner_signature_len or
+        !std.mem.eql(u8, payload[0..attachment_offer_magic.len], &attachment_offer_magic) or
+        !validAttachmentIdentity(payload, attachment_offer_magic.len))
+    {
+        return error.InvalidPayload;
+    }
+    const account_len: usize = std.mem.readInt(u16, payload[attachment_offer_account_len_offset..][0..2], .big);
+    const nick_len: usize = std.mem.readInt(u16, payload[attachment_offer_account_len_offset + 2 ..][0..2], .big);
+    const snapshot_len: usize = @intCast(std.mem.readInt(u32, payload[attachment_offer_account_len_offset + 4 ..][0..4], .big));
+    if (account_len == 0 or account_len > max_account_len or
+        nick_len == 0 or nick_len > max_nick_len or
+        snapshot_len == 0 or snapshot_len > max_snapshot_len)
+    {
+        return error.InvalidPayload;
+    }
+    const variable_len = std.math.add(usize, account_len, nick_len) catch return error.InvalidPayload;
+    const content_len = std.math.add(usize, variable_len, snapshot_len) catch return error.InvalidPayload;
+    const expected_len = std.math.add(usize, attachment_offer_fixed_len + inner_signature_len, content_len) catch
+        return error.InvalidPayload;
+    if (payload.len != expected_len) return error.InvalidPayload;
+}
+
+fn validateAttachmentRevoke(payload: []const u8) EncodeError!void {
+    const prefix_len = attachment_revoke_magic.len + 1;
+    if (payload.len < prefix_len + attachment_revoke_tail_len or
+        !std.mem.eql(u8, payload[0..attachment_revoke_magic.len], &attachment_revoke_magic))
+    {
+        return error.InvalidPayload;
+    }
+    const account_len: usize = payload[attachment_revoke_magic.len];
+    if (account_len == 0 or account_len > max_account_len) return error.InvalidPayload;
+    const identity_offset = prefix_len + account_len;
+    if (payload.len != identity_offset + attachment_revoke_tail_len or
+        !validAttachmentIdentity(payload, identity_offset))
+    {
+        return error.InvalidPayload;
+    }
+}
+
+fn validAttachmentIdentity(payload: []const u8, offset: usize) bool {
+    if (offset > payload.len or attachment_identity_len > payload.len - offset) return false;
+    const token = payload[offset .. offset + 16];
+    const attachment_id = payload[offset + 16 .. offset + attachment_identity_len];
+    return !allZero(token) and !allZero(attachment_id);
+}
+
+fn allZero(bytes: []const u8) bool {
+    var combined: u8 = 0;
+    for (bytes) |byte| combined |= byte;
+    return combined == 0;
 }
 
 fn validatePayload(kind: Kind, payload: []const u8) EncodeError!void {
@@ -206,6 +359,59 @@ fn fakeAttachmentLease() [attachment_lease_signed_len]u8 {
     return out;
 }
 
+fn putFakeAttachmentIdentity(out: []u8, offset: usize) void {
+    out[offset] = 0x31;
+    out[offset + 16] = 0x72;
+}
+
+fn fakeAttachmentOffer(allocator: std.mem.Allocator) ![]u8 {
+    const account = "alice";
+    const nick = "Alice";
+    const snapshot = "attachment-snapshot";
+    const total = attachment_offer_fixed_len + account.len + nick.len + snapshot.len + inner_signature_len;
+    const out = try allocator.alloc(u8, total);
+    @memset(out, 0);
+    @memcpy(out[0..attachment_offer_magic.len], &attachment_offer_magic);
+    putFakeAttachmentIdentity(out, attachment_offer_magic.len);
+    std.mem.writeInt(u16, out[attachment_offer_account_len_offset..][0..2], account.len, .big);
+    std.mem.writeInt(u16, out[attachment_offer_account_len_offset + 2 ..][0..2], nick.len, .big);
+    std.mem.writeInt(u32, out[attachment_offer_account_len_offset + 4 ..][0..4], snapshot.len, .big);
+    var pos = attachment_offer_fixed_len;
+    @memcpy(out[pos .. pos + account.len], account);
+    pos += account.len;
+    @memcpy(out[pos .. pos + nick.len], nick);
+    pos += nick.len;
+    @memcpy(out[pos .. pos + snapshot.len], snapshot);
+    return out;
+}
+
+fn fakeAttachmentRevoke(allocator: std.mem.Allocator) ![]u8 {
+    const account = "alice";
+    const identity_offset = attachment_revoke_magic.len + 1 + account.len;
+    const out = try allocator.alloc(u8, identity_offset + attachment_revoke_tail_len);
+    @memset(out, 0);
+    @memcpy(out[0..attachment_revoke_magic.len], &attachment_revoke_magic);
+    out[attachment_revoke_magic.len] = account.len;
+    @memcpy(out[attachment_revoke_magic.len + 1 .. identity_offset], account);
+    putFakeAttachmentIdentity(out, identity_offset);
+    return out;
+}
+
+fn fakeAttachmentAck() [attachment_ack_signed_len]u8 {
+    var out: [attachment_ack_signed_len]u8 = @splat(0);
+    @memcpy(out[0..attachment_ack_magic.len], &attachment_ack_magic);
+    out[attachment_ack_magic.len] = 1;
+    putFakeAttachmentIdentity(&out, attachment_ack_magic.len + 1);
+    return out;
+}
+
+fn fakeAttachmentLeaseV3() [attachment_lease_signed_len_v3]u8 {
+    var out: [attachment_lease_signed_len_v3]u8 = @splat(0);
+    @memcpy(out[0..attachment_lease_magic_v3.len], &attachment_lease_magic_v3);
+    putFakeAttachmentIdentity(&out, attachment_lease_magic_v3.len);
+    return out;
+}
+
 test "session replica transport OFFER ACK REVOKE and attachment lease round-trip" {
     const offer = try fakeOffer(testing.allocator, .offer);
     defer testing.allocator.free(offer);
@@ -228,6 +434,111 @@ test "session replica transport OFFER ACK REVOKE and attachment lease round-trip
         try testing.expectEqual(case.kind, decoded.kind);
         try testing.expectEqualSlices(u8, case.payload, decoded.signed_payload);
     }
+}
+
+test "attachment session replica transport round-trips every v3 object kind" {
+    const offer = try fakeAttachmentOffer(testing.allocator);
+    defer testing.allocator.free(offer);
+    const revoke = try fakeAttachmentRevoke(testing.allocator);
+    defer testing.allocator.free(revoke);
+    const ack = fakeAttachmentAck();
+    const lease = fakeAttachmentLeaseV3();
+
+    const cases = [_]struct { kind: Kind, payload: []const u8 }{
+        .{ .kind = .offer, .payload = offer },
+        .{ .kind = .ack, .payload = &ack },
+        .{ .kind = .revoke, .payload = revoke },
+        .{ .kind = .attachment_lease, .payload = &lease },
+    };
+    for (cases) |case| {
+        const out = try testing.allocator.alloc(u8, header_len + case.payload.len);
+        defer testing.allocator.free(out);
+        const wire = try encodeAttachment(case.kind, case.payload, out);
+        try testing.expectEqual(attachment_version, wire[magic.len]);
+        const decoded = try decodeAttachment(case.kind, wire);
+        try testing.expectEqual(case.kind, decoded.kind);
+        try testing.expectEqualSlices(u8, case.payload, decoded.signed_payload);
+    }
+}
+
+test "session replica transport never guesses or falls back across v2 and v3" {
+    const offer_v2 = try fakeOffer(testing.allocator, .offer);
+    defer testing.allocator.free(offer_v2);
+    const offer_v3 = try fakeAttachmentOffer(testing.allocator);
+    defer testing.allocator.free(offer_v3);
+    const max_len = @max(offer_v2.len, offer_v3.len);
+    const out = try testing.allocator.alloc(u8, header_len + max_len);
+    defer testing.allocator.free(out);
+
+    try testing.expectError(error.InvalidPayload, encode(.offer, offer_v3, out));
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.offer, offer_v2, out));
+
+    const wire_v2 = try encode(.offer, offer_v2, out);
+    try testing.expectError(error.UnsupportedVersion, decodeAttachment(.offer, wire_v2));
+    const wire_v3 = try encodeAttachment(.offer, offer_v3, out);
+    try testing.expectError(error.UnsupportedVersion, decode(.offer, wire_v3));
+}
+
+test "attachment session replica transport binds distinct inner objects to outer kind" {
+    const offer = try fakeAttachmentOffer(testing.allocator);
+    defer testing.allocator.free(offer);
+    const revoke = try fakeAttachmentRevoke(testing.allocator);
+    defer testing.allocator.free(revoke);
+    const ack = fakeAttachmentAck();
+    const lease = fakeAttachmentLeaseV3();
+    const max_len = @max(@max(offer.len, revoke.len), @max(ack.len, lease.len));
+    const out = try testing.allocator.alloc(u8, header_len + max_len);
+    defer testing.allocator.free(out);
+
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.revoke, offer, out));
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.offer, revoke, out));
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.offer, &ack, out));
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.ack, &lease, out));
+    const ack_wire = try encodeAttachment(.ack, &ack, out);
+    try testing.expectError(error.WrongKind, decodeAttachment(.offer, ack_wire));
+}
+
+test "attachment session replica transport rejects all truncation and trailing bytes" {
+    const ack = fakeAttachmentAck();
+    var out: [header_len + attachment_ack_signed_len + 1]u8 = undefined;
+    const wire = try encodeAttachment(.ack, &ack, out[0 .. out.len - 1]);
+    for (0..wire.len) |end|
+        try testing.expectError(error.Truncated, decodeAttachment(.ack, wire[0..end]));
+    out[wire.len] = 0xff;
+    try testing.expectError(error.TrailingBytes, decodeAttachment(.ack, &out));
+}
+
+test "attachment session replica transport rejects malformed identity status and lengths" {
+    const ack = fakeAttachmentAck();
+    var ack_out: [header_len + attachment_ack_signed_len]u8 = undefined;
+    _ = try encodeAttachment(.ack, &ack, &ack_out);
+
+    var bad_ack = ack;
+    bad_ack[attachment_ack_magic.len] = 0;
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.ack, &bad_ack, &ack_out));
+    bad_ack = ack;
+    @memset(bad_ack[attachment_ack_magic.len + 1 .. attachment_ack_magic.len + 1 + 16], 0);
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.ack, &bad_ack, &ack_out));
+    bad_ack = ack;
+    @memset(bad_ack[attachment_ack_magic.len + 1 + 16 .. attachment_ack_magic.len + 1 + attachment_identity_len], 0);
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.ack, &bad_ack, &ack_out));
+
+    const offer = try fakeAttachmentOffer(testing.allocator);
+    defer testing.allocator.free(offer);
+    const changed = try testing.allocator.dupe(u8, offer);
+    defer testing.allocator.free(changed);
+    const transport = try testing.allocator.alloc(u8, header_len + changed.len);
+    defer testing.allocator.free(transport);
+    std.mem.writeInt(u16, changed[attachment_offer_account_len_offset..][0..2], 0, .big);
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.offer, changed, transport));
+    @memcpy(changed, offer);
+    std.mem.writeInt(u32, changed[attachment_offer_account_len_offset + 4 ..][0..4], @intCast(max_snapshot_len + 1), .big);
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.offer, changed, transport));
+
+    const revoke = try fakeAttachmentRevoke(testing.allocator);
+    defer testing.allocator.free(revoke);
+    revoke[attachment_revoke_magic.len] = 0;
+    try testing.expectError(error.InvalidPayload, encodeAttachment(.revoke, revoke, transport));
 }
 
 test "session replica transport binds inner object to outer kind" {
@@ -304,5 +615,14 @@ test "session replica transport OFFER declared fields are strict and bounded" {
 
     @memcpy(changed, offer);
     std.mem.writeInt(u32, changed[account_len_offset + 4 ..][0..4], 99, .big);
+    try testing.expectError(error.InvalidPayload, encode(.offer, changed, &out));
+
+    @memcpy(changed, offer);
+    std.mem.writeInt(
+        u32,
+        changed[account_len_offset + 4 ..][0..4],
+        @intCast(session_portability.max_snapshot_len + 1),
+        .big,
+    );
     try testing.expectError(error.InvalidPayload, encode(.offer, changed, &out));
 }

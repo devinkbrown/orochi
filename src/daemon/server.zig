@@ -21,9 +21,12 @@ const wasm_bridge = @import("../wasm/host/bridge.zig");
 const crypto_sign = @import("../crypto/sign.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
+const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
+const session_replica_frame = @import("../proto/session_replica_frame.zig");
+const signed_s2s_frame = @import("../substrate/suimyaku/signed_frame.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const mesh_uid_alloc = @import("../substrate/suimyaku/uid_alloc.zig");
 const mesh_clock_mod = @import("../substrate/suimyaku/mesh_clock.zig");
@@ -53,6 +56,12 @@ const media_session = @import("../substrate/media_session.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
+const event_spine_replay_guard = @import("event_spine_replay_guard.zig");
+const relay_v2_replay_guard = @import("relay_v2_replay_guard.zig");
+const relay_v2_outbox = @import("relay_v2_outbox.zig");
+const relay_v2_event_log = @import("relay_v2_event_log.zig");
+const relay_v2_activation = @import("relay_v2_activation.zig");
+const attachment_delivery_spool = @import("attachment_delivery_spool.zig");
 const oper_event = @import("../proto/oper_event.zig");
 const observe_event = @import("../proto/observe_event.zig");
 const kill_relay = @import("../proto/kill_relay.zig");
@@ -84,6 +93,7 @@ const route_report = @import("../proto/route_report.zig");
 const sazanami_report = @import("../proto/sazanami_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
+const session_portability = @import("../proto/session_portability.zig");
 const migration_relay = @import("helix/migration_relay.zig");
 const session_migrate = @import("helix/session_migrate.zig");
 const session_replica_v2 = @import("helix/session_replica.zig");
@@ -180,6 +190,10 @@ const simulcast_select = @import("../substrate/simulcast_select.zig");
 const helix_capsule = @import("helix/capsule.zig");
 const helix_handoff = @import("helix/handoff.zig");
 const helix_live = @import("helix/live.zig");
+const handoff_relations = @import("helix/handoff_relations.zig");
+const handoff_manifest = @import("helix/handoff_manifest.zig");
+const world_checkpoint = @import("helix/world_checkpoint.zig");
+const history_checkpoint = @import("helix/history_checkpoint.zig");
 const prop_checkpoint = @import("helix/prop_checkpoint.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const session_capsule = @import("helix/session_capsule.zig");
@@ -308,6 +322,7 @@ const webhook_http = @import("webhook_http.zig");
 const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
+const node_short_id = @import("../crypto/node_short_id.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const tls_conn = @import("tls_conn.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
@@ -338,6 +353,75 @@ const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
+const relay_v2_deferred_capacity: usize = 256;
+const relay_v2_initial_retry_ms: u64 = 1000;
+const relay_v2_retry_frame_budget: usize = 32;
+const relay_v2_retry_byte_budget: usize = 256 * 1024;
+const RelayV2RetryWork = struct {
+    peer: u64,
+    relay_id: relay_v2_replay_guard.RelayId,
+    wire: []u8,
+};
+
+/// Test-only deterministic ACK fault target. Live reactor threads and the
+/// acceptance-test thread synchronize this state with `relay_v2_replay_mu`, the
+/// same authority lock needed to resolve a rendered msgid back to a retained
+/// RelayId. Matching the complete id prevents an unrelated delayed ACK from
+/// consuming the fault and making the reconnect test pass without exercising
+/// exact-wire retry.
+const RelayV2AckDropTestState = struct {
+    armed: bool = false,
+    peer: u64 = 0,
+    relay_id: relay_v2_replay_guard.RelayId = @splat(0),
+};
+
+const SessionReplicaProjectionMode = enum {
+    /// Normal runtime projection publishes derived client/history/activity
+    /// transitions immediately.
+    live,
+    /// Helix adoption mutates only the rollback-owned candidate authorities.
+    /// No derived output may escape before the single commit edge.
+    helix_silent,
+};
+
+const MeshBurstStage = enum(u4) {
+    idle,
+    membership,
+    mode_flags,
+    mode_state,
+    channel_props,
+    entity_props,
+    topics,
+    opers,
+    wards,
+    clones,
+};
+
+/// All fallible storage for one live MONITOR occupancy transition. The plan is
+/// prepared while the enclosing World/session transaction can still abort; its
+/// apply path mutates the online index and renders replies without allocation.
+const PreparedMonitorTransition = struct {
+    inline_replies: [64]monitor.MonitorReply = undefined,
+    inline_storage: [default_reply_bytes]u8 = undefined,
+    allocated_replies: ?[]monitor.MonitorReply = null,
+    allocated_storage: ?[]u8 = null,
+    reply_count: usize = 0,
+    storage_len: usize = 0,
+
+    fn replies(self: *PreparedMonitorTransition) []monitor.MonitorReply {
+        return self.allocated_replies orelse self.inline_replies[0..self.reply_count];
+    }
+
+    fn storage(self: *PreparedMonitorTransition) []u8 {
+        return self.allocated_storage orelse self.inline_storage[0..self.storage_len];
+    }
+
+    fn deinit(self: *PreparedMonitorTransition, allocator: std.mem.Allocator) void {
+        if (self.allocated_replies) |buf| allocator.free(buf);
+        if (self.allocated_storage) |buf| allocator.free(buf);
+        self.* = undefined;
+    }
+};
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -900,12 +984,12 @@ const ringlane = struct {
             _ = self.features;
             // Accept with SOCK_CLOEXEC so every accepted socket defaults to
             // close-on-exec. Helix UPGRADE re-execs the daemon in place; the
-            // design (see performUpgrade) carries select client sockets by
-            // explicitly CLEARING CLOEXEC on them, and relies on every other
-            // accepted socket — S2S mesh peers, the requesting oper, wss
-            // browser clients, TLS clients whose engine can't be exported —
-            // closing at execve so the far end sees the drop and reconnects.
-            // Without this flag those sockets leak across execve as orphans:
+            // design (see performUpgrade) explicitly CLEARs CLOEXEC only after
+            // every required client/transport sidecar has sealed successfully.
+            // Any omitted live client refuses UPGRADE before exec, leaving the
+            // predecessor serving. Deliberately unestablished mesh dials may use
+            // the redial path; every other inherited fd is exact or fatal.
+            // Without this default those sockets can leak across execve as orphans:
             // a re-exec'd meshed node strands its peer link (the peer keeps a
             // zombie ESTAB socket and dedups away every re-dial → split-brain).
             _ = try self.inner.accept(try encodeUserData(.accept, token), listener_fd, null, null, posix.SOCK.CLOEXEC);
@@ -921,6 +1005,25 @@ const ringlane = struct {
 
         pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
             _ = try self.inner.send(try encodeUserData(.send, token), fd, buffer, 0);
+        }
+
+        /// Cancel one exact-generation socket operation by the same `user_data`
+        /// identity with which it was submitted. Cancelling by fd is not safe:
+        /// a slot can carry RECV and SEND concurrently, and an fd may later be
+        /// reused. The matching original CQE is still reaped and applied before
+        /// Helix snapshots any socket buffer.
+        fn exactCancelUserData(kind: OpKind, token: FdToken) !struct { completion: u64, target: u64 } {
+            if (kind != .accept and kind != .recv and kind != .send and kind != .connect)
+                return error.InvalidCancelKind;
+            return .{
+                .completion = try encodeUserData(.other, token),
+                .target = try encodeUserData(kind, token),
+            };
+        }
+
+        pub fn submitExactCancel(self: *Ring, kind: OpKind, token: FdToken) !void {
+            const ud = try exactCancelUserData(kind, token);
+            _ = try self.inner.cancel(ud.completion, ud.target, 0);
         }
 
         /// Queue a relative single-shot timeout; fires as a `.timeout` completion.
@@ -1670,7 +1773,7 @@ pub const Config = struct {
     /// the list bind fresh SO_REUSEPORT listeners. Linux only.
     inherited_listener_fds: []const linux.fd_t = &.{},
     /// Inherited Helix state-arena memfd (UPGRADE handoff); `adoptInheritedSessions`
-    /// reads it after boot to re-attach carried-over client connections. null = none.
+    /// reads it after init and before serving to re-attach clients. null = none.
     resume_arena_fd: ?linux.fd_t = null,
     /// Version-independent authoritative manifest of every client and S2S fd
     /// carried by `resume_arena_fd`. It lets a successor close all inherited
@@ -1889,6 +1992,10 @@ pub const Config = struct {
     /// (backward compatible). `node_identity` is borrowed (owned by main); `io`
     /// supplies the handshake CSPRNG.
     node_identity: ?*const node_identity.NodeIdentity = null,
+    /// Optional configured Ed25519 public identity. This lets config preflight
+    /// validate a MESSAGE_V2 roster without reading the persisted private
+    /// keyfile; server init binds it to the identity actually loaded by main.
+    node_public_key: ?[]const u8 = null,
     crypto_io: ?std.Io = null,
     /// Runtime Suimyaku peer-driver limits/timers/capacities for plaintext and
     /// secured inner S2S links. Configurable via `[mesh.routing]`,
@@ -1915,6 +2022,16 @@ pub const Config = struct {
     /// on the plaintext S2S path.
     mesh_admission_roots: []const []const u8 = &.{},
     mesh_admission_min_revocation_epoch: u64 = 0,
+    /// MESSAGE_V2 is an explicit two-phase rollout. Compatibility nodes accept
+    /// and forward V2 but author legacy only; active nodes author each V2-eligible
+    /// mesh event as V2 only.
+    relay_v2_authoring: relay_v2_activation.Mode = .compat,
+    /// Monotonic operator rollout generation. A non-zero value is meaningful
+    /// only with a complete full-mesh `relay_v2_roster`.
+    relay_v2_activation_epoch: u64 = 0,
+    /// Full secured-mesh Ed25519 node-key roster. Unlike `mesh_trust_roots`,
+    /// this is not limited to direct neighbors.
+    relay_v2_roster: []const []const u8 = &.{},
     /// `[mesh].connect` — peers ("host:port"; IPv6 hosts bracketed) this node
     /// dials automatically at boot and re-dials while the link is down, so the
     /// S2S mesh stays up without an oper CONNECT. Strings are borrowed (owned
@@ -2105,7 +2222,8 @@ const WsState = struct {
 /// the `.ws_session` capsule (v2) and restored verbatim on the successor, so
 /// a mid-frame browser client survives the upgrade with no lost bytes — the
 /// v1 clean-boundary-only gate dropped essentially every active wss client.
-/// A handshake-phase adapter is never carried (the browser reconnects).
+/// A handshake-phase adapter makes the exact seal incomplete, so UPGRADE is
+/// refused before exec and the predecessor keeps serving it.
 fn wsCarryable(ws: *const WsState) bool {
     return ws.phase == .open and
         ws.deframer.pending == null and
@@ -2214,6 +2332,15 @@ pub const ConnState = struct {
     /// RECV completion clears this latch.
     recv_armed: bool = false,
     send_armed: bool = false,
+    /// Exact-cancel SQEs already queued for the corresponding ownership latch.
+    /// The matching original RECV/SEND CQE clears both the latch and this bit.
+    recv_cancel_pending: bool = false,
+    send_cancel_pending: bool = false,
+    connect_cancel_pending: bool = false,
+    /// A CONNECT canceled for a failed Helix attempt is resubmitted before
+    /// ordinary RECV/SEND activation. A successful upgrade instead retains the
+    /// outbound dial as the existing mesh re-dial hint.
+    connect_rearm_pending: bool = false,
     /// True exactly while io_uring owns `s2s_connect_addr` for an async connect.
     /// Kept separate from `send_armed`/`recv_armed` so close can drain every
     /// kernel reference before recycling the slab slot.
@@ -2377,27 +2504,43 @@ pub const ConnState = struct {
     /// Heap-owned; freed in closeConn/deinit.
     s2s_secured: ?*secured_s2s_link.SecuredLink = null,
     /// Resumable, bounded SESSION_REPLICA retained-object replay state. The
-    /// cursor is valid only for `session_replica_replay_generation`; a Store
-    /// mutation resets it before the next batch.
+    /// numeric count is diagnostics only; ordering authority is the stable value
+    /// cursor below.
     session_replica_replay_pending: bool = false,
     session_replica_replay_cursor: usize = 0,
-    session_replica_replay_generation: u64 = 0,
     /// Frozen eligibility cutoff for one retained replay pass. Using a fresh
-    /// wall time on every page would let an earlier object expire and shift the
-    /// unordered-map offset underneath the numeric cursor, skipping later facts.
+    /// wall time on every page would change the pass's membership while its
+    /// stable value cursor advances.
     session_replica_replay_now_ms: i64 = 0,
-    /// One replay frame is already encoded in `SecuredLink.outbound` but could
-    /// not yet enter the socket SendQ. Flush it before selecting another object.
-    session_replica_replay_frame_pending: bool = false,
+    /// Mutation-stable retained-object value cursor. Unlike the legacy numeric
+    /// hash-iteration offset, it remains valid across rehash, supersede, expiry,
+    /// and lease renewal while a large authority burst is in flight.
+    session_replica_replay_after: ?session_replica_v2.Store.RetainedCursor = null,
+    /// A direct Store fanout that could not be queued requests one bounded wrap
+    /// after the current ordered pass; successful live fanout needs no restart.
+    session_replica_replay_restart_pending: bool = false,
     /// A secured peer requested a full state RESYNC while exact signed session
     /// authority still had retained pages to replay. The token-less mesh burst
     /// is released only after `session_replica_replay_pending` clears, so TCP
     /// segmentation can never expose membership before its Store authority.
     session_replica_resync_burst_pending: bool = false,
+    /// Retryable full-state burst cursor. Each family is encoded once; secured
+    /// ciphertext is then drained to SendQ only at whole-record boundaries.
+    mesh_burst_stage: MeshBurstStage = .idle,
+    mesh_burst_stage_encoded: bool = false,
+    /// An explicit RESYNC arrived while a previous/periodic burst was already
+    /// past its first family. Its sealed ciphertext cannot be discarded without
+    /// creating an AEAD counter gap, so finish that pass and then wrap once to a
+    /// fresh membership-first pass before acknowledging the reset generation.
+    mesh_burst_restart_pending: bool = false,
     /// One-shot guard: membership-roster burst sent to this peer once its link
     /// first reaches established (so the peer's NAMES/WHO is correct immediately,
     /// not only after future joins). See sendMembershipBurstTo / docs/planning/16.
     s2s_burst_done: bool = false,
+    /// Scheduling-only latch for the RVO2 unbound-row establishment hook. The
+    /// persisted row exclusion remains the authority; a Helix successor safely
+    /// starts this false and rebinds after restoring the established link.
+    relay_v2_unbound_bound: bool = false,
     /// True when THIS node opened the outbound S2S connection (we dialed the
     /// peer). False on the responder side (the peer dialed us). Used by
     /// `resolveS2sCollision` to deterministically collapse the duplicate link
@@ -2780,6 +2923,30 @@ const WakeBatch = struct {
     }
 };
 
+/// An UPGRADE request deferred until the current owner reactor has processed the
+/// complete CQE batch and drained its cross-shard mailbox. A raw `ConnState *`
+/// cannot cross that boundary: a later CQE in the same batch may close/reuse the
+/// slot. The full generational ClientId is revalidated at the safe point.
+const DeferredUpgradeRequest = union(enum) {
+    signal,
+    client: client_model.ClientId,
+};
+
+/// Test-only result buffer for an in-process exec-equivalent Helix handoff.
+/// The producer writes every field before publishing `completed` with release;
+/// the harness reads them only after an acquire load observes completion.
+const TestLiveUpgradeCapture = struct {
+    const max_state_fds = 16;
+
+    completed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    arena_fd: linux.fd_t = -1,
+    state_fds: [max_state_fds]linux.fd_t = undefined,
+    state_fd_count: usize = 0,
+    clients: usize = 0,
+    s2s_preserved: usize = 0,
+};
+
 const Reactor = struct {
     /// This reactor's io_uring (accept/recv/send/poll/timeout completions).
     ring: RingCore,
@@ -2803,6 +2970,10 @@ const Reactor = struct {
     s2s_accept_armed: bool = false,
     tls_accept_armed: bool = false,
     ws_accept_armed: bool = false,
+    accept_cancel_pending: bool = false,
+    s2s_accept_cancel_pending: bool = false,
+    tls_accept_cancel_pending: bool = false,
+    ws_accept_cancel_pending: bool = false,
     /// Whether the periodic timeout-sweep timer is currently in flight.
     timer_armed: bool = false,
     timer_spec: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
@@ -2818,6 +2989,14 @@ const Reactor = struct {
     /// Only the slot index is retained across turns; every scan revalidates the
     /// occupied slot and reads its current generation before arming anything.
     activation_cursor: usize = 0,
+
+    /// Owner-thread-only Helix socket safe-point state. While true, original
+    /// RECV/SEND completions are processed, but their handlers never re-arm a
+    /// replacement operation.
+    socket_io_quiescing: bool = false,
+    /// One stable deferred request per owner. Concurrent requests coalesce while
+    /// the first is waiting for the end-of-batch safe point.
+    deferred_upgrade: ?DeferredUpgradeRequest = null,
 
     /// Fan-out wake coalescer, touched ONLY by this reactor's own thread while it
     /// runs a broadcast (`beginWakeBatch`/`endWakeBatch`). During a batch, each
@@ -2852,6 +3031,12 @@ threadlocal var current_reactor: ?*Reactor = null;
 
 /// Sentinel for `upgrade_quiesce_shard`: no multi-shard UPGRADE seal in flight.
 const no_quiesce_shard: u32 = std.math.maxInt(u32);
+/// CAS-owned setup state. Siblings ignore it until the winner zeroes every
+/// barrier counter and publishes the real coordinator shard with release order.
+const initializing_quiesce_shard: u32 = std.math.maxInt(u32) - 1;
+/// Failure/success unwind state. No new claim may start until every sibling has
+/// resumed its owner ring and acknowledged this generation exactly once.
+const resuming_quiesce_shard: u32 = std.math.maxInt(u32) - 2;
 
 const ChannelPropClock = prop_checkpoint.ChannelClock;
 
@@ -3111,6 +3296,36 @@ pub const LinuxServer = struct {
     /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
     /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
     relay_seen: message_relay.SeenSet,
+    /// Durable daemon-global replay/equivocation authority for signed
+    /// MESSAGE_V2 floods. Per-link seen sets remain reflection optimizations;
+    /// only this checkpointed full-key guard authorizes v2 delivery/history.
+    relay_v2_replay_guard: relay_v2_replay_guard.Guard,
+    /// Exact per-hop wires retained until an authenticated peer ACK removes
+    /// only `(peer node, RelayId)`. Protected by `relay_v2_replay_mu` so outbox
+    /// reservation and RVG2/Lotus publication form one no-fail cut.
+    relay_v2_outbox: relay_v2_outbox.Outbox,
+    /// Durable exact MESSAGE_V2 wire until every event-time required node has
+    /// confirmed authenticated acceptance. Shares the RVG2 mutation lane.
+    relay_v2_event_log: relay_v2_event_log.EventLog,
+    /// Rendered, attachment-specific IRC records retained until the exact
+    /// physical reusable-session connection accepts them into its SendQ. Slow
+    /// siblings therefore cannot lose an accepted mesh event or force healthy
+    /// attachments to disconnect with them.
+    attachment_delivery_spool: attachment_delivery_spool.Spool,
+    /// The spool is daemon-global while SendQs remain reactor-owned. Admission,
+    /// owner-side drain, resume transfer, and Helix capture all serialize here.
+    attachment_delivery_mu: std.atomic.Mutex = .unlocked,
+    /// One mutation/checkpoint lane for RVG2 and its exact Lotus consequence.
+    /// World mutation already serializes live reactor calls; this explicit gate
+    /// also protects direct test/admin callers and documents the shared cut.
+    relay_v2_replay_mu: std.atomic.Mutex = .unlocked,
+    /// Recoverable inbound MESSAGE_V2 work (registry/session authority lag,
+    /// future wall time, or allocation pressure). Entries retain the exact wire
+    /// and decoded owned fields without consuming RVG2; timer/session-replica
+    /// turns retry them locally, so correctness never depends on a sender
+    /// defeating its outbound reflection cache and retransmitting.
+    relay_v2_deferred: [relay_v2_deferred_capacity]s2s_link.InboundMessageV2 = undefined,
+    relay_v2_deferred_len: usize = 0,
     /// Count of inbound relayed MESSAGEs dropped in `deliverRelay` because their
     /// self-contained origin signature failed (bad Ed25519 signature, or a pubkey
     /// whose `originShortId` did not match the claimed `origin_node`). Such a
@@ -3146,6 +3361,22 @@ pub const LinuxServer = struct {
     /// Decoded `[mesh].trust_roots` Ed25519 node signing keys. Empty preserves
     /// TOFU; non-empty requires secured peers to present one of these keys.
     mesh_trusted_node_keys: [][32]u8 = &.{},
+    /// Immutable sorted event-time membership used by RVL2: this node plus the
+    /// exact configured direct-neighbor identity pins. For this release
+    /// `[mesh].trust_roots` is deliberately the direct-neighbor set, not a broad
+    /// transitive CA list. Empty means the configuration is ineligible for
+    /// durable MESSAGE_V2 admission; TOFU never becomes local-only coverage.
+    relay_v2_required_nodes: []u64 = &.{},
+    /// Validated authoring phase and canonical full-roster digest. Current
+    /// Helix handoff binds this state monotonically so active cannot downgrade.
+    relay_v2_activation_state: relay_v2_activation.State = .{},
+    /// Non-authoritative scheduler cursor over the immutable RVL2 membership.
+    /// A bounded repair sweep resumes after the last visited peer, so one down
+    /// low-sorted neighbor cannot consume every frame/byte slot forever.
+    relay_v2_peer_cursor: usize = 0,
+    /// Test-only deterministic fault seam. Protected by `relay_v2_replay_mu`;
+    /// see RelayV2AckDropTestState.
+    test_drop_relay_v2_ack: RelayV2AckDropTestState = .{},
     /// Decoded `[mesh].admission_roots` MeshPass token signer roots. Empty keeps
     /// the shared-secret admission path; non-empty requires signed tokens.
     meshpass_roots: []meshpass.TrustRoot = &.{},
@@ -3177,6 +3408,22 @@ pub const LinuxServer = struct {
     /// Count of reactor workers currently parked for the quiesce above. The
     /// sealer waits for `live workers - 1` parks before touching foreign shards.
     upgrade_parked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Sibling owners that have canceled and reaped every exact RECV/SEND CQE.
+    /// The coordinator does not release the mailbox-drain phase until all owners
+    /// reached this point, so no late socket input can enqueue behind an already
+    /// parked target shard.
+    upgrade_io_quiesced: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    upgrade_io_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    upgrade_resume_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    upgrade_expected_siblings: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    upgrade_coordinator_shard: std.atomic.Value(u32) = std.atomic.Value(u32).init(no_quiesce_shard),
+    upgrade_coordinator_resumed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Nonzero only in tests: pointer to a caller-owned capture buffer consumed
+    /// by reactor 0 at the same end-of-CQE-batch safe point as real UPGRADE.
+    test_live_upgrade_capture_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Phase barrier released by the coordinator after every owner stopped
+    /// socket input. Each sibling then drains its final fabric mailbox and parks.
+    upgrade_drain_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     world: world_model.World,
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
@@ -3369,9 +3616,27 @@ pub const LinuxServer = struct {
     /// between the reactor thread (WEBHOOK command create/delete) and the
     /// off-thread HTTP listener (token verify only); mutex-guarded internally.
     webhook_store: webhook_mod.WebhookStore = .{},
+    /// True only when the authoritative Helix webhook checkpoint has already
+    /// replaced the fresh boot store. `startWebhook` must then preserve that
+    /// exact image instead of appending the potentially stale disk snapshot.
+    inherited_webhook_store_restored: bool = false,
     /// Validated, sanitised webhook posts handed from the HTTP listener thread to
     /// reactor 0, which fans each into its bound channel on-thread. Lock-free MPMC.
     webhook_posts: webhook_mod.PostQueue = webhook_mod.PostQueue.init(),
+    /// Failure-unwind health lane for a paused Helix webhook listener. Atomic
+    /// because an UPGRADE coordinator may not be reactor 0; reactor 0's timer
+    /// performs one bounded resume attempt per sweep until the same retained
+    /// listener is serving again.
+    webhook_resume_pending: std.atomic.Value(bool) = .init(false),
+    webhook_resume_attempts: std.atomic.Value(u32) = .init(0),
+    /// Closes the cross-shard race between a new coordinator pausing the HTTP
+    /// producer and reactor 0's old failure-retry timer. Published before pause()
+    /// and cleared only after that generation's owners/World have unwound.
+    webhook_upgrade_pause_active: std.atomic.Value(bool) = .init(false),
+    /// Serializes server-level pause/resume/shutdown decisions. The module owns
+    /// its internal thread mutex; this outer gate closes the higher-level TOCTOU
+    /// between reactor-0 retry and a coordinator beginning a new pause wave.
+    webhook_lifecycle_gate: std.atomic.Mutex = .unlocked,
     /// Optional plaintext webhook HTTP listener (loopback by default). Started in
     /// `start()` when `webhook_enabled` and `webhook_port != 0`; joined in
     /// `deinit()`. Re-created on the new process across a USR2 hot-upgrade.
@@ -3434,6 +3699,17 @@ pub const LinuxServer = struct {
     /// what they missed. The ring can serialize to a snapshot (persistence
     /// wiring is a follow-up); today it is per-process-lifetime.
     event_history: event_history_mod.EventHistory(512) = .{},
+    /// Durable daemon-global replay/equivocation authority for signed OEVT v2.
+    /// Per-link seen sets only suppress immediate reflection; this guard is the
+    /// delivery/history/reflood correctness boundary across every mesh path.
+    event_spine_replay_guard: event_spine_replay_guard.Guard,
+    /// Serializes replay admission with stable OEH1 insertion/checkpointing.
+    /// EventHistory has its own reader lock, but those two authorities must move
+    /// through one mutation lane so no accepted event is observable in only one.
+    event_spine_replay_mu: std.atomic.Mutex = .unlocked,
+    /// An inherited OEH1 checkpoint outranks the periodic disk snapshot. Keep
+    /// start() from replacing the exact exec-boundary ring with older disk data.
+    inherited_event_history_restored: bool = false,
     /// Lock-free per-category/severity Event Spine counters (since boot) for
     /// `EVENT STATS`. Incremented at the same two points as the history ring.
     event_stats: event_history_mod.EventStats = .{},
@@ -3740,7 +4016,22 @@ pub const LinuxServer = struct {
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
-    pub fn init(allocator: std.mem.Allocator, raw_config: Config) !LinuxServer {
+    /// Construct directly into caller-owned storage. `self` is written exactly
+    /// once, at the final assignment, so every errdefer below still unwinds a
+    /// partially-built image the same way the by-value `init` did.
+    ///
+    /// Prefer this over `init` for heap fixtures. Debug builds give each
+    /// temporary its own stack slot with little reuse, so materializing the
+    /// ~2 MB LinuxServer by value costs a multiple of that in frame space
+    /// (measured: a 33.6 MB frame against the stock 8 MB limit, which
+    /// segfaults the Helix gate). Writing through a result pointer keeps the
+    /// big inline subsystem arrays (webhook_posts, trace_recorder,
+    /// oper_grants, event_history, ...) off the stack entirely.
+    pub fn initInPlace(
+        self: *LinuxServer,
+        allocator: std.mem.Allocator,
+        raw_config: Config,
+    ) !void {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
         // Ignore SIGPIPE process-wide. The reactors do socket I/O through io_uring
@@ -3794,6 +4085,17 @@ pub const LinuxServer = struct {
         var whowas_store = try WhowasStore.init(allocator);
         errdefer whowas_store.deinit();
 
+        var relay_replay_guard = try relay_v2_replay_guard.Guard.init(allocator, .{});
+        errdefer relay_replay_guard.deinit();
+        var relay_outbox = try relay_v2_outbox.Outbox.init(allocator, relay_v2_outbox.default_max_entries);
+        errdefer relay_outbox.deinit();
+        var relay_event_log = try relay_v2_event_log.EventLog.init(allocator, .{});
+        errdefer relay_event_log.deinit();
+        var delivery_spool = try attachment_delivery_spool.Spool.init(allocator, .{});
+        errdefer delivery_spool.deinit();
+        var event_replay_guard = try event_spine_replay_guard.Guard.init(allocator, .{});
+        errdefer event_replay_guard.deinit();
+
         // Parse the [mesh].connect auto-dial table once: invalid "host:port"
         // specs are logged and dropped so one typo never blocks the others.
         var mesh_dials: []MeshDial = &.{};
@@ -3843,6 +4145,44 @@ pub const LinuxServer = struct {
         }
         errdefer if (mesh_trusted_node_keys.len != 0) allocator.free(mesh_trusted_node_keys);
 
+        const relay_v2_activation_state = try computeRelayV2ActivationState(
+            allocator,
+            config,
+            mesh_trusted_node_keys,
+        );
+
+        var relay_v2_required_nodes: []u64 = &.{};
+        if (config.mesh_trust_roots.len != 0 and
+            mesh_trusted_node_keys.len == config.mesh_trust_roots.len and
+            mesh_trusted_node_keys.len + 1 <= relay_event_log.config.max_confirmed_nodes_per_row)
+        {
+            const nodes = try allocator.alloc(u64, mesh_trusted_node_keys.len + 1);
+            var valid_membership = config.node_id != 0;
+            nodes[0] = config.node_id;
+            for (mesh_trusted_node_keys, nodes[1..]) |key, *node| {
+                node.* = node_short_id.shortId(node_identity.nodeIdFromPublicKey(key));
+            }
+            std.mem.sort(u64, nodes, {}, std.sort.asc(u64));
+            for (nodes[1..], nodes[0 .. nodes.len - 1]) |node, prior| {
+                if (node == prior) {
+                    valid_membership = false;
+                    break;
+                }
+            }
+            if (valid_membership) {
+                relay_v2_required_nodes = nodes;
+            } else {
+                allocator.free(nodes);
+                srvLog("orochi: MESSAGE_V2 durable membership disabled: trust roots contain the local node, duplicates, or short-id collisions\n", .{});
+            }
+        } else if (config.node_identity != null) {
+            srvLog("orochi: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set\n", .{});
+        }
+        errdefer if (relay_v2_required_nodes.len != 0) allocator.free(relay_v2_required_nodes);
+        if (relay_v2_activation_state.activation_epoch != 0 and
+            relay_v2_required_nodes.len != mesh_trusted_node_keys.len + 1)
+            return error.InvalidRelayV2ActivationPlan;
+
         var meshpass_roots: []meshpass.TrustRoot = &.{};
         if (config.mesh_admission_roots.len != 0) {
             var valid_roots: usize = 0;
@@ -3889,7 +4229,7 @@ pub const LinuxServer = struct {
             .max_headlines = @intCast(@min(config.news_count, 5)),
         });
 
-        return .{
+        self.* = .{
             .allocator = allocator,
             .config = config,
             .owned_disabled_features = runtime_features.owned_disabled_features,
@@ -3904,6 +4244,10 @@ pub const LinuxServer = struct {
                 .disabled_plugins = config.wasm_disabled_plugins,
             }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
+            .relay_v2_replay_guard = relay_replay_guard,
+            .relay_v2_outbox = relay_outbox,
+            .relay_v2_event_log = relay_event_log,
+            .attachment_delivery_spool = delivery_spool,
             .tls_ticket_key = tls_ticket_key,
             .native_stream_key = blk: {
                 var k: [16]u8 = undefined;
@@ -3913,6 +4257,8 @@ pub const LinuxServer = struct {
             .reactors = reactors,
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
+            .relay_v2_required_nodes = relay_v2_required_nodes,
+            .relay_v2_activation_state = relay_v2_activation_state,
             .meshpass_roots = meshpass_roots,
             .mesh_admission_token = mesh_admission_token,
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
@@ -3940,6 +4286,7 @@ pub const LinuxServer = struct {
             .totp = totp_auth.TotpStore.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .search_index = search_index_mod.SearchIndex.initWithConfig(allocator, config.search_index_config),
+            .event_spine_replay_guard = event_replay_guard,
             .chanstats = chanstats_mod.ChanStats.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
@@ -4009,10 +4356,27 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// By-value construction, kept for callers that own the result directly.
+    /// This materializes the whole ~2 MB image in the caller's frame; a fixture
+    /// that already has heap storage should call `initInPlace` instead so the
+    /// image is never staged on the stack at all.
+    pub fn init(allocator: std.mem.Allocator, raw_config: Config) !LinuxServer {
+        var self: LinuxServer = undefined;
+        try self.initInPlace(allocator, raw_config);
+        return self;
+    }
+
     /// Run module init→ready lifecycle once the server is at its final address
     /// (called by main after construction; init() returns by value so `self`
     /// is not stable inside it).
     pub fn start(self: *LinuxServer) void {
+        // An inherited arena is an unpublished authoritative image. Starting
+        // webhook/media/metrics workers before it is adopted lets off-reactor
+        // producers observe and mutate the fresh boot image, then race the
+        // atomic replacement. This is a programmer-ordering invariant, so fail
+        // the process rather than limp into a partially resumed daemon.
+        if (!self.inheritedStateConsumedBeforeServices())
+            @panic("Server.start called before adoptInheritedSessions consumed the inherited Helix handoff");
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
         // Holding area for cross-mesh live-session migration capsules awaiting the
@@ -4030,7 +4394,7 @@ pub const LinuxServer = struct {
         // survive a restart or USR2 hot-upgrade.
         self.loadChanstats();
         // Restore the Event Spine history ring (EVENT REPLAY) the same way.
-        self.loadEventHistory();
+        self.restoreEventHistoryAtStart();
         if (self.config.media_enabled) {
             const frame_cap: usize = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)));
             self.media_plane.max_frame_bytes = frame_cap;
@@ -4077,6 +4441,11 @@ pub const LinuxServer = struct {
         }
         self.startMetrics();
         self.startWebhook();
+    }
+
+    fn inheritedStateConsumedBeforeServices(self: *const LinuxServer) bool {
+        return self.config.resume_arena_fd == null and
+            !self.config.inherited_state_fd_manifest_present;
     }
 
     /// Stand up the live Prometheus `/metrics` HTTP listener when configured.
@@ -4155,7 +4524,7 @@ pub const LinuxServer = struct {
         if (self.config.webhook_store_path.len == 0) {
             srvLog("orochi: webhook endpoint has no [webhook] store_path — bindings will NOT survive a restart or USR2 upgrade\n", .{});
         }
-        self.loadWebhooks();
+        self.restoreWebhooksAtStart();
         const sink = webhook_mod.PostSink{ .ctx = self, .submit = webhookSubmit };
         self.webhook_server = webhook_http.WebhookServer.init(
             &self.webhook_store,
@@ -4216,6 +4585,93 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Producer-barrier drain for Helix. `WebhookServer.pause()` has already
+    /// joined the HTTP thread, all socket owners are quiesced, and the caller
+    /// holds World. Rebind to reactor 0 so injected deliveries use the same
+    /// ownership/routing geometry as the ordinary on-thread drain, then empty
+    /// the finite queue completely before the authoritative fixed point.
+    fn drainWebhookPostsForUpgradeLocked(self: *LinuxServer) void {
+        if (self.reactors.len == 0) return;
+        const saved_reactor = current_reactor;
+        defer current_reactor = saved_reactor;
+        current_reactor = &self.reactors[0];
+        while (self.webhook_posts.pop()) |post| self.injectWebhookPost(&post);
+    }
+
+    fn publishWebhookResumeHealth(self: *LinuxServer, world_locked: bool, severity: event_spine.EventSeverity, msg: []const u8) void {
+        if (world_locked) {
+            self.publishOperEvent(.oper_action, severity, msg) catch {};
+            return;
+        }
+        self.world.lockWrite();
+        self.publishOperEvent(.oper_action, severity, msg) catch {};
+        self.world.unlockWrite();
+    }
+
+    /// Try to restart a producer paused for Helix failure unwind. Never accept a
+    /// new HTTP post while an older socket-quiesce generation is still RESUMING:
+    /// that would publish behind a state boundary whose owners are fail-closed.
+    /// Spawn failures remain scheduled for reactor 0's timer instead of turning
+    /// one transient resource error into a permanent webhook outage.
+    fn tryResumeWebhookAfterUpgrade(self: *LinuxServer, world_locked: bool) void {
+        var blocked = false;
+        var missing = false;
+        var resume_error: ?anyerror = null;
+        lockSpin(&self.webhook_lifecycle_gate);
+        if (self.webhook_upgrade_pause_active.load(.acquire) or
+            self.upgrade_quiesce_shard.load(.acquire) != no_quiesce_shard)
+        {
+            blocked = true;
+        } else if (self.webhook_server) |*ws| {
+            ws.resumeServing() catch |e| {
+                resume_error = e;
+            };
+        } else {
+            missing = true;
+        }
+        self.webhook_lifecycle_gate.unlock();
+
+        // Health publication happens only after releasing the lifecycle gate;
+        // CompletionHandler may already hold World on timer retry, and taking
+        // the two locks in opposite orders would deadlock pause/unwind.
+        if (blocked) {
+            self.webhook_resume_pending.store(true, .release);
+            const old = self.webhook_resume_attempts.fetchAdd(1, .acq_rel);
+            if (old == 0 or old % 64 == 63) {
+                srvLog("orochi: CRITICAL webhook listener remains paused: UPGRADE owners have not fully resumed\n", .{});
+            }
+            return;
+        }
+        if (missing) {
+            self.webhook_resume_pending.store(false, .release);
+            self.webhook_resume_attempts.store(0, .release);
+            return;
+        }
+        if (resume_error) |e| {
+            self.webhook_resume_pending.store(true, .release);
+            const old = self.webhook_resume_attempts.fetchAdd(1, .acq_rel);
+            if (old == 0 or old % 64 == 63) {
+                srvLog("orochi: CRITICAL webhook listener resume failed ({s}); retry scheduled\n", .{@errorName(e)});
+            }
+            if (old == 0)
+                self.publishWebhookResumeHealth(world_locked, .critical, "Webhook listener resume failed after UPGRADE; bounded timer retry scheduled");
+            return;
+        }
+        const attempts = self.webhook_resume_attempts.swap(0, .acq_rel);
+        self.webhook_resume_pending.store(false, .release);
+        if (attempts != 0) {
+            srvLog("orochi: webhook listener resumed after {d} deferred attempt(s)\n", .{attempts});
+            self.publishWebhookResumeHealth(world_locked, .info, "Webhook listener recovered after UPGRADE failure unwind");
+        }
+    }
+
+    fn retryWebhookResumeIfPending(self: *LinuxServer) void {
+        if (self.rx() != &self.reactors[0]) return;
+        if (!self.webhook_resume_pending.load(.acquire)) return;
+        // CompletionHandler holds World around onTimerTick.
+        self.tryResumeWebhookAfterUpgrade(true);
+    }
+
     /// Fan a validated, pre-sanitised webhook post into its bound channel as a
     /// synthetic bot sender, mirror it to the mesh, and record it in CHATHISTORY.
     /// Runs on reactor 0 (the delivery path routes cross-shard via `deliverTagged`).
@@ -4259,7 +4715,7 @@ pub const LinuxServer = struct {
             };
             var msg_buf: [default_reply_bytes]u8 = undefined;
             const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{chan}, line) catch continue;
-            self.broadcastChannelTagged(chan, tags, msg, null) catch {};
+            self.broadcastChannelTagged(chan, tags, msg, null, .ordinary) catch {};
 
             // Mesh relay so remote members of `chan` see the post too. Loop-guarded.
             var relay_msg = s2s_link.RelayMessage{
@@ -4306,6 +4762,11 @@ pub const LinuxServer = struct {
         defer self.allocator.free(text);
         const restored = self.webhook_store.load(text, self.nowMs(), self.webhookRate());
         if (restored != 0) srvLog("orochi: restored {d} webhook binding(s)\n", .{restored});
+    }
+
+    fn restoreWebhooksAtStart(self: *LinuxServer) void {
+        if (self.inherited_webhook_store_restored) return;
+        self.loadWebhooks();
     }
 
     /// `WEBHOOK CREATE <#channel> [name] | LIST <#channel> | DELETE <id>` —
@@ -4608,10 +5069,12 @@ pub const LinuxServer = struct {
         // Stop + join the webhook listener before anything it might touch (the
         // shared store) is torn down. shutdown() closes the fd and joins; the
         // store is an inline value with no heap to free.
+        lockSpin(&self.webhook_lifecycle_gate);
         if (self.webhook_server) |*ws| {
             ws.shutdown();
             self.webhook_server = null;
         }
+        self.webhook_lifecycle_gate.unlock();
         self.metrics_snapshot.deinit();
         if (self.owned_disabled_features) |owned| {
             self.allocator.free(owned);
@@ -4658,6 +5121,13 @@ pub const LinuxServer = struct {
         }
         self.history.deinit();
         self.search_index.deinit();
+        for (self.relay_v2_deferred[0..self.relay_v2_deferred_len]) |*pending|
+            pending.deinit(self.allocator);
+        self.relay_v2_outbox.deinit();
+        self.relay_v2_event_log.deinit();
+        self.relay_v2_replay_guard.deinit();
+        self.attachment_delivery_spool.deinit();
+        self.event_spine_replay_guard.deinit();
         self.chanstats.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
@@ -4778,6 +5248,7 @@ pub const LinuxServer = struct {
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         self.inherited_mesh_redials.deinit(self.allocator);
         if (self.mesh_trusted_node_keys.len != 0) self.allocator.free(self.mesh_trusted_node_keys);
+        if (self.relay_v2_required_nodes.len != 0) self.allocator.free(self.relay_v2_required_nodes);
         if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
         if (self.mesh_admission_token.len != 0) self.allocator.free(self.mesh_admission_token);
         if (self.fabric) |*f| f.deinit();
@@ -4786,6 +5257,7 @@ pub const LinuxServer = struct {
 
     /// Arm the accept SQE if needed. Submission is batched by `runOnce`.
     pub fn armAccept(self: *LinuxServer) !void {
+        if (self.rx().socket_io_quiescing) return;
         if (!self.rx().accept_armed) {
             try self.rx().ring.submitAccept(listener_token, self.rx().listener_fd);
             self.rx().accept_armed = true;
@@ -4856,6 +5328,8 @@ pub const LinuxServer = struct {
         // append, then sweep again for failures discovered while draining.
         self.abortPoisonedDeliveries();
         self.drainFabric();
+        self.drainAttachmentSpoolForCurrentReactor();
+        if (self.rx() == &self.reactors[0]) self.retryRelayV2Outbox();
         self.abortPoisonedDeliveries();
     }
 
@@ -4868,12 +5342,21 @@ pub const LinuxServer = struct {
     /// gone (the connection closed before its bytes arrived) is dropped; its
     /// buffer is still released so the pool never leaks.
     fn drainFabric(self: *LinuxServer) void {
-        const fabric = if (self.fabric) |*f| f else return;
+        _ = self.drainFabricCount();
+    }
+
+    /// Counted form used by the Helix final fixed point. A delivery drained on a
+    /// later shard may enqueue work back to an earlier shard, so a single linear
+    /// sweep is not a proof that the complete fabric is empty.
+    fn drainFabricCount(self: *LinuxServer) usize {
+        const fabric = if (self.fabric) |*f| f else return 0;
         const my_shard = self.rx().shard_id;
         var msgs: [64]reactor_fabric.DeliverMsg = undefined;
+        var drained: usize = 0;
         while (true) {
             const n = fabric.drain(my_shard, &msgs);
             if (n == 0) break;
+            drained += n;
             for (msgs[0..n]) |msg| {
                 // Every buffer this reactor drains was acquired for ITS shard, so
                 // it goes back to this shard's pool.
@@ -4905,8 +5388,13 @@ pub const LinuxServer = struct {
                     // `bytes` is the raw chatsvc event BODY; render the per-recipient
                     // `:<origin> EVENT <target> <body>` line for each local subscriber
                     // (target = that subscriber's own nick), matching the origin shard.
-                    var tag_buf: [128]u8 = undefined;
-                    const tags = event_spine.buildEventTags(&tag_buf, category, severity) catch "";
+                    const stable_identity: ?EventSpineDeliveryIdentity = if (msg.broadcast_has_event_identity)
+                        .{
+                            .event_id = msg.broadcast_event_id,
+                            .origin_time_ms = msg.broadcast_event_time_ms,
+                        }
+                    else
+                        null;
                     var it = self.rx().clients.iterator();
                     while (it.next()) |entry| {
                         const c = entry.value;
@@ -4922,7 +5410,8 @@ pub const LinuxServer = struct {
                         // MEDIA events stay member-scoped on this shard too.
                         if (!self.mediaEventAllowed(entry.id, &c.session, bytes)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
-                        const client_tags = if (c.session.hasCap(.message_tags)) tags else "";
+                        var tag_buf: [256]u8 = undefined;
+                        const client_tags = eventSpineDeliveryTags(&c.session, category, severity, stable_identity, &tag_buf);
                         const line = event_spine.renderEventTagged(client_tags, origin, c.session.displayName(), bytes, &line_buf) catch continue;
                         appendToConn(c, line) catch {
                             self.poisonOwnedDelivery(c);
@@ -4965,6 +5454,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        return drained;
     }
 
     /// Keep exactly one periodic timeout-sweep timer in flight.
@@ -5039,6 +5529,8 @@ pub const LinuxServer = struct {
         // work. Disconnect it before any timer-driven projection or retry can
         // enqueue a later event to that generation.
         self.abortPoisonedDeliveries();
+        self.drainAttachmentSpoolForCurrentReactor();
+        self.retryWebhookResumeIfPending();
         // SIGUSR2 → connection-preserving Helix UPGRADE. Polled here (out of
         // signal context) and gated to reactor 0 — the reactor that owns the
         // listener + every client connection the upgrade carries. `swap`
@@ -5046,9 +5538,7 @@ pub const LinuxServer = struct {
         // upgrade. On success `performUpgrade` execve's and never returns; a
         // failure is logged and the daemon keeps serving.
         if (self.rx() == &self.reactors[0] and upgrade_signal_requested.swap(false, .seq_cst)) {
-            self.performUpgrade(null) catch |e| {
-                srvLog("orochi: SIGUSR2 UPGRADE failed: {s}\n", .{@errorName(e)});
-            };
+            self.deferUpgrade(.signal);
         }
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
         if (self.rx() == &self.reactors[0]) self.maybeSwapOcspStaple();
@@ -5076,6 +5566,8 @@ pub const LinuxServer = struct {
             // shared-state maintenance like the sweeps above.
             if (self.pending_migrations) |*pm| _ = pm.sweep(self.nowMs(), mesh_reclaim_ttl_ms);
             self.sweepSessionReplicaStore();
+            self.retryDeferredRelayV2();
+            self.retryRelayV2Outbox();
         }
         self.sweepTempModes();
         // Keep the IRCX ACCESS store clock current on every reactor (a JOIN
@@ -5148,10 +5640,10 @@ pub const LinuxServer = struct {
                 // `world.lockWrite` (see onCompletion).
                 self.pruneStaleMeshMembers(now);
             }
-            self.resumeSessionReplicaReplays();
             self.retryDirtySessionReplicaTokens();
             self.retryDirtySessionReplicaProjections();
             self.retrySessionReplicaStoreStages();
+            self.resumeSessionReplicaReplays();
             self.retryOrphanedLocalSessionReplicaRevokes();
         }
         self.maybeWriteStats();
@@ -5211,7 +5703,7 @@ pub const LinuxServer = struct {
                 slot.value.session_replica_resync_burst_pending = true;
                 continue;
             }
-            self.sendMeshStateBurstTo(&slot.value);
+            _ = self.sendMeshStateBurstTo(&slot.value);
         }
     }
 
@@ -5796,6 +6288,22 @@ pub const LinuxServer = struct {
             if (self.partition_split) "true" else "false",
             self.partition_components,
         }) catch return w.buffered();
+        const relay_v2_roster_digest = std.fmt.bytesToHex(
+            self.relay_v2_activation_state.roster_digest,
+            .lower,
+        );
+        w.print(",\"relay_v2\":{{\"bridge_implemented\":true,\"authoring\":\"{s}\",\"authoring_eligible\":{s},\"activation_epoch\":{d},\"roster_count\":{d},\"roster_digest\":", .{
+            @tagName(self.relay_v2_activation_state.mode),
+            if (self.authoredRelayV2Configured()) "true" else "false",
+            self.relay_v2_activation_state.activation_epoch,
+            self.config.relay_v2_roster.len,
+        }) catch return w.buffered();
+        if (self.relay_v2_activation_state.activation_epoch == 0) {
+            w.writeAll("null") catch return w.buffered();
+        } else {
+            w.print("\"{s}\"", .{&relay_v2_roster_digest}) catch return w.buffered();
+        }
+        w.writeAll("}") catch return w.buffered();
         w.writeAll(",\"mesh_admission\":{\"mode\":") catch return w.buffered();
         writeJsonEscaped(&w, self.meshAdmissionMode()) catch return w.buffered();
         w.print(",\"secured_s2s\":{s},\"require_secured\":{s},\"require_signed_frames\":{s},\"roots\":{d},\"token_present\":{s},\"min_revocation_epoch\":{d}}}", .{
@@ -6076,6 +6584,173 @@ pub const LinuxServer = struct {
         self.drainWebhookPosts();
 
         _ = try self.rx().ring.submit();
+        // UPGRADE is deliberately deferred past the complete copied CQE batch,
+        // the final fabric drain, and submission of same-turn SQEs. Starting it
+        // inside a timer/command callback would snapshot state before later CQEs
+        // already copied from the ring had updated recv/send ownership.
+        self.runDeferredUpgrade();
+    }
+
+    fn deferUpgrade(self: *LinuxServer, request: DeferredUpgradeRequest) void {
+        if (self.rx().deferred_upgrade == null) self.rx().deferred_upgrade = request;
+    }
+
+    /// Run only after `runOnce` dispatched the entire copied CQE batch. The
+    /// requester is a generational id rather than a borrowed pointer; if it
+    /// disconnected later in that same batch the upgrade remains valid and its
+    /// progress falls back to the server log.
+    fn runDeferredUpgrade(self: *LinuxServer) void {
+        if (comptime builtin.is_test) {
+            if (self.rx() == &self.reactors[0]) {
+                const capture_ptr = self.test_live_upgrade_capture_ptr.swap(0, .acq_rel);
+                if (capture_ptr != 0) {
+                    const capture: *TestLiveUpgradeCapture = @ptrFromInt(capture_ptr);
+                    self.captureLiveUpgradeForTest(capture) catch |err| {
+                        capture.failure = err;
+                        capture.completed.store(true, .release);
+                    };
+                    return;
+                }
+            }
+        }
+        const request = self.rx().deferred_upgrade orelse return;
+        self.rx().deferred_upgrade = null;
+        self.performUpgrade(request) catch |err| {
+            srvLog("orochi: deferred UPGRADE failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn requestLiveUpgradeCaptureForTest(self: *LinuxServer, capture: *TestLiveUpgradeCapture) !void {
+        if (comptime !builtin.is_test) return error.Unsupported;
+        if (capture.completed.load(.acquire)) return error.InvalidInheritedHandoff;
+        if (self.test_live_upgrade_capture_ptr.cmpxchgStrong(
+            0,
+            @intFromPtr(capture),
+            .acq_rel,
+            .acquire,
+        ) != null) return error.SessionReplicaConverging;
+        self.wakeAllReactors();
+    }
+
+    /// Execute the real socket-owner safe point and production sealers, stopping
+    /// just before exec planning. Success transfers the exact carried descriptor
+    /// set out of the predecessor and stops its loop without rearming I/O; the
+    /// test harness then boots a fresh Server and exercises normal adoption.
+    fn captureLiveUpgradeForTest(self: *LinuxServer, capture: *TestLiveUpgradeCapture) !void {
+        if (comptime !builtin.is_test) return error.Unsupported;
+        if (self.rx() != &self.reactors[0]) return error.ShardQuiesceFailed;
+        const run = self.shutdown orelse return error.InvalidInheritedHandoff;
+
+        try self.quiesceSiblingReactors();
+        var owns_quiesce = true;
+        errdefer if (owns_quiesce) self.resumeSiblingReactors();
+
+        self.world.lockWrite();
+        if (self.upgradeContinuityBlockerLocked() != null) {
+            self.world.unlockWrite();
+            return error.SessionReplicaConverging;
+        }
+        var boundary_stable = false;
+        const boundary_rounds = @max(@as(usize, 2), self.config.max_clients + self.reactors.len);
+        var boundary_round: usize = 0;
+        while (boundary_round < boundary_rounds) : (boundary_round += 1) {
+            const replica_ready = self.prepareSessionReplicaUpgradeBoundary();
+            const progress = self.drainAllUpgradeFabricFixedPointLocked() catch |err| {
+                self.world.unlockWrite();
+                return err;
+            };
+            if (replica_ready and progress == 0) {
+                boundary_stable = true;
+                break;
+            }
+        }
+        self.world.unlockWrite();
+        if (!boundary_stable) return error.SessionReplicaConverging;
+
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |blob| self.allocator.free(blob);
+            blobs.deinit(self.allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(self.allocator);
+        try appendCurrentMandatoryUpgradeStateForTest(self, &pieces, &blobs);
+        _ = self.sealSessionRegistry(&pieces, &blobs) orelse return error.SessionReplicaConverging;
+
+        var total_slots: usize = 0;
+        for (self.reactors) |*reactor| total_slots += reactor.clients.slots.items.len;
+        const carried_fds = try self.allocator.alloc(linux.fd_t, total_slots);
+        defer self.allocator.free(carried_fds);
+        var carried_fd_count: usize = 0;
+        // `sealShardClients` clears CLOEXEC incrementally. Always unwind the
+        // exact accrued prefix, including failures before capture publication.
+        errdefer restoreCloexec(carried_fds[0..carried_fd_count]);
+        var counts = SealCounts{};
+        for (self.reactors) |*reactor|
+            self.sealShardClients(reactor, &pieces, &blobs, carried_fds, &carried_fd_count, &counts);
+        capture.state_fd_count = carried_fd_count;
+        if (counts.s2s_preserve_failed or counts.s2s_hint_failed or counts.fd_prepare_failed or
+            counts.clients != counts.clients_expected or
+            carried_fd_count > TestLiveUpgradeCapture.max_state_fds)
+            return error.SessionReplicaConverging;
+
+        var prepared = try helix_live.prepare(self.allocator, .{
+            .epoch = @intCast(@max(0, self.nowMs())),
+            .now_ms = self.nowMs(),
+            .timeout_ms = 5_000,
+            .arena_name = "orochi-test-live-upgrade",
+            .pieces = pieces.items,
+            .fds = &.{},
+        });
+        defer prepared.deinit();
+        const arena = prepared.runtime.arena orelse return error.SessionReplicaConverging;
+        const dup_rc = linux.dup(arena.fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return error.SocketUnavailable;
+        capture.arena_fd = @intCast(dup_rc);
+        errdefer {
+            closeFd(capture.arena_fd);
+            capture.arena_fd = -1;
+        }
+
+        @memcpy(capture.state_fds[0..carried_fd_count], carried_fds[0..carried_fd_count]);
+        capture.clients = counts.clients;
+        capture.s2s_preserved = counts.s2s_preserved;
+
+        // execve would discard the predecessor without running destructors. The
+        // in-process seam explicitly relinquishes the transferred fds so its
+        // later deinit cannot close sockets already adopted by the successor.
+        var ownership_matches: usize = 0;
+        for (carried_fds[0..carried_fd_count]) |fd| {
+            var fd_matches: usize = 0;
+            for (self.reactors) |*reactor| {
+                for (reactor.clients.slots.items) |*slot| {
+                    if (slot.occupied and slot.value.fd == fd) fd_matches += 1;
+                }
+            }
+            if (fd_matches != 1) return error.InvalidInheritedHandoff;
+            ownership_matches += 1;
+        }
+        if (ownership_matches != carried_fd_count) return error.InvalidInheritedHandoff;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                for (carried_fds[0..carried_fd_count]) |fd| {
+                    if (slot.value.fd == fd) {
+                        slot.value.fd = -1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        owns_quiesce = false;
+        run.store(false, .release);
+        // execve would terminate every parked sibling. The in-process seam must
+        // release only the park loop (with `run=false`) so workers exit without
+        // rearming any transferred socket before the harness joins them.
+        self.upgrade_quiesce_shard.store(no_quiesce_shard, .release);
+        self.wakeAllReactors();
+        capture.completed.store(true, .release);
     }
 
     pub fn boundPort(self: *LinuxServer) !u16 {
@@ -6170,23 +6845,329 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Park this reactor worker while a multi-shard UPGRADE seal owned by a
-    /// DIFFERENT shard is in flight. The parked-counter increment publishes
-    /// (release) every per-connection write this worker made before parking;
-    /// the sealer's acquire read of the counter therefore observes them all.
-    /// The park also honors the run flag so DIE/shutdown never deadlocks on a
-    /// wedged upgrade.
-    fn parkForUpgradeQuiesce(self: *LinuxServer, run: anytype) void {
-        const q = self.upgrade_quiesce_shard.load(.acquire);
-        if (q == no_quiesce_shard) return;
-        if (q < self.reactors.len and self.rx() == &self.reactors[q]) return; // the sealer itself
-        _ = self.upgrade_parked.fetchAdd(1, .acq_rel);
-        defer _ = self.upgrade_parked.fetchSub(1, .acq_rel);
-        while (self.upgrade_quiesce_shard.load(.acquire) != no_quiesce_shard) {
+    fn ownedSocketIoQuiesced(self: *LinuxServer) bool {
+        const r = self.rx();
+        if (r.accept_armed or r.s2s_accept_armed or r.tls_accept_armed or r.ws_accept_armed or
+            r.accept_cancel_pending or r.s2s_accept_cancel_pending or
+            r.tls_accept_cancel_pending or r.ws_accept_cancel_pending) return false;
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.recv_armed or slot.value.send_armed or slot.value.connect_armed) return false;
+        }
+        return true;
+    }
+
+    /// Owner-thread socket safe point. Queue exact user_data cancels for every
+    /// armed RECV/SEND, submit them, and keep reaping through the ordinary
+    /// CompletionHandler until the matching original CQEs release every buffer.
+    /// Positive/partial CQEs that beat cancellation are applied normally; only
+    /// ECANCELED changes meaning (ownership release, not EOF/stream failure).
+    fn quiesceOwnedSocketIo(self: *LinuxServer) !void {
+        const r = self.rx();
+        r.socket_io_quiescing = true;
+        var waited_ms: u64 = 0;
+        var first_err: ?anyerror = null;
+        while (!self.ownedSocketIoQuiesced()) {
+            var sq_full = false;
+            const accept_ops = [_]struct { armed: *bool, pending: *bool, token: RingFdToken }{
+                .{ .armed = &r.accept_armed, .pending = &r.accept_cancel_pending, .token = listener_token },
+                .{ .armed = &r.s2s_accept_armed, .pending = &r.s2s_accept_cancel_pending, .token = s2s_listener_token },
+                .{ .armed = &r.tls_accept_armed, .pending = &r.tls_accept_cancel_pending, .token = tls_listener_token },
+                .{ .armed = &r.ws_accept_armed, .pending = &r.ws_accept_cancel_pending, .token = ws_listener_token },
+            };
+            for (accept_ops) |op| {
+                if (!op.armed.* or op.pending.*) continue;
+                r.ring.submitExactCancel(.accept, op.token) catch |err| switch (err) {
+                    error.SubmissionQueueFull => {
+                        sq_full = true;
+                        break;
+                    },
+                    else => {
+                        if (first_err == null) first_err = err;
+                        break;
+                    },
+                };
+                op.pending.* = true;
+            }
+            for (r.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.recv_armed and !conn.recv_cancel_pending) {
+                    r.ring.submitExactCancel(.recv, conn.token) catch |err| switch (err) {
+                        error.SubmissionQueueFull => {
+                            sq_full = true;
+                            break;
+                        },
+                        else => {
+                            if (first_err == null) first_err = err;
+                            break;
+                        },
+                    };
+                    conn.recv_cancel_pending = true;
+                }
+                if (conn.send_armed and !conn.send_cancel_pending) {
+                    r.ring.submitExactCancel(.send, conn.token) catch |err| switch (err) {
+                        error.SubmissionQueueFull => {
+                            sq_full = true;
+                            break;
+                        },
+                        else => {
+                            if (first_err == null) first_err = err;
+                            break;
+                        },
+                    };
+                    conn.send_cancel_pending = true;
+                }
+                if (conn.connect_armed and !conn.connect_cancel_pending) {
+                    r.ring.submitExactCancel(.connect, conn.token) catch |err| switch (err) {
+                        error.SubmissionQueueFull => {
+                            sq_full = true;
+                            break;
+                        },
+                        else => {
+                            if (first_err == null) first_err = err;
+                            break;
+                        },
+                    };
+                    conn.connect_cancel_pending = true;
+                }
+            }
+
+            // Submit both the cancels and any same-turn SQEs queued before the
+            // deferred safe point. Nonblocking reap avoids hanging forever on an
+            // operation whose cancel raced a completion already in the CQ.
+            _ = r.ring.submit() catch |err| blk: {
+                if (first_err == null) first_err = err;
+                break :blk 0;
+            };
+            var handler = CompletionHandler{ .server = self };
+            var cqes: [ringlane.max_cqe_batch]linux.io_uring_cqe = undefined;
+            const cqe_batch = @min(@as(usize, self.config.cqe_batch), cqes.len);
+            r.ring.reapCompletions(cqes[0..cqe_batch], 0, &handler) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+            if (handler.err) |err| {
+                if (first_err == null) first_err = err;
+            }
+            if (self.ownedSocketIoQuiesced()) break;
+            if (waited_ms >= 5_000) return first_err orelse error.SocketIoQuiesceFailed;
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+            waited_ms += 1;
+            if (sq_full or waited_ms % 200 == 0) self.wakeReactor();
+        }
+        if (first_err) |err| return err;
+    }
+
+    /// After every owner stopped socket input, drain this owner's final mailbox.
+    /// At that point no later RECV can enqueue behind this drain, so the sealed
+    /// SendQ includes every cross-shard delivery accepted before the boundary.
+    fn drainUpgradeFabric(self: *LinuxServer) void {
+        if (self.fabric == null) return;
+        self.world.lockWrite();
+        self.abortPoisonedDeliveries();
+        self.drainFabric();
+        self.abortPoisonedDeliveries();
+        self.world.unlockWrite();
+    }
+
+    /// With every socket owner quiesced and every sibling parked, rebind this
+    /// coordinator thread to each reactor and drain until a complete all-shard
+    /// pass makes no progress. The caller already holds World. Rebinding is safe
+    /// here because socket_io_quiescing prevents delivery helpers from submitting
+    /// to a foreign SINGLE_ISSUER ring; they only mutate the state being sealed.
+    fn drainAllUpgradeFabricFixedPointLocked(self: *LinuxServer) !usize {
+        const saved_reactor = current_reactor;
+        defer current_reactor = saved_reactor;
+
+        var total_slots: usize = 0;
+        const inline_fallback = self.pool.count() == 0;
+        for (self.reactors) |*r| {
+            const inactive_foreign = inline_fallback and r != self.rx() and !r.socket_io_quiescing;
+            if (r.accept_armed or r.s2s_accept_armed or r.tls_accept_armed or r.ws_accept_armed or
+                r.accept_cancel_pending or r.s2s_accept_cancel_pending or
+                r.tls_accept_cancel_pending or r.ws_accept_cancel_pending)
+                return error.UpgradeSocketOwnerNotQuiesced;
+            if (inactive_foreign and r.clients.len() != 0)
+                return error.UpgradeSocketOwnerNotQuiesced;
+            total_slots = std.math.add(usize, total_slots, r.clients.slots.items.len) catch
+                return error.UpgradeFabricDidNotQuiesce;
+            for (r.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.recv_armed or conn.send_armed or conn.connect_armed or
+                    conn.recv_cancel_pending or conn.send_cancel_pending or conn.connect_cancel_pending)
+                    return error.UpgradeSocketOwnerNotQuiesced;
+            }
+            if (!r.socket_io_quiescing and !inactive_foreign)
+                return error.UpgradeSocketOwnerNotQuiesced;
+        }
+        const fabric_budget = if (self.fabric == null)
+            0
+        else
+            std.math.mul(
+                usize,
+                reactor_fabric.ReactorFabric.capacity,
+                self.reactors.len,
+            ) catch return error.UpgradeFabricDidNotQuiesce;
+        const max_passes = std.math.add(usize, total_slots, fabric_budget) catch
+            return error.UpgradeFabricDidNotQuiesce;
+
+        var pass: usize = 0;
+        var total_progress: usize = 0;
+        while (pass <= max_passes) : (pass += 1) {
+            var progress: usize = 0;
+            for (self.reactors) |*r| {
+                if (inline_fallback and r != self.rx() and !r.socket_io_quiescing) continue;
+                current_reactor = r;
+                progress += self.abortPoisonedDeliveriesCount();
+                progress += self.drainFabricCount();
+                progress += self.abortPoisonedDeliveriesCount();
+            }
+            if (progress == 0) {
+                // No drain path may have reacquired kernel ownership while the
+                // thread was rebound. Revalidate every active owner at the exact
+                // zero-progress boundary rather than trusting the entry check.
+                for (self.reactors) |*r| {
+                    if (inline_fallback and r != self.rx() and !r.socket_io_quiescing) continue;
+                    if (!r.socket_io_quiescing or r.accept_armed or r.s2s_accept_armed or
+                        r.tls_accept_armed or r.ws_accept_armed) return error.UpgradeSocketOwnerNotQuiesced;
+                    for (r.clients.slots.items) |*slot| {
+                        if (!slot.occupied) continue;
+                        const conn = &slot.value;
+                        if (conn.recv_armed or conn.send_armed or conn.connect_armed or
+                            conn.recv_cancel_pending or conn.send_cancel_pending or conn.connect_cancel_pending)
+                            return error.UpgradeSocketOwnerNotQuiesced;
+                    }
+                }
+                return total_progress;
+            }
+            total_progress = std.math.add(usize, total_progress, progress) catch
+                return error.UpgradeFabricDidNotQuiesce;
+        }
+        return error.UpgradeFabricDidNotQuiesce;
+    }
+
+    /// Failure-path owner resume. Re-enable arming, stage every live/closing
+    /// connection through the existing fair activator, and submit the first
+    /// bounded page immediately. Further pages retain their normal wake retry.
+    fn resumeOwnedSocketIo(self: *LinuxServer) void {
+        const r = self.rx();
+        // Never reinterpret a late exact-cancel CQE as ordinary EOF/error. Drain
+        // issued cancellations to their original CQEs before clearing the
+        // no-rearm mode; if the ring is still unhealthy, keep the owner quiesced
+        // and let a later recovery turn finish it rather than corrupt the stream.
+        if (!self.ownedSocketIoQuiesced()) _ = self.quiesceOwnedSocketIo() catch {};
+        if (!self.ownedSocketIoQuiesced()) return;
+        r.socket_io_quiescing = false;
+        r.accept_cancel_pending = false;
+        r.s2s_accept_cancel_pending = false;
+        r.tls_accept_cancel_pending = false;
+        r.ws_accept_cancel_pending = false;
+        self.armAccept() catch self.wakeReactor();
+        for (r.clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const conn = &slot.value;
+            if (!conn.recv_armed) conn.recv_cancel_pending = false;
+            if (!conn.send_armed) conn.send_cancel_pending = false;
+            if (!conn.connect_armed) conn.connect_cancel_pending = false;
+            if (conn.connect_rearm_pending) {
+                self.armConnect(conn) catch {
+                    self.wakeReactor();
+                    continue;
+                };
+                if (conn.connect_armed) conn.connect_rearm_pending = false;
+                continue;
+            }
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = !conn.closing;
+        }
+        _ = self.activatePendingSocketIo() catch {};
+        _ = r.ring.submit() catch {};
+    }
+
+    /// Complete this sibling's half of the RESUMING barrier exactly once. The
+    /// caller stays inside this invocation until the coordinator publishes
+    /// IDLE, so one worker can neither acknowledge twice nor begin a new loop
+    /// turn while an older generation is still unwinding.
+    fn finishUpgradeResumeIfComplete(self: *LinuxServer) void {
+        if (!self.upgrade_coordinator_resumed.load(.acquire)) return;
+        if (self.upgrade_resume_done.load(.acquire) != self.upgrade_expected_siblings.load(.acquire)) return;
+        if (self.upgrade_quiesce_shard.cmpxchgStrong(
+            resuming_quiesce_shard,
+            no_quiesce_shard,
+            .acq_rel,
+            .acquire,
+        ) == null) self.wakeAllReactors();
+    }
+
+    fn resumeUpgradeSiblingAndWait(self: *LinuxServer, run: anytype) void {
+        while (self.rx().socket_io_quiescing) {
+            if (!run.load(.acquire)) return;
+            self.resumeOwnedSocketIo();
+            if (!self.rx().socket_io_quiescing) break;
+            self.upgrade_io_failed.store(true, .release);
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+        }
+        _ = self.upgrade_resume_done.fetchAdd(1, .acq_rel);
+        self.finishUpgradeResumeIfComplete();
+        while (self.upgrade_quiesce_shard.load(.acquire) == resuming_quiesce_shard) {
             if (!run.load(.acquire)) return;
             var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
             _ = linux.nanosleep(&req, null);
         }
+    }
+
+    /// Park this reactor worker while a multi-shard UPGRADE seal owned by a
+    /// DIFFERENT shard is in flight. Before publishing its park, the owner
+    /// cancels/reaps its own exact socket operations, joins the all-owner barrier,
+    /// drains its final fabric mailbox, and only then exposes stable snapshot
+    /// state to the sealer.
+    fn parkForUpgradeQuiesce(self: *LinuxServer, run: anytype) void {
+        const q = self.upgrade_quiesce_shard.load(.acquire);
+        if (q == no_quiesce_shard) return;
+        if (q == initializing_quiesce_shard) return;
+        if (q == resuming_quiesce_shard) {
+            if (self.rx().shard_id == self.upgrade_coordinator_shard.load(.acquire)) {
+                while (self.upgrade_quiesce_shard.load(.acquire) == resuming_quiesce_shard and run.load(.acquire)) {
+                    if (self.rx().socket_io_quiescing) self.resumeOwnedSocketIo();
+                    if (!self.rx().socket_io_quiescing) {
+                        self.upgrade_coordinator_resumed.store(true, .release);
+                        self.finishUpgradeResumeIfComplete();
+                    }
+                    var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                    _ = linux.nanosleep(&req, null);
+                }
+                return;
+            }
+            self.resumeUpgradeSiblingAndWait(run);
+            return;
+        }
+        if (q < self.reactors.len and self.rx() == &self.reactors[q]) return; // the sealer itself
+
+        self.quiesceOwnedSocketIo() catch {
+            self.upgrade_io_failed.store(true, .release);
+        };
+        _ = self.upgrade_io_quiesced.fetchAdd(1, .acq_rel);
+        while (!self.upgrade_drain_ready.load(.acquire) and
+            self.upgrade_quiesce_shard.load(.acquire) == q)
+        {
+            if (!run.load(.acquire)) break;
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+        }
+        if (self.upgrade_quiesce_shard.load(.acquire) != q) {
+            self.resumeUpgradeSiblingAndWait(run);
+            return;
+        }
+        self.drainUpgradeFabric();
+        _ = self.upgrade_parked.fetchAdd(1, .acq_rel);
+        while (self.upgrade_quiesce_shard.load(.acquire) == q) {
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+        }
+        self.resumeUpgradeSiblingAndWait(run);
     }
 
     /// Quiesce every OTHER reactor worker so the calling thread may seal all
@@ -6197,19 +7178,39 @@ pub const LinuxServer = struct {
     /// never parks aborts the upgrade (`error.ShardQuiesceFailed`) rather than
     /// sealing state a live thread still mutates.
     fn quiesceSiblingReactors(self: *LinuxServer) !void {
-        if (self.reactors.len <= 1) return;
         const workers = self.pool.count();
         const expected: u32 = if (workers == 0) 0 else @intCast(workers - 1);
         // CAS-claim the quiesce: two racing UPGRADEs (SIGUSR2 on reactor 0 vs
         // an oper /UPGRADE on another shard) must never both seal — the loser
         // refuses (its worker then parks, letting the winner proceed).
-        if (self.upgrade_quiesce_shard.cmpxchgStrong(no_quiesce_shard, self.rx().shard_id, .acq_rel, .acquire) != null) {
+        if (self.upgrade_quiesce_shard.cmpxchgStrong(no_quiesce_shard, initializing_quiesce_shard, .acq_rel, .acquire) != null)
             return error.ShardQuiesceFailed;
-        }
-        if (expected == 0) return;
+        self.upgrade_coordinator_shard.store(self.rx().shard_id, .release);
+        self.upgrade_coordinator_resumed.store(false, .release);
+        self.upgrade_expected_siblings.store(expected, .release);
+        self.upgrade_parked.store(0, .release);
+        self.upgrade_io_quiesced.store(0, .release);
+        self.upgrade_resume_done.store(0, .release);
+        self.upgrade_io_failed.store(false, .release);
+        self.upgrade_drain_ready.store(false, .release);
+        self.upgrade_quiesce_shard.store(self.rx().shard_id, .release);
         self.wakeAllReactors();
+
+        // The coordinator is an owner too. It stops its own socket input before
+        // releasing the final-mailbox drain phase to siblings.
+        self.quiesceOwnedSocketIo() catch |err| {
+            self.upgrade_io_failed.store(true, .release);
+            self.resumeSiblingReactors();
+            return err;
+        };
         var waited_ms: u64 = 0;
-        while (self.upgrade_parked.load(.acquire) < expected) {
+        while (true) {
+            const quiesced = self.upgrade_io_quiesced.load(.acquire);
+            if (quiesced == expected) break;
+            if (quiesced > expected or self.upgrade_quiesce_shard.load(.acquire) != self.rx().shard_id) {
+                self.resumeSiblingReactors();
+                return error.ShardQuiesceFailed;
+            }
             if (waited_ms >= 5_000) {
                 self.resumeSiblingReactors();
                 return error.ShardQuiesceFailed;
@@ -6221,28 +7222,104 @@ pub const LinuxServer = struct {
             // leaves a sibling blocked in submitAndWait until its sweep timer.
             if (waited_ms % 200 == 0) self.wakeAllReactors();
         }
+        if (self.upgrade_io_failed.load(.acquire)) {
+            self.resumeSiblingReactors();
+            return error.SocketIoQuiesceFailed;
+        }
+        self.upgrade_drain_ready.store(true, .release);
+        self.wakeAllReactors();
+        self.drainUpgradeFabric();
+
+        waited_ms = 0;
+        while (true) {
+            const parked = self.upgrade_parked.load(.acquire);
+            if (parked == expected) break;
+            if (parked > expected or self.upgrade_quiesce_shard.load(.acquire) != self.rx().shard_id) {
+                self.resumeSiblingReactors();
+                return error.ShardQuiesceFailed;
+            }
+            if (waited_ms >= 5_000) {
+                self.resumeSiblingReactors();
+                return error.ShardQuiesceFailed;
+            }
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+            waited_ms += 1;
+            if (waited_ms % 200 == 0) self.wakeAllReactors();
+        }
     }
 
     /// Release a quiesce taken by `quiesceSiblingReactors` (upgrade failed —
     /// the daemon keeps serving). Parked workers observe the clear and resume.
     fn resumeSiblingReactors(self: *LinuxServer) void {
-        self.upgrade_quiesce_shard.store(no_quiesce_shard, .release);
+        const q = self.upgrade_quiesce_shard.load(.acquire);
+        if (q == no_quiesce_shard) return;
+        const expected = self.upgrade_expected_siblings.load(.acquire);
+        self.upgrade_drain_ready.store(false, .release);
+        self.upgrade_quiesce_shard.store(resuming_quiesce_shard, .release);
+        self.wakeAllReactors();
+        if (self.rx().socket_io_quiescing) self.resumeOwnedSocketIo();
+        if (self.rx().socket_io_quiescing) {
+            self.upgrade_io_failed.store(true, .release);
+            srvLog("orochi: UPGRADE quiesce left coordinator ring fail-closed in RESUMING\n", .{});
+            return;
+        }
+        self.upgrade_coordinator_resumed.store(true, .release);
+        self.finishUpgradeResumeIfComplete();
+
+        var waited_ms: u64 = 0;
+        while (true) {
+            if (self.upgrade_quiesce_shard.load(.acquire) == no_quiesce_shard) return;
+            const resumed = self.upgrade_resume_done.load(.acquire);
+            if (resumed == expected) {
+                self.finishUpgradeResumeIfComplete();
+                continue;
+            }
+            if (resumed > expected) {
+                self.upgrade_io_failed.store(true, .release);
+                srvLog("orochi: UPGRADE resume barrier over-counted; retaining RESUMING state\n", .{});
+                return;
+            }
+            if (waited_ms >= 5_000) {
+                self.upgrade_io_failed.store(true, .release);
+                srvLog("orochi: UPGRADE resume barrier timed out; retaining RESUMING state\n", .{});
+                return;
+            }
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+            waited_ms += 1;
+            if (waited_ms % 200 == 0) self.wakeAllReactors();
+        }
     }
 
     pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         const is_s2s = event.token.slot == s2s_listener_token.slot;
         const is_tls = event.token.slot == tls_listener_token.slot;
         const is_ws = event.token.slot == ws_listener_token.slot;
+        const armed = if (is_s2s)
+            &self.rx().s2s_accept_armed
+        else if (is_tls)
+            &self.rx().tls_accept_armed
+        else if (is_ws)
+            &self.rx().ws_accept_armed
+        else
+            &self.rx().accept_armed;
+        const cancel_pending = if (is_s2s)
+            &self.rx().s2s_accept_cancel_pending
+        else if (is_tls)
+            &self.rx().tls_accept_cancel_pending
+        else if (is_ws)
+            &self.rx().ws_accept_cancel_pending
+        else
+            &self.rx().accept_cancel_pending;
+        const was_cancel_pending = cancel_pending.*;
         if (!event.more) {
-            if (is_s2s) {
-                self.rx().s2s_accept_armed = false;
-            } else if (is_tls) {
-                self.rx().tls_accept_armed = false;
-            } else if (is_ws) {
-                self.rx().ws_accept_armed = false;
-            } else {
-                self.rx().accept_armed = false;
-            }
+            armed.* = false;
+            cancel_pending.* = false;
+        }
+        if (was_cancel_pending and event.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+            if (!self.rx().socket_io_quiescing) self.armAccept() catch self.wakeReactor();
+            return;
         }
         if (event.res < 0) return error.BadCompletion;
 
@@ -6946,6 +8023,16 @@ pub const LinuxServer = struct {
         return self.config.node_identity != null and self.config.crypto_io != null;
     }
 
+    /// Local signing identity alone does not activate durable relay-v2. A
+    /// standalone or TOFU deployment has no exact event-time coverage set and
+    /// therefore stays on ordinary local/legacy delivery. Nonempty root config
+    /// does activate the strict path even when malformed: admission then fails
+    /// closed instead of silently degrading a requested durable mesh to legacy.
+    fn authoredRelayV2Configured(self: *const LinuxServer) bool {
+        return self.relay_v2_activation_state.mode == .active and
+            self.relay_v2_required_nodes.len >= 2;
+    }
+
     /// Build a heap-owned SecuredLink for `role`, using a freshly-derived prekey.
     /// Validity uses the wall clock so the window is comparable across nodes.
     fn newSecuredLink(self: *LinuxServer, role: secured_s2s_link.Role) !*secured_s2s_link.SecuredLink {
@@ -7014,6 +8101,22 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    fn bindRelayV2UnboundIfReady(
+        self: *LinuxServer,
+        conn: *ConnState,
+        link: *secured_s2s_link.SecuredLink,
+    ) void {
+        if (conn.relay_v2_unbound_bound or !link.established() or
+            !link.supportsSecureRelayV2()) return;
+        const peer = link.remoteNodeId() orelse return;
+        if (!self.relayV2DirectNeighbor(peer)) return;
+        lockSpin(&self.relay_v2_replay_mu);
+        _ = self.relay_v2_outbox.bindUnbound(peer);
+        self.relay_v2_replay_mu.unlock();
+        conn.relay_v2_unbound_bound = true;
+        self.forwardAcceptedRelayV2(&.{});
+    }
+
     /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Tsumugi
     /// link and queue its outbound. Logs the AKE establishment transition.
     fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
@@ -7028,13 +8131,13 @@ pub const LinuxServer = struct {
             return;
         };
         const out = link.outbound();
-        var out_len = out.len;
+        const out_len = out.len;
         if (out.len != 0) {
-            appendToConn(conn, out) catch {
-                conn.closing = true;
-                return;
-            };
-            link.clearOutbound();
+            // `out` may begin with whole encrypted records retained by a
+            // retryable mesh burst. Inbound traffic is legal while our SendQ is
+            // congested; page complete records and keep driving the received
+            // RESYNC/ACK instead of closing merely because the queue is full.
+            if (!self.flushMeshBurstStage(conn) and conn.closing) return;
         }
         // JUPE gate: refuse a peer whose server name is juped — checked on every
         // established drive (not just the first), so a peer juped AFTER it linked
@@ -7049,27 +8152,12 @@ pub const LinuxServer = struct {
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
 
-            // The peer may have been partitioned when portable state changed.
-            // Re-offer both live attachments and detached snapshots so a client
-            // can attach there immediately without waiting for the source to
-            // disconnect. Per-token signed epochs make reordering safe.
-            if (!link.supportsSessionReplicaV2()) {
-                self.syncPortableSessions(link);
-                const sync_out = link.outbound();
-                if (sync_out.len != 0) {
-                    appendToConn(conn, sync_out) catch {
-                        conn.closing = true;
-                        return;
-                    };
-                    out_len += sync_out.len;
-                    link.clearOutbound();
-                }
-            }
-            // Snapshot refresh above may advance the Store generation. Start the
-            // retained replay afterward so its cursor covers that final set and
-            // no unrelated sidecar appends behind a backpressured replay record.
+            // Replay the retained Store for both current and rolling-old peers.
+            // Old peers receive an exact-once legacy translation of current
+            // local OFFERs; they never trigger a whole-store refresh/remint.
             if (!conn.session_replica_replay_pending) self.scheduleSessionReplicaReplay(conn);
         }
+        self.bindRelayV2UnboundIfReady(conn, link);
         if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
         // Apply signed session authority BEFORE user-message delivery. OFFER and
         // the first MESSAGE can share one socket read; draining the frame-family
@@ -7091,6 +8179,13 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
+        // Signed v2 is a separate exact-once authority and never falls through
+        // legacy MESSAGE delivery/downgrade.
+        // The authority drain above may unblock immutable MESSAGE_V2 objects
+        // retained from an earlier read. Retry them before newer signed frames.
+        self.retryDeferredRelayV2();
+        self.drainRelayV2(conn, link);
+        self.drainRelayV2Acks(link);
         // Surface identity transitions in the exact order accepted by the peer.
         self.drainIdentityTransitions(link);
         // Apply/surface remote aggregate channel MODE flag changes in real time.
@@ -7110,6 +8205,7 @@ pub const LinuxServer = struct {
         // Fold this peer's network-wide clone counts into the aggregate.
         self.drainCloneCountsFrom(link);
         self.drainOperEvents(link);
+        self.drainOperEventsV2(link);
         self.drainObserveEvents(link);
         self.drainKills(link);
         self.drainWards(link);
@@ -7142,27 +8238,11 @@ pub const LinuxServer = struct {
         // burst a fresh establishment sends — it rides the preserved encrypted
         // stream, so the peer reconverges within one round-trip with no netsplit.
         if (link.established() and link.takeResyncRequest()) {
-            conn.session_replica_resync_burst_pending = true;
             // Queue and flush exact signed authority before any token-less
             // NICK/MEMBERSHIP burst. The peer may receive records in separate
             // TCP reads; sidecars must never become visible in an authority-free
             // window merely because RESYNC output was segmented.
-            if (!link.supportsSessionReplicaV2()) {
-                // Rolling-old peers still need the legacy migration sidecar.
-                // Modern peers replay canonical retained Store objects below;
-                // re-minting every OFFER on each authenticated RESYNC would let
-                // one peer churn global revisions and starve unrelated cursors.
-                self.syncPortableSessions(link);
-                const replica_out = link.outbound();
-                if (replica_out.len != 0) {
-                    appendToConn(conn, replica_out) catch {
-                        conn.closing = true;
-                        return;
-                    };
-                    link.clearOutbound();
-                }
-            }
-            if (!conn.session_replica_replay_pending) self.scheduleSessionReplicaReplay(conn);
+            self.requestFullSessionReplicaReplay(conn);
         }
         // Establishment, repair, and explicit RESYNC only schedule/coalesce above.
         // Drain at most one bounded replay batch per socket-drive turn; invoking
@@ -7172,16 +8252,49 @@ pub const LinuxServer = struct {
         self.releaseMeshBurstAfterSessionReplicaReplay(conn, link);
     }
 
+    /// Encode current local oper grants for one secured peer. The surrounding
+    /// retryable burst stage owns encrypted-record pagination and clears no
+    /// ciphertext until it has entered that peer's SendQ.
+    fn sendLocalOperBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        const link = conn.s2s_secured orelse return true;
+        const kp = self.meshSignKey() orelse return true;
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const client = entry.value;
+                if (client.s2s != null or client.s2s_secured != null) continue;
+                if (!client.session.registered() or !client.session.isOper()) continue;
+                const account = client.session.account() orelse continue;
+                const now = self.grantNowU64();
+                self.grant_incarnation = @max(now, self.grant_incarnation + 1);
+                const fields = oper_cred_share.GrantFields{
+                    .account = account,
+                    .privilege_bits = client.session.oper_priv.toBits(),
+                    .class = client.session.operClass(),
+                    .title = client.session.operTitle(),
+                    .issuer_node = protocol_inventory.currentServerName(),
+                    .incarnation = self.grant_incarnation,
+                    .issued_ms = now,
+                    .expiry_ms = now + oper_grant_ttl_ms,
+                };
+                _ = self.oper_grants.upsert(fields);
+                var buf: [oper_cred_share.max_grant_len]u8 = undefined;
+                const n = oper_cred_share.sign(kp, fields, &buf) catch return false;
+                link.sendOperGrant(buf[0..n]) catch return false;
+            }
+        }
+        return true;
+    }
+
     /// Ship every `mesh`-scope WARD this node currently holds to a freshly
     /// established secured peer, so a node that links after a ban was set still
-    /// enforces it (mesh-ban anti-entropy, paralleling `rebroadcastLocalOpers`).
-    /// Best-effort; node-scope wards are local and never shipped.
-    fn sendMeshWardsTo(self: *LinuxServer, conn: *ConnState) void {
-        const link = conn.s2s_secured orelse return;
-        if (!link.established()) return;
-        var rows: [256]warden.Ward = undefined;
-        const wards = self.warden.list(null, &rows);
-        for (wards) |w| {
+    /// enforces it (mesh-ban anti-entropy, paralleling local oper grants).
+    /// Best-effort; node-scope wards are local and never shipped. The burst
+    /// driver owns the accumulated ciphertext and retry edge.
+    fn sendMeshWardsTo(self: *LinuxServer, conn: *ConnState) bool {
+        const link = conn.s2s_secured orelse return true;
+        if (!link.established()) return true;
+        for (self.warden.all()) |w| {
             if (w.scope != .mesh) continue;
             var wire_buf: [warden.max_wire_len]u8 = undefined;
             const wire = warden.encodeWire(.{
@@ -7193,19 +8306,10 @@ pub const LinuxServer = struct {
                 .set_by = w.set_by,
                 .created_ms = w.created_ms,
                 .expires_ms = w.expires_ms,
-            }, &wire_buf) catch continue;
-            link.sendWard(wire) catch continue;
+            }, &wire_buf) catch return false;
+            link.sendWard(wire) catch return false;
         }
-        // The caller (`driveS2sSecured`) owns this conn; flush the accumulated
-        // ciphertext directly onto it, matching how that path flushes outbound.
-        const out = link.outbound();
-        if (out.len != 0) {
-            appendToConn(conn, out) catch {
-                conn.closing = true;
-                return;
-            };
-            link.clearOutbound();
-        }
+        return true;
     }
 
     /// Re-mint + broadcast every locally-opered session's grant, so a freshly
@@ -7290,9 +8394,9 @@ pub const LinuxServer = struct {
         self.drainWards(link);
         self.drainRepairResync(conn, link, false);
         if (!conn.s2s_burst_done and link.established()) {
-            conn.s2s_burst_done = true;
-            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
-            self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
+            if (self.sendMeshStateBurstTo(conn)) {
+                conn.s2s_burst_done = true;
+            }
         }
     }
 
@@ -7307,23 +8411,22 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         };
-        self.flushS2sOutbound(conn, link.outbound()) catch {
-            conn.closing = true;
-            return;
-        };
-        link.clearOutbound();
         if (comptime @TypeOf(link) == *secured_s2s_link.SecuredLink) {
             std.debug.assert(secured);
+            if (!self.flushMeshBurstStage(conn) and conn.closing) return;
             // Repair can reset the peer's converged roster just like an explicit
             // RESYNC. Schedule/coalesce here; `driveS2sSecured` performs the one
             // replay batch allowed for this socket turn and releases the shared
             // roster/opers/wards/clone burst only after every page is queued.
-            conn.session_replica_resync_burst_pending = true;
-            if (!conn.session_replica_replay_pending) self.scheduleSessionReplicaReplay(conn);
+            self.requestFullSessionReplicaReplay(conn);
         } else {
             std.debug.assert(!secured);
-            self.sendMeshStateBurstTo(conn);
-            self.sendCloneAntiEntropy(conn, link);
+            self.flushS2sOutbound(conn, link.outbound()) catch {
+                conn.closing = true;
+                return;
+            };
+            link.clearOutbound();
+            _ = self.sendMeshStateBurstTo(conn);
         }
     }
 
@@ -7331,7 +8434,21 @@ pub const LinuxServer = struct {
     /// our side and start receiving; on failure tear the peer down.
     pub fn handleConnect(self: *LinuxServer, event: ringlane.ConnectEvent) !void {
         const conn = self.connForToken(event.token) catch return;
+        const was_cancel_pending = conn.connect_cancel_pending;
         conn.connect_armed = false;
+        conn.connect_cancel_pending = false;
+        if (was_cancel_pending and event.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+            conn.connect_rearm_pending = true;
+            if (!self.rx().socket_io_quiescing) {
+                self.armConnect(conn) catch {
+                    self.wakeReactor();
+                    return;
+                };
+                if (conn.connect_armed) conn.connect_rearm_pending = false;
+            }
+            return;
+        }
+        conn.connect_rearm_pending = false;
         if (conn.closing) {
             try self.closeConn(event.token, conn.close_reason);
             return;
@@ -7608,7 +8725,28 @@ pub const LinuxServer = struct {
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
+        const was_cancel_pending = conn.recv_cancel_pending;
         conn.recv_armed = false;
+        conn.recv_cancel_pending = false;
+
+        // Helix's exact cancel releases the kernel's recv_buf reference without
+        // meaning EOF. Preserve the live stream and, while the owner is at its
+        // safe point, deliberately do not arm a replacement RECV. A close that
+        // was already latched still gets its ordinary all-refs-clear finalizer.
+        if (was_cancel_pending and
+            event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
+        {
+            if (conn.closing) {
+                try self.closeConn(event.token, conn.close_reason);
+            } else if (!self.rx().socket_io_quiescing) {
+                // Failure-resume may have released the shared barrier before a
+                // cancel's original CQE arrived. Restore the quiet receive now;
+                // treating this late ECANCELED as EOF would drop the session.
+                try self.armRecv(conn);
+                try self.armSendIfNeeded(conn);
+            }
+            return;
+        }
 
         // A close requested by another completion/timer wins over any positive
         // bytes that raced with shutdown. The CQE has released recv_buf; discard
@@ -7676,7 +8814,22 @@ pub const LinuxServer = struct {
     pub fn handleSend(self: *LinuxServer, event: ringlane.SendEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
+        const was_cancel_pending = conn.send_cancel_pending;
         conn.send_armed = false;
+        conn.send_cancel_pending = false;
+        // Cancellation is not a stream error. No bytes were accepted, so retain
+        // the exact unsent [send_offset, send_len) tail for the Helix snapshot.
+        if (was_cancel_pending and
+            event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
+        {
+            if (conn.closing) {
+                try self.closeConn(event.token, conn.close_reason);
+            } else if (!self.rx().socket_io_quiescing) {
+                try self.armSendIfNeeded(conn);
+                try self.armRecv(conn);
+            }
+            return;
+        }
         // The CQE released the kernel's reference. Drop the entire unsent tail
         // now; sending any later queued bytes would cross the known stream gap.
         if (self.abortDeliveryGapFor(id, conn)) return;
@@ -7773,13 +8926,26 @@ pub const LinuxServer = struct {
     /// later command or timer action. Slot storage stays stable while closeConn
     /// frees the current entry, matching retryFailedSessionHandoffs' iteration.
     fn abortPoisonedDeliveries(self: *LinuxServer) void {
+        _ = self.abortPoisonedDeliveriesCount();
+    }
+
+    /// Count owner-side poison transitions for the Helix fabric fixed point.
+    /// A poisoned close can itself publish cross-shard state, so that transition
+    /// is progress even when the mailbox was empty at the start of the pass.
+    fn abortPoisonedDeliveriesCount(self: *LinuxServer) usize {
+        var progressed: usize = 0;
         var index: usize = 0;
         while (index < self.rx().clients.slots.items.len) : (index += 1) {
             const slot = &self.rx().clients.slots.items[index];
             if (!slot.occupied or !slot.value.delivery_gap.load(.acquire)) continue;
             const id = slotClientId(self.rx(), index, slot.gen);
             _ = self.abortDeliveryGapFor(id, &slot.value);
+            // Count every unresolved poison on every pass. Therefore a zero
+            // progress fixed-point pass proves no occupied poisoned slot remains;
+            // an abort that cannot finish reaches the derived bound and refuses.
+            progressed += 1;
         }
+        return progressed;
     }
 
     /// Mark a failure discovered by the target owner itself. The caller must not
@@ -8113,18 +9279,281 @@ pub const LinuxServer = struct {
         is_bot: bool = false,
     };
 
+    /// Render one complete attachment-specific plaintext IRC record after the
+    /// recipient's negotiated tag capabilities have been applied. The returned
+    /// bytes are the durable spool payload: TLS and WebSocket framing remain
+    /// connection transport state and are applied only when the owner drains it.
+    fn renderTaggedRecord(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+        out: []u8,
+    ) ![]const u8 {
+        const conn = self.connFor(id) orelse return error.ClientNotFound;
+        if (conn.closing) return error.ClientNotFound;
+        if (bytes.len > default_reply_bytes) return error.OutputTooSmall;
+        var tagbuf: [max_delivery_prefix_bytes]u8 = undefined;
+        const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
+        const total = std.math.add(usize, prefix.len, bytes.len) catch return error.OutputTooSmall;
+        if (total > out.len or total > max_prefixed_delivery_bytes) return error.OutputTooSmall;
+        @memcpy(out[0..prefix.len], prefix);
+        @memcpy(out[prefix.len..total], bytes);
+        return out[0..total];
+    }
+
+    /// Only rows with a real reusable credential belong in the durable spool.
+    /// Anonymous/untracked sockets retain the ordinary best-effort delivery
+    /// contract and cannot strand an orphan record after they disappear.
+    fn attachmentHasReusableSession(self: *LinuxServer, id: client_model.ClientId) bool {
+        const conn = self.connFor(id) orelse return false;
+        const account = conn.session.account() orelse return false;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return false;
+        return !tokenIsNull(handle.token);
+    }
+
+    fn attachmentEventId(msgid: []const u8) attachment_delivery_spool.EventId {
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update("orochi-attachment-delivery-v1\x00");
+        hasher.update(msgid);
+        hasher.final(&digest);
+        return digest[0..@sizeOf(attachment_delivery_spool.EventId)].*;
+    }
+
+    /// Reserve one already-rendered physical attachment record. This is the
+    /// compatibility entry point used by local event paths; MESSAGE_V2 admission
+    /// prepares the complete recipient batch inside its authority transaction.
+    fn reserveTaggedAttachmentDelivery(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+    ) !void {
+        const msgid = tags.msgid orelse return error.InvalidRecord;
+        var rendered_buf: [max_prefixed_delivery_bytes]u8 = undefined;
+        const rendered = try self.renderTaggedRecord(id, tags, bytes, &rendered_buf);
+        const record = attachment_delivery_spool.BatchRecord{
+            .client = monitorIdFromClient(id),
+            .event_id = attachmentEventId(msgid),
+            .bytes = rendered,
+        };
+        lockSpin(&self.attachment_delivery_mu);
+        const reserved = self.attachment_delivery_spool.reserveBatch(&.{record});
+        self.attachment_delivery_mu.unlock();
+        _ = try reserved;
+        self.wakeShard(id.shard);
+        if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+    }
+
+    /// Owner-only SendQ drain for durable attachment records. SendQ pressure is
+    /// not a connection fault: the head stays in the spool and a later send/timer
+    /// turn retries it. A record retires only after the exact plaintext bytes
+    /// entered that physical connection's SendQ.
+    fn drainAttachmentSpoolForCurrentReactor(self: *LinuxServer) void {
+        lockSpin(&self.attachment_delivery_mu);
+        defer self.attachment_delivery_mu.unlock();
+        var pending_buf: [64]attachment_delivery_spool.PendingRecord = undefined;
+        const pending = self.attachment_delivery_spool.collectPending(&pending_buf);
+        for (pending) |record| {
+            const id = clientIdFromMonitor(record.client);
+            if (id.shard != self.rx().shard_id) continue;
+            const conn = self.rx().clients.get(id) orelse continue;
+            if (conn.closing) continue;
+            appendToConn(conn, record.bytes) catch continue;
+            if (!self.attachment_delivery_spool.commitHeadToSendq(
+                record.client,
+                record.sequence,
+                record.event_id,
+            )) continue;
+            self.armSendIfNeeded(conn) catch {
+                self.poisonOwnedDelivery(conn);
+            };
+        }
+    }
+
+    fn transferAttachmentDeliveries(
+        self: *LinuxServer,
+        old_client: sessions_mod.ClientId,
+        new_client: sessions_mod.ClientId,
+    ) attachment_delivery_spool.TransferError!void {
+        lockSpin(&self.attachment_delivery_mu);
+        defer self.attachment_delivery_mu.unlock();
+        _ = try self.attachment_delivery_spool.transferAttachment(old_client, new_client);
+    }
+
+    const PreparedAttachmentDeliveryBatch = struct {
+        server: *LinuxServer,
+        prepared: ?attachment_delivery_spool.PreparedBatch = null,
+        locked: bool = false,
+
+        fn commit(self: *PreparedAttachmentDeliveryBatch) void {
+            if (self.prepared) |*prepared| _ = prepared.commit();
+        }
+
+        fn release(self: *PreparedAttachmentDeliveryBatch) void {
+            if (self.prepared) |*prepared| prepared.deinit();
+            self.prepared = null;
+            if (self.locked) {
+                self.server.attachment_delivery_mu.unlock();
+                self.locked = false;
+            }
+        }
+
+        fn deinit(self: *PreparedAttachmentDeliveryBatch) void {
+            self.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Finish every allocation for a complete recipient set and retain the spool
+    /// mutation lock through MESSAGE_V2's RVG2/Lotus/outbox publication. This
+    /// makes `PreparedBatch.commit` one member of the joint no-fail cut rather
+    /// than a best-effort consequence after mesh acceptance.
+    fn prepareAttachmentDeliveryBatch(
+        self: *LinuxServer,
+        recipients: []const client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+    ) !PreparedAttachmentDeliveryBatch {
+        const msgid = tags.msgid orelse return .{ .server = self };
+        var owned: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned.items) |record| self.allocator.free(record);
+            owned.deinit(self.allocator);
+        }
+        var records: std.ArrayList(attachment_delivery_spool.BatchRecord) = .empty;
+        defer records.deinit(self.allocator);
+        for (recipients) |id| {
+            if (!self.attachmentHasReusableSession(id)) continue;
+            var rendered_buf: [max_prefixed_delivery_bytes]u8 = undefined;
+            const rendered = try self.renderTaggedRecord(id, tags, bytes, &rendered_buf);
+            const copy = try self.allocator.dupe(u8, rendered);
+            owned.append(self.allocator, copy) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
+            try records.append(self.allocator, .{
+                .client = monitorIdFromClient(id),
+                .event_id = attachmentEventId(msgid),
+                .bytes = copy,
+            });
+        }
+        if (records.items.len == 0) return .{ .server = self };
+
+        lockSpin(&self.attachment_delivery_mu);
+        errdefer self.attachment_delivery_mu.unlock();
+        return .{
+            .server = self,
+            .prepared = try self.attachment_delivery_spool.prepareBatch(records.items),
+            .locked = true,
+        };
+    }
+
+    fn appendUniqueDeliveryId(
+        self: *LinuxServer,
+        out: *std.ArrayList(client_model.ClientId),
+        id: client_model.ClientId,
+    ) std.mem.Allocator.Error!void {
+        for (out.items) |existing| if (existing.eql(id)) return;
+        try out.append(self.allocator, id);
+    }
+
+    fn deliveryVisibleForClientTags(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        client_tags: ?[]const u8,
+    ) bool {
+        const tags = client_tags orelse return true;
+        const conn = self.connFor(id) orelse return false;
+        var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        return clientTagsForSession(&conn.session, tags, &visible).len != 0;
+    }
+
+    fn collectChannelDeliveryIds(
+        self: *LinuxServer,
+        channel: []const u8,
+        min_rank: u8,
+        excluded: ?client_model.ClientId,
+        visible_client_tags: ?[]const u8,
+        out: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!void {
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            if (min_rank != 0) {
+                const modes = self.world.memberModes(channel, member.*) orelse continue;
+                if (modes.rank() < min_rank) continue;
+            }
+            const id = clientIdFromWorld(member.*);
+            if (excluded) |skip| if (id.eql(skip)) continue;
+            if (!self.deliveryVisibleForClientTags(id, visible_client_tags)) continue;
+            try self.appendUniqueDeliveryId(out, id);
+        }
+    }
+
+    fn collectDirectDeliveryIds(
+        self: *LinuxServer,
+        recipients: []const client_model.ClientId,
+        sender_attachments: []const client_model.ClientId,
+        sender: client_model.ClientId,
+        echo_sender: bool,
+        visible_client_tags: ?[]const u8,
+        out: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!void {
+        for (recipients) |id| {
+            if (!self.deliveryVisibleForClientTags(id, visible_client_tags)) continue;
+            try self.appendUniqueDeliveryId(out, id);
+        }
+        for (sender_attachments) |id| {
+            if (id.eql(sender) and !echo_sender) continue;
+            if (!self.deliveryVisibleForClientTags(id, visible_client_tags)) continue;
+            try self.appendUniqueDeliveryId(out, id);
+        }
+    }
+
     /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
     /// recipient: `@time=…;account=… ` including only the tags whose caps the
     /// recipient negotiated. Used by the PRIVMSG/NOTICE/TAGMSG paths.
-    fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
+    const TaggedDeliveryMode = enum {
+        ordinary,
+        prepared_batch,
+    };
+
+    fn deliverTaggedMode(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+        mode: TaggedDeliveryMode,
+    ) !void {
         const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
+        if (tags.msgid != null and self.attachmentHasReusableSession(id)) {
+            if (mode == .prepared_batch) {
+                // The complete reusable-recipient set was reserved atomically
+                // with MESSAGE_V2 authority. Ordinary fanout is now only the
+                // transport trigger: reserving again after another attachment
+                // drained the shared batch would recreate the retired event.
+                self.wakeShard(id.shard);
+                if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+                return;
+            }
+            return self.reserveTaggedAttachmentDelivery(id, tags, bytes);
+        }
         // Sized for the full @-segment: server-time + account + msgid + relayed
         // client-only tags. Built from a serialized read of the owning reactor's
         // negotiated caps; the bytes then route to that reactor via enqueueDelivery.
         var tagbuf: [256]u8 = undefined;
         const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
         try self.deliverPrefixed(id, prefix, bytes);
+    }
+
+    fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
+        return self.deliverTaggedMode(id, tags, bytes, .ordinary);
+    }
+
+    fn deliverPreparedTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
+        return self.deliverTaggedMode(id, tags, bytes, .prepared_batch);
     }
 
     /// Mirror one already-rendered direct PRIVMSG/NOTICE line to the other
@@ -8198,6 +9627,7 @@ pub const LinuxServer = struct {
         tags: MsgTags,
         bytes: []const u8,
         except: ?client_model.ClientId,
+        mode: TaggedDeliveryMode,
     ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         // Coalesce per-recipient cross-shard wakes into one wake per touched shard.
@@ -8208,7 +9638,7 @@ pub const LinuxServer = struct {
             if (except) |skip| {
                 if (mid.eql(skip)) continue;
             }
-            self.deliverTagged(mid, tags, bytes) catch continue;
+            self.deliverTaggedMode(mid, tags, bytes, mode) catch continue;
         }
     }
 
@@ -8286,6 +9716,7 @@ pub const LinuxServer = struct {
         bytes: []const u8,
         except: ?client_model.ClientId,
         min_rank: u8,
+        mode: TaggedDeliveryMode,
     ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         self.beginWakeBatch();
@@ -8297,7 +9728,7 @@ pub const LinuxServer = struct {
             if (except) |skip| {
                 if (id.eql(skip)) continue;
             }
-            self.deliverTagged(id, tags, bytes) catch continue;
+            self.deliverTaggedMode(id, tags, bytes, mode) catch continue;
         }
     }
 
@@ -8326,6 +9757,22 @@ pub const LinuxServer = struct {
     /// number of peer links it was sent to (so callers can fall back to a wider
     /// scope when a targeted route is not yet known).
     fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, scope: RelayScope) usize {
+        return self.relayLegacyToPeers(msg, scope, false);
+    }
+
+    /// Legacy compatibility flood. Once the origin has durably admitted the
+    /// logical event as MESSAGE_V2, that event is V2-only on every edge. An old
+    /// peer stays connected but receives the exact retained RVL2 wire only after
+    /// it negotiates V2; sending a legacy twin now would deliver it a second time
+    /// when the retained object replays after upgrade. Genuine legacy-only
+    /// events continue through this path unchanged.
+    fn relayLegacyToPeers(
+        self: *LinuxServer,
+        msg: s2s_link.RelayMessage,
+        scope: RelayScope,
+        v2_admitted: bool,
+    ) usize {
+        if (v2_admitted) return 0;
         var sent: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -8335,8 +9782,7 @@ pub const LinuxServer = struct {
                     if (!link.established()) continue;
                     if (!relayWanted(link, scope) and !self.relayWantedBySessionReplica(link, scope)) continue;
                     link.sendMessage(msg) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                     sent += 1;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
@@ -8349,6 +9795,18 @@ pub const LinuxServer = struct {
             }
         }
         return sent;
+    }
+
+    fn hasSecureRelayV2Peer(self: *LinuxServer) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (link.established() and link.supportsSecureRelayV2()) return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// Per-link scope test (duck-typed over S2sLink / SecuredLink — both expose
@@ -8364,8 +9822,9 @@ pub const LinuxServer = struct {
 
     /// Session-aware nick routing is permitted only on an authenticated secured
     /// link to the exact peer that was successfully offered this token's signed
-    /// migration capsule. The binding is recorded by `broadcastSessionMigration` /
-    /// `syncPortableSessions`; no wire-controlled account or nick can create it.
+    /// migration capsule. The binding is recorded by `broadcastSessionMigration`
+    /// or retained-Store legacy replay; no wire-controlled account or nick can
+    /// create it.
     /// Keeping this separate from `relayWanted` ensures plaintext peers can never
     /// qualify through a portable-session route.
     fn relayWantedBySessionReplica(self: *LinuxServer, link: *secured_s2s_link.SecuredLink, scope: RelayScope) bool {
@@ -8648,6 +10107,123 @@ pub const LinuxServer = struct {
         return .{ .trusted_account = account, .token = handle.token, .modes = modes };
     }
 
+    /// Resolve MESSAGE_V2's signed sender route only through the exact raw
+    /// reusable token retained by local session authority. Nick/account affinity
+    /// is never a substitute: a sibling logical session with the same visible
+    /// identity hashes to a different route and receives no sent-copy authority.
+    fn replicatedSessionProofV2(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+    ) ?ReplicatedSessionProof {
+        const signed_route = msg.sender_route_id orelse return null;
+        const nick = msg.sourceNick() orelse return null;
+        const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        var account_buf: [session_replica_account_max]u8 = undefined;
+        const local = self.localPortableSessionByRoute(signed_route, &account_buf) orelse return null;
+        const entry = self.session_replica_store.getOrigin(local.token, msg.origin_node) orelse return null;
+        if (!std.ascii.eqlIgnoreCase(local.account, entry.account) or
+            !std.ascii.eqlIgnoreCase(nick, entry.nick) or now_wall > entry.expires_at_ms) return null;
+        const local_session = self.sessions.findTokenSessionInAccount(local.account, local.token) orelse return null;
+        if (!local_session.portable_resume) return null;
+        return self.proofFromSessionReplicaEntry(
+            entry,
+            local.token,
+            local.account,
+            nick,
+            if (msg.scope_kind == .channel or msg.scope_kind == .channel_whisper) msg.target else null,
+            now_wall,
+        );
+    }
+
+    const RelayV2RoutePredicateContext = struct {
+        route: message_relay_v2.RouteId,
+    };
+
+    fn relayV2TokenMatchesRoute(context: *const anyopaque, token: sessions_mod.Token) bool {
+        const wanted: *const RelayV2RoutePredicateContext = @ptrCast(@alignCast(context));
+        const derived = message_relay_v2.routeId(token) catch return false;
+        return std.crypto.timing_safe.eql(message_relay_v2.RouteId, derived, wanted.route);
+    }
+
+    fn localPortableSessionByRoute(
+        self: *LinuxServer,
+        route: message_relay_v2.RouteId,
+        account_out: []u8,
+    ) ?sessions_mod.SessionStore.TokenMatch {
+        var context = RelayV2RoutePredicateContext{ .route = route };
+        return self.sessions.findUniquePortableTokenInto(.{
+            .context = &context,
+            .matches_fn = relayV2TokenMatchesRoute,
+        }, account_out);
+    }
+
+    /// Bind a signed MESSAGE_V2 origin to its self-certifying full public key.
+    /// Server registries currently contain direct peers only, so requiring a
+    /// local name row would make a legitimate A->B->C origin permanently
+    /// unknowable at C. The authenticated immediate peer authorizes carriage;
+    /// the immutable inner signature binds the third-party origin itself.
+    fn relayV2OriginKnown(self: *LinuxServer, msg: message_relay_v2.RelayMessage) bool {
+        if (msg.origin_node == self.config.node_id) {
+            const identity = self.config.node_identity orelse return false;
+            return msg.origin_pubkey.len == message_relay_v2.pubkey_len and
+                std.mem.eql(u8, msg.origin_pubkey, &identity.sign_kp.public_key);
+        }
+        if (msg.origin_pubkey.len != message_relay_v2.pubkey_len) return false;
+        return message_relay.originShortId(msg.origin_pubkey[0..message_relay_v2.pubkey_len].*) ==
+            msg.origin_node;
+    }
+
+    const RelayV2ExactTarget = struct {
+        primary: client_model.ClientId,
+        account: []const u8,
+        token: sessions_mod.Token,
+    };
+
+    const RelayV2ExactTargetResolution = union(enum) {
+        transit,
+        pending,
+        ready: RelayV2ExactTarget,
+    };
+
+    /// Resolve a signed recipient route to one local logical session and
+    /// snapshot every attached transport for that exact raw token. A same nick
+    /// or account with another token is intentionally invisible to this path.
+    fn collectRelayV2ExactTarget(
+        self: *LinuxServer,
+        nick: []const u8,
+        signed_route: message_relay_v2.RouteId,
+        required_channel: ?[]const u8,
+        account_out: []u8,
+        out: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!RelayV2ExactTargetResolution {
+        const match = self.localPortableSessionByRoute(signed_route, account_out) orelse
+            return .transit;
+        try self.collectAttachedTokenAuthorityClients(match.account, match.token, out);
+        var index: usize = 0;
+        while (index < out.items.len) {
+            const conn = self.connFor(out.items[index]) orelse {
+                _ = out.orderedRemove(index);
+                continue;
+            };
+            const wrong_nick = !std.ascii.eqlIgnoreCase(conn.session.displayName(), nick);
+            const wrong_channel = if (required_channel) |channel|
+                !self.world.isMember(channel, worldIdFromClient(out.items[index]))
+            else
+                false;
+            if (wrong_nick or wrong_channel) {
+                _ = out.orderedRemove(index);
+            } else {
+                index += 1;
+            }
+        }
+        if (out.items.len == 0) return .pending;
+        return .{ .ready = .{
+            .primary = out.items[0],
+            .account = match.account,
+            .token = match.token,
+        } };
+    }
+
     /// Account + audit a relayed message dropped locally because its sender nick is
     /// homed on a different node than the frame claims. Mirrors
     /// `recordRelaySignatureReject`, on the dedicated home-mismatch counter.
@@ -8833,6 +10409,1210 @@ pub const LinuxServer = struct {
         return std.ascii.eqlIgnoreCase(msg.source_prefix[at + 1 ..], origin_name);
     }
 
+    const RelayV2History = struct {
+        target: []const u8,
+        sender: []const u8,
+        text: []const u8,
+        command: []const u8,
+        client_tags: ?[]const u8,
+        timestamp_ms: u64,
+    };
+
+    const RelayV2AdmitOutcome = union(enum) {
+        accepted: relay_v2_replay_guard.RelayId,
+        duplicate: relay_v2_replay_guard.RelayId,
+        rejected,
+    };
+
+    const RelayV2OutboxReservation = struct {
+        peers: []const u64,
+        receipt_peer: ?u64 = null,
+        wire: []const u8,
+        unbound_excluded_peer: u64 = relay_v2_outbox.local_origin_exclusion,
+    };
+
+    /// Stage MESSAGE_V2 replay authority in a complete candidate, optionally
+    /// enter the same accepted RelayId into Lotus, and publish both only at the
+    /// no-fail boundary. Callers must finish routing/policy checks before asking
+    /// for a history row: `.inserted` is the only outcome that authorizes live
+    /// delivery, SearchIndex projection, or exact-wire re-forwarding. A duplicate,
+    /// equivocation, malformed row, capacity failure, or OOM leaves the live
+    /// RVG2 authority unchanged; Lotus' ingestExactOnce contract likewise leaves
+    /// all non-insert outcomes byte-exact.
+    fn admitRelayV2Detailed(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+        history: ?RelayV2History,
+        outbox: ?RelayV2OutboxReservation,
+        delivery: ?*PreparedAttachmentDeliveryBatch,
+    ) std.mem.Allocator.Error!RelayV2AdmitOutcome {
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        const checkpoint = self.relay_v2_replay_guard.encodeCheckpoint(self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .rejected,
+        };
+        defer self.allocator.free(checkpoint);
+        var candidate = relay_v2_replay_guard.Guard.decodeCheckpoint(
+            self.allocator,
+            self.relay_v2_replay_guard.config,
+            checkpoint,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .rejected,
+        };
+        defer candidate.deinit();
+        const relay_id = switch (try candidate.admitMessage(msg)) {
+            .accepted => |id| id,
+            .duplicate => |id| return .{ .duplicate = id },
+            .equivocation,
+            .retired,
+            .origin_capacity,
+            .origin_mismatch,
+            .bad_signature,
+            .invalid_semantic,
+            => return .rejected,
+        };
+
+        var event_log_plan: ?relay_v2_event_log.PreparedAccepted = null;
+        defer if (event_log_plan) |*plan| plan.deinit();
+        if (outbox) |reservation| {
+            if (self.relay_v2_required_nodes.len < 2) return .rejected;
+            const prepared = self.relay_v2_event_log.prepareAccepted(
+                relay_id,
+                reservation.wire,
+                self.config.node_id,
+                reservation.receipt_peer,
+                self.relay_v2_required_nodes,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .rejected,
+            };
+            event_log_plan = switch (prepared) {
+                .ready => |plan| plan,
+                .conflict => return .rejected,
+            };
+            if (event_log_plan.?.outcome() != .inserted) return .rejected;
+        }
+
+        var lotus_candidate: ?HistoryStore = null;
+        defer if (lotus_candidate) |*candidate_store| candidate_store.deinit();
+        if (history) |row| {
+            const lotus_checkpoint = self.history.encodeCheckpoint(self.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .rejected,
+            };
+            defer self.allocator.free(lotus_checkpoint);
+            lotus_candidate = HistoryStore.decodeCheckpoint(self.allocator, lotus_checkpoint) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .rejected,
+            };
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            const stable_msgid = msgid_mod.fromStableId(relay_id, &msgid_buf);
+            const result = lotus_candidate.?.ingestExactOnce(row.target, .{
+                .msgid = stable_msgid,
+                .sender = row.sender,
+                .text = row.text,
+                .timestamp = row.timestamp_ms,
+                .command = row.command,
+                .client_tags = row.client_tags,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .rejected,
+            };
+            switch (result) {
+                .inserted => {},
+                .exact_duplicate, .equivocation => return .rejected,
+            }
+        }
+
+        // Reserve every immediate-hop retransmission before either RVG2 or
+        // Lotus becomes live. putBatch is itself failure-atomic, and no fallible
+        // work follows this point.
+        if (outbox) |reservation| {
+            self.relay_v2_outbox.putBatchExcluding(
+                reservation.peers,
+                reservation.receipt_peer,
+                relay_id,
+                reservation.wire,
+                self.meshWallMs() +| relay_v2_initial_retry_ms,
+                reservation.unbound_excluded_peer,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .rejected,
+            };
+        }
+
+        // Every fallible authority reservation is complete. Publish the exact
+        // per-attachment rendered records in the same allocation-free cut as
+        // Lotus and RVG2, before an inbound caller can emit ACK.
+        if (delivery) |prepared_delivery| prepared_delivery.commit();
+
+        if (lotus_candidate) |*candidate_store|
+            std.mem.swap(HistoryStore, &self.history, candidate_store);
+
+        std.mem.swap(
+            relay_v2_replay_guard.Guard,
+            &self.relay_v2_replay_guard,
+            &candidate,
+        );
+        if (event_log_plan) |*plan| _ = plan.commit();
+        return .{ .accepted = relay_id };
+    }
+
+    fn probeRelayV2(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+        via_peer: u64,
+    ) std.mem.Allocator.Error!relay_v2_replay_guard.Probe {
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        const probe = try self.relay_v2_replay_guard.probeMessage(msg);
+        return switch (probe) {
+            .unseen => |id| if (self.relay_v2_event_log.contains(id) or
+                self.relay_v2_outbox.containsReceipt(via_peer, id))
+                .{ .duplicate = id }
+            else
+                probe,
+            .retired => |id| if (self.relay_v2_event_log.contains(id) or
+                self.relay_v2_outbox.containsReceipt(via_peer, id))
+                .{ .duplicate = id }
+            else
+                probe,
+            else => probe,
+        };
+    }
+
+    /// An RVG2 duplicate can still be a new authenticated ingress edge in a
+    /// cycle, or a replay whose prior ACK was lost. Reserve that peer's durable
+    /// receipt and the RVL2 one-sweep exclusion transactionally before ACKing.
+    /// A row already retired from RVL2 is re-ACKable only when RVO2 still holds
+    /// this exact peer receipt.
+    fn retainRelayV2DuplicateIngress(
+        self: *LinuxServer,
+        relay_id: relay_v2_replay_guard.RelayId,
+        wire: []const u8,
+        via_peer: u64,
+    ) std.mem.Allocator.Error!bool {
+        if (!self.relayV2DirectNeighbor(via_peer) or self.relay_v2_required_nodes.len < 2)
+            return false;
+        const peers = try self.collectRelayV2OutboxPeers(via_peer, false);
+        defer self.allocator.free(peers);
+
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        if (!self.relay_v2_event_log.contains(relay_id))
+            return self.relay_v2_outbox.containsReceipt(via_peer, relay_id);
+        const prepared = self.relay_v2_event_log.prepareAccepted(
+            relay_id,
+            wire,
+            self.config.node_id,
+            via_peer,
+            self.relay_v2_required_nodes,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => false,
+        };
+        var plan = switch (prepared) {
+            .ready => |ready| ready,
+            .conflict => return false,
+        };
+        defer plan.deinit();
+        if (plan.outcome() != .exact_duplicate) return false;
+        self.relay_v2_outbox.putBatchExcluding(
+            peers,
+            via_peer,
+            relay_id,
+            wire,
+            self.meshWallMs() +| relay_v2_initial_retry_ms,
+            via_peer,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => false,
+        };
+        _ = plan.commit();
+        return true;
+    }
+
+    fn admitRelayV2(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+        history: ?RelayV2History,
+    ) std.mem.Allocator.Error!?relay_v2_replay_guard.RelayId {
+        return switch (try self.admitRelayV2Detailed(msg, history, null, null)) {
+            .accepted => |id| id,
+            .duplicate, .rejected => null,
+        };
+    }
+
+    const AcceptedAuthoredRelayV2 = struct {
+        relay_id: relay_v2_replay_guard.RelayId,
+        wire: []u8,
+
+        fn deinit(self: *AcceptedAuthoredRelayV2, allocator: std.mem.Allocator) void {
+            allocator.free(self.wire);
+            self.* = undefined;
+        }
+    };
+
+    const AuthoredRelayV2Delivery = struct {
+        recipients: []const client_model.ClientId,
+        line: []const u8,
+        is_bot: bool = false,
+    };
+
+    fn collectRelayV2OutboxPeers(
+        self: *LinuxServer,
+        exclude_peer: ?u64,
+        include_unbound_when_empty: bool,
+    ) std.mem.Allocator.Error![]u64 {
+        var peers: std.ArrayList(u64) = .empty;
+        errdefer peers.deinit(self.allocator);
+        _ = include_unbound_when_empty;
+        for (self.relay_v2_required_nodes) |peer| {
+            if (peer == self.config.node_id) continue;
+            if (exclude_peer != null and peer == exclude_peer.?) continue;
+            try peers.append(self.allocator, peer);
+        }
+        return peers.toOwnedSlice(self.allocator);
+    }
+
+    fn relayV2DirectNeighbor(self: *const LinuxServer, node: u64) bool {
+        if (node == 0 or node == self.config.node_id) return false;
+        for (self.relay_v2_required_nodes) |required| {
+            if (required == node) return true;
+        }
+        return false;
+    }
+
+    /// Build and sign one immutable local MESSAGE_V2, finish every allocation
+    /// (including canonical encode) before authority publication, then enter it
+    /// through the same RVG2/Lotus transaction as inbound traffic.
+    fn admitAuthoredRelayV2(
+        self: *LinuxServer,
+        verb: message_relay_v2.Verb,
+        target: []const u8,
+        min_rank: u8,
+        source_prefix: []const u8,
+        account: []const u8,
+        tags: []const u8,
+        data_tag: []const u8,
+        text: []const u8,
+        scope_kind: message_relay_v2.ScopeKind,
+        recipient: []const u8,
+        sender_token: ?sessions_mod.Token,
+        sender_member_modes: ?u8,
+        recipient_token: ?sessions_mod.Token,
+        hlc: u64,
+        history: ?RelayV2History,
+        delivery: ?AuthoredRelayV2Delivery,
+    ) !?AcceptedAuthoredRelayV2 {
+        const identity = self.config.node_identity orelse return null;
+        const sender_route = if (sender_token) |token|
+            message_relay_v2.routeId(token) catch return null
+        else
+            null;
+        const recipient_route = if (recipient_token) |token|
+            message_relay_v2.routeId(token) catch return null
+        else
+            null;
+        var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+        var signature: [message_relay_v2.sig_len]u8 = undefined;
+        var msg = message_relay_v2.RelayMessage{
+            .verb = verb,
+            .target = target,
+            .min_rank = min_rank,
+            .source_prefix = source_prefix,
+            .account = account,
+            .tags = tags,
+            .data_tag = data_tag,
+            .text = text,
+            .recipient = recipient,
+            .scope_kind = scope_kind,
+            .sender_route_id = sender_route,
+            .sender_member_modes = sender_member_modes,
+            .recipient_route_id = recipient_route,
+            .origin_node = self.config.node_id,
+            .hlc = hlc,
+        };
+        try message_relay_v2.stampOrigin(
+            self.allocator,
+            &msg,
+            &identity.sign_kp,
+            &pubkey,
+            &signature,
+        );
+        const wire = try message_relay_v2.encode(self.allocator, msg);
+        errdefer self.allocator.free(wire);
+        var prepared_delivery: ?PreparedAttachmentDeliveryBatch = null;
+        defer if (prepared_delivery) |*prepared| prepared.deinit();
+        if (delivery) |plan| {
+            const predicted_relay_id = try message_relay_v2.relayId(self.allocator, msg);
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
+            prepared_delivery = try self.prepareAttachmentDeliveryBatch(
+                plan.recipients,
+                .{
+                    .time_value = serverTimeValueAt(
+                        &time_buf,
+                        mesh_clock_mod.MeshClock.physicalOf(hlc),
+                    ),
+                    .account = if (account.len != 0) account else null,
+                    .client_tags = if (tags.len != 0) tags else null,
+                    .msgid = stable_msgid,
+                    .is_bot = plan.is_bot,
+                },
+                plan.line,
+            );
+        }
+        const peers = try self.collectRelayV2OutboxPeers(null, true);
+        defer self.allocator.free(peers);
+        const relay_id = switch (try self.admitRelayV2Detailed(msg, history, .{
+            .peers = peers,
+            .wire = wire,
+            .unbound_excluded_peer = self.config.node_id,
+        }, if (prepared_delivery) |*prepared| prepared else null)) {
+            .accepted => |id| id,
+            .duplicate, .rejected => {
+                self.allocator.free(wire);
+                return null;
+            },
+        };
+        if (prepared_delivery) |*prepared| prepared.release();
+        return .{ .relay_id = relay_id, .wire = wire };
+    }
+
+    /// Re-flood one already-admitted MESSAGE_V2 object without decode/re-encode
+    /// drift. Only secured, negotiated v2 links are eligible; inbound v2 is
+    /// never downgraded into legacy MESSAGE, whose mutable fields and bounded
+    /// seen set cannot preserve the same authority.
+    fn forwardAcceptedRelayV2(self: *LinuxServer, wire: []const u8) void {
+        _ = wire;
+        // All MESSAGE_V2 egress, including the just-accepted live case, flows
+        // through RVL2's per-origin ordered scheduler. Direct forwarding here
+        // could let e1..e65 overtake a retained e0 and make RVG2 retire e0 at the
+        // receiver. Reactor 0 owns S2S links; foreign shards only wake it.
+        if (current_reactor == &self.reactors[0]) {
+            self.retryRelayV2Outbox();
+        } else if (self.reactors[0].wake) |*wake| {
+            wake.wake();
+        }
+    }
+
+    fn deferRelayV2(self: *LinuxServer, item: *s2s_link.InboundMessageV2) bool {
+        for (self.relay_v2_deferred[0..self.relay_v2_deferred_len]) |*pending| {
+            if (std.mem.eql(u8, pending.wire, item.wire)) {
+                item.deinit(self.allocator);
+                return true;
+            }
+        }
+        if (self.relay_v2_deferred_len == relay_v2_deferred_capacity) return false;
+        self.relay_v2_deferred[self.relay_v2_deferred_len] = item.*;
+        self.relay_v2_deferred_len += 1;
+        item.* = undefined;
+        return true;
+    }
+
+    const RelayV2DeliveryOutcome = union(enum) {
+        accepted: relay_v2_replay_guard.RelayId,
+        duplicate: relay_v2_replay_guard.RelayId,
+        permanent,
+        retry,
+    };
+
+    fn sendRelayV2AckToPeer(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsSecureRelayV2()) continue;
+                if ((link.remoteNodeId() orelse continue) != peer) continue;
+                const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                // A prior retry may already own complete ciphertext in the
+                // shared secured buffer. Drain it first; encoding the same
+                // receipt again on every due pass would grow unbounded while a
+                // healthy peer's SendQ remains congested.
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+                link.sendMessageV2Ack(relay_id) catch return false;
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn sendRelayV2AckConfirmToPeer(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsRelayV2AckConfirm()) continue;
+                if ((link.remoteNodeId() orelse continue) != peer) continue;
+                const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return;
+                link.sendMessageV2AckConfirm(relay_id) catch return;
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return;
+                return;
+            }
+        }
+    }
+
+    fn commitRelayV2NeighborAck(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) bool {
+        if (!self.relayV2DirectNeighbor(peer)) return false;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        if (!self.relay_v2_event_log.contains(relay_id)) {
+            // A duplicate ACK after the last required confirmation retired RVL2
+            // still needs another ACK_CONFIRM; the 128-bit ID came from the
+            // authenticated neighbor and RVG2 remains the retired-ID authority.
+            _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
+            return true;
+        }
+        var plan = self.relay_v2_event_log.prepareAuthenticatedDurableAck(
+            relay_id,
+            peer,
+        ) catch return false;
+        defer plan.deinit();
+        _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
+        _ = plan.commit();
+        return true;
+    }
+
+    fn commitRelayV2IngressAckConfirm(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) bool {
+        if (!self.relayV2DirectNeighbor(peer)) return false;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        // ACK_CONFIRM is meaningful only for a receipt we durably reserved when
+        // accepting this exact neighbor's ingress. This blocks unsolicited
+        // confirmations from manufacturing coverage.
+        if (!self.relay_v2_outbox.containsReceipt(peer, relay_id)) return false;
+        if (!self.relay_v2_event_log.contains(relay_id)) {
+            _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
+            return self.relay_v2_outbox.confirmReceipt(peer, relay_id);
+        }
+        var plan = self.relay_v2_event_log.prepareAuthenticatedDurableAck(
+            relay_id,
+            peer,
+        ) catch return false;
+        defer plan.deinit();
+        _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
+        _ = self.relay_v2_outbox.confirmReceipt(peer, relay_id);
+        _ = plan.commit();
+        return true;
+    }
+
+    fn drainRelayV2Acks(
+        self: *LinuxServer,
+        link: *secured_s2s_link.SecuredLink,
+    ) void {
+        const peer = link.remoteNodeId() orelse return;
+        const acks = link.takeInboundV2Acks() catch return;
+        defer self.allocator.free(acks);
+        // Confirmation has its own negotiated payload shape, so it is safe to
+        // answer even a duplicate ACK after the outbound row was already removed.
+        // A lost confirmation therefore triggers another ACK/confirm round rather
+        // than pinning the receiver's durable admission proof forever.
+        for (acks) |id| {
+            if (comptime builtin.is_test)
+                if (self.consumeRelayV2AckDropForTest(peer, id)) continue;
+            if (self.commitRelayV2NeighborAck(peer, id))
+                self.sendRelayV2AckConfirmToPeer(peer, id);
+        }
+
+        const confirms = link.takeInboundV2AckConfirms() catch return;
+        defer self.allocator.free(confirms);
+        for (confirms) |id| _ = self.commitRelayV2IngressAckConfirm(peer, id);
+        if (acks.len != 0 or confirms.len != 0) self.forwardAcceptedRelayV2(&.{});
+    }
+
+    fn consumeRelayV2AckDropForTest(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) bool {
+        if (comptime !builtin.is_test) return false;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        if (!self.test_drop_relay_v2_ack.armed or
+            self.test_drop_relay_v2_ack.peer != peer or
+            !std.mem.eql(u8, &self.test_drop_relay_v2_ack.relay_id, &relay_id))
+        {
+            return false;
+        }
+        self.test_drop_relay_v2_ack = .{};
+        return true;
+    }
+
+    fn dropRelayV2AckForMsgidFromForTest(
+        self: *LinuxServer,
+        peer: u64,
+        msgid: []const u8,
+    ) !relay_v2_replay_guard.RelayId {
+        if (comptime !builtin.is_test) return error.Unsupported;
+        if (peer == 0 or msgid.len != msgid_mod.id_len) return error.InvalidFaultTarget;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        if (self.test_drop_relay_v2_ack.armed) return error.AlreadyArmed;
+
+        var matched: ?relay_v2_replay_guard.RelayId = null;
+        var rendered_buf: [msgid_mod.id_len]u8 = undefined;
+        var index: usize = 0;
+        while (index < self.relay_v2_event_log.len()) : (index += 1) {
+            const row = self.relay_v2_event_log.viewAt(index);
+            const rendered = msgid_mod.fromStableId(row.relay_id, &rendered_buf);
+            if (!std.mem.eql(u8, rendered, msgid)) continue;
+            if (matched != null) return error.AmbiguousFaultTarget;
+            matched = row.relay_id;
+        }
+        self.test_drop_relay_v2_ack = .{
+            .armed = true,
+            .peer = peer,
+            .relay_id = matched orelse return error.RelayNotRetained,
+        };
+        return self.test_drop_relay_v2_ack.relay_id;
+    }
+
+    fn relayV2AckDropArmedForTest(self: *LinuxServer) bool {
+        if (comptime !builtin.is_test) return false;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        return self.test_drop_relay_v2_ack.armed;
+    }
+
+    const RelayV2AuthorityStateForTest = struct {
+        event_retained: bool,
+        outbox_retained: bool,
+        receipt_retained: bool,
+    };
+
+    fn relayV2AuthorityStateForTest(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: relay_v2_replay_guard.RelayId,
+    ) RelayV2AuthorityStateForTest {
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        return .{
+            .event_retained = self.relay_v2_event_log.contains(relay_id),
+            .outbox_retained = self.relay_v2_outbox.contains(peer, relay_id),
+            .receipt_retained = self.relay_v2_outbox.containsReceipt(peer, relay_id),
+        };
+    }
+
+    fn sessionReplicaChannelFromOriginForTest(
+        self: *LinuxServer,
+        token: session_migrate.Token,
+        origin: u64,
+        channel: []const u8,
+    ) bool {
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+        const entry = self.session_replica_store.getOrigin(token, origin) orelse return false;
+        if (entry.revision.origin_node != origin) return false;
+        var snapshot = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
+        defer snapshot.deinit(self.allocator);
+        return sessionSnapshotChannelMode(&snapshot, channel) != null;
+    }
+
+    fn replayRelayV2WireToPeer(self: *LinuxServer, peer: u64, wire: []const u8) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsSecureRelayV2()) continue;
+                if ((link.remoteNodeId() orelse continue) != peer) continue;
+                const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+                link.replayRetainedMessageV2Wire(wire) catch return false;
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn collectRelayV2RetryWork(
+        self: *LinuxServer,
+        work: []RelayV2RetryWork,
+    ) usize {
+        if (work.len == 0 or self.relay_v2_required_nodes.len == 0) return 0;
+        var work_len: usize = 0;
+        var bytes_staged: usize = 0;
+
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        const peer_count = self.relay_v2_required_nodes.len;
+        var cursor = self.relay_v2_peer_cursor % peer_count;
+        var remaining = peer_count;
+        while (remaining != 0 and work_len < work.len) {
+            if (work_len != 0 and bytes_staged >= relay_v2_retry_byte_budget) break;
+
+            const peer = self.relay_v2_required_nodes[cursor];
+            cursor = (cursor + 1) % peer_count;
+            self.relay_v2_peer_cursor = cursor;
+            remaining -= 1;
+            if (peer == self.config.node_id) continue;
+
+            var page: [1]relay_v2_event_log.PageItem = undefined;
+            const page_len = self.relay_v2_event_log.collectPageForNode(peer, &page) catch continue;
+            if (page_len == 0) continue;
+            const item = page[0];
+            if (work_len != 0 and item.wire.len > relay_v2_retry_byte_budget - bytes_staged)
+                continue;
+            const wire = self.allocator.dupe(u8, item.wire) catch continue;
+            work[work_len] = .{ .peer = peer, .relay_id = item.relay_id, .wire = wire };
+            work_len += 1;
+            bytes_staged +|= item.wire.len;
+        }
+        return work_len;
+    }
+
+    fn retryRelayV2Outbox(self: *LinuxServer) void {
+        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+        const now = self.meshWallMs();
+        const work_len = self.collectRelayV2RetryWork(&work);
+
+        defer for (work[0..work_len]) |item| self.allocator.free(item.wire);
+        for (work[0..work_len]) |item| {
+            _ = self.replayRelayV2WireToPeer(item.peer, item.wire);
+        }
+
+        // Accepted inbound receipts use the same bounded, fair retry shape. ACK
+        // confirmation removes them; a lost ACK or confirmation cannot age the
+        // proof out behind unrelated messages.
+        var receipts: [relay_v2_retry_frame_budget]relay_v2_outbox.Receipt = undefined;
+        lockSpin(&self.relay_v2_replay_mu);
+        const receipt_len = self.relay_v2_outbox.collectDueReceipts(now, &receipts);
+        self.relay_v2_replay_mu.unlock();
+        for (receipts[0..receipt_len]) |receipt| {
+            if (!self.sendRelayV2AckToPeer(receipt.peer, receipt.relay_id)) continue;
+            lockSpin(&self.relay_v2_replay_mu);
+            for (self.relay_v2_outbox.mutableReceiptItems()) |*live| {
+                if (live.peer != receipt.peer or
+                    !std.mem.eql(u8, &live.relay_id, &receipt.relay_id)) continue;
+                live.attempts +|= 1;
+                const shift: u5 = @intCast(@min(live.attempts, 5));
+                live.retry_after_ms = now +| (relay_v2_initial_retry_ms << shift);
+                break;
+            }
+            self.relay_v2_replay_mu.unlock();
+        }
+    }
+
+    fn retryDeferredRelayV2(self: *LinuxServer) void {
+        var index: usize = 0;
+        while (index < self.relay_v2_deferred_len) {
+            const pending = &self.relay_v2_deferred[index];
+            switch (self.deliverRelayV2(pending.owned.msg, pending.wire, pending.via_peer)) {
+                .retry => {
+                    index += 1;
+                    continue;
+                },
+                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
+                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
+                .permanent => {},
+            }
+            pending.deinit(self.allocator);
+            self.relay_v2_deferred_len -= 1;
+            if (index != self.relay_v2_deferred_len)
+                self.relay_v2_deferred[index] = self.relay_v2_deferred[self.relay_v2_deferred_len];
+        }
+    }
+
+    fn drainRelayV2(
+        self: *LinuxServer,
+        conn: *ConnState,
+        link: *secured_s2s_link.SecuredLink,
+    ) void {
+        const inbound = link.takeInboundV2() catch return;
+        defer self.allocator.free(inbound);
+        for (inbound, 0..) |*item, inbound_index| {
+            switch (self.deliverRelayV2(item.owned.msg, item.wire, item.via_peer)) {
+                .accepted => |id| {
+                    _ = self.sendRelayV2AckToPeer(item.via_peer, id);
+                    item.deinit(self.allocator);
+                },
+                .duplicate => |id| {
+                    _ = self.sendRelayV2AckToPeer(item.via_peer, id);
+                    item.deinit(self.allocator);
+                },
+                .permanent => item.deinit(self.allocator),
+                .retry => if (!self.deferRelayV2(item)) {
+                    // Do not keep consuming a feed after the exact deferred
+                    // authority is full. Closing forces retained sender replay;
+                    // silently accepting or evicting would create an event gap.
+                    item.deinit(self.allocator);
+                    for (inbound[inbound_index + 1 ..]) |*later| later.deinit(self.allocator);
+                    conn.closing = true;
+                    self.traceLog(.err, .s2s, "MESSAGE_V2 deferred queue exhausted; closing peer feed");
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Dedicated signed MESSAGE_V2 live path. All routing and policy resolution
+    /// that can fail is completed before `admitRelayV2`; only its accepted
+    /// RelayId authorizes tags, local fanout, projections, or exact-wire flood.
+    fn deliverRelayV2(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+        wire: []const u8,
+        via_peer: u64,
+    ) RelayV2DeliveryOutcome {
+        if (!self.relayV2DirectNeighbor(via_peer)) return .permanent;
+        message_relay_v2.validateSemantic(msg) catch return .permanent;
+        // Lost ACKs are replayed against immutable authenticated identity, not
+        // today's mutable route or policy state. Re-ack an exact retained
+        // duplicate before target/session resolution; unseen events still run
+        // every first-admission check below before RVG2 can advance.
+        switch (self.probeRelayV2(msg, via_peer) catch return .retry) {
+            .duplicate => |id| return if (self.retainRelayV2DuplicateIngress(
+                id,
+                wire,
+                via_peer,
+            ) catch return .retry) .{ .duplicate = id } else .permanent,
+            .unseen => {},
+            .equivocation,
+            .retired,
+            .origin_mismatch,
+            .bad_signature,
+            .invalid_semantic,
+            => return .permanent,
+        }
+        const source_nick = msg.sourceNick() orelse return .permanent;
+        if (!self.relayV2OriginKnown(msg)) return .retry;
+        const latest_physical = std.math.add(
+            u64,
+            self.meshWallMs(),
+            mesh_clock_mod.default_max_future_skew_ms,
+        ) catch std.math.maxInt(u64);
+        if (mesh_clock_mod.MeshClock.physicalOf(msg.hlc) > latest_physical) return .retry;
+        var safe_tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        const safe_tags = clientOnlyTags(msg.tags, &safe_tag_buf);
+        const clean_msg = s2s_link.RelayMessage{
+            .verb = msg.verb,
+            .target = msg.target,
+            .min_rank = msg.min_rank,
+            .source_nick = source_nick,
+            .source_prefix = msg.source_prefix,
+            .account = msg.account,
+            .tags = safe_tags,
+            .text = msg.text,
+            .data_tag = msg.data_tag,
+            .recipient = msg.recipient,
+            .origin_node = msg.origin_node,
+            .hlc = msg.hlc,
+            .origin_pubkey = msg.origin_pubkey,
+            .origin_sig = msg.origin_sig,
+        };
+
+        const replica_proof = self.replicatedSessionProofV2(msg);
+        // SESSION_REPLICA and MESSAGE_V2 may arrive in adjacent records. A
+        // locally resident sender without its exact signed route proof is
+        // unresolved authority, not a policy denial: retaining the immutable
+        // wire lets the authority drain complete before RVG2 is consumed.
+        if (msg.sender_route_id) |sender_route| {
+            var sender_account_buf: [session_replica_account_max]u8 = undefined;
+            const receiver_owns_route = self.localPortableSessionByRoute(
+                sender_route,
+                &sender_account_buf,
+            ) != null;
+            if (receiver_owns_route and replica_proof == null) return .retry;
+        }
+        const local_sender_allowed = !((self.nickIsLiveLocal(source_nick) or
+            self.relaySenderHomeMismatch(source_nick, msg.origin_node)) and
+            replica_proof == null);
+        const residence_account: ?[]const u8 = if (replica_proof == null)
+            self.trustedRemoteAccountAtNode(source_nick, msg.origin_node)
+        else
+            null;
+        const policy_account = if (replica_proof) |proof|
+            proof.trusted_account
+        else if (residence_account) |account|
+            account
+        else
+            "";
+        const signed_member_modes: ?world_model.MemberModes = if (msg.sender_member_modes) |bits|
+            .{ .bits = bits }
+        else
+            null;
+        const is_data_family = switch (msg.verb) {
+            .data, .request, .reply => true,
+            else => false,
+        };
+        var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipient_ids.deinit(self.allocator);
+        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer sender_ids.deinit(self.allocator);
+        var exact_target: ?RelayV2ExactTarget = null;
+        var speech: ChannelSpeechResult = .deny;
+        var effective_text = msg.text;
+        var noformat_buf: [1024]u8 = undefined;
+        var dm_key_buf: [320]u8 = undefined;
+        var recipient_account_buf: [session_replica_account_max]u8 = undefined;
+        var history_row: ?RelayV2History = null;
+
+        if (replica_proof) |proof| {
+            self.collectAttachedTokenAuthorityClients(
+                proof.trusted_account,
+                proof.token,
+                &sender_ids,
+            ) catch return .retry;
+        }
+
+        switch (msg.scope_kind) {
+            .channel => {
+                if (msg.verb != .tagmsg and !is_data_family and
+                    self.world.channelHasExtFlag(msg.target, .noformat) and
+                    color_strip.hasFormatting(msg.text))
+                {
+                    effective_text = color_strip.stripFormatting(msg.text, &noformat_buf) catch msg.text;
+                }
+                // Topology is never channel-membership authority. A third-hop
+                // origin signature proves authorship, not +n bypass rights;
+                // only the separately authenticated webhook shape is external.
+                const allow_external = self.isVerifiedWebhookRelay(clean_msg, .verified);
+                if (self.world.channelHasFlag(msg.target, .no_external) and
+                    !allow_external and replica_proof == null and signed_member_modes == null and
+                    !self.remoteMemberOfChannelAtNode(msg.target, source_nick, msg.origin_node))
+                {
+                    // A membership burst can trail the immutable message on a
+                    // newly converging multi-hop route. Do not turn missing
+                    // receiver-owned membership authority into either a +n
+                    // bypass or a consumed-and-lost denial.
+                    return .retry;
+                }
+                const effective_sender_modes = if (replica_proof) |proof|
+                    proof.modes
+                else
+                    signed_member_modes orelse self.relaySenderModes(msg.target, source_nick);
+                if (is_data_family and !self.remoteDataTagAuthorized(
+                    msg.data_tag,
+                    true,
+                    effective_sender_modes,
+                    policy_account,
+                )) return .permanent;
+                const local_content_allowed = self.messageSatisfiesEncryptionPolicy(
+                    msg.target,
+                    if (safe_tags.len != 0) safe_tags else null,
+                ) and !(is_data_family and
+                    self.world.channelHasExtFlag(msg.target, .nocomicdata) and
+                    effective_sender_modes.rank() < 2);
+                if (local_sender_allowed and local_content_allowed) {
+                    speech = self.relayChannelSpeechGate(
+                        msg.target,
+                        source_nick,
+                        msg.source_prefix,
+                        policy_account,
+                        effective_text,
+                        msg.verb == .notice,
+                        msg.min_rank,
+                        if (replica_proof) |proof| proof.modes else signed_member_modes,
+                        allow_external,
+                    );
+                }
+                if (speech != .deny and speech != .opmoderate and msg.min_rank == 0) {
+                    const command: ?[]const u8 = switch (msg.verb) {
+                        .privmsg => "PRIVMSG",
+                        .notice => "NOTICE",
+                        .tagmsg => if (tagmsgHistoryEligible(safe_tags)) "TAGMSG" else null,
+                        else => null,
+                    };
+                    if (command) |history_command| history_row = .{
+                        .target = msg.target,
+                        .sender = msg.source_prefix,
+                        .text = if (msg.verb == .tagmsg) "" else effective_text,
+                        .command = history_command,
+                        .client_tags = if (safe_tags.len != 0) safe_tags else null,
+                        .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(msg.hlc),
+                    };
+                }
+            },
+            .direct => if (local_sender_allowed) {
+                if (is_data_family and !self.remoteDataTagAuthorized(
+                    msg.data_tag,
+                    false,
+                    null,
+                    policy_account,
+                )) return .permanent;
+                const signed_route = msg.recipient_route_id orelse return .permanent;
+                const target_resolution = self.collectRelayV2ExactTarget(
+                    msg.target,
+                    signed_route,
+                    null,
+                    &recipient_account_buf,
+                    &recipient_ids,
+                ) catch return .retry;
+                switch (target_resolution) {
+                    .ready => |target| exact_target = target,
+                    .pending => return .retry,
+                    .transit => {},
+                }
+                if (exact_target) |target| {
+                    var index: usize = 0;
+                    while (index < recipient_ids.items.len) {
+                        if (self.relayDirectMessagePolicyBlocks(
+                            clean_msg,
+                            policy_account,
+                            recipient_ids.items[index],
+                        )) {
+                            _ = recipient_ids.orderedRemove(index);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    if (recipient_ids.items.len == 0) {
+                        exact_target = null;
+                        // Match the legacy policy invariant: a recipient-side
+                        // SILENCE/+g/+C/+R denial also suppresses the author's
+                        // exact-token sent copy on this node.
+                        sender_ids.clearRetainingCapacity();
+                    }
+                    if (exact_target != null and msg.verb == .privmsg) {
+                        const sender_account: ?[]const u8 = if (replica_proof) |proof|
+                            proof.trusted_account
+                        else
+                            self.trustedRemoteAccountAtNode(source_nick, msg.origin_node);
+                        if (sender_account) |sender| {
+                            if (dmHistoryKey(source_nick, sender, msg.target, target.account, &dm_key_buf)) |key| {
+                                history_row = .{
+                                    .target = key,
+                                    .sender = msg.source_prefix,
+                                    .text = msg.text,
+                                    .command = "PRIVMSG",
+                                    .client_tags = if (safe_tags.len != 0) safe_tags else null,
+                                    .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(msg.hlc),
+                                };
+                            }
+                        }
+                    }
+                }
+            },
+            .channel_whisper => if (local_sender_allowed) {
+                const signed_route = msg.recipient_route_id orelse return .permanent;
+                const sender_member = replica_proof != null or signed_member_modes != null or
+                    self.remoteMemberOfChannelAtNode(msg.target, source_nick, msg.origin_node);
+                if (sender_member and !self.world.channelHasExtFlag(msg.target, .nowhisper)) {
+                    const target_resolution = self.collectRelayV2ExactTarget(
+                        msg.recipient,
+                        signed_route,
+                        msg.target,
+                        &recipient_account_buf,
+                        &recipient_ids,
+                    ) catch return .retry;
+                    switch (target_resolution) {
+                        .ready => |target| exact_target = target,
+                        .pending => return .retry,
+                        .transit => {},
+                    }
+                }
+            },
+        }
+
+        // Pre-render before authority publication. A locally unrenderable object
+        // is rejected without consuming RVG2 so an upgraded implementation can
+        // retry it; a pure-transit node uses the same bounded IRC grammar.
+        const verb = msg.verb.commandWord();
+        var render_target_buf: [128]u8 = undefined;
+        const render_target = if (msg.scope_kind == .channel)
+            if (statusRankPrefix(msg.min_rank)) |prefix|
+                std.fmt.bufPrint(&render_target_buf, "{c}{s}", .{ prefix, msg.target }) catch
+                    return .permanent
+            else
+                msg.target
+        else
+            msg.target;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = if (msg.scope_kind == .channel_whisper)
+            std.fmt.bufPrint(&line_buf, ":{s} WHISPER {s} {s} :{s}\r\n", .{
+                msg.source_prefix, msg.target, msg.recipient, msg.text,
+            }) catch return .permanent
+        else if (msg.verb == .tagmsg)
+            std.fmt.bufPrint(&line_buf, ":{s} TAGMSG {s}\r\n", .{
+                msg.source_prefix, render_target,
+            }) catch return .permanent
+        else if (is_data_family)
+            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} {s} :{s}\r\n", .{
+                msg.source_prefix, verb, render_target, msg.data_tag, effective_text,
+            }) catch return .permanent
+        else
+            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{
+                msg.source_prefix, verb, render_target, effective_text,
+            }) catch return .permanent;
+
+        // RelayId is a deterministic digest of the immutable signed object. Use
+        // it to render the complete attachment batch before live RVG2 authority
+        // moves; `admitMessage` below still performs the signature/origin checks
+        // and must return the same identity before publication.
+        const predicted_relay_id = message_relay_v2.relayId(self.allocator, msg) catch return .retry;
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        var time_buf: [40]u8 = undefined;
+        const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
+        const tags = MsgTags{
+            .time_value = serverTimeValueAt(
+                &time_buf,
+                mesh_clock_mod.MeshClock.physicalOf(msg.hlc),
+            ),
+            .account = if (policy_account.len != 0) policy_account else null,
+            .client_tags = safe_tags,
+            .msgid = stable_msgid,
+        };
+
+        var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer delivery_ids.deinit(self.allocator);
+        switch (msg.scope_kind) {
+            .channel => if (speech != .deny) {
+                if (self.world.memberIterator(msg.target)) |*iter| {
+                    var members = iter.*;
+                    const min_rank: u8 = if (speech == .opmoderate) 2 else msg.min_rank;
+                    while (members.next()) |member| {
+                        if (min_rank != 0) {
+                            const modes = self.world.memberModes(msg.target, member.*) orelse continue;
+                            if (modes.rank() < min_rank) continue;
+                        }
+                        const id = clientIdFromWorld(member.*);
+                        if (msg.verb == .tagmsg) {
+                            const target_conn = self.connFor(id) orelse continue;
+                            var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                            if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
+                        }
+                        delivery_ids.append(self.allocator, id) catch return .retry;
+                    }
+                }
+            },
+            .direct, .channel_whisper => {
+                for (recipient_ids.items) |id| {
+                    if (msg.verb == .tagmsg) {
+                        const target_conn = self.connFor(id) orelse continue;
+                        var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                        if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
+                    }
+                    delivery_ids.append(self.allocator, id) catch return .retry;
+                }
+                for (sender_ids.items) |sender_id| {
+                    var already_recipient = false;
+                    for (recipient_ids.items) |recipient_id| if (sender_id.eql(recipient_id)) {
+                        already_recipient = true;
+                        break;
+                    };
+                    if (already_recipient) continue;
+                    if (msg.verb == .tagmsg) {
+                        const target_conn = self.connFor(sender_id) orelse continue;
+                        var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                        if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
+                    }
+                    delivery_ids.append(self.allocator, sender_id) catch return .retry;
+                }
+            },
+        }
+        var prepared_delivery = self.prepareAttachmentDeliveryBatch(
+            delivery_ids.items,
+            tags,
+            line,
+        ) catch return .retry;
+        defer prepared_delivery.deinit();
+
+        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .retry;
+        defer self.allocator.free(outbox_peers);
+        const outbox_reservation = RelayV2OutboxReservation{
+            .peers = outbox_peers,
+            .receipt_peer = via_peer,
+            .wire = wire,
+            .unbound_excluded_peer = via_peer,
+        };
+        const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .retry) {
+            .accepted => |id| id,
+            .duplicate => |id| return .{ .duplicate = id },
+            .rejected => return .permanent,
+        };
+        std.debug.assert(std.mem.eql(u8, &relay_id, &predicted_relay_id));
+        // The joint cut is published. Release the spool lane before the ordinary
+        // fanout helpers encounter the now-exact-duplicate records and drain them.
+        prepared_delivery.release();
+
+        if (history_row) |row| {
+            self.search_index.index(stable_msgid, row.text) catch {};
+            self.chanstatsMessage(row.target, row.sender, row.command, row.text);
+        }
+
+        switch (msg.scope_kind) {
+            .channel => if (speech != .deny) {
+                if (self.world.memberIterator(msg.target)) |*iter| {
+                    var members = iter.*;
+                    const min_rank: u8 = if (speech == .opmoderate) 2 else msg.min_rank;
+                    while (members.next()) |member| {
+                        if (min_rank != 0) {
+                            const modes = self.world.memberModes(msg.target, member.*) orelse continue;
+                            if (modes.rank() < min_rank) continue;
+                        }
+                        const id = clientIdFromWorld(member.*);
+                        if (msg.verb == .tagmsg) {
+                            const conn = self.connFor(id) orelse continue;
+                            var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                            if (clientTagsForSession(&conn.session, safe_tags, &visible).len == 0) continue;
+                        }
+                        self.deliverPreparedTagged(id, tags, line) catch {};
+                    }
+                }
+            },
+            .direct, .channel_whisper => {
+                for (recipient_ids.items) |id| {
+                    if (msg.verb == .tagmsg) {
+                        const target_conn = self.connFor(id) orelse continue;
+                        var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                        if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
+                    }
+                    self.deliverPreparedTagged(id, tags, line) catch {};
+                }
+            },
+        }
+        for (sender_ids.items) |sender_id| {
+            var already_recipient = false;
+            for (recipient_ids.items) |recipient_id| {
+                if (sender_id.eql(recipient_id)) {
+                    already_recipient = true;
+                    break;
+                }
+            }
+            if (already_recipient) continue;
+            if (msg.scope_kind == .channel) {
+                // Channel fanout above already visits every eligible physical
+                // member, including all exact-token sender attachments. A
+                // second sender-mirror delivery duplicates ordinary messages
+                // and leaks denied/status/TAGMSG-invisible events.
+                continue;
+            }
+            if (msg.verb == .tagmsg) {
+                const target_conn = self.connFor(sender_id) orelse continue;
+                var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
+            }
+            self.deliverPreparedTagged(sender_id, tags, line) catch {};
+        }
+        self.forwardAcceptedRelayV2(wire);
+        return .{ .accepted = relay_id };
+    }
+
     /// Deliver an inbound relayed user message to LOCAL recipients (channel
     /// members or a local nick), then re-forward to other peers for multi-hop
     /// (loop-guarded by the per-peer seen-set + origin id).
@@ -8932,6 +11712,17 @@ pub const LinuxServer = struct {
             account
         else
             "";
+        const target_is_channel = world_model.isChannelName(clean_msg.target);
+        const effective_remote_modes: ?world_model.MemberModes = if (target_is_channel)
+            replica_modes orelse self.relaySenderModes(clean_msg.target, clean_msg.source_nick)
+        else
+            null;
+        if (is_data_family and !self.remoteDataTagAuthorized(
+            clean_msg.data_tag,
+            target_is_channel,
+            effective_remote_modes,
+            policy_account,
+        )) return;
         const relay_tags = MsgTags{
             .time_value = if (stable_event_identity)
                 serverTimeValueAt(&time_buf, mesh_clock_mod.MeshClock.physicalOf(clean_msg.hlc))
@@ -8957,13 +11748,9 @@ pub const LinuxServer = struct {
         // on a peer at once (same authenticated account), so a relayed line from that
         // sibling session is legitimate and must be delivered (so the user's other
         // devices + co-channel members see it). Only a DIFFERENT account asserting a
-        // local nick's prefix is a real spoof — drop that (re-forward for multi-hop).
+        // local nick's prefix is a real spoof. Legacy MESSAGE is a terminal
+        // compatibility leaf; only MESSAGE_V2 may re-flood across the mesh.
         if (self.nickIsLiveLocal(clean_msg.source_nick) and replica_proof == null) {
-            const spoof_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
-                .{ .channel = clean_msg.target }
-            else
-                .{ .nick = clean_msg.target };
-            _ = self.relayToPeers(clean_msg, spoof_scope);
             return;
         }
 
@@ -8984,11 +11771,6 @@ pub const LinuxServer = struct {
         // convergence-lagged / legacy-unsigned cross-node delivery.
         if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node) and replica_modes == null) {
             self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
-            const drop_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
-                .{ .channel = clean_msg.target }
-            else
-                .{ .nick = clean_msg.target };
-            _ = self.relayToPeers(clean_msg, drop_scope);
             return;
         }
 
@@ -9012,9 +11794,6 @@ pub const LinuxServer = struct {
                 verified_webhook or verified_multihop_membership,
             );
             if (speech == .deny) {
-                // Still re-forward for multi-hop; just do not deliver locally.
-                const drop_scope: RelayScope = .{ .channel = clean_msg.target };
-                _ = self.relayToPeers(clean_msg, drop_scope);
                 return;
             }
             var target_buf: [128]u8 = undefined;
@@ -9031,8 +11810,6 @@ pub const LinuxServer = struct {
             if (is_data_family and self.world.channelHasExtFlag(clean_msg.target, .nocomicdata) and
                 (replica_modes orelse self.relaySenderModes(clean_msg.target, clean_msg.source_nick)).rank() < 2)
             {
-                const drop_scope: RelayScope = .{ .channel = clean_msg.target };
-                _ = self.relayToPeers(clean_msg, drop_scope);
                 return;
             }
             if (clean_msg.verb != .tagmsg and !is_data_family and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
@@ -9214,13 +11991,8 @@ pub const LinuxServer = struct {
                 };
             }
         }
-        // Multi-hop re-forward, scoped via route_table (global seen-set already
-        // deduped, so re-forwarding the source link is harmless).
-        const scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
-            .{ .channel = clean_msg.target }
-        else
-            .{ .nick = clean_msg.target };
-        _ = self.relayToPeers(clean_msg, scope);
+        // Legacy MESSAGE is local-delivery-only. Multi-hop propagation is owned
+        // exclusively by accepted MESSAGE_V2 exact-wire forwarding.
     }
 
     /// Inbound IRCX WHISPER relay: deliver a `:prefix WHISPER <channel>
@@ -9234,16 +12006,11 @@ pub const LinuxServer = struct {
         msg: s2s_link.RelayMessage,
         replica_proof: ?ReplicatedSessionProof,
     ) void {
-        // WHISPER is shared-channel scoped; re-forward narrows to peers with
-        // members of that channel (the recipient nick is not in the per-nick
-        // route map, only in the channel roster).
-        const reforward: RelayScope = .{ .channel = msg.target };
         // Origin spoof guard: a peer must not assert a prefix for a nick that is
         // live & local here — UNLESS it is the SAME account (a legitimate
         // multi-client / one-nick sibling on a peer; see deliverRelay). Still
         // re-forward for multi-hop; only a DIFFERENT account's assertion is dropped.
         if (self.nickIsLiveLocal(msg.source_nick) and replica_proof == null) {
-            _ = self.relayToPeers(msg, reforward);
             return;
         }
         // Sender-identity binding (see deliverRelay): a nick homed on a KNOWN node
@@ -9251,7 +12018,6 @@ pub const LinuxServer = struct {
         // local WHISPER (never render it to the recipient) but still re-forward.
         if (self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node) and replica_proof == null) {
             self.recordRelayHomeMismatch(msg, self.meshNickHomeNode(msg.source_nick) orelse msg.origin_node);
-            _ = self.relayToPeers(msg, reforward);
             return;
         }
         // WHISPER is stricter than ordinary channel speech: both endpoints must
@@ -9262,13 +12028,11 @@ pub const LinuxServer = struct {
         // converged membership row whose authenticated origin is the message's
         // signed origin. A same-nick row homed on another node is never enough.
         if (replica_proof == null and !self.remoteMemberOfChannelAtNode(msg.target, msg.source_nick, msg.origin_node)) {
-            _ = self.relayToPeers(msg, reforward);
             return;
         }
         // Re-enforce +w NOWHISPER against the remote sender (receiver-side
         // defense-in-depth; a desynced flag must not let a remote bypass policy).
         if (self.world.channelExists(msg.target) and self.world.channelHasExtFlag(msg.target, .nowhisper)) {
-            _ = self.relayToPeers(msg, reforward);
             return;
         }
         if (self.world.findNick(msg.recipient)) |rwid| {
@@ -9280,15 +12044,14 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
         }
-        // Multi-hop re-forward toward nodes that share the channel.
-        _ = self.relayToPeers(msg, reforward);
+        // Terminal legacy leaf: no re-forward.
     }
 
     /// Acquire the connection's single RECV ownership reference. Every recv SQE
     /// in this server passes through here so close/finalization has one exact
     /// latch to consult.
     fn armRecv(self: *LinuxServer, conn: *ConnState) !void {
-        if (conn.recv_armed or conn.closing) return;
+        if (self.rx().socket_io_quiescing or conn.recv_armed or conn.closing) return;
         self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
@@ -9305,7 +12068,7 @@ pub const LinuxServer = struct {
     /// lives inline in ConnState and therefore remains stable until the matching
     /// exact-generation completion clears `connect_armed`.
     fn armConnect(self: *LinuxServer, conn: *ConnState) !void {
-        if (conn.connect_armed or conn.closing) return;
+        if (self.rx().socket_io_quiescing or conn.connect_armed or conn.closing) return;
         try self.rx().ring.submitConnect(
             conn.token,
             conn.fd,
@@ -9316,7 +12079,7 @@ pub const LinuxServer = struct {
     }
 
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
-        if (conn.send_armed) return;
+        if (self.rx().socket_io_quiescing or conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
         // A staged activation that still owes RECV must acquire that ownership
         // first. This keeps inherited secured-link replay/burst helpers inert
@@ -9340,7 +12103,7 @@ pub const LinuxServer = struct {
 
     fn hasPendingSocketActivation(self: *LinuxServer) bool {
         for (self.rx().clients.slots.items) |*slot| {
-            if (slot.occupied and slot.value.io_activation_pending) return true;
+            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending)) return true;
         }
         return false;
     }
@@ -9359,8 +12122,39 @@ pub const LinuxServer = struct {
         var index = self.rx().activation_cursor % slots.len;
         while (scanned < slots.len) : (scanned += 1) {
             const slot = &slots[index];
-            if (slot.occupied and slot.value.io_activation_pending) {
+            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending)) {
                 const conn = &slot.value;
+                // A canceled outbound dial must reacquire CONNECT before any
+                // RECV/SEND can be staged. Keep it in the same fair cursor as
+                // inherited socket activation so SQ pressure cannot orphan it.
+                if (conn.connect_rearm_pending and !conn.closing) {
+                    self.armConnect(conn) catch |err| switch (err) {
+                        error.SubmissionQueueFull => {
+                            self.rx().activation_cursor = index;
+                            self.wakeReactor();
+                            return true;
+                        },
+                        else => return err,
+                    };
+                    if (!conn.connect_armed) {
+                        self.rx().activation_cursor = index;
+                        self.wakeReactor();
+                        return true;
+                    }
+                    conn.connect_rearm_pending = false;
+                    conn.io_activation_pending = false;
+                    conn.activation_recv_required = false;
+                    acquired += 1;
+                    index = (index + 1) % slots.len;
+                    self.rx().activation_cursor = index;
+                    if (acquired >= budget) return self.hasPendingSocketActivation();
+                    continue;
+                }
+                if (conn.connect_rearm_pending and conn.closing) {
+                    conn.connect_rearm_pending = false;
+                    conn.io_activation_pending = true;
+                    conn.activation_recv_required = false;
+                }
                 if (conn.closing and !conn.send_armed and conn.send_offset >= conn.send_len and
                     !kernelOwnsConnStorage(conn))
                 {
@@ -9637,10 +12431,16 @@ pub const LinuxServer = struct {
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
             if (!identity_remains and self.world.nickOf(worldIdFromClient(id)) != null) self.recordWhowas(conn);
-            // MONITOR: report this nick offline + drop its own subscriptions.
-            if (!identity_remains and conn.session.registered()) {
+            // MONITOR occupancy belongs to the logical rendered identity, but
+            // subscriptions belong to this physical connection. Always remove
+            // the departing client from reverse indexes; emit offline only when
+            // neither this exact session nor another same-nick local token lives.
+            if (conn.session.registered()) {
                 const nick = conn.session.displayName();
-                if (!std.mem.eql(u8, nick, "*")) self.monitorOffline(id, nick) catch {};
+                if (!std.mem.eql(u8, nick, "*") and !identity_remains and
+                    !self.localRenderedNickOccupiedExcept(nick, &.{id}))
+                    self.monitorOffline(nick) catch {};
+                self.monitor.removeClient(monitorIdFromClient(id));
             }
             // Media: drop the departing nick from any call, notifying members.
             if (conn.session.registered()) self.leaveAllMediaRooms(id, conn);
@@ -10633,13 +13433,110 @@ pub const LinuxServer = struct {
     /// Burst all currently wired local mesh state to ONE peer link. This wrapper
     /// is shared by the one-shot link-establish burst and the periodic
     /// anti-entropy cadence so new state families have one re-sync hook.
-    fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) void {
-        self.sendMembershipBurstTo(conn); // roster + channel list-modes (+b/+e/+I)
-        self.sendChannelModeFlagsBurstTo(conn);
-        self.sendChannelModeStateBurstTo(conn);
-        self.sendChannelPropBurstTo(conn);
-        self.sendEntityPropBurstTo(conn);
-        self.sendTopicBurstTo(conn);
+    fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.closing) return false;
+        if (conn.mesh_burst_stage == .idle) conn.mesh_burst_stage = .membership;
+
+        while (conn.mesh_burst_stage != .idle) {
+            if (!conn.mesh_burst_stage_encoded) {
+                // A producer may have failed after emitting an earlier row of
+                // this family. Commit that complete-record prefix before retrying
+                // the family; re-emitted CRDT rows are idempotent, while silently
+                // advancing the stage would permanently omit the failed row.
+                if (!self.flushMeshBurstStage(conn)) return false;
+                const encoded = switch (conn.mesh_burst_stage) {
+                    .idle => unreachable,
+                    .membership => self.sendMembershipBurstTo(conn),
+                    .mode_flags => self.sendChannelModeFlagsBurstTo(conn),
+                    .mode_state => self.sendChannelModeStateBurstTo(conn),
+                    .channel_props => self.sendChannelPropBurstTo(conn),
+                    .entity_props => self.sendEntityPropBurstTo(conn),
+                    .topics => self.sendTopicBurstTo(conn),
+                    .opers => self.sendLocalOperBurstTo(conn),
+                    .wards => self.sendMeshWardsTo(conn),
+                    .clones => if (conn.s2s_secured) |link|
+                        self.sendCloneAntiEntropy(conn, link)
+                    else if (conn.s2s) |link|
+                        self.sendCloneAntiEntropy(conn, link)
+                    else
+                        true,
+                };
+                if (!encoded) {
+                    // Preserve/flush any complete rows emitted before the
+                    // failure, but leave the family uncommitted for a full retry.
+                    _ = self.flushMeshBurstStage(conn);
+                    return false;
+                }
+                conn.mesh_burst_stage_encoded = true;
+            }
+            if (!self.flushMeshBurstStage(conn)) return false;
+            conn.mesh_burst_stage_encoded = false;
+            conn.mesh_burst_stage = switch (conn.mesh_burst_stage) {
+                .idle => unreachable,
+                .membership => .mode_flags,
+                .mode_flags => .mode_state,
+                .mode_state => .channel_props,
+                .channel_props => .entity_props,
+                .entity_props => .topics,
+                .topics => .opers,
+                .opers => .wards,
+                .wards => .clones,
+                .clones => .idle,
+            };
+            if (conn.mesh_burst_stage == .idle and conn.mesh_burst_restart_pending) {
+                conn.mesh_burst_restart_pending = false;
+                conn.mesh_burst_stage = .membership;
+            }
+        }
+        return true;
+    }
+
+    /// Drain one encoded burst family without dropping authenticated records.
+    /// Secured links page by whole outer-record boundaries and retain the exact
+    /// suffix across SendQ backpressure; plaintext rolling-old links retain the
+    /// complete inner buffer until its one append succeeds.
+    fn flushMeshBurstStage(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.s2s_secured) |link| {
+            while (link.outbound().len != 0) {
+                const inline_queued = conn.send_len - conn.send_offset;
+                const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch {
+                    conn.closing = true;
+                    return false;
+                };
+                if (queued > conn.sendq_cap) {
+                    conn.closing = true;
+                    return false;
+                }
+                const available = conn.sendq_cap - queued;
+                const prefix = link.outboundRecordPrefix(available);
+                if (prefix.len == 0) {
+                    // Ordinary congestion retries after the SendQ drains. One
+                    // record larger than an empty server SendQ can never make
+                    // progress and is a terminal configuration/protocol error.
+                    if (queued == 0) conn.closing = true;
+                    return false;
+                }
+                reserveRawAppendToConn(conn, prefix.len) catch return false;
+                appendToConn(conn, prefix) catch {
+                    conn.closing = true;
+                    return false;
+                };
+                if (!link.consumeOutboundPrefix(prefix.len)) {
+                    conn.closing = true;
+                    return false;
+                }
+                self.armSendIfNeeded(conn) catch {
+                    conn.closing = true;
+                    return false;
+                };
+            }
+            return true;
+        }
+        if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch return false;
+            link.clearOutbound();
+        }
+        return true;
     }
 
     const ChannelModeFlagSpec = struct {
@@ -10698,7 +13595,7 @@ pub const LinuxServer = struct {
     /// Burst the full local channel-member roster to ONE freshly-established peer
     /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
     /// immediately rather than only after subsequent joins. Best-effort. (#65)
-    fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
@@ -10718,22 +13615,22 @@ pub const LinuxServer = struct {
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
                 const ident = membershipIdentityOf(mconn);
                 if (conn.s2s_secured) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch return false;
                 } else if (conn.s2s) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch return false;
                 }
             }
             if (self.world.bansOf(cv.name)) |entries| {
-                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .ban, entry.mask, entry.setter, entry.set_at, hlc, true);
+                for (entries) |entry| if (!self.sendChannelListToConn(conn, cv.name, .ban, entry.mask, entry.setter, entry.set_at, hlc, true)) return false;
             }
             if (self.world.exemptsOf(cv.name)) |entries| {
-                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .exempt, entry.mask, entry.setter, entry.set_at, hlc, true);
+                for (entries) |entry| if (!self.sendChannelListToConn(conn, cv.name, .exempt, entry.mask, entry.setter, entry.set_at, hlc, true)) return false;
             }
             if (self.world.invexOf(cv.name)) |entries| {
-                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .invex, entry.mask, entry.setter, entry.set_at, hlc, true);
+                for (entries) |entry| if (!self.sendChannelListToConn(conn, cv.name, .invex, entry.mask, entry.setter, entry.set_at, hlc, true)) return false;
             }
             if (self.world.mutesOf(cv.name)) |entries| {
-                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .quiet, entry.mask, entry.setter, entry.set_at, hlc, true);
+                for (entries) |entry| if (!self.sendChannelListToConn(conn, cv.name, .quiet, entry.mask, entry.setter, entry.set_at, hlc, true)) return false;
             }
         }
         // PRESENCE burst: announce every local registered user (channel or not) into
@@ -10752,24 +13649,18 @@ pub const LinuxServer = struct {
                 if (std.mem.eql(u8, pnick, "*")) continue;
                 const pident = membershipIdentityOf(mc);
                 if (conn.s2s_secured) |link| {
-                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch continue;
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 } else if (conn.s2s) |link| {
-                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch continue;
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 }
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
     /// Burst aggregate local channel MODE flags to ONE freshly-established peer
     /// so a relink converges immediately instead of waiting for the next MODE.
-    fn sendChannelModeFlagsBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendChannelModeFlagsBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
@@ -10778,18 +13669,12 @@ pub const LinuxServer = struct {
         while (cit.next()) |cv| {
             const flags = self.channelModeFlagBits(cv.name);
             if (conn.s2s_secured) |link| {
-                link.sendChannelModeFlags(cv.name, flags, hlc) catch continue;
+                link.sendChannelModeFlags(cv.name, flags, hlc) catch return false;
             } else if (conn.s2s) |link| {
-                link.sendChannelModeFlags(cv.name, flags, hlc) catch continue;
+                link.sendChannelModeFlags(cv.name, flags, hlc) catch return false;
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
     const ChannelModeStateSnapshot = struct {
@@ -10877,24 +13762,18 @@ pub const LinuxServer = struct {
         };
     }
 
-    fn sendChannelModeStateBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendChannelModeStateBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const ev = self.channelModeStateEvent(cv.name, hlc);
             if (conn.s2s_secured) |link| {
-                link.sendChannelModeState(ev) catch continue;
+                link.sendChannelModeState(ev) catch return false;
             } else if (conn.s2s) |link| {
-                link.sendChannelModeState(ev) catch continue;
+                link.sendChannelModeState(ev) catch return false;
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
     fn announceChannelModeState(self: *LinuxServer, channel: []const u8) void {
@@ -10906,8 +13785,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendChannelModeState(ev) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendChannelModeState(ev) catch continue;
@@ -11285,8 +14163,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin) catch continue;
@@ -11530,7 +14407,7 @@ pub const LinuxServer = struct {
     /// stored origin + signature verbatim (or seeds + signs a locally-owned prop
     /// that has no clock yet), falling back to unsigned for an emit whose live
     /// tuple diverged from the signed one.
-    fn sendEntityPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendEntityPropBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         var it = self.entity_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
@@ -11548,26 +14425,20 @@ pub const LinuxServer = struct {
             }
             const origin = self.burstEntityPropOrigin(clock, present, value, owner);
             if (conn.s2s_secured) |link| {
-                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch return false;
             } else if (conn.s2s) |link| {
-                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch return false;
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
-    fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const entity = ircx_prop_store.Entity{ .kind = .channel, .id = cv.name };
             var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-            const rows = self.props.listProps(entity, &views) catch views[0..0];
+            const rows = self.props.listProps(entity, &views) catch return false;
             for (rows) |entry| {
                 if (self.channelPropClock(entry.entity.id, entry.key) == null) {
                     // A locally-owned prop with no clock yet: seed one as a LOCAL
@@ -11576,7 +14447,7 @@ pub const LinuxServer = struct {
                     var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
                     var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
                     const ps = self.signLocalChannelProp(true, entry.entity.id, entry.key, entry.value, entry.owner, hlc, &pk_buf, &sig_buf);
-                    _ = self.recordChannelPropClock(entry.entity.id, entry.key, entry.owner, hlc, true, ps.node, ps.pubkey, ps.sig);
+                    if (!self.recordChannelPropClock(entry.entity.id, entry.key, entry.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) return false;
                 }
             }
         }
@@ -11607,18 +14478,12 @@ pub const LinuxServer = struct {
             // verify (the receiver applies it via the legacy LWW path).
             const origin = self.burstPropOrigin(clock, present, value, owner);
             if (conn.s2s_secured) |link| {
-                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch return false;
             } else if (conn.s2s) |link| {
-                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch return false;
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
     fn sendChannelListToConn(
@@ -11631,13 +14496,14 @@ pub const LinuxServer = struct {
         set_at: i64,
         hlc: u64,
         present: bool,
-    ) void {
+    ) bool {
         _ = self;
         if (conn.s2s_secured) |link| {
-            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return;
+            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return false;
         } else if (conn.s2s) |link| {
-            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return;
+            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return false;
         }
+        return true;
     }
 
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity, setter: []const u8) void {
@@ -11652,8 +14518,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendMembership(channel, nick, status, hlc, present, ident, setter) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendMembership(channel, nick, status, hlc, present, ident, setter) catch continue;
@@ -11676,8 +14541,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendChannelModeFlags(channel, flags, hlc) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendChannelModeFlags(channel, flags, hlc) catch continue;
@@ -11708,8 +14572,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
@@ -11743,8 +14606,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendChannelProp(channel, key, value, owner, hlc, present, origin) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendChannelProp(channel, key, value, owner, hlc, present, origin) catch continue;
@@ -11964,8 +14826,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendCloneCounts(payload) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendCloneCounts(payload) catch continue;
@@ -12011,8 +14872,8 @@ pub const LinuxServer = struct {
     /// Anti-entropy: ship this node's local count table to a freshly linked peer
     /// so it converges immediately. Chunked (bounded stack); best-effort. Flushes
     /// through `conn` (the drive path owns the connection, not a pid).
-    fn sendCloneAntiEntropy(self: *LinuxServer, conn: *ConnState, link: anytype) void {
-        if (self.config.max_clones_per_ip_net == 0) return;
+    fn sendCloneAntiEntropy(self: *LinuxServer, conn: *ConnState, link: anytype) bool {
+        if (self.config.max_clones_per_ip_net == 0) return true;
         const chunk = 256;
         var buf: [mesh_clones_mod.encodedLen(chunk)]u8 = undefined;
         var entries: [chunk]mesh_clones_mod.Entry = undefined;
@@ -12025,11 +14886,11 @@ pub const LinuxServer = struct {
                 n += 1;
             }
             if (n == 0) break;
-            const payload = mesh_clones_mod.encodeCounts(&buf, entries[0..n]) catch return;
-            link.sendCloneCounts(payload) catch return;
-            appendToConn(conn, link.outbound()) catch return;
-            link.clearOutbound();
+            const payload = mesh_clones_mod.encodeCounts(&buf, entries[0..n]) catch return false;
+            link.sendCloneCounts(payload) catch return false;
         }
+        _ = conn;
+        return true;
     }
 
     /// Count live connections currently in connection class `name` (across all
@@ -12454,6 +15315,19 @@ pub const LinuxServer = struct {
                     }
                     for (run[0..count]) |*change| change.deinit(self.allocator);
                 },
+            }
+        }
+    }
+
+    /// Consume candidate-link identity deltas without applying or publishing
+    /// them. Helix precommit route reconciliation must leave no queued derived
+    /// transition that could become visible after activation.
+    fn discardIdentityTransitions(self: *LinuxServer, link: anytype) void {
+        while (link.takeNextIdentityTransition()) |queued| {
+            var transition = queued;
+            switch (transition) {
+                .nick => |*delta| delta.deinit(self.allocator),
+                .membership => |*delta| delta.deinit(self.allocator),
             }
         }
     }
@@ -13009,8 +15883,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
@@ -13322,8 +16195,7 @@ pub const LinuxServer = struct {
                     if (!link.established()) continue;
                     if (link.supportsSessionReplicaV2() and !v2_authority_ready) continue;
                     link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     if (link.supportsSessionReplicaV2() and !v2_authority_ready) continue;
@@ -13337,25 +16209,19 @@ pub const LinuxServer = struct {
 
     /// Burst every local channel's current topic to ONE freshly-established peer
     /// so a relink converges immediately instead of waiting for the next TOPIC.
-    fn sendTopicBurstTo(self: *LinuxServer, conn: *ConnState) void {
+    fn sendTopicBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const info = self.world.topicInfo(cv.name) orelse continue;
             if (info.text.len == 0) continue;
             const hlc = self.nextMeshHlc();
             if (conn.s2s_secured) |link| {
-                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch continue;
+                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch return false;
             } else if (conn.s2s) |link| {
-                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch continue;
+                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch return false;
             }
         }
-        if (conn.s2s_secured) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        } else if (conn.s2s) |link| {
-            self.flushS2sOutbound(conn, link.outbound()) catch {};
-            link.clearOutbound();
-        }
+        return true;
     }
 
     fn flushS2sOutbound(self: *LinuxServer, conn: *ConnState, out: []const u8) !void {
@@ -13369,6 +16235,28 @@ pub const LinuxServer = struct {
         // The S2S link state is serialized by the world write lock; the actual
         // socket send buffer remains owned by `id.shard` via enqueueDelivery.
         try self.enqueueDelivery(id, out);
+    }
+
+    /// Preserve secured-link ciphertext under ordinary peer backpressure. S2S
+    /// sockets are reactor-owned; a foreign shard must never chunk a shared AEAD
+    /// stream through the generic delivery fabric because a partial mailbox
+    /// enqueue cannot be retried byte-for-byte. Wake the owner and leave the
+    /// complete records in `link`. On the owner, use the same whole-record SendQ
+    /// pager as replay/burst release, which neither poisons nor clears on a full
+    /// but otherwise healthy peer queue.
+    fn flushSecuredS2sOutboundTo(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        link: *secured_s2s_link.SecuredLink,
+    ) bool {
+        if (link.outbound().len == 0) return true;
+        if (id.shard != self.rx().shard_id) {
+            self.wakeShard(id.shard);
+            return false;
+        }
+        const conn = self.rx().clients.get(id) orelse return false;
+        if (conn.s2s_secured != link or conn.closing) return false;
+        return self.flushMeshBurstStage(conn);
     }
 
     /// Append a peer's remote channel members into the NAMES buffer (deduped,
@@ -16379,8 +19267,7 @@ pub const LinuxServer = struct {
                     if (!link.established()) continue;
                     if (link.routeNickNode(target_nick) == null) continue;
                     link.sendKill(origin, killer, target_nick, reason) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                     return true;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
@@ -16690,15 +19577,11 @@ pub const LinuxServer = struct {
         try self.flushMonitorReplies(&sink);
     }
 
-    /// Notify watchers that `nick` went offline, then drop the disconnecting
-    /// client's own monitor subscriptions.
-    fn monitorOffline(self: *LinuxServer, id: client_model.ClientId, nick: []const u8) !void {
-        var replies_buf: [64]monitor.MonitorReply = undefined;
-        var storage: [default_reply_bytes]u8 = undefined;
-        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
-        self.monitor.setOffline(nick, &sink) catch {};
-        self.flushMonitorReplies(&sink) catch {};
-        self.monitor.removeClient(monitorIdFromClient(id));
+    /// Notify watchers that the final physical occupant of `nick` went offline.
+    /// Connection-owned subscriptions are removed independently by `closeConn`
+    /// even when a same-nick sibling keeps this rendered identity online.
+    fn monitorOffline(self: *LinuxServer, nick: []const u8) !void {
+        try self.monitorOccupancyTransition(nick, nick, false, true);
     }
 
     /// STATS <letter> — server statistics. Supports u (uptime, 242), o (oper
@@ -19385,29 +22268,17 @@ pub const LinuxServer = struct {
     /// carried client socket (FD_CLOEXEC cleared), so the port stays bound and the
     /// successor re-attaches the live connections. TLS clients additionally carry
     /// their live engine state (suite + traffic secrets + record seqs + buffered
-    /// bytes) so the encrypted stream survives the swap; a TLS conn whose state
-    /// cannot be exported is NOT carried (it reconnects — fail-safe). Established
-    /// secured S2S links whose crypto/stream state can be sealed carry their socket
-    /// and resume in place; plaintext, unestablished, or unsealable links fall back
-    /// to reconnect. Hand-dialed initiators seal a re-dial hint the successor uses
-    /// at boot, while config-managed [mesh].connect peers re-dial through the mesh
-    /// boot pass, keeping the fallback netsplit window to one handshake round-trip.
+    /// bytes) so the encrypted stream survives the swap; failure to export any
+    /// live TLS client refuses the complete UPGRADE. Established secured S2S links
+    /// likewise must seal and resume in place. Only plaintext or unestablished
+    /// hand-dialed links use a re-dial hint, while config-managed [mesh].connect
+    /// peers re-dial through the mesh boot pass.
     /// wss browser clients are carried too: the WS adapter's partial framing
     /// state rides the v2 `.ws_session` capsule (see wsCarryable), so even a
     /// mid-frame browser client survives with no lost bytes.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
-        return self.performUpgrade(conn) catch |e| switch (e) {
-            // A refusal, not a failure: the oper already got the NOTICE
-            // explaining why; swallowing it here keeps the connection alive
-            // (a propagated handler error would tear it down).
-            error.ShardQuiesceFailed,
-            error.SessionReplicaConverging,
-            error.PropertyStateConverging,
-            error.UpgradeTargetIncompatible,
-            => {},
-            else => e,
-        };
+        self.deferUpgrade(.{ .client = idFromToken(conn.token) });
     }
 
     /// Session replica dirty flags, pending Store staging, local channel
@@ -19492,6 +22363,20 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn deferredUpgradeRequester(self: *LinuxServer, request: DeferredUpgradeRequest) ?*ConnState {
+        return switch (request) {
+            .signal => null,
+            .client => |id| blk: {
+                if (id.shard != self.rx().shard_id) break :blk null;
+                break :blk self.rx().clients.get(id);
+            },
+        };
+    }
+
+    fn deferredUpgradeNotice(self: *LinuxServer, request: DeferredUpgradeRequest, msg: []const u8) void {
+        self.upgradeNotice(self.deferredUpgradeRequester(request), msg);
+    }
+
     /// Open the target image once, execute that exact open file through
     /// `/proc/self/fd/<n>` in side-effect-free capability mode, and retain
     /// the descriptor for the final `execveat`. This both refuses incompatible
@@ -19517,8 +22402,8 @@ pub const LinuxServer = struct {
 
     /// Core Helix UPGRADE: serialize every carried session into a sealed memfd
     /// arena, then re-exec the on-disk binary preserving the listener + client
-    /// sockets. `requester` is the oper connection that ran `/UPGRADE` (excluded
-    /// from carry-over and sent progress NOTICEs), or `null` for a
+    /// sockets. `requester` is the oper connection that ran `/UPGRADE` (carried
+    /// like every other live client and also sent progress NOTICEs), or `null` for a
     /// SIGUSR2-triggered upgrade — a shell-driven deploy
     /// (`systemctl kill -s USR2 orochi`) that has no requesting client, so every
     /// registered session is carried and status is logged. The oper privilege
@@ -19528,9 +22413,9 @@ pub const LinuxServer = struct {
     /// an `.s2s_link` capsule carrying the link's crypto (Tsumugi record keys +
     /// counters), inner framing header, partial-record carry, and all not-yet-sent
     /// outbound bytes. The caller preserves the socket fd (CLOEXEC cleared) so the
-    /// peer never sees a drop. Returns true on success; false on ANY failure, so
-    /// the caller falls back to the re-dial hint path. Mutually exclusive with that
-    /// hint — a preserved link must NOT also be re-dialed.
+    /// peer never sees a drop. Returns true on success; false on ANY failure.
+    /// Failure for an established link is fatal to the complete upgrade; only an
+    /// unestablished dial may fall back to the re-dial path.
     fn sealSecuredLink(
         self: *LinuxServer,
         conn: *ConnState,
@@ -19538,6 +22423,10 @@ pub const LinuxServer = struct {
         pieces: *std.ArrayList(helix_live.StatePiece),
         blobs: *std.ArrayList([]u8),
     ) bool {
+        if (conn.recv_armed or conn.send_armed or conn.connect_armed or
+            conn.recv_cancel_pending or conn.send_cancel_pending or conn.connect_cancel_pending) return false;
+        std.debug.assert(!conn.recv_armed and !conn.send_armed and !conn.connect_armed);
+        std.debug.assert(!conn.recv_cancel_pending and !conn.send_cancel_pending and !conn.connect_cancel_pending);
         const outer = link.exportOuter();
         const inner = link.snapshotInner() orelse return false;
         const remote_name = link.snapshotInnerRemoteName();
@@ -19568,6 +22457,13 @@ pub const LinuxServer = struct {
         if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
         if (inner.peer_supports_session_replica_v2) caps |= s2s_snapshot.cap_session_replica_v2;
         if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
+        if (inner.peer_supports_secure_relay_v2) caps |= s2s_snapshot.cap_secure_relay_v2;
+        if (inner.peer_supports_event_spine_v2) caps |= s2s_snapshot.cap_event_spine_v2;
+        var caps_ext: u8 = 0;
+        if (inner.peer_supports_relay_v2_current)
+            caps_ext |= s2s_snapshot.cap_ext_relay_v2_current;
+        if (inner.peer_supports_relay_v2_ack_confirm)
+            caps_ext |= s2s_snapshot.cap_ext_relay_v2_ack_confirm;
 
         var snap = s2s_snapshot.Snapshot{
             .fd = conn.fd,
@@ -19586,6 +22482,7 @@ pub const LinuxServer = struct {
             .remote_node_id = inner.remote_node_id,
             .remote_epoch_ms = inner.remote_epoch_ms,
             .caps = caps,
+            .caps_ext = caps_ext,
             .remote_name = remote_name,
             .connect_addr = if (conn.s2s_initiator) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
             .rec_inbuf = outer.rec_inbuf,
@@ -19780,37 +22677,313 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    /// Successor side of `sealPendingMigrations`: decode one carried
-    /// `.pending_migration` payload and re-stage it in `pending_migrations`
-    /// (lazily initializing the store — adoption runs before `start()`), so the
-    /// client's eventual reconnect+reclaim finds it exactly as the predecessor
-    /// would have. The TTL clock restarts at adoption (`staged_at_ms = now`),
-    /// which only ever extends a capsule's life by the upgrade's in-flight time.
-    /// Returns false on an undecodable payload or a full store — the pre-fix
-    /// behavior (that one migration dies), never fatal.
-    fn adoptPendingMigrationCapsule(self: *LinuxServer, bytes: []const u8) bool {
-        const cap = session_migrate.decode(bytes) catch return false;
-        if (self.pending_migrations == null) {
-            self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
-                .max_entries = self.config.session_max_pending_migrations,
-                .max_per_account = self.config.session_max_per_account,
-            });
+    const MandatoryStateSeal = struct {
+        world_bytes: usize,
+        history_bytes: usize,
+        webhook_bytes: usize,
+        relay_replay_bytes: usize,
+        relay_outbox_bytes: usize,
+        relay_event_log_bytes: usize,
+        attachment_delivery_bytes: usize,
+        event_replay_bytes: usize,
+    };
+
+    fn helixWorldRelationIdentity(
+        context: *anyopaque,
+        client: world_model.ClientId,
+    ) ?world_checkpoint.MemberIdentity {
+        const self: *LinuxServer = @ptrCast(@alignCast(context));
+        const conn = self.connFor(clientIdFromWorld(client)) orelse return null;
+        if (conn.fd < 0 or conn.closing or conn.s2s != null or conn.s2s_secured != null)
+            return null;
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return null;
+        return .{ .join_key = @intCast(conn.fd), .nick = nick };
+    }
+
+    fn helixWorldRelationClient(
+        context: *anyopaque,
+        join_key: u64,
+    ) ?world_model.ClientId {
+        const self: *LinuxServer = @ptrCast(@alignCast(context));
+        if (join_key > std.math.maxInt(linux.fd_t)) return null;
+        const fd: linux.fd_t = @intCast(join_key);
+        var found: ?world_model.ClientId = null;
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                if (entry.value.fd != fd or entry.value.s2s != null or
+                    entry.value.s2s_secured != null) continue;
+                if (found != null) return null;
+                found = worldIdFromClient(entry.id);
+            }
         }
-        self.pending_migrations.?.put(cap, self.nowMs()) catch return false;
+        return found;
+    }
+
+    fn helixWorldRelationResolver(self: *LinuxServer) world_checkpoint.NickResolver {
+        return .{
+            .context = self,
+            .resolve = helixWorldRelationIdentity,
+            .lookup = helixWorldRelationClient,
+        };
+    }
+
+    /// Seal the three process-authoritative state families that cannot be
+    /// reconstructed exactly from client capsules or disk. The caller holds
+    /// World's write lock across this function and every other seal operation,
+    /// so the channel metadata/member projection and the client snapshots below
+    /// describe one stable logical instant. Empty stores are still encoded: an
+    /// inherited arena without any one of these singletons is incomplete.
+    fn sealMandatoryStateUpgradeCheckpoints(
+        self: *LinuxServer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) ?MandatoryStateSeal {
+        const world_wire = world_checkpoint.encodeLockedResolved(
+            self.allocator,
+            &self.world,
+            self.helixWorldRelationResolver(),
+        ) catch |err| {
+            srvLog("orochi: UPGRADE World checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, world_wire) catch {
+            srvLog("orochi: UPGRADE World blob ownership append failed\n", .{});
+            self.allocator.free(world_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{ .kind = .channels, .bytes = world_wire }) catch {
+            srvLog("orochi: UPGRADE World piece append failed\n", .{});
+            return null;
+        };
+
+        // ADS1 is the outermost mutation lane because MESSAGE_V2 admission takes
+        // attachment_delivery_mu before relay_v2_replay_mu. Seal the complete
+        // five-authority cut in that same order: exact rendered attachment rows,
+        // Lotus consequence, RVG2 identity, RVO2 immediate-hop retries, and RVL2
+        // full-mesh repair authority. Empty images remain mandatory material.
+        lockSpin(&self.attachment_delivery_mu);
+        lockSpin(&self.relay_v2_replay_mu);
+        const lotus_wire = self.history.encodeCheckpoint(self.allocator) catch |err| {
+            self.relay_v2_replay_mu.unlock();
+            self.attachment_delivery_mu.unlock();
+            srvLog("orochi: UPGRADE Lotus checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        const relay_replay_wire = self.relay_v2_replay_guard.encodeCheckpoint(self.allocator) catch |err| {
+            self.allocator.free(lotus_wire);
+            self.relay_v2_replay_mu.unlock();
+            self.attachment_delivery_mu.unlock();
+            srvLog("orochi: UPGRADE MESSAGE_V2 replay checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        const relay_outbox_wire = self.relay_v2_outbox.encodeCheckpoint(self.allocator) catch |err| {
+            self.allocator.free(lotus_wire);
+            self.allocator.free(relay_replay_wire);
+            self.relay_v2_replay_mu.unlock();
+            self.attachment_delivery_mu.unlock();
+            srvLog("orochi: UPGRADE MESSAGE_V2 outbox checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        const relay_event_log_wire = self.relay_v2_event_log.encodeCheckpoint(self.allocator) catch |err| {
+            self.allocator.free(lotus_wire);
+            self.allocator.free(relay_replay_wire);
+            self.allocator.free(relay_outbox_wire);
+            self.relay_v2_replay_mu.unlock();
+            self.attachment_delivery_mu.unlock();
+            srvLog("orochi: UPGRADE MESSAGE_V2 event-log checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        const attachment_delivery_wire = self.attachment_delivery_spool.encodeCheckpoint(self.allocator) catch |err| {
+            self.allocator.free(lotus_wire);
+            self.allocator.free(relay_replay_wire);
+            self.allocator.free(relay_outbox_wire);
+            self.allocator.free(relay_event_log_wire);
+            self.relay_v2_replay_mu.unlock();
+            self.attachment_delivery_mu.unlock();
+            srvLog("orochi: UPGRADE attachment-delivery checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        self.relay_v2_replay_mu.unlock();
+        self.attachment_delivery_mu.unlock();
+        defer self.allocator.free(lotus_wire);
+        var relay_replay_owned = true;
+        defer if (relay_replay_owned) self.allocator.free(relay_replay_wire);
+        var relay_outbox_owned = true;
+        defer if (relay_outbox_owned) self.allocator.free(relay_outbox_wire);
+        var relay_event_log_owned = true;
+        defer if (relay_event_log_owned) self.allocator.free(relay_event_log_wire);
+        var attachment_delivery_owned = true;
+        defer if (attachment_delivery_owned) self.allocator.free(attachment_delivery_wire);
+        const search_wire = self.search_index.encodeCheckpoint(self.allocator) catch |err| {
+            srvLog("orochi: UPGRADE search checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        defer self.allocator.free(search_wire);
+        var event_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer event_writer.deinit();
+        self.event_history.serializeInto(&event_writer.writer) catch |err| {
+            srvLog("orochi: UPGRADE EventHistory checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        const history_wire = history_checkpoint.encode(self.allocator, .{}, .{
+            .lotus = lotus_wire,
+            .search_index = search_wire,
+            .event_history = event_writer.written(),
+        }) catch |err| {
+            srvLog("orochi: UPGRADE history bundle seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, history_wire) catch {
+            srvLog("orochi: UPGRADE history blob ownership append failed\n", .{});
+            self.allocator.free(history_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{ .kind = .history, .bytes = history_wire }) catch {
+            srvLog("orochi: UPGRADE history piece append failed\n", .{});
+            return null;
+        };
+
+        const webhook_wire = self.webhook_store.encodeUpgradeCheckpoint(self.allocator) catch |err| {
+            srvLog("orochi: UPGRADE webhook checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, webhook_wire) catch {
+            srvLog("orochi: UPGRADE webhook blob ownership append failed\n", .{});
+            self.allocator.free(webhook_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{ .kind = .webhook_store, .bytes = webhook_wire }) catch {
+            srvLog("orochi: UPGRADE webhook piece append failed\n", .{});
+            return null;
+        };
+
+        lockSpin(&self.event_spine_replay_mu);
+        const event_replay_wire = self.event_spine_replay_guard.encodeCheckpoint(self.allocator) catch |err| {
+            self.event_spine_replay_mu.unlock();
+            srvLog("orochi: UPGRADE Event Spine replay checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        self.event_spine_replay_mu.unlock();
+        blobs.append(self.allocator, event_replay_wire) catch {
+            srvLog("orochi: UPGRADE Event Spine replay blob ownership append failed\n", .{});
+            self.allocator.free(event_replay_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = event_replay_wire,
+            // ESG2 is the exact v2 delivery authority. A predecessor may not
+            // allow a v1 successor to ignore it and replay retired events.
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE Event Spine replay piece append failed\n", .{});
+            return null;
+        };
+
+        blobs.append(self.allocator, relay_outbox_wire) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 outbox blob ownership append failed\n", .{});
+            return null;
+        };
+        relay_outbox_owned = false;
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = relay_outbox_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 outbox piece append failed\n", .{});
+            return null;
+        };
+
+        blobs.append(self.allocator, relay_replay_wire) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 replay blob ownership append failed\n", .{});
+            return null;
+        };
+        relay_replay_owned = false;
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = relay_replay_wire,
+            // RVG2 is the exact signed MESSAGE_V2 delivery authority. Losing it
+            // across exec would make already-delivered captures live again.
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 replay piece append failed\n", .{});
+            return null;
+        };
+
+        blobs.append(self.allocator, relay_event_log_wire) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 event-log blob ownership append failed\n", .{});
+            return null;
+        };
+        relay_event_log_owned = false;
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = relay_event_log_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE MESSAGE_V2 event-log piece append failed\n", .{});
+            return null;
+        };
+
+        blobs.append(self.allocator, attachment_delivery_wire) catch {
+            srvLog("orochi: UPGRADE attachment-delivery blob ownership append failed\n", .{});
+            return null;
+        };
+        attachment_delivery_owned = false;
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = attachment_delivery_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE attachment-delivery piece append failed\n", .{});
+            return null;
+        };
+
+        return .{
+            .world_bytes = world_wire.len,
+            .history_bytes = history_wire.len,
+            .webhook_bytes = webhook_wire.len,
+            .relay_replay_bytes = relay_replay_wire.len,
+            .relay_outbox_bytes = relay_outbox_wire.len,
+            .relay_event_log_bytes = relay_event_log_wire.len,
+            .attachment_delivery_bytes = attachment_delivery_wire.len,
+            .event_replay_bytes = event_replay_wire.len,
+        };
+    }
+
+    fn sealTlsTicketKeyUpgradeCapsule(
+        allocator: std.mem.Allocator,
+        current: tls_resumption.TicketKey,
+        previous: ?tls_resumption.TicketKey,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) bool {
+        const tk = ticket_key_capsule.encode(allocator, .{
+            .current = current,
+            .previous = previous,
+        }) catch return false;
+        blobs.append(allocator, tk) catch {
+            allocator.free(tk);
+            return false;
+        };
+        pieces.append(allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch return false;
         return true;
     }
 
-    fn adoptSessionTombstoneCapsule(self: *LinuxServer, bytes: []const u8) bool {
-        const tombstone = session_migrate.decodeTombstone(bytes) catch return false;
-        const now = @max(@as(i64, 0), self.nowMs());
-        if (tombstone.consumed_at_ms > now) return false;
-        if (self.pending_migrations == null) {
-            self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
-                .max_entries = self.config.session_max_pending_migrations,
-                .max_per_account = self.config.session_max_per_account,
-            });
-        }
-        self.pending_migrations.?.markConsumed(tombstone.token, tombstone.consumed_at_ms) catch return false;
+    fn sealMeshRedialUpgradeHint(
+        allocator: std.mem.Allocator,
+        hint: mesh_redial.Peer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) bool {
+        const wire = mesh_redial.encode(hint);
+        const hb = allocator.dupe(u8, &wire) catch return false;
+        blobs.append(allocator, hb) catch {
+            allocator.free(hb);
+            return false;
+        };
+        pieces.append(allocator, .{ .kind = .mesh_checkpoint, .bytes = hb }) catch return false;
         return true;
     }
 
@@ -19830,6 +23003,8 @@ pub const LinuxServer = struct {
         /// Mesh links: re-dial hints sealed / secured links preserved (fd carried).
         s2s_hints: usize = 0,
         s2s_preserved: usize = 0,
+        s2s_preserve_failed: bool = false,
+        s2s_hint_failed: bool = false,
     };
 
     /// Seal ONE reactor shard's connections for a Helix UPGRADE: every carried
@@ -19840,8 +23015,8 @@ pub const LinuxServer = struct {
     /// a re-dial hint. Safe to call for a foreign shard ONLY while that shard's
     /// worker is parked (`quiesceSiblingReactors`) or not running at all — the
     /// parked-counter handshake publishes the shard's connection state to this
-    /// thread. Best-effort per connection: a client that cannot be sealed is
-    /// simply not carried (it reconnects), never fatal to the upgrade.
+    /// thread. The caller compares `clients` with `clients_expected`; any live
+    /// client that cannot be sealed refuses the whole UPGRADE before exec.
     fn sealShardClients(
         self: *LinuxServer,
         r: *Reactor,
@@ -19857,22 +23032,20 @@ pub const LinuxServer = struct {
             // (zero-drop) — seal its crypto + inner framing state into an .s2s_link
             // capsule and carry the socket fd so the PEER never sees a drop (no
             // netsplit, no oper-prefix churn). A plaintext link (no crypto to
-            // resume) or a secured link we can't snapshot falls back to the re-dial
-            // hint: for a hand-dialed initiator (oper CONNECT), seal a re-dial hint
+            // resume) may use a re-dial hint. An established secured link that
+            // cannot snapshot refuses the whole UPGRADE. For an unestablished
+            // hand-dialed initiator (oper CONNECT), seal a re-dial hint
             // so the successor reconnects at boot; config-managed [mesh].connect
             // dials are re-dialed by the successor's mesh boot pass instead.
             if (e.value.s2s != null or e.value.s2s_secured != null) {
                 if (e.value.s2s_secured) |link| {
-                    // Preserve an established secured link (zero-drop). A record that
-                    // was already on the wire is not re-sealed (only the undrained
-                    // SendQ tail is carried); if an in-flight send races the swap the
-                    // peer AuthFails one record and re-dials — fail-safe (old
-                    // behavior), never a nonce reuse. So we do NOT gate on
-                    // `send_armed` (a gossip-chatty mesh link is armed often, which
-                    // would defeat preservation entirely).
+                    // Preserve an established secured link only after every exact
+                    // socket operation has been canceled and its completion reaped.
+                    // `sealSecuredLink` rejects any residual armed/cancel-pending
+                    // state, so no in-flight record may race the swap; the caller
+                    // refuses the whole UPGRADE instead of accepting AuthFail/redial.
                     const est = link.established();
-                    const sealed = est and self.sealSecuredLink(e.value, link, pieces, blobs);
-                    if (sealed) {
+                    if (est and self.sealSecuredLink(e.value, link, pieces, blobs)) {
                         // Preserved: carry the fd across execve; do NOT also seal a
                         // re-dial hint (that would open a duplicate link → churn).
                         if (!setCloexec(e.value.fd, false)) {
@@ -19884,25 +23057,44 @@ pub const LinuxServer = struct {
                         counts.s2s_preserved += 1;
                         continue;
                     }
-                    srvLog("orochi: UPGRADE — s2s_secured NOT preserved (established={}, send_armed={}); falling back to re-dial\n", .{ est, e.value.send_armed });
+                    if (est) {
+                        counts.s2s_preserve_failed = true;
+                        srvLog("orochi: UPGRADE — established secured S2S snapshot failed; exact upgrade will be refused\n", .{});
+                        continue;
+                    }
                 }
                 if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
-                    const hint = mesh_redial.encode(.{
+                    if (!sealMeshRedialUpgradeHint(self.allocator, .{
                         .addr = e.value.s2s_connect_addr.addr,
                         .port = std.mem.bigToNative(u16, e.value.s2s_connect_addr.port),
-                    });
-                    const hb = self.allocator.dupe(u8, &hint) catch continue;
-                    blobs.append(self.allocator, hb) catch {
-                        self.allocator.free(hb);
+                    }, pieces, blobs)) {
+                        counts.s2s_hint_failed = true;
                         continue;
-                    };
-                    pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = hb }) catch continue;
+                    }
                     counts.s2s_hints += 1;
                 }
                 continue;
             }
-            if (!e.value.session.registered()) continue;
+            // Every non-mesh transport must either be carried exactly or make
+            // the hot upgrade refuse. Silently omitting a pre-registration TLS,
+            // WS, or IRC handshake would close it at exec and violate Helix's
+            // connected-client guarantee.
             counts.clients_expected += 1;
+            if (!e.value.session.registered()) continue;
+            // A carried client's socket fd is the exact join key for every
+            // transport and per-client sidecar. Synthetic/half-constructed
+            // entries with no live descriptor make the seal incomplete; never
+            // let a signed cast turn -1 into an unrelated u64 owner id.
+            if (e.value.fd < 0) continue;
+            // A carried client is snapshotted only after the owner reaped both
+            // original CQEs and their exact-cancel provenance. An in-flight
+            // CONNECT still borrows the inline sockaddr and is likewise refused;
+            // listener ACCEPT owns no ConnState storage and stays outside this
+            // per-connection boundary.
+            if (e.value.recv_armed or e.value.send_armed or e.value.connect_armed or
+                e.value.recv_cancel_pending or e.value.send_cancel_pending or e.value.connect_cancel_pending) continue;
+            std.debug.assert(!e.value.recv_armed and !e.value.send_armed and !e.value.connect_armed);
+            std.debug.assert(!e.value.recv_cancel_pending and !e.value.send_cancel_pending and !e.value.connect_cancel_pending);
             if (e.value.closing) continue;
             // wss browser client (Ruri & friends): carry it whenever its
             // WebSocket adapter is past the HTTP Upgrade (phase=open) — the
@@ -19910,17 +23102,15 @@ pub const LinuxServer = struct {
             // outbound line) is serialized into the `.ws_session` capsule (v2)
             // and restored verbatim on the successor, so being mid-frame no
             // longer drops the client (the TLS crypto rides its own capsule
-            // below). Only a handshake-phase adapter — or the pathological
+            // below). A handshake-phase adapter — or the pathological
             // popped-event-pending state that cannot exist between reactor
-            // turns — falls back to the historical behavior: not carried, its
-            // socket closes at execve and the browser reconnects against the
-            // still-bound listener.
+            // turns — makes the seal incomplete and refuses UPGRADE before exec.
             const carry_ws = if (e.value.ws) |wsst| wsCarryable(wsst) else false;
             if (e.value.ws != null and !carry_ws) continue;
-            // TLS client: export the live engine state FIRST — if it cannot be
-            // exported the connection is not carried at all (its fd keeps
-            // CLOEXEC, closes at exec, and the client reconnects). A TLS socket
-            // must never be handed to the successor without its crypto state.
+            // TLS client: export the live engine state FIRST. If it cannot be
+            // exported, the exact client count remains incomplete and UPGRADE is
+            // refused before exec. A TLS socket must never reach the successor
+            // without its crypto state.
             var tls_blob: ?[]u8 = null;
             if (e.value.tls) |t| {
                 const rs = t.exportResume() catch continue;
@@ -19960,6 +23150,10 @@ pub const LinuxServer = struct {
             // arrives without a decodable TLS-engine capsule is DROPPED, never
             // adopted as plaintext (a secured socket must not fall back to cleartext).
             snap.was_secured = e.value.tls != null;
+            // Current client schema carries the transport join explicitly. The
+            // successor requires a one-to-one `.ws_session` sidecar whenever
+            // this bit is set, so a framed socket can never resume as raw IRC.
+            snap.was_websocket = e.value.ws != null;
             // Carry the monotonic signon/last-message clocks so WHOIS idle/signon
             // survive the in-place UPGRADE (CLOCK_MONOTONIC is unchanged by execve).
             snap.connected_at_ms = e.value.connected_at_ms;
@@ -19981,10 +23175,18 @@ pub const LinuxServer = struct {
             };
             defer self.allocator.free(chans);
             var chan_n: usize = 0;
+            var channels_complete = true;
             for (chan_names[0..nch]) |cname| {
-                const m = self.world.memberModes(cname, worldIdFromClient(e.id)) orelse continue;
+                const m = self.world.memberModes(cname, worldIdFromClient(e.id)) orelse {
+                    channels_complete = false;
+                    break;
+                };
                 chans[chan_n] = .{ .name = cname, .modes = m.bits };
                 chan_n += 1;
+            }
+            if (!channels_complete or chan_n != nch) {
+                if (tls_blob) |tb| self.allocator.free(tb);
+                continue;
             }
             snap.channels = chans[0..chan_n];
             // Carry the negotiated IRCv3 caps (by name) so echo-message and friends
@@ -20000,10 +23202,16 @@ pub const LinuxServer = struct {
             // lives until encode() copies it below.
             var sess_tok: sessions_mod.Token = undefined;
             if (e.value.session.account()) |acct| {
-                if (self.sessions.resumeHandleForClient(acct, monitorIdFromClient(e.id))) |handle| {
-                    sess_tok = handle.token;
-                    snap.session_token = sess_tok[0..];
+                const handle = self.sessions.resumeHandleForClient(acct, monitorIdFromClient(e.id)) orelse {
+                    if (tls_blob) |tb| self.allocator.free(tb);
+                    continue;
+                };
+                if (tokenIsNull(handle.token)) {
+                    if (tls_blob) |tb| self.allocator.free(tb);
+                    continue;
                 }
+                sess_tok = handle.token;
+                snap.session_token = sess_tok[0..];
             }
             // v4 tail: the partial inbound line pending in the RecvQ (inline
             // line_buf or its heap overflow) — dropping it made the next
@@ -20089,60 +23297,85 @@ pub const LinuxServer = struct {
                 continue;
             };
             pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch continue;
-            // Carry the client's MONITOR watch list (its capsule's client_id
-            // field holds the inherited socket FD — the fd is the join key,
-            // client ids do not survive the swap). Best-effort: any failure
-            // loses only the watch list, never the client.
+            var sidecars_complete = true;
+            // Carry exactly one MONITOR watch-list capsule for every client,
+            // including an empty list. The inherited socket FD is the join key;
+            // client ids do not survive the swap. A missing/incomplete sidecar
+            // makes the whole client image unsealable, so UPGRADE stays in the
+            // predecessor instead of silently dropping server-side state.
             const mon_client = monitorIdFromClient(e.id);
-            // Clamp the seal to what the adopt side can decode: the restore
-            // buffer holds max_carried_monitor_targets entries, and a capsule
-            // exceeding it would fail decode with TooMany — losing the WHOLE
-            // list. A node configured with `monitorlimit` above the clamp
-            // carries a partial (truncated) list instead of nothing.
-            const mon_n = @min(self.monitor.monitorCount(mon_client), max_carried_monitor_targets);
-            if (mon_n != 0) carry_mon: {
-                const targets = self.allocator.alloc([]const u8, mon_n) catch break :carry_mon;
-                defer self.allocator.free(targets);
-                const got = self.monitor.targetsInto(mon_client, targets);
+            carry_mon: {
+                const mon_total = self.monitor.monitorCount(mon_client);
+                if (mon_total > max_carried_monitor_targets) {
+                    sidecars_complete = false;
+                    break :carry_mon;
+                }
+                var targets: [max_carried_monitor_targets][]const u8 = undefined;
+                const got = self.monitor.targetsInto(mon_client, targets[0..mon_total]);
+                if (got != mon_total) {
+                    sidecars_complete = false;
+                    break :carry_mon;
+                }
                 var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
                 for (targets[0..got]) |t| wire_len += 2 + t.len;
-                const mbuf = self.allocator.alloc(u8, wire_len) catch break :carry_mon;
+                const mbuf = self.allocator.alloc(u8, wire_len) catch {
+                    sidecars_complete = false;
+                    break :carry_mon;
+                };
                 const wire = (monitor_capsule.MonitorCapsule{
                     .client_id = @intCast(e.value.fd),
                     .targets = targets[0..got],
                 }).encode(mbuf) catch {
                     self.allocator.free(mbuf);
+                    sidecars_complete = false;
                     break :carry_mon;
                 };
                 blobs.append(self.allocator, mbuf) catch {
                     self.allocator.free(mbuf);
+                    sidecars_complete = false;
                     break :carry_mon;
                 };
-                pieces.append(self.allocator, .{ .kind = .monitor_list, .bytes = wire }) catch break :carry_mon;
+                pieces.append(self.allocator, .{ .kind = .monitor_list, .bytes = wire }) catch {
+                    sidecars_complete = false;
+                    break :carry_mon;
+                };
             }
             // Carry the client's SILENCE list the same way (join key = fd in
-            // client_id). The store is keyed by owner nick; the successor
-            // resolves the adopted client's nick from the fd. Best-effort.
+            // client_id), including an empty list. The store is keyed by owner
+            // nick; the successor resolves the adopted client's nick from the
+            // fd. Failure closes the exact handoff instead of losing masks.
             carry_sil: {
-                var sil_masks: [max_carried_silence_masks][]const u8 = undefined;
+                var sil_masks: [max_carried_silence_masks + 1][]const u8 = undefined;
                 const sil_n = self.silence.masksInto(e.value.session.displayName(), &sil_masks);
-                if (sil_n == 0) break :carry_sil;
+                if (sil_n > max_carried_silence_masks) {
+                    sidecars_complete = false;
+                    break :carry_sil;
+                }
                 var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
                 for (sil_masks[0..sil_n]) |m| wire_len += 2 + m.len;
-                const sbuf = self.allocator.alloc(u8, wire_len) catch break :carry_sil;
+                const sbuf = self.allocator.alloc(u8, wire_len) catch {
+                    sidecars_complete = false;
+                    break :carry_sil;
+                };
                 const wire = (silence_capsule.SilenceCapsule{
                     .client_id = @intCast(e.value.fd),
                     .masks = sil_masks[0..sil_n],
                 }).encode(sbuf) catch {
                     self.allocator.free(sbuf);
+                    sidecars_complete = false;
                     break :carry_sil;
                 };
                 blobs.append(self.allocator, sbuf) catch {
                     self.allocator.free(sbuf);
+                    sidecars_complete = false;
                     break :carry_sil;
                 };
-                pieces.append(self.allocator, .{ .kind = .silence_list, .bytes = wire }) catch break :carry_sil;
+                pieces.append(self.allocator, .{ .kind = .silence_list, .bytes = wire }) catch {
+                    sidecars_complete = false;
+                    break :carry_sil;
+                };
             }
+            if (!sidecars_complete) continue;
             if (tls_blob != null) counts.tls += 1;
             if (carry_ws) counts.ws += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
@@ -20156,16 +23389,18 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
+    fn performUpgrade(self: *LinuxServer, request: DeferredUpgradeRequest) !void {
         if (comptime builtin.os.tag != .linux) {
-            self.upgradeNotice(requester, "UPGRADE is Linux-only");
+            self.deferredUpgradeNotice(request, "UPGRADE is Linux-only");
             return;
         }
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
         const executable_fd = self.openCompatibleUpgradeTarget(exe_target) catch |e| {
             var eb: [160]u8 = undefined;
-            self.upgradeNotice(
-                requester,
+            self.world.lockWrite();
+            defer self.world.unlockWrite();
+            self.deferredUpgradeNotice(
+                request,
                 std.fmt.bufPrint(
                     &eb,
                     "UPGRADE refused: target binary cannot accept the exact Helix handoff ({s})",
@@ -20176,53 +23411,158 @@ pub const LinuxServer = struct {
             return error.UpgradeTargetIncompatible;
         };
         defer closeFd(executable_fd);
+
+        return self.performUpgradeAfterCompatibleTarget(request, executable_fd, exe_target);
+    }
+
+    const UpgradeContinuityBlocker = enum {
+        relay_v2_deferred,
+        webtransport_listener,
+        acme_companion,
+        media_rooms,
+        media_plane,
+        native_media,
+        media_bridge,
+    };
+
+    /// Fail-closed inventory for process-owned continuity that Helix does not
+    /// serialize yet. The caller holds World's write lock, which is the server's
+    /// mutation boundary for MediaRooms/signaling. Transport predicates take
+    /// their own pump locks; bridge values are inspected under their owner lock.
+    fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
+        // Deferred MESSAGE_V2 owns exact signed wire not yet published into
+        // RVG2. Until it has a Helix capsule, exec must never discard it.
+        if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
+        if (self.config.webtransport_port != 0) return .webtransport_listener;
+        if (self.acme_reload_tls != null) return .acme_companion;
+        if (!self.media_rooms.upgradeContinuityReady()) return .media_rooms;
+        if (!self.media_plane.upgradeContinuityReady()) return .media_plane;
+        if (!self.native_media.upgradeContinuityReady()) return .native_media;
+        lockSpin(&self.media_bridges_mu);
+        defer self.media_bridges_mu.unlock();
+        var bridges = self.media_bridges.valueIterator();
+        while (bridges.next()) |bridge| {
+            if (!bridge.upgradeContinuityReady()) return .media_bridge;
+        }
+        return null;
+    }
+
+    fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
+        return switch (blocker) {
+            .relay_v2_deferred => "deferred MESSAGE_V2 authority",
+            .webtransport_listener => "WebTransport listener",
+            .acme_companion => "ACME renewal companion",
+            .media_rooms => "media room control state",
+            .media_plane => "WebRTC media transport state",
+            .native_media => "native media transport state",
+            .media_bridge => "cross-leg media bridge state",
+        };
+    }
+
+    /// Post-capability-probe half of `performUpgrade`. Kept as a narrow test seam
+    /// so failure-unwind tests can enter the producer barrier deterministically
+    /// without depending on a separately-installed Orochi executable. Production
+    /// reaches this only after `openCompatibleUpgradeTarget` has pinned and
+    /// successfully probed `executable_fd`.
+    fn performUpgradeAfterCompatibleTarget(
+        self: *LinuxServer,
+        request: DeferredUpgradeRequest,
+        executable_fd: linux.fd_t,
+        exe_target: []const u8,
+    ) !void {
+
+        // Stop and join the only off-reactor producer before socket-owner
+        // quiescence. Its retained listener keeps the port/backlog stable if the
+        // upgrade later refuses; failure unwind resumes the same listener.
+        var webhook_paused = false;
+        lockSpin(&self.webhook_lifecycle_gate);
+        if (self.webhook_server) |*ws| {
+            self.webhook_upgrade_pause_active.store(true, .release);
+            ws.pause();
+            webhook_paused = true;
+        }
+        self.webhook_lifecycle_gate.unlock();
+        defer if (webhook_paused) {
+            // This defer runs after the later World-unlock and reactor-resume
+            // defers. Only now may reactor 0's retry lane accept new HTTP work.
+            lockSpin(&self.webhook_lifecycle_gate);
+            self.webhook_upgrade_pause_active.store(false, .release);
+            self.webhook_lifecycle_gate.unlock();
+            self.tryResumeWebhookAfterUpgrade(false);
+        };
+
+        // No World lock is held while owner threads cancel/reap their rings:
+        // original CQEs run through CompletionHandler and acquire it normally.
+        // Once every owner stopped input and drained its final mailbox, freeze
+        // shared World exactly once for the complete seal. Failure unwinds in
+        // reverse order: unlock first, then owner-thread socket reactivation.
+        self.quiesceSiblingReactors() catch |e| {
+            self.world.lockWrite();
+            self.deferredUpgradeNotice(request, "UPGRADE refused: socket I/O did not reach an exact owner safe point; retry or restart to deploy");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: exact socket-I/O quiesce failed") catch {};
+            self.world.unlockWrite();
+            return e;
+        };
+        defer self.resumeSiblingReactors();
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+
+        if (self.upgradeContinuityBlockerLocked()) |blocker| {
+            var blocker_buf: [192]u8 = undefined;
+            const blocker_name = upgradeContinuityBlockerName(blocker);
+            self.deferredUpgradeNotice(
+                request,
+                std.fmt.bufPrint(
+                    &blocker_buf,
+                    "UPGRADE refused: {s} has live process-owned state with no exact Helix checkpoint",
+                    .{blocker_name},
+                ) catch "UPGRADE refused: uncheckpointed process-owned continuity state is active",
+            );
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: uncheckpointed media or companion continuity state is active") catch {};
+            return error.SessionReplicaConverging;
+        }
+
+        // No HTTP thread can push behind this drain: pause() joined it above.
+        // Any channel/mesh work produced here is then absorbed by the same
+        // preflight + all-shard fixed-point loop as socket-originated work.
+        self.drainWebhookPostsForUpgradeLocked();
+
         var nbuf: [128]u8 = undefined;
-        const requested_by = if (requester) |c| c.session.displayName() else "SIGUSR2";
+        const requested_by = if (self.deferredUpgradeRequester(request)) |c| c.session.displayName() else "SIGUSR2";
         const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
         try self.publishOperEvent(.oper_action, .critical, note);
-
-        // Multi-reactor topology: per-connection state is single-writer by its
-        // owning reactor, so before this thread may seal shards it does not own
-        // it QUIESCES every sibling worker (each parks between loop turns,
-        // touching neither its ring nor its slab). The completion bracket
-        // (onCompletion) holds `world.lockWrite` around this whole call, and a
-        // sibling mid-completion may be BLOCKED on that lock — it can only
-        // reach its park point once the lock is released. So: drop the bracket
-        // lock for the quiesce + seal (safe — once every sibling is parked, no
-        // other thread reads or writes the world), and re-acquire it on every
-        // non-execve exit so onCompletion's paired unlock stays balanced.
-        // Fail-safe: a shard whose worker never parks cannot be sealed safely —
-        // the upgrade is refused rather than silently dropping (or racing)
-        // that shard's clients.
-        const threaded_seal = self.reactors.len > 1 and self.pool.count() != 0;
-        if (threaded_seal) {
-            self.world.unlockWrite();
-            self.quiesceSiblingReactors() catch |e| {
-                self.world.lockWrite();
-                self.upgradeNotice(requester, "UPGRADE refused: a reactor shard did not quiesce — its clients cannot be sealed safely; retry or restart to deploy");
-                self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: shard quiesce failed (multi-shard seal aborted)") catch {};
-                return e;
-            };
-        }
-        // Every non-execve exit below must let the parked siblings resume; on
-        // success execve replaces the process and neither defer runs. LIFO:
-        // the bracket lock is re-acquired FIRST (uncontended — siblings are
-        // still parked), then the siblings resume.
-        defer self.resumeSiblingReactors();
-        defer if (threaded_seal) self.world.lockWrite();
+        // Queue the requester acknowledgement before the authoritative drain.
+        // No success notice is emitted after connection state is snapshotted.
+        self.deferredUpgradeNotice(request, "UPGRADE: exact I/O boundary reached; sealing live state");
 
         // ConnState owns the one piece of resume ordering state that cannot be
         // reconstructed from the current snapshot: the pre-resume nick. Flush it
         // behind accepted exact-token authority before sealing, or refuse the
         // swap without dropping a client. The successor therefore never inherits
         // an unguarded restored identity and cannot re-burst it as a collision UID.
-        if (!self.prepareSessionReplicaUpgradeBoundary()) {
-            self.upgradeNotice(requester, "UPGRADE refused: session replica state is still converging; retry after convergence");
-            self.publishOperEvent(.oper_action, .warn, "UPGRADE refused: session replica authority is still converging") catch {};
+        var boundary_stable = false;
+        const boundary_rounds = @max(@as(usize, 2), self.config.max_clients + self.reactors.len);
+        var boundary_round: usize = 0;
+        while (boundary_round < boundary_rounds) : (boundary_round += 1) {
+            const replica_ready = self.prepareSessionReplicaUpgradeBoundary();
+            const drain_progress = self.drainAllUpgradeFabricFixedPointLocked() catch break;
+            // A zero-progress all-shard pass after a clean preflight proves that
+            // no close/fanout mutated Store, World, migrations, or HLC behind the
+            // values about to be encoded. Any progress gets another preflight.
+            if (replica_ready and drain_progress == 0) {
+                boundary_stable = true;
+                break;
+            }
+        }
+        if (!boundary_stable) {
+            self.deferredUpgradeNotice(request, "UPGRADE refused: session replica state is still converging; retry after convergence");
+            self.publishOperEvent(.oper_action, .warn, "UPGRADE refused: exact replica/fabric boundary is still converging") catch {};
             return error.SessionReplicaConverging;
         }
+        // From this point through client seal and exec planning there are no
+        // mutation-producing drains, success notices, or event publications.
         const upgrade_mesh_clock = self.preparePropertyUpgradeClockBoundary() orelse {
-            self.upgradeNotice(requester, "UPGRADE refused: retained property clocks cannot advance safely; reject future-skewed state or cold-restart");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: retained property clocks cannot advance safely; reject future-skewed state or cold-restart");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: property clock high-water mark is unsafe") catch {};
             return error.PropertyStateConverging;
         };
@@ -20238,47 +23578,63 @@ pub const LinuxServer = struct {
         // Preserve the process-global HLC high-water mark before any state
         // capsules. A successor that reset it could reuse or regress event ids
         // immediately after execve, breaking deduplication and LWW ordering.
-        const mesh_clock_wire = mesh_clock_snapshot.encode(upgrade_mesh_clock);
+        lockSpin(&self.mesh_clock_lock);
+        const migration_offer_epoch = self.migration_offer_epoch;
+        self.mesh_clock_lock.unlock();
+        const mesh_clock_wire = try mesh_clock_snapshot.encode(
+            upgrade_mesh_clock,
+            migration_offer_epoch,
+            self.relay_v2_activation_state,
+        );
         // Reuse the generic v1 mesh-checkpoint capsule family. Its inner payload
         // is magic-discriminated (`MHLC` versus the existing `MRED` re-dial
         // hint), so an older rollback binary accepts the outer capsule and
         // harmlessly skips this unfamiliar payload instead of rejecting the
         // complete arena because of an unknown capsule kind.
-        try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = &mesh_clock_wire });
+        try pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = &mesh_clock_wire,
+            .min_supported = 2,
+        });
+        const mandatory_state_sealed = self.sealMandatoryStateUpgradeCheckpoints(&pieces, &blobs) orelse {
+            self.deferredUpgradeNotice(request, "UPGRADE refused: exact World/history/webhook state could not be sealed completely");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete mandatory state checkpoint") catch {};
+            return error.SessionReplicaConverging;
+        };
         if (!self.sealPropertyUpgradeCheckpoint(&pieces, &blobs)) {
-            self.upgradeNotice(requester, "UPGRADE refused: exact property and tombstone state could not be sealed completely");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: exact property and tombstone state could not be sealed completely");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete property-state checkpoint") catch {};
             return error.PropertyStateConverging;
         }
         // Carry the process-global TLS session-ticket key(s) so tickets issued
         // before the swap still open under the successor (which otherwise boots a
-        // fresh random key, killing every outstanding ticket). Emitted once, ahead
-        // of the per-client pieces; a decode/alloc failure just drops the piece and
-        // the successor keeps its freshly-minted key. `.bytes` is owned by `blobs`.
-        if (self.config.tls_enable_resumption) ticket: {
-            const tk = ticket_key_capsule.encode(self.allocator, .{
-                .current = self.tls_ticket_key,
-                .previous = self.tls_previous_ticket_key,
-            }) catch break :ticket;
-            blobs.append(self.allocator, tk) catch {
-                self.allocator.free(tk);
-                break :ticket;
-            };
-            pieces.append(self.allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch break :ticket;
+        // fresh random key, killing every outstanding ticket). This singleton is
+        // authoritative when resumption is enabled: allocation/plan failure must
+        // refuse the upgrade rather than invalidate every issued ticket.
+        if (self.config.tls_enable_resumption and !sealTlsTicketKeyUpgradeCapsule(
+            self.allocator,
+            self.tls_ticket_key,
+            self.tls_previous_ticket_key,
+            &pieces,
+            &blobs,
+        )) {
+            self.deferredUpgradeNotice(request, "UPGRADE refused: TLS session-ticket keys could not be sealed exactly");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete TLS ticket-key seal") catch {};
+            return error.SessionReplicaConverging;
         }
         const replica_now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         const replica_checkpoint = self.session_replica_store.encodeUpgradeCheckpoint(self.allocator, replica_now_wall) catch {
-            self.upgradeNotice(requester, "UPGRADE refused: signed session replica authority could not be sealed completely");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: signed session replica authority could not be sealed completely");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete SESSION_REPLICA Store seal") catch {};
             return error.SessionReplicaConverging;
         };
         blobs.append(self.allocator, replica_checkpoint) catch {
             self.allocator.free(replica_checkpoint);
-            self.upgradeNotice(requester, "UPGRADE refused: signed session replica checkpoint could not enter the state plan");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: signed session replica checkpoint could not enter the state plan");
             return error.SessionReplicaConverging;
         };
         pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = replica_checkpoint }) catch {
-            self.upgradeNotice(requester, "UPGRADE refused: signed session replica checkpoint could not enter the state plan");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: signed session replica checkpoint could not enter the state plan");
             return error.SessionReplicaConverging;
         };
         const replica_objects_sealed = self.session_replica_store.entryCount() +
@@ -20289,18 +23645,19 @@ pub const LinuxServer = struct {
         // swap. Adopted by the successor's Pass 2c, AFTER the clients pass —
         // an attached session re-joins its carried connection by fd.
         const session_accounts_sealed = self.sealSessionRegistry(&pieces, &blobs) orelse {
-            self.upgradeNotice(requester, "UPGRADE refused: the session registry could not be sealed completely");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: the session registry could not be sealed completely");
             return error.SessionReplicaConverging;
         };
         // Seal the complete PendingMigrations state as one atomic v2 capsule.
         // This includes live offers and consumed-token replay barriers with their
         // exact ordering and expiry metadata.
         const pending_sealed = self.sealPendingMigrationCheckpoint(&pieces, &blobs) orelse {
-            self.upgradeNotice(requester, "UPGRADE refused: exact pending-migration state could not be sealed completely");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: exact pending-migration state could not be sealed completely");
             return error.SessionReplicaConverging;
         };
         const migrations_sealed = pending_sealed.entries;
         const tombstones_sealed = pending_sealed.consumed;
+
         // Seal EVERY shard's clients. Siblings are parked (see the quiesce
         // above), so reading foreign per-connection state here cannot race the
         // owning reactor thread. The carried-fd scratch spans all shards.
@@ -20321,21 +23678,27 @@ pub const LinuxServer = struct {
         const ws_carried = seal_counts.ws;
         const s2s_hints = seal_counts.s2s_hints;
         const s2s_preserved = seal_counts.s2s_preserved;
+        if (seal_counts.s2s_preserve_failed or seal_counts.s2s_hint_failed) {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            self.deferredUpgradeNotice(request, "UPGRADE refused: exact secured-link or unmanaged-dial continuity could not be sealed");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete mesh continuity seal") catch {};
+            return error.SessionReplicaConverging;
+        }
         if (seal_counts.fd_prepare_failed or seal_counts.clients != seal_counts.clients_expected) {
             restoreCloexec(carried_fds[0..carried_fd_count]);
-            self.upgradeNotice(requester, "UPGRADE refused: not every registered client could be sealed without disconnecting");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: not every registered client could be sealed without disconnecting");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete registered-client seal") catch {};
             return error.SessionReplicaConverging;
         }
         if (carried_fd_count > helix_live.max_inherited_state_fds) {
             restoreCloexec(carried_fds[0..carried_fd_count]);
-            self.upgradeNotice(requester, "UPGRADE refused: carried state exceeds the authoritative fd-manifest limit");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: carried state exceeds the authoritative fd-manifest limit");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: carried state fd manifest exceeds hard limit") catch {};
             return error.SessionReplicaConverging;
         }
 
-        // Seal the state arena. On failure, fall back to a listener-only upgrade
-        // so UPGRADE still works (just without state carry-over).
+        // Seal the complete state arena. Any failure refuses UPGRADE and restores
+        // descriptor hygiene; listener-only re-exec is RESTART-only.
         const now = self.nowMs();
         var prepared = helix_live.prepare(self.allocator, .{
             .epoch = @intCast(@max(0, now)),
@@ -20347,7 +23710,7 @@ pub const LinuxServer = struct {
         }) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             var eb: [96]u8 = undefined;
-            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE refused: complete state seal failed ({s})", .{@errorName(e)}) catch "UPGRADE refused: state seal failed");
+            self.deferredUpgradeNotice(request, std.fmt.bufPrint(&eb, "UPGRADE refused: complete state seal failed ({s})", .{@errorName(e)}) catch "UPGRADE refused: state seal failed");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: complete Helix state seal failed") catch {};
             return error.SessionReplicaConverging;
         };
@@ -20355,11 +23718,11 @@ pub const LinuxServer = struct {
 
         const arena = prepared.runtime.arena orelse {
             restoreCloexec(carried_fds[0..carried_fd_count]);
-            self.upgradeNotice(requester, "UPGRADE refused: sealed state arena is missing");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: sealed state arena is missing");
             return error.SessionReplicaConverging;
         };
         var sbuf: [224]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed }) catch "UPGRADE: re-exec");
+        srvLog("orochi: {s}\n", .{std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), mandatory state {d}/{d}/{d}/{d}/{d} bytes); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed, mandatory_state_sealed.world_bytes, mandatory_state_sealed.history_bytes, mandatory_state_sealed.webhook_bytes, mandatory_state_sealed.relay_replay_bytes, mandatory_state_sealed.event_replay_bytes }) catch "UPGRADE: re-exec"});
 
         // Preserve EVERY shard's client listener + the arena across execve
         // (clear FD_CLOEXEC). The successor adopts one listener per shard, so
@@ -20369,7 +23732,7 @@ pub const LinuxServer = struct {
         const listener_fds = self.allocator.alloc(linux.fd_t, self.reactors.len) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             var eb: [96]u8 = undefined;
-            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.deferredUpgradeNotice(request, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer self.allocator.free(listener_fds);
@@ -20379,7 +23742,7 @@ pub const LinuxServer = struct {
             if (!setCloexec(r.listener_fd, false)) {
                 restoreCloexec(carried_fds[0..carried_fd_count]);
                 restoreCloexec(listener_fds[0..listener_fd_count]);
-                self.upgradeNotice(requester, "UPGRADE refused: a listener fd could not be prepared for exec");
+                self.deferredUpgradeNotice(request, "UPGRADE refused: a listener fd could not be prepared for exec");
                 return error.SessionReplicaConverging;
             }
             listener_fd_count += 1;
@@ -20387,7 +23750,7 @@ pub const LinuxServer = struct {
         if (!setCloexec(arena.fd, false)) {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             restoreCloexec(listener_fds[0..listener_fd_count]);
-            self.upgradeNotice(requester, "UPGRADE refused: the sealed state arena fd could not be prepared for exec");
+            self.deferredUpgradeNotice(request, "UPGRADE refused: the sealed state arena fd could not be prepared for exec");
             return error.SessionReplicaConverging;
         }
         // Exec the on-disk launch path (the swapped-in new binary) when known,
@@ -20405,7 +23768,7 @@ pub const LinuxServer = struct {
             restoreCloexec(listener_fds);
             _ = setCloexec(arena.fd, true);
             var eb: [96]u8 = undefined;
-            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.deferredUpgradeNotice(request, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
@@ -20414,7 +23777,7 @@ pub const LinuxServer = struct {
             restoreCloexec(listener_fds);
             _ = setCloexec(arena.fd, true);
             var eb: [96]u8 = undefined;
-            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.deferredUpgradeNotice(request, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
     }
@@ -20422,10 +23785,10 @@ pub const LinuxServer = struct {
     /// Successor side of UPGRADE: read the inherited state arena and re-attach
     /// every carried-over client connection (inherited socket fd + restored
     /// session, plus its live TLS engine when one was carried) into the client
-    /// table + io_uring recv, then immediately re-dial any carried mesh peers.
-    /// Called once after boot. Individual decodable capsules remain best-effort,
-    /// but ambiguity in the authoritative inherited-fd ownership contract is
-    /// startup-fatal: guessing could leave a live socket unserved.
+    /// table and stage mesh redials / connection I/O activation for the first
+    /// reactor turn. Called after Server.init but before the successor starts
+    /// serving. Invalid, incomplete, or failed capsule adoption is startup-fatal;
+    /// no partial inherited population is published.
     fn clearInheritedStateFdManifest(self: *LinuxServer) void {
         self.config.inherited_state_fds = &.{};
         self.config.inherited_state_fd_manifest_present = false;
@@ -20562,6 +23925,70 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Mandatory state families are exact singleton authorities, not
+    /// best-effort/evolvable records. Null covers absence and every ambiguous
+    /// representation; the caller abandons the complete handoff in either case.
+    fn canonicalMandatorySingleton(
+        caps: []const helix_capsule.Capsule,
+        kind: helix_capsule.CapsuleKind,
+    ) ?[]const u8 {
+        const descriptor = helix_capsule.descriptor(kind);
+        var selected: ?[]const u8 = null;
+        for (caps) |c| {
+            if (c.header.kind != kind) continue;
+            if (selected != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+                return null;
+            selected = c.fields[0].bytes;
+        }
+        return selected;
+    }
+
+    /// Validate the restored MESSAGE_V2 consequence authorities as one image.
+    /// Individually well-formed RVG2/RVO2/RVL2 checkpoints are not sufficient:
+    /// an outbound retry without its exact retained wire, or a retained wire the
+    /// replay guard considers unseen/equivocating, would publish a torn handoff.
+    /// Receipt-only RVO2 rows are deliberately excluded because a confirmed or
+    /// retired RVL2 row may leave its ingress ACK proof alive until confirmation.
+    fn relayV2RestoreRelationValid(
+        self: *const LinuxServer,
+        guard: *const relay_v2_replay_guard.Guard,
+        outbox: *const relay_v2_outbox.Outbox,
+        event_log: *const relay_v2_event_log.EventLog,
+    ) bool {
+        for (outbox.items()) |entry| {
+            const row = event_log.viewFor(entry.relay_id) orelse return false;
+            if (entry.peer == relay_v2_outbox.unbound_peer or
+                entry.peer == self.config.node_id or
+                std.mem.indexOfScalar(u64, row.required_nodes, entry.peer) == null or
+                std.mem.indexOfScalar(u64, row.confirmed_nodes, entry.peer) != null or
+                !std.mem.eql(u8, row.wire, entry.wire)) return false;
+        }
+        for (0..event_log.len()) |index| {
+            const row = event_log.viewAt(index);
+            if (self.config.node_id == 0 or
+                std.mem.indexOfScalar(u64, row.required_nodes, self.config.node_id) == null or
+                std.mem.indexOfScalar(u64, row.confirmed_nodes, self.config.node_id) == null) return false;
+            for (row.required_nodes) |required| {
+                if (std.mem.indexOfScalar(u64, row.confirmed_nodes, required) != null) continue;
+                if (std.mem.indexOfScalar(u64, self.relay_v2_required_nodes, required) == null)
+                    return false;
+            }
+            var owned = message_relay_v2.decode(self.allocator, row.wire) catch return false;
+            defer owned.deinit(self.allocator);
+            switch (guard.probeMessage(owned.msg) catch return false) {
+                .duplicate => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return false,
+                .retired => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+
     fn abandonInheritedSessionState(self: *LinuxServer, caps: anytype, arena_fd: linux.fd_t, reason: []const u8) void {
         // New predecessors provide a version-independent exact fd set, so even
         // an unfamiliar capsule schema cannot strand sockets. Legacy or invalid
@@ -20606,12 +24033,32 @@ pub const LinuxServer = struct {
             closeFd(arena_fd);
             self.config.resume_arena_fd = null;
             srvLog("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
-            return;
+            return error.InvalidInheritedHandoff;
         };
         defer {
             for (caps) |*c| c.deinit(self.allocator);
             self.allocator.free(caps);
         }
+        helix_live.verifyHandoffManifest(caps) catch |e| {
+            var reason_buf: [128]u8 = undefined;
+            const reason = std.fmt.bufPrint(
+                &reason_buf,
+                "invalid or incomplete whole-handoff manifest ({s})",
+                .{@errorName(e)},
+            ) catch "invalid or incomplete whole-handoff manifest";
+            self.abandonInheritedSessionState(caps, arena_fd, reason);
+            return error.InvalidInheritedHandoff;
+        };
+        _ = handoff_relations.validateCurrent(caps, self.config.inherited_state_fds) catch |e| {
+            var reason_buf: [128]u8 = undefined;
+            const reason = std.fmt.bufPrint(
+                &reason_buf,
+                "invalid whole-handoff ownership relation ({s})",
+                .{@errorName(e)},
+            ) catch "invalid whole-handoff ownership relation";
+            self.abandonInheritedSessionState(caps, arena_fd, reason);
+            return error.InvalidInheritedHandoff;
+        };
 
         // Before publishing ANY restored state, bind every ownership-bearing
         // client/S2S capsule to the exact version-independent descriptor set.
@@ -20623,6 +24070,7 @@ pub const LinuxServer = struct {
         var state_fd_claims: ?InheritedStateFdClaims = null;
         if (self.config.inherited_state_fd_manifest_present) {
             const bits = self.allocator.alloc(bool, self.config.inherited_state_fds.len) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "could not allocate inherited-fd claim set");
                 return error.InvalidInheritedHandoff;
             };
             @memset(bits, false);
@@ -20630,57 +24078,465 @@ pub const LinuxServer = struct {
             state_fd_claims = .{ .fds = self.config.inherited_state_fds, .claimed = bits };
             for (caps) |c| {
                 if (c.header.kind != .clients and c.header.kind != .s2s_link) continue;
-                if (c.fields.len != 1 or c.fields[0].ordinal != 1)
+                if (c.fields.len != 1 or c.fields[0].ordinal != 1) {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid inherited-fd owner capsule");
                     return error.InvalidInheritedHandoff;
+                }
                 const maybe_fd = switch (c.header.kind) {
                     .clients => session_snapshot.peekFd(c.fields[0].bytes),
                     .s2s_link => s2s_snapshot.peekFd(c.fields[0].bytes),
                     else => unreachable,
                 };
-                const fd = maybe_fd orelse return error.InvalidInheritedHandoff;
-                if (fd < 0 or !state_fd_claims.?.claim(fd)) return error.InvalidInheritedHandoff;
-            }
-            if (!state_fd_claims.?.allClaimed()) return error.InvalidInheritedHandoff;
-        } else {
-            // Pre-manifest predecessors are still accepted, but their owner
-            // capsules must not alias one descriptor. Otherwise two ConnState
-            // slots (and two io_uring operations) would own the same socket; a
-            // later rejection could also close the numeric fd twice. Validate
-            // before publishing any restored state, without allocating.
-            for (caps, 0..) |c, index| {
-                const fd = inheritedOwningCapsuleFd(c) orelse continue;
-                if (fd < 0) continue;
-                if (inheritedOwningFdSeenBefore(caps, index, fd)) {
-                    self.abandonInheritedSessionState(caps, arena_fd, "duplicate legacy inherited socket ownership");
-                    return;
+                const fd = maybe_fd orelse {
+                    self.abandonInheritedSessionState(caps, arena_fd, "missing inherited-fd owner prefix");
+                    return error.InvalidInheritedHandoff;
+                };
+                if (fd < 0 or !state_fd_claims.?.claim(fd)) {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate inherited-fd owner");
+                    return error.InvalidInheritedHandoff;
                 }
             }
+            if (!state_fd_claims.?.allClaimed()) {
+                self.abandonInheritedSessionState(caps, arena_fd, "unclaimed inherited descriptor");
+                return error.InvalidInheritedHandoff;
+            }
+        } else {
+            // The current whole-handoff relation has already proved there are
+            // no client/S2S owner capsules when the fd manifest is absent. This
+            // is the legitimate state-only arena shape; no descriptor ownership
+            // exists to claim or alias here.
         }
 
-        // Stage the mesh clock alongside every exact singleton below. Nothing is
-        // published until PROP, SESSION_REPLICA, and PMST have all decoded and
-        // validated successfully; a late corrupt singleton must leave the whole
-        // successor image untouched.
-        lockSpin(&self.mesh_clock_lock);
-        var staged_mesh_clock = self.mesh_clock;
-        self.mesh_clock_lock.unlock();
+        // The current Helix contract always carries these three authorities,
+        // including their empty images. Exact current descriptor metadata plus
+        // one ordinal-1 field keeps absence, duplicates, and evolvable wrapper
+        // ambiguity from silently degrading a hot upgrade into a disk reload.
+        const world_checkpoint_bytes = canonicalMandatorySingleton(caps, .channels) orelse {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing, duplicate, or noncanonical World checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        const history_checkpoint_bytes = canonicalMandatorySingleton(caps, .history) orelse {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing, duplicate, or noncanonical history checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        const webhook_checkpoint_bytes = canonicalMandatorySingleton(caps, .webhook_store) orelse {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing, duplicate, or noncanonical webhook checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        var relay_replay_checkpoint_bytes: ?[]const u8 = null;
+        var relay_outbox_checkpoint_bytes: ?[]const u8 = null;
+        var relay_event_log_checkpoint_bytes: ?[]const u8 = null;
+        var attachment_delivery_checkpoint_bytes: ?[]const u8 = null;
+        var event_replay_checkpoint_bytes: ?[]const u8 = null;
+        const mesh_descriptor = helix_capsule.descriptor(.mesh_checkpoint);
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
-            if (c.fields.len == 0) continue;
-            const restored = mesh_clock_snapshot.decode(c.fields[0].bytes) catch continue;
-            if (restored.last_stamp > staged_mesh_clock.last_stamp) staged_mesh_clock = restored;
-            break;
+            var recognized_relay = false;
+            for (c.fields) |field| {
+                if (relay_v2_replay_guard.isCheckpoint(field.bytes)) {
+                    recognized_relay = true;
+                    break;
+                }
+            }
+            if (recognized_relay) {
+                if (relay_replay_checkpoint_bytes != null or
+                    c.header.schema_id != mesh_descriptor.schema_id or
+                    c.header.version != mesh_descriptor.current_version or
+                    c.header.min_supported != 2 or
+                    c.header.max_supported != mesh_descriptor.max_supported or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                    !relay_v2_replay_guard.isCheckpoint(c.fields[0].bytes))
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate MESSAGE_V2 replay checkpoint");
+                    return error.InvalidInheritedHandoff;
+                }
+                relay_replay_checkpoint_bytes = c.fields[0].bytes;
+                continue;
+            }
+            var recognized_outbox = false;
+            for (c.fields) |field| {
+                if (relay_v2_outbox.isCheckpoint(field.bytes)) {
+                    recognized_outbox = true;
+                    break;
+                }
+            }
+            if (recognized_outbox) {
+                if (relay_outbox_checkpoint_bytes != null or
+                    c.header.schema_id != mesh_descriptor.schema_id or
+                    c.header.version != mesh_descriptor.current_version or
+                    c.header.min_supported != 2 or
+                    c.header.max_supported != mesh_descriptor.max_supported or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                    !relay_v2_outbox.isCheckpoint(c.fields[0].bytes))
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate MESSAGE_V2 outbox checkpoint");
+                    return error.InvalidInheritedHandoff;
+                }
+                relay_outbox_checkpoint_bytes = c.fields[0].bytes;
+                continue;
+            }
+            var recognized_event_log = false;
+            for (c.fields) |field| {
+                if (relay_v2_event_log.isCheckpoint(field.bytes)) {
+                    recognized_event_log = true;
+                    break;
+                }
+            }
+            if (recognized_event_log) {
+                if (relay_event_log_checkpoint_bytes != null or
+                    c.header.schema_id != mesh_descriptor.schema_id or
+                    c.header.version != mesh_descriptor.current_version or
+                    c.header.min_supported != 2 or
+                    c.header.max_supported != mesh_descriptor.max_supported or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                    !relay_v2_event_log.isCheckpoint(c.fields[0].bytes))
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate MESSAGE_V2 event-log checkpoint");
+                    return error.InvalidInheritedHandoff;
+                }
+                relay_event_log_checkpoint_bytes = c.fields[0].bytes;
+                continue;
+            }
+            var recognized_attachment_delivery = false;
+            for (c.fields) |field| {
+                if (attachment_delivery_spool.isCheckpoint(field.bytes)) {
+                    recognized_attachment_delivery = true;
+                    break;
+                }
+            }
+            if (recognized_attachment_delivery) {
+                if (attachment_delivery_checkpoint_bytes != null or
+                    c.header.schema_id != mesh_descriptor.schema_id or
+                    c.header.version != mesh_descriptor.current_version or
+                    c.header.min_supported != 2 or
+                    c.header.max_supported != mesh_descriptor.max_supported or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                    !attachment_delivery_spool.isCheckpoint(c.fields[0].bytes))
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate attachment-delivery checkpoint");
+                    return error.InvalidInheritedHandoff;
+                }
+                attachment_delivery_checkpoint_bytes = c.fields[0].bytes;
+                continue;
+            }
+            var recognized = false;
+            for (c.fields) |field| {
+                if (event_spine_replay_guard.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            if (event_replay_checkpoint_bytes != null or
+                c.header.schema_id != mesh_descriptor.schema_id or
+                c.header.version != mesh_descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != mesh_descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                !event_spine_replay_guard.isCheckpoint(c.fields[0].bytes))
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate Event Spine replay checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            event_replay_checkpoint_bytes = c.fields[0].bytes;
+        }
+        if (relay_replay_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory MESSAGE_V2 replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+        if (relay_outbox_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory MESSAGE_V2 outbox checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+        if (relay_event_log_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory MESSAGE_V2 event-log checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+        if (attachment_delivery_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory attachment-delivery checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+        if (event_replay_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory Event Spine replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+
+        // Decode all mandatory images and the complete client/member projection
+        // before the boot-exclusive publication boundary. Every value below is
+        // independently owned; a late failure destroys only staged candidates.
+        var world_replacement = world_checkpoint.decode(self.allocator, world_checkpoint_bytes) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid World checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer world_replacement.deinit();
+
+        const history_payloads = history_checkpoint.decode(.{}, history_checkpoint_bytes) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid history checkpoint bundle");
+            return error.InvalidInheritedHandoff;
+        };
+        var history_replacement = HistoryStore.decodeCheckpoint(self.allocator, history_payloads.lotus) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid Lotus history checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer history_replacement.deinit();
+        var search_replacement = search_index_mod.SearchIndex.decodeCheckpoint(
+            self.allocator,
+            self.config.search_index_config,
+            history_payloads.search_index,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid search-index checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer search_replacement.deinit();
+        const event_history_replacement = event_history_mod.EventHistory(512).restoreHelixCheckpoint(
+            history_payloads.event_history,
+        ) orelse {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid EventHistory checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        var relay_replay_replacement = relay_v2_replay_guard.Guard.decodeCheckpoint(
+            self.allocator,
+            self.relay_v2_replay_guard.config,
+            relay_replay_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible MESSAGE_V2 replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer relay_replay_replacement.deinit();
+        var relay_outbox_replacement = relay_v2_outbox.Outbox.decodeCheckpoint(
+            self.allocator,
+            self.relay_v2_outbox.max_entries,
+            relay_outbox_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible MESSAGE_V2 outbox checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer relay_outbox_replacement.deinit();
+        var relay_event_log_replacement = relay_v2_event_log.EventLog.decodeCheckpoint(
+            self.allocator,
+            self.relay_v2_event_log.config,
+            relay_event_log_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible MESSAGE_V2 event-log checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer relay_event_log_replacement.deinit();
+        if (!self.relayV2RestoreRelationValid(
+            &relay_replay_replacement,
+            &relay_outbox_replacement,
+            &relay_event_log_replacement,
+        )) {
+            self.abandonInheritedSessionState(caps, arena_fd, "inconsistent MESSAGE_V2 replay, retry, and retained-event checkpoints");
+            return error.InvalidInheritedHandoff;
+        }
+        var attachment_delivery_replacement = attachment_delivery_spool.Spool.decodeCheckpoint(
+            self.allocator,
+            self.attachment_delivery_spool.config,
+            attachment_delivery_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible attachment-delivery checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer attachment_delivery_replacement.deinit();
+        var event_replay_replacement = event_spine_replay_guard.Guard.decodeCheckpoint(
+            self.allocator,
+            self.event_spine_replay_guard.config,
+            event_replay_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible Event Spine replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer event_replay_replacement.deinit();
+        const webhook_replacement = webhook_mod.WebhookStore.restoreUpgradeCheckpoint(
+            webhook_checkpoint_bytes,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid webhook checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+
+        var client_capsule_count: usize = 0;
+        var projected_member_count: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .clients) continue;
+            const descriptor = helix_capsule.descriptor(.clients);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed client wrapper in World projection");
+                return error.InvalidInheritedHandoff;
+            }
+            const snap = session_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed client snapshot in World projection");
+                return error.InvalidInheritedHandoff;
+            };
+            client_capsule_count = std.math.add(usize, client_capsule_count, 1) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "client projection count overflow");
+                return error.InvalidInheritedHandoff;
+            };
+            var channels = session_snapshot.channelIter(snap.channels_blob);
+            while (channels.next()) |_| {
+                projected_member_count = std.math.add(usize, projected_member_count, 1) catch {
+                    self.abandonInheritedSessionState(caps, arena_fd, "client membership projection overflow");
+                    return error.InvalidInheritedHandoff;
+                };
+            }
+            if (channels.remaining == null or channels.remaining.? != 0) {
+                self.abandonInheritedSessionState(caps, arena_fd, "truncated client membership projection");
+                return error.InvalidInheritedHandoff;
+            }
+        }
+        const member_projection = self.allocator.alloc(
+            world_checkpoint.MemberProjection,
+            projected_member_count,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "could not stage client membership projection");
+            return error.InvalidInheritedHandoff;
+        };
+        defer self.allocator.free(member_projection);
+        const client_projection = self.allocator.alloc(
+            world_checkpoint.ClientProjection,
+            client_capsule_count,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "could not stage client relation projection");
+            return error.InvalidInheritedHandoff;
+        };
+        defer self.allocator.free(client_projection);
+        var projected_index: usize = 0;
+        var projected_client_index: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .clients) continue;
+            const snap = session_snapshot.decodeCurrent(c.fields[0].bytes) catch unreachable;
+            if (snap.fd < 0) {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid client fd in World relation projection");
+                return error.InvalidInheritedHandoff;
+            }
+            const join_key: u64 = @intCast(snap.fd);
+            client_projection[projected_client_index] = .{
+                .join_key = join_key,
+                .nick = snap.nick,
+            };
+            projected_client_index += 1;
+            var channels = session_snapshot.channelIter(snap.channels_blob);
+            while (channels.next()) |membership| {
+                member_projection[projected_index] = .{
+                    .channel = membership.name,
+                    .join_key = join_key,
+                    .nick = snap.nick,
+                    .modes = .{ .bits = membership.modes },
+                };
+                projected_index += 1;
+            }
+        }
+        std.debug.assert(projected_index == member_projection.len);
+        std.debug.assert(projected_client_index == client_projection.len);
+        world_replacement.validateMemberProjection(member_projection) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "client snapshots do not exactly project the World membership image");
+            return error.InvalidInheritedHandoff;
+        };
+        world_replacement.validateInviteProjection(client_projection) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "client snapshots do not exactly project the World invite image");
+            return error.InvalidInheritedHandoff;
+        };
+
+        // Stage the mandatory mesh clock alongside every exact singleton below.
+        // Nothing is published until PROP, SESSION_REPLICA, and PMST have all
+        // decoded and validated successfully; a late corrupt singleton must
+        // leave the whole successor image untouched.
+        lockSpin(&self.mesh_clock_lock);
+        var staged_mesh_clock = self.mesh_clock;
+        var staged_migration_offer_epoch = self.migration_offer_epoch;
+        self.mesh_clock_lock.unlock();
+        var mesh_clock_checkpoint_seen = false;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (field.bytes.len >= mesh_clock_snapshot.magic.len and
+                    std.mem.eql(u8, field.bytes[0..mesh_clock_snapshot.magic.len], &mesh_clock_snapshot.magic))
+                {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (mesh_clock_checkpoint_seen or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate mesh-clock checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            const restored = mesh_clock_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed mesh-clock checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+            if (!relay_v2_activation.permitsHandoff(
+                restored.relay_v2_activation,
+                self.relay_v2_activation_state,
+            )) {
+                self.abandonInheritedSessionState(caps, arena_fd, "MESSAGE_V2 activation state is downgraded, unstaged, or roster-mismatched");
+                return error.InvalidInheritedHandoff;
+            }
+            staged_mesh_clock = restored.clock;
+            staged_migration_offer_epoch = restored.migration_offer_epoch;
+            mesh_clock_checkpoint_seen = true;
+        }
+        if (!mesh_clock_checkpoint_seen) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory mesh-clock checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
+
+        // Select the process-global TLS ticket-key authority without publishing
+        // it. Resumption-enabled predecessors in the current Helix contract emit
+        // exactly one canonical v1 singleton. Missing, duplicate, malformed, or
+        // evolvable-wrapper variants are ambiguous key authority and therefore
+        // reject the complete handoff. A resumption-disabled successor likewise
+        // rejects any key capsule instead of silently importing secret state the
+        // active configuration says must not exist.
+        var ticket_key_replacement: ?ticket_key_capsule.Snapshot = null;
+        const ticket_descriptor = helix_capsule.descriptor(.tls_ticket_keys);
+        for (caps) |c| {
+            if (c.header.kind != .tls_ticket_keys) continue;
+            if (!self.config.tls_enable_resumption) {
+                self.abandonInheritedSessionState(caps, arena_fd, "unexpected TLS ticket-key authority while resumption is disabled");
+                return error.InvalidInheritedHandoff;
+            }
+            const canonical_outer = c.header.schema_id == ticket_descriptor.schema_id and
+                c.header.version == ticket_descriptor.current_version and
+                c.header.min_supported == ticket_descriptor.min_supported and
+                c.header.max_supported == ticket_descriptor.max_supported;
+            if (!canonical_outer or c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                ticket_key_replacement != null)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate TLS ticket-key authority");
+                return error.InvalidInheritedHandoff;
+            }
+            ticket_key_replacement = ticket_key_capsule.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed TLS ticket-key authority");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+        if (self.config.tls_enable_resumption and ticket_key_replacement == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing TLS ticket-key authority while resumption is enabled");
+            return error.InvalidInheritedHandoff;
         }
 
         // Restore raw PROP rows and both LWW/tombstone maps as one mandatory-v2
         // image before any replica/client/link can observe the successor. The
-        // outer min=2 marker is authoritative even when inner magic is corrupt;
-        // conversely, recognizable property bytes under min=1 are a downgrade
-        // attempt. Either mismatch abandons the complete inherited fd set.
+        // recognizable property bytes under min=1 are a downgrade attempt.
+        // `min=2` is shared by multiple mandatory authorities (PROP and ESG2),
+        // so it is not itself a property discriminator; whole-relation
+        // validation above already rejects every unknown current family.
         var property_checkpoint_bytes: ?[]const u8 = null;
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
-            const required = c.header.min_supported >= 2;
             var recognized = false;
             for (c.fields) |field| {
                 if (prop_checkpoint.isUpgradeCheckpoint(field.bytes)) {
@@ -20688,17 +24544,20 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
-            if (!required and !recognized) continue;
-            if (!required or !recognized or
-                c.header.version != 2 or c.header.min_supported != 2 or c.header.max_supported != 2 or
+            if (!recognized) continue;
+            if (c.header.version != 2 or c.header.min_supported != 2 or c.header.max_supported != 2 or
                 c.fields.len != 1 or c.fields[0].ordinal != 1 or
                 !prop_checkpoint.isUpgradeCheckpoint(c.fields[0].bytes) or
                 property_checkpoint_bytes != null)
             {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid, downgraded, unknown, or duplicate property-state checkpoint");
-                return;
+                return error.InvalidInheritedHandoff;
             }
             property_checkpoint_bytes = c.fields[0].bytes;
+        }
+        if (property_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory property-state checkpoint");
+            return error.InvalidInheritedHandoff;
         }
         // Select the signed exact-token authority singleton without publishing it.
         // Recognizable Store bytes in any non-canonical field are a malformed
@@ -20715,55 +24574,57 @@ pub const LinuxServer = struct {
                 }
             }
             if (!recognized) continue;
-            // SRST's inner wire did not change when the generic mesh-checkpoint
-            // family advanced from v1 to v2.  The immediately previous Orochi
-            // release therefore emits this exact payload under the canonical
-            // v1/1..1 outer header, while current predecessors emit v2/1..2.
-            // Accept those two complete generations only; accepting a hybrid
-            // range would make a malformed arena look like a rolling upgrade.
-            const canonical_outer =
-                (c.header.version == 1 and c.header.min_supported == 1 and c.header.max_supported == 1) or
-                (c.header.version == 2 and c.header.min_supported == 1 and c.header.max_supported == 2);
+            // Whole-relation validation above establishes this is a current
+            // handoff. Keep the Store selector equally strict: accepting a
+            // legacy outer or inner SRST here would omit current attachment
+            // lease authority while presenting a current arena.
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            const canonical_outer = c.header.schema_id == descriptor.schema_id and
+                c.header.version == descriptor.current_version and
+                c.header.min_supported == descriptor.min_supported and
+                c.header.max_supported == descriptor.max_supported;
             if (!canonical_outer or
                 c.fields.len != 1 or c.fields[0].ordinal != 1 or
                 !session_replica_v2.Store.isUpgradeCheckpoint(c.fields[0].bytes) or
                 replica_checkpoint != null)
             {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate SESSION_REPLICA Store checkpoint");
-                return;
+                return error.InvalidInheritedHandoff;
             }
             replica_checkpoint = c.fields[0].bytes;
+        }
+        if (replica_checkpoint == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory SESSION_REPLICA Store checkpoint");
+            return error.InvalidInheritedHandoff;
         }
 
         // Select the complete pending-migration holding area without publishing
         // it. Helix schema v2 is exactly one min=2/max=2 PMST checkpoint; mixing
-        // it with legacy per-entry/tombstone capsules is ambiguous.
+        // it with legacy per-entry/tombstone capsules is ambiguous. This is a
+        // current whole handoff, so there is no best-effort legacy restore arm.
         var pending_checkpoint: ?[]const u8 = null;
-        var has_legacy_pending = false;
-        var has_legacy_consumed = false;
+        const pending_descriptor = helix_capsule.descriptor(.pending_migration);
         for (caps) |c| switch (c.header.kind) {
             .pending_migration => {
-                if (c.header.version == 2) {
-                    if (c.header.min_supported != 2 or c.header.max_supported != 2 or
-                        c.fields.len != 1 or c.fields[0].ordinal != 1 or pending_checkpoint != null)
-                    {
-                        self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate pending-migration checkpoint");
-                        return;
-                    }
-                    pending_checkpoint = c.fields[0].bytes;
-                } else if (c.header.version == 1) {
-                    has_legacy_pending = true;
-                } else {
-                    self.abandonInheritedSessionState(caps, arena_fd, "unsupported pending-migration checkpoint version");
-                    return;
+                if (c.header.schema_id != pending_descriptor.schema_id or
+                    c.header.version != pending_descriptor.current_version or
+                    c.header.min_supported != 2 or c.header.max_supported != 2 or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or pending_checkpoint != null)
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate current pending-migration checkpoint");
+                    return error.InvalidInheritedHandoff;
                 }
+                pending_checkpoint = c.fields[0].bytes;
             },
-            .session_tombstone => has_legacy_consumed = true,
+            .session_tombstone => {
+                self.abandonInheritedSessionState(caps, arena_fd, "legacy session tombstone in current whole handoff");
+                return error.InvalidInheritedHandoff;
+            },
             else => {},
         };
-        if (pending_checkpoint != null and (has_legacy_pending or has_legacy_consumed)) {
-            self.abandonInheritedSessionState(caps, arena_fd, "mixed exact and legacy pending-migration state");
-            return;
+        if (pending_checkpoint == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory pending-migration checkpoint");
+            return error.InvalidInheritedHandoff;
         }
 
         // Decode every exact singleton into an independently-owned replacement.
@@ -20774,7 +24635,7 @@ pub const LinuxServer = struct {
         if (property_checkpoint_bytes) |checkpoint| {
             property_replacement = prop_checkpoint.decode(self.allocator, checkpoint) catch {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid property-state checkpoint");
-                return;
+                return error.InvalidInheritedHandoff;
             };
             staged_mesh_clock.observeChecked(
                 property_replacement.?.max_hlc,
@@ -20782,21 +24643,21 @@ pub const LinuxServer = struct {
                 mesh_clock_mod.default_max_future_skew_ms,
             ) catch {
                 self.abandonInheritedSessionState(caps, arena_fd, "property-state HLC is future-skewed or exhausted");
-                return;
+                return error.InvalidInheritedHandoff;
             };
         }
 
         var replica_replacement: ?session_replica_v2.Store = null;
         defer if (replica_replacement) |*replacement| replacement.deinit();
         if (replica_checkpoint) |checkpoint| {
-            replica_replacement = session_replica_v2.Store.restoreUpgradeCheckpoint(
+            replica_replacement = session_replica_v2.Store.restoreCurrentUpgradeCheckpoint(
                 self.allocator,
                 self.session_replica_store.cfg,
                 checkpoint,
                 replica_now_wall,
             ) catch {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid SESSION_REPLICA Store checkpoint");
-                return;
+                return error.InvalidInheritedHandoff;
             };
             if (replica_replacement.?.maxAuthorityRevision()) |revision| {
                 staged_mesh_clock.observeChecked(
@@ -20805,7 +24666,7 @@ pub const LinuxServer = struct {
                     session_replica_v2.default_max_future_skew_ms,
                 ) catch {
                     self.abandonInheritedSessionState(caps, arena_fd, "SESSION_REPLICA Store clock is future-skewed or exhausted");
-                    return;
+                    return error.InvalidInheritedHandoff;
                 };
             }
         }
@@ -20828,38 +24689,140 @@ pub const LinuxServer = struct {
                 mesh_reclaim_ttl_ms,
             ) catch {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid pending-migration checkpoint");
-                return;
+                return error.InvalidInheritedHandoff;
             };
         }
 
-        // Boot-exclusive atomic publication boundary. Every operation here is a
-        // no-fail swap/assignment, and the reactor loop has not started, so no
-        // client or mesh peer can observe an intermediate combination.
+        // Stage every mutable late-adoption authority behind a boot-only
+        // transaction. Client reconstruction still uses the ordinary server
+        // helpers, but those helpers now see candidate client tables and fresh
+        // Session/MONITOR/SILENCE stores. On any later error the errdefers below
+        // restore the byte-for-byte boot image before this public function
+        // returns; a caller may catch InvalidInheritedHandoff without observing a
+        // torn successor. No reactor SQE or service thread is active here.
+        for (self.reactors) |*reactor| {
+            if (reactor.clients.len() != 0 or reactor.accept_armed or
+                reactor.s2s_accept_armed or reactor.tls_accept_armed or
+                reactor.ws_accept_armed or reactor.timer_armed or
+                reactor.wake_armed)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "successor reactor is not inert before inherited-state adoption");
+                return error.InvalidInheritedHandoff;
+            }
+        }
+
+        const staged_client_tables = self.allocator.alloc(ClientTable, self.reactors.len) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "could not allocate candidate client tables");
+            return error.InvalidInheritedHandoff;
+        };
+        var staged_client_tables_initialized: usize = 0;
+        defer {
+            for (staged_client_tables[0..staged_client_tables_initialized]) |*table| table.deinit();
+            self.allocator.free(staged_client_tables);
+        }
+        while (staged_client_tables_initialized < staged_client_tables.len) : (staged_client_tables_initialized += 1) {
+            const shard_id: u12 = @intCast(staged_client_tables_initialized);
+            staged_client_tables[staged_client_tables_initialized] = ClientTable.init(self.allocator, shard_id);
+            staged_client_tables[staged_client_tables_initialized].reserve(self.config.max_clients) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "could not reserve a candidate client table");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+
+        var s2s_capsule_count: usize = 0;
+        for (caps) |c| if (c.header.kind == .s2s_link) {
+            s2s_capsule_count = std.math.add(usize, s2s_capsule_count, 1) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "secured-link count overflow");
+                return error.InvalidInheritedHandoff;
+            };
+        };
+        var adopted_s2s_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer adopted_s2s_ids.deinit(self.allocator);
+        adopted_s2s_ids.ensureTotalCapacity(self.allocator, s2s_capsule_count) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "could not reserve secured-link publication registry");
+            return error.InvalidInheritedHandoff;
+        };
+
+        var sessions_replacement = sessions_mod.SessionStore.initWithConfig(self.allocator, self.sessions.cfg);
+        defer sessions_replacement.deinit();
+        var monitor_replacement = monitor.MonitorStore.init(self.allocator, self.monitor.max_monitor);
+        defer monitor_replacement.deinit();
+        var silence_replacement = silence.Store.initWithParams(self.allocator, self.silence.params);
+        defer silence_replacement.deinit();
+
+        for (self.reactors, staged_client_tables) |*reactor, *replacement|
+            std.mem.swap(ClientTable, &reactor.clients, replacement);
+        std.mem.swap(sessions_mod.SessionStore, &self.sessions, &sessions_replacement);
+        std.mem.swap(monitor.MonitorStore, &self.monitor, &monitor_replacement);
+        std.mem.swap(silence.Store, &self.silence, &silence_replacement);
+        const prior_ticket_key = self.tls_ticket_key;
+        const prior_previous_ticket_key = self.tls_previous_ticket_key;
+        if (ticket_key_replacement) |replacement| {
+            self.tls_ticket_key = replacement.current;
+            self.tls_previous_ticket_key = replacement.previous;
+        }
+        errdefer {
+            self.tls_ticket_key = prior_ticket_key;
+            self.tls_previous_ticket_key = prior_previous_ticket_key;
+        }
         lockSpin(&self.mesh_clock_lock);
+        const prior_mesh_clock = self.mesh_clock;
+        const prior_migration_offer_epoch = self.migration_offer_epoch;
+        const prior_msg_seq = self.msg_seq;
+        const prior_stage_retry_pending = self.session_replica_stage_retry_pending;
+        const prior_stage_retry_cursor = self.session_replica_stage_retry_cursor;
+        const prior_stage_retry_pass_failed = self.session_replica_stage_retry_pass_failed;
         if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
             self.mesh_clock = staged_mesh_clock;
+        self.migration_offer_epoch = @max(
+            self.migration_offer_epoch,
+            staged_migration_offer_epoch,
+        );
         self.mesh_clock_lock.unlock();
+        errdefer {
+            lockSpin(&self.mesh_clock_lock);
+            self.mesh_clock = prior_mesh_clock;
+            self.migration_offer_epoch = prior_migration_offer_epoch;
+            self.mesh_clock_lock.unlock();
+            self.msg_seq = prior_msg_seq;
+            self.session_replica_stage_retry_pending = prior_stage_retry_pending;
+            self.session_replica_stage_retry_cursor = prior_stage_retry_cursor;
+            self.session_replica_stage_retry_pass_failed = prior_stage_retry_pass_failed;
+        }
 
+        world_replacement.swapWorldInto(&self.world);
         var property_entities_restored: usize = 0;
         var property_clocks_restored: usize = 0;
-        if (property_replacement) |*replacement| {
-            replacement.swapInto(
-                &self.props,
-                &self.channel_prop_clocks,
-                &self.entity_prop_clocks,
-            );
-            property_entities_restored = self.props.entity_count;
-            property_clocks_restored = self.channel_prop_clocks.count() + self.entity_prop_clocks.count();
-        }
 
         const replica_checkpoint_restored = replica_replacement != null;
         if (replica_replacement) |*replacement|
             std.mem.swap(session_replica_v2.Store, &self.session_replica_store, replacement);
         if (pending_replacement != null)
             std.mem.swap(?session_migrate.PendingMigrations, &self.pending_migrations, &pending_replacement);
+        errdefer {
+            if (pending_replacement != null)
+                std.mem.swap(?session_migrate.PendingMigrations, &self.pending_migrations, &pending_replacement);
+            if (replica_replacement) |*replacement|
+                std.mem.swap(session_replica_v2.Store, &self.session_replica_store, replacement);
+        }
 
+        const prior_replica_store_generation = self.session_replica_store_generation;
         if (replica_checkpoint_restored) {
             self.session_replica_store_generation +%= 1;
+        }
+        errdefer self.session_replica_store_generation = prior_replica_store_generation;
+        // Registered after every candidate authority swap so it executes first
+        // on error. This destructor releases only candidate-owned heap state;
+        // the exact inherited-fd manifest remains the one close authority.
+        errdefer {
+            for (self.reactors) |*reactor| self.deinitInheritedCandidateClients(&reactor.clients);
+            current_reactor = &self.reactors[0];
+            for (self.reactors, staged_client_tables) |*reactor, *replacement|
+                std.mem.swap(ClientTable, &reactor.clients, replacement);
+            std.mem.swap(sessions_mod.SessionStore, &self.sessions, &sessions_replacement);
+            std.mem.swap(monitor.MonitorStore, &self.monitor, &monitor_replacement);
+            std.mem.swap(silence.Store, &self.silence, &silence_replacement);
+            self.abandonInheritedSessionState(caps, arena_fd, "late inherited-state transaction failed");
         }
         const replica_objects_restored = self.session_replica_store.entryCount() +
             self.session_replica_store.attachmentLeaseCount() +
@@ -20874,30 +24837,45 @@ pub const LinuxServer = struct {
             migrations_staged = self.pending_migrations.?.count();
         }
 
-        // Pass 0: adopt the process-global TLS ticket key(s), overriding the fresh
-        // key this successor minted at boot, so resumption tickets issued before the
-        // upgrade still open. A missing/undecodable capsule leaves the boot key in
-        // place (resumption still works; only pre-upgrade tickets miss). Singleton.
-        for (caps) |c| {
-            if (c.header.kind != .tls_ticket_keys) continue;
-            if (c.fields.len == 0) continue;
-            const tks = ticket_key_capsule.decode(c.fields[0].bytes) catch continue;
-            self.tls_ticket_key = tks.current;
-            self.tls_previous_ticket_key = tks.previous;
-            break;
-        }
-
         // Pass 1: index the carried TLS engine states by socket fd (the join key
-        // back to the matching client snapshot). Undecodable capsules are skipped;
-        // Pass 2 then ENFORCES the drop — a client sealed as `was_secured` that finds
-        // no TLS state here is dropped rather than adopted as plaintext.
+        // back to the matching client snapshot). The relation preflight already
+        // proved every secured client has exactly one valid match; any decode or
+        // join failure below rejects the whole successor before serving.
         var tls_snaps: std.ArrayList(tls_snapshot.Snapshot) = .empty;
         defer tls_snaps.deinit(self.allocator);
         for (caps) |c| {
             if (c.header.kind != .tls_session) continue;
-            if (c.fields.len == 0) continue;
-            const ts = tls_snapshot.decode(c.fields[0].bytes) catch continue;
-            tls_snaps.append(self.allocator, ts) catch continue;
+            const descriptor = helix_capsule.descriptor(.tls_session);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current TLS-session capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
+            const ts = tls_snapshot.decodeCurrent(c.fields[0].bytes) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid current TLS-session checkpoint ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (ts.fd < 0) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            for (tls_snaps.items) |prior| {
+                if (prior.fd == ts.fd) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate TLS sidecar for fd {d}\n", .{ts.fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            tls_snaps.append(self.allocator, ts) catch {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            };
         }
 
         // Pass 1b: index the carried WebSocket adapter markers by socket fd, the
@@ -20907,29 +24885,62 @@ pub const LinuxServer = struct {
         defer ws_snaps.deinit(self.allocator);
         for (caps) |c| {
             if (c.header.kind != .ws_session) continue;
-            if (c.fields.len == 0) continue;
-            const wss = ws_snapshot.decode(c.fields[0].bytes, c.header.version) catch continue;
-            ws_snaps.append(self.allocator, wss) catch continue;
+            const descriptor = helix_capsule.descriptor(.ws_session);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current WebSocket-session capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
+            const wss = ws_snapshot.decodeCurrent(c.fields[0].bytes) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid current WebSocket-session checkpoint ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (wss.fd < 0 or !wss.phase_open) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            for (ws_snaps.items) |prior| {
+                if (prior.fd == wss.fd) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate WebSocket sidecar for fd {d}\n", .{wss.fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            ws_snaps.append(self.allocator, wss) catch {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            };
         }
 
         // Pass 2: adopt the carried clients.
         var adopted: usize = 0;
         var adopted_tls: usize = 0;
         var adopted_ws: usize = 0;
+        var matched_tls: usize = 0;
+        var matched_ws: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .clients) continue;
-            if (c.fields.len == 0) continue;
-            const snap = session_snapshot.decode(c.fields[0].bytes) catch {
-                // The inherited socket fd lives ONLY inside the blob that failed to
-                // parse; recover it from the fixed mandatory prefix and close it so a
-                // decode failure drops the client cleanly instead of leaking the fd
-                // (parity with the .s2s_link path above).
-                if (session_snapshot.peekFd(c.fields[0].bytes)) |leaked_fd| {
-                    if (leaked_fd >= 0) closeFd(leaked_fd);
-                }
-                continue;
+            if (c.fields.len != 1 or c.fields[0].ordinal != 1) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const snap = session_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                // Descriptor ownership remains centralized in the trusted
+                // manifest even when the body is malformed; the transaction's
+                // abandonment path closes it exactly once.
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
             };
-            if (snap.fd < 0) continue;
+            if (snap.fd < 0) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
             var tls_state: ?tls_snapshot.Snapshot = null;
             for (tls_snaps.items) |ts| {
                 if (ts.fd == snap.fd) {
@@ -20937,14 +24948,12 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
-            // Fail-SAFE: a client that WAS secured but has no restored TLS engine
-            // (its TLS capsule was absent or undecodable) must never be adopted as
-            // plaintext. Drop it — close the inherited fd, free no slot — so the
-            // browser reconnects over TLS against the still-bound listener.
-            if (snap.was_secured and tls_state == null) {
-                closeFd(snap.fd);
-                continue;
+            if (snap.was_secured != (tls_state != null)) {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — client/TLS sidecar join mismatch for fd {d}\n", .{snap.fd});
+                return error.InvalidInheritedHandoff;
             }
+            if (tls_state != null) matched_tls += 1;
             var ws_state: ?ws_snapshot.Snapshot = null;
             for (ws_snaps.items) |wss| {
                 if (wss.fd == snap.fd) {
@@ -20952,6 +24961,12 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
+            if (snap.was_websocket != (ws_state != null)) {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — client/WebSocket sidecar join mismatch for fd {d}\n", .{snap.fd});
+                return error.InvalidInheritedHandoff;
+            }
+            if (ws_state != null) matched_ws += 1;
             // Multi-shard: re-pin the client to its fd-derived shard by binding
             // this (boot, pre-reactor-loop) thread to the target reactor for the
             // adoption — every rx() inside adoptInheritedClient (slot alloc,
@@ -20959,50 +24974,241 @@ pub const LinuxServer = struct {
             // choice is deterministic in the fd; client ids never survive the
             // swap (fd is the join key), so any consistent spread is correct.
             current_reactor = &self.reactors[self.adoptShardForFd(snap.fd)];
-            const ok = self.adoptInheritedClient(snap, tls_state, ws_state);
+            const ok = self.adoptInheritedClient(snap, tls_state, ws_state, false);
             current_reactor = &self.reactors[0];
             if (ok) {
+                const adopted_flat = self.adoptedClientIdByFd(snap.fd) orelse {
+                    world_replacement.swapWorldInto(&self.world);
+                    return error.InvalidInheritedHandoff;
+                };
+                _ = adopted_flat;
                 adopted += 1;
                 if (tls_state != null) adopted_tls += 1;
                 if (ws_state != null) adopted_ws += 1;
             }
         }
-        // Pass 2b: restore carried MONITOR watch lists onto the adopted clients.
-        // The capsule's client_id field carries the inherited socket FD (the
-        // Helix join key); a capsule whose fd matched no adopted client is
-        // skipped (its client was dropped — the watch list dies with it, the
-        // pre-fix behavior). Restore is SILENT: the client already knows the
-        // online state of everything it watches, so no MONONLINE/MONOFFLINE
-        // is re-emitted. Undecodable capsules are skipped, never fatal.
+        if (adopted != client_capsule_count) {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — adopted only {d} of {d} exact client snapshot(s)\n", .{ adopted, client_capsule_count });
+            return error.InvalidInheritedHandoff;
+        }
+        if (matched_tls != tls_snaps.items.len or matched_ws != ws_snaps.items.len) {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — orphan TLS/WebSocket sidecar(s) remain after exact client join\n", .{});
+            return error.InvalidInheritedHandoff;
+        }
+        const adopted_world_resolver = self.helixWorldRelationResolver();
+        world_replacement.validateAdoptedMembersResolved(
+            &self.world,
+            adopted_world_resolver,
+        ) catch |e| {
+            // Client adoption may fail only for resource/runtime reasons after
+            // the pre-publication projection proved the wire images agree. Put
+            // the displaced boot World back for deterministic destruction, then
+            // make startup exit; continuing would expose adopted sockets beside
+            // a partial membership graph.
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — adopted World membership validation failed ({s})\n", .{@errorName(e)});
+            return error.InvalidInheritedHandoff;
+        };
+        world_replacement.applyInvitesResolved(
+            &self.world,
+            adopted_world_resolver,
+        ) catch |e| {
+            // applyInvites preflights references but allocation can still fail
+            // after a prefix was installed. The whole replacement World is
+            // discarded and startup exits; no partially resumed daemon starts.
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — inherited invite publication failed ({s})\n", .{@errorName(e)});
+            return error.InvalidInheritedHandoff;
+        };
+        // MONITOR's online index is derived from registered local occupancy and
+        // is not part of the per-client watch-list capsule. Rebuild it silently
+        // in the rollback-owned candidate before restoring watcher relations.
+        // Primary World owners first preserve the authoritative display casing;
+        // same-fold secondary attachments are idempotent in the second pass.
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (!conn.session.registered() or conn.s2s != null or conn.s2s_secured != null) continue;
+                const id = slotClientId(reactor, slot_index, slot.gen);
+                const nick = self.world.nickOf(worldIdFromClient(id)) orelse continue;
+                if (nick.len == 0 or std.mem.eql(u8, nick, "*")) continue;
+                self.monitor.restoreOnline(nick) catch |e| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — MONITOR online-index restore failed ({s})\n", .{@errorName(e)});
+                    return error.InvalidInheritedHandoff;
+                };
+            }
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (!conn.session.registered() or conn.s2s != null or conn.s2s_secured != null) continue;
+                const nick = conn.session.displayName();
+                if (nick.len == 0 or std.mem.eql(u8, nick, "*")) continue;
+                self.monitor.restoreOnline(nick) catch |e| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — MONITOR alias-index restore failed ({s})\n", .{@errorName(e)});
+                    return error.InvalidInheritedHandoff;
+                };
+            }
+        }
+        // Pass 2b: restore the exact one-per-client MONITOR relation. Empty
+        // lists are material rows too: requiring one fd-keyed capsule for every
+        // adopted client distinguishes "empty" from "silently missing". Restore
+        // is SILENT because the client already knows each target's online state.
+        const monitor_fds = self.allocator.alloc(i32, client_capsule_count) catch {
+            world_replacement.swapWorldInto(&self.world);
+            return error.InvalidInheritedHandoff;
+        };
+        defer self.allocator.free(monitor_fds);
         var monitor_lists_restored: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .monitor_list) continue;
-            if (c.fields.len == 0) continue;
-            var tgt_buf: [max_carried_monitor_targets][]const u8 = undefined;
-            const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch continue;
-            if (mc.client_id > std.math.maxInt(i32)) continue;
-            const watcher = self.adoptedClientIdByFd(@intCast(mc.client_id)) orelse continue;
-            var restored_any = false;
-            for (mc.targets) |t| {
-                self.monitor.restoreTarget(watcher, t) catch continue;
-                restored_any = true;
+            const descriptor = helix_capsule.descriptor(.monitor_list);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current MONITOR capsule\n", .{});
+                return error.InvalidInheritedHandoff;
             }
-            if (restored_any) monitor_lists_restored += 1;
+            var tgt_buf: [max_carried_monitor_targets][]const u8 = undefined;
+            const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid current MONITOR capsule ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (mc.client_id > std.math.maxInt(i32)) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const fd: i32 = @intCast(mc.client_id);
+            if (fd < 0) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            for (monitor_fds[0..monitor_lists_restored]) |prior_fd| {
+                if (prior_fd == fd) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate MONITOR sidecar for fd {d}\n", .{fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            if (monitor_lists_restored == monitor_fds.len) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const watcher = self.adoptedClientIdByFd(fd) orelse {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — orphan MONITOR sidecar for fd {d}\n", .{fd});
+                return error.InvalidInheritedHandoff;
+            };
+            for (mc.targets) |t| {
+                const before_count = self.monitor.monitorCount(watcher);
+                self.monitor.restoreTarget(watcher, t) catch |e| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — MONITOR restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
+                    return error.InvalidInheritedHandoff;
+                };
+                // MonitorStore normalizes IRC casemapping before insertion and
+                // intentionally treats duplicates as an idempotent no-op. The
+                // predecessor image is a set, so a no-op here proves the wire
+                // row contained a duplicate (including a case-fold alias).
+                if (self.monitor.monitorCount(watcher) != before_count + 1) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate MONITOR target for fd {d}\n", .{fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            monitor_fds[monitor_lists_restored] = fd;
+            monitor_lists_restored += 1;
+        }
+        if (monitor_lists_restored != client_capsule_count) {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — restored {d} of {d} exact MONITOR sidecar(s)\n", .{ monitor_lists_restored, client_capsule_count });
+            return error.InvalidInheritedHandoff;
         }
 
-        // Pass 2b (cont.): restore carried SILENCE lists. Same fd join key; the
-        // silence store is keyed by owner nick, resolved from the adopted
-        // connection. Duplicates/failures are skipped (`add` is idempotent-ish:
-        // a duplicate returns false), never fatal.
+        // Pass 2b (cont.): restore the exact one-per-client SILENCE relation.
+        // Duplicate masks are invalid wire state: the predecessor Store is a
+        // set, so accepting one would hide corruption or an ambiguous join.
+        const silence_fds = self.allocator.alloc(i32, client_capsule_count) catch {
+            world_replacement.swapWorldInto(&self.world);
+            return error.InvalidInheritedHandoff;
+        };
+        defer self.allocator.free(silence_fds);
+        var silence_lists_restored: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .silence_list) continue;
-            if (c.fields.len == 0) continue;
+            const descriptor = helix_capsule.descriptor(.silence_list);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current SILENCE capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
             var mask_buf: [max_carried_silence_masks][]const u8 = undefined;
-            const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch continue;
-            if (sc.client_id > std.math.maxInt(i32)) continue;
-            const owner_conn = self.adoptedConnByFd(@intCast(sc.client_id)) orelse continue;
+            const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid current SILENCE capsule ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (sc.client_id > std.math.maxInt(i32)) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const fd: i32 = @intCast(sc.client_id);
+            if (fd < 0) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            for (silence_fds[0..silence_lists_restored]) |prior_fd| {
+                if (prior_fd == fd) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate SILENCE sidecar for fd {d}\n", .{fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            if (silence_lists_restored == silence_fds.len) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const owner_conn = self.adoptedConnByFd(fd) orelse {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — orphan SILENCE sidecar for fd {d}\n", .{fd});
+                return error.InvalidInheritedHandoff;
+            };
             const owner = owner_conn.session.displayName();
-            for (sc.masks) |m| _ = self.silence.add(owner, m) catch continue;
+            for (sc.masks) |m| {
+                const added = self.silence.add(owner, m) catch |e| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — SILENCE restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
+                    return error.InvalidInheritedHandoff;
+                };
+                if (!added) {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("orochi: UPGRADE resume fatal — duplicate SILENCE mask for fd {d}\n", .{fd});
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            silence_fds[silence_lists_restored] = fd;
+            silence_lists_restored += 1;
+        }
+        if (silence_lists_restored != client_capsule_count) {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — restored {d} of {d} exact SILENCE sidecar(s)\n", .{ silence_lists_restored, client_capsule_count });
+            return error.InvalidInheritedHandoff;
         }
 
         // Pass 2c: restore the account-level multi-session/bouncer registry
@@ -21015,59 +25221,144 @@ pub const LinuxServer = struct {
         var session_accounts: usize = 0;
         var sessions_restored: usize = 0;
         var detached_session_seq: u64 = 0;
+        const attachment_client_count = attachment_delivery_replacement.attachmentCount();
+        const attachment_client_buf = self.allocator.alloc(
+            attachment_delivery_spool.ClientId,
+            attachment_client_count,
+        ) catch {
+            world_replacement.swapWorldInto(&self.world);
+            return error.InvalidInheritedHandoff;
+        };
+        defer self.allocator.free(attachment_client_buf);
+        const attachment_clients = attachment_delivery_replacement.collectAttachmentClients(
+            attachment_client_buf,
+        );
+        if (attachment_clients.len != attachment_client_count) {
+            world_replacement.swapWorldInto(&self.world);
+            return error.InvalidInheritedHandoff;
+        }
+        var attachment_remaps: std.ArrayList(attachment_delivery_spool.AttachmentRemap) = .empty;
+        defer attachment_remaps.deinit(self.allocator);
+        attachment_remaps.ensureTotalCapacity(self.allocator, attachment_client_count) catch {
+            world_replacement.swapWorldInto(&self.world);
+            return error.InvalidInheritedHandoff;
+        };
         for (caps) |c| {
             if (c.header.kind != .sessions) continue;
-            if (c.fields.len == 0) continue;
-            const count = session_capsule.peekSessionCount(c.fields[0].bytes) catch continue;
-            const entries = self.allocator.alloc(session_capsule.SessionEntry, count) catch continue;
+            const descriptor = helix_capsule.descriptor(.sessions);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current session-registry capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
+            const count = session_capsule.peekSessionCount(c.fields[0].bytes) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid session-registry header ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (count == 0) {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            }
+            const entries = self.allocator.alloc(session_capsule.SessionEntry, count) catch {
+                world_replacement.swapWorldInto(&self.world);
+                return error.InvalidInheritedHandoff;
+            };
             defer self.allocator.free(entries);
-            const cap = session_capsule.SessionCapsule.decode(c.fields[0].bytes, entries) catch continue;
-            const restored = self.adoptSessionRegistryAccount(cap, &detached_session_seq);
-            if (restored != 0) {
-                session_accounts += 1;
-                sessions_restored += restored;
+            const cap = session_capsule.SessionCapsule.decodeCurrent(c.fields[0].bytes, entries) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid session-registry checkpoint ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            const restored = self.adoptSessionRegistryAccount(
+                cap,
+                &detached_session_seq,
+                attachment_clients,
+                &attachment_remaps,
+            );
+            if (restored != cap.sessions.len) {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — restored only {d} of {d} exact session row(s) for {s}\n", .{ restored, cap.sessions.len, cap.account });
+                return error.InvalidInheritedHandoff;
             }
+            session_accounts += 1;
+            sessions_restored += restored;
         }
-        // Every attached and detached exact-token row now exists again. Project
-        // Store-selected snapshots before any preserved link is adopted and
-        // allowed to RESYNC.
-        self.reprojectLiveSessionReplicasV2();
-
-        // Rolling-upgrade compatibility: pre-v2 predecessors carried one live
-        // entry and one consumed tombstone per capsule. A v2 PMST checkpoint was
-        // already restored atomically above, so only the all-legacy case enters
-        // these best-effort loops.
-        if (pending_checkpoint == null) {
-            for (caps) |c| {
-                if (c.header.kind != .pending_migration or c.header.version != 1) continue;
-                if (c.fields.len == 0) continue;
-                if (self.adoptPendingMigrationCapsule(c.fields[0].bytes)) migrations_staged += 1;
-            }
-            for (caps) |c| {
-                if (c.header.kind != .session_tombstone) continue;
-                if (c.fields.len == 0) continue;
-                if (self.adoptSessionTombstoneCapsule(c.fields[0].bytes)) tombstones_staged += 1;
-            }
+        // Per-row capsule restore is O(1). Normalize portable authority once
+        // across the complete candidate registry so a legacy mixed [true,false]
+        // token group cannot lose renewal when its original issuer disappears.
+        // The store stages its token set before mutation; OOM rejects the whole
+        // handoff before any replacement authority is published.
+        self.sessions.normalizePortableGroupsAfterRestore() catch |e| {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — could not normalize portable attachment groups ({s})\n", .{@errorName(e)});
+            return error.InvalidInheritedHandoff;
+        };
+        // ADS1 stores predecessor physical client ids. HSSN is the canonical
+        // relation from each old id to either its fd-adopted successor id or the
+        // reserved synthetic id assigned to a detached ghost. Apply the complete
+        // simultaneous mapping once; orphan, duplicate-source, or collision
+        // conflicts reject startup before any of the five authorities publish.
+        if (attachment_remaps.items.len != attachment_clients.len) {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog(
+                "orochi: UPGRADE resume fatal — mapped only {d} of {d} attachment-delivery owner(s)\n",
+                .{ attachment_remaps.items.len, attachment_clients.len },
+            );
+            return error.InvalidInheritedHandoff;
         }
+        _ = attachment_delivery_replacement.remapAttachments(attachment_remaps.items) catch |e| {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — attachment-delivery client remap failed ({s})\n", .{@errorName(e)});
+            return error.InvalidInheritedHandoff;
+        };
 
         // Pass 3: decode carried hand-dial hints now, but leave their CONNECT
         // SQEs staged. The first reactor turn must reserve SQ space for
         // accept/wake/timer and inherited client activation before any redial.
         // Config-managed [mesh].connect peers are likewise staged by runOnce.
         var redialed: usize = 0;
+        var redial_replacement: std.ArrayListUnmanaged(posix.sockaddr.in6) = .empty;
+        defer redial_replacement.deinit(self.allocator);
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
-            if (c.fields.len == 0) continue;
-            const peer = mesh_redial.decode(c.fields[0].bytes) catch continue;
+            // `.mesh_checkpoint` is a shared family. MRED rows are identified by
+            // their current discriminator; other magic-prefixed authorities were
+            // already consumed above. Once identified, the row and its outer
+            // wrapper are exact — trailing bytes, a zero port, or an evolvable
+            // wrapper cannot silently turn a live hand-dial into a dropped peer.
+            if (c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                !mesh_redial.isCurrent(c.fields[0].bytes)) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != descriptor.min_supported or
+                c.header.max_supported != descriptor.max_supported)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical current mesh re-dial capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
+            const peer = mesh_redial.decodeCurrent(c.fields[0].bytes) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — invalid current mesh re-dial capsule ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
             const addr = posix.sockaddr.in6{
                 .port = std.mem.nativeToBig(u16, peer.port),
                 .flowinfo = 0,
                 .addr = peer.addr,
                 .scope_id = 0,
             };
-            self.inherited_mesh_redials.append(self.allocator, addr) catch |e| {
-                srvLog("orochi: UPGRADE resume — could not stage mesh re-dial ({s})\n", .{@errorName(e)});
-                continue;
+            redial_replacement.append(self.allocator, addr) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — could not stage exact mesh re-dial ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
             };
             redialed += 1;
         }
@@ -21080,30 +25371,130 @@ pub const LinuxServer = struct {
         var s2s_resumed: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .s2s_link) continue;
-            if (c.fields.len == 0) continue;
-            const snap = s2s_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
-                srvLog("orochi: UPGRADE resume — s2s link decode failed ({s})\n", .{@errorName(e)});
-                // The inherited socket fd lives ONLY inside the blob that failed to
-                // parse; recover it from the fixed leading field and close it so a
-                // decode failure drops the link cleanly instead of leaking the fd.
-                if (s2s_snapshot.peekFd(c.fields[0].bytes)) |leaked_fd| {
-                    if (leaked_fd >= 0) closeFd(leaked_fd);
-                }
-                continue;
+            const descriptor = helix_capsule.descriptor(.s2s_link);
+            const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — incompatible secured-mesh capsule\n", .{});
+                return error.InvalidInheritedHandoff;
             };
-            if (snap.fd < 0) continue;
-            if (self.adoptInheritedS2sLink(snap)) s2s_resumed += 1;
+            if (negotiated != c.header.version or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — noncanonical secured-mesh capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            }
+            const snap = s2s_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — secured-mesh decode failed ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (snap.fd < 0) {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
+                return error.InvalidInheritedHandoff;
+            }
+            const adopted_id = self.adoptInheritedS2sLink(snap, false) orelse {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
+                return error.InvalidInheritedHandoff;
+            };
+            adopted_s2s_ids.appendAssumeCapacity(adopted_id);
+            s2s_resumed += 1;
         }
 
-        // The arena is fully consumed; close the inherited memfd.
+        // Reconcile the restored signed Store into the complete rollback-owned
+        // candidate graph before descriptor ownership or any derived output can
+        // publish. Silent mode still applies World/profile/Pending/route state,
+        // but drains candidate transition queues and suppresses client/history/
+        // activity emissions. Any fallible or semantically invalid projection
+        // rejects the entire handoff.
+        if (!self.reprojectLiveSessionReplicasV2(.helix_silent) or
+            self.sessions.dirtyReplicaRowCount() != 0 or
+            self.sessions.dirtyReplicaProjectionRowCount() != 0 or
+            self.sessions.dirtyLocalProjectionRowCount() != 0 or
+            self.session_replica_stage_retry_pending)
+        {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("orochi: UPGRADE resume fatal — inherited session-replica projection was incomplete\n", .{});
+            return error.InvalidInheritedHandoff;
+        }
+
+        // Single no-fail commit edge. Every decoder, allocator, relation join,
+        // client/session restore, redial append, and preserved-link rebuild has
+        // completed. The boot stores displaced by swaps remain owned by the
+        // replacement values and are destroyed by the existing defers.
+        std.mem.swap(
+            event_spine_replay_guard.Guard,
+            &self.event_spine_replay_guard,
+            &event_replay_replacement,
+        );
+        self.webhook_store.publishUpgradeReplacement(&webhook_replacement);
+        self.inherited_webhook_store_restored = true;
+        if (property_replacement) |*replacement| {
+            replacement.swapInto(
+                &self.props,
+                &self.channel_prop_clocks,
+                &self.entity_prop_clocks,
+            );
+            property_entities_restored = self.props.entity_count;
+            property_clocks_restored = self.channel_prop_clocks.count() + self.entity_prop_clocks.count();
+        }
+        std.mem.swap(HistoryStore, &self.history, &history_replacement);
+        std.mem.swap(search_index_mod.SearchIndex, &self.search_index, &search_replacement);
+        self.event_history.publishCheckpoint(&event_history_replacement);
+        std.mem.swap(
+            relay_v2_replay_guard.Guard,
+            &self.relay_v2_replay_guard,
+            &relay_replay_replacement,
+        );
+        std.mem.swap(
+            relay_v2_outbox.Outbox,
+            &self.relay_v2_outbox,
+            &relay_outbox_replacement,
+        );
+        std.mem.swap(
+            relay_v2_event_log.EventLog,
+            &self.relay_v2_event_log,
+            &relay_event_log_replacement,
+        );
+        std.mem.swap(
+            attachment_delivery_spool.Spool,
+            &self.attachment_delivery_spool,
+            &attachment_delivery_replacement,
+        );
+        std.mem.swap(
+            std.ArrayListUnmanaged(posix.sockaddr.in6),
+            &self.inherited_mesh_redials,
+            &redial_replacement,
+        );
+        self.inherited_mesh_redial_cursor = 0;
+        self.inherited_event_history_restored = true;
+
+        // Transfer descriptor ownership immediately at the commit edge. Every
+        // later action is retryable/best-effort derived work and must never
+        // re-enter handoff abandonment.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
-        // Every carried descriptor is now either reactor-owned or was closed by
-        // an individual failed adoption. Drop the manifest without closing it.
+        // Every carried descriptor is now reactor-owned. Drop the manifest
+        // without closing it; ordinary connection teardown owns them from here.
         self.clearInheritedStateFdManifest();
+
+        // Queue rolling-old SESSION_MIGRATE authority before any inherited link
+        // becomes operationally visible. A transient post-commit queue failure
+        // closes only that preserved link; normal re-dial repairs it without ever
+        // releasing a token-less roster ahead of missing session authority.
+        for (adopted_s2s_ids.items) |id| {
+            current_reactor = &self.reactors[id.shard];
+            const conn = self.rx().clients.get(id) orelse continue;
+            if (conn.s2s_secured == null) continue;
+            self.scheduleSessionReplicaReplay(conn);
+            self.publishInheritedS2sLink(id);
+        }
+        current_reactor = &self.reactors[0];
         srvLog(
-            "orochi: UPGRADE resume — restored {d} property entity(s)/{d} clock(s), re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ property_entities_restored, property_clocks_restored, adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, replica_objects_restored, migrations_staged, tombstones_staged, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — restored mandatory World/history/events/replay/webhooks ({d}/{d}/{d}/exact/{d}), {d} property entity(s)/{d} clock(s), re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ self.world.channelCount(), self.history.totalStoredCount(), self.event_history.len(), self.webhook_store.len(), property_entities_restored, property_clocks_restored, adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, replica_objects_restored, migrations_staged, tombstones_staged, s2s_resumed, redialed },
         );
     }
 
@@ -21119,13 +25510,23 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         cap: session_capsule.SessionCapsule,
         detached_seq: *u64,
+        attachment_clients: []const attachment_delivery_spool.ClientId,
+        attachment_remaps: *std.ArrayList(attachment_delivery_spool.AttachmentRemap),
     ) usize {
         if (cap.account.len == 0 or cap.sessions.len == 0) return 0;
         // Validate first, apply second: one malformed entry rejects the whole
         // account BEFORE anything is written (fail-closed).
         var detached_count: usize = 0;
-        for (cap.sessions) |entry| {
+        for (cap.sessions, 0..) |entry, entry_index| {
             if (entry.token.len != @sizeOf(sessions_mod.Token)) return 0;
+            if (attachmentClientNeedsRemap(attachment_clients, entry.client)) {
+                for (attachment_remaps.items) |mapping| {
+                    if (mapping.old_client == entry.client) return 0;
+                }
+                for (cap.sessions[0..entry_index]) |prior| {
+                    if (prior.client == entry.client) return 0;
+                }
+            }
             var token: sessions_mod.Token = undefined;
             @memcpy(&token, entry.token);
             const live_cid: ?u64 = if (!entry.detached and entry.fd >= 0)
@@ -21146,6 +25547,9 @@ pub const LinuxServer = struct {
 
         const applied = self.allocator.alloc(u64, cap.sessions.len) catch return 0;
         defer self.allocator.free(applied);
+        const remap_start = attachment_remaps.items.len;
+        var remaps_committed = false;
+        defer if (!remaps_committed) attachment_remaps.shrinkRetainingCapacity(remap_start);
         var applied_n: usize = 0;
         for (cap.sessions) |entry| {
             var token: sessions_mod.Token = undefined;
@@ -21155,7 +25559,15 @@ pub const LinuxServer = struct {
                 self.adoptedClientIdByFd(entry.fd)
             else
                 null;
-            if (live_cid != null) continue;
+            if (live_cid) |cid| {
+                appendAttachmentRemapIfNeeded(
+                    attachment_clients,
+                    attachment_remaps,
+                    entry.client,
+                    cid,
+                ) orelse return 0;
+                continue;
+            }
             const synthetic: client_model.ClientId = .{
                 // Reactor shards never use the reserved all-ones shard id. Keep
                 // inherited ghosts in that namespace so predecessor slab handles
@@ -21191,6 +25603,17 @@ pub const LinuxServer = struct {
             }
             applied[applied_n] = cid;
             applied_n += 1;
+            appendAttachmentRemapIfNeeded(
+                attachment_clients,
+                attachment_remaps,
+                entry.client,
+                cid,
+            ) orelse {
+                _ = self.sessions.remove(cap.account, cid);
+                applied_n -= 1;
+                for (applied[0..applied_n]) |rc| _ = self.sessions.remove(cap.account, rc);
+                return 0;
+            };
         }
         // Live rows were already adopted in Pass 2 and validated above. Apply
         // their non-failing portability bit only after every synthetic ghost was
@@ -21200,7 +25623,40 @@ pub const LinuxServer = struct {
             const cid = self.adoptedClientIdByFd(entry.fd) orelse continue;
             _ = self.sessions.restorePortableResumeIssued(cap.account, cid, entry.portable_resume);
         }
+        remaps_committed = true;
         return cap.sessions.len;
+    }
+
+    fn attachmentClientNeedsRemap(
+        attachment_clients: []const attachment_delivery_spool.ClientId,
+        old_client: attachment_delivery_spool.ClientId,
+    ) bool {
+        for (attachment_clients) |client| {
+            if (client == old_client) return true;
+        }
+        return false;
+    }
+
+    /// Append only mappings that ADS1 can consume. The caller preallocates the
+    /// exact ADS1 attachment cardinality, so a large HSSN registry cannot turn
+    /// restore into unbounded remap allocation. Duplicate predecessor owners
+    /// fail closed.
+    fn appendAttachmentRemapIfNeeded(
+        attachment_clients: []const attachment_delivery_spool.ClientId,
+        attachment_remaps: *std.ArrayList(attachment_delivery_spool.AttachmentRemap),
+        old_client: attachment_delivery_spool.ClientId,
+        new_client: attachment_delivery_spool.ClientId,
+    ) ?void {
+        if (!attachmentClientNeedsRemap(attachment_clients, old_client)) return {};
+        for (attachment_remaps.items) |mapping| {
+            if (mapping.old_client == old_client) return null;
+        }
+        if (attachment_remaps.items.len == attachment_remaps.capacity) return null;
+        attachment_remaps.appendAssumeCapacity(.{
+            .old_client = old_client,
+            .new_client = new_client,
+        });
+        return {};
     }
 
     /// Deterministic shard for an adopted inherited connection: derived from
@@ -21242,9 +25698,45 @@ pub const LinuxServer = struct {
     /// Re-attach one carried-over client: take ownership of its inherited socket
     /// fd, restore its session (and live TLS engine when carried), and arm recv.
     /// Returns true on success; ANY failure closes the fd and frees the slot.
-    fn rollbackInheritedClientBeforeRecv(self: *LinuxServer, id: client_model.ClientId, fd: linux.fd_t) void {
+    fn deinitInheritedCandidateClients(self: *LinuxServer, table: *ClientTable) void {
+        for (table.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const conn = &slot.value;
+            // Candidate adoption never submits RECV/SEND/CONNECT. Releasing the
+            // inline storage is therefore safe; the fd itself remains owned by
+            // the exact inherited-state manifest and is closed once by the
+            // centralized abandonment path after every candidate is dismantled.
+            std.debug.assert(!conn.recv_armed and !conn.send_armed);
+            if (conn.s2s) |link| {
+                link.deinit();
+                self.allocator.destroy(link);
+                conn.s2s = null;
+            }
+            if (conn.s2s_secured) |link| {
+                link.deinit();
+                self.allocator.destroy(link);
+                conn.s2s_secured = null;
+            }
+            self.abortMultiline(conn);
+            if (conn.tls) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                conn.tls = null;
+            }
+            if (conn.ws) |w| {
+                self.allocator.destroy(w);
+                conn.ws = null;
+            }
+            self.clearDeferredSessionMeshParts(conn);
+            conn.send_overflow.clearAndFree(conn.overflow_allocator);
+            conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+            conn.fd = -1;
+        }
+    }
+
+    fn rollbackInheritedClientBeforeRecv(self: *LinuxServer, id: client_model.ClientId, fd: linux.fd_t, close_fd: bool) void {
         const conn = self.rx().clients.get(id) orelse {
-            closeFd(fd);
+            if (close_fd) closeFd(fd);
             return;
         };
         self.world.removeClient(worldIdFromClient(id));
@@ -21261,15 +25753,15 @@ pub const LinuxServer = struct {
             conn.ws = null;
         }
         _ = self.rx().clients.free(id);
-        closeFd(fd);
+        if (close_fd) closeFd(fd);
     }
 
     /// Tear down a carried secured link only while it is still inert. Callers
     /// must never use this after either a RECV or SEND SQE has been registered:
     /// both operations borrow storage inside the slab slot until completion.
-    fn rollbackInheritedS2sBeforeIo(self: *LinuxServer, id: client_model.ClientId, fd: linux.fd_t) void {
+    fn rollbackInheritedS2sBeforeIo(self: *LinuxServer, id: client_model.ClientId, fd: linux.fd_t, close_fd: bool) void {
         const conn = self.rx().clients.get(id) orelse {
-            closeFd(fd);
+            if (close_fd) closeFd(fd);
             return;
         };
         if (conn.s2s_secured) |link| {
@@ -21280,28 +25772,28 @@ pub const LinuxServer = struct {
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
         _ = self.rx().clients.free(id);
-        closeFd(fd);
+        if (close_fd) closeFd(fd);
     }
 
-    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot) bool {
+    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot, close_fd_on_failure: bool) bool {
         // Per-SHARD cap (rx() is the fd-derived target shard): matches the
         // accept path, whose cap is also per-shard — each reactor's table is
         // reserved to max_clients, so the bound protects buffer address
-        // stability, not a global head-count. A carried client landing on a
-        // full shard is dropped fail-safe (it reconnects).
+        // stability, not a global head-count. Failure cleans up this inherited
+        // fd locally, then the caller rejects the whole successor startup.
         if (self.rx().clients.len() >= self.config.max_clients) {
-            closeFd(snap.fd);
+            if (close_fd_on_failure) closeFd(snap.fd);
             return false;
         }
         const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch {
-            closeFd(snap.fd);
+            if (close_fd_on_failure) closeFd(snap.fd);
             return false;
         };
         const conn = self.rx().clients.get(id).?;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
         conn.token = tokenFromId(id) catch {
             _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
+            if (close_fd_on_failure) closeFd(snap.fd);
             return false;
         };
         // Restore the carried monotonic signon/last-message clocks so WHOIS idle
@@ -21316,11 +25808,11 @@ pub const LinuxServer = struct {
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
-        // socket. Any failure drops this client cleanly (fd closed, slot freed) —
-        // a TLS connection must never be adopted as plaintext.
+        // socket. Any failure cleans up the fd/slot and propagates whole-startup
+        // refusal — a TLS connection must never be adopted as plaintext.
         if (tls_state) |ts| {
             if (!self.adoptTlsState(conn, ts)) {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                 return false;
             }
         }
@@ -21332,8 +25824,8 @@ pub const LinuxServer = struct {
         // partials and rebuilds a fresh adapter exactly as before. The TLS
         // engine rebuilt above sits beneath it. ANY failure (allocation, or a
         // partial blob that cannot fit the adapter's buffers — impossible from
-        // an honest predecessor, but the arena is validated fail-closed) drops
-        // the client cleanly (fd closed, slot freed), never adopting a wss
+        // an honest predecessor, but the arena is validated fail-closed) cleans
+        // the fd/slot and propagates whole-startup refusal, never adopting a wss
         // socket as raw IRC bytes (which would corrupt every frame).
         if (ws_state) |wsv| {
             if (wsv.phase_open) {
@@ -21354,7 +25846,7 @@ pub const LinuxServer = struct {
                     break :blk true;
                 };
                 if (!ws_ok) {
-                    self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                     return false;
                 }
             }
@@ -21362,15 +25854,15 @@ pub const LinuxServer = struct {
         // v4: restore the partial inbound line into the RecvQ (inline fast path
         // when it fits, heap overflow otherwise) so the client's next bytes
         // continue the SAME line instead of parsing as a torn one. An overflow
-        // allocation failure drops the client cleanly (reconnect is safe;
-        // adopting with a torn inbound stream is not).
+        // allocation failure cleans the fd/slot and rejects successor startup;
+        // adopting with a torn inbound stream is never allowed.
         if (snap.pending_in.len != 0) {
             if (snap.pending_in.len <= conn.line_buf.len) {
                 @memcpy(conn.line_buf[0..snap.pending_in.len], snap.pending_in);
                 conn.line_len = snap.pending_in.len;
             } else {
                 conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch {
-                    self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                     return false;
                 };
             }
@@ -21382,7 +25874,7 @@ pub const LinuxServer = struct {
         if (snap.pending_out.len != 0 and tls_state == null) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
             rawAppendToConn(conn, snap.pending_out) catch {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                 return false;
             };
         }
@@ -21390,8 +25882,8 @@ pub const LinuxServer = struct {
         // account session without its exact SessionStore row is not a usable
         // resume: later registry adoption cannot repair it safely, and freeing
         // a slot after submitRecv would race an in-flight completion. Therefore
-        // allocation/capacity failure drops this inherited client cleanly while
-        // it is still inert.
+        // allocation/capacity failure cleans this inherited client while it is
+        // inert and makes the caller reject the whole successor startup.
         if (conn.session.account()) |acct| {
             var token: sessions_mod.Token = undefined;
             if (snap.session_token.len == @sizeOf(sessions_mod.Token)) {
@@ -21405,10 +25897,16 @@ pub const LinuxServer = struct {
                 token,
                 conn.connected_at_ms,
             ) catch {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                 return false;
             };
-            self.finalizeAttachEviction(outcome);
+            // Exact inherited state may not repair capacity by evicting another
+            // carried attachment. Such an eviction would also publish replica /
+            // delivery side effects outside the candidate stores.
+            if (outcome.evicted != null) {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            }
         }
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
@@ -21418,16 +25916,16 @@ pub const LinuxServer = struct {
             self.world.registerNick(snap.nick, worldIdFromClient(id)) catch |err| switch (err) {
                 error.NickInUse => {
                     const account = conn.session.account() orelse {
-                        self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                        self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                         return false;
                     };
                     if (!self.nickHeldBySameAccount(snap.nick, account, worldIdFromClient(id))) {
-                        self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                        self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                         return false;
                     }
                 },
                 else => {
-                    self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                     return false;
                 },
             };
@@ -21436,9 +25934,16 @@ pub const LinuxServer = struct {
         var cit = session_snapshot.channelIter(snap.channels_blob);
         while (cit.next()) |ch| {
             self.world.restoreMember(ch.name, worldIdFromClient(id), .{ .bits = ch.modes }) catch {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd);
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
                 return false;
             };
+        }
+        // Restore exec hygiene before the final causal stamp. A bad inherited
+        // descriptor rejects the candidate and leaves the manifest as the sole
+        // close authority for transactional callers.
+        if (linux.errno(linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC)) != .SUCCESS) {
+            self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+            return false;
         }
         // Nothing below this point can reject the adoption. Stamp the fresh
         // mesh claim only after every allocation/world/session mutation, so a
@@ -21448,10 +25953,6 @@ pub const LinuxServer = struct {
         // any required SEND after control SQEs, retaining this slot on SQ-full.
         conn.io_activation_pending = true;
         conn.activation_recv_required = true;
-        // Restore exec hygiene: the fd survived ONE execve on purpose; re-arm
-        // CLOEXEC so it never leaks into any other child. The next UPGRADE
-        // clears it again for exactly the connections it carries.
-        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
         // Re-apply the connection class (the restored session carries the facets).
         self.assignConnClass(conn);
         return true;
@@ -21459,13 +25960,13 @@ pub const LinuxServer = struct {
 
     /// Rebuild a carried client's live TLS engine from its snapshot. On success
     /// the conn owns a resumed TlsConn and any unflushed predecessor ciphertext
-    /// is re-queued verbatim. Returns false on ANY failure — the caller drops
-    /// the client (fail-safe: a TLS socket never falls back to plaintext).
+    /// is re-queued verbatim. Returns false on ANY failure; the caller cleans the
+    /// client and rejects successor startup (TLS never falls back to plaintext).
     fn adoptTlsState(self: *LinuxServer, conn: *ConnState, ts: tls_snapshot.Snapshot) bool {
         const t = self.allocator.create(tls_conn.TlsConn) catch return false;
         // Mirror the accept path's engine-config gate: the hardened 1.2 leg is
         // only offered when its cert material is configured. A carried 1.2
-        // connection with no 1.2 config fails resume and is dropped.
+        // connection with no 1.2 config fails resume and refuses the handoff.
         const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
             (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null))
             self.tls12Config()
@@ -21497,7 +25998,7 @@ pub const LinuxServer = struct {
         } else |_| {}
         // Wire bytes the predecessor encrypted but never flushed: re-queue them
         // verbatim (already TLS records — bypass the encrypt seam). If they don't
-        // fit, the client's record stream would hole; drop the client instead.
+        // fit, the client's record stream would hole; refuse the handoff instead.
         if (ts.pending_out.len != 0) {
             // Carried SendQ (inline + overflow): lift the cap to cover it so the
             // restore never truncates a legitimately-buffered burst. `assignConnClass`
@@ -21520,23 +26021,25 @@ pub const LinuxServer = struct {
     /// arm recv, then RESYNC with the peer + re-burst our state so the roster
     /// reconverges within a round-trip — the peer never saw a drop. Returns true on
     /// success; ANY failure closes the fd + frees the slot (the mesh then heals via
-    /// the normal re-dial on the next sweep).
-    fn adoptInheritedS2sLink(self: *LinuxServer, snap: s2s_snapshot.Snapshot) bool {
+    /// the normal re-dial on the next sweep). Returns the inert candidate id;
+    /// peer/event/stat visibility is published only after the whole transaction
+    /// commits.
+    fn adoptInheritedS2sLink(self: *LinuxServer, snap: s2s_snapshot.Snapshot, close_fd_on_failure: bool) ?client_model.ClientId {
         if (!self.s2sSecured() or self.rx().clients.len() >= self.config.max_clients) {
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         }
         const ident = self.config.node_identity orelse {
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         const io = self.config.crypto_io orelse {
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch {
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         const conn = self.rx().clients.get(id).?;
         conn.overflow_allocator = self.allocator;
@@ -21547,8 +26050,8 @@ pub const LinuxServer = struct {
         conn.sendq_cap = s2sSendqCap(configured_sendq);
         conn.token = tokenFromId(id) catch {
             _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         const now = self.nowMs();
         conn.connected_at_ms = now;
@@ -21566,8 +26069,8 @@ pub const LinuxServer = struct {
         const not_before = wall -| (5 * 60 * 1000);
         const prekey = ident.signedPrekey(1, not_before, 24 * 60 * 60 * 1000, s2s_bands, s2s_features) catch {
             _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         var pins: [secured_s2s_link.max_expected_remotes][20]u8 = undefined;
         var pin_count: usize = 0;
@@ -21582,8 +26085,8 @@ pub const LinuxServer = struct {
         const now_u: u64 = @intCast(@max(@as(i64, 0), now));
         const link = self.allocator.create(secured_s2s_link.SecuredLink) catch {
             _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         link.* = secured_s2s_link.SecuredLink.resumeOuter(.{
             .allocator = self.allocator,
@@ -21628,6 +26131,10 @@ pub const LinuxServer = struct {
                 .peer_supports_repair = (snap.caps & s2s_snapshot.cap_repair) != 0,
                 .peer_supports_session_replica_v2 = (snap.caps & s2s_snapshot.cap_session_replica_v2) != 0,
                 .peer_supports_session_attachment_lease_v2 = (snap.caps & s2s_snapshot.cap_session_attachment_lease_v2) != 0,
+                .peer_supports_secure_relay_v2 = (snap.caps & s2s_snapshot.cap_secure_relay_v2) != 0,
+                .peer_supports_event_spine_v2 = (snap.caps & s2s_snapshot.cap_event_spine_v2) != 0,
+                .peer_supports_relay_v2_current = (snap.caps_ext & s2s_snapshot.cap_ext_relay_v2_current) != 0,
+                .peer_supports_relay_v2_ack_confirm = (snap.caps_ext & s2s_snapshot.cap_ext_relay_v2_ack_confirm) != 0,
             },
             .remote_name = snap.remote_name,
             .rec_inbuf = snap.rec_inbuf,
@@ -21636,8 +26143,8 @@ pub const LinuxServer = struct {
         }) catch {
             self.allocator.destroy(link);
             _ = self.rx().clients.free(id);
-            closeFd(snap.fd);
-            return false;
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return null;
         };
         conn.s2s_secured = link;
         link.setLocalNickResolver(self.localNickResolver());
@@ -21649,8 +26156,8 @@ pub const LinuxServer = struct {
         if (snap.pending_out.len != 0) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
             appendToConn(conn, snap.pending_out) catch {
-                self.rollbackInheritedS2sBeforeIo(id, snap.fd);
-                return false;
+                self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+                return null;
             };
         }
 
@@ -21660,30 +26167,32 @@ pub const LinuxServer = struct {
         // Stage the mandatory record without arming SEND. Until submitRecv below,
         // every failure can still destroy the slab slot safely; afterward no path
         // rejects adoption or frees storage borrowed by io_uring.
+        // A v1/v2 predecessor could not checkpoint the relay-v2.1 extension
+        // result. Re-probe on the preserved stream before replay; an old peer
+        // sees only a harmless ordinary PING, while two current peers regain the
+        // capability without disconnecting.
+        if (!link.supportsSecureRelayV2()) {
+            link.probeRelayV2Current() catch {
+                self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+                return null;
+            };
+        }
         link.sendResync() catch {
-            self.rollbackInheritedS2sBeforeIo(id, snap.fd);
-            return false;
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+            return null;
         };
         appendToConn(conn, link.outbound()) catch {
-            self.rollbackInheritedS2sBeforeIo(id, snap.fd);
-            return false;
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+            return null;
         };
         link.clearOutbound();
 
-        // Legacy session-migration sidecars are part of adoption preparation too.
-        // Stage them while the slot is still inert so SendQ exhaustion can roll
-        // back without leaving a closing link behind an already-queued RECV.
-        if (!link.supportsSessionReplicaV2()) {
-            self.syncPortableSessions(link);
-            appendToConn(conn, link.outbound()) catch {
-                self.rollbackInheritedS2sBeforeIo(id, snap.fd);
-                return false;
-            };
-            link.clearOutbound();
+        // The fd survived ONE execve on purpose; re-arm CLOEXEC before the slot
+        // becomes a successful candidate.
+        if (linux.errno(linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC)) != .SUCCESS) {
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+            return null;
         }
-
-        // The fd survived ONE execve on purpose; re-arm CLOEXEC so it never leaks.
-        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
 
         // Replay the complete retained Store before the token-less roster burst.
         // This can span maintenance turns under SendQ pressure; the pending
@@ -21696,11 +26205,16 @@ pub const LinuxServer = struct {
         // arm SEND. The maintenance driver resumes them only after activation has
         // armed the initial RESYNC, preserving authority-before-roster ordering.
         self.scheduleSessionReplicaReplay(conn);
-        // Re-register the operational surfaces the fresh-establishment hook would
-        // have: the link resumes ALREADY established, so driveS2sSecured's
-        // `!was and established` block never fires for it. Without this the
-        // successor shows an empty peer list / "1 server" LUSERS / no peer-health
-        // even though the link is live.
+        return id;
+    }
+
+    /// Publish the operational surfaces of one fully prepared inherited link.
+    /// Called only after the complete inherited-state transaction commits.
+    fn publishInheritedS2sLink(self: *LinuxServer, id: client_model.ClientId) void {
+        current_reactor = &self.reactors[id.shard];
+        defer current_reactor = &self.reactors[0];
+        const conn = self.rx().clients.get(id) orelse return;
+        const link = conn.s2s_secured orelse return;
         const rname = link.remoteName();
         if (rname.len != 0) {
             self.publishServerLink(rname, true);
@@ -21708,9 +26222,9 @@ pub const LinuxServer = struct {
         }
         self.publishPeerCount();
         self.updatePartitionTransitions();
+        self.bindRelayV2UnboundIfReady(conn, link);
         self.stats.onS2sAccept();
         self.traceLog(.info, .s2s, "s2s secured peer preserved across upgrade");
-        return true;
     }
 
     /// True when `token` is the live connection of a config-managed
@@ -21724,8 +26238,8 @@ pub const LinuxServer = struct {
         return false;
     }
 
-    /// Listener-only upgrade fallback: re-exec preserving just the listening
-    /// socket (no state arena). Caller has already done the oper/linux checks.
+    /// RESTART-only listener handoff: re-exec preserving just the listening
+    /// socket (no state arena). This is never an UPGRADE fallback.
     fn upgradeListenerOnly(self: *LinuxServer, requester: ?*ConnState) !void {
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
@@ -22019,6 +26533,19 @@ pub const LinuxServer = struct {
             }
             dial.token = null; // dial's connection is gone — eligible again
         }
+        // A fresh successor's dial table has no cached resolution yet, while an
+        // inherited outbound link does retain its exact dial target. Resolve the
+        // configured target before looking for that survivor; otherwise the boot
+        // pass cannot match an IP-literal/DNS-alias config and opens a duplicate
+        // connection beside the zero-drop inherited link.
+        if (dial.addr == null) {
+            if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) return .skipped;
+            dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
+                dial.last_attempt_ms = now;
+                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                return .attempted;
+            };
+        }
         // Already linked to this peer via the surviving (possibly inbound)
         // link? Don't dial a duplicate — that just loops collapse→redial.
         if (self.meshPeerLinkedByDial(dial)) {
@@ -22029,11 +26556,7 @@ pub const LinuxServer = struct {
 
         const prior_attempt_ms = dial.last_attempt_ms;
         dial.last_attempt_ms = now;
-        const addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
-            srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
-            return .attempted;
-        };
-        dial.addr = addr;
+        const addr = dial.addr.?;
         if (self.initiateS2sConnectToAddr(addr)) |tok| {
             dial.token = tok;
             srvLog("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
@@ -23086,8 +27609,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendObserveEvent(act, origin, subject.nick, subject.user, subject.host, subject.account, subject.detail) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendObserveEvent(act, origin, subject.nick, subject.user, subject.host, subject.account, subject.detail) catch continue;
@@ -25902,6 +30424,39 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Resolve remote DATA reserved-prefix authority from receiver-owned state.
+    /// The relay's account text is never consulted: `policy_account` must already
+    /// have been derived from a signed portable-session proof or an authenticated
+    /// remote residence, and the matching oper grant was itself verified on
+    /// ingestion. Network opers retain the same override as local opers; without
+    /// that grant, OWN/HST additionally requires authenticated channel rank.
+    fn remoteDataTagAuthorized(
+        self: *LinuxServer,
+        tag: []const u8,
+        is_channel: bool,
+        sender_modes: ?world_model.MemberModes,
+        policy_account: []const u8,
+    ) bool {
+        if (tag.len < 3) return true;
+        const prefix = tag[0..3];
+        const policy_is_oper = if (policy_account.len != 0)
+            if (self.oper_grants.lookup(policy_account, self.grantNowU64())) |grant|
+                grant.privilege_bits != 0
+            else
+                false
+        else
+            false;
+        if (std.ascii.eqlIgnoreCase(prefix, "SYS") or
+            std.ascii.eqlIgnoreCase(prefix, "ADM")) return policy_is_oper;
+        if (std.ascii.eqlIgnoreCase(prefix, "OWN") or
+            std.ascii.eqlIgnoreCase(prefix, "HST"))
+        {
+            return policy_is_oper or
+                (is_channel and (sender_modes orelse world_model.MemberModes.empty()).isOperator());
+        }
+        return true;
+    }
+
     /// DATA / REQUEST / REPLY <target> <tag> :<message> — IRCX typed directed
     /// messaging. Tag rules: [A-z][A-z0-9.]{0,14}; reserved prefixes SYS/ADM need
     /// operator, OWN/HST need channel owner/host on a channel target. Relays
@@ -25979,37 +30534,234 @@ pub const LinuxServer = struct {
                 // opmoderate path), so a muted remote member is never reached.
                 var time_buf: [40]u8 = undefined;
                 const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
-                try self.broadcastChannelMinRank(chan, tags, line, null, 2);
+                try self.broadcastChannelMinRank(chan, tags, line, null, 2, .ordinary);
                 self.publishModerationHeld(chan, conn, message);
                 return;
             }
-            if (min_rank > 0) {
-                var time_buf: [40]u8 = undefined;
-                const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
-                try self.broadcastChannelMinRank(chan, tags, line, null, min_rank);
-            } else {
-                try self.broadcastChannel(chan, line, null);
+            const event_hlc = self.nextMeshHlc();
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectChannelDeliveryIds(chan, min_rank, null, null, &delivery_ids) catch {
+                try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                return;
+            };
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (self.authoredRelayV2Configured()) {
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    dataVerbV2(parsed.command) orelse return,
+                    chan,
+                    min_rank,
+                    try clientPrefix(conn, &prefix_buf),
+                    conn.session.account() orelse "",
+                    "",
+                    tag,
+                    message,
+                    .channel,
+                    "",
+                    self.portableSessionTokenForClient(id, conn),
+                    (self.world.memberModes(chan, worldIdFromClient(id)) orelse
+                        world_model.MemberModes.empty()).bits,
+                    null,
+                    event_hlc,
+                    null,
+                    .{ .recipients = delivery_ids.items, .line = line },
+                ) catch {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    return;
+                };
+                if (accepted_v2 == null) {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    return;
+                }
             }
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const stable_msgid = if (accepted_v2) |accepted|
+                msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
+            else
+                msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+            const event_tags = MsgTags{
+                .time_value = serverTimeValueAt(
+                    &time_buf,
+                    mesh_clock_mod.MeshClock.physicalOf(event_hlc),
+                ),
+                .account = conn.session.account(),
+                .msgid = stable_msgid,
+            };
+            if (min_rank > 0)
+                try self.broadcastChannelMinRank(
+                    chan,
+                    event_tags,
+                    line,
+                    null,
+                    min_rank,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                )
+            else
+                try self.broadcastChannelTagged(
+                    chan,
+                    event_tags,
+                    line,
+                    null,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                );
             // Cross-node relay: forward this typed DATA/REQUEST/REPLY to mesh
             // peers that have members of `chan` so remote co-members receive it.
             // Loop-guarded; the far side delivers only to its own local members.
-            self.relayChannelData(conn, parsed.command, chan, tag, message, min_rank);
+            self.relayChannelData(
+                conn,
+                parsed.command,
+                chan,
+                tag,
+                message,
+                min_rank,
+                event_hlc,
+                if (accepted_v2) |accepted| accepted.wire else null,
+            );
         } else {
             const rwid = self.world.findNick(target) orelse {
                 // Not local: relay to the peer that owns this nick (route_table
                 // narrowed; an unknown route fails closed with ERR_NOSUCHNICK
                 // instead of flooding the mesh, mirroring the PRIVMSG nick path).
-                if (self.relayNickData(conn, parsed.command, target, tag, message)) return;
+                if (self.relayNickData(id, conn, parsed.command, target, tag, message)) return;
                 try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
                 return;
             };
-            self.deliver(clientIdFromWorld(rwid), line) catch {};
+            const recipient_id = clientIdFromWorld(rwid);
+            const recipient_conn = self.connFor(recipient_id) orelse return;
+            var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer recipient_ids.deinit(self.allocator);
+            self.collectAttachedExactTokenClients(recipient_id, recipient_conn, &recipient_ids) catch {
+                try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                return;
+            };
+            var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer sender_ids.deinit(self.allocator);
+            if (!self.clientsShareExactToken(id, conn, recipient_id, recipient_conn)) {
+                self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                    return;
+                };
+            }
+
+            const event_hlc = self.nextMeshHlc();
+            const sender_token = self.portableSessionTokenForClient(id, conn);
+            const recipient_token = self.portableSessionTokenForClient(recipient_id, recipient_conn);
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectDirectDeliveryIds(
+                recipient_ids.items,
+                sender_ids.items,
+                id,
+                false,
+                null,
+                &delivery_ids,
+            ) catch {
+                try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                return;
+            };
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (recipient_token != null and self.authoredRelayV2Configured()) {
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    dataVerbV2(parsed.command) orelse return,
+                    target,
+                    0,
+                    try clientPrefix(conn, &prefix_buf),
+                    conn.session.account() orelse "",
+                    "",
+                    tag,
+                    message,
+                    .direct,
+                    "",
+                    sender_token,
+                    null,
+                    recipient_token,
+                    event_hlc,
+                    null,
+                    .{ .recipients = delivery_ids.items, .line = line },
+                ) catch {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    return;
+                };
+                if (accepted_v2 == null) {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    return;
+                }
+            }
+
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const stable_msgid = if (accepted_v2) |accepted|
+                msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
+            else
+                msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+            const event_tags = MsgTags{
+                .time_value = serverTimeValueAt(
+                    &time_buf,
+                    mesh_clock_mod.MeshClock.physicalOf(event_hlc),
+                ),
+                .account = conn.session.account(),
+                .msgid = stable_msgid,
+            };
+            for (recipient_ids.items) |recipient_attachment|
+                self.deliverTaggedMode(
+                    recipient_attachment,
+                    event_tags,
+                    line,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                ) catch {};
+            for (sender_ids.items) |sender_attachment| {
+                if (sender_attachment.eql(id)) continue;
+                var is_recipient = false;
+                for (recipient_ids.items) |recipient_attachment| if (sender_attachment.eql(recipient_attachment)) {
+                    is_recipient = true;
+                    break;
+                };
+                if (!is_recipient) self.deliverTaggedMode(
+                    sender_attachment,
+                    event_tags,
+                    line,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                ) catch {};
+            }
+            if (accepted_v2) |accepted| {
+                self.forwardAcceptedRelayV2(accepted.wire);
+                var relay_msg = s2s_link.RelayMessage{
+                    .verb = dataVerb(parsed.command) orelse return,
+                    .target = target,
+                    .source_nick = conn.session.displayName(),
+                    .source_prefix = try clientPrefix(conn, &prefix_buf),
+                    .account = conn.session.account() orelse "",
+                    .text = message,
+                    .data_tag = tag,
+                    .origin_node = self.config.node_id,
+                    .hlc = event_hlc,
+                };
+                var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+                var sig_buf: [message_relay.sig_len]u8 = undefined;
+                self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+                _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
+                    .nick = target,
+                    .token = recipient_token.?,
+                    .also_token = sender_token,
+                } }, true);
+            }
         }
     }
 
     /// Map an IRCX typed-message command word to its relay `Verb`. Returns null
     /// for anything that is not a relayable typed verb.
     fn dataVerb(command: []const u8) ?message_relay.Verb {
+        const eqi = std.ascii.eqlIgnoreCase;
+        if (eqi(command, "DATA")) return .data;
+        if (eqi(command, "REQUEST")) return .request;
+        if (eqi(command, "REPLY")) return .reply;
+        return null;
+    }
+
+    fn dataVerbV2(command: []const u8) ?message_relay_v2.Verb {
         const eqi = std.ascii.eqlIgnoreCase;
         if (eqi(command, "DATA")) return .data;
         if (eqi(command, "REQUEST")) return .request;
@@ -26028,12 +30780,13 @@ pub const LinuxServer = struct {
         data_tag: []const u8,
         message: []const u8,
         min_rank: u8,
+        hlc: u64,
+        accepted_v2_wire: ?[]const u8,
     ) void {
-        if (!self.hasEstablishedPeer()) return;
+        if (!self.hasEstablishedPeer() and accepted_v2_wire == null) return;
         const verb = dataVerb(command) orelse return;
         var pbuf: [320]u8 = undefined;
         const prefix = clientPrefix(conn, &pbuf) catch return;
-        const hlc = self.nextMeshHlc();
         _ = self.relay_seen.observe(self.config.node_id, hlc);
         var relay_msg = s2s_link.RelayMessage{
             .verb = verb,
@@ -26050,7 +30803,8 @@ pub const LinuxServer = struct {
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
-        _ = self.relayToPeers(relay_msg, .{ .channel = chan });
+        if (accepted_v2_wire) |wire| self.forwardAcceptedRelayV2(wire);
+        _ = self.relayLegacyToPeers(relay_msg, .{ .channel = chan }, accepted_v2_wire != null);
     }
 
     /// Relay a nick-targeted DATA/REQUEST/REPLY to the peer that owns `nick`.
@@ -26059,17 +30813,58 @@ pub const LinuxServer = struct {
     /// emits ERR_NOSUCHNICK rather than flooding the mesh).
     fn relayNickData(
         self: *LinuxServer,
+        id: client_model.ClientId,
         conn: *ConnState,
         command: []const u8,
         nick: []const u8,
         data_tag: []const u8,
         message: []const u8,
     ) bool {
-        if (!self.hasEstablishedPeer()) return false;
+        const recipient_token = self.detachedReplicaTokenForNick(nick);
+        if (!self.hasEstablishedPeer() and recipient_token == null) return false;
         const verb = dataVerb(command) orelse return false;
         var pbuf: [320]u8 = undefined;
         const prefix = clientPrefix(conn, &pbuf) catch return false;
         const hlc = self.nextMeshHlc();
+        var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+        defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+        const sender_token = self.portableSessionTokenForClient(id, conn);
+        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer sender_ids.deinit(self.allocator);
+        self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch return false;
+        var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer delivery_ids.deinit(self.allocator);
+        self.collectDirectDeliveryIds(
+            &.{},
+            sender_ids.items,
+            id,
+            false,
+            null,
+            &delivery_ids,
+        ) catch return false;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const rendered = formatMessage(&msg_buf, prefix, command, &.{ nick, data_tag }, message) catch return false;
+        if (recipient_token != null and self.authoredRelayV2Configured()) {
+            accepted_v2 = self.admitAuthoredRelayV2(
+                dataVerbV2(command) orelse return false,
+                nick,
+                0,
+                prefix,
+                conn.session.account() orelse "",
+                "",
+                data_tag,
+                message,
+                .direct,
+                "",
+                sender_token,
+                null,
+                recipient_token,
+                hlc,
+                null,
+                .{ .recipients = delivery_ids.items, .line = rendered },
+            ) catch return false;
+            if (accepted_v2 == null) return false;
+        }
         _ = self.relay_seen.observe(self.config.node_id, hlc);
         var relay_msg = s2s_link.RelayMessage{
             .verb = verb,
@@ -26085,7 +30880,27 @@ pub const LinuxServer = struct {
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
-        return self.relayToPeers(relay_msg, .{ .nick = nick }) > 0;
+        if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+        const scope: RelayScope = if (recipient_token) |token| .{ .session_nick = .{
+            .nick = nick,
+            .token = token,
+            .also_token = sender_token,
+        } } else .{ .nick = nick };
+        const legacy_count = self.relayLegacyToPeers(relay_msg, scope, accepted_v2 != null);
+        if (accepted_v2) |accepted| {
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const event_tags = MsgTags{
+                .time_value = serverTimeValueAt(&time_buf, mesh_clock_mod.MeshClock.physicalOf(hlc)),
+                .account = conn.session.account(),
+                .msgid = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf),
+            };
+            for (sender_ids.items) |sender_attachment| {
+                if (sender_attachment.eql(id)) continue;
+                self.deliverPreparedTagged(sender_attachment, event_tags, rendered) catch {};
+            }
+        }
+        return legacy_count > 0 or accepted_v2 != null;
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
@@ -26122,7 +30937,7 @@ pub const LinuxServer = struct {
                 // of THIS shared channel on a remote node (WHISPER's invariant).
                 // We scope the relay to the owning peer (never flood the mesh);
                 // a genuinely-unknown nick falls back to ERR_NOSUCHNICK.
-                if (!self.relayWhisperRemote(conn, args.channel, nick, args.text)) {
+                if (!self.relayWhisperRemote(id, conn, args.channel, nick, args.text)) {
                     try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
                 }
                 continue;
@@ -26135,8 +30950,129 @@ pub const LinuxServer = struct {
             const line = whisper.buildWhisperLine(&line_buf, sender, args.channel, nick, args.text) catch continue;
             var crlf_buf: [default_reply_bytes]u8 = undefined;
             const out = std.fmt.bufPrint(&crlf_buf, "{s}\r\n", .{line}) catch continue;
-            // A single failed recipient (gone mid-dispatch) must not abort the rest.
-            self.deliver(clientIdFromWorld(rwid), out) catch continue;
+            const recipient_id = clientIdFromWorld(rwid);
+            const recipient_conn = self.connFor(recipient_id) orelse continue;
+            var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer recipient_ids.deinit(self.allocator);
+            self.collectAttachedExactTokenClients(recipient_id, recipient_conn, &recipient_ids) catch {
+                try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                return;
+            };
+            var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer sender_ids.deinit(self.allocator);
+            if (!self.clientsShareExactToken(id, conn, recipient_id, recipient_conn)) {
+                self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch {
+                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                    return;
+                };
+            }
+            const event_hlc = self.nextMeshHlc();
+            const sender_token = self.portableSessionTokenForClient(id, conn);
+            const recipient_token = self.portableSessionTokenForClient(recipient_id, recipient_conn);
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectDirectDeliveryIds(
+                recipient_ids.items,
+                sender_ids.items,
+                id,
+                false,
+                null,
+                &delivery_ids,
+            ) catch {
+                try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                return;
+            };
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (recipient_token != null and self.authoredRelayV2Configured()) {
+                var source_prefix_buf: [320]u8 = undefined;
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    .whisper,
+                    args.channel,
+                    0,
+                    try clientPrefix(conn, &source_prefix_buf),
+                    conn.session.account() orelse "",
+                    "",
+                    "",
+                    args.text,
+                    .channel_whisper,
+                    nick,
+                    sender_token,
+                    (self.world.memberModes(args.channel, worldIdFromClient(id)) orelse
+                        world_model.MemberModes.empty()).bits,
+                    recipient_token,
+                    event_hlc,
+                    null,
+                    .{ .recipients = delivery_ids.items, .line = out },
+                ) catch {
+                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    return;
+                };
+                if (accepted_v2 == null) {
+                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    return;
+                }
+            }
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const stable_msgid = if (accepted_v2) |accepted|
+                msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
+            else
+                msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+            const event_tags = MsgTags{
+                .time_value = serverTimeValueAt(
+                    &time_buf,
+                    mesh_clock_mod.MeshClock.physicalOf(event_hlc),
+                ),
+                .account = conn.session.account(),
+                .msgid = stable_msgid,
+            };
+            // A single failed physical recipient must not abort healthy exact-token
+            // siblings; every attachment remains an independent transport.
+            for (recipient_ids.items) |recipient_attachment|
+                self.deliverTaggedMode(
+                    recipient_attachment,
+                    event_tags,
+                    out,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                ) catch {};
+            for (sender_ids.items) |sender_attachment| {
+                if (sender_attachment.eql(id)) continue;
+                var already_recipient = false;
+                for (recipient_ids.items) |recipient_attachment| if (sender_attachment.eql(recipient_attachment)) {
+                    already_recipient = true;
+                    break;
+                };
+                if (!already_recipient) self.deliverTaggedMode(
+                    sender_attachment,
+                    event_tags,
+                    out,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                ) catch {};
+            }
+            if (accepted_v2) |accepted| {
+                self.forwardAcceptedRelayV2(accepted.wire);
+                var source_prefix_buf: [320]u8 = undefined;
+                var relay_msg = s2s_link.RelayMessage{
+                    .verb = .whisper,
+                    .target = args.channel,
+                    .source_nick = conn.session.displayName(),
+                    .source_prefix = try clientPrefix(conn, &source_prefix_buf),
+                    .account = conn.session.account() orelse "",
+                    .text = args.text,
+                    .recipient = nick,
+                    .origin_node = self.config.node_id,
+                    .hlc = event_hlc,
+                };
+                var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+                var sig_buf: [message_relay.sig_len]u8 = undefined;
+                self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+                _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
+                    .nick = nick,
+                    .token = recipient_token.?,
+                    .also_token = sender_token,
+                } }, true);
+            }
         }
     }
 
@@ -26195,18 +31131,67 @@ pub const LinuxServer = struct {
     /// otherwise so the caller can emit ERR_NOSUCHNICK. Loop-guarded.
     fn relayWhisperRemote(
         self: *LinuxServer,
+        id: client_model.ClientId,
         conn: *ConnState,
         channel: []const u8,
         nick: []const u8,
         text: []const u8,
     ) bool {
-        if (!self.hasEstablishedPeer()) return false;
+        const recipient_token = self.detachedReplicaTokenForNick(nick);
+        if (!self.hasEstablishedPeer() and recipient_token == null) return false;
         // Enforce the channel-membership invariant against the remote roster
         // before relaying so an off-channel nick yields ERR_NOSUCHNICK, not a leak.
         if (!self.remoteMemberOfChannel(channel, nick)) return false;
         var pbuf: [320]u8 = undefined;
         const prefix = clientPrefix(conn, &pbuf) catch return false;
         const hlc = self.nextMeshHlc();
+        const sender_token = self.portableSessionTokenForClient(id, conn);
+        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer sender_ids.deinit(self.allocator);
+        self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch return false;
+        var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer delivery_ids.deinit(self.allocator);
+        self.collectDirectDeliveryIds(
+            &.{},
+            sender_ids.items,
+            id,
+            false,
+            null,
+            &delivery_ids,
+        ) catch return false;
+        const sender = whisper.Prefix{
+            .nick = conn.session.displayName(),
+            .user = conn.session.username(),
+            .host = hostOf(conn),
+        };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = whisper.buildWhisperLine(&line_buf, sender, channel, nick, text) catch return false;
+        var crlf_buf: [default_reply_bytes]u8 = undefined;
+        const out = std.fmt.bufPrint(&crlf_buf, "{s}\r\n", .{line}) catch return false;
+        var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+        defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+        if (recipient_token != null and self.authoredRelayV2Configured()) {
+            accepted_v2 = self.admitAuthoredRelayV2(
+                .whisper,
+                channel,
+                0,
+                prefix,
+                conn.session.account() orelse "",
+                "",
+                "",
+                text,
+                .channel_whisper,
+                nick,
+                sender_token,
+                (self.world.memberModes(channel, worldIdFromClient(id)) orelse
+                    world_model.MemberModes.empty()).bits,
+                recipient_token,
+                hlc,
+                null,
+                .{ .recipients = delivery_ids.items, .line = out },
+            ) catch return false;
+            if (accepted_v2 == null) return false;
+        }
         _ = self.relay_seen.observe(self.config.node_id, hlc);
         // Scope to peers that have members of the SHARED channel. WHISPER's
         // recipient is known only via channel membership (the per-nick route
@@ -26226,7 +31211,30 @@ pub const LinuxServer = struct {
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
-        return self.relayToPeers(relay_msg, .{ .channel = channel }) > 0;
+        if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+        const scope: RelayScope = if (recipient_token) |token| .{ .session_nick = .{
+            .nick = nick,
+            .token = token,
+            .also_token = sender_token,
+        } } else .{ .channel = channel };
+        const legacy_count = self.relayLegacyToPeers(relay_msg, scope, accepted_v2 != null);
+        if (accepted_v2) |accepted| {
+            var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            var time_buf: [40]u8 = undefined;
+            const event_tags = MsgTags{
+                .time_value = serverTimeValueAt(
+                    &time_buf,
+                    mesh_clock_mod.MeshClock.physicalOf(hlc),
+                ),
+                .account = conn.session.account(),
+                .msgid = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf),
+            };
+            for (sender_ids.items) |sender_attachment| {
+                if (sender_attachment.eql(id)) continue;
+                self.deliverPreparedTagged(sender_attachment, event_tags, out) catch {};
+            }
+        }
+        return legacy_count > 0 or accepted_v2 != null;
     }
 
     fn clonePublicChannelProps(self: *LinuxServer, src: []const u8, dst: []const u8) void {
@@ -27150,6 +32158,21 @@ pub const LinuxServer = struct {
         if (old_slice.len == 0 or old_slice.len > old_buf.len) return;
         @memcpy(old_buf[0..old_slice.len], old_slice);
         const old = old_buf[0..old_slice.len];
+        const new_was_announced_online = self.monitor.isOnline(newnick);
+        const old_remains_announced_online = self.localRenderedNickOccupiedExcept(old, logical_ids.items);
+        var monitor_plan: ?PreparedMonitorTransition = null;
+        defer if (monitor_plan) |*plan| plan.deinit(self.allocator);
+        if (!std.mem.eql(u8, old, newnick)) {
+            if (std.ascii.eqlIgnoreCase(old, newnick)) {
+                self.monitor.reserveOnlineTransition(old, newnick, true, new_was_announced_online) catch return;
+            } else {
+                monitor_plan = self.prepareMonitorOccupancyTransition(
+                    old,
+                    newnick,
+                    new_was_announced_online,
+                ) catch return;
+            }
+        }
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -27192,7 +32215,17 @@ pub const LinuxServer = struct {
         for (logical_ids.items) |logical_id| {
             if (self.connFor(logical_id)) |logical_conn| logical_conn.mesh_nick_hlc = nick_hlc;
         }
-        self.monitorTransition(old, newnick) catch {};
+        if (std.ascii.eqlIgnoreCase(old, newnick)) {
+            self.monitor.transitionOnlineSilent(old, newnick, true) catch {};
+        } else {
+            self.applyPreparedMonitorOccupancyTransition(
+                &monitor_plan.?,
+                old,
+                newnick,
+                old_remains_announced_online,
+                new_was_announced_online,
+            ) catch {};
+        }
     }
 
     /// Re-evaluate nick protection after a connection (re)sets its nick: if the
@@ -27241,6 +32274,7 @@ pub const LinuxServer = struct {
         @memcpy(old_buf[0..old_slice.len], old_slice);
         const old = old_buf[0..old_slice.len];
         if (std.mem.eql(u8, old, newnick)) return; // no-op
+        const new_was_announced_online = self.monitor.isOnline(newnick);
 
         // Resolve the local attachments of this reusable logical-session token
         // before applying identity-wide policy. NICK mutates the logical
@@ -27251,6 +32285,18 @@ pub const LinuxServer = struct {
         var logical_world_ids: std.ArrayList(world_model.ClientId) = .empty;
         defer logical_world_ids.deinit(self.allocator);
         try self.exactWorldIds(logical_ids.items, &logical_world_ids);
+        const old_remains_announced_online = self.localRenderedNickOccupiedExcept(old, logical_ids.items);
+        var monitor_plan: ?PreparedMonitorTransition = null;
+        defer if (monitor_plan) |*plan| plan.deinit(self.allocator);
+        if (std.ascii.eqlIgnoreCase(old, newnick)) {
+            try self.monitor.reserveOnlineTransition(old, newnick, true, new_was_announced_online);
+        } else {
+            monitor_plan = try self.prepareMonitorOccupancyTransition(
+                old,
+                newnick,
+                new_was_announced_online,
+            );
+        }
 
         // +N no-nick: a non-op member of any +N channel may not change nick.
         // Server opers bypass. Evaluate the complete exact-token membership
@@ -27382,8 +32428,20 @@ pub const LinuxServer = struct {
             if (self.connFor(logical_id)) |logical_conn| logical_conn.mesh_nick_hlc = nick_hlc;
         }
 
-        // MONITOR: old nick went away, new nick appeared.
-        self.monitorTransition(old, newnick) catch {};
+        // MONITOR follows physical occupancy, not one token's rename. A
+        // distinct-token same-nick attachment keeps the old identity online;
+        // an already-online target must not receive a duplicate 730.
+        if (std.ascii.eqlIgnoreCase(old, newnick)) {
+            self.monitor.transitionOnlineSilent(old, newnick, true) catch {};
+        } else {
+            self.applyPreparedMonitorOccupancyTransition(
+                &monitor_plan.?,
+                old,
+                newnick,
+                old_remains_announced_online,
+                new_was_announced_online,
+            ) catch {};
+        }
 
         // OBSERVE: push a nick-change record (detail = "-> <new>"); the subject's
         // session now carries the new nick, so report the new identity + change.
@@ -27399,15 +32457,42 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn localRenderedNickOccupiedExcept(
+        self: *LinuxServer,
+        nick: []const u8,
+        excluded: []const client_model.ClientId,
+    ) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const candidate_id = slotClientId(reactor, slot_index, slot.gen);
+                var skip = false;
+                for (excluded) |excluded_id| {
+                    if (candidate_id.eql(excluded_id)) {
+                        skip = true;
+                        break;
+                    }
+                }
+                if (skip) continue;
+                const candidate = &slot.value;
+                if (candidate.closing or candidate.s2s != null or candidate.s2s_secured != null or
+                    !candidate.session.registered()) continue;
+                const display = candidate.session.displayName();
+                if (std.mem.eql(u8, display, "*")) continue;
+                if (std.ascii.eqlIgnoreCase(display, nick)) return true;
+            }
+        }
+        return false;
+    }
+
     /// MONITOR notify for a nick change: old offline, new online, WITHOUT
     /// dropping the client's own subscriptions (unlike a disconnect).
     fn monitorTransition(self: *LinuxServer, old: []const u8, new: []const u8) !void {
-        var replies_buf: [64]monitor.MonitorReply = undefined;
-        var storage: [default_reply_bytes]u8 = undefined;
-        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
-        self.monitor.setOffline(old, &sink) catch {};
-        self.monitor.setOnline(new, &sink) catch {};
-        try self.flushMonitorReplies(&sink);
+        if (std.ascii.eqlIgnoreCase(old, new)) {
+            try self.monitor.transitionOnlineSilent(old, new, true);
+            return;
+        }
+        try self.monitorOccupancyTransition(old, new, false, false);
     }
 
     fn monitorOccupancyTransition(
@@ -27415,13 +32500,63 @@ pub const LinuxServer = struct {
         old: []const u8,
         new: []const u8,
         old_remains_online: bool,
-        new_was_online: bool,
+        new_was_announced_online: bool,
     ) !void {
-        var replies_buf: [64]monitor.MonitorReply = undefined;
-        var storage: [default_reply_bytes]u8 = undefined;
-        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
-        if (!old_remains_online) self.monitor.setOffline(old, &sink) catch {};
-        if (!new_was_online) self.monitor.setOnline(new, &sink) catch {};
+        var plan = try self.prepareMonitorOccupancyTransition(old, new, new_was_announced_online);
+        defer plan.deinit(self.allocator);
+        try self.applyPreparedMonitorOccupancyTransition(
+            &plan,
+            old,
+            new,
+            old_remains_online,
+            new_was_announced_online,
+        );
+    }
+
+    fn prepareMonitorOccupancyTransition(
+        self: *LinuxServer,
+        old: []const u8,
+        new: []const u8,
+        new_was_announced_online: bool,
+    ) !PreparedMonitorTransition {
+        // Prepare for the conservative case where old really goes offline. A
+        // World rename can reveal another old-nick owner and suppress those
+        // replies later; excess capacity is harmless, missing capacity is not.
+        const old_watchers = self.monitor.watcherCount(old);
+        const new_watchers = if (new_was_announced_online) 0 else self.monitor.watcherCount(new);
+        const reply_count = std.math.add(usize, old_watchers, new_watchers) catch return error.OutOfMemory;
+        const exact_storage_len = std.math.add(
+            usize,
+            std.math.mul(usize, old_watchers, old.len) catch return error.OutOfMemory,
+            std.math.mul(usize, new_watchers, new.len) catch return error.OutOfMemory,
+        ) catch return error.OutOfMemory;
+        var plan = PreparedMonitorTransition{
+            .reply_count = reply_count,
+            .storage_len = exact_storage_len,
+        };
+        errdefer plan.deinit(self.allocator);
+        if (reply_count > plan.inline_replies.len)
+            plan.allocated_replies = try self.allocator.alloc(monitor.MonitorReply, reply_count);
+        if (exact_storage_len > plan.inline_storage.len)
+            plan.allocated_storage = try self.allocator.alloc(u8, exact_storage_len);
+        // Never rely on removing old to supply the new hash slot: the eventual
+        // occupancy decision is allowed to preserve old after World reveals a
+        // shadowed owner.
+        try self.monitor.reserveOnlineTransition(old, new, true, new_was_announced_online);
+        return plan;
+    }
+
+    fn applyPreparedMonitorOccupancyTransition(
+        self: *LinuxServer,
+        plan: *PreparedMonitorTransition,
+        old: []const u8,
+        new: []const u8,
+        old_remains_online: bool,
+        new_was_announced_online: bool,
+    ) !void {
+        var sink = monitor.MonitorReplySink{ .replies = plan.replies(), .storage = plan.storage() };
+        if (!old_remains_online) try self.monitor.setOffline(old, &sink);
+        if (!new_was_announced_online) try self.monitor.setOnline(new, &sink);
         try self.flushMonitorReplies(&sink);
     }
 
@@ -27700,8 +32835,7 @@ pub const LinuxServer = struct {
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 link.sendOperGrant(signed) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
             }
         }
     }
@@ -27730,8 +32864,7 @@ pub const LinuxServer = struct {
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 link.sendWard(wire) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
             }
         }
     }
@@ -28113,6 +33246,11 @@ pub const LinuxServer = struct {
         const data = std.Io.Dir.cwd().readFileAlloc(io, self.config.event_history_path, self.allocator, .limited(1 << 22)) catch return;
         defer self.allocator.free(data);
         _ = self.event_history.load(data);
+    }
+
+    fn restoreEventHistoryAtStart(self: *LinuxServer) void {
+        if (self.inherited_event_history_restored) return;
+        self.loadEventHistory();
     }
 
     /// Persist the Event Spine history ring (best-effort). Called on the stats
@@ -30393,6 +35531,13 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         conn: *const ConnState,
     ) bool {
+        if (comptime @TypeOf(link) == *secured_s2s_link.SecuredLink) {
+            // A prior attempt owns a complete OFFER/sidecar ciphertext batch.
+            // Drain it before regenerating HLC-bearing semantic frames; otherwise
+            // every timer retry under a full peer SendQ appends another distinct
+            // batch and grows the shared secured buffer without bound.
+            if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+        }
         var complete = true;
 
         if (!conn.session_mesh_announce_token_bound) return false;
@@ -30483,23 +35628,19 @@ pub const LinuxServer = struct {
             }
         }
 
-        const outbound = link.outbound();
-        if (outbound.len == 0) return complete;
-
-        if (peer_id.shard == self.rx().shard_id) {
-            // Local owner: success means the entire accumulated prefix entered
-            // the connection SendQ. Never clear link storage on an arm/append
-            // failure; Helix seals that retained outbound byte-for-byte.
-            self.flushS2sOutboundTo(peer_id, outbound) catch return false;
-            link.clearOutbound();
+        if (comptime @TypeOf(link) == *secured_s2s_link.SecuredLink) {
+            if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
         } else {
-            // Cross-shard delivery has no acknowledgement and its fabric inbox is
-            // not a Helix capsule. Hand off a prompt copy, but KEEP the original
-            // in the link's outbound queue: the owning reactor will flush it on
-            // its next drive, and an immediate UPGRADE seals it as pending_out.
-            // Duplicate delivery is intentionally harmless (signed revision/HLC
-            // idempotence) and preferable to erasing the only durable copy.
-            self.flushS2sOutboundTo(peer_id, outbound) catch {};
+            const outbound = link.outbound();
+            if (outbound.len == 0) return complete;
+            if (peer_id.shard == self.rx().shard_id) {
+                self.flushS2sOutboundTo(peer_id, outbound) catch return false;
+                link.clearOutbound();
+            } else {
+                // Plaintext CRDT rows are idempotent; retain the original after
+                // the prompt foreign-shard handoff until the owner flushes it.
+                self.flushS2sOutboundTo(peer_id, outbound) catch {};
+            }
         }
         return complete;
     }
@@ -30618,6 +35759,13 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         account: []const u8,
     ) bool {
+        // Portability is irreversible for the lifetime of this reusable token:
+        // every later detach/mutation owes peers an encodable canonical image.
+        // Prove the current physical image fits the shared v2/legacy envelope
+        // before flipping the durable bit or exposing MTOKEN to the client.
+        const snapshot = self.encodeMigrationSnapshot(id, conn) orelse return false;
+        defer self.allocator.free(snapshot);
+        if (snapshot.len > session_portability.max_snapshot_len) return false;
         if (!self.sessions.markPortableResumeIssued(account, monitorIdFromClient(id))) return false;
         if (conn.session_mesh_announce_pending)
             conn.session_mesh_announce_requires_authority = true;
@@ -30784,7 +35932,18 @@ pub const LinuxServer = struct {
     fn removeTrackedSession(self: *LinuxServer, account: []const u8, client: sessions_mod.ClientId) bool {
         const handle = self.sessions.resumeHandleForClient(account, client);
         const removed = self.sessions.remove(account, client);
-        if (removed) if (handle) |captured| self.finalizeRemovedSessionAuthority(captured);
+        if (removed) {
+            // Logical authority retirement (logout, account rebind, explicit
+            // drop, ghost replacement) makes this physical attachment
+            // permanently ineligible to resume. Retire its durable plaintext
+            // before releasing the token's mesh authority. Transport detach
+            // deliberately never calls this chokepoint and therefore retains
+            // its rows for later resume/remap.
+            lockSpin(&self.attachment_delivery_mu);
+            _ = self.attachment_delivery_spool.discardAttachment(client);
+            self.attachment_delivery_mu.unlock();
+            if (handle) |captured| self.finalizeRemovedSessionAuthority(captured);
+        }
         return removed;
     }
 
@@ -30810,7 +35969,17 @@ pub const LinuxServer = struct {
     }
 
     fn finalizeAttachEviction(self: *LinuxServer, outcome: sessions_mod.AttachOutcome) void {
-        if (outcome.evicted) |handle| self.finalizeRemovedSessionAuthority(handle);
+        if (outcome.evicted) |evicted| {
+            // Capacity eviction destroys a distinct logical token. Never re-key
+            // its attachment-specific plaintext onto the newcomer: that would
+            // cross an authority boundary. Explicit retirement frees the rows
+            // before the portable mesh authority is revoked, so no orphan can
+            // pin spool capacity after SessionStore drops its only lookup key.
+            lockSpin(&self.attachment_delivery_mu);
+            _ = self.attachment_delivery_spool.discardAttachment(evicted.client);
+            self.attachment_delivery_mu.unlock();
+            self.finalizeRemovedSessionAuthority(evicted.resumeHandle());
+        }
     }
 
     fn trackSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
@@ -30866,7 +36035,7 @@ pub const LinuxServer = struct {
                         // Set the replication gate before emitting the credential: if
                         // the connection drops after the write is queued, detach must
                         // still ship the snapshot that this token can unlock.
-                        _ = self.markPortableResumeIssuedForConn(id, conn, account);
+                        if (!self.markPortableResumeIssuedForConn(id, conn, account)) return;
                         // Replicate LIVE state too. A second client may present this
                         // MTOKEN on another node while the issuer remains connected;
                         // waiting until detach would force a redirect/ownership race
@@ -30994,6 +36163,11 @@ pub const LinuxServer = struct {
             return;
         }
         if (snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, token);
+        self.transferAttachmentDeliveries(matched.client, cid) catch {
+            conn.preserve_resume_credential_once = true;
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during resume; token remains valid");
+            return;
+        };
         _ = self.removeTrackedSession(account, matched.client);
         conn.preserve_resume_credential_once = false;
         self.finishDeferredSessionAutojoin(id, conn, true);
@@ -31110,7 +36284,14 @@ pub const LinuxServer = struct {
             else
                 .{ .adopt_verified = true };
             if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind)) {
-                if (ghost) |g| _ = self.removeTrackedSession(account, g);
+                if (ghost) |g| {
+                    self.transferAttachmentDeliveries(g, cid) catch {
+                        conn.preserve_resume_credential_once = true;
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh resume; token remains valid");
+                        return;
+                    };
+                    _ = self.removeTrackedSession(account, g);
+                }
                 conn.preserve_resume_credential_once = false;
                 _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, true);
@@ -31162,6 +36343,11 @@ pub const LinuxServer = struct {
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
+                    self.transferAttachmentDeliveries(g, cid) catch {
+                        conn.preserve_resume_credential_once = true;
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh reclaim; token remains valid");
+                        return;
+                    };
                     _ = self.removeTrackedSession(account, g);
                 } else unreachable;
                 if (local_snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, migrate_token);
@@ -31502,8 +36688,18 @@ pub const LinuxServer = struct {
         // offers. The process-local floor makes every offer strictly newer;
         // wall time makes restart/USR2 epochs comparable at another host.
         const wall_epoch = @max(@as(u64, 1), self.meshWallMs()) *| 1_000_000;
-        const epoch = @max(wall_epoch, self.migration_offer_epoch +| 1);
+        lockSpin(&self.mesh_clock_lock);
+        const next_epoch = std.math.add(u64, self.migration_offer_epoch, 1) catch {
+            self.mesh_clock_lock.unlock();
+            return null;
+        };
+        const epoch = @max(wall_epoch, next_epoch);
+        if (epoch <= self.migration_offer_epoch) {
+            self.mesh_clock_lock.unlock();
+            return null;
+        }
         self.migration_offer_epoch = epoch;
+        self.mesh_clock_lock.unlock();
         var prepared = origin.prepare(account, snapshot, epoch, epoch) catch return null;
         defer prepared.deinit(self.allocator);
 
@@ -31817,23 +37013,78 @@ pub const LinuxServer = struct {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
                 const link = slot.value.s2s_secured orelse continue;
-                if (!link.established() or !link.supportsSessionReplicaV2()) continue;
+                if (!link.established()) continue;
+                if (!link.supportsSessionReplicaV2()) {
+                    // Reusable portable authority cannot be represented exactly
+                    // by the legacy one-shot SESSION_MIGRATE envelope. In
+                    // particular its receiver intentionally ignores consumed
+                    // notices, has no signed revoke/quarantine object, and
+                    // restages a fresh TTL on every proxy. Keep such a peer out
+                    // of a portability-enabled mesh instead of releasing a
+                    // roster that will later diverge silently.
+                    if (self.config.session_migrate_on_detach) slot.value.closing = true;
+                    continue;
+                }
                 if (kind == .attachment_lease and !link.supportsSessionAttachmentLeaseV2()) continue;
                 if (skip_peer) |skip| if (link.peerShortId() == skip) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
-                link.sendSessionReplica(kind, signed_wire) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                // The Store already retained this canonical object. Do not append
+                // another live/lease record behind older secured ciphertext on
+                // every refresh tick; drain first or let bounded Store replay
+                // deliver the newest authority once the peer makes progress.
+                if (!self.flushSecuredS2sOutboundTo(pid, link)) {
+                    self.requestSessionReplicaReplayAfterFanoutFailure(&slot.value);
+                    continue;
+                }
+                link.sendSessionReplica(kind, signed_wire) catch {
+                    self.requestSessionReplicaReplayAfterFanoutFailure(&slot.value);
+                    continue;
+                };
+                if (!self.flushSecuredS2sOutboundTo(pid, link)) {
+                    self.requestSessionReplicaReplayAfterFanoutFailure(&slot.value);
+                    continue;
+                }
             }
+        }
+    }
+
+    fn requestSessionReplicaReplayAfterFanoutFailure(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.session_replica_replay_pending) {
+            // Mutations coalesced before this pass emits object zero are already
+            // covered by its canonical Store scan. Only a failure behind an
+            // advanced value cursor needs one bounded wrap.
+            if (conn.session_replica_replay_after != null or conn.session_replica_replay_cursor != 0)
+                conn.session_replica_replay_restart_pending = true;
+        } else {
+            self.scheduleSessionReplicaReplay(conn);
         }
     }
 
     fn scheduleSessionReplicaReplay(self: *LinuxServer, conn: *ConnState) void {
         conn.session_replica_replay_pending = true;
         conn.session_replica_replay_cursor = 0;
-        conn.session_replica_replay_generation = self.session_replica_store_generation;
         conn.session_replica_replay_now_ms = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
-        conn.session_replica_replay_frame_pending = false;
+        conn.session_replica_replay_after = null;
+        conn.session_replica_replay_restart_pending = false;
+    }
+
+    /// A peer whose converged view was reset must receive a replay from the
+    /// beginning even when an earlier establishment/fanout pass is mid-page.
+    /// Exact ciphertext already retained in the secured link cannot be thrown
+    /// away because doing so would skip an AEAD send counter; finish that one
+    /// frame and request a bounded wrap instead.
+    fn requestFullSessionReplicaReplay(self: *LinuxServer, conn: *ConnState) void {
+        const first_request = !conn.session_replica_resync_burst_pending;
+        conn.session_replica_resync_burst_pending = true;
+        if (conn.mesh_burst_stage != .idle) conn.mesh_burst_restart_pending = true;
+        if (!conn.session_replica_replay_pending) return self.scheduleSessionReplicaReplay(conn);
+        if (first_request) return self.scheduleSessionReplicaReplay(conn);
+        // Every subsequent peer reset needs a complete Store generation too.
+        // If this pass has not emitted anything it already starts at zero;
+        // otherwise finish it and wrap once, preserving deterministic progress
+        // under a burst of duplicate RESYNC records.
+        if (conn.session_replica_replay_after != null or conn.session_replica_replay_cursor != 0)
+            conn.session_replica_replay_restart_pending = true;
     }
 
     /// Release either the one-shot establishment burst or a requested RESYNC
@@ -31845,35 +37096,61 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
-        if (conn.closing or !link.established() or conn.session_replica_replay_pending or
-            conn.session_replica_replay_frame_pending) return;
+        if (conn.closing or !link.established() or conn.session_replica_replay_pending) return;
         const establishment_pending = !conn.s2s_burst_done;
         if (!establishment_pending and !conn.session_replica_resync_burst_pending) return;
 
+        if (!self.sendMeshStateBurstTo(conn)) return;
         conn.s2s_burst_done = true;
         conn.session_replica_resync_burst_pending = false;
-        self.sendMeshStateBurstTo(conn);
-        self.rebroadcastLocalOpers();
-        self.sendMeshWardsTo(conn);
-        self.sendCloneAntiEntropy(conn, link);
     }
 
-    /// Replay a bounded retained-object page. Canonical Store wires are borrowed
-    /// only for this call. Each turn queues at most eight frames and targets at
-    /// most 256 KiB of actual ciphertext; one otherwise-legal oversized frame is
-    /// allowed alone so the byte target can never prevent progress. Cursor
-    /// advancement happens only after ciphertext enters the socket SendQ.
-    /// A Store mutation invalidates the unordered-map cursor and restarts safely;
-    /// duplicates are idempotent at the receiver.
+    fn finishSessionReplicaReplayPass(conn: *ConnState, current_now: i64) void {
+        if (conn.session_replica_replay_restart_pending) {
+            // A live direct fanout failed somewhere behind the ordered cursor.
+            // Wrap exactly once after finishing this pass; mutation itself never
+            // resets forward progress, so periodic lease renewal cannot starve a
+            // Store larger than one timer window.
+            conn.session_replica_replay_restart_pending = false;
+            conn.session_replica_replay_after = null;
+            conn.session_replica_replay_cursor = 0;
+            conn.session_replica_replay_now_ms = current_now;
+            return;
+        }
+        conn.session_replica_replay_pending = false;
+        conn.session_replica_replay_cursor = 0;
+        conn.session_replica_replay_after = null;
+    }
+
+    /// Replay a bounded deterministic retained-object page. Canonical Store
+    /// wires are borrowed only for this call, while the connection retains a
+    /// complete value cursor (token/kind/origin/revision/digest) between turns.
+    /// Hash-map growth, expiry, supersede, and lease renewal therefore cannot
+    /// invalidate or reset a large replay. Each turn queues at most eight frames
+    /// and targets at most 256 KiB of actual ciphertext; one otherwise-legal
+    /// oversized frame is allowed alone so the byte target cannot prevent
+    /// progress. Cursor advancement happens only after exact ciphertext enters
+    /// the socket SendQ.
     fn replaySessionReplicaStoreTo(
         self: *LinuxServer,
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
         if (!conn.session_replica_replay_pending) return;
-        if (!link.established() or !link.supportsSessionReplicaV2()) {
+        if (!link.established()) {
             conn.session_replica_replay_pending = false;
-            conn.session_replica_replay_frame_pending = false;
+            conn.session_replica_replay_after = null;
+            return;
+        }
+        const replica_v2 = link.supportsSessionReplicaV2();
+        if (!replica_v2) {
+            // A legacy peer is safe only when portable mesh sessions are
+            // disabled. Otherwise there is no wire representation for reusable
+            // authority expiry/revoke/quarantine; never release the membership
+            // burst on a link that cannot converge those facts.
+            if (self.config.session_migrate_on_detach) conn.closing = true;
+            conn.session_replica_replay_pending = false;
+            conn.session_replica_replay_after = null;
             return;
         }
 
@@ -31882,54 +37159,34 @@ pub const LinuxServer = struct {
         var queued_bytes: usize = 0;
         var frames_queued: usize = 0;
 
-        // A prior batch may have encoded one frame after SendQ filled or after
-        // the previous turn exhausted its ciphertext budget. Retain those exact
-        // bytes in the link and retry them before selecting another object.
+        // A RESYNC may interrupt a retryable mesh family whose complete sealed
+        // records are still in the shared secured-link buffer. They cannot be
+        // discarded or reordered past newly sealed authority records. Page them
+        // through the same whole-record SendQ edge before selecting an object;
+        // `mesh_burst_restart_pending` guarantees a fresh full family pass after
+        // this authority generation completes.
         if (link.outbound().len != 0) {
-            const ciphertext_len = link.outbound().len;
-            appendToConn(conn, link.outbound()) catch return;
-            link.clearOutbound();
-            if (conn.session_replica_replay_frame_pending) {
-                conn.session_replica_replay_cursor += 1;
-                conn.session_replica_replay_frame_pending = false;
-                frames_queued = 1;
-            }
-            self.armSendIfNeeded(conn) catch {
-                conn.closing = true;
-                return;
-            };
-            queued_bytes = ciphertext_len;
+            if (!self.flushMeshBurstStage(conn)) return;
         }
 
         const current_now: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
-        if (conn.session_replica_replay_generation != self.session_replica_store_generation) {
-            conn.session_replica_replay_generation = self.session_replica_store_generation;
-            conn.session_replica_replay_cursor = 0;
-            conn.session_replica_replay_now_ms = current_now;
-        }
-
         const now = conn.session_replica_replay_now_ms;
-        const total = self.session_replica_store.retainedCount(now);
-        if (conn.session_replica_replay_cursor >= total) {
-            conn.session_replica_replay_pending = false;
-            conn.session_replica_replay_cursor = 0;
-            return;
-        }
-        if (frames_queued == max_frames_per_turn) return;
+        if (frames_queued >= max_frames_per_turn or
+            (frames_queued != 0 and queued_bytes >= max_bytes_per_turn)) return;
 
         var objects: [max_frames_per_turn]session_replica_v2.Store.RetainedObject = undefined;
         const remaining_frames = max_frames_per_turn - frames_queued;
-        const n = self.session_replica_store.retainedObjectsRange(
+        const n = self.session_replica_store.retainedObjectsAfter(
             now,
-            conn.session_replica_replay_cursor,
+            conn.session_replica_replay_after,
             objects[0..remaining_frames],
         );
         if (n == 0) {
-            conn.session_replica_replay_pending = false;
-            conn.session_replica_replay_cursor = 0;
+            finishSessionReplicaReplayPass(conn, current_now);
             return;
         }
         for (objects[0..n]) |object| {
+            const object_cursor = object.cursor();
             const kind: s2s_link.SessionReplicaKind = switch (object.kind) {
                 .offer => .offer,
                 .revoke => .revoke,
@@ -31938,31 +37195,42 @@ pub const LinuxServer = struct {
                         // Rolling-old v2 peers must skip the extension without
                         // pinning this value cursor and blocking their residence
                         // burst forever.
+                        conn.session_replica_replay_after = object_cursor;
                         conn.session_replica_replay_cursor += 1;
                         continue;
                     }
                     break :blk .attachment_lease;
                 },
             };
-            link.sendSessionReplica(kind, object.wire) catch return;
-            conn.session_replica_replay_frame_pending = true;
-            const ciphertext_len = link.outbound().len;
-            // Budget the bytes that actually enter the socket SendQ, including
-            // inner framing and outer AEAD overhead. Keep an over-budget next
-            // frame encoded in the link for the next turn; its send counter and
-            // ciphertext must not be regenerated. A single legal frame is always
-            // allowed when it is first in a turn, even if a future protocol frame
-            // limit grows beyond 256 KiB, otherwise that object could never make
-            // progress.
+            const ciphertext_len = sessionReplicaSecuredRecordLen(object.wire.len) orelse {
+                conn.closing = true;
+                return;
+            };
+            // Decide both byte budget and physical SendQ capacity before
+            // encoding. `sendSessionReplica` advances the secured record counter;
+            // once called, its exact ciphertext must have a no-fail commit edge.
             if (queued_bytes != 0 and
                 (queued_bytes >= max_bytes_per_turn or ciphertext_len > max_bytes_per_turn - queued_bytes))
             {
                 return;
             }
-            appendToConn(conn, link.outbound()) catch return;
+            reserveRawAppendToConn(conn, ciphertext_len) catch return;
+            std.debug.assert(link.outbound().len == 0);
+            link.sendSessionReplica(kind, object.wire) catch return;
+            if (link.outbound().len != ciphertext_len) {
+                conn.closing = true;
+                return;
+            }
+            // Capacity and any overflow allocation were reserved above; failure
+            // here is an internal invariant violation, not recoverable
+            // backpressure. Keep the exact ciphertext and fail the peer closed.
+            appendToConn(conn, link.outbound()) catch {
+                conn.closing = true;
+                return;
+            };
             link.clearOutbound();
+            conn.session_replica_replay_after = object_cursor;
             conn.session_replica_replay_cursor += 1;
-            conn.session_replica_replay_frame_pending = false;
             frames_queued += 1;
             self.armSendIfNeeded(conn) catch {
                 conn.closing = true;
@@ -31970,17 +37238,15 @@ pub const LinuxServer = struct {
             };
             queued_bytes = std.math.add(usize, queued_bytes, ciphertext_len) catch std.math.maxInt(usize);
         }
-        if (conn.session_replica_replay_cursor >= total) {
-            conn.session_replica_replay_pending = false;
-            conn.session_replica_replay_cursor = 0;
-        }
+        if (n < remaining_frames) finishSessionReplicaReplayPass(conn, current_now);
     }
 
     fn resumeSessionReplicaReplays(self: *LinuxServer) void {
         for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied or !slot.value.session_replica_replay_pending) continue;
+            if (!slot.occupied) continue;
             const link = slot.value.s2s_secured orelse continue;
-            self.replaySessionReplicaStoreTo(&slot.value, link);
+            if (slot.value.session_replica_replay_pending)
+                self.replaySessionReplicaStoreTo(&slot.value, link);
             self.releaseMeshBurstAfterSessionReplicaReplay(&slot.value, link);
         }
     }
@@ -32063,73 +37329,6 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Reconcile every portable logical-session replica to one newly-established
-    /// secured peer. Live attachments are snapshotted from their connection;
-    /// detached snapshots come from exact owned SessionStore copies. Link I/O
-    /// happens without holding the session lock.
-    fn syncPortableSessions(self: *LinuxServer, link: anytype) void {
-        if (!self.config.session_migrate_on_detach) return;
-
-        var v2_refreshed: std.AutoHashMapUnmanaged(session_migrate.Token, void) = .empty;
-        defer v2_refreshed.deinit(self.allocator);
-
-        for (self.reactors) |*reactor| {
-            for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
-                const conn = &slot.value;
-                if (conn.s2s != null or conn.s2s_secured != null or conn.closing) continue;
-                const account = conn.session.account() orelse continue;
-                const id = slotClientId(reactor, i, slot.gen);
-                const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse continue;
-                if (!handle.portable or tokenIsNull(handle.token)) continue;
-                const snapshot_bytes = self.encodeMigrationSnapshot(id, conn) orelse continue;
-                defer self.allocator.free(snapshot_bytes);
-                var snapshot = migration_relay.Snapshot.decode(self.allocator, snapshot_bytes) catch continue;
-                defer snapshot.deinit(self.allocator);
-                if (v2_refreshed.contains(handle.token)) continue;
-                v2_refreshed.put(self.allocator, handle.token, {}) catch {
-                    _ = self.sessions.markTokenReplicaDirty(handle.token);
-                    continue;
-                };
-                _ = self.publishSessionReplicaUpsert(handle.token, account, snapshot.nick, snapshot_bytes, true);
-                const wire = self.encodeSessionMigration(account, handle.token, snapshot) orelse continue;
-                defer self.allocator.free(wire);
-                link.sendSessionMigrate(wire) catch continue;
-                if (link.peerShortId()) |peer| {
-                    self.recordSessionReplicaRoute(handle.token, peer);
-                    self.recordSessionReplicaIdentity(handle.token, account, snapshot.nick);
-                }
-            }
-        }
-
-        const copies = self.sessions.copyPortableDetachedSnapshots(self.allocator) catch return;
-        defer {
-            for (copies) |*copy| copy.deinit(self.allocator);
-            self.allocator.free(copies);
-        }
-        for (copies) |copy| {
-            // A live exact-token source always outranks any detached sibling.
-            // Sending the ghost afterward would mint a newer legacy epoch and
-            // deterministically overwrite the fresh live image on old peers.
-            if (v2_refreshed.contains(copy.token)) continue;
-            var snapshot = migration_relay.Snapshot.decode(self.allocator, copy.snapshot) catch continue;
-            defer snapshot.deinit(self.allocator);
-            if (!std.ascii.eqlIgnoreCase(snapshot.account, copy.account)) continue;
-            v2_refreshed.put(self.allocator, copy.token, {}) catch {
-                _ = self.sessions.markTokenReplicaDirty(copy.token);
-                continue;
-            };
-            _ = self.publishSessionReplicaUpsert(copy.token, copy.account, snapshot.nick, copy.snapshot, false);
-            const wire = self.encodeSessionMigration(copy.account, copy.token, snapshot) orelse continue;
-            defer self.allocator.free(wire);
-            link.sendSessionMigrate(wire) catch continue;
-            if (link.peerShortId()) |peer| {
-                self.recordSessionReplicaRoute(copy.token, peer);
-                self.recordSessionReplicaIdentity(copy.token, copy.account, snapshot.nick);
-            }
-        }
-    }
-
     /// Broadcast an encoded `session_migrate` capsule to every established secured
     /// peer (the encrypted, authenticated leg — never the plaintext S2S path,
     /// since the capsule carries account/host state). Mirrors `broadcastOperGrant`.
@@ -32137,12 +37336,12 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
+                if (slot.value.closing) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 link.sendSessionMigrate(wire) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
                 if (link.peerShortId()) |peer| self.recordSessionReplicaRoute(token, peer);
             }
         }
@@ -32168,8 +37367,7 @@ pub const LinuxServer = struct {
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 link.sendSessionMigrateConsumed(payload) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
             }
         }
     }
@@ -32322,10 +37520,11 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         token: session_migrate.Token,
         entry: *const session_replica_v2.Store.Entry,
+        mode: SessionReplicaProjectionMode,
     ) bool {
         var snapshot = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch |err| {
             if (err == error.OutOfMemory) return false;
-            return self.reconcileSessionReplicaRouteProjection(token, null, &.{});
+            return self.reconcileSessionReplicaRouteProjection(token, null, &.{}, mode);
         };
         defer snapshot.deinit(self.allocator);
         const desired = if (std.ascii.eqlIgnoreCase(snapshot.account, entry.account) and
@@ -32339,7 +37538,7 @@ pub const LinuxServer = struct {
             entry.nick
         else
             null;
-        return self.reconcileSessionReplicaRouteProjection(token, desired_nick, desired);
+        return self.reconcileSessionReplicaRouteProjection(token, desired_nick, desired, mode);
     }
 
     fn reconcileSessionReplicaRouteProjection(
@@ -32347,6 +37546,7 @@ pub const LinuxServer = struct {
         token: session_migrate.Token,
         desired_nick: ?[]const u8,
         desired_channels: []const []const u8,
+        mode: SessionReplicaProjectionMode,
     ) bool {
         var complete = true;
         for (self.reactors) |*reactor| {
@@ -32356,12 +37556,18 @@ pub const LinuxServer = struct {
                 if (!link.established() or !link.supportsSessionReplicaV2()) continue;
                 _ = link.reconcileSessionToken(token, desired_nick, desired_channels) catch {
                     complete = false;
-                    self.drainIdentityTransitions(link);
+                    if (mode == .live)
+                        self.drainIdentityTransitions(link)
+                    else
+                        self.discardIdentityTransitions(link);
                     continue;
                 };
                 // OFFER-only rename/revoke still has a client-visible event even
                 // when no compatibility NICK/PART sidecar follows this feed.
-                self.drainIdentityTransitions(link);
+                if (mode == .live)
+                    self.drainIdentityTransitions(link)
+                else
+                    self.discardIdentityTransitions(link);
             }
         }
         return complete;
@@ -32506,6 +37712,7 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         token: session_migrate.Token,
         entry: *const session_replica_v2.Store.Entry,
+        mode: SessionReplicaProjectionMode,
     ) bool {
         var snapshot = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch |err| {
             if (err != error.OutOfMemory) {
@@ -32567,19 +37774,55 @@ pub const LinuxServer = struct {
         var old_nick: []const u8 = "";
         var old_prefix: []const u8 = "";
         var nick_msg: []const u8 = "";
+        var old_remains_online = false;
+        const new_was_announced_online = self.monitor.isOnline(entry.nick);
         if (event_id) |source_id| {
             const source = self.connFor(source_id) orelse return false;
             const old = source.session.displayName();
             if (old.len > old_buf.len) return true;
             @memcpy(old_buf[0..old.len], old);
             old_nick = old_buf[0..old.len];
-            old_prefix = clientPrefix(source, &prefix_buf) catch return true;
-            nick_msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, entry.nick) catch return true;
+            if (mode == .live) {
+                old_prefix = clientPrefix(source, &prefix_buf) catch return true;
+                nick_msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, entry.nick) catch return true;
+            }
+            for (rows) |row| {
+                if (!row.attached or std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token)) continue;
+                const sibling = self.connFor(clientIdFromMonitor(row.client)) orelse continue;
+                if (sibling.closing or !sibling.session.registered()) continue;
+                if (std.ascii.eqlIgnoreCase(sibling.session.displayName(), old_nick)) {
+                    old_remains_online = true;
+                    break;
+                }
+            }
         }
         var nick_recipients: std.ArrayList(client_model.ClientId) = .empty;
         defer nick_recipients.deinit(self.allocator);
-        if (event_id != null)
+        if (event_id != null and mode == .live)
             self.collectExactLogicalNickRecipients(logical_ids.items, &nick_recipients) catch return false;
+
+        const case_only_nick = event_id != null and std.ascii.eqlIgnoreCase(old_nick, entry.nick);
+        var monitor_plan: ?PreparedMonitorTransition = null;
+        defer if (monitor_plan) |*plan| plan.deinit(self.allocator);
+        // MONITOR's derived online map participates in the same live rename.
+        // Prepare both dynamic watcher output and map capacity before World or
+        // profile mutation; apply after commit performs no allocation.
+        if (event_id != null and mode == .live) {
+            if (case_only_nick) {
+                self.monitor.reserveOnlineTransition(
+                    old_nick,
+                    entry.nick,
+                    true,
+                    new_was_announced_online,
+                ) catch return false;
+            } else {
+                monitor_plan = self.prepareMonitorOccupancyTransition(
+                    old_nick,
+                    entry.nick,
+                    new_was_announced_online,
+                ) catch return false;
+            }
+        }
 
         _ = self.world.replaceExactSessionNickOwner(entry.nick, registry_wid, logical_world_ids.items) catch |err| switch (err) {
             error.NickInUse => {
@@ -32597,7 +37840,9 @@ pub const LinuxServer = struct {
             const logical_conn = self.connFor(logical_id) orelse continue;
             logical_conn.session.setNick(entry.nick) catch unreachable;
         }
-        if (event_id != null) {
+        if (event_id != null and !case_only_nick)
+            old_remains_online = old_remains_online or self.world.findNick(old_nick) != null;
+        if (event_id != null and mode == .live) {
             self.deliverLogicalNickEvent(nick_recipients.items, nick_msg);
             var nick_body_buf: [session_replica_v2.max_nick_len + 1]u8 = undefined;
             const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{entry.nick}) catch entry.nick;
@@ -32612,7 +37857,24 @@ pub const LinuxServer = struct {
                 }
                 if (belongs) self.recordHistoryEventSender(channel_entry.key_ptr.*, old_prefix, "NICK", nick_body);
             }
-            self.monitorTransition(old_nick, entry.nick) catch {};
+            if (case_only_nick)
+                self.monitor.transitionOnlineSilent(old_nick, entry.nick, true) catch {}
+            else
+                self.applyPreparedMonitorOccupancyTransition(
+                    &monitor_plan.?,
+                    old_nick,
+                    entry.nick,
+                    old_remains_online,
+                    new_was_announced_online,
+                ) catch {};
+        } else if (mode == .helix_silent) {
+            if (event_id != null) {
+                const display = if (self.world.findNick(entry.nick)) |owner|
+                    self.world.nickOf(owner) orelse entry.nick
+                else
+                    entry.nick;
+                self.monitor.transitionOnlineSilent(old_nick, display, old_remains_online) catch return false;
+            } else self.monitor.restoreOnline(entry.nick) catch return false;
         }
 
         // Snapshot all channels that must be removed before mutating World: a
@@ -32668,9 +37930,11 @@ pub const LinuxServer = struct {
                     continue;
                 };
                 restored_any = true;
-                if (logical_was_present and !was_member) self.renderReplicaJoin(&snapshot, channel, id);
+                if (mode == .live and logical_was_present and !was_member)
+                    self.renderReplicaJoin(&snapshot, channel, id);
             }
-            if (!logical_was_present and restored_any) self.renderReplicaJoin(&snapshot, channel, null);
+            if (mode == .live and !logical_was_present and restored_any)
+                self.renderReplicaJoin(&snapshot, channel, null);
         }
 
         for (removals.items) |channel| {
@@ -32682,7 +37946,7 @@ pub const LinuxServer = struct {
                 }
             }
             if (!logical_was_present) continue;
-            self.renderReplicaPart(&snapshot, channel);
+            if (mode == .live) self.renderReplicaPart(&snapshot, channel);
             for (logical_ids.items) |id| {
                 self.world.part(channel, worldIdFromClient(id)) catch |err| {
                     if (err == error.OutOfMemory) complete = false;
@@ -32720,54 +37984,56 @@ pub const LinuxServer = struct {
             logical_conn.session.setRealname(snapshot.realname) catch unreachable;
         }
 
-        var profile_prefix_buf: [256]u8 = undefined;
-        const profile_prefix = clientPrefix(profile_source, &profile_prefix_buf) catch "";
-        if (away_changed and profile_prefix.len != 0) {
-            var away_buf: [default_reply_bytes]u8 = undefined;
-            const away_msg = formatMessage(
-                &away_buf,
-                profile_prefix,
-                "AWAY",
-                &.{},
-                if (snapshot.away.len == 0) null else snapshot.away,
-            ) catch "";
-            if (away_msg.len != 0) self.notifyReplicaProfileEvent(
-                profile_source_id,
-                logical_ids.items,
-                away_msg,
-                .away_notify,
-                snapshot.nick,
-            );
-            self.pushPresenceActivity(
-                profile_source_id,
-                profile_source,
-                if (snapshot.away.len == 0) .active else .away,
-            );
-        }
-        if (realname_changed and profile_prefix.len != 0) {
-            var setname_buf: [default_reply_bytes]u8 = undefined;
-            const setname_msg = formatMessage(
-                &setname_buf,
-                profile_prefix,
-                "SETNAME",
-                &.{},
-                snapshot.realname,
-            ) catch "";
-            if (setname_msg.len != 0) self.notifyReplicaProfileEvent(
-                profile_source_id,
-                logical_ids.items,
-                setname_msg,
-                .setname,
-                snapshot.nick,
-            );
-        }
-        if ((!modes_added.isEmpty() or !modes_removed.isEmpty()) and profile_prefix.len != 0) {
-            var delta_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
-            if (writeReplicaUmodeDelta(&delta_buf, modes_added, modes_removed)) |delta| {
-                var mode_buf: [default_reply_bytes]u8 = undefined;
-                const mode_msg = formatMessage(&mode_buf, profile_prefix, "MODE", &.{ snapshot.nick, delta }, null) catch "";
-                if (mode_msg.len != 0) {
-                    for (logical_ids.items) |logical_id| self.deliver(logical_id, mode_msg) catch {};
+        if (mode == .live) {
+            var profile_prefix_buf: [256]u8 = undefined;
+            const profile_prefix = clientPrefix(profile_source, &profile_prefix_buf) catch "";
+            if (away_changed and profile_prefix.len != 0) {
+                var away_buf: [default_reply_bytes]u8 = undefined;
+                const away_msg = formatMessage(
+                    &away_buf,
+                    profile_prefix,
+                    "AWAY",
+                    &.{},
+                    if (snapshot.away.len == 0) null else snapshot.away,
+                ) catch "";
+                if (away_msg.len != 0) self.notifyReplicaProfileEvent(
+                    profile_source_id,
+                    logical_ids.items,
+                    away_msg,
+                    .away_notify,
+                    snapshot.nick,
+                );
+                self.pushPresenceActivity(
+                    profile_source_id,
+                    profile_source,
+                    if (snapshot.away.len == 0) .active else .away,
+                );
+            }
+            if (realname_changed and profile_prefix.len != 0) {
+                var setname_buf: [default_reply_bytes]u8 = undefined;
+                const setname_msg = formatMessage(
+                    &setname_buf,
+                    profile_prefix,
+                    "SETNAME",
+                    &.{},
+                    snapshot.realname,
+                ) catch "";
+                if (setname_msg.len != 0) self.notifyReplicaProfileEvent(
+                    profile_source_id,
+                    logical_ids.items,
+                    setname_msg,
+                    .setname,
+                    snapshot.nick,
+                );
+            }
+            if ((!modes_added.isEmpty() or !modes_removed.isEmpty()) and profile_prefix.len != 0) {
+                var delta_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
+                if (writeReplicaUmodeDelta(&delta_buf, modes_added, modes_removed)) |delta| {
+                    var mode_buf: [default_reply_bytes]u8 = undefined;
+                    const mode_msg = formatMessage(&mode_buf, profile_prefix, "MODE", &.{ snapshot.nick, delta }, null) catch "";
+                    if (mode_msg.len != 0) {
+                        for (logical_ids.items) |logical_id| self.deliver(logical_id, mode_msg) catch {};
+                    }
                 }
             }
         }
@@ -32782,14 +38048,39 @@ pub const LinuxServer = struct {
     /// store owns a distinct v2 revision domain, so legacy epochs cannot
     /// downgrade it and arrival permutations across origins converge identically.
     fn projectBestSessionReplicaV2(self: *LinuxServer, token: session_migrate.Token) bool {
+        return self.projectBestSessionReplicaV2Mode(token, .live);
+    }
+
+    fn validateSessionReplicaProjectionEntry(
+        self: *LinuxServer,
+        entry: *const session_replica_v2.Store.Entry,
+    ) bool {
+        var snapshot = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
+        defer snapshot.deinit(self.allocator);
+        return std.mem.eql(u8, snapshot.account, entry.account) and
+            std.mem.eql(u8, snapshot.nick, entry.nick) and
+            snapshot.realname.len <= 256 and
+            !dispatch.hasControlByte(snapshot.realname) and
+            snapshot.away.len <= self.config.awaylen and
+            !dispatch.hasControlByte(snapshot.away) and
+            parsePortableReplicaUmodes(snapshot.umodes) != null;
+    }
+
+    fn projectBestSessionReplicaV2Mode(
+        self: *LinuxServer,
+        token: session_migrate.Token,
+        mode: SessionReplicaProjectionMode,
+    ) bool {
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         if (self.session_replica_store.bestLiveIdentity(token, now_wall)) |surviving| {
+            if (mode == .helix_silent and !self.validateSessionReplicaProjectionEntry(surviving))
+                return false;
             const marked = self.sessions.markTokenReplicaProjectionDirty(token);
             const staged = self.stageSessionReplicaV2Entry(token, surviving);
             if (!staged) self.scheduleSessionReplicaStageRetry();
-            const projected = self.projectSessionReplicaChannels(token, surviving);
+            const projected = self.projectSessionReplicaChannels(token, surviving, mode);
             const authorities_bound = self.bindSessionReplicaRouteAuthorities(token, now_wall);
-            const routes_reconciled = self.reconcileSessionReplicaRoutes(token, surviving);
+            const routes_reconciled = self.reconcileSessionReplicaRoutes(token, surviving, mode);
             if (!authorities_bound or !routes_reconciled) self.scheduleSessionReplicaStageRetry();
             const complete = staged and projected and authorities_bound and routes_reconciled;
             if (marked and complete)
@@ -32798,7 +38089,7 @@ pub const LinuxServer = struct {
         } else {
             if (self.pending_migrations) |*pm| _ = pm.removeReplica(token);
             const marked = self.sessions.markTokenReplicaProjectionDirty(token);
-            const routes_reconciled = self.reconcileSessionReplicaRouteProjection(token, null, &.{});
+            const routes_reconciled = self.reconcileSessionReplicaRouteProjection(token, null, &.{}, mode);
             if (!routes_reconciled) self.scheduleSessionReplicaStageRetry();
             if (marked and routes_reconciled) _ = self.sessions.clearTokenReplicaProjectionDirty(token);
             return routes_reconciled;
@@ -32808,16 +38099,17 @@ pub const LinuxServer = struct {
     /// After expiry sweeping removes a formerly-best origin, reproject each token
     /// that still has at least one live signed OFFER so Pending falls back to the
     /// Store-selected surviving origin even when its revision is lower.
-    fn reprojectLiveSessionReplicasV2(self: *LinuxServer) void {
+    fn reprojectLiveSessionReplicasV2(self: *LinuxServer, mode: SessionReplicaProjectionMode) bool {
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         var cursor: ?session_migrate.Token = null;
         while (true) {
             var tokens: [32]session_migrate.Token = undefined;
             const page = self.session_replica_store.liveTokensAfter(now_wall, cursor, &tokens);
-            if (page.len == 0) return;
-            for (page) |token| _ = self.projectBestSessionReplicaV2(token);
+            if (page.len == 0) return true;
+            for (page) |token|
+                if (!self.projectBestSessionReplicaV2Mode(token, mode)) return false;
             cursor = page[page.len - 1];
-            if (page.len < tokens.len) return;
+            if (page.len < tokens.len) return true;
         }
     }
 
@@ -33021,11 +38313,7 @@ pub const LinuxServer = struct {
         };
         const out = link.outbound();
         if (out.len != 0) {
-            appendToConn(conn, out) catch {
-                conn.closing = true;
-                return false;
-            };
-            link.clearOutbound();
+            if (!self.flushMeshBurstStage(conn) and conn.closing) return false;
         }
         return residence_batch_complete;
     }
@@ -33614,6 +38902,33 @@ pub const LinuxServer = struct {
                 next_part += 1;
             }
         }
+        const monitor_display_changes = old_nick.len != 0 and snap.nick.len != 0 and
+            !std.mem.eql(u8, old_nick, snap.nick);
+        const monitor_case_only = monitor_display_changes and
+            std.ascii.eqlIgnoreCase(old_nick, snap.nick);
+        const new_was_announced_online = target_owner_is_other or
+            surviving_target_identity_ids.items.len != 0;
+        var monitor_plan: ?PreparedMonitorTransition = null;
+        defer if (monitor_plan) |*plan| plan.deinit(self.allocator);
+        if (monitor_display_changes) {
+            // Prepare every fallible MONITOR operation while the session and
+            // World tickets are still abortable. The later observable apply is
+            // allocation-free even for an unbounded watcher set.
+            if (monitor_case_only) {
+                self.monitor.reserveOnlineTransition(
+                    old_nick,
+                    snap.nick,
+                    true,
+                    new_was_announced_online,
+                ) catch return false;
+            } else {
+                monitor_plan = self.prepareMonitorOccupancyTransition(
+                    old_nick,
+                    snap.nick,
+                    new_was_announced_online,
+                ) catch return false;
+            }
+        }
         // The token ticket above retains SessionStore's exclusive lock across
         // this World preparation, guaranteeing the previewed journal overlay is
         // exactly what the following no-fail cross-component commit installs.
@@ -33686,16 +39001,21 @@ pub const LinuxServer = struct {
                 for (desired, 0..) |member, i|
                     if (claimant_was_member[i]) self.recordHistoryEventSender(member.channel, old_prefix, "NICK", nick_body);
             }
-            if (exclusive_rename) {
-                self.monitorTransition(old_nick, snap.nick) catch {};
-            } else {
-                self.monitorOccupancyTransition(
-                    old_nick,
-                    snap.nick,
-                    surviving_old_identity_ids.items.len != 0,
-                    target_owner_is_other or surviving_target_identity_ids.items.len != 0,
-                ) catch {};
-            }
+        }
+        if (monitor_case_only) {
+            const display = if (self.world.findNick(snap.nick)) |owner|
+                self.world.nickOf(owner) orelse snap.nick
+            else
+                snap.nick;
+            self.monitor.transitionOnlineSilent(old_nick, display, true) catch {};
+        } else if (monitor_display_changes) {
+            self.applyPreparedMonitorOccupancyTransition(
+                &monitor_plan.?,
+                old_nick,
+                snap.nick,
+                surviving_old_identity_ids.items.len != 0,
+                new_was_announced_online,
+            ) catch {};
         }
         for (join_plans.items) |plan| {
             var tag_buf: [48]u8 = undefined;
@@ -34236,8 +39556,7 @@ pub const LinuxServer = struct {
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 link.sendTegamiPush(account, from, text) catch continue;
-                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                link.clearOutbound();
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
             }
         }
     }
@@ -36155,6 +41474,27 @@ pub const LinuxServer = struct {
         // mesh, history, and stats); the stats-tick flush later emits one
         // "collapsed N×" summary. Severity >= warn is never collapsed.
         if (!self.event_collapse.admit(@intFromEnum(category), @intFromEnum(severity), message, platform.realtimeMillis())) return;
+        if (self.config.node_identity) |identity| {
+            var origin_pubkey: [oper_event.pubkey_len]u8 = undefined;
+            var origin_sig: [oper_event.sig_len]u8 = undefined;
+            var event = oper_event.SignedOperEventV2{
+                .category = @intFromEnum(category),
+                .severity = @intFromEnum(severity),
+                .origin_node = self.config.node_id,
+                .hlc = self.nextMeshHlc(),
+                .origin_server = self.serverName(),
+                .subject = subject,
+                .message = message,
+            };
+            try oper_event.stampOrigin(&event, &identity.sign_kp, &origin_pubkey, &origin_sig);
+            const event_id = (try self.admitEventSpineV2(event)) orelse return;
+            self.deliverOperEventV2Local(event, event_id, category, severity, subject);
+            self.meshBroadcastAuthoredOperEventV2(event);
+            return;
+        }
+
+        // A node without a sovereign signing identity cannot author OEVT v2.
+        // Retain deployed direct-leaf v1 behavior; peers never re-flood it.
         self.event_history.record(@intFromEnum(category), @intFromEnum(severity), platform.realtimeMillis(), self.serverName(), message);
         self.event_stats.record(@intFromEnum(category), @intFromEnum(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
@@ -36184,6 +41524,35 @@ pub const LinuxServer = struct {
         }
     }
 
+    const EventSpineDeliveryIdentity = struct {
+        event_id: oper_event.EventId,
+        origin_time_ms: u64,
+    };
+
+    fn eventSpineDeliveryTags(
+        session: *const dispatch.ClientSession,
+        category: event_spine.EventCategory,
+        severity: event_spine.EventSeverity,
+        identity: ?EventSpineDeliveryIdentity,
+        out: []u8,
+    ) []const u8 {
+        if (!session.hasCap(.message_tags)) return "";
+        var structured_buf: [128]u8 = undefined;
+        const structured = event_spine.buildEventTags(&structured_buf, category, severity) catch return "";
+        const stable = identity orelse {
+            if (structured.len > out.len) return "";
+            @memcpy(out[0..structured.len], structured);
+            return out[0..structured.len];
+        };
+        const msgid = std.fmt.bytesToHex(stable.event_id, .lower);
+        if (session.hasCap(.server_time)) {
+            var time_buf: [32]u8 = undefined;
+            const time = serverTimeValueAt(&time_buf, stable.origin_time_ms);
+            return std.fmt.bufPrint(out, "time={s};msgid={s};{s}", .{ time, msgid, structured }) catch "";
+        }
+        return std.fmt.bufPrint(out, "msgid={s};{s}", .{ msgid, structured }) catch "";
+    }
+
     /// Deliver one Event-Spine event to this node's local oper subscribers across
     /// ALL shards, rendered `:<origin_server> EVENT <oper-nick> <message>`. Shared
     /// by the local publish path (origin = this server) and the mesh drain (origin
@@ -36196,14 +41565,49 @@ pub const LinuxServer = struct {
         subject: []const u8,
         message: []const u8,
     ) void {
+        self.deliverOperEventLocalWithIdentity(
+            origin_server,
+            category,
+            severity,
+            subject,
+            message,
+            null,
+        );
+    }
+
+    fn deliverOperEventV2Local(
+        self: *LinuxServer,
+        event: oper_event.SignedOperEventV2,
+        event_id: oper_event.EventId,
+        category: event_spine.EventCategory,
+        severity: event_spine.EventSeverity,
+        subject: []const u8,
+    ) void {
+        self.deliverOperEventLocalWithIdentity(
+            event.origin_server,
+            category,
+            severity,
+            subject,
+            event.message,
+            .{ .event_id = event_id, .origin_time_ms = event.originTimeMs() },
+        );
+    }
+
+    fn deliverOperEventLocalWithIdentity(
+        self: *LinuxServer,
+        origin_server: []const u8,
+        category: event_spine.EventCategory,
+        severity: event_spine.EventSeverity,
+        subject: []const u8,
+        message: []const u8,
+        identity: ?EventSpineDeliveryIdentity,
+    ) void {
         // chatsvc-faithful delivery: render a raw `:<origin> EVENT <target> <body>`
         // line PER RECIPIENT (target = the subscribed oper's OWN nick). Category
         // gates delivery; the TYPE leads the body (e.g. "USER CONNECT …").
         // Structured IRCv3 message-tags (category + severity), built once and
         // delivered only to clients that negotiated `message-tags`; everyone
         // else gets the plain line.
-        var tag_buf: [128]u8 = undefined;
-        const tags = event_spine.buildEventTags(&tag_buf, category, severity) catch "";
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!sessionWantsEvent(&entry.value.session, category, severity, message, subject)) continue;
@@ -36211,7 +41615,8 @@ pub const LinuxServer = struct {
             // channels they are in (no snooping calls in channels they've not joined).
             if (!self.mediaEventAllowed(entry.id, &entry.value.session, message)) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
-            const client_tags = if (entry.value.session.hasCap(.message_tags)) tags else "";
+            var tag_buf: [256]u8 = undefined;
+            const client_tags = eventSpineDeliveryTags(&entry.value.session, category, severity, identity, &tag_buf);
             const line = event_spine.renderEventTagged(client_tags, origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
             self.deliver(entry.id, line) catch continue;
         }
@@ -36244,12 +41649,151 @@ pub const LinuxServer = struct {
                 const on = @min(origin_server.len, deliver_handle.broadcast_origin_max);
                 @memcpy(fan.broadcast_origin[0..on], origin_server[0..on]);
                 fan.broadcast_origin_len = @intCast(on);
+                if (identity) |stable| {
+                    fan.broadcast_event_id = stable.event_id;
+                    fan.broadcast_event_time_ms = stable.origin_time_ms;
+                    fan.broadcast_has_event_identity = true;
+                }
                 if (fabric.sendTo(shard, fan)) {
                     self.wakeShard(shard);
                 } else {
                     fabric.release(shard, buf);
                     self.poisonEventSubscribersOnShard(shard, category, severity, message, subject);
                     self.noteCrossShardDrop(fabric, 1);
+                }
+            }
+        }
+    }
+
+    /// Verify and enter one immutable OEVT v2 object into the daemon-global
+    /// replay authority and exact OEH1 history as a single serialized mutation.
+    /// Only an accepted result authorizes stats, delivery, or re-flood. The
+    /// history id is the exact payload returned by Guard.admit for this event;
+    /// it is never independently re-derived.
+    fn admitEventSpineV2(
+        self: *LinuxServer,
+        event: oper_event.SignedOperEventV2,
+    ) std.mem.Allocator.Error!?oper_event.EventId {
+        // The signed display/history origin is not self-authenticating by name.
+        // Bind it to the sovereign node id's canonical mesh registry entry
+        // before either replay authority can move. Unknown transit origins and
+        // aliases are rejected; the immediate hop is never substituted.
+        const expected_origin = if (event.origin_node == self.config.node_id) local: {
+            // A 64-bit mesh handle is only a routing accelerator. Do not let a
+            // (deliberate or accidental) short-id collision impersonate this
+            // daemon: local authorship must bind to the complete configured
+            // sovereign public key before the replay/history transaction.
+            const identity = self.config.node_identity orelse return null;
+            if (event.origin_pubkey.len != oper_event.pubkey_len or
+                !std.mem.eql(u8, event.origin_pubkey, &identity.sign_kp.public_key))
+                return null;
+            break :local self.serverName();
+        } else self.relayOriginServerName(event.origin_node) orelse return null;
+        if (!std.mem.eql(u8, event.origin_server, expected_origin)) return null;
+
+        // OEH1 is deliberately narrower than the protocol's future-facing
+        // origin bound. Reject before guard mutation if this build cannot retain
+        // the event exactly; accepted replay authority must never outrun history.
+        if (event.origin_server.len > event_history_mod.max_origin_len or
+            event.message.len > event_history_mod.max_message_len)
+            return null;
+
+        var category_valid = false;
+        inline for (@typeInfo(event_spine.EventCategory).@"enum".field_values) |value| {
+            if (value == event.category) category_valid = true;
+        }
+        if (!category_valid) return null;
+        var severity_valid = false;
+        inline for (@typeInfo(event_spine.EventSeverity).@"enum".field_values) |value| {
+            if (value == event.severity) severity_valid = true;
+        }
+        if (!severity_valid) return null;
+
+        const accepted_id: ?oper_event.EventId = blk: {
+            lockSpin(&self.event_spine_replay_mu);
+            defer self.event_spine_replay_mu.unlock();
+            // Stage the replay mutation in a complete candidate. Guard encode,
+            // decode, and candidate admission may allocate; none touches the
+            // live authority. OEH1 ingestion below is allocation-free after the
+            // width precheck and conflicts do not mutate. Only `.inserted`
+            // reaches the two no-fail publications (history append, then swap).
+            const guard_checkpoint = self.event_spine_replay_guard.encodeCheckpoint(self.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => break :blk null,
+            };
+            defer self.allocator.free(guard_checkpoint);
+            var guard_candidate = event_spine_replay_guard.Guard.decodeCheckpoint(
+                self.allocator,
+                self.event_spine_replay_guard.config,
+                guard_checkpoint,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => break :blk null,
+            };
+            defer guard_candidate.deinit();
+            const admission = try guard_candidate.admit(
+                event,
+                self.meshWallMs(),
+                mesh_clock_mod.default_max_future_skew_ms,
+            );
+            const event_id = switch (admission) {
+                .accepted => |id| id,
+                .duplicate,
+                .equivocation,
+                .retired,
+                .origin_capacity,
+                .origin_mismatch,
+                .bad_signature,
+                .invalid_semantic,
+                .future_skew,
+                => break :blk null,
+            };
+            const stable = event_history_mod.StableEvent{
+                .event_id = event_id,
+                .category = event.category,
+                .severity = event.severity,
+                .origin_ts_unix_ms = @intCast(@min(event.originTimeMs(), @as(u64, std.math.maxInt(i64)))),
+                .origin = event.origin_server,
+                .message = event.message,
+            };
+            const history_result = self.event_history.ingestStableEvent(stable) catch
+                break :blk null;
+            if (history_result != .inserted) break :blk null;
+            std.mem.swap(
+                event_spine_replay_guard.Guard,
+                &self.event_spine_replay_guard,
+                &guard_candidate,
+            );
+            break :blk event_id;
+        };
+        if (accepted_id != null) self.event_stats.record(event.category, event.severity);
+        return accepted_id;
+    }
+
+    /// Send one locally-authored immutable v2 object to capable secured peers.
+    /// A direct legacy peer receives a v1 terminal leaf copy; it cannot re-flood
+    /// that representation. Every v2 peer receives the same signed object.
+    fn meshBroadcastAuthoredOperEventV2(
+        self: *LinuxServer,
+        event: oper_event.SignedOperEventV2,
+    ) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (link.supportsEventSpineV2()) {
+                        _ = link.sendOperEventV2(event) catch continue;
+                    } else {
+                        link.sendOperEvent(event.category, event.severity, event.origin_server, event.message) catch continue;
+                    }
+                    _ = self.flushSecuredS2sOutboundTo(pid, link);
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendOperEvent(event.category, event.severity, event.origin_server, event.message) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
                 }
             }
         }
@@ -36269,8 +41813,7 @@ pub const LinuxServer = struct {
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     link.sendOperEvent(cat, sev, origin, message) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
+                    _ = self.flushSecuredS2sOutboundTo(pid, link);
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendOperEvent(cat, sev, origin, message) catch continue;
@@ -36310,6 +41853,51 @@ pub const LinuxServer = struct {
             self.event_history.record(ev.category, ev.severity, platform.realtimeMillis(), origin, ev.message);
             self.event_stats.record(ev.category, ev.severity);
             self.deliverOperEventLocal(origin, category, severity, ev.message, ev.message);
+        }
+    }
+
+    /// Admit signed Event Spine v2 objects through the daemon-global authority,
+    /// then deliver locally and re-flood the exact immutable byte image. The
+    /// transport already verified both immediate-hop and origin signatures, but
+    /// the global guard repeats the self-contained verification before durable
+    /// replay mutation; no per-link cache can authorize delivery.
+    fn drainOperEventsV2(self: *LinuxServer, link: *secured_s2s_link.SecuredLink) void {
+        const inbound = link.takeOperEventsV2() catch return;
+        defer {
+            for (inbound) |*item| item.deinit(self.allocator);
+            self.allocator.free(inbound);
+        }
+        for (inbound) |item| {
+            const event = oper_event.decodeV2(item.wire) catch continue;
+            const event_id = (self.admitEventSpineV2(event) catch null) orelse continue;
+
+            var category_opt: ?event_spine.EventCategory = null;
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".field_values) |value| {
+                if (value == event.category) category_opt = @enumFromInt(event.category);
+            }
+            const category = category_opt orelse continue;
+            const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
+            const severity: event_spine.EventSeverity = @enumFromInt(@min(event.severity, sev_max));
+            self.deliverOperEventV2Local(event, event_id, category, severity, event.subject);
+            self.meshForwardOperEventV2(item.wire);
+        }
+    }
+
+    /// Re-wrap one accepted OEVT v2 byte image for every capable secured peer.
+    /// `forwardOperEventV2` never rewrites the origin object. The inbound link's
+    /// reflection cache returns false, while the daemon-global guard prevents
+    /// delivery or forwarding again if the same object arrives by another path.
+    fn meshForwardOperEventV2(self: *LinuxServer, wire: []const u8) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsEventSpineV2()) continue;
+                const emitted = link.forwardOperEventV2(wire) catch continue;
+                if (!emitted) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
+            }
         }
     }
 
@@ -37207,7 +42795,11 @@ pub const LinuxServer = struct {
         // shared-secret or signed-token bytes.
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "ADMISSION")) {
             var b: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&b, "admission mode={s} secured_s2s={s} require_secured={s} require_signed_frames={s} roots={d} token_present={s} min_revocation_epoch={d}", .{
+            const relay_v2_roster_digest = std.fmt.bytesToHex(
+                self.relay_v2_activation_state.roster_digest,
+                .lower,
+            );
+            const line = std.fmt.bufPrint(&b, "admission mode={s} secured_s2s={s} require_secured={s} require_signed_frames={s} roots={d} token_present={s} min_revocation_epoch={d} relay_v2_bridge_implemented=true relay_v2_authoring={s} relay_v2_eligible={s} relay_v2_epoch={d} relay_v2_roster_count={d} relay_v2_roster_digest={s}", .{
                 self.meshAdmissionMode(),
                 if (self.s2sSecured()) "true" else "false",
                 if (self.config.require_secured) "true" else "false",
@@ -37215,6 +42807,14 @@ pub const LinuxServer = struct {
                 self.meshpass_roots.len,
                 if (self.mesh_admission_token.len != 0) "true" else "false",
                 self.config.mesh_admission_min_revocation_epoch,
+                @tagName(self.relay_v2_activation_state.mode),
+                if (self.authoredRelayV2Configured()) "true" else "false",
+                self.relay_v2_activation_state.activation_epoch,
+                self.config.relay_v2_roster.len,
+                if (self.relay_v2_activation_state.activation_epoch == 0)
+                    "none"
+                else
+                    &relay_v2_roster_digest,
             }) catch "admission status unavailable";
             try self.noticeTo(conn, line);
             if (self.meshpass_roots.len != 0 and !self.s2sSecured()) {
@@ -37624,7 +43224,7 @@ pub const LinuxServer = struct {
         const event_hlc = self.nextMeshHlc();
         const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
-        const message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
 
         var prefix_buf: [256]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -37648,6 +43248,58 @@ pub const LinuxServer = struct {
                 return;
             }
             if (try self.channelSpeechGate(id, conn, target, target, "", false, 0, false) != .allow) return;
+            const history_plan: ?RelayV2History = if (tagmsgHistoryEligible(tags)) .{
+                .target = target,
+                .sender = prefix,
+                .text = "",
+                .command = "TAGMSG",
+                .client_tags = tags,
+                .timestamp_ms = event_time_ms,
+            } else null;
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectChannelDeliveryIds(
+                target,
+                0,
+                if (echo) null else id,
+                tags,
+                &delivery_ids,
+            ) catch {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                return;
+            };
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (self.authoredRelayV2Configured()) {
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    .tagmsg,
+                    target,
+                    0,
+                    prefix,
+                    conn.session.account() orelse "",
+                    tags,
+                    "",
+                    "",
+                    .channel,
+                    "",
+                    self.portableSessionTokenForClient(id, conn),
+                    (self.world.memberModes(target, worldIdFromClient(id)) orelse
+                        world_model.MemberModes.empty()).bits,
+                    null,
+                    event_hlc,
+                    history_plan,
+                    .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+                ) catch {
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    return;
+                };
+                if (accepted_v2) |accepted|
+                    message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
+                else {
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    return;
+                }
+            }
             var members = self.world.memberIterator(target) orelse return;
             while (members.next()) |member| {
                 const mid = clientIdFromWorld(member.*);
@@ -37655,9 +43307,14 @@ pub const LinuxServer = struct {
                 const mconn = self.connFor(mid) orelse continue;
                 var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
                 if (clientTagsForSession(&mconn.session, tags, &visible_tags_buf).len == 0) continue;
-                try self.deliverTagged(mid, ctags, msg);
+                try self.deliverTaggedMode(
+                    mid,
+                    ctags,
+                    msg,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                );
             }
-            self.recordHistoryTagmsgAt(target, conn, message_id, tags, event_time_ms);
+            if (accepted_v2 == null) self.recordHistoryTagmsgAt(target, conn, message_id, tags, event_time_ms);
             // Channel TAGMSG is a first-class mesh event. Relay the sanitized
             // client-only tags with the SAME origin HLC used above; receivers
             // filter tags per-capability before delivery and store eligible
@@ -37680,7 +43337,8 @@ pub const LinuxServer = struct {
                 _ = self.relay_seen.observe(self.config.node_id, event_hlc)
             else
                 _ = self.relay_seen.observeUnsigned(self.config.node_id, event_hlc);
-            _ = self.relayToPeers(relay_msg, .{ .channel = target });
+            if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+            _ = self.relayLegacyToPeers(relay_msg, .{ .channel = target }, accepted_v2 != null);
             // #33: typing and reaction tags also feed the ACTIVITY stream.
             var tag_it = std.mem.splitScalar(u8, tags, ';');
             while (tag_it.next()) |pair| {
@@ -37700,17 +43358,211 @@ pub const LinuxServer = struct {
             }
             return;
         }
-        const recipient = self.world.findNick(target) orelse return;
-        const rconn = self.connFor(clientIdFromWorld(recipient)) orelse return;
-        var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
-        if (clientTagsForSession(&rconn.session, tags, &visible_tags_buf).len != 0) {
-            try self.deliverTagged(clientIdFromWorld(recipient), ctags, msg);
+        const recipient = self.world.findNick(target) orelse {
+            const recipient_token = self.detachedReplicaTokenForNick(target) orelse return;
+            if (self.config.node_identity == null) return;
+            const sender_token = self.portableSessionTokenForClient(id, conn);
+            var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer sender_ids.deinit(self.allocator);
+            self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch return;
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectDirectDeliveryIds(
+                &.{},
+                sender_ids.items,
+                id,
+                echo,
+                tags,
+                &delivery_ids,
+            ) catch return;
+            var accepted = (self.admitAuthoredRelayV2(
+                .tagmsg,
+                target,
+                0,
+                prefix,
+                conn.session.account() orelse "",
+                tags,
+                "",
+                "",
+                .direct,
+                "",
+                sender_token,
+                null,
+                recipient_token,
+                event_hlc,
+                null,
+                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+            ) catch {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                return;
+            }) orelse {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                return;
+            };
+            defer accepted.deinit(self.allocator);
+            message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+            self.forwardAcceptedRelayV2(accepted.wire);
+
+            var relay_msg = s2s_link.RelayMessage{
+                .verb = .tagmsg,
+                .target = target,
+                .source_nick = conn.session.displayName(),
+                .source_prefix = prefix,
+                .account = conn.session.account() orelse "",
+                .tags = tags,
+                .text = "",
+                .origin_node = self.config.node_id,
+                .hlc = event_hlc,
+            };
+            var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+            var sig_buf: [message_relay.sig_len]u8 = undefined;
+            self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+            _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
+                .nick = target,
+                .token = recipient_token,
+                .also_token = sender_token,
+            } }, true);
+
+            for (sender_ids.items) |sender_attachment| {
+                if (sender_attachment.eql(id) and !echo) continue;
+                const attachment = self.connFor(sender_attachment) orelse continue;
+                var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                if (clientTagsForSession(&attachment.session, tags, &visible_tags_buf).len == 0) continue;
+                self.deliverPreparedTagged(sender_attachment, ctags, msg) catch {};
+            }
+            return;
+        };
+        const recipient_id = clientIdFromWorld(recipient);
+        const rconn = self.connFor(recipient_id) orelse return;
+        var recipient_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipient_ids.deinit(self.allocator);
+        self.collectAttachedExactTokenClients(recipient_id, rconn, &recipient_ids) catch {
+            try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+            return;
+        };
+        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer sender_ids.deinit(self.allocator);
+        if (!self.clientsShareExactToken(id, conn, recipient_id, rconn)) {
+            self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                return;
+            };
         }
-        if (echo) try self.deliverTagged(id, ctags, msg);
         const recipient_account = rconn.session.account();
         var dm_key_buf: [320]u8 = undefined;
-        if (dmHistoryKey(conn.session.displayName(), conn.session.account(), target, recipient_account, &dm_key_buf)) |store_target| {
-            self.recordHistoryTagmsgAt(store_target, conn, message_id, tags, event_time_ms);
+        const store_target = dmHistoryKey(
+            conn.session.displayName(),
+            conn.session.account(),
+            target,
+            recipient_account,
+            &dm_key_buf,
+        );
+        const sender_token = self.portableSessionTokenForClient(id, conn);
+        const recipient_token = self.portableSessionTokenForClient(recipient_id, rconn);
+        var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer delivery_ids.deinit(self.allocator);
+        self.collectDirectDeliveryIds(
+            recipient_ids.items,
+            sender_ids.items,
+            id,
+            echo,
+            tags,
+            &delivery_ids,
+        ) catch {
+            try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+            return;
+        };
+        var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+        defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+        if (recipient_token != null and self.authoredRelayV2Configured()) {
+            accepted_v2 = self.admitAuthoredRelayV2(
+                .tagmsg,
+                target,
+                0,
+                prefix,
+                conn.session.account() orelse "",
+                tags,
+                "",
+                "",
+                .direct,
+                "",
+                sender_token,
+                null,
+                recipient_token,
+                event_hlc,
+                if (store_target) |key| if (tagmsgHistoryEligible(tags)) .{
+                    .target = key,
+                    .sender = prefix,
+                    .text = "",
+                    .command = "TAGMSG",
+                    .client_tags = tags,
+                    .timestamp_ms = event_time_ms,
+                } else null else null,
+                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+            ) catch {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                return;
+            };
+            if (accepted_v2) |accepted|
+                message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
+            else {
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                return;
+            }
+        }
+        for (recipient_ids.items) |recipient_attachment| {
+            const attachment = self.connFor(recipient_attachment) orelse continue;
+            var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+            if (clientTagsForSession(&attachment.session, tags, &visible_tags_buf).len == 0) continue;
+            self.deliverTaggedMode(
+                recipient_attachment,
+                ctags,
+                msg,
+                if (accepted_v2 != null) .prepared_batch else .ordinary,
+            ) catch {};
+        }
+        for (sender_ids.items) |sender_attachment| {
+            if (sender_attachment.eql(id) and !echo) continue;
+            var already_recipient = false;
+            for (recipient_ids.items) |recipient_attachment| if (sender_attachment.eql(recipient_attachment)) {
+                already_recipient = true;
+                break;
+            };
+            if (already_recipient) continue;
+            const attachment = self.connFor(sender_attachment) orelse continue;
+            var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+            if (clientTagsForSession(&attachment.session, tags, &visible_tags_buf).len == 0) continue;
+            self.deliverTaggedMode(
+                sender_attachment,
+                ctags,
+                msg,
+                if (accepted_v2 != null) .prepared_batch else .ordinary,
+            ) catch {};
+        }
+        if (accepted_v2) |accepted| {
+            self.forwardAcceptedRelayV2(accepted.wire);
+            var relay_msg = s2s_link.RelayMessage{
+                .verb = .tagmsg,
+                .target = target,
+                .source_nick = conn.session.displayName(),
+                .source_prefix = prefix,
+                .account = conn.session.account() orelse "",
+                .tags = tags,
+                .text = "",
+                .origin_node = self.config.node_id,
+                .hlc = event_hlc,
+            };
+            var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+            var sig_buf: [message_relay.sig_len]u8 = undefined;
+            self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+            _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
+                .nick = target,
+                .token = recipient_token.?,
+                .also_token = sender_token,
+            } }, true);
+        }
+        if (accepted_v2 == null) {
+            if (store_target) |key| self.recordHistoryTagmsgAt(key, conn, message_id, tags, event_time_ms);
         }
     }
 
@@ -38133,7 +43985,7 @@ pub const LinuxServer = struct {
         const event_hlc = self.nextMeshHlc();
         const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
-        const message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
 
         // IRCv3 echo-message: a sender that negotiated the cap also receives its
         // own message back, byte-identical to what recipients see (`msg`).
@@ -38191,8 +44043,6 @@ pub const LinuxServer = struct {
             if (!is_notice and text.len > 1 and text[0] == '!') {
                 self.handleFantasy(id, conn, chan, text);
             }
-            var time_buf: [40]u8 = undefined;
-            const ctags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
             var nf_text_buf: [1024]u8 = undefined;
@@ -38211,20 +44061,94 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
             if (opmod_route) {
-                // +U opmoderate: the sender was muted (+m/+M/+Z) but the channel
-                // routes blocked messages to ops instead of dropping them. Deliver
-                // to ops-and-above only (rank >= 2); no sender error, no echo, no
-                // history, no cross-node relay — ops locally see what was attempted.
-                try self.broadcastChannelMinRank(chan, ctags, eff_msg, id, 2);
+                // +U is intentionally a local moderation side-channel: it has
+                // no mesh authority, no Lotus row, and no cross-node flood.
+                var held_time_buf: [40]u8 = undefined;
+                const held_tags = MsgTags{ .time_value = serverTimeValueAt(&held_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+                try self.broadcastChannelMinRank(chan, held_tags, eff_msg, id, 2, .ordinary);
                 self.publishModerationHeld(chan, conn, eff_text);
                 return;
             }
-            if (min_rank == 0) {
-                try self.broadcastChannelTagged(chan, ctags, eff_msg, id);
-            } else {
-                try self.broadcastChannelMinRank(chan, ctags, eff_msg, id, min_rank);
+            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+            defer delivery_ids.deinit(self.allocator);
+            self.collectChannelDeliveryIds(
+                chan,
+                min_rank,
+                if (echo) null else id,
+                null,
+                &delivery_ids,
+            ) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                return;
+            };
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (self.authoredRelayV2Configured()) {
+                var authored_prefix_buf: [320]u8 = undefined;
+                const authored_prefix = clientPrefix(conn, &authored_prefix_buf) catch return;
+                const history_plan: ?RelayV2History = if (min_rank == 0) .{
+                    .target = chan,
+                    .sender = authored_prefix,
+                    .text = eff_text,
+                    .command = command,
+                    .client_tags = clean_client_tags,
+                    .timestamp_ms = event_time_ms,
+                } else null;
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    if (is_notice) .notice else .privmsg,
+                    chan,
+                    min_rank,
+                    authored_prefix,
+                    conn.session.account() orelse "",
+                    clean_client_tags orelse "",
+                    "",
+                    eff_text,
+                    .channel,
+                    "",
+                    self.portableSessionTokenForClient(id, conn),
+                    (self.world.memberModes(chan, worldIdFromClient(id)) orelse
+                        world_model.MemberModes.empty()).bits,
+                    null,
+                    event_hlc,
+                    history_plan,
+                    .{ .recipients = delivery_ids.items, .line = eff_msg, .is_bot = conn.session.isBot() },
+                ) catch {
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                    return;
+                };
+                if (accepted_v2) |accepted| {
+                    message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+                } else {
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                    return;
+                }
             }
-            if (echo) try self.deliverTagged(id, ctags, eff_msg);
+            var time_buf: [40]u8 = undefined;
+            const ctags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+            if (min_rank == 0) {
+                try self.broadcastChannelTagged(
+                    chan,
+                    ctags,
+                    eff_msg,
+                    id,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                );
+            } else {
+                try self.broadcastChannelMinRank(
+                    chan,
+                    ctags,
+                    eff_msg,
+                    id,
+                    min_rank,
+                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                );
+            }
+            if (echo) try self.deliverTaggedMode(
+                id,
+                ctags,
+                eff_msg,
+                if (accepted_v2 != null) .prepared_batch else .ordinary,
+            );
             // Cross-node relay: forward this channel message to mesh peers so
             // remote members of `chan` receive it. Loop-guarded; the far side
             // delivers only to its own local members. Best-effort.
@@ -38248,13 +44172,26 @@ pub const LinuxServer = struct {
                     var pk_buf: [message_relay.pubkey_len]u8 = undefined;
                     var sig_buf: [message_relay.sig_len]u8 = undefined;
                     self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
-                    _ = self.relayToPeers(relay_msg, .{ .channel = chan }); // route_table: only peers with members
+                    if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+                    _ = self.relayLegacyToPeers(
+                        relay_msg,
+                        .{ .channel = chan },
+                        accepted_v2 != null,
+                    ); // route_table: only peers with members
                 } else |_| {}
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
             // chan). Only the message body + sender prefix are stored.
             if (min_rank == 0) {
-                self.recordHistoryAt(chan, conn, message_id, command, eff_text, clean_client_tags, event_time_ms);
+                if (accepted_v2 != null) {
+                    self.search_index.index(message_id, eff_text) catch {};
+                    var history_prefix_buf: [256]u8 = undefined;
+                    if (clientPrefix(conn, &history_prefix_buf)) |history_prefix|
+                        self.chanstatsMessage(chan, history_prefix, command, eff_text)
+                    else |_| {}
+                } else {
+                    self.recordHistoryAt(chan, conn, message_id, command, eff_text, clean_client_tags, event_time_ms);
+                }
                 // Record the conversation label in the channel's browsable topic
                 // registry (mesh-propagated channel PROP), gated to rank-0 so the
                 // registry stays aligned with the history CHATHISTORY can filter
@@ -38267,7 +44204,7 @@ pub const LinuxServer = struct {
         const recipient = self.world.findNick(target) orelse {
             // Not local: relay to mesh peers so the node that owns this nick can
             // deliver (loop-guarded; a truly-nonexistent nick is dropped far-side).
-            if (self.hasEstablishedPeer()) {
+            if (self.hasEstablishedPeer() or self.detachedReplicaTokenForNick(target) != null) {
                 var pbuf2: [320]u8 = undefined;
                 if (clientPrefix(conn, &pbuf2)) |prefix| {
                     const recipient_token = self.detachedReplicaTokenForNick(target);
@@ -38282,10 +44219,54 @@ pub const LinuxServer = struct {
                         if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
                         return;
                     };
+                    var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+                    defer delivery_ids.deinit(self.allocator);
+                    self.collectDirectDeliveryIds(
+                        &.{},
+                        local_sender_ids.items,
+                        id,
+                        echo,
+                        null,
+                        &delivery_ids,
+                    ) catch {
+                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                        return;
+                    };
                     const exact_sender_token: ?sessions_mod.Token = if (conn.session.account()) |account| blk: {
                         const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse break :blk null;
                         break :blk if (tokenIsNull(handle.token)) null else handle.token;
                     } else null;
+                    var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+                    defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+                    if (recipient_token != null and self.authoredRelayV2Configured()) {
+                        accepted_v2 = self.admitAuthoredRelayV2(
+                            if (is_notice) .notice else .privmsg,
+                            target,
+                            0,
+                            prefix,
+                            conn.session.account() orelse "",
+                            clean_client_tags orelse "",
+                            "",
+                            text,
+                            .direct,
+                            "",
+                            exact_sender_token,
+                            null,
+                            recipient_token,
+                            event_hlc,
+                            null,
+                            .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+                        ) catch {
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                            return;
+                        };
+                        if (accepted_v2) |accepted| {
+                            message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+                        } else {
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                            return;
+                        }
+                    }
                     _ = self.relay_seen.observe(self.config.node_id, event_hlc);
                     var relay_tag_buf: [256]u8 = undefined;
                     var relay_msg = s2s_link.RelayMessage{
@@ -38316,7 +44297,13 @@ pub const LinuxServer = struct {
                         } }
                     else
                         .{ .nick = target };
-                    if (self.relayToPeers(relay_msg, relay_scope) == 0) {
+                    if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+                    const legacy_relays = self.relayLegacyToPeers(
+                        relay_msg,
+                        relay_scope,
+                        accepted_v2 != null,
+                    );
+                    if (legacy_relays == 0 and accepted_v2 == null) {
                         if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
                         return;
                     }
@@ -38324,7 +44311,12 @@ pub const LinuxServer = struct {
                     const etags = MsgTags{ .time_value = serverTimeValueAt(&et_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
                     for (local_sender_ids.items) |logical_id| {
                         if (logical_id.eql(id) and !echo) continue;
-                        self.deliverTagged(logical_id, etags, msg) catch {};
+                        self.deliverTaggedMode(
+                            logical_id,
+                            etags,
+                            msg,
+                            if (accepted_v2 != null) .prepared_batch else .ordinary,
+                        ) catch {};
                     }
                     if (conn.session.account()) |sender_account| {
                         self.deliverSessionSyncSiblingsNick(sender_account, exact_sender_token, null, etags, msg, id, null, conn.session.displayName(), null);
@@ -38435,13 +44427,89 @@ pub const LinuxServer = struct {
                 return;
             };
         }
+        var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+        defer delivery_ids.deinit(self.allocator);
+        self.collectDirectDeliveryIds(
+            recipient_ids.items,
+            sender_ids.items,
+            id,
+            echo,
+            null,
+            &delivery_ids,
+        ) catch {
+            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+            return;
+        };
+        const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
+        var accepted_direct_v2: ?AcceptedAuthoredRelayV2 = null;
+        defer if (accepted_direct_v2) |*accepted| accepted.deinit(self.allocator);
+        var direct_history_key_buf: [320]u8 = undefined;
+        var direct_history_key: ?[]const u8 = null;
+        if (recipient_exact_token != null and self.authoredRelayV2Configured()) {
+            const authored_prefix = try clientPrefix(conn, &prefix_buf);
+            const history_plan: ?RelayV2History = if (!is_notice)
+                if (dmHistoryKey(
+                    conn.session.displayName(),
+                    conn.session.account(),
+                    target,
+                    recipient_account,
+                    &direct_history_key_buf,
+                )) |key| blk: {
+                    direct_history_key = key;
+                    break :blk .{
+                        .target = key,
+                        .sender = authored_prefix,
+                        .text = text,
+                        .command = command,
+                        .client_tags = clean_client_tags,
+                        .timestamp_ms = event_time_ms,
+                    };
+                } else null
+            else
+                null;
+            accepted_direct_v2 = self.admitAuthoredRelayV2(
+                if (is_notice) .notice else .privmsg,
+                target,
+                0,
+                authored_prefix,
+                conn.session.account() orelse "",
+                clean_client_tags orelse "",
+                "",
+                text,
+                .direct,
+                "",
+                sender_exact_token,
+                null,
+                recipient_exact_token,
+                event_hlc,
+                history_plan,
+                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+            ) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                return;
+            };
+            if (accepted_direct_v2) |accepted| {
+                message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+                if (direct_history_key) |key| {
+                    self.search_index.index(message_id, text) catch {};
+                    self.chanstatsMessage(key, authored_prefix, command, text);
+                }
+            } else {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                return;
+            }
+        }
         var time_buf: [40]u8 = undefined;
         const dtags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
         // Every exact recipient attachment participates independently. A full or
         // closing owner's queue cannot prevent its siblings from receiving the
         // event. Same-account/same-nick DIFFERENT tokens are absent by design.
-        for (recipient_ids.items) |logical_id| self.deliverTagged(logical_id, dtags, msg) catch {};
-        const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
+        for (recipient_ids.items) |logical_id| self.deliverTaggedMode(
+            logical_id,
+            dtags,
+            msg,
+            if (accepted_direct_v2 != null) .prepared_batch else .ordinary,
+        ) catch {};
         const sender_account = conn.session.account();
         const same_account = if (sender_account) |sa|
             if (recipient_account) |ra| std.ascii.eqlIgnoreCase(sa, ra) else false
@@ -38450,7 +44518,12 @@ pub const LinuxServer = struct {
         if (!same_logical_session) {
             for (sender_ids.items) |logical_id| {
                 if (logical_id.eql(id) and !echo) continue;
-                self.deliverTagged(logical_id, dtags, msg) catch {};
+                self.deliverTaggedMode(
+                    logical_id,
+                    dtags,
+                    msg,
+                    if (accepted_direct_v2 != null) .prepared_batch else .ordinary,
+                ) catch {};
             }
         }
         if (same_account) {
@@ -38537,10 +44610,15 @@ pub const LinuxServer = struct {
                     } }
                 else
                     .{ .nick = route_nick };
-                _ = self.relayToPeers(relay_msg, relay_scope);
+                if (accepted_direct_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
+                _ = self.relayLegacyToPeers(
+                    relay_msg,
+                    relay_scope,
+                    accepted_direct_v2 != null,
+                );
             } else |_| {}
         }
-        if (!is_notice) {
+        if (!is_notice and accepted_direct_v2 == null) {
             var dm_key_buf: [320]u8 = undefined;
             if (dmHistoryKey(conn.session.displayName(), conn.session.account(), target, recipient_account, &dm_key_buf)) |store_target| {
                 self.recordHistoryAt(store_target, conn, message_id, command, text, clean_client_tags, event_time_ms);
@@ -38912,7 +44990,10 @@ const CompletionHandler = struct {
     err: ?anyerror = null,
 
     fn onCompletion(self: *CompletionHandler, completion: ringlane.Completion) void {
-        if (self.err != null) return;
+        // Never abandon the remainder of a CQE batch after one handler error.
+        // Later CQEs may be the exact RECV/SEND ownership releases that make a
+        // connection safe to close or a Helix snapshot exact. Preserve only the
+        // first error for the caller while dispatching every copied completion.
         // World-lock boundary (multithreading Phase B): take the shared world's
         // write lock once around the whole completion so concurrent reactors
         // serialize all world (channel/nick/membership) reads + mutations + the
@@ -38924,7 +45005,7 @@ const CompletionHandler = struct {
         defer self.server.world.unlockWrite();
         switch (completion) {
             .accept => |event| self.server.handleAccept(event) catch |err| {
-                self.err = err;
+                if (self.err == null) self.err = err;
             },
             .recv => |event| self.server.handleRecv(event) catch |err| {
                 self.recordOpErr(err);
@@ -38952,7 +45033,7 @@ const CompletionHandler = struct {
     /// here is a benign lifecycle event, not a fatal loop error.
     fn recordOpErr(self: *CompletionHandler, err: anyerror) void {
         if (err == error.ClientNotFound) return;
-        self.err = err;
+        if (self.err == null) self.err = err;
     }
 };
 
@@ -39433,6 +45514,43 @@ fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     conn.send_overflow.appendSlice(conn.overflow_allocator, bytes) catch return error.OutputTooSmall;
 }
 
+/// Reserve the exact SendQ storage needed by one already-sized secured record
+/// before advancing the link's AEAD send counter. Once this succeeds,
+/// `rawAppendToConn` cannot fail for capacity or allocation, so replay never has
+/// to leave counter-owning ciphertext in a shared SecuredLink outbound buffer.
+fn reserveRawAppendToConn(conn: *ConnState, bytes_len: usize) ServerError!void {
+    const inline_queued = conn.send_len - conn.send_offset;
+    const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch
+        return error.OutputTooSmall;
+    if (queued > conn.sendq_cap or bytes_len > conn.sendq_cap - queued)
+        return error.OutputTooSmall;
+
+    if (conn.send_overflow.items.len == 0) {
+        if (conn.send_len + bytes_len <= conn.send_buf.len) return;
+        if (!conn.send_armed and conn.send_offset != 0 and
+            inline_queued + bytes_len <= conn.send_buf.len) return;
+    }
+    conn.send_overflow.ensureUnusedCapacity(conn.overflow_allocator, bytes_len) catch
+        return error.OutputTooSmall;
+}
+
+/// Exact outer Tsumugi record size for one signed SESSION_REPLICA object. A v2
+/// peer necessarily negotiated the direct signed envelope, and SecuredLink
+/// seals each inner drain into one `[u32 length][ciphertext][tag]` record.
+fn sessionReplicaSecuredRecordLen(signed_payload_len: usize) ?usize {
+    const transport_len = session_replica_frame.encodedLen(signed_payload_len) catch return null;
+    const inner_len = std.math.add(
+        usize,
+        s2s_frame.header_len + signed_s2s_frame.header_len,
+        transport_len,
+    ) catch return null;
+    return std.math.add(
+        usize,
+        inner_len,
+        @sizeOf(u32) + std.crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length,
+    ) catch null;
+}
+
 /// Refill the drained inline `send_buf` with the next chunk of the SendQ overflow.
 /// Called from the send-completion handler with nothing armed, so writing the
 /// inline buffer is safe. The overflow heap is freed entirely once fully drained
@@ -39847,6 +45965,8 @@ test "session replica replay skips attachment leases for rolling-old peers witho
     defer pair.deinit();
     pair.a.clearOutbound();
     pair.b.clearOutbound();
+    try std.testing.expect(pair.a.supportsSecureRelayV2());
+    try std.testing.expect(pair.a.supportsEventSpineV2());
     if (pair.a.inner) |inner| {
         inner.peer.peer_supports_session_attachment_lease_v2 = false;
     } else return error.TestUnexpectedResult;
@@ -39895,7 +46015,7 @@ test "session replica replay skips attachment leases for rolling-old peers witho
     try std.testing.expectEqual(s2s_link.SessionReplicaKind.offer, frames[0].kind);
 }
 
-test "session replica repeated RESYNC replays canonical Store without revision churn or cursor reset" {
+test "session replica mid-flight RESYNC restarts canonical Store without revision churn" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -39935,28 +46055,131 @@ test "session replica repeated RESYNC replays canonical Store without revision c
         if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     }
 
-    try pair.b.sendResync();
-    const first = try allocator.dupe(u8, pair.b.outbound());
-    defer allocator.free(first);
-    pair.b.clearOutbound();
-    server.driveS2sSecured(&conn, &pair.a, first);
+    // Model an establishment replay already in flight before the peer resets
+    // its converged view and asks for its first RESYNC burst.
+    server.scheduleSessionReplicaReplay(&conn);
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expect(conn.session_replica_replay_pending);
     try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
     const cutoff = conn.session_replica_replay_now_ms;
     try std.testing.expectEqual(generation, server.session_replica_store_generation);
     try std.testing.expect(server.session_replica_store.maxAuthorityRevision().?.eql(maximum));
 
-    // A repeated authenticated request coalesces with the in-flight pass. It
-    // advances the remaining page instead of restarting at object zero.
+    // The peer's RESYNC contract resets its converged view to empty. Its first
+    // request arriving mid-page must therefore restart from object zero;
+    // continuing the old cursor would send only the final two objects and then
+    // release roster.
+    resetTestSendQ(&conn);
     try pair.b.sendResync();
     const second = try allocator.dupe(u8, pair.b.outbound());
     defer allocator.free(second);
     pair.b.clearOutbound();
     server.driveS2sSecured(&conn, &pair.a, second);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
+    try std.testing.expect(conn.session_replica_replay_now_ms >= cutoff);
+
+    // Reset the receiver a SECOND time before the restarted pass reaches its
+    // tail. This request must not be swallowed by the coalescing latch: the
+    // current tail completes, then the replay wraps to object zero for the new
+    // reset generation.
+    resetTestSendQ(&conn);
+    try pair.b.sendResync();
+    const third = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(third);
+    pair.b.clearOutbound();
+    server.driveS2sSecured(&conn, &pair.a, third);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
+    try std.testing.expect(conn.session_replica_replay_after == null);
+
+    // The second reset's complete pass must expose page one again before its
+    // tail is allowed to clear the pending burst.
+    resetTestSendQ(&conn);
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
+    resetTestSendQ(&conn);
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expect(!conn.session_replica_replay_pending);
-    try std.testing.expectEqual(cutoff, conn.session_replica_replay_now_ms);
     try std.testing.expectEqual(generation, server.session_replica_store_generation);
     try std.testing.expect(server.session_replica_store.maxAuthorityRevision().?.eql(maximum));
+}
+
+test "session replica value replay completes 140 objects under continuous behind-cursor renewal" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "stable-replay.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const object_count = 140;
+    for (0..object_count) |index| {
+        var token: session_migrate.Token = @splat(0);
+        std.mem.writeInt(u16, token[token.len - 2 ..][0..2], @intCast(index + 1), .big);
+        try std.testing.expect(server.publishSessionReplicaUpsert(token, "alice", "Alice", "initial", false));
+    }
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.sendq_cap = default_sendq_cap;
+    defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    server.scheduleSessionReplicaReplay(&conn);
+
+    var seen: [object_count]bool = @splat(false);
+    var turns: usize = 0;
+    while (conn.session_replica_replay_pending and turns < 24) : (turns += 1) {
+        resetTestSendQ(&conn);
+        server.replaySessionReplicaStoreTo(&conn, &pair.a);
+        const ciphertext = try copyTestSendQ(allocator, &conn);
+        defer allocator.free(ciphertext);
+        try pair.b.feed(ciphertext, @intCast(500 + turns));
+        const frames = try pair.b.takeSessionReplicaFrames();
+        defer {
+            for (frames) |*frame| frame.deinit(allocator);
+            allocator.free(frames);
+        }
+        for (frames) |frame| {
+            if (frame.kind != .offer) continue;
+            const signed = try session_replica_v2.decodeOffer(frame.signed_payload);
+            const value = std.mem.readInt(u16, signed.offer.token[signed.offer.token.len - 2 ..][0..2], .big);
+            try std.testing.expect(value >= 1 and value <= object_count);
+            seen[value - 1] = true;
+        }
+
+        if (conn.session_replica_replay_pending) {
+            // Replace an object lexicographically behind the current cursor on
+            // every page. The old numeric/hash iterator reset here forever once
+            // the Store exceeded roughly 120 objects under normal lease cadence.
+            var behind: session_migrate.Token = @splat(0);
+            std.mem.writeInt(u16, behind[behind.len - 2 ..][0..2], 1, .big);
+            try std.testing.expect(server.publishSessionReplicaUpsert(
+                behind,
+                "alice",
+                "Alice",
+                "renewed-behind-cursor",
+                false,
+            ));
+        }
+    }
+    try std.testing.expect(!conn.session_replica_replay_pending);
+    try std.testing.expect(turns <= 18);
+    for (seen) |present| try std.testing.expect(present);
 }
 
 test "session replica conflicted lease replays both witnesses back to ingress peer" {
@@ -40044,7 +46267,7 @@ test "session replica conflicted lease replays both witnesses back to ingress pe
     try std.testing.expect(!std.mem.eql(u8, frames[0].signed_payload, frames[1].signed_payload));
 }
 
-test "session replica retained replay preserves ciphertext under backpressure and resumes at eight frames" {
+test "session replica replay preflights SendQ before AEAD advance and resumes at eight frames" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -40086,24 +46309,22 @@ test "session replica retained replay preserves ciphertext under backpressure an
     server.scheduleSessionReplicaReplay(&conn);
     server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
-    try std.testing.expect(conn.session_replica_replay_frame_pending);
-    try std.testing.expect(pair.a.outbound().len != 0);
-    const retained_ciphertext = try allocator.dupe(u8, pair.a.outbound());
-    defer allocator.free(retained_ciphertext);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
 
-    // Resume with room. The retained record counts as frame one, so this turn
-    // may encode only seven more: never nine after a backpressured carry-over.
+    // Resume with room. The first attempt did not advance the encrypted record
+    // counter or manufacture shared outbound ownership, so this turn may encode
+    // the ordinary eight-record page exactly once.
+    resetTestSendQ(&conn);
     conn.sendq_cap = default_sendq_cap;
     server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expect(conn.session_replica_replay_pending);
     try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
-    try std.testing.expect(!conn.session_replica_replay_frame_pending);
     try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
-    try std.testing.expect(conn.send_overflow.items.len >= retained_ciphertext.len);
-    try std.testing.expectEqualSlices(u8, retained_ciphertext, conn.send_overflow.items[0..retained_ciphertext.len]);
 
     var seen: [10]bool = @splat(false);
-    try pair.b.feed(conn.send_overflow.items, 100);
+    const first_page = try copyTestSendQ(allocator, &conn);
+    defer allocator.free(first_page);
+    try pair.b.feed(first_page, 100);
     {
         const frames = try pair.b.takeSessionReplicaFrames();
         defer {
@@ -40346,6 +46567,581 @@ test "session replica gates establishment and RESYNC membership behind every ret
     try std.testing.expect(!conn.session_replica_resync_burst_pending);
 }
 
+test "session replica burst retains whole-record ciphertext across SendQ backpressure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "burst-retry-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A token-less local member keeps this test focused on authenticated record
+    // continuity rather than residence admission (covered by the gate campaign
+    // above).
+    const local_id = try addTestLocalClient(&server, "BurstLocal", null);
+    try server.world.restoreMember("#burst-retry", worldIdFromClient(local_id), world_model.MemberModes.empty());
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.s2s_secured = &pair.a;
+    defer {
+        conn.s2s_secured = null;
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    }
+
+    // Leave no SendQ room at the exact roster-release edge. The burst flags and
+    // family cursor must remain pending, and the already-sealed membership
+    // record must remain byte-identical in SecuredLink.
+    const filler: [32]u8 = @splat(0x5a);
+    conn.sendq_cap = filler.len;
+    try rawAppendToConn(&conn, &filler);
+    server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn.s2s_burst_done);
+    try std.testing.expectEqual(MeshBurstStage.membership, conn.mesh_burst_stage);
+    try std.testing.expect(conn.mesh_burst_stage_encoded);
+    try std.testing.expect(pair.a.outbound().len != 0);
+    const retained = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(retained);
+
+    // The receiver resets while that first pass is still retained. Preserve the
+    // sealed record, replay authority, and require a membership-first wrap after
+    // the interrupted pass rather than resuming only its later families.
+    try pair.b.sendResync();
+    const inbound_resync = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(inbound_resync);
+    pair.b.clearOutbound();
+    server.driveS2sSecured(&conn, &pair.a, inbound_resync);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    try std.testing.expect(conn.mesh_burst_restart_pending);
+
+    // Once the socket queue drains, retry consumes only complete records, keeps
+    // the retained bytes as the exact prefix, and clears the gate only after the
+    // interrupted pass AND a fresh full pass have entered SendQ.
+    resetTestSendQ(&conn);
+    conn.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
+    try std.testing.expect(!conn.session_replica_replay_pending);
+    server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(conn.s2s_burst_done);
+    try std.testing.expect(!conn.session_replica_resync_burst_pending);
+    try std.testing.expectEqual(MeshBurstStage.idle, conn.mesh_burst_stage);
+    try std.testing.expect(!conn.mesh_burst_stage_encoded);
+    try std.testing.expect(!conn.mesh_burst_restart_pending);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    const burst = try copyTestSendQ(allocator, &conn);
+    defer allocator.free(burst);
+    try std.testing.expect(burst.len >= retained.len);
+    try std.testing.expectEqualSlices(u8, retained, burst[0..retained.len]);
+
+    // Observe the retained pre-reset membership first, then the remaining old
+    // families plus the mandatory fresh membership pass. Draining between them
+    // prevents the receiver's LWW change queue from coalescing the two facts.
+    try pair.b.feed(burst[0..retained.len], 400);
+    pair.b.processDeferredResidenceFrames(400);
+    var interrupted_hlc: ?u64 = null;
+    {
+        const membership = try pair.b.takeMembershipChanges();
+        defer {
+            for (membership) |*change| change.deinit(allocator);
+            allocator.free(membership);
+        }
+        var saw_channel = false;
+        for (membership) |change| {
+            if (std.ascii.eqlIgnoreCase(change.channel, "#burst-retry")) saw_channel = true;
+        }
+        try std.testing.expect(saw_channel);
+        for (pair.b.channelMembers("#burst-retry")) |member| {
+            if (std.ascii.eqlIgnoreCase(member.nick, "BurstLocal")) interrupted_hlc = member.hlc;
+        }
+        try std.testing.expect(interrupted_hlc != null);
+    }
+    try pair.b.feed(burst[retained.len..], 401);
+    pair.b.processDeferredResidenceFrames(401);
+    {
+        const membership = try pair.b.takeMembershipChanges();
+        defer {
+            for (membership) |*change| change.deinit(allocator);
+            allocator.free(membership);
+        }
+        // An identical PRESENT refresh need not enqueue another user-visible
+        // delta, but its newer HLC must prove the fresh pass was accepted.
+        var fresh_hlc: ?u64 = null;
+        for (pair.b.channelMembers("#burst-retry")) |member| {
+            if (std.ascii.eqlIgnoreCase(member.nick, "BurstLocal")) fresh_hlc = member.hlc;
+        }
+        try std.testing.expect(fresh_hlc != null);
+        try std.testing.expect(fresh_hlc.? > interrupted_hlc.?);
+    }
+
+    // A later authenticated record must still verify. If the denied attempt had
+    // cleared even one ciphertext record, this feed would fail with AuthFailed
+    // because the receiver's record counter would lag the sender's.
+    try pair.a.sendResync();
+    const later = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(later);
+    pair.a.clearOutbound();
+    try pair.b.feed(later, 402);
+}
+
+test "session replica live fanout preserves retained ciphertext on a full peer SendQ" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "fanout-backpressure-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const local_id = try addTestLocalClient(&server, "FanoutLocal", null);
+    try server.world.restoreMember("#fanout-backpressure", worldIdFromClient(local_id), world_model.MemberModes.empty());
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.overflow_allocator = allocator;
+    peer.token = try tokenFromId(peer_id);
+    peer.send_armed = true;
+    peer.s2s_secured = &pair.a;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const filler: [32]u8 = @splat(0x6d);
+    peer.sendq_cap = filler.len;
+    try rawAppendToConn(peer, &filler);
+    server.releaseMeshBurstAfterSessionReplicaReplay(peer, &pair.a);
+    try std.testing.expect(!peer.closing);
+    try std.testing.expectEqual(MeshBurstStage.membership, peer.mesh_burst_stage);
+    try std.testing.expect(peer.mesh_burst_stage_encoded);
+    const retained = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(retained);
+    try std.testing.expect(retained.len != 0);
+
+    // A live Store advance while the roster record is retained used to route
+    // through generic recipient delivery, poison the peer, and clear BOTH
+    // records. The secured edge must retain the exact prefix and schedule replay.
+    const token: session_migrate.Token = @splat(0x82);
+    for (0..64) |revision| {
+        var snapshot_buf: [32]u8 = undefined;
+        const snapshot = try std.fmt.bufPrint(&snapshot_buf, "fanout-{d}", .{revision});
+        try std.testing.expect(server.publishSessionReplicaUpsert(token, "alice", "Alice", snapshot, false));
+        try std.testing.expectEqual(retained.len, pair.a.outbound().len);
+    }
+    try std.testing.expect(!peer.delivery_gap.load(.acquire));
+    try std.testing.expect(!peer.closing);
+    try std.testing.expect(peer.session_replica_replay_pending);
+    try std.testing.expectEqual(retained.len, pair.a.outbound().len);
+    try std.testing.expectEqualSlices(u8, retained, pair.a.outbound());
+
+    resetTestSendQ(peer);
+    peer.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    server.replaySessionReplicaStoreTo(peer, &pair.a);
+    server.releaseMeshBurstAfterSessionReplicaReplay(peer, &pair.a);
+    try std.testing.expect(!peer.closing);
+    try std.testing.expect(!peer.delivery_gap.load(.acquire));
+    try std.testing.expect(!peer.session_replica_replay_pending);
+    try std.testing.expect(peer.s2s_burst_done);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+
+    const ciphertext = try copyTestSendQ(allocator, peer);
+    defer allocator.free(ciphertext);
+    try pair.b.feed(ciphertext, 450);
+    pair.b.processDeferredResidenceFrames(450);
+    const frames = try pair.b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expect(frames.len >= 1);
+    var saw_member = false;
+    for (pair.b.channelMembers("#fanout-backpressure")) |member| {
+        if (std.ascii.eqlIgnoreCase(member.nick, "FanoutLocal")) saw_member = true;
+    }
+    try std.testing.expect(saw_member);
+
+    try pair.a.sendResync();
+    const later = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(later);
+    pair.a.clearOutbound();
+    try pair.b.feed(later, 451);
+}
+
+test "session replica secured receipt retry does not duplicate retained ciphertext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expect(pair.a.supportsSecureRelayV2());
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "receipt-backpressure-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.overflow_allocator = allocator;
+    peer.token = try tokenFromId(peer_id);
+    peer.send_armed = true;
+    peer.s2s_secured = &pair.a;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const filler: [32]u8 = @splat(0x73);
+    peer.sendq_cap = filler.len;
+    try rawAppendToConn(peer, &filler);
+    try pair.a.sendResync();
+    const retained_len = pair.a.outbound().len;
+    try std.testing.expect(retained_len != 0);
+
+    const relay_id: relay_v2_replay_guard.RelayId = @splat(0x5a);
+    for (0..64) |_| {
+        try std.testing.expect(!server.sendRelayV2AckToPeer(pair.idb.shortId(), relay_id));
+        try std.testing.expectEqual(retained_len, pair.a.outbound().len);
+        try std.testing.expect(!peer.delivery_gap.load(.acquire));
+        try std.testing.expect(!peer.closing);
+    }
+
+    resetTestSendQ(peer);
+    peer.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    try std.testing.expect(server.sendRelayV2AckToPeer(pair.idb.shortId(), relay_id));
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    const ciphertext = try copyTestSendQ(allocator, peer);
+    defer allocator.free(ciphertext);
+    try pair.b.feed(ciphertext, 475);
+    const acks = try pair.b.takeInboundV2Acks();
+    defer allocator.free(acks);
+    try std.testing.expectEqual(@as(usize, 1), acks.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &acks[0]);
+}
+
+test "session replica deferred sidecar retry bounds retained ciphertext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "sidecar-backpressure-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .session_migrate_on_detach = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try addTestLocalClient(&server, "Ruri", "ruri");
+    const conn = server.connFor(id).?;
+    const handle = server.sessions.resumeHandleForClient("ruri", monitorIdFromClient(id)).?;
+    try std.testing.expect(server.sessions.markPortableResumeIssued("ruri", monitorIdFromClient(id)));
+    try std.testing.expect(server.publishSessionReplicaUpsert(handle.token, "ruri", "Ruri", "sidecar-authority", true));
+    try server.world.restoreMember("#sidecar-backpressure", worldIdFromClient(id), world_model.MemberModes.empty());
+    conn.session_mesh_announce_pending = true;
+    conn.session_mesh_announce_token_bound = true;
+    conn.session_mesh_announce_requires_authority = true;
+    conn.session_mesh_announce_token = handle.token;
+    conn.session_mesh_announce_nick_change = true;
+    conn.session_mesh_announce_old_nick_len = "DeviceB".len;
+    @memcpy(conn.session_mesh_announce_old_nick[0.."DeviceB".len], "DeviceB");
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.overflow_allocator = allocator;
+    peer.token = try tokenFromId(peer_id);
+    peer.send_armed = true;
+    peer.s2s_secured = &pair.a;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+    const filler: [32]u8 = @splat(0x74);
+    peer.sendq_cap = filler.len;
+    try rawAppendToConn(peer, &filler);
+
+    server.flushDeferredSessionMeshAnnouncements(id, conn);
+    try std.testing.expect(conn.session_mesh_announce_pending);
+    const retained_len = pair.a.outbound().len;
+    try std.testing.expect(retained_len != 0);
+    for (0..64) |_| {
+        server.flushDeferredSessionMeshAnnouncements(id, conn);
+        try std.testing.expect(conn.session_mesh_announce_pending);
+        try std.testing.expectEqual(retained_len, pair.a.outbound().len);
+        try std.testing.expect(!peer.delivery_gap.load(.acquire));
+        try std.testing.expect(!peer.closing);
+    }
+
+    resetTestSendQ(peer);
+    peer.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    server.flushDeferredSessionMeshAnnouncements(id, conn);
+    try std.testing.expect(!conn.session_mesh_announce_pending);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    const ciphertext = try copyTestSendQ(allocator, peer);
+    defer allocator.free(ciphertext);
+    try pair.b.feed(ciphertext, 490);
+    pair.b.processDeferredResidenceFrames(490);
+    var saw_member = false;
+    for (pair.b.channelMembers("#sidecar-backpressure")) |member| {
+        if (std.ascii.eqlIgnoreCase(member.nick, "Ruri")) saw_member = true;
+    }
+    try std.testing.expect(saw_member);
+}
+
+test "session replica burst retries incomplete family after secured record allocation failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "burst-oom-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const local_id = try addTestLocalClient(&server, "BurstOom", null);
+    try server.world.restoreMember("#burst-oom", worldIdFromClient(local_id), world_model.MemberModes.empty());
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    conn.s2s_secured = &pair.a;
+    defer {
+        conn.s2s_secured = null;
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    }
+
+    // The inner signed frame is already durable when the outer record resize is
+    // attempted. Fail exactly that allocation. The burst family must remain
+    // uncommitted rather than treating the caught row as a completed snapshot.
+    pair.a.out.clearAndFree(pair.a.allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    pair.a.allocator = failing.allocator();
+    server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+    pair.a.allocator = allocator;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn.s2s_burst_done);
+    try std.testing.expectEqual(MeshBurstStage.membership, conn.mesh_burst_stage);
+    try std.testing.expect(!conn.mesh_burst_stage_encoded);
+
+    // Recovery retries the entire idempotent family, then releases the gate only
+    // after the missing row and every later family have entered this SendQ.
+    server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+    try std.testing.expect(conn.s2s_burst_done);
+    try std.testing.expectEqual(MeshBurstStage.idle, conn.mesh_burst_stage);
+    const burst = try copyTestSendQ(allocator, &conn);
+    defer allocator.free(burst);
+    try pair.b.feed(burst, 500);
+    pair.b.processDeferredResidenceFrames(500);
+    const membership = try pair.b.takeMembershipChanges();
+    defer {
+        for (membership) |*change| change.deinit(allocator);
+        allocator.free(membership);
+    }
+    var saw_channel = false;
+    for (pair.b.channelMembers("#burst-oom")) |member| {
+        if (std.ascii.eqlIgnoreCase(member.nick, "BurstOom")) saw_channel = true;
+    }
+    try std.testing.expect(saw_channel);
+
+    // No failed outer allocation may advance the AEAD counter; a later record
+    // authenticates only if the retry preserved exact counter continuity.
+    try pair.a.sendResync();
+    const later = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(later);
+    pair.a.clearOutbound();
+    try pair.b.feed(later, 501);
+}
+
+test "session replica replay leaves no inner residue after outer record allocation failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "replay-outer-oom.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const token: session_migrate.Token = @splat(0x81);
+    try std.testing.expect(server.publishSessionReplicaUpsert(token, "alice", "Alice", "outer-oom", false));
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.sendq_cap = default_sendq_cap;
+    defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    server.scheduleSessionReplicaReplay(&conn);
+
+    // Force the secured outer ArrayList to allocate, then deny exactly that
+    // reservation. Transactional send must fail before appending the signed
+    // plaintext frame to the inner link.
+    pair.a.out.clearAndFree(pair.a.allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    pair.a.allocator = failing.allocator();
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
+    pair.a.allocator = allocator;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(conn.session_replica_replay_pending);
+    try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.inner.?.outbound().len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len - conn.send_offset);
+
+    // Recovery emits exactly one object and completes normally; a duplicate
+    // inner residue would make the exact ciphertext-length invariant close it.
+    server.replaySessionReplicaStoreTo(&conn, &pair.a);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn.session_replica_replay_pending);
+    const ciphertext = try copyTestSendQ(allocator, &conn);
+    defer allocator.free(ciphertext);
+    try pair.b.feed(ciphertext, 600);
+    const frames = try pair.b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+}
+
+test "session replica burst sends every legal mesh ward beyond legacy scratch cap" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "ward-burst-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const ward_count: usize = 257;
+    for (0..ward_count) |index| {
+        var pattern_buf: [48]u8 = undefined;
+        const pattern = try std.fmt.bufPrint(&pattern_buf, "192.0.2.{d}", .{index});
+        try server.warden.add(.{
+            .match = .address,
+            .pattern = pattern,
+            .scope = .mesh,
+            .action = .expel,
+            .reason = "anti-entropy completeness",
+            .set_by = "ward-test",
+            .created_ms = @intCast(index + 1),
+        });
+    }
+    try std.testing.expectEqual(ward_count, server.warden.count());
+
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    conn.s2s_secured = &pair.a;
+    defer {
+        conn.s2s_secured = null;
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    }
+    server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+    try std.testing.expect(conn.s2s_burst_done);
+    try std.testing.expectEqual(MeshBurstStage.idle, conn.mesh_burst_stage);
+
+    const burst = try copyTestSendQ(allocator, &conn);
+    defer allocator.free(burst);
+    try pair.b.feed(burst, 700);
+    const received = try pair.b.takeWards();
+    defer {
+        for (received) |wire| allocator.free(wire);
+        allocator.free(received);
+    }
+    try std.testing.expectEqual(ward_count, received.len);
+}
+
 test "session replica replay budgets actual ciphertext with one-frame progress exception" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -40388,8 +47184,7 @@ test "session replica replay budgets actual ciphertext with one-frame progress e
         defer allocator.free(first);
         try std.testing.expect(first.len != 0 and first.len <= replay_budget);
         try std.testing.expectEqual(@as(usize, 1), conn.session_replica_replay_cursor);
-        try std.testing.expect(conn.session_replica_replay_frame_pending);
-        try std.testing.expect(pair.a.outbound().len != 0);
+        try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
         try pair.b.feed(first, 200);
         {
             const frames = try pair.b.takeSessionReplicaFrames();
@@ -40406,7 +47201,6 @@ test "session replica replay budgets actual ciphertext with one-frame progress e
         defer allocator.free(second);
         try std.testing.expect(second.len != 0 and second.len <= replay_budget);
         try std.testing.expect(!conn.session_replica_replay_pending);
-        try std.testing.expect(!conn.session_replica_replay_frame_pending);
         try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
         try pair.b.feed(second, 201);
         {
@@ -40499,9 +47293,9 @@ test "maximum legal session replica fits the clamped server-link SendQ and progr
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
     conn.send_armed = true;
-    // An operator-supplied 1 MiB server class is slightly smaller than the
-    // secured representation of the legal 1 MiB inner frame. The S2S-only floor
-    // supplies exactly the missing outer prefix/tag bytes.
+    // The server-link floor must fit the shared portable maximum plus every v2
+    // and secured-record wrapper. The shared cap deliberately leaves legacy
+    // envelope headroom, so the emitted record need not fill the entire queue.
     conn.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     try std.testing.expectEqual(min_s2s_sendq_cap, conn.sendq_cap);
@@ -40509,11 +47303,11 @@ test "maximum legal session replica fits the clamped server-link SendQ and progr
     server.scheduleSessionReplicaReplay(&conn);
     server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expect(!conn.session_replica_replay_pending);
-    try std.testing.expect(!conn.session_replica_replay_frame_pending);
     try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
     const wire = try copyTestSendQ(allocator, &conn);
     defer allocator.free(wire);
-    try std.testing.expectEqual(min_s2s_sendq_cap, wire.len);
+    try std.testing.expect(wire.len > snapshot.len);
+    try std.testing.expect(wire.len <= conn.sendq_cap);
     try pair.b.feed(wire, 250);
     const frames = try pair.b.takeSessionReplicaFrames();
     defer {
@@ -40591,7 +47385,7 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
     outer.established.serialize(&snap.established);
 
     const sq_before = server.rx().ring.inner.sq_ready();
-    try std.testing.expect(server.adoptInheritedS2sLink(snap));
+    try std.testing.expect(server.adoptInheritedS2sLink(snap, true) != null);
     try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
     var it = server.rx().clients.iterator();
     const conn = (it.next() orelse return error.TestExpectedEqual).value;
@@ -40683,7 +47477,7 @@ test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried 
 
     const clients_before = server.reactors[0].clients.len();
     const sqes_before = server.reactors[0].ring.inner.sq_ready();
-    try std.testing.expect(!server.adoptInheritedS2sLink(snap));
+    try std.testing.expect(server.adoptInheritedS2sLink(snap, true) == null);
     try std.testing.expectEqual(clients_before, server.reactors[0].clients.len());
     // A rejected adoption is still inert: no RECV/SEND SQE may borrow the
     // freed slab slot or its inline buffers.
@@ -40692,7 +47486,7 @@ test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried 
     try std.testing.expectEqual(linux.E.BADF, linux.errno(fd_state));
 }
 
-test "legacy hot-adopt stages migration before consuming the final SQ entry" {
+test "portability-enabled hot-adopt rejects a rolling-old peer before roster release" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -40723,7 +47517,9 @@ test "legacy hot-adopt stages migration before consuming the final SQ entry" {
     };
     defer server.deinit();
 
-    // Give the legacy peer a real portable sidecar to stage after RESYNC.
+    // Give the Store real reusable authority. A predecessor without
+    // SESSION_REPLICA v2 cannot represent its revoke/quarantine/expiry rules and
+    // therefore must never become a partial member of this mesh.
     const token: session_migrate.Token = @splat(0x5c);
     _ = try server.sessions.attach("legacy-account", 77, token, 1);
     try std.testing.expect(server.sessions.markPortableResumeIssued("legacy-account", 77));
@@ -40736,23 +47532,28 @@ test "legacy hot-adopt stages migration before consuming the final SQ entry" {
     }).encode(allocator);
     defer allocator.free(migration_snapshot);
     try std.testing.expect(server.sessions.markDetachedWithSnapshot("legacy-account", 77, migration_snapshot));
+    try std.testing.expect(server.publishSessionReplicaUpsert(
+        token,
+        "legacy-account",
+        "legacy-device",
+        migration_snapshot,
+        false,
+    ));
 
     var sockets: [2]i32 = undefined;
     if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
         return error.SkipZigTest;
+    var owner_open = true;
+    defer if (owner_open) closeFd(sockets[0]);
     defer closeFd(sockets[1]);
 
-    // Leave exactly one SQ entry. A pre-fix adoption consumed it with RECV,
-    // discovered the legacy SendQ failure afterward, and could not arm the send
-    // that would drive closing-link teardown.
+    // Leave exactly one SQ entry so the adopted link still exercises the
+    // authority-first activation path before compatibility rejection.
     var dummy_timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
     try server.reactors[0].ring.submitTimeout(timer_token, &dummy_timeout);
     const sqes_before = server.reactors[0].ring.inner.sq_ready();
     try std.testing.expectEqual(@as(u32, 1), sqes_before);
 
-    const carried = try allocator.alloc(u8, min_s2s_sendq_cap - resync_len);
-    defer allocator.free(carried);
-    @memset(carried, 0xa5);
     const outer = pair.a.exportOuter();
     const inner = pair.a.snapshotInner() orelse return error.TestUnexpectedResult;
     var caps: u8 = 0;
@@ -40760,8 +47561,8 @@ test "legacy hot-adopt stages migration before consuming the final SQ entry" {
     if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
     if (inner.peer_supports_oper_info) caps |= s2s_snapshot.cap_oper_info;
     if (inner.peer_supports_repair) caps |= s2s_snapshot.cap_repair;
-    // Deliberately omit SESSION_REPLICA v2: this forces the legacy migration
-    // staging path whose output cannot fit after carried bytes + RESYNC.
+    // Deliberately omit SESSION_REPLICA v2. Legacy SESSION_MIGRATE cannot carry
+    // reusable negative authority, so no proxy replay is permitted.
     var snap = s2s_snapshot.Snapshot{
         .fd = sockets[0],
         .role = @intFromEnum(outer.role),
@@ -40780,15 +47581,27 @@ test "legacy hot-adopt stages migration before consuming the final SQ entry" {
         .caps = caps,
         .remote_name = pair.a.snapshotInnerRemoteName(),
         .rec_inbuf = outer.rec_inbuf,
-        .pending_out = carried,
     };
     outer.established.serialize(&snap.established);
 
     const clients_before = server.reactors[0].clients.len();
-    try std.testing.expect(!server.adoptInheritedS2sLink(snap));
-    try std.testing.expectEqual(clients_before, server.reactors[0].clients.len());
+    const adopted_id = server.adoptInheritedS2sLink(snap, true) orelse return error.TestUnexpectedResult;
+    owner_open = false;
+    try std.testing.expectEqual(clients_before + 1, server.reactors[0].clients.len());
     try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
-    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+    const conn = server.reactors[0].clients.get(adopted_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(conn.session_replica_replay_pending);
+    server.replaySessionReplicaStoreTo(conn, conn.s2s_secured.?);
+    try std.testing.expect(conn.closing);
+    try std.testing.expect(!conn.session_replica_replay_pending);
+    try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
+    try std.testing.expectEqual(@as(usize, 0), conn.s2s_secured.?.outbound().len);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    server.releaseMeshBurstAfterSessionReplicaReplay(conn, conn.s2s_secured.?);
+    try std.testing.expect(conn.session_replica_resync_burst_pending);
+    // The already-buffered mandatory RESYNC is not a roster burst. The closing
+    // latch keeps all membership/ward/clone sidecars suppressed until teardown.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
 }
 
 test "UPGRADE restored property checkpoint bursts after preserved-link activation" {
@@ -40899,16 +47712,34 @@ test "UPGRADE restored property checkpoint bursts after preserved-link activatio
     const s2s_blob = try s2s_snapshot.encode(allocator, snap);
     defer allocator.free(s2s_blob);
 
-    const pieces = [_]helix_live.StatePiece{
-        .{ .kind = .mesh_checkpoint, .bytes = checkpoint, .min_supported = 2 },
-        .{ .kind = .s2s_link, .bytes = s2s_blob },
-    };
+    // Build a complete current handoff, then substitute the predecessor's
+    // property authority. Partial two-piece arenas are no longer a meaningful
+    // fixture now that the whole-handoff manifest commits to every mandatory
+    // singleton and relation.
+    var upgrade_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (upgrade_blobs.items) |blob| allocator.free(blob);
+        upgrade_blobs.deinit(allocator);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    try appendCurrentMandatoryUpgradeStateForTest(&server, &pieces, &upgrade_blobs);
+    var property_replaced = false;
+    for (pieces.items) |*piece| {
+        if (piece.kind != .mesh_checkpoint or !prop_checkpoint.isUpgradeCheckpoint(piece.bytes)) continue;
+        piece.bytes = checkpoint;
+        piece.min_supported = 2;
+        property_replaced = true;
+        break;
+    }
+    try std.testing.expect(property_replaced);
+    try pieces.append(allocator, .{ .kind = .s2s_link, .bytes = s2s_blob });
     var prepared = try helix_live.prepare(allocator, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-pass4-restored-properties",
-        .pieces = &pieces,
+        .pieces = pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -41614,6 +48445,84 @@ fn decodeMeshTrustRoot(text: []const u8) ?[32]u8 {
     return out;
 }
 
+const relay_v2_roster_max_nodes: usize = 4096;
+const relay_v2_roster_digest_domain = "orochi-relay-v2-full-mesh-roster-v1\x00";
+
+fn relayV2PublicKeyLessThan(_: void, lhs: [32]u8, rhs: [32]u8) bool {
+    return std.mem.order(u8, &lhs, &rhs) == .lt;
+}
+
+fn relayV2RosterContains(roster: []const [32]u8, wanted: [32]u8) bool {
+    for (roster) |candidate| {
+        if (std.crypto.timing_safe.eql([32]u8, candidate, wanted)) return true;
+    }
+    return false;
+}
+
+fn computeRelayV2ActivationState(
+    allocator: std.mem.Allocator,
+    config: Config,
+    direct_neighbor_keys: []const [32]u8,
+) !relay_v2_activation.State {
+    const plan_empty = config.relay_v2_activation_epoch == 0 and
+        config.relay_v2_roster.len == 0;
+    if (plan_empty) {
+        const state = relay_v2_activation.State{ .mode = config.relay_v2_authoring };
+        try relay_v2_activation.validate(state);
+        return state;
+    }
+    if (config.relay_v2_activation_epoch == 0 or config.relay_v2_roster.len < 2 or
+        config.relay_v2_roster.len > relay_v2_roster_max_nodes)
+        return error.InvalidRelayV2ActivationPlan;
+    if (config.node_identity == null or config.crypto_io == null or
+        !config.require_secured or !config.s2s_config.require_signed_frames)
+        return error.InsecureRelayV2ActivationPlan;
+    if (config.node_public_key) |encoded| {
+        const expected = decodeMeshTrustRoot(encoded) orelse
+            return error.InvalidRelayV2ActivationPlan;
+        if (!std.crypto.timing_safe.eql(
+            [32]u8,
+            expected,
+            config.node_identity.?.sign_kp.public_key,
+        )) return error.InvalidRelayV2ActivationPlan;
+    }
+    if (config.mesh_trust_roots.len == 0 or
+        direct_neighbor_keys.len != config.mesh_trust_roots.len)
+        return error.InvalidRelayV2ActivationPlan;
+
+    const roster = try allocator.alloc([32]u8, config.relay_v2_roster.len);
+    defer allocator.free(roster);
+    for (config.relay_v2_roster, roster) |encoded, *decoded| {
+        decoded.* = decodeMeshTrustRoot(encoded) orelse
+            return error.InvalidRelayV2ActivationRoster;
+    }
+    std.mem.sort([32]u8, roster, {}, relayV2PublicKeyLessThan);
+    for (roster[1..], roster[0 .. roster.len - 1]) |key, prior| {
+        if (std.crypto.timing_safe.eql([32]u8, key, prior))
+            return error.InvalidRelayV2ActivationRoster;
+    }
+    if (!relayV2RosterContains(roster, config.node_identity.?.sign_kp.public_key))
+        return error.InvalidRelayV2ActivationRoster;
+    for (direct_neighbor_keys) |key| {
+        if (!relayV2RosterContains(roster, key))
+            return error.InvalidRelayV2ActivationRoster;
+    }
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(relay_v2_roster_digest_domain);
+    var count_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_bytes, @intCast(roster.len), .big);
+    hasher.update(&count_bytes);
+    for (roster) |key| hasher.update(&key);
+    var state = relay_v2_activation.State{
+        .mode = config.relay_v2_authoring,
+        .activation_epoch = config.relay_v2_activation_epoch,
+    };
+    hasher.final(&state.roster_digest);
+    try relay_v2_activation.validate(state);
+    return state;
+}
+
 fn decodeMeshAdmissionToken(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidMeshAdmissionToken;
@@ -42224,6 +49133,2570 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
+fn adoptUpgradePiecesForTest(
+    server: *Server,
+    pieces: []const helix_live.StatePiece,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var prepared = try helix_live.prepare(std.testing.allocator, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = arena_name,
+        .pieces = pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try server.adoptInheritedSessions();
+    return arena_dup;
+}
+
+/// Negative-fixture counterpart to `adoptUpgradePiecesForTest`. Returning the
+/// duplicated numeric fd lets callers assert whether a pre-publication refusal
+/// consumed it or a post-publication startup-fatal path deliberately left it
+/// for process unwind.
+fn rejectUpgradePiecesForTest(
+    server: *Server,
+    pieces: []const helix_live.StatePiece,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var prepared = try helix_live.prepare(std.testing.allocator, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = arena_name,
+        .pieces = pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+    return arena_dup;
+}
+
+/// Encode one complete manifested stream while deliberately widening one
+/// capsule's advertised maximum. Production `prepare` always emits registry
+/// headers; this negative-fixture helper keeps the manifest digest valid so the
+/// successor reaches the authority-specific canonical-wrapper check.
+fn encodeUpgradeStreamWithWidenedHeaderForTest(
+    allocator: std.mem.Allocator,
+    pieces: []const helix_live.StatePiece,
+    widened_kind: helix_capsule.CapsuleKind,
+) ![]u8 {
+    var stream: std.ArrayList(u8) = .empty;
+    errdefer stream.deinit(allocator);
+    var accumulator = handoff_manifest.Accumulator.init();
+    for (pieces) |piece| {
+        var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
+        var cap = helix_capsule.make(piece.kind, &fields);
+        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        if (piece.kind == widened_kind) cap.header.max_supported +|= 1;
+        try accumulator.add(.{
+            .header = .{
+                .schema_id = cap.header.schema_id,
+                .kind = @intFromEnum(cap.header.kind),
+                .version = cap.header.version,
+                .min_supported = cap.header.min_supported,
+                .max_supported = cap.header.max_supported,
+            },
+            .bytes = piece.bytes,
+        });
+        const encoded = try helix_capsule.encode(allocator, cap);
+        defer allocator.free(encoded);
+        try stream.appendSlice(allocator, encoded);
+    }
+    var manifest_buf: [handoff_manifest.encoded_len]u8 = undefined;
+    const manifest_wire = try accumulator.encode(&manifest_buf);
+    var manifest_fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = manifest_wire }};
+    const manifest_cap = helix_capsule.make(.handoff_manifest, &manifest_fields);
+    const manifest_encoded = try helix_capsule.encode(allocator, manifest_cap);
+    defer allocator.free(manifest_encoded);
+    try stream.appendSlice(allocator, manifest_encoded);
+    return stream.toOwnedSlice(allocator);
+}
+
+fn adoptUpgradeStreamForTest(
+    server: *Server,
+    stream: []const u8,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var arena = try helix_handoff.Arena.create(arena_name);
+    defer arena.close();
+    try arena.writeAll(stream);
+    try arena.seal();
+    const dup_rc = linux.dup(arena.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try server.adoptInheritedSessions();
+    return arena_dup;
+}
+
+fn rejectUpgradeStreamForTest(
+    server: *Server,
+    stream: []const u8,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var arena = try helix_handoff.Arena.create(arena_name);
+    defer arena.close();
+    try arena.writeAll(stream);
+    try arena.seal();
+    const dup_rc = linux.dup(arena.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+    return arena_dup;
+}
+
+/// Build the complete current mandatory singleton set for successor tests.
+/// All returned payload storage is owned by `blobs`; callers free it after the
+/// arena has copied the pieces. This intentionally uses the production sealers
+/// so tests cannot accidentally bless a representation the real predecessor
+/// never emits.
+fn appendCurrentMandatoryUpgradeStateForTest(
+    server: *Server,
+    pieces: *std.ArrayList(helix_live.StatePiece),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+
+    const upgrade_mesh_clock = server.preparePropertyUpgradeClockBoundary() orelse
+        return error.PropertyStateConverging;
+    lockSpin(&server.mesh_clock_lock);
+    const migration_offer_epoch = server.migration_offer_epoch;
+    server.mesh_clock_lock.unlock();
+    const mesh_clock_wire = try mesh_clock_snapshot.encode(
+        upgrade_mesh_clock,
+        migration_offer_epoch,
+        server.relay_v2_activation_state,
+    );
+    const mesh_clock_owned = try server.allocator.dupe(u8, &mesh_clock_wire);
+    blobs.append(server.allocator, mesh_clock_owned) catch |err| {
+        server.allocator.free(mesh_clock_owned);
+        return err;
+    };
+    // `blobs` owns the allocation from this point.  In particular, a later
+    // sealer failure must not also free it through a function-wide errdefer.
+    try pieces.append(server.allocator, .{
+        .kind = .mesh_checkpoint,
+        .bytes = mesh_clock_owned,
+        .min_supported = 2,
+    });
+
+    _ = server.sealMandatoryStateUpgradeCheckpoints(pieces, blobs) orelse
+        return error.MandatoryStateSealFailed;
+    if (!server.sealPropertyUpgradeCheckpoint(pieces, blobs))
+        return error.PropertyStateSealFailed;
+
+    const replica_now_wall: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const replica_wire = try server.session_replica_store.encodeUpgradeCheckpoint(
+        server.allocator,
+        replica_now_wall,
+    );
+    blobs.append(server.allocator, replica_wire) catch |err| {
+        server.allocator.free(replica_wire);
+        return err;
+    };
+    try pieces.append(server.allocator, .{ .kind = .mesh_checkpoint, .bytes = replica_wire });
+    _ = server.sealPendingMigrationCheckpoint(pieces, blobs) orelse
+        return error.PendingMigrationSealFailed;
+
+    if (server.config.tls_enable_resumption and !Server.sealTlsTicketKeyUpgradeCapsule(
+        server.allocator,
+        server.tls_ticket_key,
+        server.tls_previous_ticket_key,
+        pieces,
+        blobs,
+    )) return error.TlsTicketKeySealFailed;
+}
+
+/// Keep the multi-megabyte `LinuxServer.init` return frame out of already-large
+/// integration-test frames. This helper is intentionally a separate call seam;
+/// allocating the destination alone is insufficient when the compiler still
+/// materializes the returned aggregate in the caller.
+noinline fn createTestServer(
+    allocator: std.mem.Allocator,
+    config: Config,
+) !*Server {
+    const server = try allocator.create(Server);
+    errdefer allocator.destroy(server);
+    try server.initInPlace(allocator, config);
+    return server;
+}
+
+fn upgradePieceBytesForTest(
+    pieces: []const helix_live.StatePiece,
+    kind: helix_capsule.CapsuleKind,
+) ?[]const u8 {
+    for (pieces) |piece| if (piece.kind == kind) return piece.bytes;
+    return null;
+}
+
+fn upgradeEventReplayBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            event_spine_replay_guard.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn upgradeRelayReplayBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            relay_v2_replay_guard.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn upgradeRelayOutboxBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            relay_v2_outbox.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn upgradeRelayEventLogBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            relay_v2_event_log.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn upgradeAttachmentDeliveryBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            attachment_delivery_spool.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn eventHistoryBytesForTest(
+    allocator: std.mem.Allocator,
+    history: *event_history_mod.EventHistory(512),
+) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    try history.serializeInto(&writer.writer);
+    return allocator.dupe(u8, writer.written());
+}
+
+test "UPGRADE mandatory state round trip is exact and deterministic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var event_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7a)), "event-upgrade-test");
+    defer event_identity.deinit();
+    var event_peer = try node_identity.fromSeed(@as([32]u8, @splat(0x7b)), "event-upgrade-test");
+    defer event_peer.deinit();
+    const event_peer_root = std.fmt.bytesToHex(event_peer.sign_kp.public_key, .lower);
+    const event_roots = [_][]const u8{&event_peer_root};
+    const event_config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = event_identity.shortId(),
+        .server_name = "event-upgrade.test",
+        .node_identity = &event_identity,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &event_roots,
+    };
+
+    const predecessor = createTestServer(alloc, event_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    _ = try predecessor.world.markRegistered("#exact-state", true);
+    _ = try predecessor.history.append("#exact-state", .{
+        .msgid = "exact-message-1",
+        .sender = "alice",
+        .text = "survives the exec boundary",
+        .timestamp = 42,
+    });
+    try predecessor.search_index.index("exact-message-1", "survives the exec boundary");
+    predecessor.event_history.record(2, 1, 43, "node.predecessor", "exact event history");
+    var event_pubkey: [oper_event.pubkey_len]u8 = undefined;
+    var event_signature: [oper_event.sig_len]u8 = undefined;
+    var stable_event = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.oper_action),
+        .severity = @intFromEnum(event_spine.EventSeverity.notice),
+        .origin_node = event_identity.shortId(),
+        .hlc = predecessor.nextMeshHlc(),
+        .origin_server = "event-upgrade.test",
+        .subject = "#exact-state",
+        .message = "stable event survives upgrade",
+    };
+    try oper_event.stampOrigin(&stable_event, &event_identity.sign_kp, &event_pubkey, &event_signature);
+    const stable_event_id = (try predecessor.admitEventSpineV2(stable_event)) orelse
+        return error.TestUnexpectedResult;
+    var relay_pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var relay_signature: [message_relay_v2.sig_len]u8 = undefined;
+    var stable_relay = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#exact-state",
+        .source_prefix = "alice!user@event-upgrade.test",
+        .account = "alice",
+        .text = "stable relay survives upgrade",
+        .scope_kind = .channel,
+        .origin_node = event_identity.shortId(),
+        .hlc = predecessor.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(
+        alloc,
+        &stable_relay,
+        &event_identity.sign_kp,
+        &relay_pubkey,
+        &relay_signature,
+    );
+    const stable_relay_wire = try message_relay_v2.encode(alloc, stable_relay);
+    defer alloc.free(stable_relay_wire);
+    const stable_relay_id = switch (try predecessor.admitRelayV2Detailed(stable_relay, .{
+        .target = stable_relay.target,
+        .sender = stable_relay.source_prefix,
+        .text = stable_relay.text,
+        .command = "PRIVMSG",
+        .client_tags = null,
+        .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(stable_relay.hlc),
+    }, .{
+        .peers = &.{event_peer.shortId()},
+        .wire = stable_relay_wire,
+        .unbound_excluded_peer = event_identity.shortId(),
+    }, null)) {
+        .accepted => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try predecessor.webhook_store.create(
+        "#exact-state",
+        "exact hook",
+        "alice",
+        44,
+        45,
+        .{ .per_min = 60, .burst = 10 },
+        @splat(0x12),
+        @splat(0x34),
+    );
+
+    var predecessor_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (predecessor_blobs.items) |blob| alloc.free(blob);
+        predecessor_blobs.deinit(alloc);
+    }
+    var predecessor_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer predecessor_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &predecessor_pieces, &predecessor_blobs);
+
+    const successor = createTestServer(alloc, event_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, predecessor_pieces.items, "orochi-test-mandatory-exact");
+    current_reactor = null;
+    try std.testing.expect(successor.inherited_event_history_restored);
+    try std.testing.expect(successor.inherited_webhook_store_restored);
+    lockSpin(&successor.event_spine_replay_mu);
+    const replay_admission = try successor.event_spine_replay_guard.admit(
+        stable_event,
+        successor.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    successor.event_spine_replay_mu.unlock();
+    try std.testing.expect(replay_admission == .duplicate);
+    try std.testing.expectEqual(
+        event_history_mod.StableIngestResult.exact_duplicate,
+        try successor.event_history.ingestStableEvent(.{
+            .event_id = stable_event_id,
+            .category = stable_event.category,
+            .severity = stable_event.severity,
+            .origin_ts_unix_ms = @intCast(stable_event.originTimeMs()),
+            .origin = stable_event.origin_server,
+            .message = stable_event.message,
+        }),
+    );
+    const relay_replay_admission = try successor.relay_v2_replay_guard.admitMessage(stable_relay);
+    try std.testing.expect(relay_replay_admission == .duplicate);
+    var stable_relay_msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    const stable_relay_msgid = msgid_mod.fromStableId(stable_relay_id, &stable_relay_msgid_buf);
+    const lotus_replay_admission = try successor.history.ingestExactOnce(stable_relay.target, .{
+        .msgid = stable_relay_msgid,
+        .sender = stable_relay.source_prefix,
+        .text = stable_relay.text,
+        .timestamp = mesh_clock_mod.MeshClock.physicalOf(stable_relay.hlc),
+        .command = "PRIVMSG",
+    });
+    try std.testing.expect(lotus_replay_admission == .exact_duplicate);
+    try std.testing.expect(successor.relay_v2_outbox.contains(event_peer.shortId(), stable_relay_id));
+
+    var successor_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (successor_blobs.items) |blob| alloc.free(blob);
+        successor_blobs.deinit(alloc);
+    }
+    var successor_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer successor_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(successor, &successor_pieces, &successor_blobs);
+
+    inline for (.{ helix_capsule.CapsuleKind.channels, .history, .webhook_store }) |kind| {
+        try std.testing.expectEqualSlices(
+            u8,
+            upgradePieceBytesForTest(predecessor_pieces.items, kind).?,
+            upgradePieceBytesForTest(successor_pieces.items, kind).?,
+        );
+    }
+    try std.testing.expectEqualSlices(
+        u8,
+        upgradeEventReplayBytesForTest(predecessor_pieces.items).?,
+        upgradeEventReplayBytesForTest(successor_pieces.items).?,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        upgradeRelayReplayBytesForTest(predecessor_pieces.items).?,
+        upgradeRelayReplayBytesForTest(successor_pieces.items).?,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        upgradeRelayOutboxBytesForTest(predecessor_pieces.items).?,
+        upgradeRelayOutboxBytesForTest(successor_pieces.items).?,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        upgradeRelayEventLogBytesForTest(predecessor_pieces.items).?,
+        upgradeRelayEventLogBytesForTest(successor_pieces.items).?,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        upgradeAttachmentDeliveryBytesForTest(predecessor_pieces.items).?,
+        upgradeAttachmentDeliveryBytesForTest(successor_pieces.items).?,
+    );
+
+    const second_successor = createTestServer(alloc, event_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(second_successor);
+    defer second_successor.deinit();
+    _ = try adoptUpgradePiecesForTest(
+        second_successor,
+        successor_pieces.items,
+        "orochi-test-mandatory-exact-second",
+    );
+    current_reactor = null;
+    try std.testing.expect(second_successor.relay_v2_outbox.contains(event_peer.shortId(), stable_relay_id));
+}
+
+test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drains FIFO once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0, .tls_port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    const old_client: u64 = 0x00ab_cdef;
+    const token: sessions_mod.Token = @splat(0x5d);
+    _ = try predecessor.sessions.attachReportingEviction("alice", old_client, token, 42);
+    try std.testing.expect(predecessor.sessions.markDetachedWithSnapshot(
+        "alice",
+        old_client,
+        "two-hop-restore",
+    ));
+    const first_event: attachment_delivery_spool.EventId = @splat(0x11);
+    const second_event: attachment_delivery_spool.EventId = @splat(0x22);
+    const first_line = ":source!u@h PRIVMSG Alice :first-through-helix\r\n";
+    const second_line = ":source!u@h PRIVMSG Alice :second-through-helix\r\n";
+    const reserved = try predecessor.attachment_delivery_spool.reserveBatch(&.{
+        .{ .client = old_client, .event_id = first_event, .bytes = first_line },
+        .{ .client = old_client, .event_id = second_event, .bytes = second_line },
+    });
+    try std.testing.expectEqual(@as(usize, 2), reserved.inserted);
+
+    var predecessor_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (predecessor_blobs.items) |blob| alloc.free(blob);
+        predecessor_blobs.deinit(alloc);
+    }
+    var predecessor_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer predecessor_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &predecessor_pieces, &predecessor_blobs);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        predecessor.sealSessionRegistry(&predecessor_pieces, &predecessor_blobs) orelse
+            return error.TestUnexpectedResult,
+    );
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(
+        successor,
+        predecessor_pieces.items,
+        "orochi-test-ads1-two-hop-first",
+    );
+    current_reactor = null;
+    const first_successor_client = successor.sessions.findDetachedTokenInAccount("alice", token) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(first_successor_client != old_client);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        successor.attachment_delivery_spool.pendingCountFor(old_client),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        successor.attachment_delivery_spool.pendingCountFor(first_successor_client),
+    );
+    try std.testing.expect(successor.attachment_delivery_spool.contains(first_successor_client, first_event));
+    try std.testing.expect(successor.attachment_delivery_spool.contains(first_successor_client, second_event));
+    var first_pending_buf: [1]attachment_delivery_spool.PendingRecord = undefined;
+    const first_pending = successor.attachment_delivery_spool.collectPending(&first_pending_buf);
+    try std.testing.expectEqual(@as(usize, 1), first_pending.len);
+    try std.testing.expectEqualSlices(u8, &first_event, &first_pending[0].event_id);
+    try std.testing.expectEqualStrings(first_line, first_pending[0].bytes);
+
+    var successor_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (successor_blobs.items) |blob| alloc.free(blob);
+        successor_blobs.deinit(alloc);
+    }
+    var successor_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer successor_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(successor, &successor_pieces, &successor_blobs);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        successor.sealSessionRegistry(&successor_pieces, &successor_blobs) orelse
+            return error.TestUnexpectedResult,
+    );
+
+    const second_successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(second_successor);
+    defer second_successor.deinit();
+    _ = try adoptUpgradePiecesForTest(
+        second_successor,
+        successor_pieces.items,
+        "orochi-test-ads1-two-hop-second",
+    );
+    current_reactor = null;
+    const second_successor_client = second_successor.sessions.findDetachedTokenInAccount("alice", token) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        second_successor.attachment_delivery_spool.pendingCountFor(second_successor_client),
+    );
+    try std.testing.expect(second_successor.attachment_delivery_spool.contains(second_successor_client, first_event));
+    try std.testing.expect(second_successor.attachment_delivery_spool.contains(second_successor_client, second_event));
+
+    var pending_buf: [1]attachment_delivery_spool.PendingRecord = undefined;
+    const pending_first = second_successor.attachment_delivery_spool.collectPending(&pending_buf);
+    try std.testing.expectEqual(@as(usize, 1), pending_first.len);
+    try std.testing.expectEqualSlices(u8, &first_event, &pending_first[0].event_id);
+    try std.testing.expectEqualStrings(first_line, pending_first[0].bytes);
+    try std.testing.expect(second_successor.attachment_delivery_spool.commitHeadToSendq(
+        second_successor_client,
+        pending_first[0].sequence,
+        pending_first[0].event_id,
+    ));
+
+    const pending_second = second_successor.attachment_delivery_spool.collectPending(&pending_buf);
+    try std.testing.expectEqual(@as(usize, 1), pending_second.len);
+    try std.testing.expectEqualSlices(u8, &second_event, &pending_second[0].event_id);
+    try std.testing.expectEqualStrings(second_line, pending_second[0].bytes);
+    try std.testing.expect(second_successor.attachment_delivery_spool.commitHeadToSendq(
+        second_successor_client,
+        pending_second[0].sequence,
+        pending_second[0].event_id,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), second_successor.attachment_delivery_spool.len());
+}
+
+test "MESSAGE_V2 replay and Lotus publish transactionally with one accepted identity" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "relay-transaction-test");
+    defer identity.deinit();
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var pubkey_a: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature_a: [message_relay_v2.sig_len]u8 = undefined;
+    var first = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#relay-transaction",
+        .source_prefix = "alice!user@relay.test",
+        .text = "first exact message",
+        .scope_kind = .channel,
+        .origin_node = identity.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(allocator, &first, &identity.sign_kp, &pubkey_a, &signature_a);
+    const first_id = (try server.admitRelayV2(first, .{
+        .target = first.target,
+        .sender = first.source_prefix,
+        .text = first.text,
+        .command = "PRIVMSG",
+        .client_tags = null,
+        .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(first.hlc),
+    })) orelse return error.TestUnexpectedResult;
+    const verified_first = switch (try message_relay_v2.verifyAndRelayId(allocator, first)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(verified_first, first_id);
+    var retained: [2]lotus.Message = undefined;
+    try std.testing.expectEqual(@as(usize, 1), (try server.history.latest(first.target, 2, &retained)).len);
+
+    const guard_after_first = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after_first);
+    const lotus_after_first = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(lotus_after_first);
+    try std.testing.expect((try server.admitRelayV2(first, .{
+        .target = first.target,
+        .sender = first.source_prefix,
+        .text = first.text,
+        .command = "PRIVMSG",
+        .client_tags = null,
+        .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(first.hlc),
+    })) == null);
+    const guard_after_duplicate = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after_duplicate);
+    const lotus_after_duplicate = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(lotus_after_duplicate);
+    try std.testing.expectEqualSlices(u8, guard_after_first, guard_after_duplicate);
+    try std.testing.expectEqualSlices(u8, lotus_after_first, lotus_after_duplicate);
+
+    var pubkey_b: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature_b: [message_relay_v2.sig_len]u8 = undefined;
+    var conflict = first;
+    conflict.hlc = server.nextMeshHlc();
+    conflict.text = "guard-new but Lotus-conflicting message";
+    try message_relay_v2.stampOrigin(allocator, &conflict, &identity.sign_kp, &pubkey_b, &signature_b);
+    const conflict_id = switch (try message_relay_v2.verifyAndRelayId(allocator, conflict)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    var conflict_msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    const conflict_msgid = msgid_mod.fromStableId(conflict_id, &conflict_msgid_buf);
+    _ = try server.history.ingestExactOnce("#other-target", .{
+        .msgid = conflict_msgid,
+        .sender = "mallory!user@relay.test",
+        .text = "preexisting conflicting state",
+        .timestamp = 1,
+    });
+    const guard_before_conflict = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before_conflict);
+    const lotus_before_conflict = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(lotus_before_conflict);
+    try std.testing.expect((try server.admitRelayV2(conflict, .{
+        .target = conflict.target,
+        .sender = conflict.source_prefix,
+        .text = conflict.text,
+        .command = "PRIVMSG",
+        .client_tags = null,
+        .timestamp_ms = mesh_clock_mod.MeshClock.physicalOf(conflict.hlc),
+    })) == null);
+    const guard_after_conflict = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after_conflict);
+    const lotus_after_conflict = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(lotus_after_conflict);
+    try std.testing.expectEqualSlices(u8, guard_before_conflict, guard_after_conflict);
+    try std.testing.expectEqualSlices(u8, lotus_before_conflict, lotus_after_conflict);
+    try std.testing.expect((try server.relay_v2_replay_guard.admitMessage(conflict)) == .accepted);
+}
+
+test "MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x81)), "rvl2-membership-test");
+    defer identity.deinit();
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const accepted = try server.admitAuthoredRelayV2(
+        .privmsg,
+        "#durable",
+        0,
+        "Alice!u@local.test",
+        "alice",
+        "",
+        "",
+        "must-not-become-local-only",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        server.nextMeshHlc(),
+        null,
+        null,
+    );
+    try std.testing.expect(accepted == null);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+}
+
+test "MESSAGE_V2 authoring activation requires a staged canonical full-mesh roster" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "relay-v2-activation");
+    defer local.deinit();
+    var peer = try node_identity.fromSeed(@as([32]u8, @splat(0x92)), "relay-v2-activation");
+    defer peer.deinit();
+    const local_root = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster_forward = [_][]const u8{ &local_root, &peer_root };
+    const roster_reverse = [_][]const u8{ &peer_root, &local_root };
+
+    const compat = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &roster_forward,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(compat);
+    defer compat.deinit();
+    try std.testing.expect(!compat.authoredRelayV2Configured());
+    try std.testing.expectEqual(@as(u64, 17), compat.relay_v2_activation_state.activation_epoch);
+    try std.testing.expect(!std.mem.allEqual(u8, &compat.relay_v2_activation_state.roster_digest, 0));
+
+    const active = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &roster_reverse,
+    });
+    defer alloc.destroy(active);
+    defer active.deinit();
+    try std.testing.expect(active.authoredRelayV2Configured());
+    try std.testing.expectEqualSlices(
+        u8,
+        &compat.relay_v2_activation_state.roster_digest,
+        &active.relay_v2_activation_state.roster_digest,
+    );
+    try std.testing.expectError(error.InvalidRelayV2ActivationPlan, createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .node_public_key = &peer_root,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &roster_forward,
+    }));
+
+    try std.testing.expectError(error.MissingActivationPlan, createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+    }));
+    try std.testing.expectError(error.InsecureRelayV2ActivationPlan, createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &roster_forward,
+    }));
+    const missing_local = [_][]const u8{ &peer_root, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    try std.testing.expectError(error.InvalidRelayV2ActivationRoster, createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &missing_local,
+    }));
+    const duplicate_roots = [_][]const u8{ &peer_root, &peer_root };
+    try std.testing.expectError(error.InvalidRelayV2ActivationPlan, createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &duplicate_roots,
+        .relay_v2_activation_epoch = 17,
+        .relay_v2_roster = &roster_forward,
+    }));
+}
+
+test "MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admission" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    if (pair.a.inner) |inner| {
+        inner.peer.peer_supports_secure_relay_v2 = false;
+        inner.peer.peer_supports_relay_v2_current = false;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!pair.a.supportsSecureRelayV2());
+
+    const peer_root = std.fmt.bytesToHex(pair.idb.sign_kp.public_key, .lower);
+    const local_root = std.fmt.bytesToHex(pair.ida.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &peer_root, &local_root };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer_conn = server.rx().clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    peer_conn.send_armed = true;
+    peer_conn.sendq_cap = default_sendq_cap;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const legacy = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#rolling",
+        .source_nick = "Alice",
+        .source_prefix = "Alice!u@origin.test",
+        .text = "one representation",
+        .origin_node = pair.ida.shortId(),
+        .hlc = 7,
+    };
+
+    // Once the same logical event is retained in RVL2, no current capability
+    // snapshot may create a legacy twin for this still-connected old peer.
+    try std.testing.expectEqual(@as(usize, 0), server.relayLegacyToPeers(legacy, .all, true));
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_overflow.items.len);
+
+    // A genuinely legacy-only event still traverses the exact same old leg.
+    try std.testing.expectEqual(@as(usize, 1), server.relayLegacyToPeers(legacy, .all, false));
+    const ciphertext = try copyTestSendQ(alloc, peer_conn);
+    defer alloc.free(ciphertext);
+    try std.testing.expect(ciphertext.len != 0);
+    try pair.b.feed(ciphertext, 100);
+    const inbound = try pair.b.takeInbound();
+    defer {
+        for (inbound) |*item| item.deinit(alloc);
+        alloc.free(inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqualStrings("one representation", inbound[0].msg.text);
+}
+
+test "MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    if (pair.a.inner) |inner| {
+        inner.peer.peer_supports_secure_relay_v2 = false;
+        inner.peer.peer_supports_relay_v2_current = false;
+        inner.peer.peer_supports_relay_v2_ack_confirm = false;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!pair.a.supportsSecureRelayV2());
+
+    const peer_root = std.fmt.bytesToHex(pair.idb.sign_kp.public_key, .lower);
+    const local_root = std.fmt.bytesToHex(pair.ida.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer_conn = server.rx().clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    peer_conn.send_armed = true;
+    peer_conn.sendq_cap = default_sendq_cap;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const event_hlc = server.nextMeshHlc();
+    var accepted = (try server.admitAuthoredRelayV2(
+        .privmsg,
+        "#rolling",
+        0,
+        "Alice!u@origin.test",
+        "alice",
+        "",
+        "",
+        "retained until upgrade",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        event_hlc,
+        null,
+        null,
+    )) orelse return error.TestUnexpectedResult;
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+
+    const legacy_twin = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#rolling",
+        .source_nick = "Alice",
+        .source_prefix = "Alice!u@origin.test",
+        .account = "alice",
+        .text = "retained until upgrade",
+        .origin_node = pair.ida.shortId(),
+        .hlc = event_hlc,
+    };
+    server.forwardAcceptedRelayV2(accepted.wire);
+    try std.testing.expectEqual(@as(usize, 0), server.relayLegacyToPeers(legacy_twin, .all, true));
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+
+    // Model the same preserved link completing the append-only capability
+    // reprobe after its remote daemon upgrades. The retained exact wire becomes
+    // eligible without creating a second logical representation.
+    if (pair.a.inner) |inner| {
+        inner.peer.peer_supports_secure_relay_v2 = true;
+        inner.peer.peer_supports_relay_v2_current = true;
+        inner.peer.peer_supports_relay_v2_ack_confirm = true;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(pair.a.supportsSecureRelayV2());
+    try std.testing.expect(pair.a.supportsRelayV2AckConfirm());
+    server.retryRelayV2Outbox();
+
+    const retained_ciphertext = try copyTestSendQ(alloc, peer_conn);
+    defer alloc.free(retained_ciphertext);
+    try std.testing.expect(retained_ciphertext.len != 0);
+    resetTestSendQ(peer_conn);
+    try pair.b.feed(retained_ciphertext, 100);
+    const v2 = try pair.b.takeInboundV2();
+    defer {
+        for (v2) |*item| item.deinit(alloc);
+        alloc.free(v2);
+    }
+    try std.testing.expectEqual(@as(usize, 1), v2.len);
+    try std.testing.expectEqualSlices(u8, accepted.wire, v2[0].wire);
+    try std.testing.expectEqual(event_hlc, v2[0].owned.msg.hlc);
+    const received_id = try message_relay_v2.relayId(alloc, v2[0].owned.msg);
+    try std.testing.expectEqualSlices(u8, &accepted.relay_id, &received_id);
+    const legacy = try pair.b.takeInbound();
+    defer {
+        for (legacy) |*item| item.deinit(alloc);
+        alloc.free(legacy);
+    }
+    try std.testing.expectEqual(@as(usize, 0), legacy.len);
+
+    // The authenticated neighbor ACK completes the event-time coverage set and
+    // retires both the scheduler row and its outbound retry obligation.
+    try pair.b.sendMessageV2Ack(accepted.relay_id);
+    const ack_ciphertext = try alloc.dupe(u8, pair.b.outbound());
+    defer alloc.free(ack_ciphertext);
+    pair.b.clearOutbound();
+    try pair.a.feed(ack_ciphertext, 101);
+    server.drainRelayV2Acks(&pair.a);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+}
+
+test "MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-neighbor obligation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x82)), "rvl2-cycle-test");
+    defer local.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0x83)), "rvl2-cycle-test");
+    defer peer_b.deinit();
+    var peer_c = try node_identity.fromSeed(@as([32]u8, @splat(0x84)), "rvl2-cycle-test");
+    defer peer_c.deinit();
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(peer_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_b, &root_c };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#cycle",
+        .source_prefix = "Bob!u@peer-b.test",
+        .account = "bob",
+        .text = "one immutable event",
+        .scope_kind = .channel,
+        .origin_node = peer_b.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &peer_b.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const peers = try server.collectRelayV2OutboxPeers(peer_b.shortId(), false);
+    defer alloc.free(peers);
+    const relay_id = switch (try server.admitRelayV2Detailed(msg, null, .{
+        .peers = peers,
+        .receipt_peer = peer_b.shortId(),
+        .wire = wire,
+        .unbound_excluded_peer = peer_b.shortId(),
+    }, null)) {
+        .accepted => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expect(server.relay_v2_event_log.isConfirmedBy(relay_id, local.shortId()));
+    try std.testing.expect(server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+
+    try std.testing.expect(try server.retainRelayV2DuplicateIngress(
+        relay_id,
+        wire,
+        peer_c.shortId(),
+    ));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.contains(peer_b.shortId(), relay_id));
+
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_event_log.isConfirmedBy(relay_id, peer_c.shortId()));
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_b.shortId(), relay_id));
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_b.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_c.shortId(), relay_id));
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.receiptItems().len);
+}
+
+test "MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x85)), "rvl2-peer-fairness-test");
+    defer local.deinit();
+    var peer_a = try node_identity.fromSeed(@as([32]u8, @splat(0x86)), "rvl2-peer-fairness-test");
+    defer peer_a.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0x87)), "rvl2-peer-fairness-test");
+    defer peer_b.deinit();
+    const root_a = std.fmt.bytesToHex(peer_a.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_b };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    // One retained head per distinct origin lets the first sorted peer fill the
+    // complete 32-frame budget under the old peer-major sweep. Both peers lack
+    // every row, so the scheduler visits each exactly once in this bounded call:
+    // the later peer is not starved and a cursor wrap cannot duplicate one head.
+    for (0..relay_v2_retry_frame_budget) |index| {
+        var seed: [32]u8 = @splat(@as(u8, @intCast(index + 1)));
+        seed[31] ^= 0x5a;
+        var origin = try node_identity.fromSeed(seed, "rvl2-peer-fairness-origin");
+        defer origin.deinit();
+        var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+        var signature: [message_relay_v2.sig_len]u8 = undefined;
+        var text_buf: [32]u8 = undefined;
+        const body = try std.fmt.bufPrint(&text_buf, "origin-head-{d}", .{index});
+        var msg = message_relay_v2.RelayMessage{
+            .verb = .privmsg,
+            .target = "#peer-fairness",
+            .source_prefix = "origin!u@fairness.test",
+            .text = body,
+            .scope_kind = .channel,
+            .origin_node = origin.shortId(),
+            .hlc = server.nextMeshHlc(),
+        };
+        try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+        const wire = try message_relay_v2.encode(alloc, msg);
+        defer alloc.free(wire);
+        switch (try server.admitRelayV2Detailed(msg, null, .{ .peers = &.{}, .wire = wire }, null)) {
+            .accepted => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+    const work_len = server.collectRelayV2RetryWork(&work);
+    defer for (work[0..work_len]) |item| alloc.free(item.wire);
+    try std.testing.expectEqual(@as(usize, 2), work_len);
+    var peer_a_count: usize = 0;
+    var peer_b_count: usize = 0;
+    for (work[0..work_len]) |item| {
+        if (item.peer == peer_a.shortId()) peer_a_count += 1;
+        if (item.peer == peer_b.shortId()) peer_b_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), peer_a_count);
+    try std.testing.expectEqual(@as(usize, 1), peer_b_count);
+}
+
+test "MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "rvl2-egress-order-test");
+    defer local.deinit();
+    var peer_a = try node_identity.fromSeed(@as([32]u8, @splat(0x92)), "rvl2-egress-order-test");
+    defer peer_a.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0x93)), "rvl2-egress-order-test");
+    defer peer_b.deinit();
+    const root_a = std.fmt.bytesToHex(peer_a.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_b };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    // One origin authors 65 ascending-HLC events (> the 64-HLC RVG2 per-origin
+    // retention window). Each is admitted "live" back-to-back while neither
+    // neighbor has ACKed, so every row is a retained obligation for both. The
+    // unified egress scheduler must never expose a newer same-origin head to a
+    // neighbor while a lower-HLC row for that origin is still unconfirmed:
+    // e1..e64 may not overtake e0. This is the ordering guarantee the
+    // forward-through-the-scheduler unification (P0 #4) exists to enforce, at
+    // the live server-egress boundary rather than only inside the event log.
+    const backlog = 65;
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x9a)), "rvl2-egress-order-origin");
+    defer origin.deinit();
+
+    var ids: [backlog]message_relay_v2.RelayId = undefined;
+    for (0..backlog) |index| {
+        var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+        var signature: [message_relay_v2.sig_len]u8 = undefined;
+        var text_buf: [40]u8 = undefined;
+        const body = try std.fmt.bufPrint(&text_buf, "egress-order-{d}", .{index});
+        var msg = message_relay_v2.RelayMessage{
+            .verb = .privmsg,
+            .target = "#egress-order",
+            .source_prefix = "origin!u@egress.test",
+            .text = body,
+            .scope_kind = .channel,
+            .origin_node = origin.shortId(),
+            .hlc = server.nextMeshHlc(),
+        };
+        try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+        const wire = try message_relay_v2.encode(alloc, msg);
+        defer alloc.free(wire);
+        ids[index] = switch (try server.admitRelayV2Detailed(msg, null, .{ .peers = &.{}, .wire = wire }, null)) {
+            .accepted => |id| id,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+
+    // Drain peer_a's obligations head by head. Each sweep must hand back the
+    // lowest unconfirmed same-origin HLC first; confirming it advances the head
+    // by exactly one. Assert the emitted order is e0, e1, ... e64 — no gap, no
+    // reordering, no newer-before-older.
+    for (0..backlog) |expected| {
+        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+        const work_len = server.collectRelayV2RetryWork(&work);
+        defer for (work[0..work_len]) |item| alloc.free(item.wire);
+        var head: ?RelayV2RetryWork = null;
+        for (work[0..work_len]) |item| {
+            if (item.peer == peer_a.shortId()) head = item;
+        }
+        const got = head orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.eql(u8, &got.relay_id, &ids[expected]));
+        try std.testing.expect(server.commitRelayV2NeighborAck(peer_a.shortId(), got.relay_id));
+    }
+
+    // peer_a is fully confirmed: it owes no residual head. peer_b, never ACKed,
+    // still owes its own head at the lowest HLC (e0) — custody is retained and
+    // ordered independently per neighbor, not collapsed across them.
+    var tail: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+    const tail_len = server.collectRelayV2RetryWork(&tail);
+    defer for (tail[0..tail_len]) |item| alloc.free(item.wire);
+    var peer_a_residual: usize = 0;
+    var peer_b_head: ?RelayV2RetryWork = null;
+    for (tail[0..tail_len]) |item| {
+        if (item.peer == peer_a.shortId()) peer_a_residual += 1;
+        if (item.peer == peer_b.shortId()) peer_b_head = item;
+    }
+    try std.testing.expectEqual(@as(usize, 0), peer_a_residual);
+    const b_head = peer_b_head orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.eql(u8, &b_head.relay_id, &ids[0]));
+}
+
+test "MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires it once on heal" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x94)), "rvl2-partition-heal-test");
+    defer local.deinit();
+    var peer_a = try node_identity.fromSeed(@as([32]u8, @splat(0x95)), "rvl2-partition-heal-test");
+    defer peer_a.deinit();
+    var peer_c = try node_identity.fromSeed(@as([32]u8, @splat(0x96)), "rvl2-partition-heal-test");
+    defer peer_c.deinit();
+    const root_a = std.fmt.bytesToHex(peer_a.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(peer_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_c };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    // B (local) accepts one event ingressed from neighbor A and must carry it to
+    // its other direct neighbor C. Model a partition: C never ACKs. The retained
+    // obligation to C must survive every retry sweep, never drop and never split
+    // into a second row; on heal (C finally ACKs) it retires exactly once. This
+    // is the A-B-C custody edge under partition/heal (P0 #4), proven at the live
+    // server-egress boundary.
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x9c)), "rvl2-partition-heal-origin");
+    defer origin.deinit();
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#partition-heal",
+        .source_prefix = "origin!u@partition.test",
+        .text = "carried across a partition",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const peers = try server.collectRelayV2OutboxPeers(peer_a.shortId(), false);
+    defer alloc.free(peers);
+    const relay_id = switch (try server.admitRelayV2Detailed(msg, null, .{
+        .peers = peers,
+        .receipt_peer = peer_a.shortId(),
+        .wire = wire,
+        .unbound_excluded_peer = peer_a.shortId(),
+    }, null)) {
+        .accepted => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    // The forward obligation is to C (the non-ingress neighbor); the ingress
+    // receipt is held for A; nothing is owed back to the ingress neighbor A.
+    try std.testing.expect(server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_a.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_a.shortId(), relay_id));
+
+    // Partition: sweep the scheduler repeatedly while C never acknowledges. C's
+    // obligation is re-offered on every sweep, exactly once, and never lost.
+    for (0..8) |_| {
+        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+        const work_len = server.collectRelayV2RetryWork(&work);
+        defer for (work[0..work_len]) |item| alloc.free(item.wire);
+        var to_c: usize = 0;
+        for (work[0..work_len]) |item| {
+            if (item.peer == peer_c.shortId()) {
+                to_c += 1;
+                try std.testing.expect(std.mem.eql(u8, &item.relay_id, &relay_id));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), to_c);
+        try std.testing.expect(server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    }
+
+    // Heal: C acknowledges. The obligation retires — the outbox no longer holds
+    // it — and a duplicate heal ACK is idempotent and mutates nothing further.
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), relay_id));
+
+    // Post-heal the scheduler has no residual obligation to C.
+    var tail: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+    const tail_len = server.collectRelayV2RetryWork(&tail);
+    defer for (tail[0..tail_len]) |item| alloc.free(item.wire);
+    for (tail[0..tail_len]) |item| {
+        try std.testing.expect(item.peer != peer_c.shortId());
+    }
+}
+
+test "MESSAGE_V2 Helix restore relation rejects individually valid torn authorities" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x88)), "rvl2-restore-relation-test");
+    defer local.deinit();
+    var peer_a = try node_identity.fromSeed(@as([32]u8, @splat(0x89)), "rvl2-restore-relation-test");
+    defer peer_a.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0x8a)), "rvl2-restore-relation-test");
+    defer peer_b.deinit();
+    const root_a = std.fmt.bytesToHex(peer_a.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_b };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#restore-relation",
+        .source_prefix = "local!u@restore.test",
+        .text = "one exact retained event",
+        .scope_kind = .channel,
+        .origin_node = local.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &local.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const relay_id = switch (try message_relay_v2.verifyAndRelayId(alloc, msg)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var guard = try relay_v2_replay_guard.Guard.init(alloc, .{});
+    defer guard.deinit();
+    switch (try guard.admitMessage(msg)) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    var log = try relay_v2_event_log.EventLog.init(alloc, .{});
+    defer log.deinit();
+    try std.testing.expectEqual(
+        relay_v2_event_log.ReserveOutcome.inserted,
+        try log.reserveAccepted(relay_id, wire, local.shortId(), null, server.relay_v2_required_nodes),
+    );
+    var outbox = try relay_v2_outbox.Outbox.init(alloc, 16);
+    defer outbox.deinit();
+    try outbox.putBatchExcluding(
+        &.{ peer_a.shortId(), peer_b.shortId() },
+        null,
+        relay_id,
+        wire,
+        1,
+        local.shortId(),
+    );
+    try std.testing.expect(server.relayV2RestoreRelationValid(&guard, &outbox, &log));
+
+    // ACK publication must remove the matching RVO2 obligation in the same
+    // cut. Leaving it behind is individually decodable but permanently unsent.
+    try std.testing.expectEqual(
+        relay_v2_event_log.ConfirmationOutcome.confirmed,
+        try log.confirmAuthenticatedDurableAck(relay_id, peer_a.shortId()),
+    );
+    try std.testing.expect(!server.relayV2RestoreRelationValid(&guard, &outbox, &log));
+
+    var narrow_required = [_]u64{ local.shortId(), peer_a.shortId() };
+    std.mem.sort(u64, &narrow_required, {}, std.sort.asc(u64));
+    var narrow_log = try relay_v2_event_log.EventLog.init(alloc, .{});
+    defer narrow_log.deinit();
+    _ = try narrow_log.reserveAccepted(relay_id, wire, local.shortId(), null, &narrow_required);
+    var wrong_peer_outbox = try relay_v2_outbox.Outbox.init(alloc, 16);
+    defer wrong_peer_outbox.deinit();
+    try wrong_peer_outbox.putBatchExcluding(
+        &.{peer_b.shortId()},
+        null,
+        relay_id,
+        wire,
+        1,
+        local.shortId(),
+    );
+    try std.testing.expect(!server.relayV2RestoreRelationValid(&guard, &wrong_peer_outbox, &narrow_log));
+
+    var foreign_accept_log = try relay_v2_event_log.EventLog.init(alloc, .{});
+    defer foreign_accept_log.deinit();
+    _ = try foreign_accept_log.reserveAccepted(
+        relay_id,
+        wire,
+        peer_a.shortId(),
+        null,
+        server.relay_v2_required_nodes,
+    );
+    var empty_outbox = try relay_v2_outbox.Outbox.init(alloc, 16);
+    defer empty_outbox.deinit();
+    try std.testing.expect(!server.relayV2RestoreRelationValid(&guard, &empty_outbox, &foreign_accept_log));
+
+    var empty_guard = try relay_v2_replay_guard.Guard.init(alloc, .{});
+    defer empty_guard.deinit();
+    try std.testing.expect(!server.relayV2RestoreRelationValid(&empty_guard, &empty_outbox, &narrow_log));
+
+    var empty_log = try relay_v2_event_log.EventLog.init(alloc, .{});
+    defer empty_log.deinit();
+    try std.testing.expect(!server.relayV2RestoreRelationValid(&guard, &wrong_peer_outbox, &empty_log));
+    var receipt_only = try relay_v2_outbox.Outbox.init(alloc, 16);
+    defer receipt_only.deinit();
+    try receipt_only.putBatchExcluding(
+        &.{},
+        peer_a.shortId(),
+        relay_id,
+        wire,
+        1,
+        local.shortId(),
+    );
+    try std.testing.expect(server.relayV2RestoreRelationValid(&empty_guard, &receipt_only, &empty_log));
+}
+
+test "UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .tls_port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var base: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer base.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &base, &blobs);
+
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x8b)), "rvl2-torn-handoff-test");
+    defer origin.deinit();
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#torn-handoff",
+        .source_prefix = "origin!u@restore.test",
+        .text = "outbox without retained authority",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = 1,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const relay_id = switch (try message_relay_v2.verifyAndRelayId(alloc, msg)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    var orphan_outbox = try relay_v2_outbox.Outbox.init(alloc, predecessor.relay_v2_outbox.max_entries);
+    defer orphan_outbox.deinit();
+    try orphan_outbox.putBatchExcluding(&.{9}, null, relay_id, wire, 1, origin.shortId());
+    const orphan_checkpoint = try orphan_outbox.encodeCheckpoint(alloc);
+    defer alloc.free(orphan_checkpoint);
+
+    var torn: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer torn.deinit(alloc);
+    for (base.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and relay_v2_outbox.isCheckpoint(piece.bytes)) {
+            try torn.append(alloc, .{
+                .kind = .mesh_checkpoint,
+                .bytes = orphan_checkpoint,
+                .min_supported = piece.min_supported,
+            });
+        } else try torn.append(alloc, piece);
+    }
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try successor.world.markRegistered("#old-sentinel", true);
+    _ = try rejectUpgradePiecesForTest(successor, torn.items, "orochi-test-rvl2-torn-relation");
+    current_reactor = null;
+    try std.testing.expect(successor.config.resume_arena_fd == null);
+    try std.testing.expect(successor.world.channelExists("#old-sentinel"));
+    try std.testing.expect(!successor.inherited_event_history_restored);
+    try std.testing.expect(!successor.inherited_webhook_store_restored);
+}
+
+test "MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 window eviction" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "relay-receipt-test");
+    defer identity.deinit();
+    var receipt_peer = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "relay-receipt-test");
+    defer receipt_peer.deinit();
+    var replay_peer = try node_identity.fromSeed(@as([32]u8, @splat(0x74)), "relay-receipt-test");
+    defer replay_peer.deinit();
+    const receipt_root = std.fmt.bytesToHex(receipt_peer.sign_kp.public_key, .lower);
+    const replay_root = std.fmt.bytesToHex(replay_peer.sign_kp.public_key, .lower);
+    const receipt_roots = [_][]const u8{ &receipt_root, &replay_root };
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &receipt_roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+
+    var first_pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var first_signature: [message_relay_v2.sig_len]u8 = undefined;
+    var first = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#receipt",
+        .source_prefix = "alice!user@receipt.test",
+        .text = "lost ack",
+        .scope_kind = .channel,
+        .origin_node = identity.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(
+        allocator,
+        &first,
+        &identity.sign_kp,
+        &first_pubkey,
+        &first_signature,
+    );
+    const first_wire = try message_relay_v2.encode(allocator, first);
+    defer allocator.free(first_wire);
+    const first_id = switch (try server.admitRelayV2Detailed(first, null, .{
+        .peers = &.{},
+        .receipt_peer = receipt_peer.shortId(),
+        .wire = first_wire,
+    }, null)) {
+        .accepted => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // More than the configured greatest-W window evicts the first exact HLC
+    // into RVG2's ambiguous retired watermark.
+    for (0..relay_v2_replay_guard.default_window_size + 1) |index| {
+        var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+        var signature: [message_relay_v2.sig_len]u8 = undefined;
+        var text_buf: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&text_buf, "later-{d}", .{index});
+        var later = message_relay_v2.RelayMessage{
+            .verb = .privmsg,
+            .target = "#receipt",
+            .source_prefix = "alice!user@receipt.test",
+            .text = text,
+            .scope_kind = .channel,
+            .origin_node = identity.shortId(),
+            .hlc = server.nextMeshHlc(),
+        };
+        try message_relay_v2.stampOrigin(allocator, &later, &identity.sign_kp, &pubkey, &signature);
+        const wire = try message_relay_v2.encode(allocator, later);
+        defer allocator.free(wire);
+        switch (try server.admitRelayV2Detailed(later, null, .{ .peers = &.{}, .wire = wire }, null)) {
+            .accepted => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(server.relay_v2_event_log.contains(first_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(receipt_peer.shortId(), first_id));
+    switch (try server.probeRelayV2(first, receipt_peer.shortId())) {
+        .duplicate => |id| try std.testing.expectEqualSlices(u8, &first_id, &id),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try server.probeRelayV2(first, replay_peer.shortId())) {
+        .duplicate => |id| try std.testing.expectEqualSlices(u8, &first_id, &id),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(try server.retainRelayV2DuplicateIngress(
+        first_id,
+        first_wire,
+        replay_peer.shortId(),
+    ));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(replay_peer.shortId(), first_id));
+}
+
+test "Event Spine v2 history conflict rolls back staged replay authority byte-exact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7b)), "event-transaction-test");
+    defer identity.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "event-transaction.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var pubkey: [oper_event.pubkey_len]u8 = undefined;
+    var signature: [oper_event.sig_len]u8 = undefined;
+    var event = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.oper_action),
+        .severity = @intFromEnum(event_spine.EventSeverity.notice),
+        .origin_node = identity.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .origin_server = "event-transaction.test",
+        .subject = "#transaction",
+        .message = "canonical event",
+    };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &pubkey, &signature);
+    const verified = switch (oper_event.verifyAndEventId(event)) {
+        .verified => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Inject a validly-shaped OEH1 row with the same stable id but conflicting
+    // content. The staged guard accepts the authentic object, then history
+    // rejects equivocation without mutation; the live guard must not advance.
+    try std.testing.expectEqual(
+        event_history_mod.StableIngestResult.inserted,
+        try server.event_history.ingestStableEvent(.{
+            .event_id = verified.event_id,
+            .category = event.category,
+            .severity = event.severity,
+            .origin_ts_unix_ms = @intCast(event.originTimeMs()),
+            .origin = event.origin_server,
+            .message = "conflicting retained event",
+        }),
+    );
+    const guard_before = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    const history_before = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_before);
+
+    try std.testing.expect((try server.admitEventSpineV2(event)) == null);
+
+    const guard_after = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after);
+    const history_after = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_after);
+    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+    try std.testing.expectEqualSlices(u8, history_before, history_after);
+
+    lockSpin(&server.event_spine_replay_mu);
+    const still_fresh = try server.event_spine_replay_guard.admit(
+        event,
+        server.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    server.event_spine_replay_mu.unlock();
+    try std.testing.expect(still_fresh == .accepted);
+    try std.testing.expectEqualSlices(u8, &verified.event_id, &still_fresh.accepted);
+}
+
+test "Event Spine v2 undefined severity fails closed without authority mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7d)), "event-severity-test");
+    defer identity.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "event-severity.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var pubkey: [oper_event.pubkey_len]u8 = undefined;
+    var signature: [oper_event.sig_len]u8 = undefined;
+    var event = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.oper_action),
+        .severity = std.math.maxInt(u8),
+        .origin_node = identity.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .origin_server = "event-severity.test",
+        .subject = "#severity",
+        .message = "undefined severity must never clamp",
+    };
+    // An over-max ("undefined") severity fails closed at the shared validateV2
+    // transcript guard: stampOrigin cannot sign it (the same guard also rejects
+    // it on the decode path, so a malicious peer's bytes never reach authority
+    // either). Signing does not mutate authority, so the guard/history capture
+    // and the admit rejection below still bracket every authority mutation.
+    try std.testing.expectError(
+        error.InvalidSeverity,
+        oper_event.stampOrigin(&event, &identity.sign_kp, &pubkey, &signature),
+    );
+    const guard_before = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    const history_before = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_before);
+
+    // The unsigned, over-max-severity event is refused by admit without mutation.
+    try std.testing.expect((try server.admitEventSpineV2(event)) == null);
+
+    const guard_after = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after);
+    const history_after = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_after);
+    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+    try std.testing.expectEqualSlices(u8, history_before, history_after);
+}
+
+test "Event Spine v2 binds local and remote origins before authority mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var local_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7e)), "event-origin-test");
+    defer local_identity.deinit();
+    var remote_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7f)), "event-origin-test");
+    defer remote_identity.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local_identity.shortId(),
+        .server_name = "event-origin.test",
+        .node_identity = &local_identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const hlc = server.nextMeshHlc();
+    var wrong_name_pk: [oper_event.pubkey_len]u8 = undefined;
+    var wrong_name_sig: [oper_event.sig_len]u8 = undefined;
+    var wrong_name = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.security),
+        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .origin_node = local_identity.shortId(),
+        .hlc = hlc,
+        .origin_server = "local-alias.invalid",
+        .subject = "#origin",
+        .message = "wrong local display origin",
+    };
+    try oper_event.stampOrigin(&wrong_name, &local_identity.sign_kp, &wrong_name_pk, &wrong_name_sig);
+
+    var remote_pk: [oper_event.pubkey_len]u8 = undefined;
+    var remote_sig: [oper_event.sig_len]u8 = undefined;
+    var unknown_remote = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.security),
+        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .origin_node = remote_identity.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .origin_server = "unknown-remote.test",
+        .subject = "#origin",
+        .message = "unregistered transit origin",
+    };
+    try oper_event.stampOrigin(&unknown_remote, &remote_identity.sign_kp, &remote_pk, &remote_sig);
+
+    const guard_before = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    const history_before = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_before);
+    try std.testing.expect((try server.admitEventSpineV2(wrong_name)) == null);
+    try std.testing.expect((try server.admitEventSpineV2(unknown_remote)) == null);
+
+    // Simulate the only dangerous routing-handle shape: an object carrying a
+    // different complete key while claiming the local short id. A real 64-bit
+    // collision is impractical to brute-force in a unit test; the daemon's
+    // full-key equality check is what rejects it before signature/replay work.
+    var local_claim_wrong_key = unknown_remote;
+    local_claim_wrong_key.origin_node = local_identity.shortId();
+    try std.testing.expect((try server.admitEventSpineV2(local_claim_wrong_key)) == null);
+
+    const guard_after = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after);
+    const history_after = try eventHistoryBytesForTest(allocator, &server.event_history);
+    defer allocator.free(history_after);
+    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+    try std.testing.expectEqualSlices(u8, history_before, history_after);
+
+    // The failed alias/unknown/key claims did not poison the same local HLC.
+    var canonical_pk: [oper_event.pubkey_len]u8 = undefined;
+    var canonical_sig: [oper_event.sig_len]u8 = undefined;
+    var canonical = wrong_name;
+    canonical.origin_server = "event-origin.test";
+    canonical.message = "canonical local origin";
+    try oper_event.stampOrigin(&canonical, &local_identity.sign_kp, &canonical_pk, &canonical_sig);
+    try std.testing.expect((try server.admitEventSpineV2(canonical)) != null);
+}
+
+test "Event Spine v2 guard allocation failures leave replay and history byte-exact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7c)), "event-oom-test");
+    defer identity.deinit();
+
+    var fail_index: usize = 0;
+    var reached_success = false;
+    while (fail_index < 128) : (fail_index += 1) {
+        var server = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .node_id = identity.shortId(),
+            .server_name = "event-oom.test",
+            .node_identity = &identity,
+            .crypto_io = std.testing.io,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        var pubkey: [oper_event.pubkey_len]u8 = undefined;
+        var signature: [oper_event.sig_len]u8 = undefined;
+        var event = oper_event.SignedOperEventV2{
+            .category = @intFromEnum(event_spine.EventCategory.oper_action),
+            .severity = @intFromEnum(event_spine.EventSeverity.notice),
+            .origin_node = identity.shortId(),
+            .hlc = server.nextMeshHlc(),
+            .origin_server = "event-oom.test",
+            .subject = "#oom",
+            .message = "transactional allocation sweep",
+        };
+        try oper_event.stampOrigin(&event, &identity.sign_kp, &pubkey, &signature);
+        const guard_before = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+        defer allocator.free(guard_before);
+        const history_before = try eventHistoryBytesForTest(allocator, &server.event_history);
+        defer allocator.free(history_before);
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        failing.fail_index = fail_index;
+        server.allocator = failing.allocator();
+        const attempt = server.admitEventSpineV2(event);
+        server.allocator = allocator;
+        if (attempt) |maybe_id| {
+            // The first fail index beyond all allocation sites reaches the
+            // successful no-fail publication boundary. Candidate allocations
+            // were made through the failing allocator's backing allocator; point
+            // ownership back at that stable allocator before fixture teardown.
+            server.event_spine_replay_guard.allocator = allocator;
+            server.event_spine_replay_guard.inner.allocator = allocator;
+            try std.testing.expect(maybe_id != null);
+            try std.testing.expectEqual(@as(usize, 1), server.event_history.len());
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            const guard_after = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+            defer allocator.free(guard_after);
+            const history_after = try eventHistoryBytesForTest(allocator, &server.event_history);
+            defer allocator.free(history_after);
+            try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+            try std.testing.expectEqualSlices(u8, history_before, history_after);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "UPGRADE mandatory state rejects missing duplicate and late corruption without publication" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var base_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (base_blobs.items) |blob| alloc.free(blob);
+        base_blobs.deinit(alloc);
+    }
+    var base_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer base_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &base_pieces, &base_blobs);
+
+    var mismatched_guard = try event_spine_replay_guard.Guard.init(alloc, .{
+        .window_size = (event_spine_replay_guard.Config{}).window_size + 1,
+        .max_origins = (event_spine_replay_guard.Config{}).max_origins,
+    });
+    defer mismatched_guard.deinit();
+    const mismatched_guard_wire = try mismatched_guard.encodeCheckpoint(alloc);
+    defer alloc.free(mismatched_guard_wire);
+    var mismatched_relay_guard = try relay_v2_replay_guard.Guard.init(alloc, .{
+        .window_size = (relay_v2_replay_guard.Config{}).window_size + 1,
+        .max_origins = (relay_v2_replay_guard.Config{}).max_origins,
+    });
+    defer mismatched_relay_guard.deinit();
+    const mismatched_relay_guard_wire = try mismatched_relay_guard.encodeCheckpoint(alloc);
+    defer alloc.free(mismatched_relay_guard_wire);
+
+    const Scenario = enum {
+        missing_world,
+        duplicate_history,
+        corrupt_webhook_late,
+        missing_event_replay,
+        duplicate_event_replay,
+        corrupt_event_replay_late,
+        event_replay_config_mismatch,
+        missing_relay_replay,
+        duplicate_relay_replay,
+        corrupt_relay_replay_late,
+        relay_replay_config_mismatch,
+    };
+    for ([_]Scenario{
+        Scenario.missing_world,
+        .duplicate_history,
+        .corrupt_webhook_late,
+        .missing_event_replay,
+        .duplicate_event_replay,
+        .corrupt_event_replay_late,
+        .event_replay_config_mismatch,
+        .missing_relay_replay,
+        .duplicate_relay_replay,
+        .corrupt_relay_replay_late,
+        .relay_replay_config_mismatch,
+    }) |scenario| {
+        var scenario_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer scenario_pieces.deinit(alloc);
+        var corrupt_owned: ?[]u8 = null;
+        defer if (corrupt_owned) |blob| alloc.free(blob);
+        for (base_pieces.items) |piece| {
+            if (scenario == .missing_world and piece.kind == .channels) continue;
+            const is_event_replay = piece.kind == .mesh_checkpoint and
+                event_spine_replay_guard.isCheckpoint(piece.bytes);
+            const is_relay_replay = piece.kind == .mesh_checkpoint and
+                relay_v2_replay_guard.isCheckpoint(piece.bytes);
+            if (scenario == .missing_event_replay and is_event_replay) continue;
+            if (scenario == .missing_relay_replay and is_relay_replay) continue;
+            if (scenario == .corrupt_webhook_late and piece.kind == .webhook_store) {
+                const corrupt = try alloc.dupe(u8, piece.bytes);
+                corrupt[corrupt.len - 1] ^= 1;
+                corrupt_owned = corrupt;
+                try scenario_pieces.append(alloc, .{ .kind = piece.kind, .bytes = corrupt, .min_supported = piece.min_supported });
+            } else if (scenario == .corrupt_event_replay_late and is_event_replay) {
+                const corrupt = try alloc.dupe(u8, piece.bytes);
+                corrupt[corrupt.len - 1] ^= 1;
+                corrupt_owned = corrupt;
+                try scenario_pieces.append(alloc, .{ .kind = piece.kind, .bytes = corrupt, .min_supported = piece.min_supported });
+            } else if (scenario == .event_replay_config_mismatch and is_event_replay) {
+                try scenario_pieces.append(alloc, .{
+                    .kind = piece.kind,
+                    .bytes = mismatched_guard_wire,
+                    .min_supported = piece.min_supported,
+                });
+            } else if (scenario == .corrupt_relay_replay_late and is_relay_replay) {
+                const corrupt = try alloc.dupe(u8, piece.bytes);
+                corrupt[corrupt.len - 1] ^= 1;
+                corrupt_owned = corrupt;
+                try scenario_pieces.append(alloc, .{ .kind = piece.kind, .bytes = corrupt, .min_supported = piece.min_supported });
+            } else if (scenario == .relay_replay_config_mismatch and is_relay_replay) {
+                try scenario_pieces.append(alloc, .{
+                    .kind = piece.kind,
+                    .bytes = mismatched_relay_guard_wire,
+                    .min_supported = piece.min_supported,
+                });
+            } else {
+                try scenario_pieces.append(alloc, piece);
+            }
+        }
+        if (scenario == .duplicate_history) {
+            try scenario_pieces.append(alloc, .{
+                .kind = .history,
+                .bytes = upgradePieceBytesForTest(base_pieces.items, .history).?,
+            });
+        }
+        if (scenario == .duplicate_event_replay) {
+            try scenario_pieces.append(alloc, .{
+                .kind = .mesh_checkpoint,
+                .bytes = upgradeEventReplayBytesForTest(base_pieces.items).?,
+                .min_supported = 2,
+            });
+        }
+        if (scenario == .duplicate_relay_replay) {
+            try scenario_pieces.append(alloc, .{
+                .kind = .mesh_checkpoint,
+                .bytes = upgradeRelayReplayBytesForTest(base_pieces.items).?,
+                .min_supported = 2,
+            });
+        }
+
+        const successor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer alloc.destroy(successor);
+        defer successor.deinit();
+        _ = try successor.world.markRegistered("#old-sentinel", true);
+        _ = try successor.history.append("#old-sentinel", .{
+            .msgid = "old-message",
+            .sender = "sentinel",
+            .text = "old history",
+            .timestamp = 7,
+        });
+        try successor.search_index.index("old-message", "old history");
+        successor.event_history.record(1, 1, 8, "old.node", "old event");
+        _ = try successor.webhook_store.create(
+            "#old-sentinel",
+            "old hook",
+            "sentinel",
+            9,
+            10,
+            .{ .per_min = 60, .burst = 10 },
+            @splat(0x56),
+            @splat(0x78),
+        );
+
+        var before_blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (before_blobs.items) |blob| alloc.free(blob);
+            before_blobs.deinit(alloc);
+        }
+        var before_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer before_pieces.deinit(alloc);
+        try appendCurrentMandatoryUpgradeStateForTest(successor, &before_pieces, &before_blobs);
+
+        _ = try rejectUpgradePiecesForTest(successor, scenario_pieces.items, "orochi-test-mandatory-reject");
+        current_reactor = null;
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expect(!successor.inherited_event_history_restored);
+        try std.testing.expect(!successor.inherited_webhook_store_restored);
+
+        var after_blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (after_blobs.items) |blob| alloc.free(blob);
+            after_blobs.deinit(alloc);
+        }
+        var after_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer after_pieces.deinit(alloc);
+        try appendCurrentMandatoryUpgradeStateForTest(successor, &after_pieces, &after_blobs);
+        inline for (.{ helix_capsule.CapsuleKind.channels, .history, .webhook_store }) |kind| {
+            try std.testing.expectEqualSlices(
+                u8,
+                upgradePieceBytesForTest(before_pieces.items, kind).?,
+                upgradePieceBytesForTest(after_pieces.items, kind).?,
+            );
+        }
+        try std.testing.expectEqualSlices(
+            u8,
+            upgradeEventReplayBytesForTest(before_pieces.items).?,
+            upgradeEventReplayBytesForTest(after_pieces.items).?,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            upgradeRelayReplayBytesForTest(before_pieces.items).?,
+            upgradeRelayReplayBytesForTest(after_pieces.items).?,
+        );
+    }
+}
+
+test "UPGRADE current mandatory handoff requires MHLC PRPC SRST and PMST" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var predecessor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var base: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer base.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&predecessor, &base, &blobs);
+
+    const Missing = enum { mhlc, prpc, srst, pmst };
+    for ([_]Missing{ .mhlc, .prpc, .srst, .pmst }) |missing| {
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(alloc);
+        for (base.items) |piece| {
+            const omit = switch (missing) {
+                .mhlc => piece.kind == .mesh_checkpoint and
+                    piece.bytes.len >= mesh_clock_snapshot.magic.len and
+                    std.mem.eql(u8, piece.bytes[0..mesh_clock_snapshot.magic.len], &mesh_clock_snapshot.magic),
+                .prpc => piece.kind == .mesh_checkpoint and prop_checkpoint.isUpgradeCheckpoint(piece.bytes),
+                .srst => piece.kind == .mesh_checkpoint and session_replica_v2.Store.isUpgradeCheckpoint(piece.bytes),
+                .pmst => piece.kind == .pending_migration and piece.min_supported == 2,
+            };
+            if (!omit) try pieces.append(alloc, piece);
+        }
+
+        var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        _ = try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-required-current-state");
+        current_reactor = null;
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expect(!successor.inherited_event_history_restored);
+        try std.testing.expect(!successor.inherited_webhook_store_restored);
+    }
+}
+
+test "MESSAGE_V2 Helix activation is staged exact and monotonic across current handoff" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0xa1)), "relay-v2-helix-activation");
+    defer local.deinit();
+    var peer = try node_identity.fromSeed(@as([32]u8, @splat(0xa2)), "relay-v2-helix-activation");
+    defer peer.deinit();
+    var third = try node_identity.fromSeed(@as([32]u8, @splat(0xa3)), "relay-v2-helix-activation");
+    defer third.deinit();
+    const local_root = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer.sign_kp.public_key, .lower);
+    const third_root = std.fmt.bytesToHex(third.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    const mismatched_roster = [_][]const u8{ &local_root, &peer_root, &third_root };
+
+    const compat_predecessor = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 23,
+        .relay_v2_roster = &roster,
+    });
+    defer alloc.destroy(compat_predecessor);
+    defer compat_predecessor.deinit();
+    var compat_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (compat_blobs.items) |blob| alloc.free(blob);
+        compat_blobs.deinit(alloc);
+    }
+    var compat_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer compat_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(compat_predecessor, &compat_pieces, &compat_blobs);
+
+    const active_successor = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 23,
+        .relay_v2_roster = &roster,
+    });
+    defer alloc.destroy(active_successor);
+    defer active_successor.deinit();
+    _ = try adoptUpgradePiecesForTest(
+        active_successor,
+        compat_pieces.items,
+        "orochi-test-relay-v2-activate",
+    );
+    current_reactor = null;
+    try std.testing.expect(active_successor.authoredRelayV2Configured());
+
+    // The same staged predecessor cannot activate a different full-roster
+    // digest, even when that successor configuration is independently valid.
+    const mismatched_successor = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 23,
+        .relay_v2_roster = &mismatched_roster,
+    });
+    defer alloc.destroy(mismatched_successor);
+    defer mismatched_successor.deinit();
+    const mismatched_clock_before = mismatched_successor.mesh_clock;
+    _ = try rejectUpgradePiecesForTest(
+        mismatched_successor,
+        compat_pieces.items,
+        "orochi-test-relay-v2-roster-mismatch",
+    );
+    current_reactor = null;
+    try std.testing.expectEqual(mismatched_clock_before, mismatched_successor.mesh_clock);
+
+    // Once the predecessor is active, a compatibility successor is a forbidden
+    // downgrade even though it carries the same epoch and roster.
+    var active_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (active_blobs.items) |blob| alloc.free(blob);
+        active_blobs.deinit(alloc);
+    }
+    var active_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer active_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(active_successor, &active_pieces, &active_blobs);
+    const downgrade = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_activation_epoch = 23,
+        .relay_v2_roster = &roster,
+    });
+    defer alloc.destroy(downgrade);
+    defer downgrade.deinit();
+    _ = try rejectUpgradePiecesForTest(
+        downgrade,
+        active_pieces.items,
+        "orochi-test-relay-v2-downgrade",
+    );
+    current_reactor = null;
+    try std.testing.expect(!downgrade.authoredRelayV2Configured());
+}
+
+test "UPGRADE continuity gate accepts idle state and refuses every media or companion owner" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const blocker = struct {
+        fn get(s: *Server) ?Server.UpgradeContinuityBlocker {
+            s.world.lockWrite();
+            defer s.world.unlockWrite();
+            return s.upgradeContinuityBlockerLocked();
+        }
+    }.get;
+
+    try std.testing.expect(blocker(&server) == null);
+
+    try server.media_rooms.join("#media-gate", "alice", .voice);
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_rooms, blocker(&server).?);
+    try std.testing.expect(server.media_rooms.leaveAll("#media-gate", "alice"));
+    try std.testing.expect(blocker(&server) == null);
+
+    _ = server.media_plane.allocate("#media-gate", "alice") orelse return error.OutOfMemory;
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_plane, blocker(&server).?);
+    server.media_plane.remove("#media-gate", "alice");
+    try std.testing.expect(blocker(&server) == null);
+
+    try server.native_media.register("#media-gate", "alice", .voice, 1234, .{});
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.native_media, blocker(&server).?);
+    server.native_media.unregister("#media-gate", "alice");
+    try std.testing.expect(blocker(&server) == null);
+
+    server.bridgeRegister("#media-gate", "alice", .native, 1234, &.{});
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_bridge, blocker(&server).?);
+    server.bridgeUnregister("#media-gate", "alice");
+    try std.testing.expect(blocker(&server) == null);
+
+    server.config.webtransport_port = 4433;
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.webtransport_listener, blocker(&server).?);
+    server.config.webtransport_port = 0;
+
+    var acme_tls = config_format.Config.Tls{};
+    server.acme_reload_tls = &acme_tls;
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.acme_companion, blocker(&server).?);
+    server.acme_reload_tls = null;
+    try std.testing.expect(blocker(&server) == null);
+}
+
+test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const event_path = try rehashTmpPath(alloc, tmp, "event-history.snapshot");
+    defer alloc.free(event_path);
+    const webhook_path = try rehashTmpPath(alloc, tmp, "webhooks.tsv");
+    defer alloc.free(webhook_path);
+
+    var disk_events = event_history_mod.EventHistory(512){};
+    disk_events.record(1, 1, 1, "disk.node", "stale disk event");
+    var event_writer = std.Io.Writer.Allocating.init(alloc);
+    defer event_writer.deinit();
+    try disk_events.serializeInto(&event_writer.writer);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "event-history.snapshot",
+        .data = event_writer.written(),
+    });
+
+    var disk_webhooks = webhook_mod.WebhookStore.init();
+    _ = try disk_webhooks.create(
+        "#disk",
+        "stale disk hook",
+        "disk",
+        1,
+        1,
+        .{ .per_min = 60, .burst = 10 },
+        @splat(0x91),
+        @splat(0x92),
+    );
+    var webhook_text: std.ArrayList(u8) = .empty;
+    defer webhook_text.deinit(alloc);
+    try disk_webhooks.serialize(alloc, &webhook_text);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "webhooks.tsv",
+        .data = webhook_text.items,
+    });
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+        .event_history_path = event_path,
+        .webhook_enabled = true,
+        .webhook_port = 0,
+        .webhook_store_path = webhook_path,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.event_history.record(2, 2, 2, "inherited.node", "authoritative inherited event");
+    _ = try server.webhook_store.create(
+        "#inherited",
+        "authoritative hook",
+        "inherited",
+        2,
+        2,
+        .{ .per_min = 60, .burst = 10 },
+        @splat(0x81),
+        @splat(0x82),
+    );
+    server.inherited_event_history_restored = true;
+    server.inherited_webhook_store_restored = true;
+
+    server.start();
+
+    var events: [4]event_history_mod.StoredEvent = undefined;
+    const event_count = server.event_history.collect(null, 0, &events);
+    try std.testing.expectEqual(@as(usize, 1), event_count);
+    try std.testing.expectEqualStrings("authoritative inherited event", events[0].message());
+    try std.testing.expectEqual(@as(usize, 1), server.webhook_store.len());
+    var inherited_entries: [2]webhook_mod.ListEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), server.webhook_store.list("#inherited", &inherited_entries));
+    var disk_entries: [2]webhook_mod.ListEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 0), server.webhook_store.list("#disk", &disk_entries));
+}
+
+test "UPGRADE exact client adoption failure is startup fatal and restores displaced World" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var predecessor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer predecessor.deinit();
+    const predecessor_client = try addTestLocalClient(&predecessor, "fatal-client", null);
+    _ = try predecessor.world.join("#fatal", worldIdFromClient(predecessor_client));
+    const fatal_modes = predecessor.world.memberModes("#fatal", worldIdFromClient(predecessor_client)).?.bits;
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var inherited_socket_open = true;
+    defer if (inherited_socket_open) closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    // Current World checkpoints key physical member relations by the carried
+    // connection fd. Give the predecessor fixture the same live join key used
+    // by the deliberately-invalid client capsule below, then relinquish it once
+    // the checkpoint has been sealed (execve would transfer that ownership).
+    const predecessor_conn = predecessor.rx().clients.get(predecessor_client).?;
+    predecessor_conn.fd = sockets[0];
+    defer {
+        if (predecessor_conn.fd == sockets[0]) predecessor_conn.fd = -1;
+    }
+    const client_wire = try session_snapshot.encode(alloc, .{
+        .nick = "fatal-client",
+        .realname = "Fatal Client",
+        .fd = sockets[0],
+        .was_secured = true,
+        // Deliberately omit the matching TLS capsule. Exact adoption must fail
+        // startup after publication, never expose this socket as plaintext.
+        .channels = &.{.{ .name = "#fatal", .modes = fatal_modes }},
+    });
+    defer alloc.free(client_wire);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&predecessor, &pieces, &blobs);
+    predecessor_conn.fd = -1;
+    try pieces.append(alloc, .{ .kind = .clients, .bytes = client_wire });
+
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-client-fatal",
+        .pieces = pieces.items,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    var arena_open = true;
+    defer if (arena_open) closeFd(arena_dup);
+
+    var successor = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    _ = try successor.world.markRegistered("#old-world", true);
+    successor.config.resume_arena_fd = arena_dup;
+    try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
+    inherited_socket_open = false; // the secured-without-TLS fail-safe closed it
+    current_reactor = null;
+
+    // The whole-handoff relation catches the missing TLS join before ANY
+    // publication. Startup fails, the inherited socket is closed, and every
+    // fresh-boot authority remains untouched.
+    try std.testing.expect(!successor.inherited_event_history_restored);
+    try std.testing.expect(!successor.inherited_webhook_store_restored);
+    try std.testing.expect(successor.world.channelExists("#old-world"));
+    try std.testing.expect(!successor.world.channelExists("#fatal"));
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], posix.F.GETFD, 0)));
+
+    closeFd(arena_dup);
+    arena_open = false;
+    successor.config.resume_arena_fd = null;
+}
+
 fn fixedHexAfter(haystack: []const u8, marker: []const u8, hex_len: usize) ?[]const u8 {
     const start = (std.mem.indexOf(u8, haystack, marker) orelse return null) + marker.len;
     if (start + hex_len > haystack.len) return null;
@@ -42399,7 +51872,895 @@ test "multi-shard UPGRADE seal carries clients on EVERY shard (CLOEXEC cleared)"
     } else return error.SkipZigTest;
 }
 
-test "multi-shard UPGRADE quiesce parks the sibling worker, CAS-guards, and resumes" {
+test "UPGRADE exact cancels target operation kind and generation" {
+    const token = RingFdToken{ .slot = 0x1234, .gen = 0x5678 };
+    inline for (.{ ringlane.OpKind.accept, .recv, .send, .connect }) |kind| {
+        const ud = try ringlane.Ring.exactCancelUserData(kind, token);
+        try std.testing.expectEqual(try ringlane.encodeUserData(kind, token), ud.target);
+        try std.testing.expectEqual(try ringlane.encodeUserData(.other, token), ud.completion);
+        const decoded = try ringlane.decodeUserData(ud.target);
+        try std.testing.expectEqual(kind, decoded.kind);
+        try std.testing.expectEqual(token.slot, decoded.token.slot);
+        try std.testing.expectEqual(token.gen, decoded.token.gen);
+    }
+    try std.testing.expectError(
+        error.InvalidCancelKind,
+        ringlane.Ring.exactCancelUserData(.timeout, token),
+    );
+}
+
+test "UPGRADE TLS ticket-key capsule allocation failure is fatal to the seal" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(std.testing.allocator);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| std.testing.allocator.free(blob);
+        blobs.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(!Server.sealTlsTicketKeyUpgradeCapsule(
+        failing.allocator(),
+        @splat(0xA1),
+        @as(tls_resumption.TicketKey, @splat(0xB2)),
+        &pieces,
+        &blobs,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), blobs.items.len);
+}
+
+test "UPGRADE successor adopts one canonical TLS ticket-key authority atomically" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const carried_current: tls_resumption.TicketKey = @splat(0xA4);
+    const carried_previous: tls_resumption.TicketKey = @splat(0xB5);
+    const blob = try ticket_key_capsule.encode(allocator, .{
+        .current = carried_current,
+        .previous = carried_previous,
+    });
+    defer allocator.free(blob);
+
+    var successor = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_enable_resumption = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    successor.tls_ticket_key = @splat(0x11);
+    successor.tls_previous_ticket_key = @as(tls_resumption.TicketKey, @splat(0x22));
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |owned| allocator.free(owned);
+        blobs.deinit(allocator);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    try appendCurrentMandatoryUpgradeStateForTest(&successor, &pieces, &blobs);
+    var ticket_replaced = false;
+    for (pieces.items) |*piece| {
+        if (piece.kind != .tls_ticket_keys) continue;
+        piece.bytes = blob;
+        ticket_replaced = true;
+        break;
+    }
+    try std.testing.expect(ticket_replaced);
+    const listener_fd = successor.reactors[0].listener_fd;
+    const arena_fd = try adoptUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-success");
+    current_reactor = null;
+
+    try std.testing.expectEqualSlices(u8, &carried_current, &successor.tls_ticket_key);
+    try std.testing.expect(successor.tls_previous_ticket_key != null);
+    try std.testing.expectEqualSlices(u8, &carried_previous, &successor.tls_previous_ticket_key.?);
+    try std.testing.expect(successor.config.resume_arena_fd == null);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_fd, posix.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+}
+
+test "UPGRADE successor rejects missing duplicate corrupt and late-failing TLS ticket authority without publication" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const carried_current: tls_resumption.TicketKey = @splat(0xC6);
+    const carried_previous: tls_resumption.TicketKey = @splat(0xD7);
+    const valid = try ticket_key_capsule.encode(allocator, .{
+        .current = carried_current,
+        .previous = carried_previous,
+    });
+    defer allocator.free(valid);
+    const Scenario = enum { missing, duplicate, corrupt, late_failure };
+    for ([_]Scenario{ .missing, .duplicate, .corrupt, .late_failure }) |scenario| {
+        var successor = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_enable_resumption = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        const boot_current: tls_resumption.TicketKey = @splat(0x31);
+        const boot_previous: tls_resumption.TicketKey = @splat(0x42);
+        successor.tls_ticket_key = boot_current;
+        successor.tls_previous_ticket_key = boot_previous;
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |owned| allocator.free(owned);
+            blobs.deinit(allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(allocator);
+        try appendCurrentMandatoryUpgradeStateForTest(&successor, &pieces, &blobs);
+        var ticket_index: ?usize = null;
+        var pmst_index: ?usize = null;
+        for (pieces.items, 0..) |piece, index| {
+            if (piece.kind == .tls_ticket_keys) ticket_index = index;
+            if (piece.kind == .pending_migration and piece.min_supported == 2) pmst_index = index;
+        }
+        try std.testing.expect(ticket_index != null);
+        try std.testing.expect(pmst_index != null);
+        switch (scenario) {
+            .missing => _ = pieces.orderedRemove(ticket_index.?),
+            .duplicate => try pieces.append(allocator, .{ .kind = .tls_ticket_keys, .bytes = valid }),
+            .corrupt => pieces.items[ticket_index.?].bytes = "bad-ticket-key",
+            .late_failure => {
+                pieces.items[ticket_index.?].bytes = valid;
+                // The ticket singleton decodes successfully, then this exact
+                // PMST checkpoint fails before the common publication boundary.
+                pieces.items[pmst_index.?].bytes = "bad-pmst";
+            },
+        }
+        const listener_fd = successor.reactors[0].listener_fd;
+        const arena_fd = try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-refuse");
+        current_reactor = null;
+
+        try std.testing.expectEqualSlices(u8, &boot_current, &successor.tls_ticket_key);
+        try std.testing.expect(successor.tls_previous_ticket_key != null);
+        try std.testing.expectEqualSlices(u8, &boot_previous, &successor.tls_previous_ticket_key.?);
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_fd, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    }
+}
+
+test "UPGRADE successor rejects noncanonical TLS ticket wrapper and disabled authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const carried: tls_resumption.TicketKey = @splat(0xE8);
+    const blob = try ticket_key_capsule.encode(allocator, .{ .current = carried });
+    defer allocator.free(blob);
+
+    inline for (.{ true, false }) |resumption_enabled| {
+        var successor = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_enable_resumption = resumption_enabled,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer successor.deinit();
+        const boot_current: tls_resumption.TicketKey = @splat(if (resumption_enabled) 0x51 else 0x61);
+        successor.tls_ticket_key = boot_current;
+        successor.tls_previous_ticket_key = null;
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |owned| allocator.free(owned);
+            blobs.deinit(allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(allocator);
+        try appendCurrentMandatoryUpgradeStateForTest(&successor, &pieces, &blobs);
+        const listener_fd = successor.reactors[0].listener_fd;
+        const arena_fd = if (resumption_enabled) blk: {
+            var ticket_replaced = false;
+            for (pieces.items) |*piece| {
+                if (piece.kind != .tls_ticket_keys) continue;
+                piece.bytes = blob;
+                ticket_replaced = true;
+                break;
+            }
+            try std.testing.expect(ticket_replaced);
+            const stream = try encodeUpgradeStreamWithWidenedHeaderForTest(
+                allocator,
+                pieces.items,
+                .tls_ticket_keys,
+            );
+            defer allocator.free(stream);
+            break :blk try rejectUpgradeStreamForTest(&successor, stream, "orochi-test-ticket-key-outer");
+        } else blk: {
+            try pieces.append(allocator, .{ .kind = .tls_ticket_keys, .bytes = blob });
+            break :blk try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-disabled");
+        };
+        current_reactor = null;
+
+        try std.testing.expectEqualSlices(u8, &boot_current, &successor.tls_ticket_key);
+        try std.testing.expect(successor.tls_previous_ticket_key == null);
+        try std.testing.expect(successor.config.resume_arena_fd == null);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_fd, posix.F.GETFD, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
+    }
+}
+
+test "UPGRADE unmanaged mesh re-dial hint allocation failure is fatal to continuity" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(std.testing.allocator);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| std.testing.allocator.free(blob);
+        blobs.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(!Server.sealMeshRedialUpgradeHint(
+        failing.allocator(),
+        .{ .addr = @splat(0x44), .port = 6697 },
+        &pieces,
+        &blobs,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), blobs.items.len);
+}
+
+test "UPGRADE logged-in client without exact session token is incomplete" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = alloc;
+    conn.token = try tokenFromId(id);
+    try conn.session.setNick("tokenless");
+    conn.session.registration.registered = true;
+    conn.session.loginAs("account");
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.sealShardClients(&server.reactors[0], &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+}
+
+test "UPGRADE oversized MONITOR sidecar makes registered client incomplete" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = alloc;
+    conn.token = try tokenFromId(id);
+    try conn.session.setNick("watcher");
+    conn.session.registration.registered = true;
+    for (0..max_carried_monitor_targets + 1) |i| {
+        var nick_buf: [24]u8 = undefined;
+        try server.monitor.restoreTarget(monitorIdFromClient(id), try std.fmt.bufPrint(&nick_buf, "watched{d}", .{i}));
+    }
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.sealShardClients(&server.reactors[0], &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+}
+
+test "UPGRADE registered client seals one exact empty MONITOR and SILENCE sidecar" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer for (sockets) |fd| closeFd(fd);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = alloc;
+    conn.token = try tokenFromId(id);
+    try conn.session.setNick("empty-sidecars");
+    conn.session.registration.registered = true;
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.sealShardClients(&server.reactors[0], &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients);
+    try std.testing.expectEqual(@as(usize, 1), fd_count);
+
+    var clients: usize = 0;
+    var monitors: usize = 0;
+    var silences: usize = 0;
+    for (pieces.items) |piece| switch (piece.kind) {
+        .clients => clients += 1,
+        .monitor_list => {
+            monitors += 1;
+            var targets: [max_carried_monitor_targets][]const u8 = undefined;
+            const decoded = try monitor_capsule.MonitorCapsule.decode(piece.bytes, &targets);
+            try std.testing.expectEqual(@as(u64, @intCast(sockets[0])), decoded.client_id);
+            try std.testing.expectEqual(@as(usize, 0), decoded.targets.len);
+        },
+        .silence_list => {
+            silences += 1;
+            var masks: [max_carried_silence_masks][]const u8 = undefined;
+            const decoded = try silence_capsule.SilenceCapsule.decode(piece.bytes, &masks);
+            try std.testing.expectEqual(@as(u64, @intCast(sockets[0])), decoded.client_id);
+            try std.testing.expectEqual(@as(usize, 0), decoded.masks.len);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), clients);
+    try std.testing.expectEqual(@as(usize, 1), monitors);
+    try std.testing.expectEqual(@as(usize, 1), silences);
+}
+
+test "UPGRADE established secured mesh snapshot failure marks complete seal fatal" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+
+    const id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = alloc;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = &pair.a;
+    // Deterministic snapshot refusal seam: an unreaped exact RECV means the
+    // established link cannot export a stable stream image.
+    conn.recv_armed = true;
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.sealShardClients(&server.reactors[0], &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expect(counts.s2s_preserve_failed);
+    try std.testing.expectEqual(@as(usize, 0), counts.s2s_preserved);
+    try std.testing.expectEqual(@as(usize, 0), counts.s2s_hints);
+
+    conn.recv_armed = false;
+    conn.s2s_secured = null;
+}
+
+test "UPGRADE services cannot start before inherited state is consumed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    try std.testing.expect(server.inheritedStateConsumedBeforeServices());
+    server.config.resume_arena_fd = 123;
+    try std.testing.expect(!server.inheritedStateConsumedBeforeServices());
+    server.config.resume_arena_fd = null;
+    server.config.inherited_state_fd_manifest_present = true;
+    try std.testing.expect(!server.inheritedStateConsumedBeforeServices());
+    server.config.inherited_state_fd_manifest_present = false;
+    try std.testing.expect(server.inheritedStateConsumedBeforeServices());
+}
+
+test "UPGRADE completed secured mesh recv seals and resumes one continuous record stream" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var predecessor = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "upgrade-stream-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer predecessor.deinit();
+    current_reactor = &predecessor.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+
+    const id = try predecessor.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = predecessor.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = &pair.a;
+
+    // Put one complete encrypted record in the kernel, then reap it only into
+    // io_uring's CQ. Helix quiescence, not the ordinary reactor loop, must
+    // dispatch this completion before it snapshots the record counters.
+    const before_recv_counter = pair.a.exportOuter().recv_counter;
+    try pair.b.sendMembership(
+        "#before-upgrade",
+        "BeforeUpgrade",
+        0,
+        700,
+        true,
+        .{ .username = "before", .realname = "Before Upgrade", .host = "mesh.test" },
+        "",
+    );
+    const completed_wire = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(completed_wire);
+    pair.b.clearOutbound();
+    try predecessor.armRecv(conn);
+    _ = try predecessor.reactors[0].ring.submit();
+    try writeAllFd(sockets[1], completed_wire);
+    _ = try predecessor.reactors[0].ring.submitAndWait(1);
+
+    try predecessor.quiesceOwnedSocketIo();
+    try std.testing.expect(!conn.recv_armed);
+    try std.testing.expect(!conn.recv_cancel_pending);
+    try std.testing.expectEqual(before_recv_counter + 1, pair.a.exportOuter().recv_counter);
+
+    // The exact post-dispatch counters and any response bytes are the only
+    // stream image the successor may inherit.
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| allocator.free(blob);
+        blobs.deinit(allocator);
+    }
+    try std.testing.expect(predecessor.sealSecuredLink(conn, &pair.a, &pieces, &blobs));
+    try std.testing.expectEqual(@as(usize, 1), pieces.items.len);
+    try std.testing.expectEqual(.s2s_link, pieces.items[0].kind);
+    const snap = try s2s_snapshot.decode(pieces.items[0].bytes, s2s_snapshot.schema_version);
+    try std.testing.expectEqual(before_recv_counter + 1, snap.recv_counter);
+    try std.testing.expectEqual(sockets[0], snap.fd);
+    try std.testing.expect((snap.caps & s2s_snapshot.cap_secure_relay_v2) != 0);
+    try std.testing.expect((snap.caps & s2s_snapshot.cap_event_spine_v2) != 0);
+
+    // Transfer descriptor ownership away from the predecessor fixture exactly
+    // as execve would. The stack-owned pair.a remains alive only as an oracle;
+    // the successor constructs an independent resumed SecuredLink from `snap`.
+    conn.s2s_secured = null;
+    conn.fd = -1;
+
+    var successor = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "upgrade-stream-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    current_reactor = &successor.reactors[0];
+    try std.testing.expect(successor.adoptInheritedS2sLink(snap, true) != null);
+
+    var adopted: ?*ConnState = null;
+    var clients = successor.reactors[0].clients.iterator();
+    while (clients.next()) |entry| {
+        if (entry.value.fd == sockets[0] and entry.value.s2s_secured != null) {
+            try std.testing.expect(adopted == null);
+            adopted = entry.value;
+        }
+    }
+    const adopted_conn = adopted orelse return error.TestUnexpectedResult;
+    const resumed = adopted_conn.s2s_secured orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(snap.recv_counter, resumed.exportOuter().recv_counter);
+    try std.testing.expect(resumed.supportsSecureRelayV2());
+    try std.testing.expect(resumed.supportsEventSpineV2());
+
+    // Successor -> live peer: the carried response plus mandatory RESYNC remain
+    // valid at the next send counter. RESYNC is observed exactly once.
+    const peer_recv_before = pair.b.exportOuter().recv_counter;
+    const successor_wire = try copyTestSendQ(allocator, adopted_conn);
+    defer allocator.free(successor_wire);
+    try std.testing.expect(successor_wire.len != 0);
+    resetTestSendQ(adopted_conn);
+    try pair.b.feed(successor_wire, 701);
+    try std.testing.expect(pair.b.exportOuter().recv_counter > peer_recv_before);
+    try std.testing.expect(pair.b.takeResyncRequest());
+    try std.testing.expect(!pair.b.takeResyncRequest());
+
+    // RESYNC can make the peer answer with its current roster. Drain that
+    // ordinary post-adoption exchange in both directions before minting the
+    // single record whose exactly-once delivery is asserted below; discarding
+    // either side would deliberately create a record-counter hole.
+    var pump_rounds: usize = 0;
+    while (pair.b.outbound().len != 0 or resumed.outbound().len != 0) : (pump_rounds += 1) {
+        if (pump_rounds == 32) return error.TestUnexpectedResult;
+        const peer_out = try allocator.dupe(u8, pair.b.outbound());
+        defer allocator.free(peer_out);
+        const resumed_out = try allocator.dupe(u8, resumed.outbound());
+        defer allocator.free(resumed_out);
+        pair.b.clearOutbound();
+        resumed.clearOutbound();
+        if (peer_out.len != 0) try resumed.feed(peer_out, 702 + pump_rounds);
+        if (resumed_out.len != 0) try pair.b.feed(resumed_out, 702 + pump_rounds);
+    }
+    resumed.processDeferredResidenceFrames(734);
+    const baseline_changes = try resumed.takeMembershipChanges();
+    defer {
+        for (baseline_changes) |*change| change.deinit(allocator);
+        allocator.free(baseline_changes);
+    }
+
+    // Live peer -> successor: the next signed membership is one complete AEAD
+    // record and decrypts under the resumed receive counter exactly once.
+    try pair.b.sendMembership(
+        "#after-upgrade",
+        "AfterUpgrade",
+        0,
+        701,
+        true,
+        .{ .username = "after", .realname = "After Upgrade", .host = "mesh.test" },
+        "",
+    );
+    const post_wire = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(post_wire);
+    pair.b.clearOutbound();
+    try std.testing.expect(post_wire.len > 4);
+    try std.testing.expectEqual(post_wire.len, 4 + @as(usize, std.mem.readInt(u32, post_wire[0..4], .little)));
+    const successor_recv_before = resumed.exportOuter().recv_counter;
+    try resumed.feed(post_wire, 702);
+    try std.testing.expectEqual(successor_recv_before + 1, resumed.exportOuter().recv_counter);
+    resumed.processDeferredResidenceFrames(702);
+    const changes = try resumed.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("#after-upgrade", changes[0].channel);
+    try std.testing.expectEqualStrings("AfterUpgrade", changes[0].nick);
+}
+
+test "UPGRADE timer deferral still dispatches later recv CQE in copied batch" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    defer upgrade_signal_requested.store(false, .seq_cst);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    conn.recv_armed = true;
+    conn.recv_cancel_pending = true;
+    server.reactors[0].socket_io_quiescing = true;
+
+    upgrade_signal_requested.store(true, .seq_cst);
+    var handler = CompletionHandler{ .server = &server };
+    handler.onCompletion(.{ .timeout = {} });
+    handler.onCompletion(.{ .recv = .{
+        .token = conn.token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .more = false,
+    } });
+
+    try std.testing.expect(server.reactors[0].deferred_upgrade != null);
+    try std.testing.expect(!conn.recv_armed);
+    try std.testing.expect(!conn.recv_cancel_pending);
+    server.reactors[0].deferred_upgrade = null;
+    server.reactors[0].socket_io_quiescing = false;
+}
+
+test "UPGRADE quiesce applies completed unreaped recv before safe point" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    try server.armRecv(conn);
+    _ = try server.reactors[0].ring.submit();
+    try writeAllFd(sockets[1], "NICK retained\r\n");
+    _ = try server.reactors[0].ring.submitAndWait(1);
+
+    try server.quiesceOwnedSocketIo();
+    try std.testing.expect(!conn.recv_armed);
+    try std.testing.expect(!conn.recv_cancel_pending);
+    try std.testing.expectEqualStrings("retained", conn.session.displayName());
+    server.resumeOwnedSocketIo();
+    try std.testing.expect(!server.reactors[0].socket_io_quiescing);
+}
+
+test "UPGRADE send completion and exact cancel retain the unsent suffix" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    @memcpy(conn.send_buf[0..6], "abcdef");
+    conn.send_len = 6;
+    conn.send_armed = true;
+    conn.send_cancel_pending = true;
+    server.reactors[0].socket_io_quiescing = true;
+
+    try server.handleSend(.{ .token = conn.token, .res = 2, .more = false, .notif = false });
+    try std.testing.expectEqual(@as(usize, 2), conn.send_offset);
+    try std.testing.expectEqualStrings("cdef", conn.send_buf[conn.send_offset..conn.send_len]);
+    conn.send_armed = true;
+    conn.send_cancel_pending = true;
+    try server.handleSend(.{
+        .token = conn.token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .more = false,
+        .notif = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), conn.send_offset);
+    try std.testing.expectEqualStrings("cdef", conn.send_buf[conn.send_offset..conn.send_len]);
+    try std.testing.expect(!conn.send_armed);
+    try std.testing.expect(!conn.send_cancel_pending);
+    server.reactors[0].socket_io_quiescing = false;
+}
+
+test "UPGRADE quiet recv exact cancel rearms on failure resume" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    try server.armRecv(conn);
+    _ = try server.reactors[0].ring.submit();
+
+    try server.quiesceOwnedSocketIo();
+    try std.testing.expect(!conn.recv_armed);
+    try std.testing.expect(!conn.recv_cancel_pending);
+    server.resumeOwnedSocketIo();
+    try std.testing.expect(!server.reactors[0].socket_io_quiescing);
+    try std.testing.expect(conn.recv_armed);
+}
+
+test "UPGRADE canceled CONNECT survives SQ-full and retries through fair activation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ring_entries = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const fd = try socketTcp6();
+    const id = try server.reactors[0].clients.alloc(ConnState.init(fd));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 9, 2_000);
+    conn.s2s_initiator = true;
+    conn.connect_rearm_pending = true;
+
+    var long_timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
+    var filled = false;
+    for (0..64) |_| {
+        server.reactors[0].ring.submitTimeout(timer_token, &long_timeout) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                filled = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try std.testing.expect(filled);
+
+    try std.testing.expect(try server.activatePendingSocketIo());
+    try std.testing.expect(conn.connect_rearm_pending);
+    try std.testing.expect(!conn.connect_armed);
+
+    _ = try server.reactors[0].ring.submit();
+    _ = try server.activatePendingSocketIo();
+    try std.testing.expect(!conn.connect_rearm_pending);
+    try std.testing.expect(conn.connect_armed);
+}
+
+test "UPGRADE final fixed point carries post-barrier marker on all four shards" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 4 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len != 4) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(alloc, 4) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var peers: [4]linux.fd_t = @splat(-1);
+    defer for (peers) |fd| if (fd >= 0) closeFd(fd);
+    var ids: [4]client_model.ClientId = undefined;
+    const markers = [_][]const u8{ "seq7-shard0", "seq7-shard1", "seq7-shard2", "seq7-shard3" };
+    for (server.reactors, 0..) |*r, i| {
+        current_reactor = r;
+        var sockets: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+            return error.SkipZigTest;
+        peers[i] = sockets[1];
+        ids[i] = try r.clients.alloc(ConnState.init(sockets[0]));
+        const conn = r.clients.get(ids[i]).?;
+        conn.overflow_allocator = alloc;
+        conn.token = try tokenFromId(ids[i]);
+        var nick_buf: [16]u8 = undefined;
+        try conn.session.setNick(try std.fmt.bufPrint(&nick_buf, "fixed{d}", .{i}));
+        conn.session.registration.registered = true;
+        r.socket_io_quiescing = true;
+
+        const buf = server.fabric.?.acquire(@intCast(i), markers[i]) orelse return error.TestUnexpectedResult;
+        if (!server.fabric.?.sendTo(@intCast(i), .{ .to = ids[i], .buf = buf })) {
+            server.fabric.?.release(@intCast(i), buf);
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    current_reactor = &server.reactors[0];
+    server.world.lockWrite();
+    const progress = server.drainAllUpgradeFabricFixedPointLocked() catch |err| {
+        server.world.unlockWrite();
+        return err;
+    };
+    server.world.unlockWrite();
+    try std.testing.expectEqual(@as(usize, 4), progress);
+    server.world.lockWrite();
+    const second_progress = server.drainAllUpgradeFabricFixedPointLocked() catch |err| {
+        server.world.unlockWrite();
+        return err;
+    };
+    server.world.unlockWrite();
+    try std.testing.expectEqual(@as(usize, 0), second_progress);
+    try std.testing.expectEqual(@as(u64, 0), server.crossShardDrops());
+    for (server.reactors, 0..) |*r, i| {
+        const conn = r.clients.get(ids[i]).?;
+        try std.testing.expectEqualStrings(markers[i], conn.send_buf[conn.send_offset..conn.send_len]);
+    }
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| alloc.free(b);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var carried_fds: [4]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    for (server.reactors) |*r|
+        server.sealShardClients(r, &pieces, &blobs, &carried_fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 4), counts.clients);
+    try std.testing.expectEqual(@as(usize, 4), counts.clients_expected);
+
+    var seen: [4]u8 = @splat(0);
+    for (pieces.items) |piece| {
+        if (piece.kind != .clients) continue;
+        const snap = try session_snapshot.decode(piece.bytes);
+        for (markers, 0..) |marker, i| {
+            if (std.mem.eql(u8, snap.pending_out, marker)) seen[i] += 1;
+        }
+    }
+    for (seen) |count| try std.testing.expectEqual(@as(u8, 1), count);
+}
+
+test "UPGRADE quiesce generation CAS and RESUMING completion are exact" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -42410,55 +52771,33 @@ test "multi-shard UPGRADE quiesce parks the sibling worker, CAS-guards, and resu
     };
     defer server.deinit();
     try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
-    const port = try server.boundPort();
+    current_reactor = &server.reactors[0];
 
-    var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-    defer {
-        server.requestStop(&run);
-        thr.join();
-    }
-    // Wait for the worker pool to come up. If the fabric/pool fell back to a
-    // single in-line reactor (no eventfd), the threaded quiesce handshake
-    // under test cannot exist — skip rather than fake it.
-    var spins: usize = 0;
-    while (server.pool.count() == 0) : (spins += 1) {
-        if (spins > 2000) return error.SkipZigTest;
-        testSleepMs(1);
-    }
+    // Only one contender can own initialization and reset the monotonic
+    // counters. This pure seam avoids issuing SINGLE_ISSUER ring operations
+    // from a non-owner thread (the old threaded test did exactly that).
+    try std.testing.expect(server.upgrade_quiesce_shard.cmpxchgStrong(
+        no_quiesce_shard,
+        initializing_quiesce_shard,
+        .acq_rel,
+        .acquire,
+    ) == null);
+    try std.testing.expect(server.upgrade_quiesce_shard.cmpxchgStrong(
+        no_quiesce_shard,
+        initializing_quiesce_shard,
+        .acq_rel,
+        .acquire,
+    ) != null);
 
-    // Claim the quiesce from this (non-worker) thread; rx() falls back to
-    // reactor 0, mirroring the SIGUSR2 sealer's geometry. The shard-1 worker
-    // must park (shard 0's worker is the claimed shard and stays exempt).
-    try server.quiesceSiblingReactors();
-    try std.testing.expect(server.upgrade_parked.load(.acquire) >= 1);
-    // A racing second UPGRADE must lose the CAS claim and refuse — two
-    // sealers must never both walk foreign shards.
-    try std.testing.expectError(error.ShardQuiesceFailed, server.quiesceSiblingReactors());
-
-    // Resume: the parked worker drains its park (counter returns to 0) ...
-    server.resumeSiblingReactors();
-    spins = 0;
-    while (server.upgrade_parked.load(.acquire) != 0) : (spins += 1) {
-        if (spins > 5000) return error.TestUnexpectedResult;
-        testSleepMs(1);
-    }
-    // ... and the daemon still serves: a fresh client registers and gets a
-    // PONG after the aborted-upgrade round trip (no wedged reactor, no
-    // leaked quiesce flag).
-    const cfd = try connectLoopback(port);
-    defer closeFd(cfd);
-    try writeAllFd(cfd, "NICK quiesced\r\nUSER q 0 * :q\r\nPING :alive\r\n");
-    var acc: std.ArrayList(u8) = .empty;
-    defer acc.deinit(alloc);
-    var rbuf: [1024]u8 = undefined;
-    var guard: usize = 0;
-    while (std.mem.indexOf(u8, acc.items, "PONG") == null) : (guard += 1) {
-        if (guard > 64) return error.TestUnexpectedResult;
-        const n = try readFd(cfd, &rbuf);
-        if (n == 0) return error.TestUnexpectedResult;
-        try acc.appendSlice(alloc, rbuf[0..n]);
-    }
+    server.upgrade_expected_siblings.store(1, .release);
+    server.upgrade_resume_done.store(0, .release);
+    server.upgrade_coordinator_resumed.store(true, .release);
+    server.upgrade_quiesce_shard.store(resuming_quiesce_shard, .release);
+    server.finishUpgradeResumeIfComplete();
+    try std.testing.expectEqual(resuming_quiesce_shard, server.upgrade_quiesce_shard.load(.acquire));
+    server.upgrade_resume_done.store(1, .release);
+    server.finishUpgradeResumeIfComplete();
+    try std.testing.expectEqual(no_quiesce_shard, server.upgrade_quiesce_shard.load(.acquire));
 }
 
 test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves both" {
@@ -42491,20 +52830,47 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     defer closeFd(peer_a); // carried ends transfer to the server on adopt
     defer closeFd(peer_b);
 
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
     const blob_a = try session_snapshot.encode(alloc, .{ .nick = "evenling", .realname = "A", .fd = carried_a });
     defer alloc.free(blob_a);
     const blob_b = try session_snapshot.encode(alloc, .{ .nick = "oddling", .realname = "B", .fd = carried_b });
     defer alloc.free(blob_b);
-    const arena_pieces = [_]helix_live.StatePiece{
+    var monitor_a_buf: [32]u8 = undefined;
+    const monitor_a = try (monitor_capsule.MonitorCapsule{ .client_id = @intCast(carried_a), .targets = &.{} }).encode(&monitor_a_buf);
+    var silence_a_buf: [32]u8 = undefined;
+    const silence_a = try (silence_capsule.SilenceCapsule{ .client_id = @intCast(carried_a), .masks = &.{} }).encode(&silence_a_buf);
+    var monitor_b_buf: [32]u8 = undefined;
+    const monitor_b = try (monitor_capsule.MonitorCapsule{ .client_id = @intCast(carried_b), .targets = &.{} }).encode(&monitor_b_buf);
+    var silence_b_buf: [32]u8 = undefined;
+    const silence_b = try (silence_capsule.SilenceCapsule{ .client_id = @intCast(carried_b), .masks = &.{} }).encode(&silence_b_buf);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |owned| alloc.free(owned);
+        blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&server, &arena_pieces, &blobs);
+    try arena_pieces.appendSlice(alloc, &.{
         .{ .kind = .clients, .bytes = blob_a },
+        .{ .kind = .monitor_list, .bytes = monitor_a },
+        .{ .kind = .silence_list, .bytes = silence_a },
         .{ .kind = .clients, .bytes = blob_b },
-    };
+        .{ .kind = .monitor_list, .bytes = monitor_b },
+        .{ .kind = .silence_list, .bytes = silence_b },
+    });
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-multishard-adopt",
-        .pieces = arena_pieces[0..],
+        .pieces = arena_pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -42512,12 +52878,6 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
     const arena_dup: linux.fd_t = @intCast(dup_rc);
 
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
     server.config.resume_arena_fd = arena_dup;
     var state_fds = [_]linux.fd_t{ carried_a, carried_b };
     server.config.inherited_state_fds = &state_fds;
@@ -42525,6 +52885,8 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     server.config.inherited_state_fd_manifest_valid = true;
     try server.adoptInheritedSessions();
     current_reactor = null;
+    try std.testing.expect(server.monitor.isOnline("evenling"));
+    try std.testing.expect(server.monitor.isOnline("oddling"));
 
     // Successful adoption transfers both descriptors to their reactors and
     // clears the authoritative manifest without closing the live sockets.
@@ -42856,6 +53218,195 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
     try recvUntil(&c, "@label=zed BATCH +", 200);
     try recvUntil(&c, "@batch=", 200);
     try recvUntil(&c, "BATCH -", 200);
+}
+
+test "webhook Helix unwind stays paused until every owner reaches IDLE" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .webhook_enabled = true,
+        .webhook_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    current_reactor = &server.reactors[0];
+    const ws = if (server.webhook_server) |*value| value else return error.SkipZigTest;
+    ws.pause();
+    try std.testing.expect(ws.thread == null);
+
+    server.upgrade_quiesce_shard.store(resuming_quiesce_shard, .release);
+    server.tryResumeWebhookAfterUpgrade(false);
+    try std.testing.expect(ws.thread == null);
+    try std.testing.expect(server.webhook_resume_pending.load(.acquire));
+
+    server.upgrade_quiesce_shard.store(no_quiesce_shard, .release);
+    const Retry = struct {
+        fn run(s: *Server, started: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            s.tryResumeWebhookAfterUpgrade(false);
+        }
+    };
+    var retry_started = std.atomic.Value(bool).init(false);
+    lockSpin(&server.webhook_lifecycle_gate);
+    server.webhook_upgrade_pause_active.store(true, .release);
+    var retry_thread = try std.Thread.spawn(.{}, Retry.run, .{ &server, &retry_started });
+    while (!retry_started.load(.acquire)) std.Thread.yield() catch {};
+    server.webhook_lifecycle_gate.unlock();
+    retry_thread.join();
+    try std.testing.expect(ws.thread == null);
+    try std.testing.expect(server.webhook_resume_pending.load(.acquire));
+
+    lockSpin(&server.webhook_lifecycle_gate);
+    server.webhook_upgrade_pause_active.store(false, .release);
+    server.webhook_lifecycle_gate.unlock();
+    server.tryResumeWebhookAfterUpgrade(false);
+    try std.testing.expect(ws.thread != null);
+    try std.testing.expect(!server.webhook_resume_pending.load(.acquire));
+}
+
+test "webhook Helix resume failure remains on bounded timer retry lane" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .webhook_enabled = true,
+        .webhook_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    current_reactor = &server.reactors[0];
+    const ws = if (server.webhook_server) |*value| value else return error.SkipZigTest;
+    ws.pause();
+    ws.shutdown(); // deterministically makes resumeServing return ListenerClosed
+
+    server.tryResumeWebhookAfterUpgrade(false);
+    try std.testing.expect(server.webhook_resume_pending.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), server.webhook_resume_attempts.load(.acquire));
+
+    server.world.lockWrite();
+    server.retryWebhookResumeIfPending();
+    server.world.unlockWrite();
+    try std.testing.expect(server.webhook_resume_pending.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), server.webhook_resume_attempts.load(.acquire));
+}
+
+test "webhook queued before refused UPGRADE drains once and retained listener accepts once after resume" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .webhook_enabled = true,
+        .webhook_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    current_reactor = &server.reactors[0];
+
+    const observer_id = try addTestLocalClient(&server, "UpgradeObserver", null);
+    const observer = server.reactors[0].clients.get(observer_id) orelse return error.TestUnexpectedResult;
+    observer.session.registration.registered = true;
+    _ = try server.world.join("#upgrade-hooks", worldIdFromClient(observer_id));
+    observer.send_len = 0;
+    observer.send_offset = 0;
+
+    const idm: [webhook_mod.id_bytes]u8 = @splat(0x71);
+    const tkm: [webhook_mod.token_bytes]u8 = @splat(0x72);
+    const creds = try server.webhook_store.create(
+        "#upgrade-hooks",
+        "upgrade-hook",
+        "operator",
+        0,
+        0,
+        server.webhookRate(),
+        idm,
+        tkm,
+    );
+    const ws = if (server.webhook_server) |*value| value else return error.SkipZigTest;
+    const original_listener_fd = ws.listen_fd;
+    const original_port = ws.port;
+
+    const Post = struct {
+        fn send(port: u16, credentials: webhook_mod.Credentials, content: []const u8) !void {
+            var body_buf: [256]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "{{\"content\":\"{s}\",\"username\":\"Upgrade Hook\"}}", .{content});
+            var request_buf: [768]u8 = undefined;
+            const request = try std.fmt.bufPrint(
+                &request_buf,
+                "POST /api/webhooks/{s}/{s} HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n{s}",
+                .{ credentials.id, credentials.token, body.len, body },
+            );
+            const fd = try connectLoopback(port);
+            defer closeFd(fd);
+            try writeAllFd(fd, request);
+            var client = LiveClient{ .fd = fd };
+            try recvUntil(&client, "204 No Content", 400);
+        }
+    };
+
+    // A 204 proves the listener completed validation and enqueued the first
+    // post. With no reactor loop running it must remain queued and invisible
+    // until the upgrade's producer-barrier drain.
+    try Post.send(original_port, creds, "before refused upgrade");
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countOccurrences(observer.send_buf[0..observer.send_len], "PRIVMSG #upgrade-hooks :before refused upgrade"),
+    );
+
+    // Enter immediately after the real executable capability probe. The
+    // registered observer intentionally owns fd=-1, so the natural complete-
+    // client seal rejects the upgrade only AFTER webhook pause + queue drain.
+    const target_rc = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(target_rc) != .SUCCESS) return error.SkipZigTest;
+    const target_fd: linux.fd_t = @intCast(target_rc);
+    defer closeFd(target_fd);
+    try std.testing.expectError(
+        error.SessionReplicaConverging,
+        server.performUpgradeAfterCompatibleTarget(.signal, target_fd, "/proc/self/exe"),
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(observer.send_buf[0..observer.send_len], "PRIVMSG #upgrade-hooks :before refused upgrade"),
+    );
+    try std.testing.expectEqual(original_listener_fd, ws.listen_fd);
+    try std.testing.expectEqual(original_port, ws.port);
+    try std.testing.expect(ws.thread != null);
+    try std.testing.expectEqual(no_quiesce_shard, server.upgrade_quiesce_shard.load(.acquire));
+    try std.testing.expect(!server.webhook_resume_pending.load(.acquire));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(original_listener_fd, posix.F.GETFD, 0)));
+
+    // The retained descriptor serves a fresh request on the same port. Drain
+    // twice to prove neither the pre-boundary nor post-unwind post duplicates.
+    try Post.send(original_port, creds, "after refused upgrade");
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countOccurrences(observer.send_buf[0..observer.send_len], "PRIVMSG #upgrade-hooks :after refused upgrade"),
+    );
+    server.drainWebhookPosts();
+    server.drainWebhookPosts();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(observer.send_buf[0..observer.send_len], "PRIVMSG #upgrade-hooks :before refused upgrade"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(observer.send_buf[0..observer.send_len], "PRIVMSG #upgrade-hooks :after refused upgrade"),
+    );
 }
 
 test "webhook: a Discord POST is delivered to the bound channel as a bot integration" {
@@ -44634,6 +55185,65 @@ test "exact-token NICK enforces no-nick across sibling membership union" {
     try std.testing.expect(server.world.findNick("Renamed") != null);
 }
 
+test "MONITOR rename prepares unbounded watcher output before identity commit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Alice", "alice");
+    const conn = server.connFor(id).?;
+    try server.monitor.restoreOnline("Alice");
+
+    // One watcher beyond the inline reply plan forces the live rename to own a
+    // heap buffer. The watcher ids need not be connected: MONITOR's reverse
+    // index is the authority being exercised, while delivery remains best-effort.
+    for (0..65) |index| {
+        var replies: [2]monitor.MonitorReply = undefined;
+        var storage: [128]u8 = undefined;
+        var sink = monitor.MonitorReplySink{ .replies = &replies, .storage = &storage };
+        try server.monitor.addTargets(10_000 + index, "Alice", &sink);
+    }
+    try std.testing.expectEqual(@as(usize, 65), server.monitor.watcherCount("Alice"));
+
+    // Deny the dynamic reply plan itself. No MONITOR occupancy or World/session
+    // identity has moved, so an enclosing NICK/RESUME transaction can still
+    // return without exposing a split-brain rename.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const stable_allocator = server.allocator;
+    {
+        server.allocator = failing.allocator();
+        defer server.allocator = stable_allocator;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            server.prepareMonitorOccupancyTransition("Alice", "Bob", false),
+        );
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("Alice", conn.session.displayName());
+    try std.testing.expect(server.world.findNick("Alice") != null);
+    try std.testing.expect(server.world.findNick("Bob") == null);
+    try std.testing.expect(server.monitor.isOnline("Alice"));
+    try std.testing.expect(!server.monitor.isOnline("Bob"));
+
+    // With capacity available, the ordinary live path commits World, session,
+    // and the derived MONITOR index together even though watcher delivery is
+    // larger than the historical fixed sink.
+    var parsed = try irc_line.parseLine("NICK Bob");
+    try server.handleNickChange(id, conn, &parsed);
+    try std.testing.expectEqualStrings("Bob", conn.session.displayName());
+    try std.testing.expect(server.world.findNick("Alice") == null);
+    try std.testing.expect(server.world.findNick("Bob") != null);
+    try std.testing.expect(!server.monitor.isOnline("Alice"));
+    try std.testing.expect(server.monitor.isOnline("Bob"));
+}
+
 test "repeated JOIN repairs exact siblings without emitting a duplicate logical event" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
@@ -45072,7 +55682,7 @@ test "session replica lifecycle LOGOUT revokes the final local portable token" {
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45102,7 +55712,7 @@ test "session replica lifecycle account switch revokes the abandoned portable to
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45132,7 +55742,7 @@ test "session replica lifecycle IRCX AUTH guest rebind revokes the abandoned por
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45167,7 +55777,7 @@ test "session replica lifecycle REGISTER rebind revokes the abandoned portable t
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45210,7 +55820,7 @@ test "session replica lifecycle DROP revokes every distinct local token" {
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45250,7 +55860,7 @@ test "session replica lifecycle keeps one-of-N authority and last nonportable si
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45284,7 +55894,7 @@ test "session replica lifecycle revokes portable authority evicted by attach cap
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45313,7 +55923,7 @@ test "session replica lifecycle revokes portable authority replaced on same-clie
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = ident.shortId(),
@@ -45342,7 +55952,7 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
-    server.* = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -45663,6 +56273,190 @@ test "session-sync exact-once matrix: local same-account distinct tokens dedupe 
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], "PRIVMSG Recipient :matrix-local"));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(account_sync.send_buf[0..account_sync.send_len], "PRIVMSG Recipient :matrix-local"));
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(same_nick_decoy.send_buf[0..same_nick_decoy.send_len], "PRIVMSG Recipient :matrix-local"));
+}
+
+test "threaded server: auxiliary direct events fan out exact-token attachments once with stable identity" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xA9)), "auxiliary-matrix.test");
+    defer identity.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "auxiliary-matrix.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "auxiliary-matrix";
+    const sender_token: sessions_mod.Token = @splat(0x11);
+    const recipient_token: sessions_mod.Token = @splat(0x22);
+    const decoy_token: sessions_mod.Token = @splat(0x33);
+    const sender_id = try addTestLocalClient(&server, "Sender", account);
+    const sender_exact_id = try addTestLocalClient(&server, "SenderAttach", account);
+    const recipient_id = try addTestLocalClient(&server, "Recipient", account);
+    const recipient_exact_id = try addTestLocalClient(&server, "RecipientAttach", account);
+    const decoy_id = try addTestLocalClient(&server, "SenderDecoy", account);
+    const sender = server.connFor(sender_id).?;
+    const sender_exact = server.connFor(sender_exact_id).?;
+    const recipient = server.connFor(recipient_id).?;
+    const recipient_exact = server.connFor(recipient_exact_id).?;
+    const decoy = server.connFor(decoy_id).?;
+
+    try std.testing.expect(server.sessions.adoptTokenGroup(
+        account,
+        monitorIdFromClient(sender_id),
+        sender_token,
+        true,
+    ));
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        account,
+        monitorIdFromClient(sender_exact_id),
+        sender_token,
+    ));
+    try std.testing.expect(server.sessions.adoptTokenGroup(
+        account,
+        monitorIdFromClient(recipient_id),
+        recipient_token,
+        true,
+    ));
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        account,
+        monitorIdFromClient(recipient_exact_id),
+        recipient_token,
+    ));
+    try std.testing.expect(server.sessions.adoptTokenGroup(
+        account,
+        monitorIdFromClient(decoy_id),
+        decoy_token,
+        true,
+    ));
+
+    // Render both physical attachments with their shared session nick. The
+    // independently-issued decoy deliberately renders Sender too: account and
+    // nick affinity must never widen exact-token authority.
+    server.world.unregisterNick(worldIdFromClient(sender_exact_id));
+    try sender_exact.session.setNick("Sender");
+    server.world.unregisterNick(worldIdFromClient(recipient_exact_id));
+    try recipient_exact.session.setNick("Recipient");
+    server.world.unregisterNick(worldIdFromClient(decoy_id));
+    try decoy.session.setNick("Sender");
+
+    // Every attachment participates in the WHISPER channel independently.
+    // Exact-token fan-out, rather than a single World nick owner, must still
+    // deliver one physical copy to each eligible sibling.
+    inline for (.{ sender_id, sender_exact_id, recipient_id, recipient_exact_id, decoy_id }) |member_id|
+        try server.world.restoreMember("#auxiliary", worldIdFromClient(member_id), world_model.MemberModes.empty());
+
+    sender.session.addCap(.message_tags);
+    sender.session.addCap(.server_time);
+    sender.session.addCap(.echo_message);
+    sender_exact.session.addCap(.message_tags);
+    sender_exact.session.addCap(.server_time);
+    recipient.session.addCap(.message_tags);
+    recipient.session.addCap(.server_time);
+    // Deliberately no message-tags/typing cap on this exact recipient: DATA and
+    // WHISPER still arrive, while a semantically empty TAGMSG must be filtered.
+    recipient_exact.session.addCap(.server_time);
+    decoy.session.addCap(.message_tags);
+    decoy.session.addCap(.server_time);
+
+    const outputs = [_]*ConnState{ sender, sender_exact, recipient, recipient_exact, decoy };
+    const Reset = struct {
+        fn run(conns: []const *ConnState) void {
+            for (conns) |conn| {
+                conn.send_len = 0;
+                conn.send_offset = 0;
+            }
+        }
+    };
+
+    const typed_cases = [_]struct { wire: []const u8, marker: []const u8 }{
+        .{ .wire = "DATA Recipient TAG :matrix-data", .marker = "DATA Recipient TAG :matrix-data" },
+        .{ .wire = "REQUEST Recipient RPC :matrix-request", .marker = "REQUEST Recipient RPC :matrix-request" },
+        .{ .wire = "REPLY Recipient RPC :matrix-reply", .marker = "REPLY Recipient RPC :matrix-reply" },
+    };
+    for (typed_cases) |case| {
+        Reset.run(&outputs);
+        var parsed = try irc_line.parseLine(case.wire);
+        try server.handleData(sender_id, sender, &parsed);
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(sender.send_buf[0..sender.send_len], case.marker));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_exact.send_buf[0..sender_exact.send_len], case.marker));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], case.marker));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient_exact.send_buf[0..recipient_exact.send_len], case.marker));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(decoy.send_buf[0..decoy.send_len], case.marker));
+        try std.testing.expectEqualStrings(
+            extractMsgid(sender_exact.send_buf[0..sender_exact.send_len]) orelse return error.TestUnexpectedResult,
+            extractMsgid(recipient.send_buf[0..recipient.send_len]) orelse return error.TestUnexpectedResult,
+        );
+    }
+
+    Reset.run(&outputs);
+    var tagmsg = try irc_line.parseLine("@+draft/typing=active TAGMSG Recipient");
+    try server.handleTagmsg(sender_id, sender, &tagmsg);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender.send_buf[0..sender.send_len], "TAGMSG Recipient"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_exact.send_buf[0..sender_exact.send_len], "TAGMSG Recipient"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], "TAGMSG Recipient"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(recipient_exact.send_buf[0..recipient_exact.send_len], "TAGMSG Recipient"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(decoy.send_buf[0..decoy.send_len], "TAGMSG Recipient"));
+    const tagmsg_id = extractMsgid(sender.send_buf[0..sender.send_len]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(tagmsg_id, extractMsgid(sender_exact.send_buf[0..sender_exact.send_len]) orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(tagmsg_id, extractMsgid(recipient.send_buf[0..recipient.send_len]) orelse return error.TestUnexpectedResult);
+
+    Reset.run(&outputs);
+    var whisper_line = try irc_line.parseLine("WHISPER #auxiliary Recipient :matrix-whisper");
+    try server.handleWhisper(sender_id, sender, &whisper_line);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(sender.send_buf[0..sender.send_len], "WHISPER #auxiliary Recipient :matrix-whisper"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_exact.send_buf[0..sender_exact.send_len], "WHISPER #auxiliary Recipient :matrix-whisper"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient.send_buf[0..recipient.send_len], "WHISPER #auxiliary Recipient :matrix-whisper"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(recipient_exact.send_buf[0..recipient_exact.send_len], "WHISPER #auxiliary Recipient :matrix-whisper"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(decoy.send_buf[0..decoy.send_len], "WHISPER #auxiliary Recipient :matrix-whisper"));
+    try std.testing.expectEqualStrings(
+        extractMsgid(sender_exact.send_buf[0..sender_exact.send_len]) orelse return error.TestUnexpectedResult,
+        extractMsgid(recipient.send_buf[0..recipient.send_len]) orelse return error.TestUnexpectedResult,
+    );
+}
+
+test "threaded server: remote DATA reserved tags require trusted oper grant or channel rank" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const now = server.grantNowU64();
+    _ = server.oper_grants.upsert(.{
+        .account = "trusted-oper",
+        .privilege_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+        .class = "oper",
+        .title = "",
+        .issuer_node = "authority.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + 60_000,
+    });
+    const member = world_model.MemberModes.empty();
+    const channel_op = world_model.MemberModes.fromModes(&.{.op});
+
+    try std.testing.expect(server.remoteDataTagAuthorized("TAG", false, null, ""));
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, ""));
+    // A mutable relay account claim cannot become `policy_account`; passing an
+    // ungranted forged value demonstrates that mere text has no authority.
+    try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, member, "forged-oper-text"));
+    try std.testing.expect(server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
+    try std.testing.expect(server.remoteDataTagAuthorized("ADM.alert", true, member, "trusted-oper"));
+    try std.testing.expect(server.remoteDataTagAuthorized("OWN.state", true, channel_op, ""));
+    try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", true, member, ""));
+    try std.testing.expect(!server.remoteDataTagAuthorized("OWN.state", false, null, ""));
+    // Network-oper override matches the local handleData policy even when the
+    // target is direct rather than a channel.
+    try std.testing.expect(server.remoteDataTagAuthorized("HST.state", false, null, "trusted-oper"));
 }
 
 test "session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror" {
@@ -46853,6 +57647,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"channels\":1,\"messages\":1,\"active_channels_24h\":1}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"features\":{\"s2s\":false,\"websocket\":false,\"webtransport\":false,\"proxy_protocol\":false,\"media\":false,\"webpush\":false,\"webauthn\":false,\"webhook\":false,\"metrics\":false,\"sts\":false,\"raw_public_key\":false,\"ktls_tx\":false,\"ktls_rx\":false,\"orowasm\":false,\"geo\":false,\"connection_throttle\":false,\"mesh_clone_limit\":false,\"reputation_gate\":false,\"dnsbl\":false}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"relay_v2\":{\"bridge_implemented\":true,\"authoring\":\"compat\",\"authoring_eligible\":false,\"activation_epoch\":0,\"roster_count\":0,\"roster_digest\":null}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh_admission\":{\"mode\":\"open\",\"secured_s2s\":false,\"require_secured\":false,\"require_signed_frames\":true,\"roots\":0,\"token_present\":false,\"min_revocation_epoch\":0}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
@@ -47882,6 +58677,98 @@ test "signed peer ingest uses Store residence decisions for downgrade and v2 row
     try std.testing.expectEqual(s2s_peer_mod.S2sPeer.MembershipDelta.Kind.parted, v2_part_changes[0].kind);
     try std.testing.expectEqual(@as(usize, 0), v2_receiver.channelMembers("#v2-rowless-two").len);
     try std.testing.expectEqual(@as(usize, 0), v2_receiver.channelMembers("#v2-rowless-three").len);
+}
+
+test "Helix silent session projection is complete without derived output and rejects invalid profile" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x2d)), "helix-projection-local");
+    defer local_ident.deinit();
+    var remote_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x2e)));
+    defer remote_kp.deinit();
+    const remote_node = message_relay.originShortId(remote_kp.public_key);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local_ident.shortId(),
+        .node_identity = &local_ident,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Before", "helix-acct");
+    const conn = server.connFor(id).?;
+    const token = server.sessions.resumeHandleForClient("helix-acct", monitorIdFromClient(id)).?.token;
+    try server.monitor.restoreOnline("Before");
+    const snapshot = try (migration_relay.Snapshot{
+        .nick = "After",
+        .umodes = "+i",
+        .channels = &.{"#helix-silent"},
+        .channel_modes = &.{@as(u8, 0)},
+        .realname = "Restored Profile",
+        .away = "restored-away",
+        .account = "helix-acct",
+    }).encode(allocator);
+    defer allocator.free(snapshot);
+    const now: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64) - 60_000)));
+    const now_u: u64 = @intCast(now);
+    const wire = try session_replica_v2.encodeOffer(allocator, .{
+        .operation = .upsert,
+        .token = token,
+        .revision = .{ .epoch = now_u, .sequence = (now_u << mesh_clock_mod.seq_bits) | 1, .origin_node = remote_node },
+        .issued_at_ms = now,
+        .expires_at_ms = now + 60_000,
+        .account = "helix-acct",
+        .nick = "After",
+        .snapshot = snapshot,
+    }, &remote_kp);
+    defer allocator.free(wire);
+    const signed = try session_replica_v2.decodeOffer(wire);
+    _ = try server.session_replica_store.applySignedOffer(signed, remote_node, now);
+    const send_len_before = conn.send_len;
+    const history_before = server.history.totalStoredCount();
+    try std.testing.expect(server.projectBestSessionReplicaV2Mode(token, .helix_silent));
+    try std.testing.expectEqualStrings("After", conn.session.displayName());
+    try std.testing.expectEqualStrings("Restored Profile", conn.session.realname());
+    try std.testing.expectEqualStrings("restored-away", conn.session.awayMessage().?);
+    try std.testing.expect(conn.session.hasUmode(.invisible));
+    try std.testing.expect(server.world.isMember("#helix-silent", worldIdFromClient(id)));
+    try std.testing.expectEqual(send_len_before, conn.send_len);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+    try std.testing.expectEqual(@as(usize, 0), server.sessions.dirtyReplicaProjectionRowCount());
+    try std.testing.expect(!server.session_replica_stage_retry_pending);
+    try std.testing.expect(!server.monitor.isOnline("Before"));
+    try std.testing.expect(server.monitor.isOnline("After"));
+
+    // The migration decoder accepts retired +w compatibility, but strict
+    // current Helix projection rejects it before mutating candidate state.
+    const invalid_snapshot = try (migration_relay.Snapshot{
+        .nick = "Rejected",
+        .umodes = "+w",
+        .channels = &.{},
+        .channel_modes = &.{},
+        .account = "helix-acct",
+    }).encode(allocator);
+    defer allocator.free(invalid_snapshot);
+    const invalid_wire = try session_replica_v2.encodeOffer(allocator, .{
+        .operation = .upsert,
+        .token = token,
+        .revision = .{ .epoch = now_u, .sequence = (now_u << mesh_clock_mod.seq_bits) | 2, .origin_node = remote_node },
+        .issued_at_ms = now,
+        .expires_at_ms = now + 60_000,
+        .account = "helix-acct",
+        .nick = "Rejected",
+        .snapshot = invalid_snapshot,
+    }, &remote_kp);
+    defer allocator.free(invalid_wire);
+    const invalid_signed = try session_replica_v2.decodeOffer(invalid_wire);
+    _ = try server.session_replica_store.applySignedOffer(invalid_signed, remote_node, now);
+    try std.testing.expect(!server.projectBestSessionReplicaV2Mode(token, .helix_silent));
+    try std.testing.expectEqualStrings("After", conn.session.displayName());
+    try std.testing.expectEqual(send_len_before, conn.send_len);
 }
 
 test "signed session replica projects JOIN PART only to the exact token and never republishes" {
@@ -49632,6 +60519,23 @@ fn extractTimeTag(bytes: []const u8) ?[]const u8 {
     return bytes[start..end];
 }
 
+/// Return the complete IRC line containing `needle`.  Threaded mesh tests can
+/// legitimately receive unrelated presence/maintenance lines alongside the
+/// event under test, so extracting the first tag in the whole receive buffer
+/// would compare metadata from different events.
+fn ircLineContaining(bytes: []const u8, needle: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, bytes, needle) orelse return null;
+    const start = if (std.mem.lastIndexOf(u8, bytes[0..at], "\r\n")) |previous|
+        previous + 2
+    else
+        0;
+    const end = if (std.mem.indexOf(u8, bytes[at..], "\r\n")) |following|
+        at + following
+    else
+        bytes.len;
+    return bytes[start..end];
+}
+
 fn waitMillis(ms: i64) void {
     const deadline = platform.monotonicMillis() + ms;
     while (platform.monotonicMillis() < deadline) {}
@@ -50735,91 +61639,6 @@ test "threaded server: migration staging isolates equal nonces from different pe
     try std.testing.expectEqual(@as(usize, 2), server.pending_migrations.?.count());
 }
 
-test "threaded server: peer reconnect anti-entropy reoffers portable detached state" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xD7)), "local");
-    defer identity.deinit();
-    var server = Server.init(alloc, .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .node_id = identity.shortId(),
-        .node_identity = &identity,
-        .crypto_io = std.testing.io,
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer server.deinit();
-
-    const token: session_migrate.Token = @splat(0x44);
-    _ = try server.sessions.attach("alice", 77, token, 1);
-    try std.testing.expect(server.sessions.markPortableResumeIssued("alice", 77));
-    const snapshot = try (migration_relay.Snapshot{
-        .nick = "alice-phone",
-        .umodes = "+i",
-        .channels = &.{"#home"},
-        .channel_modes = &.{0},
-        .account = "alice",
-    }).encode(alloc);
-    defer alloc.free(snapshot);
-    try std.testing.expect(server.sessions.markDetachedWithSnapshot("alice", 77, snapshot));
-
-    const CaptureLink = struct {
-        allocator: std.mem.Allocator,
-        wires: std.ArrayListUnmanaged([]u8) = .empty,
-
-        fn sendSessionMigrate(self: *@This(), wire: []const u8) !void {
-            const owned = try self.allocator.dupe(u8, wire);
-            errdefer self.allocator.free(owned);
-            try self.wires.append(self.allocator, owned);
-        }
-
-        fn peerShortId(_: *const @This()) ?u64 {
-            return null;
-        }
-
-        fn deinit(self: *@This()) void {
-            for (self.wires.items) |wire| self.allocator.free(wire);
-            self.wires.deinit(self.allocator);
-        }
-    };
-    var link = CaptureLink{ .allocator = alloc };
-    defer link.deinit();
-
-    // Each secured-link establishment re-offers the still-detached portable
-    // snapshot, with strictly increasing signed order metadata.
-    server.syncPortableSessions(&link);
-    server.syncPortableSessions(&link);
-    try std.testing.expectEqual(@as(usize, 2), link.wires.items.len);
-    const outer_1 = try session_migrate.decode(link.wires.items[0]);
-    const outer_2 = try session_migrate.decode(link.wires.items[1]);
-    try std.testing.expectEqualSlices(u8, &token, &outer_1.token);
-    try std.testing.expectEqualStrings("alice", outer_1.account);
-    var frame_1 = try migration_relay.decodeFrame(alloc, outer_1.snapshot);
-    defer frame_1.deinit(alloc);
-    var frame_2 = try migration_relay.decodeFrame(alloc, outer_2.snapshot);
-    defer frame_2.deinit(alloc);
-    try std.testing.expect(frame_2.token.epoch > frame_1.token.epoch);
-
-    // The ordinary receive path verifies the node signature and stages the
-    // snapshot under the exact local session token.
-    server.pending_migrations = session_migrate.PendingMigrations.init(alloc);
-    server.stageSessionMigration(&server.pending_migrations.?, identity.sign_kp.public_key, link.wires.items[1]);
-    const staged = server.pending_migrations.?.get(token) orelse return error.TestUnexpectedResult;
-    var restored = try migration_relay.Snapshot.decode(alloc, staged.snapshot);
-    defer restored.deinit(alloc);
-    try std.testing.expectEqualStrings("alice-phone", restored.nick);
-    try std.testing.expectEqualStrings("alice", restored.account);
-    try std.testing.expectEqualStrings("#home", restored.channels[0]);
-
-    // The operational kill switch covers reconnect reconciliation as well as
-    // the detach-time broadcast.
-    server.config.session_migrate_on_detach = false;
-    server.syncPortableSessions(&link);
-    try std.testing.expectEqual(@as(usize, 2), link.wires.items.len);
-}
-
 test "threaded server: session migration restore cannot switch the authenticated account" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -51183,6 +62002,47 @@ test "threaded server: session reclaim crypto_io-null disables reclaim not const
     var resume_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
     try server.handleSessionResume(id, conn, "acct3", &resume_line);
     try expectContains(conn.send_buf[0..conn.send_len], "RESUME requires a valid session token");
+}
+
+test "threaded server: MTOKEN is withheld when portable snapshot preflight cannot complete" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_pass = "portable-preflight-key",
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Preflight", "preflight-acct");
+    const conn = server.connFor(id).?;
+    const handle_before = server.sessions.resumeHandleForClient(
+        "preflight-acct",
+        monitorIdFromClient(id),
+    ).?;
+    try std.testing.expect(!handle_before.portable);
+
+    // The local reusable token is still useful on this node, but a failed
+    // portable snapshot allocation must not flip the group bit or expose a mesh
+    // credential whose state cannot subsequently be published.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    defer server.allocator = allocator;
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &token_line);
+    server.allocator = allocator;
+
+    const out = conn.send_buf[0..conn.send_len];
+    try expectContains(out, "SESSION TOKEN ");
+    try std.testing.expect(std.mem.indexOf(u8, out, "SESSION MTOKEN ") == null);
+    try std.testing.expect(!server.sessions.resumeHandleForClient(
+        "preflight-acct",
+        monitorIdFromClient(id),
+    ).?.portable);
 }
 
 test "threaded server: mesh reclaim credentials use portable wall-clock expiry" {
@@ -57729,7 +68589,7 @@ test "delivery fanout continues past stale and poisoned members to a later healt
     try server.broadcastChannelTagged("#delivery-isolation", .{
         .time_value = "",
         .account = null,
-    }, line, null);
+    }, line, null, .ordinary);
 
     try std.testing.expect(poisoned.delivery_gap.load(.acquire));
     try std.testing.expect(poisoned.delivery_abort_started);
@@ -57770,6 +68630,278 @@ test "tagged near-max line fails atomically without retaining its prefix" {
     try std.testing.expect(conn.delivery_abort_started);
     try std.testing.expectEqual(@as(usize, 0), conn.send_len);
     try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "reusable attachment SendQ pressure retains tagged event without poisoning" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Durable", "durable-account");
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    conn.session.addCap(.message_tags);
+    conn.send_armed = true; // keep the synthetic fd out of the io_uring arm path
+    conn.sendq_cap = 0;
+
+    const line = ":source!u@h PRIVMSG Durable :retained\r\n";
+    try server.deliverTagged(id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQRS",
+    }, line);
+
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expect(!conn.delivery_gap.load(.acquire));
+    try std.testing.expect(!conn.closing);
+
+    conn.sendq_cap = 4096;
+    server.drainAttachmentSpoolForCurrentReactor();
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try expectContains(conn.send_buf[0..conn.send_len], "@msgid=0123456789ABCDEFGHJKMNPQRS ");
+    try expectContains(conn.send_buf[0..conn.send_len], line);
+    try std.testing.expect(!conn.delivery_gap.load(.acquire));
+    try std.testing.expect(!conn.closing);
+}
+
+test "detached reusable attachment transfers retained event to resumed physical id" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const old_id = try addTestLocalClient(&server, "OldAttachment", null);
+    const new_id = try addTestLocalClient(&server, "NewAttachment", null);
+    const event_id: attachment_delivery_spool.EventId = @splat(0x5a);
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(old_id),
+        .event_id = event_id,
+        .bytes = ":source!u@h PRIVMSG NewAttachment :resume-me\r\n",
+    }});
+
+    try server.transferAttachmentDeliveries(
+        monitorIdFromClient(old_id),
+        monitorIdFromClient(new_id),
+    );
+    try std.testing.expect(!server.attachment_delivery_spool.contains(monitorIdFromClient(old_id), event_id));
+    try std.testing.expect(server.attachment_delivery_spool.contains(monitorIdFromClient(new_id), event_id));
+
+    const conn = server.connFor(new_id) orelse return error.TestUnexpectedResult;
+    conn.send_armed = true;
+    server.drainAttachmentSpoolForCurrentReactor();
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try expectContains(conn.send_buf[0..conn.send_len], "PRIVMSG NewAttachment :resume-me");
+}
+
+test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authorities unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6d)), "authored-spool-cut-test");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6e)), "authored-spool-cut-test");
+    defer peer_identity.deinit();
+    const peer_root_hex = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const peer_roots = [_][]const u8{&peer_root_hex};
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &peer_roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "DurableAuthor", "durable-author");
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    conn.session.addCap(.message_tags);
+
+    var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 512,
+        .max_record_bytes = 256,
+    });
+    std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+    defer {
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+        limited_spool.deinit();
+    }
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(id),
+        .event_id = @splat(0x11),
+        .bytes = ":seed!u@h PRIVMSG DurableAuthor :occupy\r\n",
+    }});
+
+    const guard_before = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    const history_before = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_before);
+    const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_before);
+    const outbox_before = server.relay_v2_outbox.len();
+
+    try std.testing.expectError(error.CapacityExceeded, server.admitAuthoredRelayV2(
+        .privmsg,
+        "#durable",
+        0,
+        "DurableAuthor!u@h",
+        "durable-author",
+        "",
+        "",
+        "must-not-publish",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        server.nextMeshHlc(),
+        null,
+        .{
+            .recipients = &.{id},
+            .line = ":DurableAuthor!u@h PRIVMSG #durable :must-not-publish\r\n",
+        },
+    ));
+
+    const guard_after = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after);
+    const history_after = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_after);
+    const spool_after = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_after);
+    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+    try std.testing.expectEqualSlices(u8, history_before, history_after);
+    try std.testing.expectEqualSlices(u8, spool_before, spool_after);
+    try std.testing.expectEqual(outbox_before, server.relay_v2_outbox.len());
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+}
+
+test "different-token session eviction retires old spool rows without leaking to newcomer" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const old_id = try addTestLocalClient(&server, "OldToken", "shared-account");
+    const old_conn = server.connFor(old_id) orelse return error.TestUnexpectedResult;
+    old_conn.session.addCap(.message_tags);
+    old_conn.send_armed = true;
+    old_conn.sendq_cap = 0;
+    try server.deliverTagged(old_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQRT",
+    }, ":source!u@h PRIVMSG OldToken :old-token-secret\r\n");
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    try std.testing.expect(server.sessions.markDetached("shared-account", monitorIdFromClient(old_id)));
+
+    const new_id = try addTestLocalClient(&server, "NewToken", "shared-account");
+    const new_conn = server.connFor(new_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expect(!server.sessions.containsClient("shared-account", monitorIdFromClient(old_id)));
+    try std.testing.expect(server.sessions.containsClient("shared-account", monitorIdFromClient(new_id)));
+    try std.testing.expect(std.mem.indexOf(u8, new_conn.send_buf[0..new_conn.send_len], "old-token-secret") == null);
+}
+
+test "logout retires pending attachment rows before socket close and later token reuse" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const old_id = try addTestLocalClient(&server, "LogoutOld", "logout-account");
+    const old_conn = server.connFor(old_id) orelse return error.TestUnexpectedResult;
+    old_conn.session.addCap(.message_tags);
+    old_conn.send_armed = true;
+    old_conn.sendq_cap = 0;
+    try server.deliverTagged(old_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQRV",
+    }, ":source!u@h PRIVMSG LogoutOld :logout-secret\r\n");
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+
+    old_conn.sendq_cap = 4096;
+    const old_token = old_conn.token;
+    try server.handleLogout(old_id, old_conn);
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expect(!server.sessions.containsClient("logout-account", monitorIdFromClient(old_id)));
+    try server.closeConn(old_token, "logout retirement test");
+
+    const newcomer_id = try addTestLocalClient(&server, "LogoutNew", "logout-account");
+    const newcomer = server.connFor(newcomer_id) orelse return error.TestUnexpectedResult;
+    newcomer.send_armed = true;
+    server.drainAttachmentSpoolForCurrentReactor();
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expect(std.mem.indexOf(u8, newcomer.send_buf[0..newcomer.send_len], "logout-secret") == null);
+}
+
+test "account rebind retires pending attachment rows before socket close and old-account reuse" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const old_id = try addTestLocalClient(&server, "RebindOld", "first-account");
+    const old_conn = server.connFor(old_id) orelse return error.TestUnexpectedResult;
+    old_conn.session.addCap(.message_tags);
+    old_conn.send_armed = true;
+    old_conn.sendq_cap = 0;
+    try server.deliverTagged(old_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQRW",
+    }, ":source!u@h PRIVMSG RebindOld :rebind-secret\r\n");
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+
+    old_conn.sendq_cap = 4096;
+    const old_token = old_conn.token;
+    try server.finishLogin(old_conn, "second-account");
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expect(!server.sessions.containsClient("first-account", monitorIdFromClient(old_id)));
+    try std.testing.expect(server.sessions.containsClient("second-account", monitorIdFromClient(old_id)));
+    try server.closeConn(old_token, "account rebind retirement test");
+
+    const newcomer_id = try addTestLocalClient(&server, "RebindNew", "first-account");
+    const newcomer = server.connFor(newcomer_id) orelse return error.TestUnexpectedResult;
+    newcomer.send_armed = true;
+    server.drainAttachmentSpoolForCurrentReactor();
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expect(std.mem.indexOf(u8, newcomer.send_buf[0..newcomer.send_len], "rebind-secret") == null);
 }
 
 test "cross-shard deliver: pool-exhaustion drops are counted, never silent" {
@@ -63741,6 +74873,54 @@ test "configured boot dial cursor reaches three peers behind a fast failure" {
     try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
 }
 
+test "configured boot dial resolves and recognizes inherited outbound survivor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    const specs = [_][]const u8{"127.0.0.1:65041"};
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const inherited = server.rx().clients.get(id).?;
+    inherited.overflow_allocator = allocator;
+    inherited.token = try tokenFromId(id);
+    inherited.s2s_secured = &pair.a;
+    defer inherited.s2s_secured = null; // pair owns this stack-backed fixture
+    inherited.s2s_initiator = true;
+    inherited.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 65041, 2_000);
+
+    // A successor starts with an unresolved configured-dial table even though
+    // the inherited link retains its exact target. Boot must resolve solely to
+    // match that survivor; it must not allocate a second connection or SQE.
+    try std.testing.expect(server.mesh_dials[0].addr == null);
+    const clients_before = server.rx().clients.len();
+    const sq_before = server.rx().ring.inner.sq_ready();
+    try std.testing.expect(server.sweepMeshAutoConnect(true, 1));
+    try std.testing.expect(server.mesh_dials[0].addr != null);
+    try std.testing.expect(server.mesh_dials[0].token == null);
+    try std.testing.expectEqual(clients_before, server.rx().clients.len());
+    try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+}
+
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
     if (comptime builtin.os.tag == .linux) {
         // Deterministic, execve-safe: drive the handler directly (it only stores the
@@ -63791,7 +74971,7 @@ test "UPGRADE refuses an incompatible target before listener or client CLOEXEC m
     const listener_fd = server.reactors[0].listener_fd;
     try std.testing.expect(setCloexec(listener_fd, true));
     try std.testing.expect(setCloexec(conn.fd, true));
-    try std.testing.expectError(error.UpgradeTargetIncompatible, server.performUpgrade(null));
+    try std.testing.expectError(error.UpgradeTargetIncompatible, server.performUpgrade(.signal));
 
     const listener_flags = linux.fcntl(listener_fd, posix.F.GETFD, 0);
     const client_flags = linux.fcntl(conn.fd, posix.F.GETFD, 0);
@@ -63835,7 +75015,7 @@ test "failed inherited client adoption does not advance HLC or queue carried out
         .nick = "Rollback",
         .realname = "Rollback",
         .pending_out = ":orochi NOTICE Rollback :carried\r\n",
-    }, null, null);
+    }, null, null, true);
     failing.fail_index = std.math.maxInt(usize);
     inherited_fd_unconsumed = false; // adoption either owns it or closed it
 
@@ -63914,7 +75094,7 @@ test "failed inherited TLS plus WebSocket adoption frees carried SendQ overflow"
         .fd = sockets[0],
         .phase_open = true,
         .tx = oversized_ws_tail,
-    });
+    }, true);
     inherited_fd_unconsumed = false;
 
     try std.testing.expect(!adopted);
@@ -64044,6 +75224,32 @@ fn reserveThreeLoopbackPorts() ServerError!struct { u16, u16, u16 } {
         defer closeFd(fd3);
         return .{ try socketPort(fd1), try socketPort(fd2), try socketPort(fd3) };
     } else return error.Unsupported;
+}
+
+/// Heavyweight mesh acceptance tests temporarily release their probed S2S
+/// ports before the real listeners bind them. Multiple copies of the tests
+/// running in separate Zig test processes can otherwise reserve the same ports,
+/// authenticate each other's identical fixtures, and produce a false topology
+/// timeout or silently Skip on AddressInUse. One advisory kernel lock serializes
+/// these cross-process fixtures; a crashed test releases it automatically.
+fn acquireHeavyMeshAcceptanceTestLock() !linux.fd_t {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const open_rc = linux.open(
+        "/tmp/orochi-heavy-mesh-acceptance-test.lock",
+        .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
+        0o600,
+    );
+    if (linux.errno(open_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const fd: linux.fd_t = @intCast(open_rc);
+    errdefer closeFd(fd);
+    while (true) {
+        const lock_rc = linux.flock(fd, 2); // LOCK_EX
+        switch (linux.errno(lock_rc)) {
+            .SUCCESS => return fd,
+            .INTR => continue,
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 fn testSleepMs(ms: isize) void {
@@ -64353,6 +75559,17 @@ fn testDmRelayVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
 var test_dm_relay_anchor: u8 = 0;
 const test_dm_relay_checker = sasl.PlainChecker{ .ptr = &test_dm_relay_anchor, .verifyFn = testDmRelayVerify };
 
+// Three-node line acceptance additionally needs one real mesh-admin connection
+// to hold the B-C leg down and reconnect it deterministically.
+fn testLineMeshVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    if (std.mem.eql(u8, creds.authcid, "admin"))
+        return std.mem.eql(u8, creds.password, "orochi");
+    return (std.mem.eql(u8, creds.authcid, "ruri") or std.mem.eql(u8, creds.authcid, "kazu")) and
+        std.mem.eql(u8, creds.password, "pw");
+}
+var test_line_mesh_anchor: u8 = 0;
+const test_line_mesh_checker = sasl.PlainChecker{ .ptr = &test_line_mesh_anchor, .verifyFn = testLineMeshVerify };
+
 // Design C / F1 fail-closed, at the live-integration level. Cross-node
 // multi-device coexistence (account "ruri" as nick Ruri on BOTH nodes) is what
 // lets a DM to a locally-held nick ALSO relay to the account's session on the
@@ -64528,10 +75745,15 @@ test "threaded server: one reusable session stays live and participatory across 
     defer ident1.deinit();
     var ident2 = try node_identity.fromSeed(@as([32]u8, @splat(0x92)), "mesh-session-test");
     defer ident2.deinit();
+    const root1 = std.fmt.bytesToHex(ident1.sign_kp.public_key, .lower);
+    const root2 = std.fmt.bytesToHex(ident2.sign_kp.public_key, .lower);
+    const roots_for_node1 = [_][]const u8{&root2};
+    const roots_for_node2 = [_][]const u8{&root1};
+    const relay_v2_roster = [_][]const u8{ &root1, &root2 };
 
     // Boot the target first so node 1 can auto-dial its real ephemeral S2S port.
     const node2 = try alloc.create(Server);
-    node2.* = Server.init(alloc, .{
+    node2.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_ports[1],
@@ -64540,7 +75762,11 @@ test "threaded server: one reusable session stays live and participatory across 
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
         .mesh_pass = "mesh-session-shared-secret",
+        .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_roster,
         .sasl_checker = test_dm_relay_checker,
         .account_services = &services2,
         .num_shards = 1,
@@ -64570,7 +75796,7 @@ test "threaded server: one reusable session stays live and participatory across 
     const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
     const peers = [_][]const u8{peer};
     const node1 = try alloc.create(Server);
-    node1.* = Server.init(alloc, .{
+    node1.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_ports[0],
@@ -64579,7 +75805,11 @@ test "threaded server: one reusable session stays live and participatory across 
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
         .mesh_pass = "mesh-session-shared-secret",
+        .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_roster,
         .mesh_connect = &peers,
         .sasl_checker = test_dm_relay_checker,
         .account_services = &services1,
@@ -64651,15 +75881,22 @@ test "threaded server: one reusable session stays live and participatory across 
     a.reset();
     try writeAllFd(fd_a, "SESSION TOKEN\r\n");
     try recvUntil(a, "SESSION MTOKEN ", 200);
-    const marker = "SESSION MTOKEN ";
-    const token_start = (std.mem.indexOf(u8, a.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
-    const token_tail = a.written()[token_start..];
-    const token_cr = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    const token_len = std.mem.indexOfScalar(u8, token_tail[0..token_cr], ' ') orelse token_cr;
-    if (token_len == 0 or token_len > 1024) return error.TestUnexpectedResult;
+    const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
+    var local_token_buf: [64]u8 = undefined;
+    @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
+    const local_token = local_token_buf[0..local_token_reply.len];
+    const mesh_token_reply = try expectFreshMeshSessionToken(
+        a.written(),
+        "mesh-session-shared-secret",
+        "ruri",
+        local_token,
+    );
+    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
-    const mesh_token = token_buf[0..token_len];
+    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
+    const mesh_token = token_buf[0..mesh_token_reply.len];
 
     // Attach B on the other node. Retrying the same credential while the signed
     // replica is in flight must be safe: no nonce burn and no source disconnect.
@@ -64959,9 +76196,494 @@ test "threaded server: one reusable session stays live and participatory across 
     try recvUntil(c, "PRIVMSG #mesh-session :survivor-can-still-send", 400);
 }
 
+const LiveUpgradeTestNode = struct {
+    allocator: std.mem.Allocator,
+    server: *Server,
+    run: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    const UpgradeSummary = struct {
+        state_fds: usize,
+        clients: usize,
+        s2s_preserved: usize,
+    };
+
+    fn init(allocator: std.mem.Allocator, config: Config) !LiveUpgradeTestNode {
+        const server = try allocator.create(Server);
+        errdefer allocator.destroy(server);
+        try server.initInPlace(allocator, config);
+        return .{ .allocator = allocator, .server = server };
+    }
+
+    fn start(self: *LiveUpgradeTestNode) !void {
+        if (self.thread != null) return error.TestUnexpectedResult;
+        self.server.start();
+        self.run.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ self.server, &self.run });
+    }
+
+    fn deinit(self: *LiveUpgradeTestNode) void {
+        if (self.thread) |thread_value| {
+            var thread = thread_value;
+            self.server.requestStop(&self.run);
+            thread.join();
+            self.thread = null;
+        }
+        current_reactor = null;
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+        self.* = undefined;
+    }
+
+    fn upgrade(self: *LiveUpgradeTestNode, successor_config: Config) !UpgradeSummary {
+        if (self.thread == null) return error.TestUnexpectedResult;
+        var capture = TestLiveUpgradeCapture{};
+        try self.server.requestLiveUpgradeCaptureForTest(&capture);
+        const deadline = platform.monotonicMillis() + 15_000;
+        while (!capture.completed.load(.acquire)) {
+            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            testSleepMs(1);
+        }
+        if (capture.failure) |err| {
+            std.debug.print("live upgrade test capture failed: {s}\n", .{@errorName(err)});
+            return err;
+        }
+        if (capture.arena_fd < 0 or capture.state_fd_count == 0) return error.TestUnexpectedResult;
+
+        var predecessor_thread = self.thread.?;
+        predecessor_thread.join();
+        self.thread = null;
+        try std.testing.expect(!self.run.load(.acquire));
+
+        var arena_owned = true;
+        defer if (arena_owned) closeFd(capture.arena_fd);
+        var fds_owned = true;
+        defer if (fds_owned) {
+            for (capture.state_fds[0..capture.state_fd_count]) |fd| closeFd(fd);
+        };
+
+        var successor = try Server.init(self.allocator, successor_config);
+        var successor_owned = true;
+        errdefer if (successor_owned) successor.deinit();
+        successor.config.resume_arena_fd = capture.arena_fd;
+        successor.config.inherited_state_fds = capture.state_fds[0..capture.state_fd_count];
+        successor.config.inherited_state_fd_manifest_present = true;
+        successor.config.inherited_state_fd_manifest_valid = true;
+        try successor.adoptInheritedSessions();
+        current_reactor = null;
+        arena_owned = false;
+        fds_owned = false;
+
+        // The capture seam set every transferred predecessor ConnState fd to -1,
+        // so destroying its rings/stores cannot close successor-owned sockets.
+        self.server.deinit();
+        self.server.* = successor;
+        successor_owned = false;
+        try self.start();
+        return .{
+            .state_fds = capture.state_fd_count,
+            .clients = capture.clients,
+            .s2s_preserved = capture.s2s_preserved,
+        };
+    }
+};
+
+fn testSessionTokenFromReply(bytes: []const u8, marker: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, bytes, marker) orelse return null) + marker.len;
+    const tail = bytes[start..];
+    const cr = std.mem.indexOfScalar(u8, tail, '\r') orelse return null;
+    const token_len = std.mem.indexOfScalar(u8, tail[0..cr], ' ') orelse cr;
+    if (token_len == 0) return null;
+    return tail[0..token_len];
+}
+
+fn expectFreshMeshSessionToken(
+    bytes: []const u8,
+    mesh_key: []const u8,
+    account: []const u8,
+    stable_token_hex: []const u8,
+) ![]const u8 {
+    const sealed_hex = testSessionTokenFromReply(bytes, "SESSION MTOKEN ") orelse
+        return error.TestUnexpectedResult;
+    if (sealed_hex.len % 2 != 0 or sealed_hex.len / 2 > 512)
+        return error.TestUnexpectedResult;
+    var raw: [512]u8 = undefined;
+    const sealed = std.fmt.hexToBytes(raw[0 .. sealed_hex.len / 2], sealed_hex) catch
+        return error.TestUnexpectedResult;
+    const now: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+    const fields = try session_reclaim_mesh.open(mesh_key, sealed, now);
+    try std.testing.expectEqualStrings(account, fields.account);
+    try std.testing.expectEqualStrings(stable_token_hex, fields.session_id);
+    try std.testing.expect(fields.origin_node.len != 0);
+    try std.testing.expect(fields.expiry_ms >= fields.issued_ms);
+    try std.testing.expectEqual(LinuxServer.mesh_reclaim_ttl_ms, fields.expiry_ms - fields.issued_ms);
+    try std.testing.expect(fields.expiry_ms >= now);
+    return sealed_hex;
+}
+
+fn expectLiveSessionToken(
+    client: *LiveClient,
+    expected: []const u8,
+    mesh_key: []const u8,
+    account: []const u8,
+) !void {
+    client.reset();
+    try writeAllFd(client.fd, "SESSION TOKEN\r\n");
+    const deadline = platform.monotonicMillis() + 1_000;
+    while (platform.monotonicMillis() < deadline) {
+        try client.readAvailable();
+        if (testSessionTokenFromReply(client.written(), "SESSION TOKEN ")) |token| {
+            try std.testing.expectEqualStrings(expected, token);
+            _ = try expectFreshMeshSessionToken(client.written(), mesh_key, account, expected);
+            return;
+        }
+        testSleepMs(10);
+    }
+    return error.TestTimeout;
+}
+
+fn resumeLiveMeshSession(client: *LiveClient, command: []const u8) !void {
+    for (0..100) |_| {
+        client.reset();
+        try writeAllFd(client.fd, command);
+        const deadline = platform.monotonicMillis() + 250;
+        while (platform.monotonicMillis() < deadline) {
+            try client.readAvailable();
+            if (std.mem.indexOf(u8, client.written(), "attached to") != null) return;
+            testSleepMs(10);
+        }
+        testSleepMs(20);
+    }
+    return error.TestTimeout;
+}
+
+fn expectNoUpgradeTopologyChurn(clients: []const *LiveClient) !void {
+    const deadline = platform.monotonicMillis() + 400;
+    while (platform.monotonicMillis() < deadline) {
+        for (clients) |client| try client.readAvailable();
+        testSleepMs(10);
+    }
+    for (clients) |client| {
+        const output = client.written();
+        try std.testing.expect(std.mem.indexOf(u8, output, " JOIN ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, " JOIN :") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, " PART ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, " QUIT ") == null);
+        client.reset();
+    }
+}
+
+fn expectAllUpgradeClientsPing(clients: []const *LiveClient, phase: []const u8) !void {
+    for (clients, 0..) |client, index| {
+        client.reset();
+        var line_buf: [96]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "PING :{s}-{d}\r\n", .{ phase, index });
+        try writeAllFd(client.fd, line);
+        var needle_buf: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "PONG orochi.local :{s}-{d}", .{ phase, index });
+        try recvUntil(client, needle, 600);
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), needle));
+    }
+}
+
+fn expectSharedUpgradeMessage(
+    clients: []const *LiveClient,
+    sender_index: usize,
+    target: []const u8,
+    body: []const u8,
+) !void {
+    for (clients) |client| client.reset();
+    var line_buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "PRIVMSG {s} :{s}\r\n", .{ target, body });
+    try writeAllFd(clients[sender_index].fd, line);
+    var needle_buf: [224]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "PRIVMSG {s} :{s}", .{ target, body });
+    if (clients.len > 16) return error.TestUnexpectedResult;
+    var received: [16]bool = @splat(false);
+    var remaining = clients.len;
+    const deadline = platform.monotonicMillis() + 20_000;
+    while (remaining != 0 and platform.monotonicMillis() < deadline) {
+        for (clients, 0..) |client, index| {
+            if (received[index]) continue;
+            try client.readAvailable();
+            if (std.mem.indexOf(u8, client.written(), needle) == null) continue;
+            received[index] = true;
+            remaining -= 1;
+        }
+        if (remaining != 0) testSleepMs(10);
+    }
+    if (remaining != 0) {
+        std.debug.print(
+            "four-client Helix delivery timeout phase={s} sender={d} target={s} missing={d}\n",
+            .{ body, sender_index, target, remaining },
+        );
+        for (clients, 0..) |client, index| {
+            std.debug.print(
+                "  recipient={d} received={} output=\n{s}\n",
+                .{ index, received[index], client.written() },
+            );
+        }
+        return error.TestTimeout;
+    }
+    testSleepMs(80);
+    for (clients) |client| try client.readAvailable();
+
+    const first_event = ircLineContaining(clients[0].written(), needle) orelse return error.TestUnexpectedResult;
+    const expected_msgid = extractMsgid(first_event) orelse return error.TestUnexpectedResult;
+    const expected_time = extractTimeTag(first_event) orelse return error.TestUnexpectedResult;
+    for (clients) |client| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), needle));
+        const event_line = ircLineContaining(client.written(), needle) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_msgid, extractMsgid(event_line) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(expected_time, extractTimeTag(event_line) orelse return error.TestUnexpectedResult);
+    }
+    // Keep the flood buckets comfortably below their sustained rate while still
+    // making this multi-event acceptance gate fast enough for the full suite.
+    testSleepMs(120);
+}
+
+test "threaded server: four-client reusable session survives sequential Helix upgrades across secured mesh" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
+    defer closeFd(cross_process_lock);
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+
+    var tmp1 = std.testing.tmpDir(.{});
+    defer tmp1.cleanup();
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var store1 = try services_mod.OroStore.open(alloc, std.testing.io, tmp1.dir, "mesh-helix-node1.wal");
+    defer store1.deinit();
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp2.dir, "mesh-helix-node2.wal");
+    defer store2.deinit();
+    var services1 = services_mod.Services.init(&store1, null);
+    var services2 = services_mod.Services.init(&store2, null);
+    var ident1 = try node_identity.fromSeed(@as([32]u8, @splat(0xB1)), "mesh-helix-session-test");
+    defer ident1.deinit();
+    var ident2 = try node_identity.fromSeed(@as([32]u8, @splat(0xB2)), "mesh-helix-session-test");
+    defer ident2.deinit();
+    const root1 = std.fmt.bytesToHex(ident1.sign_kp.public_key, .lower);
+    const root2 = std.fmt.bytesToHex(ident2.sign_kp.public_key, .lower);
+    const roots_for_node1 = [_][]const u8{&root2};
+    const roots_for_node2 = [_][]const u8{&root1};
+    const relay_v2_helix_roster = [_][]const u8{ &root1, &root2 };
+
+    var node2_config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = ident2.shortId(),
+        .server_name = "helix-session-node2.test",
+        .node_identity = &ident2,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "mesh-helix-shared-secret",
+        .mesh_trust_roots = &roots_for_node2,
+        .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_helix_roster,
+        .sasl_checker = test_dm_relay_checker,
+        .account_services = &services2,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    };
+    var node2 = try LiveUpgradeTestNode.init(alloc, node2_config);
+    defer node2.deinit();
+    try node2.start();
+    try std.testing.expect(node2.server.authoredRelayV2Configured());
+    const port2 = try node2.server.boundPort();
+
+    var peer_buf: [32]u8 = undefined;
+    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const peers = [_][]const u8{peer};
+    var node1_config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = ident1.shortId(),
+        .server_name = "helix-session-node1.test",
+        .node_identity = &ident1,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "mesh-helix-shared-secret",
+        .mesh_trust_roots = &roots_for_node1,
+        .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_helix_roster,
+        .mesh_connect = &peers,
+        .sasl_checker = test_dm_relay_checker,
+        .account_services = &services1,
+        .num_shards = 2,
+        .sweep_interval_ms = 100,
+    };
+    var node1 = try LiveUpgradeTestNode.init(alloc, node1_config);
+    defer node1.deinit();
+    try node1.start();
+    try std.testing.expect(node1.server.authoredRelayV2Configured());
+    const port1 = try node1.server.boundPort();
+
+    const live_storage = try alloc.alloc(LiveClient, 4);
+    defer alloc.free(live_storage);
+    const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_d = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_d);
+    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    live_storage[0] = .{ .fd = fd_a };
+    live_storage[1] = .{ .fd = fd_d };
+    live_storage[2] = .{ .fd = fd_b };
+    live_storage[3] = .{ .fd = fd_c };
+    const clients = [_]*LiveClient{ &live_storage[0], &live_storage[1], &live_storage[2], &live_storage[3] };
+    const caps = "echo-message message-tags server-time orochi/session-sync";
+
+    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", caps);
+    try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Helix origin\r\n");
+    try recvUntil(clients[0], " 001 Ruri ", 300);
+    try expectMeshPeerVisible(clients[0], "helix-session-node2.test", 100);
+    try writeAllFd(fd_a, "JOIN #helix-mesh\r\n");
+    try recvUntil(clients[0], " 366 Ruri #helix-mesh ", 300);
+    clients[0].reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(clients[0], "SESSION MTOKEN ", 500);
+    const local_token_reply = testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
+    var local_token_buf: [64]u8 = undefined;
+    @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
+    const local_token = local_token_buf[0..local_token_reply.len];
+    const mesh_token_reply = try expectFreshMeshSessionToken(
+        clients[0].written(),
+        node1_config.mesh_pass,
+        "ruri",
+        local_token,
+    );
+    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
+    var mesh_token_buf: [1024]u8 = undefined;
+    @memcpy(mesh_token_buf[0..mesh_token_reply.len], mesh_token_reply);
+    const mesh_token = mesh_token_buf[0..mesh_token_reply.len];
+    var resume_buf: [1200]u8 = undefined;
+    const resume_command = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
+
+    try saslPlainPreludeWithCaps(fd_d, "ruri", "pw", caps);
+    try writeAllFd(fd_d, "NICK DeviceD\r\nUSER ruri 0 * :Helix local sibling\r\n");
+    try recvUntil(clients[1], " 001 DeviceD ", 300);
+    try resumeLiveMeshSession(clients[1], resume_command);
+    try expectContains(clients[1].written(), "JOIN #helix-mesh");
+
+    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", caps);
+    try writeAllFd(fd_b, "NICK DeviceB\r\nUSER ruri 0 * :Helix remote sibling B\r\n");
+    try recvUntil(clients[2], " 001 DeviceB ", 300);
+    try resumeLiveMeshSession(clients[2], resume_command);
+    try expectContains(clients[2].written(), "JOIN #helix-mesh");
+
+    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", caps);
+    try writeAllFd(fd_c, "NICK DeviceC\r\nUSER ruri 0 * :Helix remote sibling C\r\n");
+    try recvUntil(clients[3], " 001 DeviceC ", 300);
+    try resumeLiveMeshSession(clients[3], resume_command);
+    try expectContains(clients[3].written(), "JOIN #helix-mesh");
+
+    try expectSharedUpgradeMessage(&clients, 0, "#helix-mesh", "before-either-upgrade");
+    for (clients) |client| client.reset();
+    testSleepMs(150);
+    for (clients) |client| {
+        try client.readAvailable();
+        client.reset();
+    }
+
+    node1_config.s2s_port = 0;
+    const node1_upgrade = try node1.upgrade(node1_config);
+    try std.testing.expect(node1.server.authoredRelayV2Configured());
+    try std.testing.expectEqual(@as(usize, 2), node1_upgrade.clients);
+    try std.testing.expectEqual(@as(usize, 1), node1_upgrade.s2s_preserved);
+    try std.testing.expectEqual(@as(usize, 3), node1_upgrade.state_fds);
+    try expectNoUpgradeTopologyChurn(&clients);
+    try expectAllUpgradeClientsPing(&clients, "after-node1");
+    for (clients) |client| try expectLiveSessionToken(client, local_token, node1_config.mesh_pass, "ruri");
+    try expectMeshPeerVisible(clients[0], "helix-session-node2.test", 100);
+    try expectMeshPeerVisible(clients[2], "helix-session-node1.test", 100);
+    inline for (0..4) |sender_index| {
+        var body_buf: [64]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "after-node1-from-{d}", .{sender_index});
+        try expectSharedUpgradeMessage(&clients, sender_index, "#helix-mesh", body);
+    }
+
+    for (clients) |client| client.reset();
+    testSleepMs(150);
+    for (clients) |client| {
+        try client.readAvailable();
+        client.reset();
+    }
+    node2_config.s2s_port = 0;
+    const node2_upgrade = try node2.upgrade(node2_config);
+    try std.testing.expect(node2.server.authoredRelayV2Configured());
+    try std.testing.expectEqual(@as(usize, 2), node2_upgrade.clients);
+    try std.testing.expectEqual(@as(usize, 1), node2_upgrade.s2s_preserved);
+    try std.testing.expectEqual(@as(usize, 3), node2_upgrade.state_fds);
+    try expectNoUpgradeTopologyChurn(&clients);
+    try expectAllUpgradeClientsPing(&clients, "after-node2");
+    for (clients) |client| try expectLiveSessionToken(client, local_token, node1_config.mesh_pass, "ruri");
+    try expectMeshPeerVisible(clients[0], "helix-session-node2.test", 100);
+    try expectMeshPeerVisible(clients[2], "helix-session-node1.test", 100);
+    inline for (0..4) |sender_index| {
+        var body_buf: [64]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "after-node2-from-{d}", .{sender_index});
+        try expectSharedUpgradeMessage(&clients, sender_index, "#helix-mesh", body);
+    }
+
+    // A freshly minted portable envelope after both upgrades must still carry
+    // the original stable token and attach a new device on the opposite node;
+    // the four existing transports remain connected and see no logical JOIN.
+    clients[0].reset();
+    try writeAllFd(clients[0].fd, "SESSION TOKEN\r\n");
+    try recvUntil(clients[0], "SESSION MTOKEN ", 500);
+    try std.testing.expectEqualStrings(
+        local_token,
+        testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
+            return error.TestUnexpectedResult,
+    );
+    const fresh_mesh_reply = try expectFreshMeshSessionToken(
+        clients[0].written(),
+        node1_config.mesh_pass,
+        "ruri",
+        local_token,
+    );
+    if (fresh_mesh_reply.len > 1024) return error.TestUnexpectedResult;
+    var fresh_mesh_buf: [1024]u8 = undefined;
+    @memcpy(fresh_mesh_buf[0..fresh_mesh_reply.len], fresh_mesh_reply);
+    const fresh_resume = try std.fmt.bufPrint(
+        &resume_buf,
+        "SESSION RESUME {s}\r\n",
+        .{fresh_mesh_buf[0..fresh_mesh_reply.len]},
+    );
+    for (clients) |client| client.reset();
+
+    const fd_e = connectLoopback(try node2.server.boundPort()) catch return error.SkipZigTest;
+    defer closeFd(fd_e);
+    var extra = LiveClient{ .fd = fd_e };
+    try saslPlainPreludeWithCaps(fd_e, "ruri", "pw", caps);
+    try writeAllFd(fd_e, "NICK DeviceE\r\nUSER ruri 0 * :Helix post-upgrade sibling E\r\n");
+    try recvUntil(&extra, " 001 DeviceE ", 300);
+    try resumeLiveMeshSession(&extra, fresh_resume);
+    try expectContains(extra.written(), "JOIN #helix-mesh");
+    try expectNoUpgradeTopologyChurn(&clients);
+    const all_clients = [_]*LiveClient{
+        clients[0], clients[1], clients[2], clients[3], &extra,
+    };
+    try expectAllUpgradeClientsPing(&all_clients, "after-fifth-attach");
+    try expectLiveSessionToken(&extra, local_token, node1_config.mesh_pass, "ruri");
+    try expectSharedUpgradeMessage(&all_clients, 4, "#helix-mesh", "post-upgrade-fifth-client-participates");
+    try expectSharedUpgradeMessage(&all_clients, 0, "Ruri", "opposite-node-self-dm-after-both-upgrades");
+}
+
 test "threaded server: reusable session stays exact-once across a three-node secured line" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
+    defer closeFd(cross_process_lock);
     const s2s_ports = reserveThreeLoopbackPorts() catch return error.SkipZigTest;
 
     var tmp1 = std.testing.tmpDir(.{});
@@ -64986,10 +76708,14 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     defer ident2.deinit();
     var ident3 = try node_identity.fromSeed(@as([32]u8, @splat(0xA3)), "mesh-session-line-test");
     defer ident3.deinit();
+    const root1 = std.fmt.bytesToHex(ident1.sign_kp.public_key, .lower);
+    const root2 = std.fmt.bytesToHex(ident2.sign_kp.public_key, .lower);
+    const root3 = std.fmt.bytesToHex(ident3.sign_kp.public_key, .lower);
+    const roots_for_node1 = [_][]const u8{&root2};
+    const roots_for_node2 = [_][]const u8{ &root1, &root3 };
+    const roots_for_node3 = [_][]const u8{&root2};
+    const relay_v2_line_roster = [_][]const u8{ &root1, &root2, &root3 };
 
-    var node3_spec_buf: [32]u8 = undefined;
-    const node3_spec = try std.fmt.bufPrint(&node3_spec_buf, "127.0.0.1:{d}", .{s2s_ports[2]});
-    const node2_to_node3 = [_][]const u8{node3_spec};
     var node2_spec_buf: [32]u8 = undefined;
     const node2_spec = try std.fmt.bufPrint(&node2_spec_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
     const node1_to_node2 = [_][]const u8{node2_spec};
@@ -64997,8 +76723,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     // A strict line: node 1 dials node 2, node 2 dials node 3, and there is no
     // node-1/node-3 connection. End-to-end traffic therefore has to survive a
     // real forwarding hop through node 2 rather than accidentally using a clique.
-    const node3 = try alloc.create(Server);
-    node3.* = Server.init(alloc, .{
+    const node3 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_ports[2],
@@ -65007,13 +76732,16 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .node_identity = &ident3,
         .crypto_io = std.testing.io,
         .mesh_pass = "mesh-session-line-secret",
+        .mesh_trust_roots = &roots_for_node3,
         .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_line_roster,
         .sasl_checker = test_dm_relay_checker,
         .account_services = &services3,
         .num_shards = 1,
         .sweep_interval_ms = 100,
     }) catch |err| {
-        alloc.destroy(node3);
         return switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
             else => err,
@@ -65024,8 +76752,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         alloc.destroy(node3);
     }
 
-    const node2 = try alloc.create(Server);
-    node2.* = Server.init(alloc, .{
+    const node2 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_ports[1],
@@ -65034,14 +76761,19 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
         .mesh_pass = "mesh-session-line-secret",
+        .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
-        .mesh_connect = &node2_to_node3,
-        .sasl_checker = test_dm_relay_checker,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_line_roster,
+        // This edge is opened explicitly by an oper below, so the acceptance
+        // test can hold it down deterministically between SQUIT and CONNECT.
+        .sasl_checker = test_line_mesh_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services2,
         .num_shards = 1,
         .sweep_interval_ms = 100,
     }) catch |err| {
-        alloc.destroy(node2);
         return switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
             else => err,
@@ -65052,8 +76784,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         alloc.destroy(node2);
     }
 
-    const node1 = try alloc.create(Server);
-    node1.* = Server.init(alloc, .{
+    const node1 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_ports[0],
@@ -65062,14 +76793,17 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
         .mesh_pass = "mesh-session-line-secret",
+        .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_line_roster,
         .mesh_connect = &node1_to_node2,
         .sasl_checker = test_dm_relay_checker,
         .account_services = &services1,
         .num_shards = 1,
         .sweep_interval_ms = 100,
     }) catch |err| {
-        alloc.destroy(node1);
         return switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
             else => err,
@@ -65083,9 +76817,12 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     node3.start();
     node2.start();
     node1.start();
-    const port1 = node1.boundPort() catch return error.SkipZigTest;
-    const port2 = node2.boundPort() catch return error.SkipZigTest;
-    const port3 = node3.boundPort() catch return error.SkipZigTest;
+    try std.testing.expect(node1.authoredRelayV2Configured());
+    try std.testing.expect(node2.authoredRelayV2Configured());
+    try std.testing.expect(node3.authoredRelayV2Configured());
+    const port1 = try node1.boundPort();
+    const port2 = try node2.boundPort();
+    const port3 = try node3.boundPort();
     var run1 = std.atomic.Value(bool).init(true);
     var run2 = std.atomic.Value(bool).init(true);
     var run3 = std.atomic.Value(bool).init(true);
@@ -65104,9 +76841,29 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node2, &run2 });
     thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node1, &run1 });
 
+    // Establish B-C through the real oper CONNECT path. Unlike an auto-connect
+    // dial this edge stays down after SQUIT until the test explicitly reconnects,
+    // giving the retained V2 scheduler a deterministic partition window.
+    const admin_fd = try connectLoopback(port2);
+    defer closeFd(admin_fd);
+    var admin = LiveClient{ .fd = admin_fd };
+    try saslAdminPrelude(admin_fd);
+    try writeAllFd(admin_fd, "NICK MeshAdmin\r\nUSER meshadmin 0 * :Line mesh admin\r\n");
+    try recvUntil(&admin, " 001 MeshAdmin ", 200);
+    try recvUntil(&admin, " 381 MeshAdmin ", 200);
+    var connect_node3_buf: [64]u8 = undefined;
+    const connect_node3 = try std.fmt.bufPrint(
+        &connect_node3_buf,
+        "CONNECT 127.0.0.1 {d}\r\n",
+        .{s2s_ports[2]},
+    );
+    admin.reset();
+    try writeAllFd(admin_fd, connect_node3);
+    try recvUntil(&admin, "CONNECT initiated (secured)", 200);
+
     // Wait for both secured legs and prove the topology is a line from the client
     // surface: each edge sees only node 2, while node 2 sees both edge nodes.
-    const probe1_fd = connectLoopback(port1) catch return error.SkipZigTest;
+    const probe1_fd = try connectLoopback(port1);
     defer closeFd(probe1_fd);
     var probe1 = LiveClient{ .fd = probe1_fd };
     try writeAllFd(probe1_fd, "NICK Probe1\r\nUSER probe 0 * :Probe One\r\n");
@@ -65114,14 +76871,14 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try expectMeshPeerVisible(&probe1, "session-line-node2.test", 120);
     try std.testing.expect(std.mem.indexOf(u8, probe1.written(), "session-line-node3.test") == null);
 
-    const probe2_fd = connectLoopback(port2) catch return error.SkipZigTest;
+    const probe2_fd = try connectLoopback(port2);
     defer closeFd(probe2_fd);
     var probe2 = LiveClient{ .fd = probe2_fd };
     try writeAllFd(probe2_fd, "NICK Probe2\r\nUSER probe 0 * :Probe Two\r\n");
     try recvUntil(&probe2, " 001 Probe2 ", 200);
     try expectMeshPeersVisible(&probe2, &.{ "session-line-node1.test", "session-line-node3.test" }, 120);
 
-    const probe3_fd = connectLoopback(port3) catch return error.SkipZigTest;
+    const probe3_fd = try connectLoopback(port3);
     defer closeFd(probe3_fd);
     var probe3 = LiveClient{ .fd = probe3_fd };
     try writeAllFd(probe3_fd, "NICK Probe3\r\nUSER probe 0 * :Probe Three\r\n");
@@ -65131,14 +76888,14 @@ test "threaded server: reusable session stays exact-once across a three-node sec
 
     const clients = try alloc.alloc(LiveClient, 4);
     defer alloc.free(clients);
-    const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
+    const fd_a = try connectLoopback(port1);
     defer closeFd(fd_a);
-    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+    const fd_b = try connectLoopback(port2);
     defer closeFd(fd_b);
-    const fd_c = connectLoopback(port3) catch return error.SkipZigTest;
+    const fd_c = try connectLoopback(port3);
     var c_open = true;
     defer if (c_open) closeFd(fd_c);
-    const fd_sender = connectLoopback(port3) catch return error.SkipZigTest;
+    const fd_sender = try connectLoopback(port3);
     defer closeFd(fd_sender);
     clients[0] = .{ .fd = fd_a };
     clients[1] = .{ .fd = fd_b };
@@ -65184,12 +76941,31 @@ test "threaded server: reusable session stays exact-once across a three-node sec
             const end = if (std.mem.indexOfScalar(u8, bytes[at..], '\n')) |newline| at + newline else bytes.len;
             return bytes[start..end];
         }
+
+        fn expectPeerAbsent(client: *LiveClient, peer_name: []const u8) !void {
+            for (0..100) |_| {
+                client.reset();
+                try writeAllFd(client.fd, "LINKS\r\n");
+                const deadline = platform.monotonicMillis() + 250;
+                while (platform.monotonicMillis() < deadline) {
+                    var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+                    const ready = posix.poll(&fds, 20) catch return error.Unexpected;
+                    if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
+                    if (std.mem.indexOf(u8, client.written(), " 365 ") != null) break;
+                }
+                if (std.mem.indexOf(u8, client.written(), " 365 ") != null and
+                    std.mem.indexOf(u8, client.written(), peer_name) == null) return;
+                testSleepMs(10);
+            }
+            return error.TestTimeout;
+        }
     };
 
     // Mint one portable credential on node 1. Only node 2 is directly connected,
     // so node 3 receives the SAME origin-signed OFFER only through node 2's v2
     // forwarding path; no direct edge or intermediate re-signing can help it.
-    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", "message-tags server-time orochi/session-sync");
+    const ruri_caps = "echo-message message-tags server-time orochi/session-sync";
+    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", ruri_caps);
     try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Line attachment A\r\n");
     try recvUntil(a, " 001 Ruri ", 200);
     try writeAllFd(fd_a, "JOIN #mesh-line\r\n");
@@ -65197,25 +76973,32 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     a.reset();
     try writeAllFd(fd_a, "SESSION TOKEN\r\n");
     try recvUntil(a, "SESSION MTOKEN ", 200);
-    const marker = "SESSION MTOKEN ";
-    const token_start = (std.mem.indexOf(u8, a.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
-    const token_tail = a.written()[token_start..];
-    const token_cr = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    const token_len = std.mem.indexOfScalar(u8, token_tail[0..token_cr], ' ') orelse token_cr;
-    if (token_len == 0 or token_len > 1024) return error.TestUnexpectedResult;
+    const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
+    var local_token_buf: [64]u8 = undefined;
+    @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
+    const local_token = local_token_buf[0..local_token_reply.len];
+    const mesh_token_reply = try expectFreshMeshSessionToken(
+        a.written(),
+        "mesh-session-line-secret",
+        "ruri",
+        local_token,
+    );
+    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
-    const mesh_token = token_buf[0..token_len];
+    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
+    const mesh_token = token_buf[0..mesh_token_reply.len];
     var resume_buf: [1200]u8 = undefined;
     const resume_cmd = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
 
-    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", "message-tags server-time orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", ruri_caps);
     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER ruri 0 * :Line attachment B\r\n");
     try recvUntil(b, " 001 DeviceB ", 200);
     try Helpers.attach(b, resume_cmd);
     try expectContains(b.written(), "JOIN #mesh-line");
 
-    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", "message-tags server-time orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", ruri_caps);
     try writeAllFd(fd_c, "NICK DeviceC\r\nUSER ruri 0 * :Line attachment C\r\n");
     try recvUntil(c, " 001 DeviceC ", 200);
     try Helpers.attach(c, resume_cmd);
@@ -65250,10 +77033,10 @@ test "threaded server: reusable session stays exact-once across a three-node sec
 
     // A fourth client resumes only AFTER that mutation. It must restore the
     // latest retained snapshot on the far node, not the TOKEN-time snapshot.
-    const fd_d = connectLoopback(port3) catch return error.SkipZigTest;
+    const fd_d = try connectLoopback(port3);
     defer closeFd(fd_d);
     var d = LiveClient{ .fd = fd_d };
-    try saslPlainPreludeWithCaps(fd_d, "ruri", "pw", "message-tags server-time orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_d, "ruri", "pw", ruri_caps);
     try writeAllFd(fd_d, "NICK DeviceD\r\nUSER ruri 0 * :Late line attachment D\r\n");
     try recvUntil(&d, " 001 DeviceD ", 200);
     try Helpers.attach(&d, resume_cmd);
@@ -65454,6 +77237,218 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try writeAllFd(fd_b, "PING survivor-b\r\n");
     try recvUntil(a, "PONG", 200);
     try recvUntil(b, "PONG", 200);
+
+    // Break the only B-C leg through the real oper SQUIT path and hold it down.
+    // A message authored on A during the partition must reach B immediately but
+    // remain absent on C until the same secured edge is explicitly restored.
+    admin.reset();
+    try writeAllFd(admin_fd, "SQUIT session-line-node3.test :retained-v2-test\r\n");
+    try recvUntil(&admin, "SQUIT complete", 200);
+    try Helpers.expectPeerAbsent(&admin, "session-line-node3.test");
+    try Helpers.expectPeerAbsent(&probe3, "session-line-node2.test");
+
+    // Mutate the reusable session while the only far edge is physically down.
+    // The near-side attachment receives the change, while the far-side
+    // attachment cannot. Its later synthetic JOIN is positive proof that SRST
+    // retained replay crossed the restored B-C link (not a local node3 resume).
+    a.reset();
+    b.reset();
+    d.reset();
+    sender.reset();
+    try writeAllFd(fd_b, "JOIN #mesh-retained\r\n");
+    try recvUntil(b, " 366 Ruri #mesh-retained ", 400);
+    try recvUntil(a, "JOIN :#mesh-retained", 600);
+    try Helpers.settle(&.{ a, b });
+    try Helpers.expectOnce(a, "JOIN :#mesh-retained");
+    try d.readAvailable();
+    try sender.readAvailable();
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(d.written(), "JOIN :#mesh-retained"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(sender.written(), "JOIN :#mesh-retained"));
+
+    const retained_needle = "PRIVMSG #mesh-line :retained-across-b-c-reconnect";
+    a.reset();
+    b.reset();
+    d.reset();
+    sender.reset();
+    try writeAllFd(fd_a, "PRIVMSG #mesh-line :retained-across-b-c-reconnect\r\n");
+    try recvUntil(a, retained_needle, 200);
+    try recvUntil(b, retained_needle, 200);
+    try Helpers.settle(&.{ a, b });
+    try Helpers.expectOnce(a, retained_needle);
+    try Helpers.expectOnce(b, retained_needle);
+    const retained_partition_line = Helpers.lineContaining(a, retained_needle) orelse return error.TestUnexpectedResult;
+    const retained_partition_msgid = extractMsgid(retained_partition_line) orelse return error.TestUnexpectedResult;
+    var retained_expected_msgid: [msgid_mod.id_len]u8 = undefined;
+    @memcpy(&retained_expected_msgid, retained_partition_msgid);
+    testSleepMs(150);
+    try d.readAvailable();
+    try sender.readAvailable();
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(d.written(), retained_needle));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(sender.written(), retained_needle));
+    // Force the first authenticated receipt ACK for this retained event to be
+    // lost at node 2. The same-origin barrier below cannot pass it until node 2
+    // retransmits, node 3 deduplicates/re-ACKs, and RVL2 retires the head.
+    const retained_relay_id = try node2.dropRelayV2AckForMsgidFromForTest(
+        ident3.shortId(),
+        &retained_expected_msgid,
+    );
+
+    // Restore the exact secured edge. The retained session mutation and event
+    // must cross only after reconnection; the event keeps one msgid/server-time
+    // identity on every live copy.
+    admin.reset();
+    try writeAllFd(admin_fd, connect_node3);
+    try recvUntil(&admin, "CONNECT initiated (secured)", 200);
+    try expectMeshPeersVisible(
+        &admin,
+        &.{ "session-line-node1.test", "session-line-node3.test" },
+        160,
+    );
+    try recvUntil(&d, "JOIN :#mesh-retained", 600);
+    try Helpers.expectOnce(&d, "JOIN :#mesh-retained");
+    var retained_session_token: session_migrate.Token = undefined;
+    _ = std.fmt.hexToBytes(&retained_session_token, local_token) catch return error.TestUnexpectedResult;
+    var retained_store_projected = false;
+    for (0..100) |_| {
+        if (node3.sessionReplicaChannelFromOriginForTest(
+            retained_session_token,
+            ident2.shortId(),
+            "#mesh-retained",
+        )) {
+            retained_store_projected = true;
+            break;
+        }
+        testSleepMs(10);
+    }
+    try std.testing.expect(retained_store_projected);
+    try recvUntil(&d, retained_needle, 400);
+    try recvUntil(sender, retained_needle, 400);
+    try Helpers.settle(&.{ a, b, &d, sender });
+    try Helpers.expectOnce(a, retained_needle);
+    try Helpers.expectOnce(b, retained_needle);
+    try Helpers.expectOnce(&d, retained_needle);
+    try Helpers.expectOnce(sender, retained_needle);
+    const retained_a_line = Helpers.lineContaining(a, retained_needle) orelse return error.TestUnexpectedResult;
+    const retained_b_line = Helpers.lineContaining(b, retained_needle) orelse return error.TestUnexpectedResult;
+    const retained_d_line = Helpers.lineContaining(&d, retained_needle) orelse return error.TestUnexpectedResult;
+    const retained_sender_line = Helpers.lineContaining(sender, retained_needle) orelse return error.TestUnexpectedResult;
+    const retained_msgid = extractMsgid(retained_a_line) orelse return error.TestUnexpectedResult;
+    const retained_time = extractTimeTag(retained_a_line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(&retained_expected_msgid, retained_msgid);
+    inline for (.{ retained_b_line, retained_d_line, retained_sender_line }) |event_line| {
+        try std.testing.expectEqualStrings(retained_msgid, extractMsgid(event_line) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(retained_time, extractTimeTag(event_line) orelse return error.TestUnexpectedResult);
+    }
+
+    // Same-origin RVL2 head ordering makes this a deterministic ACK-progress
+    // fence: it cannot reach the far edge until the dropped ACK above has been
+    // recovered. Keep the first event in every buffer and prove its exact-wire
+    // retry remained delivery-exactly-once.
+    const barrier_needle = "PRIVMSG #mesh-line :ack-barrier-after-retained";
+    try writeAllFd(fd_a, "PRIVMSG #mesh-line :ack-barrier-after-retained\r\n");
+    try recvUntil(a, barrier_needle, 600);
+    try recvUntil(b, barrier_needle, 600);
+    try recvUntil(&d, barrier_needle, 600);
+    try recvUntil(sender, barrier_needle, 600);
+    try Helpers.settle(&.{ a, b, &d, sender });
+    try std.testing.expect(!node2.relayV2AckDropArmedForTest());
+    inline for (.{ a, b, &d, sender }) |client| {
+        try Helpers.expectOnce(client, retained_needle);
+        try Helpers.expectOnce(client, barrier_needle);
+    }
+    const barrier_a_line = Helpers.lineContaining(a, barrier_needle) orelse return error.TestUnexpectedResult;
+    const barrier_msgid = extractMsgid(barrier_a_line) orelse return error.TestUnexpectedResult;
+    const barrier_time = extractTimeTag(barrier_a_line) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.eql(u8, retained_msgid, barrier_msgid));
+    inline for (.{ b, &d, sender }) |client| {
+        const barrier_line = Helpers.lineContaining(client, barrier_needle) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(barrier_msgid, extractMsgid(barrier_line) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(barrier_time, extractTimeTag(barrier_line) orelse return error.TestUnexpectedResult);
+    }
+
+    // Delivery alone is insufficient: a broken ACK_CONFIRM path can leave the
+    // exact event/outbox/receipt transaction pinned while later messages flow.
+    // Poll the synchronized authorities until the retained id is retired across
+    // all three nodes, then assert each topology-specific row is absent.
+    var retired = false;
+    var retire_attempt: usize = 0;
+    while (retire_attempt < 200) : (retire_attempt += 1) {
+        const n1 = node1.relayV2AuthorityStateForTest(ident2.shortId(), retained_relay_id);
+        const n2_to_3 = node2.relayV2AuthorityStateForTest(ident3.shortId(), retained_relay_id);
+        const n2_from_1 = node2.relayV2AuthorityStateForTest(ident1.shortId(), retained_relay_id);
+        const n3 = node3.relayV2AuthorityStateForTest(ident2.shortId(), retained_relay_id);
+        retired = !n1.event_retained and !n1.outbox_retained and
+            !n2_to_3.event_retained and !n2_to_3.outbox_retained and
+            !n2_from_1.receipt_retained and !n3.event_retained and
+            !n3.receipt_retained;
+        if (retired) break;
+        testSleepMs(10);
+    }
+    try std.testing.expect(retired);
+
+    // A new far-edge client can still resume with the original portable token
+    // after the partition. It joins the same logical session, then authors one
+    // event that every surviving attachment and the independent member sees once.
+    const fd_e = try connectLoopback(port3);
+    defer closeFd(fd_e);
+    var e = LiveClient{ .fd = fd_e };
+    try saslPlainPreludeWithCaps(fd_e, "ruri", "pw", ruri_caps);
+    try writeAllFd(fd_e, "NICK DeviceE\r\nUSER ruri 0 * :Post-reconnect line attachment E\r\n");
+    try recvUntil(&e, " 001 DeviceE ", 200);
+    try Helpers.attach(&e, resume_cmd);
+    try expectContains(e.written(), "JOIN #mesh-line");
+    try expectContains(e.written(), "JOIN #mesh-retained");
+    try expectLiveSessionToken(&e, local_token, "mesh-session-line-secret", "ruri");
+
+    sender.reset();
+    try writeAllFd(fd_sender, "JOIN #mesh-retained\r\n");
+    try recvUntil(sender, " 366 RelaySender #mesh-retained ", 400);
+    const retained_participation = "PRIVMSG #mesh-retained :resumed-member-participates";
+    a.reset();
+    b.reset();
+    d.reset();
+    e.reset();
+    sender.reset();
+    try writeAllFd(fd_e, "PRIVMSG #mesh-retained :resumed-member-participates\r\n");
+    try recvUntil(a, retained_participation, 400);
+    try recvUntil(b, retained_participation, 400);
+    try recvUntil(&d, retained_participation, 400);
+    try recvUntil(&e, retained_participation, 400);
+    try recvUntil(sender, retained_participation, 400);
+    try Helpers.settle(&.{ a, b, &d, &e, sender });
+    const retained_participation_line = Helpers.lineContaining(&e, retained_participation) orelse
+        return error.TestUnexpectedResult;
+    const participation_msgid = extractMsgid(retained_participation_line) orelse return error.TestUnexpectedResult;
+    const participation_time = extractTimeTag(retained_participation_line) orelse return error.TestUnexpectedResult;
+    inline for (.{ a, b, &d, &e, sender }) |client| {
+        try Helpers.expectOnce(client, retained_participation);
+        const event_line = Helpers.lineContaining(client, retained_participation) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(participation_msgid, extractMsgid(event_line) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(participation_time, extractTimeTag(event_line) orelse return error.TestUnexpectedResult);
+    }
+
+    const resumed_needle = "PRIVMSG #mesh-line :far-edge-resume-after-reconnect";
+    a.reset();
+    b.reset();
+    d.reset();
+    e.reset();
+    sender.reset();
+    try writeAllFd(fd_e, "PRIVMSG #mesh-line :far-edge-resume-after-reconnect\r\n");
+    try recvUntil(a, resumed_needle, 400);
+    try recvUntil(b, resumed_needle, 400);
+    try recvUntil(&d, resumed_needle, 400);
+    try recvUntil(&e, resumed_needle, 400);
+    try recvUntil(sender, resumed_needle, 400);
+    try Helpers.settle(&.{ a, b, &d, &e, sender });
+    const resumed_e_line = Helpers.lineContaining(&e, resumed_needle) orelse return error.TestUnexpectedResult;
+    const resumed_msgid = extractMsgid(resumed_e_line) orelse return error.TestUnexpectedResult;
+    const resumed_time = extractTimeTag(resumed_e_line) orelse return error.TestUnexpectedResult;
+    inline for (.{ a, b, &d, &e, sender }) |client| {
+        try Helpers.expectOnce(client, resumed_needle);
+        const event_line = Helpers.lineContaining(client, resumed_needle) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(resumed_msgid, extractMsgid(event_line) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(resumed_time, extractTimeTag(event_line) orelse return error.TestUnexpectedResult);
+    }
 }
 
 // FIX 1: the RECEIVING node re-enforces ITS OWN channel policy against a remote
@@ -65788,6 +77783,53 @@ test "wsCarryable: any open adapter carries, incl. mid-frame; handshake/pending 
     try std.testing.expect(!wsCarryable(ws));
 }
 
+const UpgradeFixtureAuthority = enum { mesh_clock, property, replica_store, pending };
+
+fn replaceUpgradeFixtureAuthority(
+    pieces: *std.ArrayList(helix_live.StatePiece),
+    authority: UpgradeFixtureAuthority,
+    replacement: helix_live.StatePiece,
+) bool {
+    for (pieces.items) |*piece| {
+        const matches = switch (authority) {
+            .mesh_clock => piece.kind == .mesh_checkpoint and
+                std.mem.startsWith(u8, piece.bytes, &mesh_clock_snapshot.magic),
+            .property => piece.kind == .mesh_checkpoint and prop_checkpoint.isUpgradeCheckpoint(piece.bytes),
+            .replica_store => piece.kind == .mesh_checkpoint and session_replica_v2.Store.isUpgradeCheckpoint(piece.bytes),
+            .pending => piece.kind == .pending_migration,
+        };
+        if (!matches) continue;
+        piece.* = replacement;
+        return true;
+    }
+    return false;
+}
+
+fn appendEmptyUpgradeClientSidecarsForTest(
+    allocator: std.mem.Allocator,
+    pieces: *std.ArrayList(helix_live.StatePiece),
+    blobs: *std.ArrayList([]u8),
+    fd: linux.fd_t,
+) !void {
+    const monitor_buf = try allocator.alloc(u8, 4 + 1 + 8 + 2);
+    errdefer allocator.free(monitor_buf);
+    const monitor_wire = try (monitor_capsule.MonitorCapsule{
+        .client_id = @intCast(fd),
+        .targets = &.{},
+    }).encode(monitor_buf);
+    try blobs.append(allocator, monitor_buf);
+    try pieces.append(allocator, .{ .kind = .monitor_list, .bytes = monitor_wire });
+
+    const silence_buf = try allocator.alloc(u8, 4 + 1 + 8 + 2);
+    errdefer allocator.free(silence_buf);
+    const silence_wire = try (silence_capsule.SilenceCapsule{
+        .client_id = @intCast(fd),
+        .masks = &.{},
+    }).encode(silence_buf);
+    try blobs.append(allocator, silence_buf);
+    try pieces.append(allocator, .{ .kind = .silence_list, .bytes = silence_wire });
+}
+
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const Ed25519 = std.crypto.sign.Ed25519;
@@ -65856,19 +77898,33 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
         .pending_out = pend_copy,
     });
     defer alloc.free(tls_blob);
-    const sess_blob = try session_snapshot.encode(alloc, .{ .nick = "TLSY", .realname = "Carried", .fd = sp[0] });
+    const sess_blob = try session_snapshot.encode(alloc, .{ .nick = "TLSY", .realname = "Carried", .fd = sp[0], .was_secured = true });
     defer alloc.free(sess_blob);
-    const arena_pieces = [_]helix_live.StatePiece{
-        .{ .kind = .tls_session, .bytes = tls_blob },
-        .{ .kind = .clients, .bytes = sess_blob },
+    const fixture = try alloc.create(Server);
+    defer alloc.destroy(fixture);
+    fixture.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    var fixture_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (fixture_blobs.items) |blob| alloc.free(blob);
+        fixture_blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(fixture, &arena_pieces, &fixture_blobs);
+    try arena_pieces.append(alloc, .{ .kind = .tls_session, .bytes = tls_blob });
+    try arena_pieces.append(alloc, .{ .kind = .clients, .bytes = sess_blob });
+    try appendEmptyUpgradeClientSidecarsForTest(alloc, &arena_pieces, &fixture_blobs, sp[0]);
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-tls-adopt",
-        .pieces = arena_pieces[0..],
-        .fds = &.{},
+        .pieces = arena_pieces.items,
+        .fds = &.{sp[0]},
     });
     defer prepared.deinit();
     const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
@@ -65888,6 +77944,10 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
+    var state_fds = [_]linux.fd_t{sp[0]};
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
     try server.adoptInheritedSessions();
     // adopt binds this thread to the server's reactor; unbind so later
     // main-thread calls (and the teardown defers) resolve per-instance.
@@ -65951,16 +78011,28 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
         .last_physical = mesh_clock_mod.MeshClock.physicalOf(predecessor_stamp),
         .last_stamp = predecessor_stamp,
     };
-    const wire = mesh_clock_snapshot.encode(predecessor);
-    const arena_pieces = [_]helix_live.StatePiece{
-        .{ .kind = .mesh_checkpoint, .bytes = &wire },
+    var fixture = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    fixture.mesh_clock = predecessor;
+    const predecessor_migration_epoch: u64 = 1_900_000_000_000_123_456;
+    fixture.migration_offer_epoch = predecessor_migration_epoch;
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &arena_pieces, &blobs);
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-mesh-clock-adopt",
-        .pieces = arena_pieces[0..],
+        .pieces = arena_pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -65978,6 +78050,7 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
     current_reactor = null;
 
     try std.testing.expectEqual(predecessor_stamp, server.mesh_clock.last_stamp);
+    try std.testing.expectEqual(predecessor_migration_epoch, server.migration_offer_epoch);
     // The successor's process-local sequence counter starts fresh, and the
     // synthetic predecessor wall time is deliberately ahead of the test host.
     // Only the restored high-water mark can make this next stamp advance.
@@ -66009,8 +78082,8 @@ test "UPGRADE property clock boundary prepares successor HLC without mutating pr
     try std.testing.expectEqual(mesh_clock_mod.MeshClock.physicalOf(retained), candidate.last_physical);
     try std.testing.expectEqual(predecessor.last_physical, server.mesh_clock.last_physical);
     try std.testing.expectEqual(predecessor.last_stamp, server.mesh_clock.last_stamp);
-    const candidate_wire = mesh_clock_snapshot.encode(candidate);
-    var successor_clock = try mesh_clock_snapshot.decode(&candidate_wire);
+    const candidate_wire = try mesh_clock_snapshot.encode(candidate, 0, .{});
+    var successor_clock = (try mesh_clock_snapshot.decode(&candidate_wire)).clock;
     try std.testing.expect(successor_clock.stamp(server.meshWallMs(), 1) > retained);
 
     const clock = server.channelPropClock("#upgrade", "CLOCK") orelse
@@ -66063,17 +78136,25 @@ test "UPGRADE resume atomically restores exact property rows clocks and tombston
         &predecessor.entity_prop_clocks,
     );
     defer alloc.free(checkpoint);
-    const pieces = [_]helix_live.StatePiece{.{
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&predecessor, &pieces, &blobs);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{
         .kind = .mesh_checkpoint,
         .bytes = checkpoint,
         .min_supported = 2,
-    }};
+    }));
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-property-state-adopt",
-        .pieces = &pieces,
+        .pieces = pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -66160,7 +78241,7 @@ test "UPGRADE property checkpoint selection fails closed without tearing the liv
     const Scenario = enum { corrupt_required, duplicate_required, downgraded_wrapper, unknown_required };
     for ([_]Scenario{ .corrupt_required, .duplicate_required, .downgraded_wrapper, .unknown_required }) |scenario| {
         var piece_buf: [2]helix_live.StatePiece = undefined;
-        const pieces: []const helix_live.StatePiece = switch (scenario) {
+        const malformed_pieces: []const helix_live.StatePiece = switch (scenario) {
             .corrupt_required => blk: {
                 piece_buf[0] = .{ .kind = .mesh_checkpoint, .bytes = corrupt, .min_supported = 2 };
                 break :blk piece_buf[0..1];
@@ -66179,12 +78260,34 @@ test "UPGRADE property checkpoint selection fails closed without tearing the liv
                 break :blk piece_buf[0..1];
             },
         };
+        const fixture = try alloc.create(Server);
+        fixture.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| {
+            alloc.destroy(fixture);
+            return switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+                else => err,
+            };
+        };
+        defer {
+            fixture.deinit();
+            alloc.destroy(fixture);
+        }
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |blob| alloc.free(blob);
+            blobs.deinit(alloc);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(alloc);
+        try appendCurrentMandatoryUpgradeStateForTest(fixture, &pieces, &blobs);
+        try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, malformed_pieces[0]));
+        if (malformed_pieces.len == 2) try pieces.append(alloc, malformed_pieces[1]);
         var prepared = try helix_live.prepare(alloc, .{
             .epoch = 1,
             .now_ms = 1,
             .timeout_ms = 1000,
             .arena_name = "orochi-test-property-state-select",
-            .pieces = pieces,
+            .pieces = pieces.items,
             .fds = &.{},
         });
         defer prepared.deinit();
@@ -66203,7 +78306,7 @@ test "UPGRADE property checkpoint selection fails closed without tearing the liv
         try std.testing.expect(successor.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 1, false, 1, "", ""));
         const listener_fd = successor.reactors[0].listener_fd;
         successor.config.resume_arena_fd = arena_dup;
-        try successor.adoptInheritedSessions();
+        try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
         current_reactor = null;
 
         try std.testing.expect(successor.config.resume_arena_fd == null);
@@ -66284,7 +78387,7 @@ test "UPGRADE property checkpoint rejects malformed required outer capsule shape
         try std.testing.expect(successor.recordEntityPropClock(.user, "Sentinel", "OLD", "old", 1, false, 1, "", ""));
         const listener_fd = successor.reactors[0].listener_fd;
         successor.config.resume_arena_fd = arena_dup;
-        try successor.adoptInheritedSessions();
+        try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
         arena_dup_owned = false;
         current_reactor = null;
 
@@ -66336,17 +78439,29 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     var cap_buf: [512]u8 = undefined;
     const cap_wire = try cap.encode(&cap_buf);
 
-    const arena_pieces = [_]helix_live.StatePiece{
-        .{ .kind = .clients, .bytes = sess_blob },
-        .{ .kind = .sessions, .bytes = cap_wire },
+    var fixture = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &arena_pieces, &blobs);
+    try arena_pieces.append(alloc, .{ .kind = .clients, .bytes = sess_blob });
+    try arena_pieces.append(alloc, .{ .kind = .sessions, .bytes = cap_wire });
+    try appendEmptyUpgradeClientSidecarsForTest(alloc, &arena_pieces, &blobs, sp[0]);
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-sess-adopt",
-        .pieces = arena_pieces[0..],
-        .fds = &.{},
+        .pieces = arena_pieces.items,
+        .fds = &.{sp[0]},
     });
     defer prepared.deinit();
     const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
@@ -66359,8 +78474,13 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     };
     defer server.deinit();
     server.config.resume_arena_fd = arena_dup;
+    var state_fds = [_]linux.fd_t{sp[0]};
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
     try server.adoptInheritedSessions();
     current_reactor = null;
+    try std.testing.expect(server.monitor.isOnline("ALIA"));
 
     // (1) The attached session re-tracked against the adopted connection with
     // the SAME reclaim token — not wiped, not detached, not a fresh token.
@@ -66407,13 +78527,26 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     try std.testing.expect(tok_c_ghost != attached_client.?);
 }
 
-test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
+test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
     const tok_good: sessions_mod.Token = @splat('G');
     const tok_valid: sessions_mod.Token = @splat('V');
+
+    var inherited_pair: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &inherited_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    var inherited_owner_open = true;
+    defer if (inherited_owner_open) closeFd(inherited_pair[0]);
+    defer closeFd(inherited_pair[1]);
+    const client_wire = try session_snapshot.encode(alloc, .{
+        .nick = "LateRollback",
+        .realname = "Late transaction rollback client",
+        .fd = inherited_pair[0],
+    });
+    defer alloc.free(client_wire);
 
     // A healthy account capsule ...
     const good_entries = [_]session_capsule.SessionEntry{
@@ -66435,18 +78568,31 @@ test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
     // ... and a garbage `.sessions` payload (bad inner magic) — skipped, no panic.
     const garbage = "not-a-session-capsule-at-all";
 
-    const arena_pieces = [_]helix_live.StatePiece{
-        .{ .kind = .sessions, .bytes = good_wire },
-        .{ .kind = .sessions, .bytes = torn_wire },
-        .{ .kind = .sessions, .bytes = garbage },
+    var fixture = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &arena_pieces, &blobs);
+    try arena_pieces.append(alloc, .{ .kind = .clients, .bytes = client_wire });
+    try appendEmptyUpgradeClientSidecarsForTest(alloc, &arena_pieces, &blobs, inherited_pair[0]);
+    try arena_pieces.append(alloc, .{ .kind = .sessions, .bytes = good_wire });
+    try arena_pieces.append(alloc, .{ .kind = .sessions, .bytes = torn_wire });
+    try arena_pieces.append(alloc, .{ .kind = .sessions, .bytes = garbage });
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-sess-fault",
-        .pieces = arena_pieces[0..],
-        .fds = &.{},
+        .pieces = arena_pieces.items,
+        .fds = &.{inherited_pair[0]},
     });
     defer prepared.deinit();
     const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
@@ -66458,18 +78604,46 @@ test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
         else => return err,
     };
     defer server.deinit();
+    // Seed every late-adoption store with an unmistakable boot image. The
+    // healthy first account is deliberately applied before the malformed second
+    // account fails; transaction rollback must discard that prefix and restore
+    // all old authorities, not merely World.
+    const old_token: sessions_mod.Token = @splat('O');
+    _ = try server.sessions.attach("old-account", 0xA11, old_token, 7);
+    try std.testing.expect(server.sessions.markDetached("old-account", 0xA11));
+    try server.monitor.restoreTarget(0xA11, "OldTarget");
+    try server.monitor.restoreOnline("OldTarget");
+    try std.testing.expect(try server.silence.add("OldOwner", "bad!*@example.test"));
+    _ = try server.world.markRegistered("#old-world", true);
+    try seedUpgradeAtomicPublicationSentinels(&server);
+    const old_generation = server.session_replica_store_generation;
+    const old_ticket_key = server.tls_ticket_key;
+    const old_previous_ticket_key = server.tls_previous_ticket_key;
+    const old_msg_seq = server.msg_seq;
     server.config.resume_arena_fd = arena_dup;
-    try server.adoptInheritedSessions();
+    var state_fds = [_]linux.fd_t{inherited_pair[0]};
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+    inherited_owner_open = false;
     current_reactor = null;
 
-    // The healthy account restored completely.
-    try std.testing.expect(server.sessions.findDetachedTokenInAccount("good", tok_good).? != 42);
-    const snap = (try server.sessions.copyDetachedSnapshotInAccount(alloc, "good", tok_good)).?;
-    defer alloc.free(snap);
-    try std.testing.expectEqualSlices(u8, "good-snap", snap);
-    // The account with a malformed entry restored NOTHING — even its valid
-    // entry is absent (atomic reject), and the registry never panicked.
-    try std.testing.expect(server.sessions.findTokenInAccount("torn", tok_valid) == null);
+    try std.testing.expect(server.config.resume_arena_fd == null);
+    try std.testing.expect(server.world.channelExists("#old-world"));
+    try std.testing.expect(server.sessions.findDetachedTokenInAccount("old-account", old_token) != null);
+    const good_rows = try server.sessions.copySessionsAlloc(alloc, "good");
+    defer alloc.free(good_rows);
+    try std.testing.expectEqual(@as(usize, 0), good_rows.len);
+    try std.testing.expectEqual(@as(usize, 1), server.monitor.monitorCount(0xA11));
+    try std.testing.expect(server.monitor.isOnline("OldTarget"));
+    try std.testing.expect(server.silence.isSilenced("OldOwner", "bad!user@example.test"));
+    try std.testing.expectEqual(old_ticket_key, server.tls_ticket_key);
+    try std.testing.expectEqual(old_previous_ticket_key, server.tls_previous_ticket_key);
+    try std.testing.expectEqual(old_msg_seq, server.msg_seq);
+    try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(inherited_pair[0], posix.F.GETFD, 0)));
+    try expectUpgradeAtomicPublicationSentinels(&server, old_generation);
 }
 
 test "UPGRADE session registry ghosts cannot collide with a live successor client id" {
@@ -66501,10 +78675,20 @@ test "UPGRADE session registry ghosts cannot collide with a live successor clien
         .{ .token = &ghost_token, .signon_unix = 2, .detached = true, .client = live_client, .snapshot = "ghost" },
     };
     var detached_seq: u64 = 0;
+    var attachment_remaps: std.ArrayList(attachment_delivery_spool.AttachmentRemap) = .empty;
+    defer attachment_remaps.deinit(alloc);
+    const attachment_clients = [_]attachment_delivery_spool.ClientId{ 7, live_client };
+    try attachment_remaps.ensureTotalCapacity(alloc, attachment_clients.len);
     try std.testing.expectEqual(
         @as(usize, 2),
-        server.adoptSessionRegistryAccount(.{ .account = "alice", .sessions = &entries }, &detached_seq),
+        server.adoptSessionRegistryAccount(
+            .{ .account = "alice", .sessions = &entries },
+            &detached_seq,
+            &attachment_clients,
+            &attachment_remaps,
+        ),
     );
+    try std.testing.expectEqual(@as(usize, 2), attachment_remaps.items.len);
 
     const live = server.sessions.resumeHandleForClient("alice", live_client) orelse return error.TestUnexpectedResult;
     try std.testing.expect(server.sessions.containsClient("alice", live_client));
@@ -66515,6 +78699,37 @@ test "UPGRADE session registry ghosts cannot collide with a live successor clien
     const ghost_snapshot = (try server.sessions.copyDetachedSnapshotInAccount(alloc, "alice", ghost_token)).?;
     defer alloc.free(ghost_snapshot);
     try std.testing.expectEqualStrings("ghost", ghost_snapshot);
+}
+
+test "UPGRADE attachment remaps stay bounded by tiny ADS1 authority across large HSSN registry" {
+    const alloc = std.testing.allocator;
+    const attachment_clients = [_]attachment_delivery_spool.ClientId{2048};
+    var remaps: std.ArrayList(attachment_delivery_spool.AttachmentRemap) = .empty;
+    defer remaps.deinit(alloc);
+    try remaps.ensureTotalCapacity(alloc, attachment_clients.len);
+    const planned_capacity = remaps.capacity;
+
+    var old_client: u64 = 0;
+    while (old_client < 4096) : (old_client += 1) {
+        LinuxServer.appendAttachmentRemapIfNeeded(
+            &attachment_clients,
+            &remaps,
+            old_client,
+            old_client + 10_000,
+        ) orelse return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 1), remaps.items.len);
+    try std.testing.expectEqual(@as(u64, 2048), remaps.items[0].old_client);
+    try std.testing.expectEqual(@as(u64, 12_048), remaps.items[0].new_client);
+    try std.testing.expectEqual(planned_capacity, remaps.capacity);
+
+    // A second HSSN owner for the only spooled predecessor is ambiguous.
+    try std.testing.expect(LinuxServer.appendAttachmentRemapIfNeeded(
+        &attachment_clients,
+        &remaps,
+        2048,
+        77,
+    ) == null);
 }
 
 test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
@@ -66543,10 +78758,12 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
     }
     var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
     defer pieces.deinit(alloc);
-    const sealed = pred.sealPendingMigrationCheckpoint(&pieces, &blobs) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 1), sealed.entries);
-    try std.testing.expectEqual(@as(usize, 1), sealed.consumed);
-    try std.testing.expectEqual(@as(usize, 1), pieces.items.len);
+    try appendCurrentMandatoryUpgradeStateForTest(&pred, &pieces, &blobs);
+    var found_pending = false;
+    for (pieces.items) |piece| {
+        if (piece.kind == .pending_migration) found_pending = true;
+    }
+    try std.testing.expect(found_pending);
 
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
@@ -66635,7 +78852,7 @@ test "UPGRADE arena read failure closes exact carried fd manifest but preserves 
     server.config.inherited_state_fds = &state_fds;
     server.config.inherited_state_fd_manifest_present = true;
     server.config.inherited_state_fd_manifest_valid = true;
-    try server.adoptInheritedSessions();
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
     current_reactor = null;
 
     try std.testing.expect(server.config.resume_arena_fd == null);
@@ -66799,7 +79016,7 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
         });
         defer alloc.free(client_blob);
         var piece_buf: [2]helix_live.StatePiece = undefined;
-        const pieces: []const helix_live.StatePiece = switch (scenario) {
+        const owner_pieces: []const helix_live.StatePiece = switch (scenario) {
             .duplicate_capsule_fd => blk: {
                 piece_buf[0] = .{ .kind = .clients, .bytes = client_blob };
                 piece_buf[1] = .{ .kind = .clients, .bytes = client_blob };
@@ -66814,12 +79031,35 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
                 break :blk piece_buf[0..1];
             },
         };
+        const fixture = try alloc.create(Server);
+        fixture.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| {
+            alloc.destroy(fixture);
+            return switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+                else => err,
+            };
+        };
+        defer {
+            fixture.deinit();
+            alloc.destroy(fixture);
+        }
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |blob| alloc.free(blob);
+            blobs.deinit(alloc);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(alloc);
+        try appendCurrentMandatoryUpgradeStateForTest(fixture, &pieces, &blobs);
+        try pieces.appendSlice(alloc, owner_pieces);
+        if (scenario != .unreadable_owner_capsule)
+            try appendEmptyUpgradeClientSidecarsForTest(alloc, &pieces, &blobs, owned_pair[0]);
         var prepared = try helix_live.prepare(alloc, .{
             .epoch = 1,
             .now_ms = 1,
             .timeout_ms = 1000,
             .arena_name = "orochi-test-state-fd-bijection",
-            .pieces = pieces,
+            .pieces = pieces.items,
             .fds = &.{},
         });
         defer prepared.deinit();
@@ -66828,11 +79068,18 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
         const arena_dup: linux.fd_t = @intCast(dup_rc);
         defer closeFd(arena_dup);
 
-        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
-            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-            else => return err,
+        const server = try alloc.create(Server);
+        server.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| {
+            alloc.destroy(server);
+            return switch (err) {
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+                else => err,
+            };
         };
-        defer server.deinit();
+        defer {
+            server.deinit();
+            alloc.destroy(server);
+        }
         const listener_fd = server.reactors[0].listener_fd;
         var manifest_buf: [2]linux.fd_t = undefined;
         const manifest: []linux.fd_t = switch (scenario) {
@@ -66856,22 +79103,30 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
         try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
         current_reactor = null;
 
-        // Startup-fatal production semantics deliberately leave every numeric
-        // descriptor untouched; main exits and the kernel closes them. Catching
-        // the error in-process here proves no rogue/colliding fd was guessed.
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(owned_pair[0], posix.F.GETFD, 0)));
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(other_pair[0], posix.F.GETFD, 0)));
+        // The exact trusted manifest is the cleanup authority: rejection closes
+        // the arena and precisely the descriptors it named, never an unlisted fd.
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
+        const owned_expected: linux.E = if (scenario == .capsule_fd_absent) .SUCCESS else .BADF;
+        const other_expected: linux.E = if (scenario == .extra_manifest_fd or scenario == .capsule_fd_absent) .BADF else .SUCCESS;
+        try std.testing.expectEqual(owned_expected, linux.errno(linux.fcntl(owned_pair[0], posix.F.GETFD, 0)));
+        try std.testing.expectEqual(other_expected, linux.errno(linux.fcntl(other_pair[0], posix.F.GETFD, 0)));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, posix.F.GETFD, 0)));
-        try std.testing.expect(server.config.resume_arena_fd != null);
-        try std.testing.expect(server.config.inherited_state_fd_manifest_present);
+        try std.testing.expect(server.config.resume_arena_fd == null);
+        try std.testing.expect(!server.config.inherited_state_fd_manifest_present);
     }
 
-    var no_arena_server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
+    const no_arena_server = try alloc.create(Server);
+    no_arena_server.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| {
+        alloc.destroy(no_arena_server);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+            else => err,
+        };
     };
-    defer no_arena_server.deinit();
+    defer {
+        no_arena_server.deinit();
+        alloc.destroy(no_arena_server);
+    }
     no_arena_server.config.inherited_state_fd_manifest_present = true;
     no_arena_server.config.inherited_state_fd_manifest_valid = false;
     try std.testing.expectError(error.InvalidInheritedHandoff, no_arena_server.adoptInheritedSessions());
@@ -66896,7 +79151,7 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(orphan_pair[1], posix.F.GETFD, 0)));
 }
 
-test "UPGRADE legacy duplicate owner capsules are rejected before fd or io_uring adoption" {
+test "UPGRADE duplicate owner capsules are rejected before fd or io_uring adoption" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -66914,17 +79169,31 @@ test "UPGRADE legacy duplicate owner capsules are rejected before fd or io_uring
         .fd = owner_pair[0],
     });
     defer alloc.free(client_blob);
-    const pieces = [_]helix_live.StatePiece{
-        .{ .kind = .clients, .bytes = client_blob },
-        .{ .kind = .clients, .bytes = client_blob },
+    const fixture = try alloc.create(Server);
+    defer alloc.destroy(fixture);
+    fixture.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(fixture, &pieces, &blobs);
+    try pieces.append(alloc, .{ .kind = .clients, .bytes = client_blob });
+    try pieces.append(alloc, .{ .kind = .clients, .bytes = client_blob });
+    try appendEmptyUpgradeClientSidecarsForTest(alloc, &pieces, &blobs, owner_pair[0]);
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-legacy-owner-dedup",
-        .pieces = &pieces,
-        .fds = &.{},
+        .pieces = pieces.items,
+        .fds = &.{owner_pair[0]},
     });
     defer prepared.deinit();
     const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
@@ -66933,16 +79202,20 @@ test "UPGRADE legacy duplicate owner capsules are rejected before fd or io_uring
     var arena_open = true;
     defer if (arena_open) closeFd(arena_dup);
 
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+    const server = try alloc.create(Server);
+    defer alloc.destroy(server);
+    server.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
     const sqes_before = server.reactors[0].ring.inner.sq_ready();
     server.config.resume_arena_fd = arena_dup;
-    // Deliberately omit the authoritative state-fd manifest: this is the
-    // compatibility path for a pre-manifest predecessor.
-    try server.adoptInheritedSessions();
+    var state_fds = [_]linux.fd_t{owner_pair[0]};
+    server.config.inherited_state_fds = &state_fds;
+    server.config.inherited_state_fd_manifest_present = true;
+    server.config.inherited_state_fd_manifest_valid = true;
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
     current_reactor = null;
     arena_open = false;
     owner_fd_open = false;
@@ -67108,7 +79381,7 @@ test "UPGRADE exact Store and PMST singletons reject malformed outer shapes" {
         const generation = successor.session_replica_store_generation;
         const listener_fd = successor.reactors[0].listener_fd;
         successor.config.resume_arena_fd = arena_dup;
-        try successor.adoptInheritedSessions();
+        try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
         arena_dup_owned = false;
         current_reactor = null;
 
@@ -67119,7 +79392,7 @@ test "UPGRADE exact Store and PMST singletons reject malformed outer shapes" {
     }
 }
 
-test "UPGRADE accepts SESSION_REPLICA Store from canonical mesh-checkpoint v1 predecessor" {
+test "UPGRADE rejects SESSION_REPLICA Store from pre-manifest v1 predecessor" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -67158,14 +79431,12 @@ test "UPGRADE accepts SESSION_REPLICA Store from canonical mesh-checkpoint v1 pr
     try seedUpgradeAtomicPublicationSentinels(&successor);
     const generation = successor.session_replica_store_generation;
     successor.config.resume_arena_fd = arena_dup;
-    try successor.adoptInheritedSessions();
+    try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
     arena_dup_owned = false;
     current_reactor = null;
 
     try std.testing.expect(successor.config.resume_arena_fd == null);
-    try std.testing.expectEqual(@as(usize, 0), successor.session_replica_store.entryCount());
-    try std.testing.expectEqual(@as(usize, 0), successor.session_replica_store.attachmentLeaseCount());
-    try std.testing.expectEqual(generation +% 1, successor.session_replica_store_generation);
+    try expectUpgradeAtomicPublicationSentinels(&successor, generation);
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(arena_dup, posix.F.GETFD, 0)));
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(successor.reactors[0].listener_fd, posix.F.GETFD, 0)));
 }
@@ -67197,18 +79468,28 @@ test "UPGRADE late corrupt Store leaves valid property and all live sentinels un
     defer alloc.free(corrupt_store_checkpoint);
     corrupt_store_checkpoint[corrupt_store_checkpoint.len - 1] ^= 1;
 
-    const mesh_checkpoint = mesh_clock_snapshot.encode(.{ .last_stamp = 200 });
-    const pieces = [_]helix_live.StatePiece{
-        .{ .kind = .mesh_checkpoint, .bytes = &mesh_checkpoint },
-        .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 },
-        .{ .kind = .mesh_checkpoint, .bytes = corrupt_store_checkpoint },
+    var fixture = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    fixture.mesh_clock = .{ .last_stamp = 200 };
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &pieces, &blobs);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 }));
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .replica_store, .{ .kind = .mesh_checkpoint, .bytes = corrupt_store_checkpoint }));
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1_000,
         .arena_name = "orochi-test-atomic-bad-store",
-        .pieces = &pieces,
+        .pieces = pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -67227,7 +79508,7 @@ test "UPGRADE late corrupt Store leaves valid property and all live sentinels un
     const generation = successor.session_replica_store_generation;
     const listener_fd = successor.reactors[0].listener_fd;
     successor.config.resume_arena_fd = arena_dup;
-    try successor.adoptInheritedSessions();
+    try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
     arena_dup_owned = false;
     current_reactor = null;
 
@@ -67269,19 +79550,29 @@ test "UPGRADE late corrupt PMST leaves valid property Store and all live sentine
     defer alloc.free(corrupt_pending_checkpoint);
     corrupt_pending_checkpoint[corrupt_pending_checkpoint.len - 1] ^= 1;
 
-    const mesh_checkpoint = mesh_clock_snapshot.encode(.{ .last_stamp = 200 });
-    const pieces = [_]helix_live.StatePiece{
-        .{ .kind = .mesh_checkpoint, .bytes = &mesh_checkpoint },
-        .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 },
-        .{ .kind = .mesh_checkpoint, .bytes = store_checkpoint },
-        .{ .kind = .pending_migration, .bytes = corrupt_pending_checkpoint, .min_supported = 2 },
+    var fixture = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
     };
+    defer fixture.deinit();
+    fixture.mesh_clock = .{ .last_stamp = 200 };
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &pieces, &blobs);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{ .kind = .mesh_checkpoint, .bytes = property_checkpoint, .min_supported = 2 }));
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .replica_store, .{ .kind = .mesh_checkpoint, .bytes = store_checkpoint }));
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .pending, .{ .kind = .pending_migration, .bytes = corrupt_pending_checkpoint, .min_supported = 2 }));
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1_000,
         .arena_name = "orochi-test-atomic-bad-pmst",
-        .pieces = &pieces,
+        .pieces = pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -67300,7 +79591,7 @@ test "UPGRADE late corrupt PMST leaves valid property Store and all live sentine
     const generation = successor.session_replica_store_generation;
     const listener_fd = successor.reactors[0].listener_fd;
     successor.config.resume_arena_fd = arena_dup;
-    try successor.adoptInheritedSessions();
+    try std.testing.expectError(error.InvalidInheritedHandoff, successor.adoptInheritedSessions());
     arena_dup_owned = false;
     current_reactor = null;
 
@@ -67325,19 +79616,26 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
     closeFd(probe_fd);
 
     // The surviving peer: a node whose S2S listener stays up across our swap.
-    var node2 = Server.init(alloc, .{
+    const node2 = try alloc.create(Server);
+    node2.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = s2s_port,
         .node_id = 2,
         .server_name = "node2.test",
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
-        else => return err,
+    }) catch |err| {
+        alloc.destroy(node2);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
+            else => err,
+        };
     };
-    defer node2.deinit();
+    defer {
+        node2.deinit();
+        alloc.destroy(node2);
+    }
     var run2 = std.atomic.Value(bool).init(true);
-    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node2, &run2 });
     defer {
         run2.store(false, .release);
         if (connectLoopback(node2.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
@@ -67347,15 +79645,33 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
     // The predecessor sealed a re-dial hint for the hand-opened link (this peer
     // is NOT in [mesh].connect — the hint is the only way it comes back).
     const hint = mesh_redial.encode(.{ .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = s2s_port });
-    const arena_pieces = [_]helix_live.StatePiece{
-        .{ .kind = .mesh_checkpoint, .bytes = &hint },
+    const fixture = try alloc.create(Server);
+    fixture.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| {
+        alloc.destroy(fixture);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+            else => err,
+        };
     };
+    defer {
+        fixture.deinit();
+        alloc.destroy(fixture);
+    }
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var arena_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer arena_pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(fixture, &arena_pieces, &blobs);
+    try arena_pieces.append(alloc, .{ .kind = .mesh_checkpoint, .bytes = &hint });
     var prepared = try helix_live.prepare(alloc, .{
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
         .arena_name = "orochi-test-redial",
-        .pieces = arena_pieces[0..],
+        .pieces = arena_pieces.items,
         .fds = &.{},
     });
     defer prepared.deinit();
@@ -67365,17 +79681,24 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
 
     // The successor: no [mesh].connect, no oper — the carried hint alone must
     // re-establish the link as soon as the loop starts.
-    var node1 = Server.init(alloc, .{
+    const node1 = try alloc.create(Server);
+    node1.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
         .s2s_port = 0,
         .node_id = 1,
         .server_name = "node1.test",
-    }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
+    }) catch |err| {
+        alloc.destroy(node1);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+            else => err,
+        };
     };
-    defer node1.deinit();
+    defer {
+        node1.deinit();
+        alloc.destroy(node1);
+    }
     node1.config.resume_arena_fd = arena_dup;
     try node1.adoptInheritedSessions();
     // adopt binds this thread to node1's reactor; unbind so the main-thread
@@ -67383,7 +79706,7 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
     current_reactor = null;
     const port1 = node1.boundPort() catch return error.SkipZigTest;
     var run1 = std.atomic.Value(bool).init(true);
-    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node1, &run1 });
     defer {
         run1.store(false, .release);
         if (connectLoopback(port1)) |wfd| closeFd(wfd) else |_| {}
@@ -67965,6 +80288,9 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
         worldIdFromClient(sibling_id),
         world_model.MemberModes.fromModes(&.{.voice}),
     );
+    try server.monitor.restoreOnline("Shared");
+    try server.monitor.restoreTarget(monitorIdFromClient(claimant_id), "WatchedTarget");
+    try std.testing.expectEqual(@as(usize, 1), server.monitor.watcherCount("WatchedTarget"));
 
     // Attach a real established peer so closeConn exercises the production
     // retraction fan-out and the receiver decodes exactly what crossed the wire.
@@ -68012,6 +80338,9 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
         .notif = false,
     });
     try std.testing.expect(server.connFor(claimant_id) == null);
+    try std.testing.expect(server.monitor.isOnline("Shared"));
+    try std.testing.expectEqual(@as(usize, 0), server.monitor.watcherCount("WatchedTarget"));
+    try std.testing.expectEqual(@as(usize, 0), server.monitor.monitorCount(monitorIdFromClient(claimant_id)));
     try std.testing.expectEqual(
         @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
         server.world.findNick("Shared"),

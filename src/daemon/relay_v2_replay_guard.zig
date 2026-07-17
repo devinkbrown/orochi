@@ -52,6 +52,37 @@ pub const Decision = enum {
     origin_capacity,
 };
 
+/// One origin-verification and replay-admission result for a complete immutable
+/// MESSAGE_V2 object. Only `accepted` exposes an identity, and that identity is
+/// derived from the same authenticated transcript that advanced the guard.
+/// Delivery, Lotus history, msgid rendering, and re-forwarding must use this
+/// exact payload rather than calling `relayId` independently.
+pub const Admission = union(enum) {
+    accepted: RelayId,
+    duplicate: RelayId,
+    equivocation,
+    retired,
+    origin_capacity,
+    origin_mismatch,
+    bad_signature,
+    invalid_semantic,
+};
+
+/// Read-only authentication and replay-authority lookup. This is deliberately
+/// separate from `Admission`: receivers use it to re-ack an exact retained
+/// duplicate before consulting mutable routing or policy state, while an
+/// unseen message must still complete all first-admission checks before the
+/// guard is mutated.
+pub const Probe = union(enum) {
+    unseen: RelayId,
+    duplicate: RelayId,
+    equivocation,
+    retired: RelayId,
+    origin_mismatch,
+    bad_signature,
+    invalid_semantic,
+};
+
 pub const InitError = error{InvalidConfig};
 
 pub const CheckpointError = std.mem.Allocator.Error || error{
@@ -70,6 +101,82 @@ pub const CheckpointError = std.mem.Allocator.Error || error{
     InvalidWatermark,
     InvalidField,
 };
+
+/// Unambiguous family selector only. A true result still requires the complete
+/// strict `validateCheckpoint` pass before the capsule is accepted.
+pub fn isCheckpoint(bytes: []const u8) bool {
+    return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], &magic);
+}
+
+/// Allocation-free strict-current validation for checkpoint selectors and
+/// whole-handoff relation checks. Returns the encoded authority configuration;
+/// the eventual owner must still compare it with its operator-owned expected
+/// configuration when staging through `Guard.decodeCheckpoint`.
+pub fn validateCheckpoint(bytes: []const u8) CheckpointError!Config {
+    if (bytes.len < checkpoint_header_len + checksum_len) return error.Truncated;
+    if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
+    if (bytes[magic.len] != checkpoint_version) return error.UnsupportedVersion;
+    const encoded_config = Config{
+        .window_size = readU16(bytes[5..7]),
+        .max_origins = readU32(bytes[7..11]),
+    };
+    if (!encoded_config.valid()) return error.InvalidConfig;
+    const origin_count: usize = readU32(bytes[11..15]);
+    const body_len: usize = readU32(bytes[15..19]);
+    if (origin_count > encoded_config.max_origins) return error.CapacityExceeded;
+    if (body_len > hard_max_checkpoint_bytes) return error.CheckpointTooLarge;
+    const prefix_len = std.math.add(usize, checkpoint_header_len, body_len) catch
+        return error.CheckpointTooLarge;
+    const expected_len = std.math.add(usize, prefix_len, checksum_len) catch
+        return error.CheckpointTooLarge;
+    if (expected_len > hard_max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (bytes.len < expected_len) return error.Truncated;
+    if (bytes.len > expected_len) return error.TrailingBytes;
+    var actual_sum: [checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0..prefix_len], &actual_sum);
+    if (!std.mem.eql(u8, &actual_sum, bytes[prefix_len..])) return error.ChecksumMismatch;
+
+    var pos: usize = checkpoint_header_len;
+    var previous_pubkey: ?PublicKey = null;
+    for (0..origin_count) |_| {
+        if (pos > prefix_len or prefix_len - pos < origin_prefix_len) return error.Truncated;
+        const pubkey: PublicKey = bytes[pos..][0..@sizeOf(PublicKey)].*;
+        pos += @sizeOf(PublicKey);
+        if (previous_pubkey) |previous| {
+            if (std.mem.eql(u8, &previous, &pubkey)) return error.DuplicateOrigin;
+            if (!std.mem.lessThan(u8, &previous, &pubkey)) return error.NonCanonicalOrder;
+        }
+        previous_pubkey = pubkey;
+        const retired_present = bytes[pos];
+        pos += 1;
+        if (retired_present > 1) return error.InvalidField;
+        const retired_raw = readU64(bytes[pos..][0..8]);
+        pos += 8;
+        if (retired_present == 0 and retired_raw != 0) return error.InvalidWatermark;
+        const retired: ?u64 = if (retired_present == 1) retired_raw else null;
+        const entry_count: usize = readU16(bytes[pos..][0..2]);
+        pos += 2;
+        if (entry_count == 0 or entry_count > encoded_config.window_size)
+            return error.CapacityExceeded;
+        const entries_bytes = std.math.mul(usize, entry_count, checkpoint_entry_len) catch
+            return error.CheckpointTooLarge;
+        if (pos > prefix_len or entries_bytes > prefix_len - pos) return error.Truncated;
+        var previous_hlc: ?u64 = null;
+        for (0..entry_count) |_| {
+            const hlc = readU64(bytes[pos..][0..8]);
+            pos += 8 + @sizeOf(RelayId);
+            if (retired) |watermark| if (hlc <= watermark) return error.InvalidWatermark;
+            if (previous_hlc) |previous| {
+                if (hlc == previous) return error.DuplicateHlc;
+                if (hlc < previous) return error.NonCanonicalOrder;
+            }
+            previous_hlc = hlc;
+        }
+    }
+    if (pos < prefix_len) return error.TrailingBytes;
+    if (pos > prefix_len) return error.Truncated;
+    return encoded_config;
+}
 
 const Entry = struct {
     hlc: u64,
@@ -121,6 +228,57 @@ pub const Guard = struct {
         try self.origins.ensureUnusedCapacity(self.allocator, 1);
         self.origins.putAssumeCapacityNoClobber(pubkey, staged);
         return .accepted;
+    }
+
+    /// Verify the immutable author and derive its relay identity exactly once,
+    /// then enter that identity into durable replay authority. Invalid origin
+    /// objects cannot mutate the guard or poison a later valid message.
+    pub fn admitMessage(
+        self: *Guard,
+        msg: message_relay_v2.RelayMessage,
+    ) std.mem.Allocator.Error!Admission {
+        const relay_id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, msg)) {
+            .verified => |id| id,
+            .origin_mismatch => return .origin_mismatch,
+            .bad_signature => return .bad_signature,
+            .invalid_semantic => return .invalid_semantic,
+        };
+        const pubkey: PublicKey = msg.origin_pubkey[0..@sizeOf(PublicKey)].*;
+        return switch (try self.admit(pubkey, msg.hlc, relay_id)) {
+            .accepted => .{ .accepted = relay_id },
+            .duplicate => .{ .duplicate = relay_id },
+            .equivocation => .equivocation,
+            .retired => .retired,
+            .origin_capacity => .origin_capacity,
+        };
+    }
+
+    /// Verify the complete immutable message and query retained replay facts
+    /// without changing them. A duplicate result is proof that this exact
+    /// RelayId was accepted previously; `retired` is intentionally not such a
+    /// proof because the watermark also covers never-admitted too-old events.
+    pub fn probeMessage(
+        self: *const Guard,
+        msg: message_relay_v2.RelayMessage,
+    ) std.mem.Allocator.Error!Probe {
+        const relay_id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, msg)) {
+            .verified => |id| id,
+            .origin_mismatch => return .origin_mismatch,
+            .bad_signature => return .bad_signature,
+            .invalid_semantic => return .invalid_semantic,
+        };
+        const pubkey: PublicKey = msg.origin_pubkey[0..@sizeOf(PublicKey)].*;
+        const origin = self.origins.get(pubkey) orelse return .{ .unseen = relay_id };
+        if (origin.retired_through_hlc) |watermark| {
+            if (msg.hlc <= watermark) return .{ .retired = relay_id };
+        }
+        const index = lowerBound(origin.entries.items, msg.hlc);
+        if (index >= origin.entries.items.len or origin.entries.items[index].hlc != msg.hlc)
+            return .{ .unseen = relay_id };
+        return if (std.mem.eql(u8, &origin.entries.items[index].relay_id, &relay_id))
+            .{ .duplicate = relay_id }
+        else
+            .equivocation;
     }
 
     /// Canonical deterministic checkpoint. The caller owns the returned bytes.
@@ -395,6 +553,8 @@ fn writeU64(bytes: *[8]u8, value: u64) void {
 }
 
 const testing = std.testing;
+const sign = @import("../crypto/sign.zig");
+const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
 
 fn testKey(byte: u8) PublicKey {
     return @splat(byte);
@@ -402,6 +562,31 @@ fn testKey(byte: u8) PublicKey {
 
 fn testId(byte: u8) RelayId {
     return @splat(byte);
+}
+
+fn testSignedMessage(
+    kp: *const sign.KeyPair,
+    hlc: u64,
+    text: []const u8,
+    pubkey: *[message_relay_v2.pubkey_len]u8,
+    signature: *[message_relay_v2.sig_len]u8,
+) !message_relay_v2.RelayMessage {
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#mesh",
+        .source_prefix = "alice!u@mesh.test",
+        .account = "alice",
+        .text = text,
+        .scope_kind = .channel,
+        .origin_node = signed_frame.originShortId(kp.public_key),
+        .hlc = hlc,
+    };
+    try message_relay_v2.stampOrigin(testing.allocator, &msg, kp, pubkey, signature);
+    return msg;
+}
+
+fn expectAdmission(expected: std.meta.Tag(Admission), admission: Admission) !void {
+    try testing.expectEqual(expected, std.meta.activeTag(admission));
 }
 
 fn rewriteCheckpointChecksum(bytes: []u8) void {
@@ -419,6 +604,101 @@ fn expectOrigin(
     try testing.expectEqual(retired, origin.retired_through_hlc);
     try testing.expectEqual(expected_hlcs.len, origin.entries.items.len);
     for (origin.entries.items, expected_hlcs) |entry, hlc| try testing.expectEqual(hlc, entry.hlc);
+}
+
+test "relay v2 replay admission verifies once and returns the authoritative accepted identity" {
+    var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0x91)));
+    defer kp.deinit();
+    var pk_a: [message_relay_v2.pubkey_len]u8 = undefined;
+    var sig_a: [message_relay_v2.sig_len]u8 = undefined;
+    const first = try testSignedMessage(&kp, 10, "first", &pk_a, &sig_a);
+    const expected_id = switch (try message_relay_v2.verifyAndRelayId(testing.allocator, first)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var guard = try Guard.init(testing.allocator, .{ .window_size = 1, .max_origins = 1 });
+    defer guard.deinit();
+    switch (try guard.probeMessage(first)) {
+        .unseen => |id| try testing.expectEqualSlices(u8, &expected_id, &id),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try guard.admitMessage(first)) {
+        .accepted => |id| try testing.expectEqualSlices(u8, &expected_id, &id),
+        else => return error.TestUnexpectedResult,
+    }
+    const before_probe = try guard.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(before_probe);
+    switch (try guard.probeMessage(first)) {
+        .duplicate => |id| try testing.expectEqualSlices(u8, &expected_id, &id),
+        else => return error.TestUnexpectedResult,
+    }
+    const after_probe = try guard.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(after_probe);
+    try testing.expectEqualSlices(u8, before_probe, after_probe);
+    try expectAdmission(.duplicate, try guard.admitMessage(first));
+
+    var pk_conflict: [message_relay_v2.pubkey_len]u8 = undefined;
+    var sig_conflict: [message_relay_v2.sig_len]u8 = undefined;
+    const conflict = try testSignedMessage(&kp, 10, "different", &pk_conflict, &sig_conflict);
+    try testing.expectEqual(
+        std.meta.Tag(Probe).equivocation,
+        std.meta.activeTag(try guard.probeMessage(conflict)),
+    );
+    try expectAdmission(.equivocation, try guard.admitMessage(conflict));
+
+    var pk_new: [message_relay_v2.pubkey_len]u8 = undefined;
+    var sig_new: [message_relay_v2.sig_len]u8 = undefined;
+    const newer = try testSignedMessage(&kp, 11, "newer", &pk_new, &sig_new);
+    try expectAdmission(.accepted, try guard.admitMessage(newer));
+    try testing.expectEqual(
+        std.meta.Tag(Probe).retired,
+        std.meta.activeTag(try guard.probeMessage(first)),
+    );
+    try expectAdmission(.retired, try guard.admitMessage(first));
+
+    // Invalid semantic and invalid proof paths never disturb the valid origin.
+    var invalid = newer;
+    invalid.target = "not-a-channel";
+    try expectAdmission(.invalid_semantic, try guard.admitMessage(invalid));
+    var bad_sig = newer;
+    var corrupt_signature = sig_new;
+    corrupt_signature[0] ^= 1;
+    bad_sig.origin_sig = &corrupt_signature;
+    try expectAdmission(.bad_signature, try guard.admitMessage(bad_sig));
+    try expectAdmission(.duplicate, try guard.admitMessage(newer));
+
+    var other_kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0x92)));
+    defer other_kp.deinit();
+    var other_pk: [message_relay_v2.pubkey_len]u8 = undefined;
+    var other_sig: [message_relay_v2.sig_len]u8 = undefined;
+    const other = try testSignedMessage(&other_kp, 1, "other", &other_pk, &other_sig);
+    try expectAdmission(.origin_capacity, try guard.admitMessage(other));
+}
+
+test "relay v2 replay message admission is failure-atomic across every allocation failure" {
+    var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0x93)));
+    defer kp.deinit();
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    const msg = try testSignedMessage(&kp, 50, "allocation sweep", &pubkey, &signature);
+
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, message: message_relay_v2.RelayMessage) !void {
+            var guard = try Guard.init(allocator, .{ .window_size = 2, .max_origins = 2 });
+            defer guard.deinit();
+            const result = guard.admitMessage(message) catch |err| {
+                try testing.expectEqual(@as(usize, 0), guard.origins.count());
+                return err;
+            };
+            switch (result) {
+                .accepted => {},
+                else => return error.TestUnexpectedResult,
+            }
+            try testing.expectEqual(@as(usize, 1), guard.origins.count());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{msg});
 }
 
 test "relay v2 replay guard isolates full origin keys and detects duplicates and equivocation" {
@@ -498,6 +778,8 @@ test "relay v2 replay guard checkpoint is deterministic and preserves authority"
 
     const first_wire = try first.encodeCheckpoint(testing.allocator);
     defer testing.allocator.free(first_wire);
+    try testing.expect(isCheckpoint(first_wire));
+    try testing.expect(Config.eql(cfg, try validateCheckpoint(first_wire)));
     const second_wire = try second.encodeCheckpoint(testing.allocator);
     defer testing.allocator.free(second_wire);
     try testing.expectEqualSlices(u8, first_wire, second_wire);
@@ -556,29 +838,45 @@ test "relay v2 replay guard checkpoint rejects corruption bounds duplicates and 
         error.Truncated,
         Guard.decodeCheckpoint(testing.allocator, cfg, checkpoint[0 .. checkpoint.len - 1]),
     );
+    try testing.expectError(error.Truncated, validateCheckpoint(checkpoint[0 .. checkpoint.len - 1]));
     const trailing = try testing.allocator.alloc(u8, checkpoint.len + 1);
     defer testing.allocator.free(trailing);
     @memcpy(trailing[0..checkpoint.len], checkpoint);
     trailing[checkpoint.len] = 0;
     try testing.expectError(error.TrailingBytes, Guard.decodeCheckpoint(testing.allocator, cfg, trailing));
+    try testing.expectError(error.TrailingBytes, validateCheckpoint(trailing));
 
     const corrupt = try testing.allocator.dupe(u8, checkpoint);
     defer testing.allocator.free(corrupt);
     corrupt[checkpoint_header_len + origin_prefix_len] ^= 1;
     try testing.expectError(error.ChecksumMismatch, Guard.decodeCheckpoint(testing.allocator, cfg, corrupt));
+    try testing.expectError(error.ChecksumMismatch, validateCheckpoint(corrupt));
     try testing.expectError(
         error.ConfigMismatch,
         Guard.decodeCheckpoint(testing.allocator, .{ .window_size = 3, .max_origins = 2 }, checkpoint),
+    );
+    const invalid_config = try testing.allocator.dupe(u8, checkpoint);
+    defer testing.allocator.free(invalid_config);
+    writeU16(invalid_config[5..7], 0);
+    rewriteCheckpointChecksum(invalid_config);
+    try testing.expectError(error.InvalidConfig, validateCheckpoint(invalid_config));
+    try testing.expectError(
+        error.InvalidConfig,
+        Guard.decodeCheckpoint(testing.allocator, cfg, invalid_config),
     );
 
     const bad_magic = try testing.allocator.dupe(u8, checkpoint);
     defer testing.allocator.free(bad_magic);
     bad_magic[0] ^= 1;
+    try testing.expect(!isCheckpoint(bad_magic));
     try testing.expectError(error.BadMagic, Guard.decodeCheckpoint(testing.allocator, cfg, bad_magic));
+    try testing.expectError(error.BadMagic, validateCheckpoint(bad_magic));
     const bad_version = try testing.allocator.dupe(u8, checkpoint);
     defer testing.allocator.free(bad_version);
     bad_version[magic.len] +%= 1;
     try testing.expectError(error.UnsupportedVersion, Guard.decodeCheckpoint(testing.allocator, cfg, bad_version));
+    try testing.expect(isCheckpoint(bad_version));
+    try testing.expectError(error.UnsupportedVersion, validateCheckpoint(bad_version));
 
     // First origin is W-full: prefix + two entries. Point the second origin at
     // the same full public key and authenticate the malformed state.
@@ -594,6 +892,7 @@ test "relay v2 replay guard checkpoint rejects corruption bounds duplicates and 
         error.DuplicateOrigin,
         Guard.decodeCheckpoint(testing.allocator, cfg, duplicate_origin),
     );
+    try testing.expectError(error.DuplicateOrigin, validateCheckpoint(duplicate_origin));
 
     const unsorted_origins = try testing.allocator.dupe(u8, checkpoint);
     defer testing.allocator.free(unsorted_origins);
@@ -611,6 +910,7 @@ test "relay v2 replay guard checkpoint rejects corruption bounds duplicates and 
     @memcpy(duplicate_hlc[second_entry .. second_entry + 8], duplicate_hlc[first_entry .. first_entry + 8]);
     rewriteCheckpointChecksum(duplicate_hlc);
     try testing.expectError(error.DuplicateHlc, Guard.decodeCheckpoint(testing.allocator, cfg, duplicate_hlc));
+    try testing.expectError(error.DuplicateHlc, validateCheckpoint(duplicate_hlc));
 
     const unsorted_hlc = try testing.allocator.dupe(u8, checkpoint);
     defer testing.allocator.free(unsorted_hlc);
@@ -666,6 +966,7 @@ test "relay v2 replay guard checkpoint rejects corruption bounds duplicates and 
         error.TrailingBytes,
         Guard.decodeCheckpoint(testing.allocator, cfg, authenticated_trailing),
     );
+    try testing.expectError(error.TrailingBytes, validateCheckpoint(authenticated_trailing));
 }
 
 test "relay v2 replay guard admission is unchanged on allocation failure and retry succeeds" {

@@ -2,25 +2,29 @@
 
 *Hot-restart Orochi in place with the Helix workflow, preserving every shard's listener and live sessions.*
 
-Helix is Orochi's in-place upgrade workflow. The operator-facing command is `UPGRADE`, implemented as an oper-only hot re-exec on Linux (`src/daemon/server.zig:16851`, `src/daemon/server.zig:16852`).
+Helix is Orochi's in-place upgrade workflow. The operator-facing command is
+`UPGRADE`, implemented by `LinuxServer.handleUpgrade` as an oper-only hot re-exec
+on Linux.
 
 ## Preconditions
 
 | Requirement | Detail | Source |
 |---|---|---|
-| Linux | Non-Linux builds reply that `UPGRADE` is Linux-only. | `src/daemon/server.zig:17417` |
-| Operator privilege | The command requires the `server_restart` privilege before proceeding. | `src/daemon/server.zig:16852` |
-| Re-exec path | The daemon re-execs the configured on-disk launch path, falling back to `/proc/self/exe`. | `src/daemon/server.zig:17556` |
+| Linux | Non-Linux builds reply that `UPGRADE` is Linux-only. | `LinuxServer.performUpgrade` |
+| Operator privilege | The command requires the `server_restart` privilege before proceeding. | `LinuxServer.handleUpgrade` |
+| Re-exec path | The daemon probes and retains the exact configured on-disk launch image, falling back to `/proc/self/exe`. | `LinuxServer.openCompatibleUpgradeTarget`, `LinuxServer.performUpgrade` |
 
 ## Workflow
 
-1. The old process publishes an operator event and selects every registered connection except the requesting oper's own connection (`src/daemon/server.zig:17425`, `src/daemon/server.zig:17193`).
-2. On a multi-reactor node, it parks every sibling reactor between loop turns before reading foreign-shard connection state. A shard that does not park within the bounded wait refuses the upgrade instead of being dropped (`src/daemon/server.zig:5746`, `src/daemon/server.zig:17443`).
-3. It snapshots connection state and channel memberships across every shard (`src/daemon/server.zig:17102`, `src/daemon/server.zig:17215`, `src/daemon/server.zig:17236`).
-4. It serializes the snapshots into Helix state pieces and seals them into a memfd arena (`src/daemon/server.zig:17514`, `src/daemon/helix/live.zig:58`).
-5. It clears close-on-exec for every per-shard listener, the carried client sockets, and the arena fd; then it builds an exec plan for the configured on-disk binary with `--supervisor` and commits the exec (`src/daemon/server.zig:17538`, `src/daemon/server.zig:17557`, `src/daemon/server.zig:17566`).
-6. The successor starts in `--supervisor` mode, adopts the inherited listener fd for each shard, keeps every `SO_REUSEPORT` accept queue served, and stores the inherited arena fd for session adoption (`src/main.zig:151`, `src/daemon/server.zig:3410`).
-7. After the new server starts, it reads the arena and re-attaches carried-over client, TLS, WebSocket, session-registry, and secured-mesh state on a best-effort basis. Carried clients are deterministically re-pinned across the live shard set (`src/main.zig:998`, `src/daemon/server.zig:17582`).
+1. The old process publishes an operator event and selects every live client,
+   including the requesting oper connection. The requester is retained only as
+   the destination for progress notices; it is not excluded from carry-over.
+2. On a multi-reactor node, it parks every sibling reactor between loop turns before reading foreign-shard connection state. A shard that does not park within the bounded wait refuses the upgrade instead of being dropped (`LinuxServer.quiesceSiblingReactors`).
+3. It snapshots connection state and channel memberships across every shard (`LinuxServer.sealShardClients`).
+4. It serializes the snapshots into Helix state pieces and seals them into a memfd arena (`helix_live.prepare`).
+5. It clears close-on-exec for every per-shard listener, the carried client sockets, and the arena fd; then it builds an exec plan for the configured on-disk binary with `--supervisor` and commits the exec (`LinuxServer.performUpgrade`, `helix_live.buildArenaListenerExecPlan`).
+6. The successor initializes in `--supervisor` mode, adopts the inherited listener fd for each shard, keeps every `SO_REUSEPORT` accept queue represented, and stores the inherited arena fd for session adoption (`src/main.zig`, `Server.init`).
+7. Before the successor starts serving, it verifies the whole manifest and cross-capsule relations, then stages and publishes the mandatory client, TLS, WebSocket, session-registry, mesh-clock, replay/outbox/event-log, attachment-spool, and secured-mesh authorities. Invalid or incomplete mandatory state refuses startup rather than publishing a partial handoff. Carried clients are deterministically re-pinned across the live shard set and I/O is armed on the first reactor turn.
 
 Session-registry carry preserves every attachment row, including multiple live or
 detached rows sharing one reusable logical-session token. The successor therefore
@@ -31,16 +35,36 @@ process-local token-to-authenticated-peer authorization bindings.
 
 The Helix live path passes inherited fds through environment variables. A single-shard or legacy handoff uses `OROCHI_HELIX_LISTEN_FD`; a multi-shard predecessor additionally passes the full shard-ordered set in `OROCHI_HELIX_LISTEN_FDS`. The sealed arena uses `OROCHI_HELIX_ARENA_FD` (`src/daemon/helix/live.zig:119`, `src/daemon/helix/live.zig:135`, `src/daemon/helix/live.zig:276`).
 
-## Fallbacks
+Current handoff also requires exactly one MHLC v3 mesh-clock capsule. Besides
+the mesh HLC and migration-offer floor, v3 carries the configured MESSAGE_V2
+authoring mode, activation epoch, and canonical roster digest. The relational
+preflight rejects missing/duplicate/old/malformed MHLC state and validates the
+predecessor-to-successor activation transition before any inherited state is
+published. The live upgrade capability token includes `mesh-clock-v3`, so a
+target image without this exact authority is refused before exec.
 
-If state sealing fails, `UPGRADE` falls back to a listener-only re-exec: the listen port stays bound, but session carry-over is skipped (`src/daemon/server.zig:17514`, `src/daemon/server.zig:17525`, `src/daemon/server.zig:18333`). If the successor cannot read or adopt a carried item, it drops that item without aborting the process (`src/daemon/server.zig:17582`).
+Because this is an exact capability boundary, the first deployment from an
+image whose token predates `mesh-clock-v3` requires a planned cold restart.
+After activation, a successor must keep the exact active epoch/digest and mode;
+hot downgrade and plan replacement are rejected. Cold boot cannot recover the
+previous active tuple from Helix, so the deployment system must preserve it.
+
+## Fail-closed boundary
+
+Current UPGRADE requires a complete state set, sealed arena, exact target
+capability token, whole-handoff manifest, fd relation, and mandatory authority
+validation. Failure before exec leaves the predecessor serving; invalid
+successor state is rejected instead of being intentionally reduced to a
+listener-only or partial-session handoff. The listener-only helper belongs to
+the explicit RESTART path, not UPGRADE.
 
 ## Rollback boundary
 
-Hot rollback is safe only when the older binary understands the listener handoff
-emitted by the running predecessor. In particular, do **not** hot-roll back a
-multi-shard Orochi 0.5.2+ process to a pre-0.5.2 binary: the older successor adopts
-only shard 0's listener and leaves the sibling inherited fds in the `SO_REUSEPORT`
-group without reactors accepting from them, black-holing a share of new connections.
-Install the previous binary and use a cold restart across that boundary. See the
-[runbook rollback procedure](../RUNBOOK.md#rollback).
+Hot rollback is safe only when the target exposes the exact full Helix capability
+token required by the running predecessor; listener compatibility alone is not
+enough. In particular, do **not** hot-roll back a multi-shard Orochi 0.5.2+
+process to a pre-0.5.2 binary. Before MESSAGE_V2 activation, use a cold restart
+across that boundary. After activation, hot or cold rollback is allowed only to
+an image that implements the activation boundary and preserves the exact active
+mode, epoch, and roster digest. See the [runbook rollback
+procedure](../RUNBOOK.md#rollback).

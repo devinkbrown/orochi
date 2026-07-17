@@ -23,7 +23,7 @@
 const std = @import("std");
 const tls_resumption = @import("../../crypto/tls_resumption.zig");
 
-pub const Error = error{ Truncated, BadVersion };
+pub const Error = error{ Truncated, BadVersion, InvalidBoolean, TrailingBytes };
 
 /// Wire version. Bump on any incompatible layout change.
 pub const version: u8 = 1;
@@ -72,6 +72,24 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     return snap;
 }
 
+/// Decode only the unique current v1 representation emitted by `encode`.
+/// The legacy `decode` remains tolerant for explicit old callers; authoritative
+/// Helix adoption must use this entry point so a noncanonical previous-key
+/// marker or unauthenticated trailing bytes cannot select ambiguous state.
+pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    const marker_index = 1 + key_len;
+    if (bytes.len <= marker_index) return error.Truncated;
+    if (bytes[0] != version) return error.BadVersion;
+    const expected_len: usize = switch (bytes[marker_index]) {
+        0 => marker_index + 1,
+        1 => marker_index + 1 + key_len,
+        else => return error.InvalidBoolean,
+    };
+    if (bytes.len < expected_len) return error.Truncated;
+    if (bytes.len > expected_len) return error.TrailingBytes;
+    return decode(bytes);
+}
+
 const testing = std.testing;
 
 test "ticket-key capsule round-trips a current-only key" {
@@ -102,4 +120,44 @@ test "ticket-key capsule decode rejects truncation and a bad version" {
     try testing.expectError(error.Truncated, decode(&short));
     const bad = [_]u8{9} ++ @as([(1 + key_len)]u8, @splat(0));
     try testing.expectError(error.BadVersion, decode(&bad));
+}
+
+test "ticket-key decodeCurrent rejects every prefix nonboolean marker and trailing data" {
+    const allocator = testing.allocator;
+    const cur = @as([key_len]u8, @splat(0x31));
+    const prev = @as([key_len]u8, @splat(0x42));
+    const wire = try encode(allocator, .{ .current = cur, .previous = prev });
+    defer allocator.free(wire);
+
+    for (0..wire.len) |end| {
+        try testing.expectError(error.Truncated, decodeCurrent(wire[0..end]));
+    }
+    const got = try decodeCurrent(wire);
+    try testing.expectEqualSlices(u8, &cur, &got.current);
+    try testing.expectEqualSlices(u8, &prev, &got.previous.?);
+
+    const malformed = try allocator.dupe(u8, wire);
+    defer allocator.free(malformed);
+    malformed[1 + key_len] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(malformed));
+
+    const trailing = try allocator.alloc(u8, wire.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try testing.expectError(error.TrailingBytes, decodeCurrent(trailing));
+}
+
+test "ticket-key decodeCurrent is allocation-free" {
+    const fn_info = @typeInfo(@TypeOf(decodeCurrent)).@"fn";
+    comptime {
+        const return_type = fn_info.return_type orelse @compileError("decodeCurrent must return a value");
+        const decode_errors = @typeInfo(return_type).error_union.error_set;
+        for (@typeInfo(decode_errors).error_set.error_names.?) |name| {
+            if (std.mem.eql(u8, name, "OutOfMemory"))
+                @compileError("decodeCurrent must remain allocation-free");
+        }
+    }
+    const wire = [_]u8{version} ++ @as([key_len]u8, @splat(0xA5)) ++ [_]u8{0};
+    try testing.expect((try decodeCurrent(&wire)).previous == null);
 }

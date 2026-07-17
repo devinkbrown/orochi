@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 
 const capsule = @import("capsule.zig");
 const handoff = @import("handoff.zig");
+const handoff_manifest = @import("handoff_manifest.zig");
 const supervisor = @import("supervisor.zig");
 
 const linux = std.os.linux;
@@ -26,6 +27,102 @@ pub const StatePiece = struct {
     /// fail closed instead of being accepted and silently mis-decoded.
     min_supported: ?u16 = null,
 };
+
+/// Owned predecessor view containing the original state pieces followed by one
+/// canonical whole-handoff manifest. The manifest bytes remain valid until
+/// `deinit`; callers pass `pieces` directly to `prepare`.
+pub const ManifestedPieces = struct {
+    pieces: []StatePiece,
+    manifest_bytes: []u8,
+
+    pub fn deinit(self: *ManifestedPieces, allocator: std.mem.Allocator) void {
+        allocator.free(self.pieces);
+        allocator.free(self.manifest_bytes);
+        self.* = .{ .pieces = &.{}, .manifest_bytes = &.{} };
+    }
+};
+
+/// Commit to the exact ordered predecessor state and append one manifest as the
+/// final piece. Existing manifest pieces are rejected so a caller cannot create
+/// an ambiguous nested or duplicate commitment.
+pub fn appendHandoffManifest(
+    allocator: std.mem.Allocator,
+    pieces: []const StatePiece,
+) (std.mem.Allocator.Error || handoff_manifest.Error)!ManifestedPieces {
+    var accumulator = handoff_manifest.Accumulator.init();
+    for (pieces) |piece| {
+        if (piece.kind == .handoff_manifest) return error.DuplicateManifest;
+        const descriptor = capsule.descriptor(piece.kind);
+        try accumulator.add(.{
+            .header = .{
+                .schema_id = descriptor.schema_id,
+                .kind = @intFromEnum(piece.kind),
+                .version = descriptor.current_version,
+                .min_supported = piece.min_supported orelse descriptor.min_supported,
+                .max_supported = descriptor.max_supported,
+            },
+            .bytes = piece.bytes,
+        });
+    }
+
+    const manifest_bytes = try allocator.alloc(u8, handoff_manifest.encoded_len);
+    errdefer allocator.free(manifest_bytes);
+    _ = try accumulator.encode(manifest_bytes);
+
+    const complete = try allocator.alloc(StatePiece, pieces.len + 1);
+    errdefer allocator.free(complete);
+    @memcpy(complete[0..pieces.len], pieces);
+    complete[pieces.len] = .{ .kind = .handoff_manifest, .bytes = manifest_bytes };
+    return .{ .pieces = complete, .manifest_bytes = manifest_bytes };
+}
+
+/// Allocation-free successor verification over already-decoded capsules. The
+/// manifest must occur exactly once, as the canonical final v1 capsule, and all
+/// preceding capsules must use the one-field StatePiece representation.
+pub fn verifyHandoffManifest(capsules: []const capsule.Capsule) handoff_manifest.Error!void {
+    if (capsules.len == 0) return error.MissingManifest;
+    const last = capsules[capsules.len - 1];
+    if (last.header.kind != .handoff_manifest) {
+        for (capsules) |item| {
+            if (item.header.kind == .handoff_manifest) return error.ManifestNotLast;
+        }
+        return error.MissingManifest;
+    }
+    for (capsules[0 .. capsules.len - 1]) |item| {
+        if (item.header.kind == .handoff_manifest) return error.DuplicateManifest;
+    }
+
+    const expected_header = capsule.Header.init(.handoff_manifest);
+    if (last.header.schema_id != expected_header.schema_id or
+        last.header.version != expected_header.version or
+        last.header.min_supported != expected_header.min_supported or
+        last.header.max_supported != expected_header.max_supported)
+    {
+        return error.WrongManifestHeader;
+    }
+    if (last.fields.len != 1 or last.fields[0].ordinal != handoff_manifest.field_ordinal) {
+        return error.NonCanonicalManifest;
+    }
+
+    var accumulator = handoff_manifest.Accumulator.init();
+    for (capsules[0 .. capsules.len - 1]) |item| {
+        if (item.fields.len != 1 or item.fields[0].ordinal != handoff_manifest.field_ordinal) {
+            return error.NonCanonicalPiece;
+        }
+        try accumulator.add(.{
+            .header = .{
+                .schema_id = item.header.schema_id,
+                .kind = @intFromEnum(item.header.kind),
+                .version = item.header.version,
+                .min_supported = item.header.min_supported,
+                .max_supported = item.header.max_supported,
+            },
+            .ordinal = item.fields[0].ordinal,
+            .bytes = item.fields[0].bytes,
+        });
+    }
+    try handoff_manifest.verify(last.fields[0].bytes, accumulator);
+}
 
 pub const PrepareInputs = struct {
     epoch: u64,
@@ -57,15 +154,20 @@ pub const Prepared = struct {
 /// initialize the control socket, and advance the model to the pass-fds action.
 pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Prepared {
     if (builtin.os.tag != .linux) return error.Unsupported;
-    if (inputs.pieces.len > std.math.maxInt(u32)) return error.TooManyCapsules;
+    // One slot is reserved for the mandatory canonical final manifest. Build it
+    // here, at the only live arena-serialization boundary, so no producer can
+    // accidentally emit an uncommitted current-generation arena.
+    if (inputs.pieces.len >= std.math.maxInt(u32)) return error.TooManyCapsules;
     if (inputs.fds.len > std.math.maxInt(u32)) return error.TooManyFds;
+    var manifested = try appendHandoffManifest(allocator, inputs.pieces);
+    defer manifested.deinit(allocator);
 
     var runtime: supervisor.Runtime = .{};
     errdefer runtime.deinit();
 
     try runtime.createArena(inputs.arena_name);
     if (runtime.arena) |*arena| {
-        for (inputs.pieces) |piece| {
+        for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
             var cap = capsule.make(piece.kind, fields[0..]);
             if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
@@ -87,13 +189,13 @@ pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Pre
     model = step.model;
     step = try supervisor.transition(model, .drain_complete);
     model = step.model;
-    step = try supervisor.transition(model, .{ .capsules_serialized = @intCast(inputs.pieces.len) });
+    step = try supervisor.transition(model, .{ .capsules_serialized = @intCast(manifested.pieces.len) });
     model = step.model;
 
     return .{
         .runtime = runtime,
         .model = model,
-        .capsule_count = @intCast(inputs.pieces.len),
+        .capsule_count = @intCast(manifested.pieces.len),
         .fd_count = @intCast(inputs.fds.len),
     };
 }
@@ -159,9 +261,11 @@ pub const max_inherited_state_fds = 4096;
 /// capability probe. A predecessor requires this complete line before it makes
 /// any client, mesh, listener, or arena descriptor inheritable. Keep this token
 /// in lockstep with the mandatory outer capsule and fd-ownership contracts.
+/// `clients-v5` promises exact client-tail validation through the canonical
+/// `was_websocket` discriminator; a target lacking it must never receive fds.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
 pub const upgrade_capability_token =
-    "OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1";
+    "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
 
 /// Require the capability token as a complete output line. Substring matching
 /// would let a diagnostic such as "missing TOKEN" accidentally authorize a
@@ -633,7 +737,7 @@ test "live prepare seals capsules and handoff passes fds" {
     });
     defer prepared.deinit();
 
-    try std.testing.expectEqual(@as(u32, 2), prepared.capsule_count);
+    try std.testing.expectEqual(@as(u32, 3), prepared.capsule_count);
     try std.testing.expectEqual(@as(u32, 1), prepared.fd_count);
     try std.testing.expect(prepared.runtime.arena.?.sealed);
     try std.testing.expect(prepared.runtime.arena.?.size > 0);
@@ -661,7 +765,7 @@ test "readArena round-trips the sealed capsule stream" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    // Prepare seals two capsules into a memfd arena.
+    // Prepare seals two data capsules plus its mandatory final manifest.
     const pieces = [_]StatePiece{
         .{ .kind = .clients, .bytes = "client-state" },
         .{ .kind = .channels, .bytes = "channel-state" },
@@ -681,11 +785,156 @@ test "readArena round-trips the sealed capsule stream" {
         for (caps) |*c| c.deinit(allocator);
         allocator.free(caps);
     }
-    try std.testing.expectEqual(@as(usize, 2), caps.len);
+    try std.testing.expectEqual(@as(usize, 3), caps.len);
     try std.testing.expectEqual(capsule.CapsuleKind.clients, caps[0].header.kind);
     try std.testing.expect(std.mem.eql(u8, "client-state", caps[0].fields[0].bytes));
     try std.testing.expectEqual(capsule.CapsuleKind.channels, caps[1].header.kind);
     try std.testing.expect(std.mem.eql(u8, "channel-state", caps[1].fields[0].bytes));
+    try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, caps[2].header.kind);
+    try verifyHandoffManifest(caps);
+}
+
+test "whole handoff manifest helper accepts canonical empty state" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var manifested = try appendHandoffManifest(allocator, &.{});
+    defer manifested.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), manifested.pieces.len);
+    try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, manifested.pieces[0].kind);
+    try std.testing.expectEqual(@as(usize, handoff_manifest.encoded_len), manifested.manifest_bytes.len);
+
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = manifested.manifest_bytes }};
+    const caps = [_]capsule.Capsule{capsule.make(.handoff_manifest, fields[0..])};
+    try verifyHandoffManifest(&caps);
+
+    // The actual serialization boundary independently guarantees the same
+    // canonical manifest even when the caller supplies no data pieces.
+    var prepared = try prepare(allocator, .{
+        .epoch = 8,
+        .now_ms = 2,
+        .timeout_ms = 1000,
+        .arena_name = "helix-empty-whole-manifest",
+        .pieces = &.{},
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(u32, 1), prepared.capsule_count);
+    const decoded = try readArena(allocator, prepared.runtime.arena.?.fd);
+    defer {
+        for (decoded) |*item| item.deinit(allocator);
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try verifyHandoffManifest(decoded);
+}
+
+test "whole handoff manifest predecessor append is allocation-failure clean" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const pieces = [_]StatePiece{
+                .{ .kind = .clients, .bytes = "alice" },
+                .{ .kind = .channels, .bytes = "#mesh" },
+                .{ .kind = .sessions, .bytes = "account" },
+            };
+            var manifested = try appendHandoffManifest(allocator, &pieces);
+            defer manifested.deinit(allocator);
+            if (manifested.pieces.len != pieces.len + 1) return error.BadPieceCount;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "whole handoff manifest round-trips arena and rejects every completeness mutation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const source = [_]StatePiece{
+        .{ .kind = .clients, .bytes = "alice" },
+        .{ .kind = .channels, .bytes = "#mesh" },
+        .{ .kind = .webhook_store, .bytes = "webhooks" },
+    };
+    var manifested = try appendHandoffManifest(allocator, &source);
+    defer manifested.deinit(allocator);
+    try std.testing.expectError(error.DuplicateManifest, appendHandoffManifest(allocator, manifested.pieces));
+    try std.testing.expectError(error.DuplicateManifest, prepare(allocator, .{
+        .epoch = 9,
+        .now_ms = 3,
+        .timeout_ms = 1000,
+        .arena_name = "helix-double-whole-manifest",
+        .pieces = manifested.pieces,
+        .fds = &.{},
+    }));
+
+    var prepared = try prepare(allocator, .{
+        .epoch = 9,
+        .now_ms = 3,
+        .timeout_ms = 1000,
+        .arena_name = "helix-whole-manifest",
+        .pieces = &source,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+
+    const caps = try readArena(allocator, prepared.runtime.arena.?.fd);
+    defer {
+        for (caps) |*item| item.deinit(allocator);
+        allocator.free(caps);
+    }
+    try std.testing.expectEqual(@as(usize, 4), caps.len);
+    try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, caps[3].header.kind);
+    try verifyHandoffManifest(caps);
+
+    // Dropping or duplicating any ordinary piece changes both the total and its
+    // exact per-kind count.
+    const dropped = [_]capsule.Capsule{ caps[0], caps[2], caps[3] };
+    try std.testing.expectError(error.CountMismatch, verifyHandoffManifest(&dropped));
+    const duplicated = [_]capsule.Capsule{ caps[0], caps[1], caps[1], caps[2], caps[3] };
+    try std.testing.expectError(error.CountMismatch, verifyHandoffManifest(&duplicated));
+
+    // Ordering, payloads, and effective outer headers are digest-bound even
+    // when their aggregate counts remain unchanged.
+    const reordered = [_]capsule.Capsule{ caps[1], caps[0], caps[2], caps[3] };
+    try std.testing.expectError(error.DigestMismatch, verifyHandoffManifest(&reordered));
+    var flipped = try allocator.dupe(u8, caps[1].fields[0].bytes);
+    defer allocator.free(flipped);
+    flipped[0] ^= 1;
+    var corrupt_payload = caps[1];
+    var corrupt_payload_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = flipped }};
+    corrupt_payload.fields = &corrupt_payload_fields;
+    const bitflipped = [_]capsule.Capsule{ caps[0], corrupt_payload, caps[2], caps[3] };
+    try std.testing.expectError(error.DigestMismatch, verifyHandoffManifest(&bitflipped));
+    var corrupt_header = caps[1];
+    corrupt_header.header.schema_id ^= 1;
+    const wrong_data_header = [_]capsule.Capsule{ caps[0], corrupt_header, caps[2], caps[3] };
+    try std.testing.expectError(error.DigestMismatch, verifyHandoffManifest(&wrong_data_header));
+
+    // Manifest position, uniqueness, exact outer header, and one-field shape
+    // are structural requirements independent of the checksum.
+    try std.testing.expectError(error.MissingManifest, verifyHandoffManifest(caps[0..3]));
+    const duplicate_manifest = [_]capsule.Capsule{ caps[3], caps[1], caps[2], caps[3] };
+    try std.testing.expectError(error.DuplicateManifest, verifyHandoffManifest(&duplicate_manifest));
+    const manifest_not_last = [_]capsule.Capsule{ caps[0], caps[1], caps[3], caps[2] };
+    try std.testing.expectError(error.ManifestNotLast, verifyHandoffManifest(&manifest_not_last));
+    var wrong_manifest_header = caps[3];
+    wrong_manifest_header.header.max_supported = 2;
+    const wrong_outer = [_]capsule.Capsule{ caps[0], caps[1], caps[2], wrong_manifest_header };
+    try std.testing.expectError(error.WrongManifestHeader, verifyHandoffManifest(&wrong_outer));
+    var noncanonical_manifest = caps[3];
+    var extra_manifest_fields = [_]capsule.Field{
+        caps[3].fields[0],
+        .{ .ordinal = 2, .bytes = "extra" },
+    };
+    noncanonical_manifest.fields = &extra_manifest_fields;
+    const extra_manifest_field = [_]capsule.Capsule{ caps[0], caps[1], caps[2], noncanonical_manifest };
+    try std.testing.expectError(error.NonCanonicalManifest, verifyHandoffManifest(&extra_manifest_field));
+    var noncanonical_piece = caps[0];
+    var extra_piece_fields = [_]capsule.Field{
+        caps[0].fields[0],
+        .{ .ordinal = 2, .bytes = "extra" },
+    };
+    noncanonical_piece.fields = &extra_piece_fields;
+    const extra_piece_field = [_]capsule.Capsule{ noncanonical_piece, caps[1], caps[2], caps[3] };
+    try std.testing.expectError(error.NonCanonicalPiece, verifyHandoffManifest(&extra_piece_field));
 }
 
 test "mesh state pieces advertise ordinary overlap and exact property requirement" {
@@ -711,8 +960,8 @@ test "mesh state pieces advertise ordinary overlap and exact property requiremen
         for (caps) |*c| c.deinit(allocator);
         allocator.free(caps);
     }
-    try std.testing.expectEqual(@as(usize, 2), caps.len);
-    for (caps) |cap| {
+    try std.testing.expectEqual(@as(usize, 3), caps.len);
+    for (caps[0..2]) |cap| {
         try std.testing.expectEqual(capsule.CapsuleKind.mesh_checkpoint, cap.header.kind);
         try std.testing.expectEqual(@as(u16, 2), cap.header.version);
         try std.testing.expectEqual(@as(u16, 2), cap.header.max_supported);
@@ -723,6 +972,8 @@ test "mesh state pieces advertise ordinary overlap and exact property requiremen
     try std.testing.expectEqualStrings("ordinary-mesh-state", caps[0].fields[0].bytes);
     try std.testing.expectEqual(@as(u16, 2), caps[1].header.min_supported);
     try std.testing.expectEqualStrings("exact-property-state", caps[1].fields[0].bytes);
+    try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, caps[2].header.kind);
+    try verifyHandoffManifest(caps);
 
     var legacy = capsule.descriptor(.mesh_checkpoint);
     legacy.current_version = 1;
@@ -777,6 +1028,37 @@ test "upgrade capability token must occupy a complete output line" {
     try std.testing.expect(!hasUpgradeCapabilityLine("prefix " ++ upgrade_capability_token ++ "\n"));
     try std.testing.expect(!hasUpgradeCapabilityLine(upgrade_capability_token ++ " suffix\n"));
     try std.testing.expect(!hasUpgradeCapabilityLine("OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v1\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    // The immediately preceding token understood RVO2 but not the mandatory
+    // RVL2/ADS1 authorities. It must be refused before any fd loses CLOEXEC;
+    // otherwise the successor would exec successfully and only then reject the
+    // newly mandatory mesh checkpoints, disconnecting every carried client.
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    // The immediately preceding current token has no strict MHLC v3 activation
+    // authority. Accepting it could exec a successor that resets an active
+    // MESSAGE_V2 author back to compatibility mode.
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    // A predecessor that predates whole-arena integrity or exact
+    // World/history/webhook ownership must refuse the new handoff contract;
+    // operators can still cold-restart it.
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1\n",
+    ));
 }
 
 test "std.process.run can execute a CLOEXEC image through proc self fd" {

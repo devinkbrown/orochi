@@ -18,6 +18,92 @@ realm = "example"
 mesh_pass = "env:OROCHI_MESH_PASS"
 ```
 
+## MESSAGE_V2 bridge and activation
+
+MESSAGE_V2 uses a mesh-wide compatibility barrier so one logical event is never
+sent once as legacy and later replayed as V2. The safe default is
+`relay_v2_authoring = "compat"`: the node can receive, acknowledge, retain, and
+forward V2, but its own events remain legacy-only.
+
+Use these distinct passes for a rollout. Do not combine staging and activation
+in one reload:
+
+1. Deploy the bridge-capable binary to every node while authoring remains
+   `compat` and no activation plan is present. If the running image predates the
+   exact `mesh-clock-v3` Helix token, this first bridge deployment requires a
+   planned cold restart; see [Helix upgrade](upgrade.md).
+2. Run the newly staged binary's `--check-config` against each node's exact
+   configuration. A plan requires an explicit `[node].secret_key` or matching
+   `[node].public_key`, secured S2S,
+   signed frames, at least one direct trust root, and a full roster containing
+   the local key and every direct root.
+3. Configure one never-before-used, strictly increasing
+   `relay_v2_activation_epoch` and the complete full-mesh `relay_v2_roster` on
+   every node, still in `compat`. Run the new binary's `--check-config` against
+   this final staged configuration, then Helix-reload every process once so the
+   plan is present in live MHLC state.
+4. Verify every roster member reports `bridge_implemented=true`, `authoring=compat`,
+   the same non-zero epoch and digest, and the expected roster count. Direct-neighbor
+   capability probes are insufficient for a line such as A-B-C because A cannot
+   infer whether hidden node C is ready.
+5. Change only `relay_v2_authoring` to `"active"`, rerun `--check-config`, and
+   Helix-reload nodes sequentially. After each node, stop and require its
+   `authoring_eligible=true` with the unchanged epoch/count/digest, healthy
+   links, and an exact-once channel plus shared portable-session event observed
+   on every live attachment. Every still-compat bridge accepts V2 during this
+   pass. Do not advance when any per-node gate fails; follow the detailed
+   [runbook activation procedure](../RUNBOOK.md#message_v2-activation-runbook).
+6. After the last per-node gate, verify every roster member reports
+   `authoring=active` and `authoring_eligible=true` with the unchanged epoch,
+   count, and digest.
+
+```toml
+[mesh]
+require_secured = true
+require_signed_frames = true
+trust_roots = ["env:DIRECT_PEER_PUBKEY"]
+relay_v2_authoring = "compat" # change to "active" only after the barrier
+relay_v2_activation_epoch = 1
+relay_v2_roster = ["env:NODE_A_PUBKEY", "env:NODE_B_PUBKEY", "env:NODE_C_PUBKEY"]
+```
+
+The roster is separate from `trust_roots`: the former is the complete mesh;
+the latter is the local node's direct-neighbor allowlist. Orochi canonicalizes
+the full public keys into a roster digest and carries `{mode, epoch, digest}` in
+the mandatory MHLC v3 Helix checkpoint. Current handoff rejects an unstaged
+activation, a roster mismatch, active-to-compat downgrade, malformed state, or
+an older MHLC version before publishing inherited state. Mesh-wide READY proof
+is currently an external deployment gate; the daemon does not infer it from
+only its adjacent links. Roster order and hex-versus-base64 encoding do not
+affect the digest, but the roster alone proves neither topology nor readiness.
+`bridge_implemented` is only a local build marker; it is not a negotiated-peer
+or mesh-wide readiness proof.
+
+Inspect the file-backed status surface and the oper IRC surface on every node:
+
+```sh
+jq '.relay_v2' /path/to/stats/status.json
+# From an oper client:
+/quote MESH ADMISSION
+```
+
+Once any member activates, never remove or decrease the staged epoch, bind the
+same epoch to another roster, or switch that member back to `compat`. Roster
+change after activation is not implemented; it requires a future protocol and
+release. A strictly higher epoch may replace a plan only while the predecessor
+is still `compat`. A cold boot validates the configuration but has no durable
+record of a previously active generation, so deployment automation must preserve
+the exact active tuple and must never start an image that lacks the exact
+activation/capability semantics or changes the tuple during rollback.
+
+Activation accepts 1..255 unique direct roots. No direct root may be the local
+key, duplicate another key, or collide with another configured node's compact
+u64 id, and every direct root must appear in the 2..4096-key full roster.
+“V2-eligible” currently covers authored channel `PRIVMSG`, `NOTICE`, `TAGMSG`,
+and typed `DATA`/`REQUEST`/`REPLY`; direct-message variants additionally require
+an authenticated portable recipient-session token. Other IRC events stay on
+their existing paths.
+
 `[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:70`, `src/daemon/server.zig:1738`). The server binds it alongside the IRC listener when the value is non-zero (`src/daemon/server.zig:3298`, `src/daemon/server.zig:3299`).
 
 ## Secured vs. plaintext links

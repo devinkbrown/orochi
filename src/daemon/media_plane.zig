@@ -174,6 +174,32 @@ pub const MediaPlane = struct {
         self.* = undefined;
     }
 
+    /// Whether no live WebRTC transport state would be lost by an in-place
+    /// exec. This is an allocation-free, cross-thread-safe snapshot: take the
+    /// three registry/egress locks together so an endpoint, fingerprint, or
+    /// queued control packet cannot move between independently observed states.
+    ///
+    /// Merely having a bound socket, a configured cross-leg sink, or allocated
+    /// but idle DTLS engines is not active continuity state. Legitimate DTLS/SRTP
+    /// peers are admitted through an endpoint, so the endpoint/index gate covers
+    /// their continuity without racing the pump-owned crypto tables.
+    pub fn upgradeContinuityReady(self: *MediaPlane) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        lockSpin(&self.rtcp_out_mutex);
+        defer self.rtcp_out_mutex.unlock();
+
+        return self.transport.endpoints.count() == 0 and
+            self.transport.by_ufrag.count() == 0 and
+            self.transport.by_addr.count() == 0 and
+            self.transport.by_ssrc.count() == 0 and
+            self.transport.group_keys.count() == 0 and
+            self.offered_fps.count() == 0 and
+            self.rtcp_out_len == 0;
+    }
+
     /// Install the cross-leg sink (call before `start`, or while stopped).
     pub fn setCrossLegSink(self: *MediaPlane, sink: media_bridge.RtpCrossSink) void {
         self.cross = sink;
@@ -842,6 +868,31 @@ test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     defer decoded.deinit(testing.allocator);
     try testing.expectEqual(stun.MessageType.binding_success_response, decoded.typ);
     try testing.expect(plane.isConnected("#c", "alice"));
+}
+
+test "upgrade continuity: MediaPlane ignores idle socket and gates live transport state" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+
+    try testing.expect(plane.upgradeContinuityReady());
+    try plane.start(loopback_be, 0);
+    try testing.expect(plane.upgradeContinuityReady());
+
+    _ = plane.allocate("#c", "alice") orelse return error.TestUnexpectedResult;
+    try testing.expect(!plane.upgradeContinuityReady());
+    plane.remove("#c", "alice");
+    try testing.expect(plane.upgradeContinuityReady());
+
+    const digest: [peer_verify.digest_len]u8 = @splat(0xA5);
+    try plane.bindOfferedFingerprint("#c", "alice", digest);
+    try testing.expect(!plane.upgradeContinuityReady());
+    plane.dropOfferedFingerprint("#c", "alice");
+    try testing.expect(plane.upgradeContinuityReady());
+
+    _ = plane.groupKey("#orphan");
+    try testing.expect(!plane.upgradeContinuityReady());
+    plane.remove("#orphan", "nobody");
+    try testing.expect(plane.upgradeContinuityReady());
 }
 
 test "MediaPlane: start/shutdown is clean and re-startable port is reported" {

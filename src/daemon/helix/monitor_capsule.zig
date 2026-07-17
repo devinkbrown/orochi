@@ -41,6 +41,8 @@ pub const Error = error{
     /// More targets than the caller-provided output slice (decode) or than the
     /// wire format can represent (encode) could hold.
     TooMany,
+    /// A complete record was followed by unauthenticated/unknown bytes.
+    TrailingBytes,
 };
 
 /// A single client's resumable MONITOR watch list.
@@ -97,6 +99,7 @@ pub const MonitorCapsule = struct {
         while (i < count) : (i += 1) {
             targets_out[i] = try readStr(bytes, &pos);
         }
+        if (pos != bytes.len) return error.TrailingBytes;
 
         return .{
             .client_id = client_id,
@@ -255,6 +258,15 @@ test "decode returns BadVersion on a future version" {
 
     var out: [8][]const u8 = undefined;
     try std.testing.expectError(error.BadVersion, MonitorCapsule.decode(bumped[0..wire.len], &out));
+}
+
+test "decode rejects trailing bytes" {
+    const original = MonitorCapsule{ .client_id = 9, .targets = &.{} };
+    var buf: [64]u8 = undefined;
+    const wire = try original.encode(&buf);
+    buf[wire.len] = 0;
+    var out: [1][]const u8 = undefined;
+    try std.testing.expectError(error.TrailingBytes, MonitorCapsule.decode(buf[0 .. wire.len + 1], &out));
 }
 
 test "decode returns TooMany when targets_out is too small" {

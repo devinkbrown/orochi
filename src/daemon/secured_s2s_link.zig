@@ -31,10 +31,14 @@ const hs = @import("../crypto/tsumugi_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
 const session_replica = @import("helix/session_replica.zig");
+const s2s_frame = @import("../proto/s2s_frame.zig");
+const session_replica_frame = @import("../proto/session_replica_frame.zig");
+const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
 const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
+const oper_event = @import("../proto/oper_event.zig");
 
 pub const Role = tsumugi_session.Role;
 
@@ -288,6 +292,7 @@ pub const SecuredLink = struct {
             .admitted_frame_families = rs.established.admitted_frame_families,
             .session_replica_transport_enabled = true,
             .secure_relay_transport_enabled = true,
+            .event_spine_v2_transport_enabled = true,
         }, rs.inner, rs.remote_name, rs.rng_seed);
         self.inner = link;
         return self;
@@ -309,6 +314,50 @@ pub const SecuredLink = struct {
     pub fn outbound(self: *const SecuredLink) []const u8 {
         return self.out.items;
     }
+
+    /// Largest prefix of complete encrypted records that fits `max_bytes`.
+    /// SendQ pagination must never split a `[len][ciphertext][tag]` record: the
+    /// receiver authenticates and advances its counter only at record edges.
+    pub fn outboundRecordPrefix(self: *const SecuredLink, max_bytes: usize) []const u8 {
+        var cursor: usize = 0;
+        while (cursor < self.out.items.len) {
+            if (self.out.items.len - cursor < record_len_prefix) break;
+            const body_len: usize = std.mem.readInt(
+                u32,
+                self.out.items[cursor..][0..record_len_prefix],
+                .little,
+            );
+            const record_len = std.math.add(usize, record_len_prefix, body_len) catch break;
+            if (record_len > self.out.items.len - cursor or record_len > max_bytes -| cursor) break;
+            cursor += record_len;
+        }
+        return self.out.items[0..cursor];
+    }
+
+    /// Consume a prefix previously returned by `outboundRecordPrefix`. Reject a
+    /// non-boundary length defensively so callers cannot create an authenticated
+    /// stream gap by discarding half a record.
+    pub fn consumeOutboundPrefix(self: *SecuredLink, prefix_len: usize) bool {
+        if (prefix_len == 0 or prefix_len > self.out.items.len) return false;
+        var cursor: usize = 0;
+        while (cursor < prefix_len) {
+            if (prefix_len - cursor < record_len_prefix) return false;
+            const body_len: usize = std.mem.readInt(
+                u32,
+                self.out.items[cursor..][0..record_len_prefix],
+                .little,
+            );
+            const record_len = std.math.add(usize, record_len_prefix, body_len) catch return false;
+            if (record_len > prefix_len - cursor) return false;
+            cursor += record_len;
+        }
+        if (cursor != prefix_len) return false;
+        const rest = self.out.items.len - prefix_len;
+        std.mem.copyForwards(u8, self.out.items[0..rest], self.out.items[prefix_len..]);
+        self.out.shrinkRetainingCapacity(rest);
+        return true;
+    }
+
     pub fn clearOutbound(self: *SecuredLink) void {
         self.out.clearRetainingCapacity();
     }
@@ -650,15 +699,63 @@ pub const SecuredLink = struct {
         return link.supportsSecureRelayV2();
     }
 
+    pub fn supportsRelayV2AckConfirm(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsRelayV2AckConfirm();
+    }
+
     pub fn sendMessageV2(self: *SecuredLink, msg: s2s_link.RelayMessageV2) anyerror!void {
         const link = self.inner orelse return error.NotEstablished;
         try link.sendMessageV2(msg);
         try self.drainInner();
     }
 
+    pub fn forwardMessageV2(self: *SecuredLink, wire: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardMessageV2(wire);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn replayRetainedMessageV2Wire(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.replayRetainedMessageV2Wire(wire);
+        try self.drainInner();
+    }
+
     pub fn takeInboundV2(self: *SecuredLink) anyerror![]s2s_link.InboundMessageV2 {
         const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundMessageV2, 0);
         return link.takeInboundV2();
+    }
+
+    pub fn sendMessageV2Ack(self: *SecuredLink, id: message_relay_v2.RelayId) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendMessageV2Ack(id);
+        try self.drainInner();
+    }
+
+    pub fn sendMessageV2AckConfirm(self: *SecuredLink, id: message_relay_v2.RelayId) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendMessageV2AckConfirm(id);
+        try self.drainInner();
+    }
+
+    pub fn probeRelayV2Current(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.probeRelayV2Current();
+        try self.drainInner();
+    }
+
+    pub fn takeInboundV2Acks(self: *SecuredLink) anyerror![]message_relay_v2.RelayId {
+        const link = self.inner orelse
+            return self.allocator.alloc(message_relay_v2.RelayId, 0);
+        return link.takeInboundV2Acks();
+    }
+
+    pub fn takeInboundV2AckConfirms(self: *SecuredLink) anyerror![]message_relay_v2.RelayId {
+        const link = self.inner orelse
+            return self.allocator.alloc(message_relay_v2.RelayId, 0);
+        return link.takeInboundV2AckConfirms();
     }
 
     pub fn takeDroppedRelayV2Frames(self: *SecuredLink) u64 {
@@ -795,6 +892,25 @@ pub const SecuredLink = struct {
 
     pub fn sendSessionReplica(self: *SecuredLink, kind: s2s_link.SessionReplicaKind, signed_payload: []const u8) anyerror!void {
         const link = self.inner orelse return error.NotEstablished;
+        // SESSION_REPLICA replay advances its retained cursor only after this
+        // method succeeds, so it cannot tolerate plaintext residue when an outer
+        // allocation fails. Reserve both no-fail commit edges before the pure
+        // peer encoder allocates/signs anything: all scratch failures then occur
+        // before ByteSink mutation, and drainInner seals without allocation.
+        if (link.outbound().len != 0) return error.PendingInnerOutbound;
+        const transport_len = try session_replica_frame.encodedLen(signed_payload.len);
+        const inner_len = try std.math.add(
+            usize,
+            s2s_frame.header_len + signed_frame.header_len,
+            transport_len,
+        );
+        const record_len = try std.math.add(
+            usize,
+            record_len_prefix + record_tag_len,
+            inner_len,
+        );
+        try self.out.ensureUnusedCapacity(self.allocator, record_len);
+        try link.reserveOutboundCapacity(inner_len);
         try link.sendSessionReplica(kind, signed_payload);
         try self.drainInner();
     }
@@ -861,6 +977,47 @@ pub const SecuredLink = struct {
     pub fn takeOperEvents(self: *SecuredLink) anyerror![][]u8 {
         const link = self.inner orelse return &.{};
         return link.takeOperEvents();
+    }
+
+    pub fn supportsEventSpineV2(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsEventSpineV2();
+    }
+
+    pub fn sendOperEventV2Authored(self: *SecuredLink, category: u6, severity: u8, hlc: u64, origin_server: []const u8, subject: []const u8, message: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.sendOperEventV2Authored(category, severity, hlc, origin_server, subject, message);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn sendOperEventV2(self: *SecuredLink, event: s2s_link.SignedOperEventV2) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.sendOperEventV2(event);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn forwardOperEventV2(self: *SecuredLink, wire: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardOperEventV2(wire);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn takeOperEventsV2(self: *SecuredLink) anyerror![]s2s_link.InboundOperEventV2 {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundOperEventV2, 0);
+        return link.takeOperEventsV2();
+    }
+
+    pub fn takeDroppedOperEventV2Frames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeDroppedOperEventV2Frames();
+    }
+
+    pub fn takeRejectedOperEventV2Frames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeRejectedOperEventV2Frames();
     }
 
     /// Emit a signed OBSERVE_EVENT over the encrypted leg, then flush ciphertext.
@@ -1040,6 +1197,7 @@ pub const SecuredLink = struct {
             .admitted_frame_families = self.establishedKeys().admitted_frame_families,
             .session_replica_transport_enabled = true,
             .secure_relay_transport_enabled = true,
+            .event_spine_v2_transport_enabled = true,
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
@@ -1403,6 +1561,42 @@ test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {
         message_relay_v2.VerifyOutcome.verified,
         try message_relay_v2.verifyOrigin(testing.allocator, inbound[0].owned.msg),
     );
+}
+
+test "event spine v2 is negotiated encrypted authored and drained through SecuredLink" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    try testing.expect(p.a.supportsEventSpineV2());
+    try testing.expect(p.b.supportsEventSpineV2());
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    try testing.expect(try p.a.sendOperEventV2Authored(
+        13,
+        2,
+        0x300_000,
+        "a.orochi",
+        "#secure",
+        "encrypted event spine payload",
+    ));
+    try testing.expect(p.a.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "encrypted event spine payload") == null);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "a.orochi") == null);
+    try pump(&p.a, &p.b, false);
+
+    const inbound = try p.b.takeOperEventsV2();
+    defer {
+        for (inbound) |*item| item.deinit(testing.allocator);
+        testing.allocator.free(inbound);
+    }
+    try testing.expectEqual(@as(usize, 1), inbound.len);
+    try testing.expectEqual(p.ida.shortId(), inbound[0].via_peer);
+    const event = try oper_event.decodeV2(inbound[0].wire);
+    try testing.expectEqual(p.ida.shortId(), event.origin_node);
+    try testing.expectEqualStrings("a.orochi", event.origin_server);
+    try testing.expectEqualStrings("#secure", event.subject);
+    try testing.expectEqualStrings("encrypted event spine payload", event.message);
+    try testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(event));
 }
 
 test "session replica v2 activates only inside established Tsumugi SecuredLink" {
