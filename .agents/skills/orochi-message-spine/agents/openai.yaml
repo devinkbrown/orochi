@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orochi Message Spine"
+  short_description: "Build exact-once mesh event delivery"
+  default_prompt: "Use $orochi-message-spine to implement and falsify exact-once MESSAGE_V2 and event delivery."

@@ -9,7 +9,7 @@
 
 ## Parallel work
 
-- Give each writing agent an explicit, non-overlapping file set. One agent owns integration files such as `src/daemon/server.zig` at a time.
+- Give each writing agent an explicit, non-overlapping file set. The named `orochi-server-integrator` is always the sole `src/daemon/server.zig` writer; the parent never transfers that file to another role, even temporarily.
 - Use parallel agents primarily for bounded modules, read-only audits, test execution, and log analysis.
 - Before editing a file, check whether another active agent owns it. Route integration requests to that owner instead of racing edits.
 - Return concise evidence: files changed, invariants covered, exact commands, pass counts, and unresolved risks.
@@ -31,6 +31,28 @@
 - Release readiness requires the full project gates, Debug and ReleaseSafe coverage for critical modules, deterministic multi-node/multi-client upgrade acceptance, and a clean reproducible release build.
 - A green test is evidence only for the behavior it actually exercises. Identify vacuous topology, shard-count, transport, timing, and parser assertions.
 - A fresh reviewer must try to refute release-critical changes. Authors do not grade their own work.
+
+## Claude review routing
+
+- Invoke Claude through `tools/claude-review.sh`; direct ad hoc review output is not release evidence.
+- Pass an explicit repository-relative file scope. The launcher gives Claude only exact-path `Read` access to an immutable private snapshot and rejects output unless every scoped file has a valid source anchor and every finding stays inside that scope.
+- Use `fast` (Haiku/low) for codecs and mechanical consistency, `integration` (Sonnet/medium) for ownership and lifecycle seams, and `security` (Sonnet/high) for Helix, mesh, replay, token, and adversarial boundaries.
+- Use `orochi-reviewer` when a domain-specific lens must be supplied in the prompt. Writer agents do not enter the structured-review launcher; use a fresh reviewer instead.
+- Treat Claude findings as hypotheses. Codex reproduces each counterexample against the current tree, routes confirmed fixes to the single file owner, and sends the fixed scope through a fresh review.
+
+## Codex specialist routing
+
+- Project-scoped native roles live in `.codex/agents/` and inherit the active Codex model. Use `zig-coder` for bounded leaf-module implementation, `orochi-session` for session/migration/Helix leaf state, and `orochi-server-integrator` as the sole `server.zig` writer.
+- Use `orochi-dst` for deterministic fault campaigns and `orochi-reviewer` as a fresh read-only adversarial gate. Rotate `orochi-release-gate`, `orochi-deploy`, and `orochi-docs` only at their explicit handoff points.
+- A specialist role does not override the one-writer-per-file rule. The parent assigns disjoint files, retains integration authority, validates returned evidence, and decides what is committed.
+- Use `orochi-agent-architect` only to audit or evolve the roster itself. It is read-only and should reduce overlap, not create agents reflexively.
+
+## Skills and deterministic tooling
+
+- Canonical project skills live under `.agents/skills`; `.claude/skills` exposes the same tree so Codex and Claude use one source of truth.
+- Use `orochi-roadmap-execution` to resume or select roadmap slices, `orochi-session-mesh` for reusable sessions, `orochi-message-spine` for exact-once events, and `orochi-server-integration` for live daemon wiring.
+- Use `orochi-zig-verification` for gate selection and fault evidence, `orochi-cross-model-review` for grounded Claude review, and `orochi-release-deploy` for the ordered release workflow.
+- Use `orochi-agent-toolkit` only when changing the workflow itself. After agent, skill, or review-launcher changes, run its validator, Python authority tests, and snapshot-isolation shell regression.
 
 ## Git and deployment safety
 

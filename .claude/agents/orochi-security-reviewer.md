@@ -1,7 +1,7 @@
 ---
 name: orochi-security-reviewer
 description: Performs deep read-only adversarial review of Orochi mesh, session, token, Helix, cryptographic, and concurrency boundaries.
-disallowedTools: Edit, Write, Bash, NotebookEdit, WebFetch, WebSearch, Agent
+tools: Read
 model: claude-sonnet-5
 effort: high
 permissionMode: plan

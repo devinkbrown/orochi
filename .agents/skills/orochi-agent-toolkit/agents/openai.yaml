@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orochi Agent Toolkit"
+  short_description: "Evolve and validate Orochi agent tooling"
+  default_prompt: "Use $orochi-agent-toolkit to audit and improve the Orochi Codex and Claude workflow."

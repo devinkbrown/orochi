@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orochi Server Integration"
+  short_description: "Integrate daemon state transactionally"
+  default_prompt: "Use $orochi-server-integration to wire a completed module into server.zig without partial publication."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orochi Session Mesh"
+  short_description: "Build exact mesh-wide reusable sessions"
+  default_prompt: "Use $orochi-session-mesh to implement and verify mesh-wide session resume and migration."

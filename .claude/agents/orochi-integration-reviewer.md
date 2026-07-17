@@ -1,7 +1,7 @@
 ---
 name: orochi-integration-reviewer
 description: Reviews Orochi integration seams, lifecycle ordering, failure atomicity, and test adequacy after module changes.
-disallowedTools: Edit, Write, Bash, NotebookEdit, WebFetch, WebSearch, Agent
+tools: Read
 model: claude-sonnet-5
 effort: medium
 permissionMode: plan

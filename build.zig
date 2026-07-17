@@ -198,7 +198,7 @@ pub fn build(b: *std.Build) void {
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
+    // set the relevant field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
         .filters = test_filters,
@@ -468,6 +468,38 @@ pub fn build(b: *std.Build) void {
     const test_services_verbose_step = b.step("test-services-verbose", "Run focused services/auth tests with per-test progress output");
     test_services_verbose_step.dependOn(&run_services_tests_verbose.step);
 
+    // Reusable-session correctness spans SessionStore, World projection,
+    // portable credentials, mesh replication, and Helix. Keep a dedicated gate
+    // so lower-case allocation-failure tests are not accidentally omitted by
+    // the broader services filter.
+    const session_test_filters: []const []const u8 = &.{
+        "session",
+        "Session",
+        "SESSION",
+        "token bind",
+        "portable detached",
+        "PreparedSessionRestore",
+        "handoffExactSessionIdentity",
+        "migration",
+        "reclaim",
+        "replica",
+    };
+    const session_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = session_test_filters,
+    });
+    const run_session_tests = b.addRunArtifact(session_tests);
+    const test_session_step = b.step("test-session", "Run reusable-session, migration, replica, World restore, and Helix session tests");
+    test_session_step.dependOn(&run_session_tests.step);
+    const session_tests_verbose = b.addTest(.{
+        .root_module = mod,
+        .filters = session_test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_session_tests_verbose = b.addRunArtifact(session_tests_verbose);
+    const test_session_verbose_step = b.step("test-session-verbose", "Run reusable-session tests with per-test progress output");
+    test_session_verbose_step.dependOn(&run_session_tests_verbose.step);
+
     const helix_test_filters: []const []const u8 = &.{
         "Helix",
         "helix",
@@ -614,6 +646,7 @@ pub fn build(b: *std.Build) void {
     test_roadmap_step.dependOn(&run_event_tests.step);
     test_roadmap_step.dependOn(&run_mesh_tests.step);
     test_roadmap_step.dependOn(&run_services_tests.step);
+    test_roadmap_step.dependOn(&run_session_tests.step);
     test_roadmap_step.dependOn(&run_tls_tests.step);
     const test_roadmap_verbose_step = b.step("test-roadmap-verbose", "Run focused server roadmap suites with per-test progress output");
     test_roadmap_verbose_step.dependOn(&check_exe.step);
@@ -623,6 +656,7 @@ pub fn build(b: *std.Build) void {
     test_roadmap_verbose_step.dependOn(&run_event_tests_verbose.step);
     test_roadmap_verbose_step.dependOn(&run_mesh_tests_verbose.step);
     test_roadmap_verbose_step.dependOn(&run_services_tests_verbose.step);
+    test_roadmap_verbose_step.dependOn(&run_session_tests_verbose.step);
     test_roadmap_verbose_step.dependOn(&run_tls_tests_verbose.step);
 
     // `zig build ct-check` — the opt-in, dudect-style constant-time verification
