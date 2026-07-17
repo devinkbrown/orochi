@@ -219,8 +219,10 @@ pub const SecuredLink = struct {
     /// upgrade WITHOUT re-running the AKE: the outer record-layer secrets/counters
     /// (from `exportOuter` + `Established.deserialize`) plus the inner CRDT link's
     /// bounded identity/transport header (`s2s_link.ResumeHeader` + remote name).
-    /// The converged roster is NOT carried — a RESYNC refills it from the peer,
-    /// whose socket was preserved so it never saw a drop.
+    /// The converged roster rides the capsule's SEPARATE v4 roster block: after
+    /// `resumeOuter` the caller primes it via `primeResumedMember`, then RESYNCs —
+    /// the peer (whose socket was preserved so it never saw a drop) re-bursts, and
+    /// the primed rows dedup instead of re-announcing every member as a JOIN.
     pub const ResumeState = struct {
         established: hs.Established,
         send_counter: u64,
@@ -236,7 +238,8 @@ pub const SecuredLink = struct {
     /// Rebuild an established secured link from a resume capsule. Borrows the same
     /// identity/config as `init` (via `opts`) and takes ownership of `rs.established`
     /// (moved into `resumed_established`; do NOT deinit it separately). The inner
-    /// CRDT link is stood up established with a FRESH empty replica.
+    /// CRDT link is stood up established with a FRESH empty replica; the caller
+    /// restores the carried roster via `primeResumedMember` before feeding bytes.
     pub fn resumeOuter(opts: Options, rs: ResumeState) anyerror!SecuredLink {
         var expected: [max_expected_remotes][20]u8 = undefined;
         var expected_count: usize = 0;
@@ -416,6 +419,27 @@ pub const SecuredLink = struct {
         const link = self.inner orelse return;
         try link.sendResync();
         try self.drainInner();
+    }
+
+    /// Prime one carried remote member into the resumed inner link's route table
+    /// (see `S2sLink.primeResumedMember`). Valid only on a link built by
+    /// `resumeOuter`, BEFORE any inbound bytes are fed: the primed roster is what
+    /// makes the peer's RESYNC re-burst dedup to `.unchanged` instead of
+    /// re-announcing every surviving member as a spurious client-visible JOIN.
+    /// Fails closed on a duplicate/conflicting record (`RosterConflict`) so the
+    /// adoption path can abort transactionally.
+    pub fn primeResumedMember(
+        self: *SecuredLink,
+        channel: []const u8,
+        nick: []const u8,
+        node: u64,
+        status: u4,
+        hlc: u64,
+        ident: s2s_peer.MemberIdentity,
+        now_ms: i64,
+    ) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.primeResumedMember(channel, nick, node, status, hlc, ident, now_ms);
     }
 
     /// Consume a pending peer RESYNC request; the daemon answers with a full burst.
@@ -1300,6 +1324,31 @@ pub const SecuredLink = struct {
 
 const testing = std.testing;
 
+const s2s_snapshot = @import("helix/s2s_snapshot.zig");
+
+/// Drain every queued identity transition on `link`, returning how many were
+/// membership deltas of `kind` for `nick` — the exact deltas the daemon's
+/// `drainIdentityTransitions` turns into client-visible JOIN/PART/MODE
+/// broadcasts (`emitRemoteMembership`). Frees each drained delta.
+fn drainMembershipKindFor(
+    link: *SecuredLink,
+    kind: s2s_peer.S2sPeer.MembershipDelta.Kind,
+    nick: []const u8,
+) usize {
+    var hits: usize = 0;
+    while (link.takeNextIdentityTransition()) |queued| {
+        var transition = queued;
+        switch (transition) {
+            .membership => |*d| {
+                if (d.kind == kind and std.mem.eql(u8, d.nick, nick)) hits += 1;
+                d.deinit(testing.allocator);
+            },
+            .nick => |*d| d.deinit(testing.allocator),
+        }
+    }
+    return hits;
+}
+
 const DeterministicIo = struct {
     s: u64,
     fn io(self: *DeterministicIo) std.Io {
@@ -1903,6 +1952,254 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
     // The encrypted stream truly continued (records flowed post-resume).
     try testing.expect(a2.send_counter > saved_send);
     try testing.expect(a2.recv_counter > saved_recv);
+}
+
+test "resumeOuter without the carried s2s roster re-announces the survivor on RESYNC (spurious JOIN)" {
+    // The ORIGINAL bug this pins: a resumed link starts with an EMPTY route
+    // table, so the peer's RESYNC re-burst of a member who never left returns
+    // `.joined` and queues the delta the daemon broadcasts as ":trev JOIN #root"
+    // to local clients whose view was preserved across the zero-drop upgrade.
+    // This negative control proves the suppression in the companion test comes
+    // from the roster prime — i.e. that the fix's test has teeth.
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x33)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x44)), "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x7a7a };
+
+    const optsA = Options{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.orochi",
+    };
+    var a = try SecuredLink.init(optsA);
+    var a_live = true;
+    defer if (a_live) a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = &idb,
+        .local_prekey = pre_b,
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.orochi",
+    });
+    defer b.deinit();
+    try pump(&a, &b, false);
+
+    // B announces a member; A converges and legitimately queues ONE JOIN delta.
+    const ident = s2s_peer.MemberIdentity{ .username = "trev", .realname = "Trevor", .host = "cloak.b" };
+    try b.sendMembership("#root", "trev", 0b0010, 100, true, ident, "");
+    try pump(&a, &b, false);
+    a.processDeferredResidenceFrames(100);
+    try testing.expectEqual(@as(usize, 1), drainMembershipKindFor(&a, .joined, "trev"));
+
+    // --- Helix swap of A WITHOUT carrying the roster (the pre-v4 behavior). ---
+    const outer = a.exportOuter();
+    var est_buf: [hs.Established.serialized_len]u8 = undefined;
+    outer.established.serialize(&est_buf);
+    const inner_hdr = a.snapshotInner().?;
+    const remote_name = try testing.allocator.dupe(u8, a.snapshotInnerRemoteName());
+    defer testing.allocator.free(remote_name);
+    const saved_send = outer.send_counter;
+    const saved_recv = outer.recv_counter;
+    try testing.expectEqual(@as(usize, 0), outer.rec_inbuf.len);
+    try testing.expectEqual(@as(usize, 0), outer.pending_out.len);
+    a.deinit();
+    a_live = false;
+
+    var a2 = try SecuredLink.resumeOuter(optsA, .{
+        .established = hs.Established.deserialize(&est_buf),
+        .send_counter = saved_send,
+        .recv_counter = saved_recv,
+        .feed_seq = outer.feed_seq,
+        .inner = inner_hdr,
+        .remote_name = remote_name,
+        .rec_inbuf = &.{},
+        .now_ms = 1000,
+        .rng_seed = 0x2222,
+    });
+    defer a2.deinit();
+    try testing.expect(a2.findRemoteMember("trev") == null);
+
+    try a2.sendResync();
+    try pump(&a2, &b, false);
+    try testing.expect(b.takeResyncRequest());
+    // The daemon answers a RESYNC with a full membership burst (fresh hlc).
+    try b.sendMembership("#root", "trev", 0b0010, 200, true, ident, "");
+    try pump(&a2, &b, false);
+    a2.processDeferredResidenceFrames(200);
+
+    // THE BUG: the empty roster makes the surviving member re-announce as a
+    // fresh JOIN delta — the daemon would broadcast a spurious ":trev JOIN".
+    try testing.expectEqual(@as(usize, 1), drainMembershipKindFor(&a2, .joined, "trev"));
+}
+
+test "resumeOuter primed with the carried s2s roster suppresses the spurious RESYNC re-JOIN" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x55)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x66)), "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x5b5b };
+
+    const optsA = Options{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.orochi",
+    };
+    var a = try SecuredLink.init(optsA);
+    var a_live = true;
+    defer if (a_live) a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = &idb,
+        .local_prekey = pre_b,
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.orochi",
+    });
+    defer b.deinit();
+    try pump(&a, &b, false);
+
+    const ident = s2s_peer.MemberIdentity{ .username = "trev", .realname = "Trevor", .host = "cloak.b" };
+    try b.sendMembership("#root", "trev", 0b0010, 100, true, ident, "");
+    try pump(&a, &b, false);
+    a.processDeferredResidenceFrames(100);
+    try testing.expectEqual(@as(usize, 1), drainMembershipKindFor(&a, .joined, "trev"));
+
+    // --- SEAL: capture the converged roster exactly as `sealSecuredLink` does,
+    // and push it through the REAL v4 capsule codec (encode → decode). ---
+    var roster: std.ArrayList(u8) = .empty;
+    defer roster.deinit(testing.allocator);
+    var roster_count: u32 = 0;
+    if (a.channelNames()) |names| {
+        var nit = names;
+        while (nit.next()) |chan| {
+            for (a.channelMembers(chan)) |m| {
+                try s2s_snapshot.appendRosterMember(testing.allocator, &roster, .{
+                    .channel = chan,
+                    .nick = m.nick,
+                    .node = m.node,
+                    .status = m.status,
+                    .hlc = m.hlc,
+                    .username = m.username,
+                    .realname = m.realname,
+                    .host = m.host,
+                    .account = m.account,
+                    .real_host = m.real_host,
+                    .certfp = m.certfp,
+                    .session_token = m.session_token,
+                });
+                roster_count += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 1), roster_count);
+
+    const outer = a.exportOuter();
+    var snap = s2s_snapshot.Snapshot{
+        .fd = 5,
+        .role = @intFromEnum(outer.role),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .remote_node_id = idb.shortId(),
+        .remote_name = a.snapshotInnerRemoteName(),
+        .roster = roster.items,
+        .roster_count = roster_count,
+    };
+    outer.established.serialize(&snap.established);
+    const blob = try s2s_snapshot.encode(testing.allocator, snap);
+    defer testing.allocator.free(blob);
+    const carried = try s2s_snapshot.decode(blob, s2s_snapshot.schema_version);
+
+    const inner_hdr = a.snapshotInner().?;
+    const remote_name = try testing.allocator.dupe(u8, a.snapshotInnerRemoteName());
+    defer testing.allocator.free(remote_name);
+    const saved_send = outer.send_counter;
+    const saved_recv = outer.recv_counter;
+    a.deinit();
+    a_live = false;
+
+    var a2 = try SecuredLink.resumeOuter(optsA, .{
+        .established = hs.Established.deserialize(&carried.established),
+        .send_counter = carried.send_counter,
+        .recv_counter = carried.recv_counter,
+        .feed_seq = carried.feed_seq,
+        .inner = inner_hdr,
+        .remote_name = remote_name,
+        .rec_inbuf = &.{},
+        .now_ms = 1000,
+        .rng_seed = 0x3333,
+    });
+    defer a2.deinit();
+
+    // --- ADOPT: prime the carried roster BEFORE any RESYNC processing. ---
+    var rit = s2s_snapshot.rosterIterator(&carried);
+    while (try rit.next()) |m| {
+        try a2.primeResumedMember(m.channel, m.nick, m.node, m.status, m.hlc, .{
+            .username = m.username,
+            .realname = m.realname,
+            .host = m.host,
+            .account = m.account,
+            .real_host = m.real_host,
+            .certfp = m.certfp,
+            .session_token = m.session_token,
+        }, 1000);
+    }
+
+    // NAMES stays correct even before the RESYNC lands: the member is already
+    // projected with its real identity, status, origin node, and HLC.
+    const primed = a2.findRemoteMember("trev").?;
+    try testing.expectEqualStrings("trev", primed.username);
+    try testing.expectEqualStrings("cloak.b", primed.host);
+    try testing.expectEqual(@as(u4, 0b0010), primed.status);
+    try testing.expectEqual(idb.shortId(), primed.node);
+    try testing.expectEqual(@as(u64, 100), primed.hlc);
+    // And a prime queues NO delta — restored state was visible pre-swap.
+    try testing.expectEqual(@as(usize, 0), drainMembershipKindFor(&a2, .joined, "trev"));
+
+    try a2.sendResync();
+    try pump(&a2, &b, false);
+    try testing.expect(b.takeResyncRequest());
+    // The daemon answers with the same full burst a fresh establishment sends.
+    try b.sendMembership("#root", "trev", 0b0010, 200, true, ident, "");
+    try pump(&a2, &b, false);
+    a2.processDeferredResidenceFrames(200);
+
+    // THE FIX: the primed roster dedups the re-burst — no `.joined` delta, so
+    // the daemon never broadcasts a spurious ":trev JOIN #root".
+    try testing.expectEqual(@as(usize, 0), drainMembershipKindFor(&a2, .joined, "trev"));
+
+    // The RESYNC still ran and still won LWW: the member remains present and
+    // its clock advanced to the re-burst HLC (prime is a prime, not a veto).
+    const after = a2.findRemoteMember("trev").?;
+    try testing.expectEqual(@as(u4, 0b0010), after.status);
+    try testing.expectEqual(@as(u64, 200), after.hlc);
+    try testing.expect(a2.send_counter > saved_send);
+    try testing.expect(a2.recv_counter > saved_recv);
+
+    // A subsequent genuine departure still applies and surfaces normally: the
+    // primed row is an ordinary converged row, never a frozen one — the PART
+    // removes it and queues exactly the client-visible `.parted` delta.
+    try b.sendMembership("#root", "trev", 0b0010, 300, false, ident, "");
+    try pump(&a2, &b, false);
+    a2.processDeferredResidenceFrames(300);
+    try testing.expectEqual(@as(usize, 1), drainMembershipKindFor(&a2, .parted, "trev"));
+    try testing.expect(a2.findRemoteMember("trev") == null);
 }
 
 test "a trust-pin mismatch rejects the peer prekey" {

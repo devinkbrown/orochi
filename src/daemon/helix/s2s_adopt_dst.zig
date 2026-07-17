@@ -3,8 +3,9 @@
 
 //! Deterministic-Ocean coverage for the Helix `.s2s_link` capsule adoption path
 //! at the CAPSULE-STREAM level — the exact old→new UPGRADEs that the v2 bump (adding
-//! `admitted_frame_families` to `Established`, growing the embedded blob by 4 bytes)
-//! and v3 bump (adding `caps_ext`, growing the blob by one byte) must survive without
+//! `admitted_frame_families` to `Established`, growing the embedded blob by 4 bytes),
+//! the v3 bump (adding `caps_ext`, growing the blob by one byte), and the v4 bump
+//! (appending the converged remote-member roster block) must survive without
 //! a netsplit. "Upgrades are where panics live," so this
 //! models the successor's `adoptInheritedSessions` loop (server.zig, Pass 0 + Pass 4)
 //! and asserts the invariant that matters: every inherited s2s socket fd is
@@ -70,17 +71,51 @@ fn sampleSnap(fd: i32) s2s_snapshot.Snapshot {
     return snap;
 }
 
-/// Encode an actual schema-v2 `.s2s_link` capsule. The current encoder writes v3,
-/// so remove the v3-only `caps_ext` byte and advertise the exact v2 range.
-/// Caller owns the returned bytes.
+/// Synthesize the pre-roster (v3-layout) wire image from a current-encode blob
+/// by stripping the trailing v4 roster block. Valid only when the encoded
+/// roster was EMPTY (the block is then exactly 8 zero bytes: count=0, len=0) —
+/// every pre-v4 fixture here models a rosterless predecessor.
+fn stripEmptyRosterBlock(allocator: Allocator, current_blob: []const u8) ![]u8 {
+    std.debug.assert(current_blob.len >= 8);
+    for (current_blob[current_blob.len - 8 ..]) |b| std.debug.assert(b == 0);
+    return allocator.dupe(u8, current_blob[0 .. current_blob.len - 8]);
+}
+
+/// Encode an actual schema-v3 `.s2s_link` capsule — the immediately-prior
+/// PRODUCTION schema (what the currently-deployed binary seals). The current
+/// encoder writes v4, so strip the trailing roster block and advertise the
+/// exact v3 range. Caller owns the returned bytes.
+fn v3Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
+    const current_blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(current_blob);
+    const v3_blob = try stripEmptyRosterBlock(allocator, current_blob);
+    defer allocator.free(v3_blob);
+
+    const d = capsule.descriptor(.s2s_link);
+    const v3_header = capsule.Header{
+        .schema_id = d.schema_id,
+        .kind = .s2s_link,
+        .version = 3,
+        .min_supported = 1,
+        .max_supported = 3,
+    };
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = v3_blob }};
+    return capsule.encode(allocator, .{ .header = v3_header, .fields = fields[0..] });
+}
+
+/// Encode an actual schema-v2 `.s2s_link` capsule. The current encoder writes v4,
+/// so strip the v4-only roster block, remove the v3-only `caps_ext` byte, and
+/// advertise the exact v2 range. Caller owns the returned bytes.
 fn v2Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const current_blob = try s2s_snapshot.encode(allocator, snap);
     defer allocator.free(current_blob);
+    const v3_blob = try stripEmptyRosterBlock(allocator, current_blob);
+    defer allocator.free(v3_blob);
 
-    const v2_blob = try allocator.alloc(u8, current_blob.len - 1);
+    const v2_blob = try allocator.alloc(u8, v3_blob.len - 1);
     defer allocator.free(v2_blob);
-    @memcpy(v2_blob[0..caps_ext_field_off_v2], current_blob[0..caps_ext_field_off_v2]);
-    @memcpy(v2_blob[caps_ext_field_off_v2..], current_blob[caps_ext_field_off_v2 + 1 ..]);
+    @memcpy(v2_blob[0..caps_ext_field_off_v2], v3_blob[0..caps_ext_field_off_v2]);
+    @memcpy(v2_blob[caps_ext_field_off_v2..], v3_blob[caps_ext_field_off_v2 + 1 ..]);
 
     const d = capsule.descriptor(.s2s_link);
     const v2_header = capsule.Header{
@@ -97,17 +132,19 @@ fn v2Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
 /// Encode a v1 `.s2s_link` capsule as a PRE-BUMP binary would have sealed it: the
 /// embedded `Established` blob is 4 bytes shorter (no `admitted_frame_families`)
 /// and the capsule header advertises `version=1, min=1, max=1`. Built by encoding
-/// the v2 blob and splicing out the trailing u32, then wrapping in a hand-crafted
-/// v1 header the current binary still accepts (`min_supported = 1`). Both later
-/// additions are removed: v2's trailing Established u32 and v3's `caps_ext` byte.
+/// the current blob and removing every later addition — v4's roster block, v3's
+/// `caps_ext` byte, and v2's trailing Established u32 — then wrapping in a
+/// hand-crafted v1 header the current binary still accepts (`min_supported = 1`).
 fn v1Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const current_blob = try s2s_snapshot.encode(allocator, snap);
     defer allocator.free(current_blob);
+    const v3_blob = try stripEmptyRosterBlock(allocator, current_blob);
+    defer allocator.free(v3_blob);
 
-    const v2_blob = try allocator.alloc(u8, current_blob.len - 1);
+    const v2_blob = try allocator.alloc(u8, v3_blob.len - 1);
     defer allocator.free(v2_blob);
-    @memcpy(v2_blob[0..caps_ext_field_off_v2], current_blob[0..caps_ext_field_off_v2]);
-    @memcpy(v2_blob[caps_ext_field_off_v2..], current_blob[caps_ext_field_off_v2 + 1 ..]);
+    @memcpy(v2_blob[0..caps_ext_field_off_v2], v3_blob[0..caps_ext_field_off_v2]);
+    @memcpy(v2_blob[caps_ext_field_off_v2..], v3_blob[caps_ext_field_off_v2 + 1 ..]);
 
     const cut_at = est_field_off + s2s_snapshot.est_len - 4;
     var v1_blob: std.ArrayList(u8) = .empty;
@@ -130,7 +167,7 @@ fn v1Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
 
 /// Encode a FORWARD-VERSIONED (too-new) `.s2s_link` capsule: a hypothetical future
 /// binary sealed it at `schema_version + 1`. The current capsule layer
-/// forward-accepts it (the advertised range overlaps the local `[1,3]` range), so the
+/// forward-accepts it (the advertised range overlaps the local `[1,4]` range), so the
 /// blob survives the stream walk and reaches `s2s_snapshot.decode`, which then
 /// rejects the unknown version fail-closed — the fd must still be recovered.
 fn tooNewCapsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
@@ -337,6 +374,95 @@ test "s2s_link v1 and v2 capsules co-adopt in one upgrade stream, fd ledger bala
     try testing.expectEqual(@as(usize, 1), res.siblings_adopted);
     try testing.expectEqual(@as(usize, 2), res.s2s_adopted);
     try testing.expectEqual(@as(usize, 0), res.s2s_dropped);
+    try testing.expectEqual(@as(usize, 0), res.fds_leaked);
+}
+
+/// Encode a CURRENT (v4) `.s2s_link` capsule carrying `snap` verbatim —
+/// including any roster block. Caller owns the returned bytes.
+fn currentCapsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
+    const blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(blob);
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
+    return capsule.encode(allocator, capsule.make(.s2s_link, fields[0..]));
+}
+
+test "s2s_link v3 capsule (previous production schema) co-adopts with a v4 roster capsule across upgrade" {
+    const allocator = testing.allocator;
+
+    // The exact next-deploy stream: a v3 link sealed by the currently-deployed
+    // binary rides beside a v4 link whose blob carries a converged roster.
+    var roster: std.ArrayList(u8) = .empty;
+    defer roster.deinit(allocator);
+    try s2s_snapshot.appendRosterMember(allocator, &roster, .{
+        .channel = "#root",
+        .nick = "trev",
+        .node = 0xB0B,
+        .status = 2,
+        .hlc = 700,
+        .username = "trev",
+        .host = "cloak.ircx.us",
+    });
+    var v4_snap = sampleSnap(55);
+    v4_snap.roster = roster.items;
+    v4_snap.roster_count = 1;
+
+    const parts = [_][]u8{
+        try v3Capsule(allocator, sampleSnap(54)),
+        try ticketKeyCapsule(allocator, 0x3C),
+        try currentCapsule(allocator, v4_snap),
+    };
+    const stream = try joinCaps(allocator, parts[0..]);
+    defer allocator.free(stream);
+
+    var open: std.AutoHashMapUnmanaged(i32, void) = .empty;
+    defer open.deinit(allocator);
+
+    const res = try adoptStream(allocator, stream, null, &open);
+    try testing.expectEqual(@as(usize, 1), res.siblings_adopted);
+    try testing.expectEqual(@as(usize, 2), res.s2s_adopted);
+    try testing.expectEqual(@as(usize, 0), res.s2s_dropped);
+    try testing.expectEqual(@as(usize, 0), res.fds_leaked);
+}
+
+test "s2s_link v4 capsule with a corrupt roster is refused fail-closed and fd recovered on resume" {
+    const allocator = testing.allocator;
+
+    var roster: std.ArrayList(u8) = .empty;
+    defer roster.deinit(allocator);
+    try s2s_snapshot.appendRosterMember(allocator, &roster, .{
+        .channel = "#root",
+        .nick = "trev",
+        .node = 0xB0B,
+        .status = 2,
+        .hlc = 700,
+    });
+    var snap = sampleSnap(56);
+    snap.roster = roster.items;
+    snap.roster_count = 1;
+    const blob = try s2s_snapshot.encode(allocator, snap);
+    defer allocator.free(blob);
+    // Corrupt the roster block's declared count so the decode-time walk
+    // mismatches — the link must drop cleanly, never adopt a partial roster.
+    const count_off = blob.len - roster.items.len - 8;
+    std.mem.writeInt(u32, blob[count_off..][0..4], 9, .little);
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
+    const bad = try capsule.encode(allocator, capsule.make(.s2s_link, fields[0..]));
+
+    const parts = [_][]u8{
+        bad,
+        try ticketKeyCapsule(allocator, 0x4D),
+    };
+    const stream = try joinCaps(allocator, parts[0..]);
+    defer allocator.free(stream);
+
+    var open: std.AutoHashMapUnmanaged(i32, void) = .empty;
+    defer open.deinit(allocator);
+
+    const res = try adoptStream(allocator, stream, null, &open);
+    try testing.expectEqual(@as(usize, 1), res.siblings_adopted);
+    try testing.expectEqual(@as(usize, 0), res.s2s_adopted);
+    try testing.expectEqual(@as(usize, 1), res.s2s_dropped);
+    try testing.expectEqual(@as(usize, 1), res.fds_recovered);
     try testing.expectEqual(@as(usize, 0), res.fds_leaked);
 }
 

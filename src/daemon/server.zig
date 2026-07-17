@@ -22450,6 +22450,40 @@ pub const LinuxServer = struct {
             pending = buf;
         }
 
+        // v4: seal the link's converged remote-member roster verbatim (nick
+        // spelling incl. loser-UID aliases, origin node, status, HLC, identity,
+        // and the receiver-derived session token). The successor primes its
+        // fresh route table from it BEFORE the RESYNC, so the peer's re-burst
+        // dedups to `.unchanged` instead of re-announcing every surviving
+        // member to local clients as a spurious JOIN — and NAMES for remote
+        // members stays correct even before the re-burst lands.
+        var roster: std.ArrayList(u8) = .empty;
+        defer roster.deinit(self.allocator);
+        var roster_count: u32 = 0;
+        if (link.channelNames()) |names| {
+            var nit = names;
+            while (nit.next()) |chan| {
+                for (link.channelMembers(chan)) |m| {
+                    if (roster_count == std.math.maxInt(u32)) return false;
+                    s2s_snapshot.appendRosterMember(self.allocator, &roster, .{
+                        .channel = chan,
+                        .nick = m.nick,
+                        .node = m.node,
+                        .status = m.status,
+                        .hlc = m.hlc,
+                        .username = m.username,
+                        .realname = m.realname,
+                        .host = m.host,
+                        .account = m.account,
+                        .real_host = m.real_host,
+                        .certfp = m.certfp,
+                        .session_token = m.session_token,
+                    }) catch return false;
+                    roster_count += 1;
+                }
+            }
+        }
+
         var caps: u8 = 0;
         if (inner.peer_supports_signing) caps |= s2s_snapshot.cap_signing;
         if (inner.peer_supports_account) caps |= s2s_snapshot.cap_account;
@@ -22487,6 +22521,8 @@ pub const LinuxServer = struct {
             .connect_addr = if (conn.s2s_initiator) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
             .rec_inbuf = outer.rec_inbuf,
             .pending_out = pending,
+            .roster = roster.items,
+            .roster_count = roster_count,
         };
         outer.established.serialize(&snap.established);
 
@@ -26015,12 +26051,45 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Restore the sealed converged remote-member roster (the v4 capsule roster
+    /// block) into a freshly-resumed link's route table. Runs BEFORE any RESYNC
+    /// processing so the peer's re-burst of these same members dedups to
+    /// `.unchanged` (or a genuine `.status_changed`) instead of re-announcing
+    /// every surviving remote member to local clients as a spurious JOIN — and
+    /// NAMES for remote members stays correct even before the re-burst lands.
+    /// No deltas are queued for primes: restored state was already visible to
+    /// local clients before the swap. Fail-closed: any malformed/duplicate
+    /// record or allocation failure errors out and the caller aborts the whole
+    /// adoption transactionally (the rollback tears down the link, so a partial
+    /// roster never publishes).
+    fn primeInheritedS2sRoster(
+        self: *LinuxServer,
+        link: *secured_s2s_link.SecuredLink,
+        snap: *const s2s_snapshot.Snapshot,
+        now: i64,
+    ) !void {
+        _ = self;
+        var it = s2s_snapshot.rosterIterator(snap);
+        while (try it.next()) |m| {
+            try link.primeResumedMember(m.channel, m.nick, m.node, m.status, m.hlc, .{
+                .username = m.username,
+                .realname = m.realname,
+                .host = m.host,
+                .account = m.account,
+                .real_host = m.real_host,
+                .certfp = m.certfp,
+                .session_token = m.session_token,
+            }, now);
+        }
+    }
+
     /// Re-attach a PRESERVED secured mesh link across a Helix upgrade: take
     /// ownership of its inherited socket fd, rebuild the SecuredLink established
     /// from the capsule (Tsumugi record keys + counters + inner framing header),
-    /// arm recv, then RESYNC with the peer + re-burst our state so the roster
-    /// reconverges within a round-trip — the peer never saw a drop. Returns true on
-    /// success; ANY failure closes the fd + frees the slot (the mesh then heals via
+    /// prime the carried remote-member roster, arm recv, then RESYNC with the
+    /// peer + re-burst our state so the roster reconverges within a round-trip —
+    /// the peer never saw a drop and local clients never see a spurious re-JOIN.
+    /// ANY failure closes the fd + frees the slot (the mesh then heals via
     /// the normal re-dial on the next sweep). Returns the inert candidate id;
     /// peer/event/stat visibility is published only after the whole transaction
     /// commits.
@@ -26152,6 +26221,14 @@ pub const LinuxServer = struct {
         link.setSessionTokenResolver(self.sessionTokenResolver());
         link.setSessionTokenNickAuthorizer(self.sessionTokenNickAuthorizer());
         conn.s2s_burst_done = true; // the reconverge below is driven explicitly
+
+        // Prime the carried roster BEFORE any inbound/RESYNC processing (see
+        // primeInheritedS2sRoster). A pre-v4 capsule carries an empty roster and
+        // primes nothing — the RESYNC alone reconverges, the pre-bump behavior.
+        self.primeInheritedS2sRoster(link, &snap, now) catch {
+            self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+            return null;
+        };
 
         if (snap.pending_out.len != 0) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);

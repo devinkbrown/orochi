@@ -201,8 +201,10 @@ pub const S2sLink = struct {
     pub const ResumeHeader = s2s_peer.S2sPeer.ResumeHeader;
 
     /// Bounded identity/transport header to resume this link across a hot upgrade.
-    /// The converged CRDT/route state is NOT captured — refilled from the peer via
-    /// a RESYNC burst (see `s2s_peer.resumeEstablished`).
+    /// The converged CRDT/route state is NOT captured here — the remote-member
+    /// roster rides the capsule's separate v4 roster block (restored via
+    /// `primeResumedMember`), and a RESYNC burst reconverges the rest (see
+    /// `s2s_peer.resumeEstablished`).
     pub fn snapshotResume(self: *const S2sLink) ResumeHeader {
         return self.peer.snapshotResume();
     }
@@ -215,7 +217,9 @@ pub const S2sLink = struct {
     /// Initialize in place directly in the established state from a resume header,
     /// bypassing the handshake. `self` must already live at its final address (the
     /// inner peer's clock captures `&self`). Stands up a FRESH empty CRDT replica;
-    /// the caller must RESYNC to refill the roster.
+    /// the caller primes the carried roster via `primeResumedMember` and then
+    /// RESYNCs to reconverge (the primed rows make the re-burst dedup instead of
+    /// re-announcing every member).
     pub fn resumeEstablished(self: *S2sLink, opts: Options, hdr: ResumeHeader, remote_name: []const u8, rng_seed: u64) !void {
         self.* = .{
             .allocator = opts.allocator,
@@ -253,6 +257,35 @@ pub const S2sLink = struct {
     /// Ask the peer to re-send its full converged state (post-resume reconverge).
     pub fn sendResync(self: *S2sLink) !void {
         try self.peer.sendResync(self.sink());
+    }
+
+    /// Prime one converged remote channel member into this link's route table,
+    /// restoring the pre-upgrade roster on a link stood up via
+    /// `resumeEstablished` BEFORE any RESYNC/burst bytes are processed. This
+    /// deliberately bypasses `recvMembership`'s collision/residence machinery:
+    /// the record is the RECEIVER's own converged state (sealed by the Helix
+    /// predecessor), not a new peer claim, so it is applied verbatim — original
+    /// nick spelling (including loser-UID aliases), origin node, status bits,
+    /// HLC, propagated identity, and the receiver-derived session token. With
+    /// the roster primed, the peer's RESYNC re-burst of the same members dedups
+    /// to `.unchanged` instead of queueing a spurious client-visible JOIN, and
+    /// NAMES projects the member even before the re-burst lands. No delta is
+    /// queued: restored state was already visible to local clients pre-swap.
+    /// Every prime must land as a fresh `.joined` row (the resumed replica
+    /// starts empty); anything else is a duplicate/conflicting roster record
+    /// and fails closed so the caller can abort adoption transactionally.
+    pub fn primeResumedMember(
+        self: *S2sLink,
+        channel: []const u8,
+        nick: []const u8,
+        node: NodeId,
+        status: u4,
+        hlc: u64,
+        ident: MemberIdentity,
+        now_ms: i64,
+    ) !void {
+        const res = try self.peer.routes.applyMembership(channel, nick, node, status, hlc, true, ident, now_ms);
+        if (res.outcome != .joined) return error.RosterConflict;
     }
 
     /// Consume a pending peer RESYNC request (the daemon answers with a full burst).

@@ -127,9 +127,14 @@ pub const registry = [_]Descriptor{
     .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .send_queue, .schema_id = 0x4853_4551, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07): `Established.serialize` gained a trailing `admitted_frame_families`
-    // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
-    // v1 capsules sealed by pre-bump binaries; `s2s_snapshot.decode` is version-aware.
-    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 3, .min_supported = 1, .max_supported = 3 },
+    // (u32), growing the embedded blob by 4 bytes. v3 appends the `caps_ext` byte.
+    // v4 (2026-07): appends the trailing converged remote-member roster block
+    // ([u32 count][u32 len][records]) so the successor primes its route table
+    // BEFORE the RESYNC — without it the peer's re-burst re-announced every
+    // surviving remote member to local clients as a spurious JOIN on every
+    // upgrade. `min_supported = 1` keeps accepting capsules sealed by pre-bump
+    // binaries; `s2s_snapshot.decode` is version-aware.
+    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 4, .min_supported = 1, .max_supported = 4 },
     // v2 (2026-07): appends the WS adapter's partial framing state — the
     // deframer's buffered partial inbound frame + fragmentation flags and the tx
     // accumulator's partial outbound line — so a mid-frame wss client is carried

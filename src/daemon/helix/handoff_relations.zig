@@ -568,14 +568,16 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     try std.testing.expectEqual(@as(usize, 1), summary.mesh_clock);
 
     // A v2 predecessor owns the same fd graph but predates the caps-extension
-    // byte. Its advertised current version must negotiate and validate without
-    // weakening the exact ownership relation.
+    // byte AND the v4 roster block. Its advertised current version must
+    // negotiate and validate without weakening the exact ownership relation.
     const caps_ext_off = @sizeOf(i32) + 1 + 1 + s2s_snapshot.est_len +
         8 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 1;
-    const s2s_v2 = try allocator.alloc(u8, s2s.len - 1);
+    // Strip the trailing v4 roster block first (empty roster ⇒ 8 zero bytes).
+    const s2s_v3 = s2s[0 .. s2s.len - 8];
+    const s2s_v2 = try allocator.alloc(u8, s2s_v3.len - 1);
     defer allocator.free(s2s_v2);
-    @memcpy(s2s_v2[0..caps_ext_off], s2s[0..caps_ext_off]);
-    @memcpy(s2s_v2[caps_ext_off..], s2s[caps_ext_off + 1 ..]);
+    @memcpy(s2s_v2[0..caps_ext_off], s2s_v3[0..caps_ext_off]);
+    @memcpy(s2s_v2[caps_ext_off..], s2s_v3[caps_ext_off + 1 ..]);
     fields[8][0].bytes = s2s_v2;
     caps[8].header.version = 2;
     caps[8].header.max_supported = 2;
