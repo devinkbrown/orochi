@@ -203,6 +203,7 @@ const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
 const monitor_capsule = @import("helix/monitor_capsule.zig");
 const silence_capsule = @import("helix/silence_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
+const oper_grant_snapshot = @import("helix/oper_grant_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -15792,10 +15793,31 @@ pub const LinuxServer = struct {
     }
 
     /// Apply an inbound remote TOPIC to the local projection. Returns true when
-    /// applied, false when rejected by local policy (so the caller suppresses the
-    /// live emit).
+    /// applied, false when rejected by local policy or when the event is an
+    /// unchanged re-affirmation (so the caller suppresses the live emit).
     fn applyRemoteTopic(self: *LinuxServer, ch: anytype) bool {
         if (!self.world.channelExists(ch.channel)) return false;
+        // Unchanged re-affirmation dedup, keyed on the WORLD topic — state that
+        // survives a Helix upgrade in the World capsule. The topic re-burst
+        // (`sendTopicBurstTo`: RESYNC answers and the periodic anti-entropy
+        // cadence) stamps a FRESH mesh HLC, so the per-link route-table LWW
+        // clock cannot gate it: post-upgrade the link's clock was reset, and in
+        // steady state the fresh HLC always supersedes. Every sibling drain
+        // (mode flags, mode state, lists) already diffs against the carried
+        // World before emitting; topics must do the same, or every re-burst
+        // re-announces `:setter TOPIC #chan :<unchanged text>` to local
+        // members. A genuine change (different text, setter, or set_at — a
+        // deliberate re-SET of the same text included) still applies + emits.
+        const cur = self.world.topicInfo(ch.channel);
+        if (ch.present) {
+            if (cur) |info| {
+                if (std.mem.eql(u8, info.text, ch.topic) and
+                    std.mem.eql(u8, info.setter, ch.setter) and
+                    info.set_at == ch.set_at) return false;
+            }
+        } else if (cur == null or cur.?.text.len == 0) {
+            return false; // clearing an already-absent topic is a no-op
+        }
         // Receiver-side defense-in-depth, mirroring handleTopic: when THIS node's
         // projection has +t (topic_ops), only an op/founder may change the topic.
         // Resolve the remote setter's status across the combined local+remote
@@ -22976,6 +22998,39 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // Seal the server-wide cross-mesh oper-grant registry (grants +
+        // revocation tombstones + the mint-incarnation high-water mark). The
+        // successor primes its registry from this BEFORE the io loop can
+        // process any peer grant re-mint, so `applyMeshGrant` sees
+        // `had_oper_override=true` for an unchanged oper and does NOT
+        // re-broadcast a spurious `MODE #chan +Y <nick>` after every upgrade.
+        // An empty registry image remains mandatory material (it still carries
+        // the incarnation mark).
+        const oper_grant_wire = oper_grant_snapshot.encodeFromRegistry(
+            self.allocator,
+            &self.oper_grants,
+            self.grantNowU64(),
+            self.grant_incarnation,
+        ) catch |err| {
+            srvLog("orochi: UPGRADE oper-grant checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, oper_grant_wire) catch {
+            srvLog("orochi: UPGRADE oper-grant blob ownership append failed\n", .{});
+            self.allocator.free(oper_grant_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = oper_grant_wire,
+            // Exact server-wide state piece: a rollback binary that cannot
+            // recognize it must refuse the arena, never silently drop it.
+            .min_supported = 2,
+        }) catch {
+            srvLog("orochi: UPGRADE oper-grant piece append failed\n", .{});
+            return null;
+        };
+
         return .{
             .world_bytes = world_wire.len,
             .history_bytes = history_wire.len,
@@ -24529,6 +24584,41 @@ pub const LinuxServer = struct {
             return error.InvalidInheritedHandoff;
         }
 
+        // Select the carried cross-mesh oper-grant registry image without
+        // publishing it. AT-MOST-once: an arena sealed by a pre-checkpoint
+        // predecessor lacks the piece and adopts with an empty registry (the
+        // exact pre-checkpoint behavior, mirroring a pre-v4 rosterless
+        // `.s2s_link` capsule); requiring it would cold-refuse the first
+        // post-introduction USR2. Present-but-malformed, downgraded, or
+        // duplicate images reject the complete handoff fail-closed.
+        var oper_grant_checkpoint: ?oper_grant_snapshot.Snapshot = null;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (oper_grant_snapshot.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (oper_grant_checkpoint != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate oper-grant checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            oper_grant_checkpoint = oper_grant_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed oper-grant checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+
         // Select the process-global TLS ticket-key authority without publishing
         // it. Resumption-enabled predecessors in the current Helix contract emit
         // exactly one canonical v1 singleton. Missing, duplicate, malformed, or
@@ -25506,6 +25596,27 @@ pub const LinuxServer = struct {
         );
         self.inherited_mesh_redial_cursor = 0;
         self.inherited_event_history_restored = true;
+
+        // Prime the carried cross-mesh oper-grant registry at the same no-fail
+        // commit edge: fixed-capacity upserts of the pre-validated image cannot
+        // fail, and the io loop (the only place a peer's post-RESYNC grant
+        // re-mint is processed) has not started, so `applyMeshGrant` sees the
+        // converged `had_oper_override` state and never announces a false +Y
+        // transition. Merge (not replace): `loadGrants` may already have
+        // re-minted this node's own persisted grants with a fresh incarnation,
+        // and upsert keeps whichever is newest per account. Tombstones ride
+        // along, preserving the incarnation replay guard across the exec.
+        var oper_grants_restored: usize = 0;
+        if (oper_grant_checkpoint) |snap| {
+            self.grant_incarnation = @max(self.grant_incarnation, snap.mint_incarnation);
+            var grant_it = snap.iterator();
+            while (grant_it.next()) |g| {
+                _ = self.oper_grants.upsert(g);
+                oper_grants_restored += 1;
+            }
+        }
+        if (oper_grants_restored != 0)
+            srvLog("orochi: UPGRADE resume — primed {d} carried oper grant(s)\n", .{oper_grants_restored});
 
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
@@ -49474,6 +49585,14 @@ fn upgradeAttachmentDeliveryBytesForTest(pieces: []const helix_live.StatePiece) 
     return null;
 }
 
+fn upgradeOperGrantBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            oper_grant_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
 fn eventHistoryBytesForTest(
     allocator: std.mem.Allocator,
     history: *event_history_mod.EventHistory(512),
@@ -49689,6 +49808,146 @@ test "UPGRADE mandatory state round trip is exact and deterministic" {
     );
     current_reactor = null;
     try std.testing.expect(second_successor.relay_v2_outbox.contains(event_peer.shortId(), stable_relay_id));
+}
+
+test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, tombstones, incarnation)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    // The converged pre-upgrade registry: a remote oper's live grant (the state
+    // whose loss produced the spurious post-upgrade `+Y`) plus a revocation
+    // tombstone (the incarnation replay guard) and the mint high-water mark.
+    const now = predecessor.grantNowU64();
+    predecessor.grant_incarnation = now + 5;
+    const trev_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
+    _ = predecessor.oper_grants.upsert(.{
+        .account = "trev",
+        .privilege_bits = trev_bits,
+        .class = "netadmin",
+        .title = "Network Administrator",
+        .issuer_node = "ircx.us",
+        .incarnation = 100,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+    _ = predecessor.oper_grants.upsert(.{
+        .account = "revoked_oper",
+        .privilege_bits = 0,
+        .class = "revoked",
+        .title = "",
+        .issuer_node = "orochi.local",
+        .incarnation = 200,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    try std.testing.expect(upgradeOperGrantBytesForTest(pieces.items) != null);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "orochi-test-oper-grants");
+    current_reactor = null;
+
+    // The successor's registry converged BEFORE its io loop could process any
+    // peer grant re-mint: `applyMeshGrant` will see `had_oper_override=true`.
+    const g = successor.oper_grants.lookup("trev", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(trev_bits, g.privilege_bits);
+    try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
+    try std.testing.expectEqualStrings("netadmin", g.class);
+    try std.testing.expectEqualStrings("ircx.us", g.issuer_node);
+    try std.testing.expectEqual(@as(u64, 100), g.incarnation);
+    const tomb = successor.oper_grants.lookup("revoked_oper", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(@as(u64, 0), tomb.privilege_bits);
+    try std.testing.expectEqual(@as(u64, 200), tomb.incarnation);
+    // A stale pre-revocation re-mint still loses to the carried tombstone.
+    try std.testing.expectEqual(oper_cred_share.UpsertResult.stale_ignored, successor.oper_grants.upsert(.{
+        .account = "revoked_oper",
+        .privilege_bits = trev_bits,
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "orochi.local",
+        .incarnation = 150,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    }));
+    try std.testing.expect(successor.grant_incarnation >= now + 5);
+}
+
+test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor) adopts with an empty registry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    const now = predecessor.grantNowU64();
+    _ = predecessor.oper_grants.upsert(.{
+        .account = "trev",
+        .privilege_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "ircx.us",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+
+    // Model the PRIOR schema: an arena sealed by a pre-checkpoint binary simply
+    // has no oper-grant piece. It must still adopt — with an empty registry —
+    // never refuse (the roster-precedent tolerance, not a required singleton).
+    var legacy: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer legacy.deinit(alloc);
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and oper_grant_snapshot.isCheckpoint(piece.bytes)) continue;
+        try legacy.append(alloc, piece);
+    }
+    try std.testing.expectEqual(pieces.items.len - 1, legacy.items.len);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "orochi-test-oper-grants-legacy");
+    current_reactor = null;
+    try std.testing.expectEqual(@as(usize, 0), successor.oper_grants.count());
+    try std.testing.expectEqual(@as(u64, 0), successor.grant_incarnation);
 }
 
 test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drains FIFO once" {
@@ -52570,6 +52829,322 @@ test "UPGRADE completed secured mesh recv seals and resumes one continuous recor
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqualStrings("#after-upgrade", changes[0].channel);
     try std.testing.expectEqualStrings("AfterUpgrade", changes[0].nick);
+}
+
+/// Shared skeleton for the two RESYNC-re-burst tests below: converge a
+/// predecessor holding a remote OPER member (+o) in #root over a live secured
+/// pair, seal the link (v4 roster) + the mandatory state (OGNT grants), and
+/// adopt the link on a successor that has a local member `alice` in #root whose
+/// SendQ the tests then assert. Returns everything the caller needs; the caller
+/// decides whether to prime the grant registry (the fix vs the negative
+/// control).
+const ResyncQuietFixture = struct {
+    predecessor: *Server,
+    successor: *Server,
+    pair: *SessionReplayTestPair,
+    pieces: std.ArrayList(helix_live.StatePiece),
+    blobs: std.ArrayList([]u8),
+    sockets: [2]linux.fd_t,
+    alice: *ConnState,
+    resumed: *secured_s2s_link.SecuredLink,
+    grant_kp: std.crypto.sign.Ed25519.KeyPair,
+    op_status: u4,
+    now: u64,
+
+    const trev_ident = s2s_peer_mod.MemberIdentity{
+        .username = "trev",
+        .realname = "Trevor",
+        .host = "cloak.ircx.us",
+    };
+
+    fn init(alloc: std.mem.Allocator, pair: *SessionReplayTestPair) !ResyncQuietFixture {
+        const op_status: u4 = @truncate(chanmode.MemberModes.fromModes(&.{.op}).bits);
+
+        var predecessor = createTestServer(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .node_id = pair.ida.shortId(),
+            .server_name = "resync-quiet-a.test",
+            .node_identity = &pair.ida,
+            .crypto_io = std.testing.io,
+            .mesh_pass = "session-replay-secret",
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        errdefer {
+            predecessor.deinit();
+            alloc.destroy(predecessor);
+        }
+        current_reactor = &predecessor.reactors[0];
+
+        var sockets: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+            return error.SkipZigTest;
+        errdefer closeFd(sockets[1]);
+
+        const peer_id = try predecessor.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+        const peer_conn = predecessor.reactors[0].clients.get(peer_id).?;
+        peer_conn.overflow_allocator = alloc;
+        peer_conn.token = try tokenFromId(peer_id);
+        peer_conn.s2s_secured = &pair.a;
+
+        // Pre-upgrade convergence: the peer projects remote oper `trev` as an
+        // OP (+o) member of #root; the predecessor's route table converges and
+        // its (already-announced) transitions are consumed.
+        try pair.b.sendMembership("#root", "trev", op_status, 700, true, trev_ident, "");
+        const pre_wire = try alloc.dupe(u8, pair.b.outbound());
+        defer alloc.free(pre_wire);
+        pair.b.clearOutbound();
+        try pair.a.feed(pre_wire, 700);
+        pair.a.processDeferredResidenceFrames(700);
+        predecessor.discardIdentityTransitions(&pair.a);
+
+        // The converged pre-upgrade grant registry: trev's oper_override grant,
+        // exactly as `applyMeshGrant` stored it when the grant first arrived.
+        const now = predecessor.grantNowU64();
+        _ = predecessor.oper_grants.upsert(.{
+            .account = "trev",
+            .privilege_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+            .class = "netadmin",
+            .title = "",
+            .issuer_node = "resync-quiet-b.test",
+            .incarnation = 100,
+            .issued_ms = now,
+            .expiry_ms = now + Server.oper_grant_ttl_ms,
+        });
+
+        // Seal: the mandatory state (carries the OGNT grants piece) and the
+        // secured link (carries the v4 roster incl. trev's +o and hlc 700).
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        errdefer pieces.deinit(alloc);
+        var blobs: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (blobs.items) |blob| alloc.free(blob);
+            blobs.deinit(alloc);
+        }
+        try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+        try std.testing.expect(predecessor.sealSecuredLink(peer_conn, &pair.a, &pieces, &blobs));
+
+        // Transfer descriptor ownership exactly as execve would.
+        peer_conn.s2s_secured = null;
+        peer_conn.fd = -1;
+
+        var successor = createTestServer(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .node_id = pair.ida.shortId(),
+            .server_name = "resync-quiet-a.test",
+            .node_identity = &pair.ida,
+            .crypto_io = std.testing.io,
+            .mesh_pass = "session-replay-secret",
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        errdefer {
+            successor.deinit();
+            alloc.destroy(successor);
+        }
+        current_reactor = &successor.reactors[0];
+
+        // The successor's carried World image: alice (a local client whose view
+        // was preserved across the swap) in #root, with the topic the World
+        // capsule carries.
+        const alice_id = try addTestLocalClient(successor, "alice", null);
+        const alice = successor.connFor(alice_id).?;
+        alice.overflow_allocator = alloc;
+        alice.session.registration.registered = true;
+        _ = try successor.world.join("#root", worldIdFromClient(alice_id));
+        // Topic setter is trev (+o via the carried link roster): the receiver's
+        // +t defense resolves the setter across the combined projection, so a
+        // non-op setter would be rejected there and mask what these tests
+        // actually prove (the unchanged-re-affirmation dedup).
+        try successor.world.setTopic("#root", "stormy weather", "trev", 1234);
+
+        // Adopt the preserved link: primes the carried v4 roster (trev, +o,
+        // hlc 700) BEFORE any RESYNC processing.
+        const link_bytes = upgradePieceBytesForTest(pieces.items, .s2s_link) orelse
+            return error.TestUnexpectedResult;
+        const snap = try s2s_snapshot.decode(link_bytes, s2s_snapshot.schema_version);
+        try std.testing.expect(snap.roster_count != 0);
+        try std.testing.expect(successor.adoptInheritedS2sLink(snap, true) != null);
+        var resumed: ?*secured_s2s_link.SecuredLink = null;
+        var clients_it = successor.reactors[0].clients.iterator();
+        while (clients_it.next()) |entry| {
+            if (entry.value.fd == sockets[0]) resumed = entry.value.s2s_secured;
+        }
+
+        const grant_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+        return .{
+            .predecessor = predecessor,
+            .successor = successor,
+            .pair = pair,
+            .pieces = pieces,
+            .blobs = blobs,
+            .sockets = sockets,
+            .alice = alice,
+            .resumed = resumed orelse return error.TestUnexpectedResult,
+            .grant_kp = grant_kp,
+            .op_status = op_status,
+            .now = now,
+        };
+    }
+
+    /// Prime the successor's grant registry from the sealed OGNT piece — the
+    /// same decode + infallible upserts the adoption commit edge performs
+    /// (proven end-to-end by the arena-path adopt test above).
+    fn primeGrants(self: *ResyncQuietFixture) !void {
+        const bytes = upgradeOperGrantBytesForTest(self.pieces.items) orelse
+            return error.TestUnexpectedResult;
+        const gsnap = try oper_grant_snapshot.decodeCurrent(bytes);
+        self.successor.grant_incarnation = @max(self.successor.grant_incarnation, gsnap.mint_incarnation);
+        var it = gsnap.iterator();
+        while (it.next()) |g| _ = self.successor.oper_grants.upsert(g);
+    }
+
+    /// One signed grant re-mint for trev, as the peer's post-RESYNC opers burst
+    /// re-sends it: fresh (higher) incarnation, UNCHANGED privileges.
+    fn applyRemintedGrant(self: *ResyncQuietFixture, incarnation: u64, privilege_bits: u64) !bool {
+        var buf: [oper_cred_share.max_grant_len]u8 = undefined;
+        const n = try oper_cred_share.sign(self.grant_kp, .{
+            .account = "trev",
+            .privilege_bits = privilege_bits,
+            .class = "netadmin",
+            .title = "",
+            .issuer_node = "resync-quiet-b.test",
+            .incarnation = incarnation,
+            .issued_ms = self.now,
+            .expiry_ms = self.now + Server.oper_grant_ttl_ms,
+        }, &buf);
+        return self.successor.applyMeshGrant(buf[0..n], self.grant_kp.public_key.toBytes());
+    }
+
+    /// Feed one peer->successor burst and run the daemon drains, mirroring the
+    /// established-link drive order.
+    fn feedAndDrain(self: *ResyncQuietFixture, alloc: std.mem.Allocator, now_ms: u64) !void {
+        const wire = try alloc.dupe(u8, self.pair.b.outbound());
+        defer alloc.free(wire);
+        self.pair.b.clearOutbound();
+        if (wire.len != 0) try self.resumed.feed(wire, now_ms);
+        self.resumed.processDeferredResidenceFrames(now_ms);
+        self.successor.drainIdentityTransitions(self.resumed);
+        self.successor.drainChannelModeFlagChanges(self.resumed);
+        self.successor.drainTopicChanges(self.resumed);
+    }
+
+    fn deinit(self: *ResyncQuietFixture, alloc: std.mem.Allocator) void {
+        for (self.blobs.items) |blob| alloc.free(blob);
+        self.blobs.deinit(alloc);
+        self.pieces.deinit(alloc);
+        closeFd(self.sockets[1]);
+        self.successor.deinit();
+        alloc.destroy(self.successor);
+        self.predecessor.deinit();
+        alloc.destroy(self.predecessor);
+    }
+};
+
+test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero client-visible lines" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var fx = try ResyncQuietFixture.init(alloc, &pair);
+    defer fx.deinit(alloc);
+
+    // THE FIX under test: the carried grant registry is primed before any
+    // re-mint can be processed (arena-path adoption does this at its commit
+    // edge; the negative-control test below omits exactly this step).
+    try fx.primeGrants();
+
+    resetTestSendQ(fx.alice);
+
+    // The peer's post-RESYNC re-burst of UNCHANGED converged state: the same
+    // member (+o, fresh hlc), the same topic (fresh hlc — `sendTopicBurstTo`
+    // always stamps a fresh one), the same aggregate mode flags, and the
+    // re-minted oper grant (fresh incarnation, unchanged privileges).
+    fx.successor.world.lockWrite();
+    try pair.b.sendMembership("#root", "trev", fx.op_status, 900, true, ResyncQuietFixture.trev_ident, "");
+    try pair.b.sendTopic("#root", "stormy weather", "trev", 1234, 901, true);
+    try pair.b.sendChannelModeFlags("#root", fx.successor.channelModeFlagBits("#root"), 902);
+    try fx.feedAndDrain(alloc, 903);
+    try std.testing.expect(try fx.applyRemintedGrant(
+        101,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+    ));
+    fx.successor.world.unlockWrite();
+
+    // ZERO spurious client-visible lines for the unchanged member: no JOIN, no
+    // +Y/oper MODE, no member-mode MODE, no channel-mode MODE, no TOPIC, no
+    // NICK — alice's view was preserved across the swap and must stay silent.
+    const quiet = try copyTestSendQ(alloc, fx.alice);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings("", quiet);
+
+    // GENUINE changes after adoption still surface exactly once.
+    fx.successor.world.lockWrite();
+    const op_voice: u4 = @truncate(chanmode.MemberModes.fromModes(&.{ .op, .voice }).bits);
+    try pair.b.sendMembership("#root", "trev", op_voice, 950, true, ResyncQuietFixture.trev_ident, "kain");
+    try pair.b.sendTopic("#root", "calm seas", "trev", 2000, 951, true);
+    try fx.feedAndDrain(alloc, 952);
+    // Revocation tombstone: a genuine transition OUT of oper_override.
+    try std.testing.expect(try fx.applyRemintedGrant(102, 0));
+    fx.successor.world.unlockWrite();
+
+    const changed = try copyTestSendQ(alloc, fx.alice);
+    defer alloc.free(changed);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root +v trev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "TOPIC #root :calm seas") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root -Y trev") != null);
+    // Exactly once each.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "TOPIC #root"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "-Y trev"));
+    // And still no spurious re-JOIN anywhere in the whole exchange.
+    try std.testing.expect(std.mem.indexOf(u8, changed, "JOIN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "NICK") == null);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "+Y") == null);
+}
+
+test "UPGRADE resume negative control: without the carried grant registry the RESYNC re-mint re-announces +Y" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var fx = try ResyncQuietFixture.init(alloc, &pair);
+    defer fx.deinit(alloc);
+
+    // Deliberately DO NOT prime the grant registry (the pre-fix successor
+    // state), and model a pre-carry World by clearing the carried topic.
+    try fx.successor.world.setTopic("#root", "", "", 0);
+    resetTestSendQ(fx.alice);
+
+    fx.successor.world.lockWrite();
+    try pair.b.sendTopic("#root", "stormy weather", "trev", 1234, 901, true);
+    try fx.feedAndDrain(alloc, 903);
+    try std.testing.expect(try fx.applyRemintedGrant(
+        101,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+    ));
+    fx.successor.world.unlockWrite();
+
+    // The observed live bug reproduced: the unchanged oper's re-mint announces
+    // a spurious `MODE #root +Y trev`, and an un-carried topic re-announces —
+    // proving the quiet test above has teeth.
+    const noisy = try copyTestSendQ(alloc, fx.alice);
+    defer alloc.free(noisy);
+    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, noisy, "TOPIC #root :stormy weather") != null);
 }
 
 test "UPGRADE timer deferral still dispatches later recv CQE in copied batch" {

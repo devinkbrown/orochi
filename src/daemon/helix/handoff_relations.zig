@@ -19,6 +19,7 @@ const relay_v2_replay_guard = @import("../relay_v2_replay_guard.zig");
 const relay_v2_outbox = @import("../relay_v2_outbox.zig");
 const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 const mesh_redial = @import("mesh_redial.zig");
+const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 const monitor_capsule = @import("monitor_capsule.zig");
 const prop_checkpoint = @import("prop_checkpoint.zig");
 const s2s_snapshot = @import("s2s_snapshot.zig");
@@ -82,6 +83,8 @@ pub const Error = error{
     DuplicateMeshClock,
     MissingMeshClock,
     InvalidMeshClock,
+    DuplicateOperGrants,
+    InvalidOperGrants,
     UnknownMeshCheckpoint,
 };
 
@@ -99,6 +102,7 @@ pub const Summary = struct {
     relay_v2_event_log: usize = 0,
     attachment_delivery_spool: usize = 0,
     mesh_clock: usize = 0,
+    oper_grants: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -299,6 +303,13 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.mesh_clock = 1;
             continue;
         }
+        if (oper_grant_snapshot.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidOperGrants;
+            oper_grant_snapshot.validateCheckpoint(bytes) catch return error.InvalidOperGrants;
+            if (summary.oper_grants != 0) return error.DuplicateOperGrants;
+            summary.oper_grants = 1;
+            continue;
+        }
         if (item.header.min_supported != descriptor.min_supported)
             return error.UnknownMeshCheckpoint;
         if (session_replica.Store.isUpgradeCheckpoint(bytes)) continue;
@@ -320,6 +331,14 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
     if (summary.relay_v2_event_log != 1) return error.MissingRelayV2EventLog;
     if (summary.attachment_delivery_spool != 1) return error.MissingAttachmentDeliverySpool;
     if (summary.mesh_clock != 1) return error.MissingMeshClock;
+    // `oper_grants` is deliberately AT-MOST-once, not required: an arena sealed
+    // by a pre-checkpoint predecessor simply lacks the piece and must still
+    // adopt (empty registry = the exact pre-checkpoint behavior), mirroring how
+    // a pre-v4 `.s2s_link` capsule adopts with an empty roster. Requiring it
+    // would turn the FIRST post-introduction USR2 into a whole-handoff refusal
+    // — dropping every preserved link/client, the regression class this piece
+    // exists to prevent. Present-but-malformed/duplicate still fails closed
+    // above, and a downgraded successor refuses the unknown discriminator.
     return summary;
 }
 
@@ -1111,4 +1130,93 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
     try std.testing.expectError(error.InvalidAttachmentDeliverySpool, validateCurrent(&.{corrupt_cap}, &.{}));
+}
+
+test "current handoff relations validate the at-most-once oper-grant checkpoint" {
+    const allocator = std.testing.allocator;
+    const oper_cred_share = @import("../../proto/oper_cred_share.zig");
+
+    // The six required singletons; the grants piece rides beside them.
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    var event_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_replay }};
+    var event_cap = capsule.make(.mesh_checkpoint, &event_field);
+    event_cap.header.min_supported = 2;
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    var relay_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_replay }};
+    var relay_cap = capsule.make(.mesh_checkpoint, &relay_field);
+    relay_cap.header.min_supported = 2;
+    const relay_outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(relay_outbox);
+    var outbox_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_outbox }};
+    var outbox_cap = capsule.make(.mesh_checkpoint, &outbox_field);
+    outbox_cap.header.min_supported = 2;
+    const relay_event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(relay_event_log);
+    var event_log_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_event_log }};
+    var event_log_cap = capsule.make(.mesh_checkpoint, &event_log_field);
+    event_log_cap.header.min_supported = 2;
+    const attachment = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment);
+    var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
+    var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
+    attachment_cap.header.min_supported = 2;
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+    var clock_field: [1]capsule.Field = undefined;
+    const clock_cap = testMeshClockCap(&clock, &clock_field);
+
+    var reg = oper_cred_share.Registry.init();
+    _ = reg.upsert(.{
+        .account = "trev",
+        .privilege_bits = 1,
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "ircx.us",
+        .incarnation = 7,
+        .issued_ms = 1,
+        .expiry_ms = 1_000,
+    });
+    const grants = try oper_grant_snapshot.encodeFromRegistry(allocator, &reg, 0, 9);
+    defer allocator.free(grants);
+    try std.testing.expect(oper_grant_snapshot.isCheckpoint(grants));
+    var grants_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = grants }};
+    var grants_cap = capsule.make(.mesh_checkpoint, &grants_field);
+    grants_cap.header.min_supported = 2;
+
+    // Present once: accepted and counted.
+    const with = try validateCurrent(
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap, grants_cap },
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), with.oper_grants);
+
+    // ABSENT is legal: a pre-checkpoint predecessor's arena still adopts
+    // (empty registry = pre-checkpoint behavior). No Missing error.
+    const without = try validateCurrent(
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap },
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), without.oper_grants);
+
+    // Duplicate is ambiguous authority.
+    try std.testing.expectError(error.DuplicateOperGrants, validateCurrent(
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap, grants_cap, grants_cap },
+        &.{},
+    ));
+
+    // Malformed body with the right magic fails closed (declared count 2 with
+    // only one record present walks off the end).
+    const corrupt = try allocator.dupe(u8, grants);
+    defer allocator.free(corrupt);
+    std.mem.writeInt(u32, corrupt[oper_grant_snapshot.magic.len + 1 + 8 ..][0..4], 2, .little);
+    var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
+    var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
+    corrupt_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidOperGrants, validateCurrent(&.{corrupt_cap}, &.{}));
+
+    // A downgraded (min=1) header on this exact state piece fails closed.
+    var weak_cap = grants_cap;
+    weak_cap.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidOperGrants, validateCurrent(&.{weak_cap}, &.{}));
 }
