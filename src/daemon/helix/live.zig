@@ -17,6 +17,17 @@ const supervisor = @import("supervisor.zig");
 
 const linux = std.os.linux;
 
+/// Hard ceiling on the inherited state-arena size read by `readArena`, before the
+/// capsule stream is even validated. The arena is produced by the prior binary
+/// (the trust boundary), so a corrupt/buggy predecessor image — or a non-memfd fd
+/// that never EOFs — must not be able to OOM the successor by claiming an
+/// unbounded size. The bound comfortably exceeds the sum of the mandatory
+/// checkpoint caps (prop 512 MiB + history 136 MiB + world/search 64 MiB each +
+/// event 8 MiB) plus a very large per-client capsule population, so it never
+/// rejects a legitimate handoff for orochi's scale while still fail-closing an
+/// absurd one.
+pub const max_arena_bytes: usize = 2 * 1024 * 1024 * 1024;
+
 /// One unit of state to carry across the upgrade, already serialized by the caller.
 pub const StatePiece = struct {
     kind: capsule.CapsuleKind,
@@ -634,6 +645,9 @@ pub fn readArena(allocator: std.mem.Allocator, arena_fd: handoff.Fd) anyerror![]
             .SUCCESS => {
                 const n: usize = @intCast(rc);
                 if (n == 0) break; // EOF
+                // Fail closed before growing past the ceiling so a corrupt or
+                // never-EOFing inherited fd cannot OOM the successor pre-validation.
+                if (buf.items.len + n > max_arena_bytes) return error.ArenaTooLarge;
                 try buf.appendSlice(allocator, tmp[0..n]);
                 off += n;
             },

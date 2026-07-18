@@ -5835,10 +5835,11 @@ pub const LinuxServer = struct {
             }
         }
         self.maybeRunBackups();
-        // Event Spine history snapshot, gated to reactor 0 (writeFileAbs is not
-        // atomic, so a single writer avoids interleaved writes) and throttled to
-        // the stats cadence. The ring is shared across reactors, so reactor 0's
-        // snapshot captures events raised on every shard.
+        // Event Spine history snapshot, gated to reactor 0 (the ring is shared
+        // across reactors, so a single writer avoids N redundant concurrent
+        // snapshots racing the same target) and throttled to the stats cadence.
+        // The write itself is atomic (tmp+rename, see `saveEventHistory`), and
+        // reactor 0's snapshot captures events raised on every shard.
         if (self.config.event_history_path.len != 0 and self.rx() == &self.reactors[0]) {
             const enow = self.nowMs();
             if (self.event_history_last_write_ms == 0 or enow - self.event_history_last_write_ms >= self.config.stats_interval_ms) {
@@ -9059,47 +9060,28 @@ pub const LinuxServer = struct {
         while (off < bytes.len) {
             const end = @min(off + deliver_handle.max_bytes, bytes.len);
             const chunk = bytes[off..end];
-            // Retry acquire on momentary pool exhaustion; the target drains
-            // continuously so a buffer frees shortly. Bounded so a wedged target
-            // cannot spin this forever. Per-shard pools size each pool to its
-            // inbox, so an exhausted pool means the inbox is (near) full too — the
-            // full-inbox wake below is what unsticks both.
-            var spins: usize = 0;
-            const buf = while (true) {
-                if (fabric.acquire(id.shard, chunk)) |b| break b;
-                if (spins == 0) self.wakeShard(id.shard); // nudge the target to drain
-                spins += 1;
-                if (spins > 4096) {
-                    // A prior chunk may already be in the mailbox. Poison makes
-                    // that partial stream terminal before later bytes overtake it.
-                    const outcome = self.poisonDeliveryGeneration(id);
-                    self.noteCrossShardDrop(fabric, 1);
-                    return outcome;
-                }
-                std.atomic.spinLoopHint();
+            // Poison on the FIRST acquire failure, matching `enqueueCloseOnOwner`.
+            // The only paths that free a `DeliverBuf` / inbox slot run under the
+            // same `world.lockWrite` this sender holds, so a retry-spin here can
+            // never succeed — it only burns cycles and stalls every other reactor
+            // on that lock (an overload amplifier to a wedged shard). A prior chunk
+            // may already be in the mailbox; poison makes that partial stream
+            // terminal so later bytes cannot overtake it.
+            const buf = fabric.acquire(id.shard, chunk) orelse {
+                const outcome = self.poisonDeliveryGeneration(id);
+                self.noteCrossShardDrop(fabric, 1);
+                return outcome;
             };
-            // Likewise retry a full inbox briefly, then drop to avoid a stall. On
-            // the first full observation wake the owning reactor so it drains and
-            // frees a slot (this is the safety valve that keeps a deferred/batched
-            // wake from wedging a large single-shard fan-out).
-            var pushed = false;
-            var psp: usize = 0;
             const is_last = opts.close_after and end == bytes.len;
-            while (psp < 4096) : (psp += 1) {
-                if (fabric.sendTo(id.shard, .{
-                    .to = id,
-                    .buf = buf,
-                    .close_after = is_last,
-                    .close_reason = opts.close_reason,
-                    .preframed_secure = opts.preframed_secure,
-                })) {
-                    pushed = true;
-                    break;
-                }
-                if (psp == 0) self.wakeShard(id.shard);
-                std.atomic.spinLoopHint();
-            }
-            if (!pushed) {
+            if (!fabric.sendTo(id.shard, .{
+                .to = id,
+                .buf = buf,
+                .close_after = is_last,
+                .close_reason = opts.close_reason,
+                .preframed_secure = opts.preframed_secure,
+            })) {
+                // Same rationale: the inbox drains only under the world lock this
+                // sender holds, so poison on the first full-inbox observation.
                 fabric.release(id.shard, buf);
                 const outcome = self.poisonDeliveryGeneration(id);
                 self.noteCrossShardDrop(fabric, 1);
@@ -24104,12 +24086,18 @@ pub const LinuxServer = struct {
     pub fn adoptInheritedSessions(self: *LinuxServer) error{InvalidInheritedHandoff}!void {
         if (comptime builtin.os.tag != .linux) return;
         const arena_fd = self.config.resume_arena_fd orelse {
-            // A state-fd manifest without its arena is an incomplete handoff.
-            // Close a trustworthy exact set. A malformed/colliding list is
-            // startup-fatal because guessing at numeric fds is unsafe.
+            // A state-fd manifest without its arena is an incomplete handoff. A
+            // malformed/colliding list is startup-fatal because guessing at
+            // numeric fds is unsafe (the kernel closes the whole table on exit).
+            // A TRUSTED exact list is recoverable: we can close precisely the
+            // named descriptors and cold-boot with the process still up — but that
+            // silently downgrades a hot upgrade to a cold boot, so LOG it loudly
+            // (this branch is an anomaly: the predecessor should always seal the
+            // arena alongside the manifest, so a missing arena means a bug there).
             if (self.config.inherited_state_fd_manifest_present) {
                 if (!self.inheritedStateFdManifestTrusted(-1))
                     return error.InvalidInheritedHandoff;
+                srvLog("orochi: UPGRADE resume DOWNGRADED to cold boot — state-fd manifest present but sealed arena fd absent; closing {d} carried descriptor(s) and booting fresh\n", .{self.config.inherited_state_fds.len});
                 _ = self.closeInheritedStateFdManifest(-1);
             }
             return;
@@ -24505,7 +24493,14 @@ pub const LinuxServer = struct {
         var projected_client_index: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .clients) continue;
-            const snap = session_snapshot.decodeCurrent(c.fields[0].bytes) catch unreachable;
+            // An identical decode already succeeded in the counting loop above, so
+            // this is dead in practice — but never assert `unreachable` on
+            // inherited bytes: propagate into the existing transactional abort so
+            // any drift between the two passes fails closed instead of panicking.
+            const snap = session_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed client snapshot in World relation projection");
+                return error.InvalidInheritedHandoff;
+            };
             if (snap.fd < 0) {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid client fd in World relation projection");
                 return error.InvalidInheritedHandoff;
@@ -24977,20 +24972,27 @@ pub const LinuxServer = struct {
         defer tls_snaps.deinit(self.allocator);
         for (caps) |c| {
             if (c.header.kind != .tls_session) continue;
+            // Rolling-compatible like `.s2s_link`: a pre-bump predecessor stamps a
+            // lower version (the flag-widened-but-still-v1 TLS blob), so negotiate
+            // the header and decode per version rather than pinning current —
+            // pinning would `Truncated → whole-handoff abort` (netsplit) on the
+            // first USR2 from such a predecessor.
             const descriptor = helix_capsule.descriptor(.tls_session);
-            if (c.header.schema_id != descriptor.schema_id or
-                c.header.version != descriptor.current_version or
-                c.header.min_supported != descriptor.min_supported or
-                c.header.max_supported != descriptor.max_supported or
+            const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — incompatible TLS-session capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            };
+            if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current TLS-session capsule\n", .{});
+                srvLog("orochi: UPGRADE resume fatal — noncanonical TLS-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
-            const ts = tls_snapshot.decodeCurrent(c.fields[0].bytes) catch |e| {
+            const ts = tls_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid current TLS-session checkpoint ({s})\n", .{@errorName(e)});
+                srvLog("orochi: UPGRADE resume fatal — invalid TLS-session checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (ts.fd < 0) {
@@ -25017,20 +25019,26 @@ pub const LinuxServer = struct {
         defer ws_snaps.deinit(self.allocator);
         for (caps) |c| {
             if (c.header.kind != .ws_session) continue;
+            // Rolling-compatible: the descriptor advertises `min_supported = 1`, so
+            // negotiate + decode per version rather than pin current (tightening
+            // instead would refuse the currently-deployed predecessor's own
+            // capsule — sealed with `min_supported = 1` — and netsplit the deploy).
             const descriptor = helix_capsule.descriptor(.ws_session);
-            if (c.header.schema_id != descriptor.schema_id or
-                c.header.version != descriptor.current_version or
-                c.header.min_supported != descriptor.min_supported or
-                c.header.max_supported != descriptor.max_supported or
+            const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — incompatible WebSocket-session capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            };
+            if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current WebSocket-session capsule\n", .{});
+                srvLog("orochi: UPGRADE resume fatal — noncanonical WebSocket-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
-            const wss = ws_snapshot.decodeCurrent(c.fields[0].bytes) catch |e| {
+            const wss = ws_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid current WebSocket-session checkpoint ({s})\n", .{@errorName(e)});
+                srvLog("orochi: UPGRADE resume fatal — invalid WebSocket-session checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (wss.fd < 0 or !wss.phase_open) {
@@ -25346,10 +25354,11 @@ pub const LinuxServer = struct {
         // Pass 2c: restore the account-level multi-session/bouncer registry
         // from the carried `.sessions` capsules (one per account). Runs AFTER
         // Pass 2 so an attached session can re-join its adopted connection by
-        // inherited fd — the same join key the TLS/WS capsules use. Undecodable
-        // capsules are skipped (that account's sessions die, the pre-fix
-        // behavior); each account applies atomically (all-or-nothing), so a
-        // fault never leaves a torn subset of an account's sessions.
+        // inherited fd — the same join key the TLS/WS capsules use. An
+        // undecodable capsule is FATAL to the whole handoff (a transactional
+        // abort, not a silent skip); each account otherwise applies atomically
+        // (all-or-nothing), so a fault never leaves a torn subset of an
+        // account's sessions.
         var session_accounts: usize = 0;
         var sessions_restored: usize = 0;
         var detached_session_seq: u64 = 0;
@@ -25377,15 +25386,23 @@ pub const LinuxServer = struct {
         };
         for (caps) |c| {
             if (c.header.kind != .sessions) continue;
+            // Rolling-compatible: the descriptor advertises `min_supported = 1`, so
+            // negotiate + decode per version rather than pin current (tightening
+            // instead would refuse the currently-deployed predecessor's capsule —
+            // sealed `min_supported = 1` — and netsplit the deploy). The current
+            // version uses the strict `decodeCurrent` (current state stays
+            // fail-closed); a genuine legacy version uses the version-aware `decode`.
             const descriptor = helix_capsule.descriptor(.sessions);
-            if (c.header.schema_id != descriptor.schema_id or
-                c.header.version != descriptor.current_version or
-                c.header.min_supported != descriptor.min_supported or
-                c.header.max_supported != descriptor.max_supported or
+            const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("orochi: UPGRADE resume fatal — incompatible session-registry capsule\n", .{});
+                return error.InvalidInheritedHandoff;
+            };
+            if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current session-registry capsule\n", .{});
+                srvLog("orochi: UPGRADE resume fatal — noncanonical session-registry capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const count = session_capsule.peekSessionCount(c.fields[0].bytes) catch |e| {
@@ -25402,7 +25419,10 @@ pub const LinuxServer = struct {
                 return error.InvalidInheritedHandoff;
             };
             defer self.allocator.free(entries);
-            const cap = session_capsule.SessionCapsule.decodeCurrent(c.fields[0].bytes, entries) catch |e| {
+            const cap = (if (c.header.version == descriptor.current_version)
+                session_capsule.SessionCapsule.decodeCurrent(c.fields[0].bytes, entries)
+            else
+                session_capsule.SessionCapsule.decode(c.fields[0].bytes, entries)) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
                 srvLog("orochi: UPGRADE resume fatal — invalid session-registry checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
@@ -25464,6 +25484,17 @@ pub const LinuxServer = struct {
             // already consumed above. Once identified, the row and its outer
             // wrapper are exact — trailing bytes, a zero port, or an evolvable
             // wrapper cannot silently turn a live hand-dial into a dropped peer.
+            //
+            // L9 robustness note: this `continue` is NOT a silent-loss path for an
+            // UNKNOWN discriminator. `handoff_relations.validateCurrent` (run at
+            // adoptInheritedSessions entry, before any adoption) already rejected
+            // the whole handoff fail-closed with `UnknownMeshCheckpoint` for any
+            // mesh_checkpoint row whose magic matches none of the known families
+            // (handoff_relations.zig — the `!mesh_redial.isCurrent` arm). So by
+            // here every row is a KNOWN discriminator; this only skips the ones
+            // already consumed by their own earlier passes. A future sealer-side
+            // magic added WITHOUT teaching validateCurrent about it is the single
+            // maintenance point that keeps this guarantee — keep that arm in sync.
             if (c.fields.len != 1 or c.fields[0].ordinal != 1 or
                 !mesh_redial.isCurrent(c.fields[0].bytes)) continue;
             const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
@@ -25613,16 +25644,25 @@ pub const LinuxServer = struct {
         // and upsert keeps whichever is newest per account. Tombstones ride
         // along, preserving the incarnation replay guard across the exec.
         var oper_grants_restored: usize = 0;
+        var oper_grants_dropped: usize = 0;
         if (oper_grant_checkpoint) |snap| {
             self.grant_incarnation = @max(self.grant_incarnation, snap.mint_incarnation);
             var grant_it = snap.iterator();
             while (grant_it.next()) |g| {
-                _ = self.oper_grants.upsert(g);
-                oper_grants_restored += 1;
+                switch (self.oper_grants.upsert(g)) {
+                    .inserted, .superseded => oper_grants_restored += 1,
+                    // A full fixed-capacity registry silently drops a new-account
+                    // grant (and its revocation tombstone, carried in the same
+                    // record). Never swallow that — a lost cross-mesh grant means a
+                    // stale +Y verdict after the swap.
+                    .stale_ignored => oper_grants_dropped += 1,
+                }
             }
         }
         if (oper_grants_restored != 0)
             srvLog("orochi: UPGRADE resume — primed {d} carried oper grant(s)\n", .{oper_grants_restored});
+        if (oper_grants_dropped != 0)
+            srvLog("orochi: UPGRADE resume — WARNING: dropped {d} carried oper grant(s) (registry capacity exhausted or superseded); a cross-mesh grant/revocation may be lost\n", .{oper_grants_dropped});
 
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
@@ -33467,10 +33507,18 @@ pub const LinuxServer = struct {
     /// cadence so at most one interval of events is lost across a restart.
     fn saveEventHistory(self: *LinuxServer) void {
         if (self.config.event_history_path.len == 0) return;
+        // Atomic write (tmp+rename): a SIGKILL/power-loss mid-write must not leave
+        // a truncated snapshot behind the loader's exact-length framing. Requires
+        // the same `crypto_io` the loader uses; symmetric with `loadEventHistory`,
+        // which already no-ops without it (so persistence is off either way).
+        const io = self.config.crypto_io orelse return;
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
         self.event_history.serializeInto(&aw.writer) catch return;
-        writeFileAbs(self.allocator, self.config.event_history_path, aw.written());
+        const path = self.config.event_history_path;
+        const dir = std.fs.path.dirname(path) orelse ".";
+        const name = std.fs.path.basename(path);
+        chanstats_mod.writeFileAtomicIo(io, dir, name, aw.written());
     }
 
     // --- Account command family (Phase 2) ----------------------------------

@@ -55,10 +55,13 @@
 //! but arrives without a decodable TLS-engine capsule is DROPPED, never adopted as
 //! plaintext — a secured socket must never silently fall back to cleartext. It is
 //! APPEND-ONLY: a capsule from a pre-flag build omits it and decodes to
-//! `was_secured = false`, which is exactly the historical (never-drop) behavior.
-//! Because this grows the `.clients` payload, the `.clients` capsule descriptor is
-//! bumped to `current_version = 2` (`min_supported = 1` still adopts old capsules;
-//! see helix/capsule.zig) and `decode` reads the byte tolerantly.
+//! `was_secured = false` under the tolerant `decode`, which is exactly the
+//! historical (never-drop) behavior. This field was introduced as `.clients`
+//! schema v2; the `.clients` descriptor has since advanced to an EXACT current
+//! contract (`current_version = min_supported = max_supported = 5`, see
+//! helix/capsule.zig), so current adoption uses the strict `decodeCurrent` and a
+//! rollback is a cold restart. The tolerant `decode` that reads this byte
+//! optionally survives only for explicit legacy/test fixtures.
 //!
 //! The session-token block (OPTIONAL, `[u8 tlen][tlen bytes]`, written last — past
 //! the secured flag) carries the client's 16-byte multi-session reclaim token so a
@@ -355,7 +358,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                         if (p + m <= r.buf.len) {
                             dst.* = r.buf[p .. p + m];
                             p += m;
-                        }
+                        } else p = r.buf.len; // malformed length → stop (match caps arm)
                     }
                 }
                 // Trailing username block (past the oper grant).
@@ -365,7 +368,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                     if (p + ul <= r.buf.len) {
                         username = r.buf[p .. p + ul];
                         p += ul;
-                    }
+                    } else p = r.buf.len; // malformed length → stop (match caps arm)
                 }
                 // Trailing secured-flag byte (past the username block). Gated on a
                 // byte remaining so a pre-flag (v1) capsule defaults it to false.
@@ -832,6 +835,47 @@ test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absen
 test "decode rejects a truncated buffer" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 5, 0, 'a' })); // claims 5, has 1
     try testing.expectError(error.Truncated, decode(&[_]u8{0})); // first length cut off
+}
+
+test "tolerant decode stops the tail walk on an over-long oper-grant length" {
+    // L6: the oper_class/oper_title/username arms must STOP the tail walk on an
+    // over-long length (like the caps arm), never leave the cursor misaligned and
+    // keep reading the following blocks from shifted bytes. Encode a full tail,
+    // then corrupt the oper_class length prefix to overrun the buffer.
+    const allocator = testing.allocator;
+    const token16 = "0123456789abcdef";
+    const bytes = try encode(allocator, .{
+        .nick = "kain",
+        .is_oper = true,
+        .caps = "sasl",
+        .oper_priv_bits = 0x140,
+        .oper_class = "UNIQ_OPER_CLASS_MARKER",
+        .oper_title = "UNIQ_OPER_TITLE_MARKER",
+        .username = "kainuser",
+        .was_secured = true,
+        .session_token = token16,
+    });
+    defer allocator.free(bytes);
+
+    const corrupt = try allocator.dupe(u8, bytes);
+    defer allocator.free(corrupt);
+    // The 2-byte little-endian oper_class length sits immediately before the
+    // oper_class string; overrun it far past the buffer end.
+    const class_at = std.mem.indexOf(u8, corrupt, "UNIQ_OPER_CLASS_MARKER").?;
+    std.mem.writeInt(u16, corrupt[class_at - 2 ..][0..2], 0xFFFF, .little);
+
+    const got = try decode(corrupt);
+    // The walk stops at the malformed length: oper_class and every FOLLOWING
+    // optional block default cleanly rather than reading misaligned bytes.
+    try testing.expectEqual(@as(usize, 0), got.oper_class.len);
+    try testing.expectEqual(@as(usize, 0), got.oper_title.len);
+    try testing.expectEqual(@as(usize, 0), got.username.len);
+    try testing.expect(!got.was_secured); // NOT read from a shifted cursor
+    try testing.expectEqual(@as(usize, 0), got.session_token.len);
+    // The blocks BEFORE the corruption still parse.
+    try testing.expectEqualStrings("kain", got.nick);
+    try testing.expectEqualStrings("sasl", got.caps);
+    try testing.expectEqual(@as(u64, 0x140), got.oper_priv_bits);
 }
 
 test "session_snapshot was_secured round-trips across an upgrade (true and false)" {

@@ -33,10 +33,17 @@ const tls_conn = @import("../tls_conn.zig");
 const tls_server = @import("../../crypto/tls_server.zig");
 const tls12_server = @import("../../crypto/tls12_server.zig");
 
-pub const Error = error{ Truncated, TrailingBytes, InvalidFlags, BadCertfp, TooLong, BadEngine, BadLength };
+pub const Error = error{ Truncated, TrailingBytes, InvalidFlags, BadCertfp, TooLong, BadEngine, BadLength, UnsupportedVersion };
 
 const engine_tls13: u8 = 1;
 const engine_tls12: u8 = 2;
+
+/// Current `.tls_session` capsule schema version whose blob layout `encode`
+/// writes. The blob carries no inline version — it rides the capsule header — so
+/// this MIRRORS the descriptor in `capsule.zig`; bump both together. v2 makes the
+/// trailing kTLS-offload flag bytes mandatory; v1 tolerates them being absent OR
+/// present (see `decode`).
+pub const schema_version: u16 = 2;
 
 const Secret13 = @FieldType(tls_server.Server.ResumeState, "client_app_secret");
 const Keys12 = @FieldType(tls12_server.Server.ResumeState, "keys");
@@ -116,20 +123,30 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     return out.toOwnedSlice(allocator);
 }
 
-/// Decode a snapshot; byte-slice fields borrow `bytes`.
-pub fn decode(bytes: []const u8) Error!Snapshot {
-    return decodeInternal(bytes, false);
+/// Decode a snapshot sealed at capsule `version` (the `.tls_session` capsule
+/// header version). Byte-slice fields borrow `bytes`.
+///
+/// v1 is the value stamped by BOTH a genuine pre-kTLS predecessor (the blob ends
+/// at the certfp, with no flag bytes) AND the flag-widened-but-not-yet-version-
+/// bumped predecessor (two trailing kTLS-offload flag bytes) — the encoder gained
+/// the flags before this version was bumped, so a v1 blob may or may not carry
+/// them. The v1 arm therefore tolerates the flags being absent OR present (a
+/// present flag must still be canonical). v2 makes both flags mandatory, ending
+/// the length ambiguity for every future layout change. Every supported version
+/// stays otherwise strict: canonical certfp and exact EOF are required. Any
+/// version outside 1..2 is rejected fail-closed.
+pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
+    return decodeInternal(bytes, version);
 }
 
-/// Decode the exact payload emitted by the current encoder. Unlike the legacy
-/// compatibility decoder, both kTLS flag bytes are mandatory booleans, trailing
-/// bytes are rejected, and a present certificate fingerprint must be canonical
-/// lowercase SHA-256 hex.
+/// Decode exactly the current schema (`schema_version`) emitted by `encode`:
+/// both kTLS flag bytes mandatory, trailing bytes rejected, and a present
+/// certificate fingerprint must be canonical lowercase SHA-256 hex.
 pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
-    return decodeInternal(bytes, true);
+    return decodeInternal(bytes, schema_version);
 }
 
-fn decodeInternal(bytes: []const u8, strict_current: bool) Error!Snapshot {
+fn decodeInternal(bytes: []const u8, version: u16) Error!Snapshot {
     var r = Reader{ .buf = bytes };
     const fd = try r.int(i32);
     const engine = try r.byte();
@@ -177,24 +194,42 @@ fn decodeInternal(bytes: []const u8, strict_current: bool) Error!Snapshot {
     const certfp = try r.take(try r.byte());
     var tx_offloaded = false;
     var rx_offloaded = false;
-    if (strict_current) {
-        const tx = try r.byte();
-        const rx = try r.byte();
-        if (tx > 1 or rx > 1) return error.InvalidFlags;
-        tx_offloaded = tx == 1;
-        rx_offloaded = rx == 1;
-        if (r.pos != r.buf.len) return error.TrailingBytes;
-        if (certfp.len != 0) {
-            if (certfp.len != 64) return error.BadCertfp;
-            for (certfp) |byte| {
-                if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')))
-                    return error.BadCertfp;
+    switch (version) {
+        1 => {
+            // Legacy v1: the two kTLS flag bytes are absent (genuine pre-kTLS) OR
+            // present (a flag-widened predecessor that never bumped the version).
+            // Tolerate both; a present flag must still be a canonical boolean.
+            if (r.pos < r.buf.len) {
+                const tx = try r.byte();
+                if (tx > 1) return error.InvalidFlags;
+                tx_offloaded = tx == 1;
             }
+            if (r.pos < r.buf.len) {
+                const rx = try r.byte();
+                if (rx > 1) return error.InvalidFlags;
+                rx_offloaded = rx == 1;
+            }
+        },
+        schema_version => {
+            const tx = try r.byte();
+            const rx = try r.byte();
+            if (tx > 1 or rx > 1) return error.InvalidFlags;
+            tx_offloaded = tx == 1;
+            rx_offloaded = rx == 1;
+        },
+        // MAINTENANCE TRAP — a future schema bump that keeps `min_supported = 1`
+        // in the capsule descriptor MUST add an explicit arm for EVERY still-
+        // accepted version, or that version's TLS sidecars silently drop across
+        // the upgrade (the exact field-shift/netsplit class this switch prevents).
+        else => return error.UnsupportedVersion,
+    }
+    if (r.pos != r.buf.len) return error.TrailingBytes;
+    if (certfp.len != 0) {
+        if (certfp.len != 64) return error.BadCertfp;
+        for (certfp) |byte| {
+            if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')))
+                return error.BadCertfp;
         }
-    } else {
-        // Trailing kTLS offload flags; absent in older snapshots ⇒ not offloaded.
-        tx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
-        rx_offloaded = if (r.pos < r.buf.len) (try r.byte()) != 0 else false;
     }
     return .{ .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx_offloaded, .rx_offloaded = rx_offloaded };
 }
@@ -254,7 +289,7 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
     });
     defer allocator.free(bytes);
 
-    const got = try decode(bytes);
+    const got = try decode(bytes, schema_version);
     try testing.expectEqual(@as(i32, 42), got.fd);
     const g13 = got.state.engine.tls13;
     try testing.expectEqual(@as(u16, 0x1301), g13.suite);
@@ -268,11 +303,21 @@ test "tls13 snapshot round-trips fd, suite, secrets, seqs, pending + certfp" {
     try testing.expect(got.tx_offloaded);
     try testing.expect(got.rx_offloaded);
 
-    // Tolerant decode: a snapshot missing the trailing kTLS flags (an older
-    // encoder) decodes as not-offloaded rather than erroring.
-    const legacy = try decode(bytes[0 .. bytes.len - 2]);
-    try testing.expect(!legacy.tx_offloaded);
-    try testing.expect(!legacy.rx_offloaded);
+    // Cross-version (a): a genuine pre-kTLS v1 blob ends at the certfp with NO
+    // flag bytes; the v1 arm decodes it as not-offloaded rather than erroring.
+    const v1_no_flags = try decode(bytes[0 .. bytes.len - 2], 1);
+    try testing.expect(!v1_no_flags.tx_offloaded);
+    try testing.expect(!v1_no_flags.rx_offloaded);
+
+    // Cross-version (b) — the netsplit guard: the CURRENTLY-DEPLOYED predecessor
+    // seals the flag-BEARING layout while still stamping v1. Decoding that exact
+    // blob as v1 must read the flags (not reject them as trailing bytes), so the
+    // next USR2 into a v2 binary adopts the link instead of dropping it.
+    const v1_with_flags = try decode(bytes, 1);
+    try testing.expect(v1_with_flags.tx_offloaded);
+    try testing.expect(v1_with_flags.rx_offloaded);
+    try testing.expectEqual(@as(i32, 42), v1_with_flags.fd);
+    try testing.expectEqualStrings(&repeatBytes("ab", 32), v1_with_flags.certfp);
 }
 
 test "tls12 snapshot round-trips key material and seqs" {
@@ -294,7 +339,7 @@ test "tls12 snapshot round-trips key material and seqs" {
     });
     defer allocator.free(bytes);
 
-    const got = try decode(bytes);
+    const got = try decode(bytes, schema_version);
     try testing.expectEqual(@as(i32, 7), got.fd);
     const g12 = got.state.engine.tls12;
     try testing.expectEqual(@as(u16, 0xc02b), g12.suite);
@@ -308,10 +353,25 @@ test "tls12 snapshot round-trips key material and seqs" {
     try testing.expectEqual(@as(usize, 0), got.certfp.len);
 }
 
-test "decode rejects truncation and unknown engines" {
-    try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }));
+test "decode rejects truncation, unknown engines, and unknown versions" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }, schema_version));
     // fd(4) + engine byte 9 = unknown.
-    try testing.expectError(error.BadEngine, decode(&[_]u8{ 1, 0, 0, 0, 9, 0x01, 0x13 }));
+    try testing.expectError(error.BadEngine, decode(&[_]u8{ 1, 0, 0, 0, 9, 0x01, 0x13 }, schema_version));
+    // A full, valid v2 blob decoded under a too-new (or zero) version reaches the
+    // version switch and is rejected fail-closed — a layout this binary cannot
+    // parse.
+    const s13 = tls_server.Server.ResumeState{
+        .suite = 0x1301,
+        .client_app_secret = @splat(1),
+        .server_app_secret = @splat(2),
+        .app_read_seq = 0,
+        .app_write_seq = 0,
+    };
+    const bytes = try encode(allocator, .{ .fd = 5, .state = .{ .engine = .{ .tls13 = s13 } } });
+    defer allocator.free(bytes);
+    try testing.expectError(error.UnsupportedVersion, decode(bytes, schema_version + 1));
+    try testing.expectError(error.UnsupportedVersion, decode(bytes, 0));
 }
 
 test "current decode requires canonical flags fingerprint and exact EOF" {

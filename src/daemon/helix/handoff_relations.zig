@@ -176,25 +176,36 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
     // and a missing secured/framed transport checkpoint.
     for (capsules, 0..) |item, index| switch (item.header.kind) {
         .tls_session => {
-            const bytes = canonicalPayload(item, .tls_session) orelse return error.InvalidTls;
-            const tls = tls_snapshot.decodeCurrent(bytes) catch return error.InvalidTls;
+            // Rolling-compatible like `.s2s_link`: a pre-bump predecessor stamps a
+            // lower version (e.g. the flag-widened-but-still-v1 TLS blob), so the
+            // relation pass must negotiate and decode per version, not pin current.
+            const bytes = canonicalRollingPayload(item, .tls_session) orelse return error.InvalidTls;
+            const tls = tls_snapshot.decode(bytes, item.header.version) catch return error.InvalidTls;
             const client = findClient(capsules, tls.fd) orelse return error.OrphanTls;
             if (!client.was_secured) return error.UnexpectedTls;
             for (capsules[0..index]) |prior| {
                 if (prior.header.kind != .tls_session) continue;
-                const prior_tls = tls_snapshot.decodeCurrent(prior.fields[0].bytes) catch unreachable;
+                // The prior already decoded when it was `item`, so this is dead in
+                // practice — but never assert `unreachable` on inherited bytes
+                // (UB under ReleaseFast); fail the handoff closed instead.
+                const prior_tls = tls_snapshot.decode(prior.fields[0].bytes, prior.header.version) catch return error.InvalidTls;
                 if (prior_tls.fd == tls.fd) return error.DuplicateTls;
             }
             summary.tls += 1;
         },
         .ws_session => {
-            const bytes = canonicalPayload(item, .ws_session) orelse return error.InvalidWebSocket;
-            const websocket = ws_snapshot.decodeCurrent(bytes) catch return error.InvalidWebSocket;
+            const bytes = canonicalRollingPayload(item, .ws_session) orelse return error.InvalidWebSocket;
+            const websocket = ws_snapshot.decode(bytes, item.header.version) catch return error.InvalidWebSocket;
+            // `decode` (unlike `decodeCurrent`) does not enforce it, but only an
+            // OPEN adapter is ever sealed for adoption — a closed one is invalid.
+            if (!websocket.phase_open) return error.InvalidWebSocket;
             const client = findClient(capsules, websocket.fd) orelse return error.OrphanWebSocket;
             if (!client.was_websocket) return error.UnexpectedWebSocket;
             for (capsules[0..index]) |prior| {
                 if (prior.header.kind != .ws_session) continue;
-                const prior_ws = ws_snapshot.decodeCurrent(prior.fields[0].bytes) catch unreachable;
+                // Dead in practice (prior already decoded as `item`) — but never
+                // assert `unreachable` on inherited bytes; fail closed instead.
+                const prior_ws = ws_snapshot.decode(prior.fields[0].bytes, prior.header.version) catch return error.InvalidWebSocket;
                 if (prior_ws.fd == websocket.fd) return error.DuplicateWebSocket;
             }
             summary.websockets += 1;
@@ -364,6 +375,20 @@ fn canonicalS2sPayload(item: capsule.Capsule) ?[]const u8 {
     return item.fields[0].bytes;
 }
 
+/// The rolling-compatible sidecar analogue of `canonicalS2sPayload` for the
+/// TLS/WS transport capsules: their descriptors advertise a `min_supported`
+/// window (so a pre-bump predecessor's capsule still adopts instead of
+/// netsplitting the next USR2). Require the predecessor's advertised current
+/// version to be the negotiated overlap, then let the per-version decoder
+/// validate the exact body. Owning/exact families keep `canonicalPayload`.
+fn canonicalRollingPayload(item: capsule.Capsule, kind: capsule.CapsuleKind) ?[]const u8 {
+    if (item.header.kind != kind or item.fields.len != 1 or
+        item.fields[0].ordinal != 1) return null;
+    const negotiated = capsule.negotiate(capsule.descriptor(kind), item.header) catch return null;
+    if (negotiated != item.header.version) return null;
+    return item.fields[0].bytes;
+}
+
 fn containsFd(fds: []const i32, fd: i32) bool {
     for (fds) |candidate| if (candidate == fd) return true;
     return false;
@@ -382,7 +407,7 @@ fn countTlsForFd(capsules: []const capsule.Capsule, fd: i32) usize {
     var count: usize = 0;
     for (capsules) |item| {
         if (item.header.kind != .tls_session) continue;
-        const tls = tls_snapshot.decodeCurrent(item.fields[0].bytes) catch continue;
+        const tls = tls_snapshot.decode(item.fields[0].bytes, item.header.version) catch continue;
         if (tls.fd == fd) count += 1;
     }
     return count;
@@ -392,7 +417,7 @@ fn countWebSocketsForFd(capsules: []const capsule.Capsule, fd: i32) usize {
     var count: usize = 0;
     for (capsules) |item| {
         if (item.header.kind != .ws_session) continue;
-        const websocket = ws_snapshot.decodeCurrent(item.fields[0].bytes) catch continue;
+        const websocket = ws_snapshot.decode(item.fields[0].bytes, item.header.version) catch continue;
         if (websocket.fd == fd) count += 1;
     }
     return count;
@@ -602,6 +627,69 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     caps[8].header.max_supported = 2;
     const rolling = try validateCurrent(current, &.{ 10, 11, 20 });
     try std.testing.expectEqual(@as(usize, 1), rolling.s2s_links);
+}
+
+test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard)" {
+    const allocator = std.testing.allocator;
+    const tls_server = @import("../../crypto/tls_server.zig");
+
+    const client = try session_snapshot.encode(allocator, .{ .nick = "alice", .fd = 10, .was_secured = true });
+    defer allocator.free(client);
+    // The CURRENTLY-DEPLOYED predecessor seals the flag-bearing TLS blob while
+    // still stamping capsule version 1. The relation preflight must negotiate and
+    // decode it as v1 rather than pinning current, or the next USR2 netsplits.
+    const tls = try tls_snapshot.encode(allocator, .{
+        .fd = 10,
+        .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{
+            .suite = 0x1301,
+            .client_app_secret = @splat(1),
+            .server_app_secret = @splat(2),
+            .app_read_seq = 3,
+            .app_write_seq = 4,
+        } } },
+        .tx_offloaded = true,
+    });
+    defer allocator.free(tls);
+    var monitor_buf: [32]u8 = undefined;
+    const monitor = try (monitor_capsule.MonitorCapsule{ .client_id = 10, .targets = &.{} }).encode(&monitor_buf);
+    var silence_buf: [32]u8 = undefined;
+    const silence = try (silence_capsule.SilenceCapsule{ .client_id = 10, .masks = &.{} }).encode(&silence_buf);
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    const relay_outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(relay_outbox);
+    const relay_event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(relay_event_log);
+    const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment_delivery);
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+
+    const pieces = [_]TestPiece{
+        .{ .kind = .clients, .bytes = client },
+        .{ .kind = .tls_session, .bytes = tls },
+        .{ .kind = .monitor_list, .bytes = monitor },
+        .{ .kind = .silence_list, .bytes = silence },
+        .{ .kind = .mesh_checkpoint, .bytes = event_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
+        .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = &clock },
+    };
+    var fields: [pieces.len][1]capsule.Field = undefined;
+    var caps: [pieces.len]capsule.Capsule = undefined;
+    _ = makeTestCaps(&pieces, &fields, &caps);
+    for (caps[caps.len - 6 ..]) |*cap| cap.header.min_supported = 2;
+    // Stamp the TLS capsule as a legacy v1 image (what a pre-bump predecessor
+    // produced), keeping the flag-bearing v2 blob bytes.
+    caps[1].header.version = 1;
+    caps[1].header.min_supported = 1;
+    caps[1].header.max_supported = 1;
+    const summary = try validateCurrent(&caps, &.{10});
+    try std.testing.expectEqual(@as(usize, 1), summary.tls);
+    try std.testing.expectEqual(@as(usize, 1), summary.clients);
 }
 
 test "current handoff relations reject missing duplicate orphan and unexpected transport sidecars" {

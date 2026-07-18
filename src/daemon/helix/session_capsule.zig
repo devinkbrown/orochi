@@ -144,8 +144,9 @@ pub const SessionCapsule = struct {
         return out[0..pos];
     }
 
-    /// Exact encoded byte length of `self` (v2 layout), for sizing `encode`'s
-    /// output buffer.
+    /// Exact encoded byte length of `self` (v3 layout — the trailing `+ 1` per
+    /// session is the v3 portable-resume byte), for sizing `encode`'s output
+    /// buffer.
     pub fn encodedLen(self: SessionCapsule) usize {
         var n: usize = magic.len + 1 + 2 + self.account.len + 2;
         for (self.sessions) |entry| {

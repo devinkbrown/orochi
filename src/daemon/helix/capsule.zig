@@ -68,6 +68,34 @@ pub const CapsuleKind = enum(u8) {
             else => error.UnknownKind,
         };
     }
+
+    /// Whether a capsule of this kind carries raw cryptographic key material in
+    /// its field payloads, so `Capsule.deinit` secure-zeroes the owned bytes
+    /// before freeing them. Key material sealed into the successor's memfd arena
+    /// (TLS 1.3/1.2 traffic secrets, the Tsumugi directional record keys, and the
+    /// STEK ticket keys) must never linger in freed heap across a USR2 — the
+    /// arena lives only in memory, but a freed-then-reused allocation could leak
+    /// it to unrelated state. The switch is exhaustive so a new secret-bearing
+    /// kind is a compile error until this decision is made for it.
+    pub fn carriesSecrets(kind: CapsuleKind) bool {
+        return switch (kind) {
+            .tls_session, .tsumugi_ratchet, .s2s_link, .tls_ticket_keys => true,
+            .clients,
+            .channels,
+            .sessions,
+            .mesh_checkpoint,
+            .send_queue,
+            .ws_session,
+            .pending_migration,
+            .monitor_list,
+            .silence_list,
+            .session_tombstone,
+            .history,
+            .webhook_store,
+            .handoff_manifest,
+            => false,
+        };
+    }
 };
 
 /// Per-kind registry metadata. There is deliberately no global ABI integer.
@@ -116,7 +144,16 @@ pub const registry = [_]Descriptor{
     // v3 (2026-07): appends the portable-resume issuance bit so the successor
     // preserves detach-time mesh replication policy. Legacy v1/v2 decode false.
     .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 3, .min_supported = 1, .max_supported = 3 },
-    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07): `tls_snapshot.encode` gained two trailing kTLS-offload flag
+    // bytes (tx/rx) — but the encoder was widened WITHOUT bumping this version, so
+    // a pre-bump predecessor seals the flag-bearing blob while STILL stamping
+    // `version = 1`. Two layouts (genuine pre-kTLS = no flags, and pre-bump = with
+    // flags) therefore share version 1, distinguishable only by length. v2 ends
+    // that ambiguity: from here the flags are mandatory. `min_supported = 1` keeps
+    // adopting both historical v1 shapes (a pre-bump predecessor's next USR2 into
+    // this binary must not netsplit); `tls_snapshot.decode` is version-aware (the
+    // v1 arm tolerates the flags being absent OR present, v2 requires them).
+    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .tsumugi_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07) introduces exact property-state checkpoints. Ordinary
     // magic-discriminated mesh payloads retain the full 1..2 range so a v1
@@ -219,6 +256,10 @@ pub const Capsule = struct {
     fields: []Field,
 
     pub fn deinit(self: *Capsule, allocator: Allocator) void {
+        // Secure-zero key-material payloads before freeing so no TLS/Tsumugi/
+        // ticket-key bytes survive in a reused allocation. Owned (duped) field
+        // bytes are the only thing deinit frees, so wiping them is in-bounds.
+        wipeSecretPayloads(self.header.kind, self.fields);
         for (self.fields) |field| allocator.free(field.bytes);
         allocator.free(self.fields);
         self.* = .{ .header = Header.init(.clients), .fields = &.{} };
@@ -227,6 +268,16 @@ pub const Capsule = struct {
 
 pub fn make(kind: CapsuleKind, fields: []Field) Capsule {
     return .{ .header = Header.init(kind), .fields = fields };
+}
+
+/// Secure-zero the payload bytes of `fields` iff `kind` carries key material
+/// (see `CapsuleKind.carriesSecrets`). Split out of `Capsule.deinit` so the wipe
+/// is directly testable: `Allocator.free` overwrites freed memory with the
+/// `undefined` poison in safe builds, which would mask a post-free read of the
+/// wiped region — so the wipe must be observed BEFORE the free, on caller memory.
+pub fn wipeSecretPayloads(kind: CapsuleKind, fields: []const Field) void {
+    if (!kind.carriesSecrets()) return;
+    for (fields) |field| std.crypto.secureZero(u8, @constCast(field.bytes));
 }
 
 pub fn negotiate(local: Descriptor, incoming: Header) Error!u16 {
@@ -239,6 +290,22 @@ pub fn validate(capsule: Capsule) Error!void {
     try validateHeader(capsule.header);
     const d = try descriptorForSchema(capsule.header.schema_id);
     if (d.kind != capsule.header.kind) return error.SchemaMismatch;
+    // M8: this generic container decoder is DELIBERATELY forward-tolerant — it
+    // accepts a stamped `version` ABOVE this binary's `max_supported` (negotiate
+    // only requires range OVERLAP, and clamps the RESULT). That evolvability is
+    // relied upon and tested (server.zig "generic decoder intentionally accepts
+    // these evolvable shapes"; helix/s2s_adopt_dst "the capsule layer
+    // forward-accepts v3"). The fail-closed guarantee against a too-new version
+    // is NOT left implicit: it is enforced ABOVE this layer, exhaustively, by
+    //   (a) every per-family adoption selector / handoff_relations helper, which
+    //       pins the version exactly (`.clients`/`.channels`/checkpoints) or
+    //       requires `negotiate(...) == header.version` (the rolling `.s2s_link`/
+    //       `.tls_session`/`.ws_session`/`.sessions` families) — a too-new header
+    //       fails that equality and is rejected before any DATA decoder runs; and
+    //   (b) every per-kind DATA decoder's explicit `else => UnsupportedVersion`.
+    // So a too-new capsule NEVER reaches a progressive `if (version >= N)` arm.
+    // Rejecting it here instead would abort the whole stream on a single
+    // forward-versioned sidecar, breaking that intentional graceful degradation.
     _ = try negotiate(d, capsule.header);
     try validateFieldOrdinals(capsule.fields);
 }
@@ -518,6 +585,59 @@ test "mesh checkpoint v2 keeps ordinary pieces compatible and exact pieces fail 
     const exact_capsule = Capsule{ .header = exact, .fields = field[0..] };
     try validate(exact_capsule);
     try std.testing.expectEqual(@as(u32, 1), exact_capsule.fields[0].ordinal);
+}
+
+test "tls_session is a rolling v1..2 descriptor that accepts a pre-bump v1 capsule" {
+    const d = descriptor(.tls_session);
+    try std.testing.expectEqual(@as(u16, 2), d.current_version);
+    try std.testing.expectEqual(@as(u16, 1), d.min_supported);
+    try std.testing.expectEqual(@as(u16, 2), d.max_supported);
+    // A pre-bump predecessor sealed the flag-bearing blob while stamping v1; it
+    // must still negotiate against this binary (its next USR2 must not netsplit).
+    var legacy = Header.init(.tls_session);
+    legacy.version = 1;
+    legacy.min_supported = 1;
+    legacy.max_supported = 1;
+    try std.testing.expectEqual(@as(u16, 1), try negotiate(d, legacy));
+}
+
+test "validate is forward-tolerant of a too-new version (rejection is above this layer)" {
+    // M8: the generic container decoder deliberately ACCEPTS a stamped version
+    // above the local max (evolvability). A too-new capsule is rejected above
+    // this layer by the per-family selectors + per-kind decoders, never here.
+    var too_new = Header.init(.tls_ticket_keys); // exact 1..1 descriptor locally
+    too_new.version = 9;
+    too_new.min_supported = 1;
+    too_new.max_supported = 9;
+    var field = [_]Field{.{ .ordinal = 1, .bytes = "x" }};
+    try validate(Capsule{ .header = too_new, .fields = field[0..] });
+    // A negotiated overlap still exists (the forward-tolerance contract): the
+    // clamped result is the local max, never the too-new stamped value.
+    try std.testing.expectEqual(@as(u16, 1), try negotiate(descriptor(.tls_ticket_keys), too_new));
+}
+
+test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
+    try std.testing.expect(CapsuleKind.tls_session.carriesSecrets());
+    try std.testing.expect(CapsuleKind.s2s_link.carriesSecrets());
+    try std.testing.expect(CapsuleKind.tsumugi_ratchet.carriesSecrets());
+    try std.testing.expect(CapsuleKind.tls_ticket_keys.carriesSecrets());
+    try std.testing.expect(!CapsuleKind.clients.carriesSecrets());
+    try std.testing.expect(!CapsuleKind.channels.carriesSecrets());
+    try std.testing.expect(!CapsuleKind.ws_session.carriesSecrets());
+
+    // Wipe proof on caller-owned STACK buffers (no free ⇒ no `undefined` poison
+    // to mask the result). `deinit` calls `wipeSecretPayloads` on the same owned
+    // field bytes just before freeing them, so this exercises the real wipe path.
+    var secret_buf = "traffic-secret-material".*;
+    var plain_buf = "world-checkpoint-state".*;
+    var secret_field = [_]Field{.{ .ordinal = 1, .bytes = &secret_buf }};
+    var plain_field = [_]Field{.{ .ordinal = 1, .bytes = &plain_buf }};
+
+    wipeSecretPayloads(.tls_session, &secret_field); // secret-bearing → wiped
+    wipeSecretPayloads(.clients, &plain_field); // plain → untouched
+
+    for (secret_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    try std.testing.expectEqualStrings("world-checkpoint-state", &plain_buf);
 }
 
 test "duplicate and reordered ordinals are rejected" {
