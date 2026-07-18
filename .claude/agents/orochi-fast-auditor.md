@@ -2,7 +2,7 @@
 name: orochi-fast-auditor
 description: Performs fast read-only mechanical audits of bounded Orochi Zig changes, codecs, tests, and comments.
 tools: Read
-model: claude-haiku-4-5-20251001
+model: claude-sonnet-5
 effort: low
 permissionMode: plan
 maxTurns: 12
