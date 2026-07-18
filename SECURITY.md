@@ -8,7 +8,7 @@ cryptography, and authentication surface. We take security reports seriously.
 **Do not open a public issue for a security vulnerability.**
 
 Report privately through GitHub's
-[private vulnerability reporting](https://github.com/devinkbrown/orochi/security/advisories/new)
+[private vulnerability reporting](https://github.com/devinkbrown/onyx-server/security/advisories/new)
 ("Report a vulnerability" under the repository's **Security** tab). If that is
 unavailable, email **devin.kyle.brown@gmail.com** with the details.
 

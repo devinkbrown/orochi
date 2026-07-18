@@ -32,7 +32,7 @@ server, no OpenSSL, no runtime to install.
 build `orochi:latest` locally from the verified static binary:
 
 ```sh
-git clone https://github.com/devinkbrown/orochi && cd orochi
+git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
 packaging/release.sh                                   # reproducible static binary → dist/
 docker build -f packaging/Dockerfile -t orochi:latest .
 docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest

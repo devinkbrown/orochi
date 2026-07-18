@@ -20,7 +20,7 @@
 
 [Unit]
 Description=Orochi IRC daemon (Suimyaku + Tsumugi mesh)
-Documentation=https://github.com/devinkbrown/orochi
+Documentation=https://github.com/devinkbrown/onyx-server
 After=network-online.target
 Wants=network-online.target
 

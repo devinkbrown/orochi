@@ -31,7 +31,7 @@ cd "$REPO_ROOT"
 
 OUT="${1:-dist}"
 TARGET="x86_64-linux-musl"
-REPO_URL="https://github.com/devinkbrown/orochi"
+REPO_URL="https://github.com/devinkbrown/onyx-server"
 
 # A clean tree gives a clean `<semver>+<hash>` version (no `-dirty` suffix), which
 # is what makes the artifact reproducible for anyone building the same commit.

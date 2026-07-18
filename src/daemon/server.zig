@@ -44910,7 +44910,7 @@ pub const LinuxServer = struct {
             .ping => req.dequoteArg(&ping_arg_buf) catch return,
             .time => serverTimeValue(&time_buf),
             .clientinfo => "ACTION CLIENTINFO PING SOURCE TIME VERSION",
-            .source => "https://github.com/devinkbrown/orochi",
+            .source => "https://github.com/devinkbrown/onyx-server",
             else => return,
         };
         const command_name = ctcp.commandName(req.id) orelse return;
