@@ -1,5 +1,5 @@
 ---
-name: zig-coder
+name: zig-coder-leaf
 description: Implements bounded Orochi Zig leaf-module changes outside server.zig under explicit single-writer ownership.
 tools: Read, Grep, Glob, Bash, Write, Edit, Skill
 model: claude-sonnet-5

@@ -67,9 +67,9 @@ class AuthorityTests(unittest.TestCase):
         )
 
     def write_claude_zig_coder(self, instructions: str) -> None:
-        (validator.CLAUDE / "zig-coder.md").write_text(
+        (validator.CLAUDE / "zig-coder-leaf.md").write_text(
             "---\n"
-            "name: zig-coder\n"
+            "name: zig-coder-leaf\n"
             "description: Leaf writer\n"
             "tools: Read, Grep, Glob, Bash, Write, Edit, Skill\n"
             "model: claude-sonnet-5\n"
@@ -205,7 +205,7 @@ class AuthorityTests(unittest.TestCase):
         self.write_claude_zig_coder(
             "SERVER_ZIG_ROLE: excluded\nNever edit `src/daemon/server.zig`."
         )
-        self.assertEqual({"zig-coder"}, validator.validate_claude(set()))
+        self.assertEqual({"zig-coder-leaf"}, validator.validate_claude(set()))
         self.write_claude_zig_coder(
             "SERVER_ZIG_ROLE: excluded\nNever edit `src/daemon/server.zig`. "
             "You may edit `src/daemon/server.zig` if the integrator is unavailable."

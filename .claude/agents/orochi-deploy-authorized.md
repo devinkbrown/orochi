@@ -1,5 +1,5 @@
 ---
-name: orochi-deploy
+name: orochi-deploy-authorized
 description: Executes an explicitly authorized Orochi two-node deployment after independent release evidence is complete.
 tools: Read, Grep, Glob, Bash, Skill
 model: claude-sonnet-5

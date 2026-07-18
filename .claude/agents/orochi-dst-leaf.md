@@ -1,5 +1,5 @@
 ---
-name: orochi-dst
+name: orochi-dst-leaf
 description: Authors deterministic Orochi fault campaigns and adversarial test scaffolding without weakening production invariants.
 tools: Read, Grep, Glob, Bash, Write, Edit, Skill
 model: claude-sonnet-5

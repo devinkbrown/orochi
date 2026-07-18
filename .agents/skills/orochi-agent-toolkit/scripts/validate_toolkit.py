@@ -55,12 +55,12 @@ CLAUDE_TOOLS = {
     "orochi-integration-reviewer": {"Read"},
     "orochi-security-reviewer": {"Read"},
     "orochi-release-gate": {"Read", "Grep", "Glob", "Bash", "Skill"},
-    "orochi-deploy": {"Read", "Grep", "Glob", "Bash", "Skill"},
+    "orochi-deploy-authorized": {"Read", "Grep", "Glob", "Bash", "Skill"},
     "orochi-docs": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
-    "orochi-dst": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
+    "orochi-dst-leaf": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
     "orochi-server-integrator": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
     "orochi-session": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
-    "zig-coder": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
+    "zig-coder-leaf": {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "Skill"},
 }
 CODEX_SERVER_EXCLUDED_WRITERS = {
     name
@@ -68,7 +68,7 @@ CODEX_SERVER_EXCLUDED_WRITERS = {
     if sandbox != "read-only" and name != "orochi-server-integrator"
 }
 CLAUDE_MODEL_EFFORT = {
-    "orochi-fast-auditor": ("claude-haiku-4-5-20251001", "low"),
+    "orochi-fast-auditor": ("claude-sonnet-5", "low"),
     "orochi-integration-reviewer": ("claude-sonnet-5", "medium"),
     "orochi-security-reviewer": ("claude-sonnet-5", "high"),
     "orochi-release-gate": ("claude-sonnet-5", "medium"),
