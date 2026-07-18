@@ -22,13 +22,16 @@ use "IRCXNet" as a public product or network identity in new copy.
 | **Ink & Vermillion** | The **visual identity** — the palette/typography direction of the Onyx surfaces. | The look-and-feel, not the product name. |
 
 The **network name is operator-configured**, not hard-coded to any brand: `[network]
-name` sets the string emitted in the `001` welcome (`src/daemon/dispatch.zig:2089`),
-the `NETWORK` `005` token (`src/proto/isupport.zig:265`, `:350`), and the `/INFO`
-`Network:` line (`src/proto/server_about.zig:70`). The in-source **default is
-`Orochi`** (`src/daemon/config_format.zig:860`, `src/proto/isupport.zig:265`) — the
-neutral value a fresh self-hosted node advertises. The **flagship deployment's
-network is branded `Onyx`**; an operator running their own node picks their own
-name.
+name` sets the string emitted in the `001` welcome (`src/daemon/dispatch.zig:2094`,
+`emitWelcome`), the `NETWORK` `005` token (`src/proto/isupport.zig:265`, `:350`), and
+the `/INFO` `Network:` line (`src/proto/server_about.zig:71`). The protocol layer's
+bare fallback constant is `Orochi` (`src/proto/protocol_inventory.zig:19`) — reachable
+only if config loading is bypassed entirely. In normal operation `Config.initDefaults`
+seeds `[network] name` to **`Onyx`** (`src/daemon/config_format.zig:879`) and
+`main.zig` installs it via `setNetworkName` before serving, so a fresh self-hosted
+node with no `[network]` section already advertises **`Onyx`** — the same value as
+the flagship deployment. An operator running their own node can still pick their own
+name via `[network] name`.
 
 ## Subsystems
 

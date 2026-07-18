@@ -6,7 +6,7 @@
 Release notes for the Orochi daemon. Newest first. Orochi is a clean-room,
 pure-Zig IRC/IRCX server with a post-quantum CRDT mesh, an in-house TLS 1.3
 stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
-`build.zig.zon`. Dates are the deploy date to the live IRCXNet nodes.
+`build.zig.zon`. Dates are the deploy date to the live Onyx nodes.
 
 ---
 
