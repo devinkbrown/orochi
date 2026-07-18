@@ -1370,6 +1370,40 @@ pub const RouteTable = struct {
         self.channel_count -= 1;
     }
 
+    /// Idempotently set whether `node` appears in `chan`'s node-set, INDEPENDENT
+    /// of the join/part refcount that `addChannelMember`/`removeChannelMember`
+    /// track. A caller that recomputes presence from scratch on every event
+    /// (anti-entropy route refresh) needs "present exactly once" / "absent"
+    /// convergence, not an accumulating refcount — and, critically, it must
+    /// touch ONLY this per-channel node-set, never the authoritative
+    /// `channel_members`/`nick_to_node` maps that `removeNode` also clears.
+    pub fn setChannelNodePresence(self: *Self, chan: []const u8, node: NodeId, present: bool) Error!void {
+        try self.validateName(chan);
+        try validateNode(node);
+
+        if (present) {
+            // Add only when absent, so repeated refreshes never inflate the
+            // node's refcount past one (which a later single clear could not undo).
+            if (self.channels.getPtr(chan)) |state| {
+                if (state.find(node) != null) return;
+            }
+            try self.addChannelMember(chan, node);
+            return;
+        }
+
+        // Full, refcount-agnostic removal: the refresh recomputed this node as
+        // no-longer-live, so it leaves the set regardless of any prior count.
+        const entry = self.channels.getEntry(chan) orelse return;
+        entry.value_ptr.removeNode(node);
+        if (entry.value_ptr.len != 0) return;
+
+        const owned_key = entry.key_ptr.*;
+        entry.value_ptr.deinit(self.allocator);
+        self.channels.removeByPtr(entry.key_ptr);
+        self.allocator.free(owned_key);
+        self.channel_count -= 1;
+    }
+
     /// Outcome of `applyMembership`, so the caller can emit the matching live IRC
     /// surface (a remote `JOIN`/`PART` to local channel members). `unchanged`
     /// covers stale events and re-affirmations of an existing member (so the
@@ -2200,6 +2234,35 @@ test "node removal purges its nicks" {
     try std.testing.expectEqual(@as(usize, 1), len);
     try std.testing.expect(containsNode(out[0..len], 20));
     try std.testing.expectEqual(@as(usize, 0), try table.channelNodes("#empty-after-purge", &out));
+}
+
+test "setChannelNodePresence is idempotent by liveness and refcount-agnostic" {
+    var table = try RouteTable.init(std.testing.allocator, .{
+        .max_nicks = 8,
+        .max_channels = 8,
+        .max_nodes_per_channel = 8,
+    });
+    defer table.deinit();
+
+    var out: [4]NodeId = undefined;
+
+    // Absent -> present adds exactly one node-set entry.
+    try table.setChannelNodePresence("#suimyaku", 7, true);
+    try std.testing.expectEqual(@as(usize, 1), try table.channelNodes("#suimyaku", &out));
+    try std.testing.expectEqual(@as(NodeId, 7), out[0]);
+
+    // Repeated "present" refreshes never inflate the set (idempotent) — a single
+    // "absent" must fully clear it, which it could not if a refcount accumulated.
+    try table.setChannelNodePresence("#suimyaku", 7, true);
+    try table.setChannelNodePresence("#suimyaku", 7, true);
+    try std.testing.expectEqual(@as(usize, 1), try table.channelNodes("#suimyaku", &out));
+
+    try table.setChannelNodePresence("#suimyaku", 7, false);
+    try std.testing.expectEqual(@as(usize, 0), try table.channelNodes("#suimyaku", &out));
+
+    // Clearing an absent node / empty channel is a no-op, never an error.
+    try table.setChannelNodePresence("#suimyaku", 7, false);
+    try table.setChannelNodePresence("#never-seen", 9, false);
 }
 
 test "no leak across clear, remove, and deinit paths" {

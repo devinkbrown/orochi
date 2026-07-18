@@ -468,6 +468,18 @@ const DeferredResidenceFrame = struct {
 pub const S2sPeer = struct {
     allocator: Allocator,
     decoder: s2s_frame.Decoder,
+    /// Advisory per-link anti-entropy shadow of the `#suimyaku` control channel,
+    /// merged from `BURST`/`DELTA`/`REPAIR_RESPONSE`. It carries NO per-fact
+    /// origin authentication (`BURST`/`DELTA` skip `verifiedPayload`; only
+    /// MeshPass admits the link), so a Byzantine admitted peer can forge any
+    /// field here. It MUST NOT feed an authority/attribution decision: the
+    /// client-visible roster/oper/modes surface flows through the SEPARATE,
+    /// origin-gated `MEMBERSHIP` + `CHANNEL_MODE_STATE` paths. Today only member
+    /// LIVENESS is read (`refreshChannelRoute`); `members[].dot.replica_id` and
+    /// `.modes` have zero readers. The moment any consumer reads those for a
+    /// decision — or this shadow becomes a delivered user channel — the per-fact
+    /// signing gap (`signed_frame.zig:126-133`) must be closed FIRST, or forged
+    /// facts stop being inert. The committed Byzantine tripwire test pins this.
     state: *ChannelCrdt,
     session: link_session.LinkSession,
     registry: server_registry.ServerRegistry,
@@ -3703,16 +3715,39 @@ pub const S2sPeer = struct {
         try self.refreshChannelRoute();
     }
 
+    // ADVISORY ANTI-ENTROPY SHADOW — NO per-fact origin authentication.
+    // `self.state` is merged from `BURST`/`DELTA`/`REPAIR_RESPONSE`, and `BURST`
+    // and `DELTA` are NOT routed through `verifiedPayload` (only MeshPass admits
+    // them). It MUST NOT feed any authority/attribution decision: real
+    // client-visible membership/oper/modes flow through the SEPARATE,
+    // origin-gated `MEMBERSHIP` + `CHANNEL_MODE_STATE` paths, which populate the
+    // authoritative `routes.channel_members`/`nick_to_node` maps that
+    // NAMES/delivery/401/WHOIS read. Reading `dot.replica_id` or `.modes` here
+    // for any decision requires FIRST closing the per-fact-signing gap
+    // (`signed_frame.zig:126-133`); until then those fields are inert.
+    //
+    // This function reflects THIS peer's own liveness in the control channel's
+    // node-set and NOTHING else. The prior implementation opened with a
+    // node-GLOBAL `routes.removeNode(self.remote_node_id)`, wiping
+    // `channel_members`+`nick_to_node` as collateral on the unauthenticated
+    // `DELTA` path with `live == 0` — the shipped member-staleness-prune outage
+    // shape (empty NAMES / 401 cross-node PM). The mutation is now scoped to the
+    // single node-set entry this shadow actually owns, updated idempotently by
+    // liveness, and never touches the authoritative roster (audit H2).
     fn refreshChannelRoute(self: *S2sPeer) !void {
         if (self.channel_name.len == 0) return;
-        self.routes.removeNode(self.remote_node_id);
+        // No coherent origin to track yet (unknown/unauthenticated peer, or a
+        // Helix-resumed link before its handshake refills the id): the advisory
+        // node-set keys on `remote_node_id`, so there is nothing to set. Return a
+        // clean no-op rather than letting `setChannelNodePresence`'s `validateNode`
+        // reject 0 and tear down the link on an otherwise-harmless DELTA/REPAIR.
+        if (self.remote_node_id == 0) return;
         var live: usize = 0;
         for (self.state.members.items) |entry| {
             if (entry.adds.items.len == 0) continue;
             live += 1;
         }
-        if (live == 0) return;
-        try self.routes.addChannelMember(self.channel_name, self.remote_node_id);
+        try self.routes.setChannelNodePresence(self.channel_name, self.remote_node_id, live != 0);
     }
 
     fn closeRemote(self: *S2sPeer) void {
@@ -4369,6 +4404,174 @@ test "two s2s peer drivers handshake and converge channel CRDT state" {
     try a.sendDelta(&delta, a_to_b.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xD317A);
     try std.testing.expect(ChannelCrdt.eql(&a_state, &b_state));
+}
+
+// Regression (audit H2 correctness item): `refreshChannelRoute` must scope its
+// mutation to the advisory `#suimyaku` node-set entry it owns and NEVER wipe the
+// authoritative `channel_members`/`nick_to_node` maps that NAMES/delivery/401/
+// WHOIS read. Before the fix it opened with a node-GLOBAL
+// `routes.removeNode(remote_node_id)` — reachable on the unauthenticated DELTA
+// path with `live == 0` — evicting the roster the peer's honest MEMBERSHIP
+// frames populated (the shipped member-staleness-prune outage shape).
+test "refreshChannelRoute scopes to the control-channel node-set and never wipes the authoritative roster" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "a.test");
+    defer peer.deinit();
+
+    // Authoritative roster: an origin-gated MEMBERSHIP frame from node 2 placed
+    // alice@node2 into #chat (channel_members + nick_to_node) — exactly the maps
+    // the client-visible surface reads.
+    _ = try peer.routes.applyMembership("#chat", "alice", 2, 0, 100, true, .{}, 10);
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("alice"));
+
+    // A DELTA/REPAIR churn event whose merged shadow has ZERO live members must
+    // NOT evict node 2's authoritative roster.
+    try std.testing.expectEqual(@as(usize, 0), state.members.items.len);
+    try peer.refreshChannelRoute();
+
+    // Roster intact (the bug wiped it via node-GLOBAL removeNode)...
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("alice"));
+    var nodes: [4]NodeId = undefined;
+    // ...and the advisory node-set correctly excludes node 2 (no live members).
+    try std.testing.expectEqual(@as(usize, 0), try peer.routes.channelNodes("#suimyaku", &nodes));
+
+    // A live member now appears in the shadow: node 2 joins the control-channel
+    // node-set, still without disturbing the #chat roster.
+    discard(try state.localJoin(30, .{ .op = true }, 30));
+    try peer.refreshChannelRoute();
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("alice"));
+    try std.testing.expectEqual(@as(usize, 1), try peer.routes.channelNodes("#suimyaku", &nodes));
+    try std.testing.expectEqual(@as(NodeId, 2), nodes[0]);
+
+    // Idempotency: repeated live refreshes keep the node-set at exactly one entry
+    // (no accumulated refcount), roster still intact.
+    try peer.refreshChannelRoute();
+    try peer.refreshChannelRoute();
+    try std.testing.expectEqual(@as(usize, 1), try peer.routes.channelNodes("#suimyaku", &nodes));
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("alice"));
+
+    // Liveness drops back to zero: node 2 leaves the node-set, roster STILL intact.
+    discard(try state.localPart(30));
+    try peer.refreshChannelRoute();
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("alice"));
+    try std.testing.expectEqual(@as(usize, 0), try peer.routes.channelNodes("#suimyaku", &nodes));
+}
+
+// Regression (review MEDIUM): a link with no coherent origin yet
+// (remote_node_id == 0 — an unknown/unauthenticated or Helix-resumed link before
+// its handshake refills the id) must NOT tear down on a DELTA/REPAIR. The
+// advisory node-set keys on remote_node_id, so refreshChannelRoute is a clean
+// no-op; setChannelNodePresence(node=0) would otherwise hit `validateNode` and
+// propagate error.InvalidNode through feed().
+test "refreshChannelRoute is a clean no-op on an origin-less (remote_node_id==0) link" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    var peer = try newPeer(allocator, &state, &tc, 1, 0, 1000, "a.test");
+    defer peer.deinit();
+    const limits = peer.config.link.burst_limits;
+
+    // An unrelated node's roster row must survive untouched.
+    _ = try peer.routes.applyMembership("#chat", "carol", 5, 0, 100, true, .{}, 10);
+
+    // live == 0 branch (the diff's net-new exposure)...
+    try peer.refreshChannelRoute();
+    // ...and the live != 0 branch (which the OLD code also errored on)...
+    discard(try state.localJoin(30, .{ .op = true }, 30));
+    try peer.refreshChannelRoute();
+    // ...and through the real DELTA path (mergeDelta → refreshChannelRoute).
+    const bytes = try burst.serialize(allocator, &state, limits);
+    defer allocator.free(bytes);
+    try peer.mergeDelta(bytes);
+
+    try std.testing.expectEqual(@as(?NodeId, 5), peer.routeNickNode("carol"));
+    var nodes: [2]NodeId = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try peer.routes.channelNodes("#suimyaku", &nodes));
+}
+
+// Byzantine tripwire (audit H2): an admitted (possibly Byzantine) MeshPass peer
+// can push BURST/DELTA/REPAIR_RESPONSE into the advisory `self.state` shadow with
+// NO per-fact origin authentication. This pins the self-limited boundary as a
+// PERMANENT CI gate: forged shadow facts — including a `dot.replica_id` naming a
+// THIRD victim node and forged channel modes — must NOT reach the authoritative
+// client-visible roster (`channel_members`/`nick_to_node`), and a forged
+// all-tombstone DELTA must NOT evict a third node's roster. The day a future
+// change lets forged shadow state reach a third node or an authority decision,
+// this test reds (see the `self.state` field-declaration contract).
+test "forged mesh shadow facts never reach the authoritative roster (Byzantine tripwire)" {
+    const allocator = std.testing.allocator;
+    // An oper prefix bit in the route table's MemberStatus layout. The exact
+    // value is immaterial to the invariant — the test asserts it round-trips
+    // UNCHANGED through the forged frames, whatever it is.
+    const victim_status: u4 = 0b0100;
+
+    var tc = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    // The receiver's admitted peer link is node 2.
+    var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "a.test");
+    defer peer.deinit();
+    const limits = peer.config.link.burst_limits;
+
+    // Authoritative roster, as origin-gated MEMBERSHIP frames populate it:
+    //  - "vic" is an oper homed on a THIRD node (3), NOT the sender.
+    //  - "peeruser" is homed on the sender's own node (2).
+    _ = try peer.routes.applyMembership("#chat", "vic", 3, victim_status, 200, true, .{}, 10);
+    _ = try peer.routes.applyMembership("#chat", "peeruser", 2, 0, 210, true, .{}, 10);
+
+    const before_vic = peer.findRemoteMember("vic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(NodeId, 3), before_vic.node);
+    try std.testing.expectEqual(victim_status, before_vic.status);
+
+    // Forge a CRDT that CLAIMS to be node 3 (replica_id = 3) and carries a member
+    // with founder+op status AND forged channel modes — the exact fields
+    // (dot.replica_id, modes) an attacker would target.
+    var forged = ChannelCrdt.init(allocator, 3);
+    defer forged.deinit();
+    discard(try forged.localJoin(99, .{ .founder = true, .op = true }, 20));
+    discard(try forged.localSetMode(.{ .invite_only = true }, 21));
+    const forged_bytes = try burst.serialize(allocator, &forged, limits);
+    defer allocator.free(forged_bytes);
+
+    // Drive it through BOTH shadow-merge paths an admitted peer can reach: BURST
+    // (burst.apply) and DELTA (mergeDelta → refreshChannelRoute).
+    try burst.apply(allocator, peer.state, forged_bytes, limits);
+    try peer.mergeDelta(forged_bytes);
+
+    // The victim's authoritative roster row is unchanged: same node, same oper
+    // status. The forgery landed only in the inert shadow.
+    const after_vic = peer.findRemoteMember("vic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(NodeId, 3), after_vic.node);
+    try std.testing.expectEqual(victim_status, after_vic.status);
+    try std.testing.expectEqual(@as(?NodeId, 3), peer.routeNickNode("vic"));
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("peeruser"));
+
+    // A forged ALL-TOMBSTONE DELTA (member present, zero live adds → live==0) must
+    // evict AT MOST the sender's own node's routing presence — never a third
+    // node's roster.
+    var tombstone = ChannelCrdt.init(allocator, 3);
+    defer tombstone.deinit();
+    discard(try tombstone.localJoin(99, .{}, 22));
+    discard(try tombstone.localPart(99));
+    const tomb_bytes = try burst.serialize(allocator, &tombstone, limits);
+    defer allocator.free(tomb_bytes);
+    try peer.mergeDelta(tomb_bytes);
+
+    // Third node's roster survives; the sender's own roster survives too (the fix
+    // scopes refreshChannelRoute to the advisory node-set, never the roster).
+    try std.testing.expectEqual(@as(?NodeId, 3), peer.routeNickNode("vic"));
+    try std.testing.expectEqual(@as(?NodeId, 2), peer.routeNickNode("peeruser"));
+    const survived_vic = peer.findRemoteMember("vic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(victim_status, survived_vic.status);
+
+    // Recovery on re-burst is clean: a re-affirming MEMBERSHIP keeps the roster.
+    _ = try peer.routes.applyMembership("#chat", "vic", 3, victim_status, 220, true, .{}, 20);
+    const recovered = peer.findRemoteMember("vic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(victim_status, recovered.status);
 }
 
 // Regression: LINKS rendered a remote peer's description as the generic
