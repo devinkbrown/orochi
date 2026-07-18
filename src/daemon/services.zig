@@ -2302,11 +2302,39 @@ pub const Services = struct {
     }
 
     // ── Durable KEEPTOPIC (registered-channel topic survives recreation) ────────
-    // "ktp\x00<channel>" in `.props`: presence = enabled; value = the saved topic
-    // (empty when enabled but nothing saved yet). Restored on channel recreation.
+    // "ktp\x00<channel>" in `.props`: presence = enabled. The value is one of:
+    //   • empty            — enabled but nothing saved yet.
+    //   • legacy text      — a raw topic written by an older build (no metadata).
+    //   • versioned blob   — [sentinel=0x01][ver=0x01][set_at i64 LE]
+    //                        [setter_len u16 LE][setter][text]
+    // Every new save writes a versioned blob, so a topic round-trips exactly
+    // whatever its bytes (including a leading 0x01). The SOH (0x01) sentinel only
+    // discriminates a LEGACY (pre-metadata) value from a versioned one. Decode is
+    // fail-closed and fully bounds-checked: a sentinel-led value whose metadata is
+    // malformed falls back to the legacy whole-value-is-text interpretation rather
+    // than crashing or reading OOB. The sole residual ambiguity is an old legacy
+    // value that both begins with 0x01 and happens to form a self-consistent
+    // header — it decodes to a wrong setter/set-time (never a crash) for that one
+    // pre-existing value; new saves are immune.
     const keeptopic_prefix = "ktp\x00";
     const keeptopic_key_max: usize = keeptopic_prefix.len + channel_max;
-    const keeptopic_value_max: usize = 512;
+    const keeptopic_text_max: usize = 512; // topic TEXT cap (unchanged behaviour)
+    const keeptopic_setter_max: usize = 256; // setter (nick!user@host) cap
+    const keeptopic_meta_sentinel: u8 = 0x01;
+    const keeptopic_meta_version: u8 = 1;
+    // sentinel(1) + version(1) + set_at(8) + setter_len(2)
+    const keeptopic_meta_header: usize = 12;
+    const keeptopic_value_max: usize = keeptopic_meta_header + keeptopic_setter_max + keeptopic_text_max;
+
+    /// Restored KEEPTOPIC state. `text`/`setter` slice into the caller's out
+    /// buffers. `setter == null` signals a legacy/metadata-absent value: the
+    /// caller restores the topic text and falls back to serverName()/now for the
+    /// setter and set-time. `set_at` is meaningful only when `setter != null`.
+    pub const KeepTopicRestore = struct {
+        text: []const u8,
+        setter: ?[]const u8,
+        set_at: i64,
+    };
 
     fn keepTopicKey(buf: []u8, channel: []const u8) ?[]const u8 {
         if (channel.len == 0 or channel.len > channel_max) return null;
@@ -2328,29 +2356,94 @@ pub const Services = struct {
         }
     }
 
-    /// Persist `topic` for `channel` — only when KEEPTOPIC is enabled (key present).
-    pub fn chanKeepTopicSave(self: *Services, channel: []const u8, topic: []const u8) ServiceError!void {
-        if (topic.len > keeptopic_value_max) return;
+    /// Persist `topic` with the `setter` that set it and `set_at` (Unix seconds)
+    /// for `channel` — only when KEEPTOPIC is enabled (key present). Oversize text
+    /// (> keeptopic_text_max) is not persisted (unchanged behaviour); the setter
+    /// is truncated to keeptopic_setter_max.
+    pub fn chanKeepTopicSave(
+        self: *Services,
+        channel: []const u8,
+        topic: []const u8,
+        setter: []const u8,
+        set_at: i64,
+    ) ServiceError!void {
+        if (topic.len > keeptopic_text_max) return;
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
         var kb: [keeptopic_key_max]u8 = undefined;
         const k = keepTopicKey(&kb, channel) orelse return;
         if (self.store.family(.props).get(k) == null) return; // not enabled
-        try self.store.family(.props).put(k, topic);
+
+        // An empty topic clears the remembered value: store the empty marker so
+        // recreation restores nothing, matching the pre-metadata behaviour (a
+        // metadata blob is never empty, so `get` returns null for this).
+        if (topic.len == 0) {
+            try self.store.family(.props).put(k, "");
+            return;
+        }
+
+        const setter_clamped = setter[0..@min(setter.len, keeptopic_setter_max)];
+        var blob: [keeptopic_value_max]u8 = undefined;
+        blob[0] = keeptopic_meta_sentinel;
+        blob[1] = keeptopic_meta_version;
+        std.mem.writeInt(i64, blob[2..10], set_at, .little);
+        std.mem.writeInt(u16, blob[10..12], @intCast(setter_clamped.len), .little);
+        @memcpy(blob[keeptopic_meta_header .. keeptopic_meta_header + setter_clamped.len], setter_clamped);
+        const text_off = keeptopic_meta_header + setter_clamped.len;
+        @memcpy(blob[text_off .. text_off + topic.len], topic);
+        try self.store.family(.props).put(k, blob[0 .. text_off + topic.len]);
     }
 
-    /// Copy the saved topic for `channel` into `out` when KEEPTOPIC is enabled and a
-    /// non-empty topic is stored; else null. Returns a slice into `out`.
-    pub fn chanKeepTopicGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
+    /// Return the saved topic for `channel` when KEEPTOPIC is enabled and a
+    /// non-empty value is stored; else null. `text`/`setter` slice into `text_out`
+    /// / `setter_out`. A legacy (pre-metadata) value returns `setter == null`, so
+    /// the caller falls back to serverName()/now — see KeepTopicRestore.
+    pub fn chanKeepTopicGet(
+        self: *Services,
+        channel: []const u8,
+        text_out: []u8,
+        setter_out: []u8,
+    ) ?KeepTopicRestore {
         self.lock.lockShared();
         defer self.lock.unlockShared();
         var kb: [keeptopic_key_max]u8 = undefined;
         const k = keepTopicKey(&kb, channel) orelse return null;
         const blob = self.store.family(.props).get(k) orelse return null;
         if (blob.len == 0) return null;
-        const n = @min(blob.len, out.len);
-        @memcpy(out[0..n], blob[0..n]);
-        return out[0..n];
+
+        // Versioned blob: decode fail-closed — malformed metadata falls through to
+        // the legacy whole-value-is-text interpretation below. A decoded but empty
+        // topic restores nothing (mirrors the empty-value case above).
+        if (blob[0] == keeptopic_meta_sentinel) {
+            if (decodeKeepTopicMeta(blob, text_out, setter_out)) |r| {
+                return if (r.text.len == 0) null else r;
+            }
+        }
+
+        // Legacy value (or malformed metadata): the whole value is the topic text,
+        // with no setter/set_at — signal metadata absent.
+        const n = @min(blob.len, text_out.len);
+        @memcpy(text_out[0..n], blob[0..n]);
+        return .{ .text = text_out[0..n], .setter = null, .set_at = 0 };
+    }
+
+    /// Decode a sentinel-led KEEPTOPIC value. Every field is bounds-checked; any
+    /// malformation (short header, unknown version, setter length past the end)
+    /// returns null so the caller falls back to the legacy text-only path.
+    fn decodeKeepTopicMeta(blob: []const u8, text_out: []u8, setter_out: []u8) ?KeepTopicRestore {
+        if (blob.len < keeptopic_meta_header) return null;
+        if (blob[1] != keeptopic_meta_version) return null;
+        const set_at = std.mem.readInt(i64, blob[2..10], .little);
+        const setter_len: usize = std.mem.readInt(u16, blob[10..12], .little);
+        const setter_end = keeptopic_meta_header + setter_len;
+        if (setter_end > blob.len) return null; // truncated setter
+        const setter = blob[keeptopic_meta_header..setter_end];
+        const text = blob[setter_end..];
+        const sn = @min(setter.len, setter_out.len);
+        @memcpy(setter_out[0..sn], setter[0..sn]);
+        const tn = @min(text.len, text_out.len);
+        @memcpy(text_out[0..tn], text[0..tn]);
+        return .{ .text = text_out[0..tn], .setter = setter_out[0..sn], .set_at = set_at };
     }
 
     // ── Durable registered-channel founder successor (svc_successor; SUCCESSOR) ──
@@ -3521,27 +3614,201 @@ test "keeptopic: enable/save/get persist across reopen; save is a no-op when off
         var store = try openTestStore(tmp, "services-keeptopic.wal");
         defer store.deinit();
         var services = Services.init(&store, null);
-        var buf: [128]u8 = undefined;
+        var t: [128]u8 = undefined;
+        var s: [128]u8 = undefined;
         // off by default; save does nothing while off
-        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null);
-        try services.chanKeepTopicSave("#chan", "ignored");
-        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null);
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &t, &s) == null);
+        try services.chanKeepTopicSave("#chan", "ignored", "nick!u@h", 100);
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &t, &s) == null);
         // enable then save
         try services.chanKeepTopicEnable("#chan", true);
-        try services.chanKeepTopicSave("#chan", "the topic");
-        const got = services.chanKeepTopicGet("#CHAN", &buf) orelse return error.TestUnexpectedResult; // case-insensitive
-        try std.testing.expectEqualStrings("the topic", got);
+        try services.chanKeepTopicSave("#chan", "the topic", "nick!u@h", 100);
+        const got = services.chanKeepTopicGet("#CHAN", &t, &s) orelse return error.TestUnexpectedResult; // case-insensitive
+        try std.testing.expectEqualStrings("the topic", got.text);
     }
     {
         var store = try openTestStore(tmp, "services-keeptopic.wal");
         defer store.deinit();
         var services = Services.init(&store, null);
-        var buf: [128]u8 = undefined;
-        const got = services.chanKeepTopicGet("#chan", &buf) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("the topic", got); // survived reopen
+        var t: [128]u8 = undefined;
+        var s: [128]u8 = undefined;
+        const got = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("the topic", got.text); // survived reopen
+        try std.testing.expectEqualStrings("nick!u@h", got.setter.?);
+        try std.testing.expectEqual(@as(i64, 100), got.set_at);
         try services.chanKeepTopicEnable("#chan", false);
-        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null); // disabled -> gone
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &t, &s) == null); // disabled -> gone
     }
+}
+
+test "keeptopic: setter and set-time round-trip exactly, and survive reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "services-keeptopic-meta.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try services.chanKeepTopicEnable("#chan", true);
+        try services.chanKeepTopicSave("#chan", "hello world", "alice!a@host.example", 1_700_000_000);
+        var t: [512]u8 = undefined;
+        var s: [256]u8 = undefined;
+        const r = services.chanKeepTopicGet("#CHAN", &t, &s) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("hello world", r.text);
+        try std.testing.expectEqualStrings("alice!a@host.example", r.setter.?);
+        try std.testing.expectEqual(@as(i64, 1_700_000_000), r.set_at);
+    }
+    {
+        var store = try openTestStore(tmp, "services-keeptopic-meta.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var t: [512]u8 = undefined;
+        var s: [256]u8 = undefined;
+        const r = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("hello world", r.text); // survived reopen
+        try std.testing.expectEqualStrings("alice!a@host.example", r.setter.?);
+        try std.testing.expectEqual(@as(i64, 1_700_000_000), r.set_at);
+    }
+}
+
+test "keeptopic: legacy raw-text blob decodes as text-only with metadata absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-keeptopic-legacy.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.chanKeepTopicEnable("#chan", true);
+
+    // Write a legacy value directly (raw topic bytes, no sentinel/metadata) under
+    // the exact ktp key, as an older build would have stored it.
+    var kb: [Services.keeptopic_key_max]u8 = undefined;
+    const key = Services.keepTopicKey(&kb, "#chan").?;
+    try store.family(.props).put(key, "an old topic set before metadata");
+
+    var t: [512]u8 = undefined;
+    var s: [256]u8 = undefined;
+    const r = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("an old topic set before metadata", r.text);
+    try std.testing.expect(r.setter == null); // metadata absent -> caller uses serverName()/now
+}
+
+test "keeptopic: malformed metadata fails closed to text-only, no crash" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-keeptopic-malformed.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.chanKeepTopicEnable("#chan", true);
+
+    var kb: [Services.keeptopic_key_max]u8 = undefined;
+    const key = Services.keepTopicKey(&kb, "#chan").?;
+    var t: [512]u8 = undefined;
+    var s: [256]u8 = undefined;
+
+    // Case 1: sentinel + version present but the fixed header is truncated (< 12).
+    const short_header = [_]u8{ 0x01, 0x01, 0x00, 0x00 };
+    try store.family(.props).put(key, &short_header);
+    const r1 = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r1.setter == null); // fell back to legacy text-only
+    try std.testing.expectEqualSlices(u8, &short_header, r1.text);
+
+    // Case 2: full 12-byte header but setter_len points past the end of the value.
+    var bad_setter_len: [12]u8 = @splat(0);
+    bad_setter_len[0] = 0x01; // sentinel
+    bad_setter_len[1] = 0x01; // version
+    // set_at bytes [2..10] left 0; setter_len (u16 LE at [10..12]) = 100, but no
+    // setter bytes follow -> setter_end (112) > blob.len (12).
+    std.mem.writeInt(u16, bad_setter_len[10..12], 100, .little);
+    try store.family(.props).put(key, &bad_setter_len);
+    const r2 = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r2.setter == null); // fell back to legacy text-only
+    try std.testing.expectEqualSlices(u8, &bad_setter_len, r2.text);
+
+    // Case 3: unknown version -> fail closed to text-only.
+    var bad_version: [12]u8 = @splat(0);
+    bad_version[0] = 0x01; // sentinel
+    bad_version[1] = 0xFF; // unknown version
+    try store.family(.props).put(key, &bad_version);
+    const r3 = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r3.setter == null);
+    try std.testing.expectEqualSlices(u8, &bad_version, r3.text);
+}
+
+test "keeptopic: setter truncated to cap; oversize text not persisted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-keeptopic-caps.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.chanKeepTopicEnable("#chan", true);
+
+    var t: [512]u8 = undefined;
+    var s: [256]u8 = undefined;
+
+    // A setter over the 256-byte cap is truncated to the cap.
+    var long_setter: [400]u8 = undefined;
+    @memset(&long_setter, 'x');
+    try services.chanKeepTopicSave("#chan", "topic", &long_setter, 42);
+    const r = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("topic", r.text);
+    try std.testing.expectEqual(@as(usize, 256), r.setter.?.len); // truncated to keeptopic_setter_max
+    try std.testing.expectEqual(@as(i64, 42), r.set_at);
+
+    // A topic over the 512-byte text cap is a no-op (unchanged behaviour): the
+    // prior saved value stays intact.
+    var long_text: [600]u8 = undefined;
+    @memset(&long_text, 't');
+    try services.chanKeepTopicSave("#chan", &long_text, "bob!b@h", 43);
+    const r2 = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("topic", r2.text); // oversize text rejected, prior value kept
+    try std.testing.expectEqual(@as(i64, 42), r2.set_at);
+}
+
+test "keeptopic: a legacy value beginning with the sentinel fails closed to text-only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-keeptopic-legacy-sentinel.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.chanKeepTopicEnable("#chan", true);
+
+    // A pre-metadata topic that legitimately begins with SOH (0x01) but is NOT a
+    // valid versioned blob (byte[1] is not the format version) must fall back to
+    // legacy text — bounds-checked, no crash, whole value returned as text with
+    // metadata absent so the caller uses serverName()/now.
+    var kb: [Services.keeptopic_key_max]u8 = undefined;
+    const key = Services.keepTopicKey(&kb, "#chan").?;
+    const legacy = "\x01ACTION waves at the channel from before metadata existed";
+    try store.family(.props).put(key, legacy);
+
+    var t: [512]u8 = undefined;
+    var s: [256]u8 = undefined;
+    const r = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r.setter == null);
+    try std.testing.expectEqualStrings(legacy, r.text);
+}
+
+test "keeptopic: saving an empty topic clears an enabled channel's remembered value" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-keeptopic-clear.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.chanKeepTopicEnable("#chan", true);
+
+    var t: [512]u8 = undefined;
+    var s: [256]u8 = undefined;
+    // Remember a topic, then clear it with an empty save.
+    try services.chanKeepTopicSave("#chan", "remembered", "alice!a@h", 500);
+    _ = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try services.chanKeepTopicSave("#chan", "", "alice!a@h", 600);
+    // Cleared: recreation restores nothing, but KEEPTOPIC stays enabled.
+    try std.testing.expect(services.chanKeepTopicGet("#chan", &t, &s) == null);
+    // Still enabled -> a fresh save is remembered again.
+    try services.chanKeepTopicSave("#chan", "again", "bob!b@h", 700);
+    const r = services.chanKeepTopicGet("#chan", &t, &s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("again", r.text);
+    try std.testing.expectEqualStrings("bob!b@h", r.setter.?);
+    try std.testing.expectEqual(@as(i64, 700), r.set_at);
 }
 
 test "channel transfer: only the founder may hand ownership to a registered account" {

@@ -17033,10 +17033,16 @@ pub const LinuxServer = struct {
             // KEEPTOPIC: restore a registered channel's saved topic on recreation,
             // so a topic the founder set isn't lost when the channel empties.
             if (self.account_services) |kt| {
-                var ktbuf: [512]u8 = undefined;
-                if (kt.chanKeepTopicGet(join_target, &ktbuf)) |saved| {
+                var kttext: [512]u8 = undefined;
+                var ktsetter: [256]u8 = undefined;
+                if (kt.chanKeepTopicGet(join_target, &kttext, &ktsetter)) |saved| {
                     if (self.world.topic(join_target) == null) {
-                        self.world.setTopic(join_target, saved, self.serverName(), @divFloor(platform.realtimeMillis(), 1000)) catch {};
+                        // A legacy value carries no setter/set_at (setter == null);
+                        // fall back to serverName()/now exactly as before. A
+                        // versioned value restores the original setter + set-time.
+                        const restore_setter = saved.setter orelse self.serverName();
+                        const restore_at = if (saved.setter != null) saved.set_at else @divFloor(platform.realtimeMillis(), 1000);
+                        self.world.setTopic(join_target, saved.text, restore_setter, restore_at) catch {};
                     }
                 }
                 // PRIVATE (CHANNEL SET): a registered channel marked private comes
@@ -35492,10 +35498,12 @@ pub const LinuxServer = struct {
                         try self.failReply(conn, "CHANNEL", "TEMPORARILY_UNAVAILABLE", "Could not store KEEPTOPIC");
                         return;
                     };
-                    // On enable, snapshot the current live topic so it is remembered now.
+                    // On enable, snapshot the current live topic — with its setter
+                    // and set-time — so recreation restores all three, not a fake
+                    // serverName()/now.
                     if (on) {
-                        if (self.world.topic(r.channel)) |cur| {
-                            if (cur.len != 0) svc.chanKeepTopicSave(r.channel, cur) catch {};
+                        if (self.world.topicInfo(r.channel)) |cur| {
+                            if (cur.text.len != 0) svc.chanKeepTopicSave(r.channel, cur.text, cur.setter, cur.set_at) catch {};
                         }
                     }
                     try channelNotice(conn, "Channel {s} KEEPTOPIC {s}", .{ r.channel, if (on) "on" else "off" });
@@ -44914,8 +44922,10 @@ pub const LinuxServer = struct {
         const setter = try clientPrefix(conn, &setter_buf);
         const set_at = @divFloor(platform.realtimeMillis(), 1000);
         try self.world.setTopic(channel, text, setter, set_at);
-        // KEEPTOPIC: persist the new topic for a registered channel that opted in.
-        if (self.account_services) |kt| kt.chanKeepTopicSave(channel, text) catch {};
+        // KEEPTOPIC: persist the new topic — with the setter and set-time that set
+        // it — for a registered channel that opted in, so recreation restores all
+        // three (not a fake serverName()/now).
+        if (self.account_services) |kt| kt.chanKeepTopicSave(channel, text, setter, set_at) catch {};
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
