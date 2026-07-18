@@ -1327,20 +1327,22 @@ fn testRsaSpki(allocator: std.mem.Allocator, n: []const u8, e: []const u8) ![]u8
     return out.toOwnedSlice(allocator);
 }
 
-// M521 = 2^521-1 (a Mersenne PRIME) with e = d = n-2 ≡ -1 (mod n-1): a
+// M2281 = 2^2281-1 (a Mersenne PRIME) with e = d = n-2 ≡ -1 (mod n-1): a
 // self-signing RSA key needing no key generation or modular inverse, mirroring
 // the trick `rsa_verify.zig` uses for its own KAT. It exercises the RSA branch
-// of `verifySct` with our own signer. 521 bits = 66 bytes (0x01 then 65×0xFF);
-// n-2 flips the low byte to 0xFD.
-const m521_n = blk: {
-    var n: [66]u8 = @splat(0xFF);
+// of `verifySct` with our own signer. 2281 bits = 286 bytes (0x01 then
+// 285×0xFF) — comfortably above rsa_verify's 2048-bit modern-hardening floor,
+// so verifySct's RSA branch still accepts the key; n-2 flips the low byte to
+// 0xFD.
+const m2281_n = blk: {
+    var n: [286]u8 = @splat(0xFF);
     n[0] = 0x01;
     break :blk n;
 };
-const m521_ed = blk: {
-    var e: [66]u8 = @splat(0xFF);
+const m2281_ed = blk: {
+    var e: [286]u8 = @splat(0xFF);
     e[0] = 0x01;
-    e[65] = 0xFD;
+    e[285] = 0xFD;
     break :blk e;
 };
 /// DER DigestInfo prefix for SHA-256 (RFC 8017 §9.2), for the PKCS1 KAT below.
@@ -1433,10 +1435,10 @@ test "verifySctAgainstLogs verifies an ECDSA SCT from its serialized bytes" {
 }
 
 test "verifyOneSct accepts an RSA-PKCS1-SHA256 log signature (self-consistency KAT)" {
-    // The RSA log key is the self-signing M521 key we control (see above): this
+    // The RSA log key is the self-signing M2281 key we control (see above): this
     // exercises verifySct's RSA branch, not an external CT vector.
     const allocator = testing.allocator;
-    const spki = try testRsaSpki(allocator, &m521_n, &m521_ed);
+    const spki = try testRsaSpki(allocator, &m2281_n, &m2281_ed);
     defer allocator.free(spki);
     const log = CtLog{ .log_id = logIdFromSpki(spki), .key_spki_der = spki };
 
@@ -1452,20 +1454,20 @@ test "verifyOneSct accepts an RSA-PKCS1-SHA256 log signature (self-consistency K
     });
 
     // Encode EM = 00 01 FF.. 00 || DigestInfo(sha256) || SHA256(signed), then
-    // self-sign s = EM^d mod n with our controlled M521 private exponent.
+    // self-sign s = EM^d mod n with our controlled M2281 private exponent.
     const digest = hash.Sha256.hash(signed);
-    const k = m521_n.len; // 66
+    const k = m2281_n.len; // 286
     const t_len = sha256_digest_info_prefix.len + digest.len; // 51
-    var em: [66]u8 = undefined;
+    var em: [286]u8 = undefined;
     em[0] = 0x00;
     em[1] = 0x01;
-    const ps_len = k - t_len - 3; // 12
+    const ps_len = k - t_len - 3; // 232
     @memset(em[2 .. 2 + ps_len], 0xFF);
     em[2 + ps_len] = 0x00;
     @memcpy(em[3 + ps_len ..][0..sha256_digest_info_prefix.len], &sha256_digest_info_prefix);
     @memcpy(em[3 + ps_len + sha256_digest_info_prefix.len ..][0..digest.len], &digest);
-    var sig: [66]u8 = undefined;
-    try rsa_verify.modExp(&em, &m521_ed, &m521_n, &sig);
+    var sig: [286]u8 = undefined;
+    try rsa_verify.modExp(&em, &m2281_ed, &m2281_n, &sig);
 
     const sct = Sct{
         .version = .v1,

@@ -1490,29 +1490,32 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
 // ===========================================================================
 // RSASSA-PSS certificate-signature tests.
 //
-// Test signatures use a self-verifying Mersenne modulus n = M1279 = 2^1279 - 1
+// Test signatures use a self-verifying Mersenne modulus n = M2203 = 2^2203 - 1
 // (a known Mersenne PRIME) with e = d = n - 2. Because n is prime,
 // x^(n-1) ≡ 1 (mod n) (Fermat), and e·d ≡ (-1)(-1) ≡ 1 (mod n-1), so
 // s = EM^d and EM = s^e round-trip through a single public modexp — NO key
-// generation, NO modular inverse, NO external tooling. M1279 is 160 bytes, large
-// enough to carry SHA-512 with a 64-byte salt (emBits = 1278 ⇒ emLen = 160,
-// which also exercises the top-bit masking the smaller M521 vector does not).
+// generation, NO modular inverse, NO external tooling. M2203 is the smallest
+// Mersenne prime at or above rsa_verify's 2048-bit modern-hardening floor, so
+// verifyCertSignature still accepts the key (M1279, the prior vector, is now
+// refused). At 276 bytes it carries SHA-512 with a 64-byte salt, and its
+// emBits = 2202 ⇒ emLen = 276 keeps 6 non-byte-aligned top bits, so the PSS
+// top-bit masking path stays exercised (M2281's emBits = 2280 would not).
 //
 // The EMSA-PSS-ENCODE below is written straight from RFC 8017 §9.1.1 and is
 // deliberately independent of the verify path under test (its hashing and MGF1
 // use std.crypto directly, not rsa_verify's helpers).
 // ===========================================================================
 
-const m1279_n = blk: {
-    var n: [160]u8 = @splat(0xFF);
-    n[0] = 0x7F; // 2^1279 - 1 has 1279 set bits ⇒ top byte 0x7F, then 159×0xFF
+const m2203_n = blk: {
+    var n: [276]u8 = @splat(0xFF);
+    n[0] = 0x07; // 2^2203 - 1 has 2203 set bits ⇒ top byte 0x07, then 275×0xFF
     break :blk n;
 };
 // n - 2: identical to n except the least-significant byte 0xFF → 0xFD.
-const m1279_ed = blk: {
-    var d: [160]u8 = @splat(0xFF);
-    d[0] = 0x7F;
-    d[159] = 0xFD;
+const m2203_ed = blk: {
+    var d: [276]u8 = @splat(0xFF);
+    d[0] = 0x07;
+    d[275] = 0xFD;
     break :blk d;
 };
 
@@ -1585,7 +1588,7 @@ fn testSignPss(
     const top_bits: u3 = @intCast(8 * em_len - em_bits);
     if (top_bits != 0) db[0] &= @as(u8, 0xFF) >> top_bits;
 
-    var em: [256]u8 = undefined;
+    var em: [320]u8 = undefined; // ≥ emLen (276 for the M2203 test modulus)
     @memcpy(em[0..db_len], db[0..db_len]);
     @memcpy(em[db_len..][0..h_len], hbuf[0..h_len]);
     em[em_len - 1] = 0xbc;
@@ -1596,15 +1599,19 @@ fn testSignPss(
 /// Build an RSA SubjectPublicKeyInfo DER from a big-endian modulus/exponent
 /// (both already valid positive DER-INTEGER magnitudes: MSB clear).
 fn testBuildRsaSpki(out: []u8, n: []const u8, e: []const u8) []const u8 {
-    var rsapk_body: [512]u8 = undefined;
+    // n and e are BOTH full-modulus-width here (the self-signing key sets
+    // e = d = n-2), so each INTEGER TLV is ~1+3+276 = 280 bytes: size the DER
+    // scratch for two of them plus the SEQUENCE/BIT-STRING wrappers, not for a
+    // short exponent.
+    var rsapk_body: [640]u8 = undefined;
     var rp = W.init(&rsapk_body);
     rp.tlv(0x02, n);
     rp.tlv(0x02, e);
-    var rsapk_seq: [520]u8 = undefined;
+    var rsapk_seq: [640]u8 = undefined;
     var rs = W.init(&rsapk_seq);
     rs.tlv(0x30, rp.bytes());
 
-    var bit_buf: [540]u8 = undefined;
+    var bit_buf: [660]u8 = undefined;
     bit_buf[0] = 0x00; // BIT STRING unused-bits octet
     @memcpy(bit_buf[1..][0..rs.bytes().len], rs.bytes());
     const bit_val = bit_buf[0 .. 1 + rs.bytes().len];
@@ -1706,7 +1713,7 @@ fn testBuildPssParams(out: []u8, opts: PssBuildOpts) []const u8 {
 test "verifyCertSignature accepts RSASSA-PSS over SHA-256/384/512 and rejects a flipped byte" {
     const tbs = "orochi RSASSA-PSS cert-signature end-to-end test bytes";
     var spki_buf: [700]u8 = undefined;
-    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    const spki = testBuildRsaSpki(&spki_buf, &m2203_n, &m2203_ed);
 
     const cases = .{
         .{ rsa_verify.HashAlg.sha256, @as([]const u8, &PssHashOid.sha256), @as(u8, 32) },
@@ -1721,8 +1728,8 @@ test "verifyCertSignature accepts RSASSA-PSS over SHA-256/384/512 and rejects a 
         var mhash: [64]u8 = undefined;
         testHash(alg, tbs, mhash[0..alg.digestLen()]);
         const salt = @as([64]u8, @splat(0x5A));
-        var sig: [160]u8 = undefined;
-        try testSignPss(&sig, &m1279_n, &m1279_ed, alg, mhash[0..alg.digestLen()], salt[0..salt_len]);
+        var sig: [276]u8 = undefined; // full M2203 modulus length
+        try testSignPss(&sig, &m2203_n, &m2203_ed, alg, mhash[0..alg.digestLen()], salt[0..salt_len]);
 
         var params_buf: [256]u8 = undefined;
         const params = testBuildPssParams(&params_buf, .{
@@ -1748,11 +1755,11 @@ test "verifyCertSignature accepts RSASSA-PSS whose hash AlgorithmIdentifiers omi
     var mhash: [32]u8 = undefined;
     testHash(.sha256, tbs, &mhash);
     const salt = @as([32]u8, @splat(0x33));
-    var sig: [160]u8 = undefined;
-    try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
+    var sig: [276]u8 = undefined; // full M2203 modulus length
+    try testSignPss(&sig, &m2203_n, &m2203_ed, .sha256, &mhash, &salt);
 
     var spki_buf: [700]u8 = undefined;
-    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    const spki = testBuildRsaSpki(&spki_buf, &m2203_n, &m2203_ed);
     var params_buf: [256]u8 = undefined;
     const params = testBuildPssParams(&params_buf, .{
         .hash_oid = &PssHashOid.sha256,
@@ -1769,11 +1776,11 @@ test "verifyCertSignature rejects RSASSA-PSS when the declared hash differs from
     var mhash: [32]u8 = undefined;
     testHash(.sha256, tbs, &mhash);
     const salt = @as([32]u8, @splat(0x11));
-    var sig: [160]u8 = undefined;
-    try testSignPss(&sig, &m1279_n, &m1279_ed, .sha256, &mhash, &salt);
+    var sig: [276]u8 = undefined; // full M2203 modulus length
+    try testSignPss(&sig, &m2203_n, &m2203_ed, .sha256, &mhash, &salt);
 
     var spki_buf: [700]u8 = undefined;
-    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
+    const spki = testBuildRsaSpki(&spki_buf, &m2203_n, &m2203_ed);
     // The signature is a SHA-256 PSS, but the params declare SHA-512.
     var params_buf: [256]u8 = undefined;
     const params = testBuildPssParams(&params_buf, .{
@@ -1789,8 +1796,8 @@ test "verifyCertSignature rejects RSASSA-PSS when the declared hash differs from
 
 test "verifyCertSignature rejects RSASSA-PSS with a missing/oversized salt (fail-closed cap)" {
     var spki_buf: [700]u8 = undefined;
-    const spki = testBuildRsaSpki(&spki_buf, &m1279_n, &m1279_ed);
-    const sig = @as([160]u8, @splat(0));
+    const spki = testBuildRsaSpki(&spki_buf, &m2203_n, &m2203_ed);
+    const sig = @as([276]u8, @splat(0)); // full M2203 modulus length
 
     // saltLength = 4096, far above the max_pss_salt_len (512) cap → reject.
     var over_buf: [256]u8 = undefined;
