@@ -64,6 +64,11 @@ pub const Error = x509.Error || error{
     /// A certificate's signature did not verify under its issuer's public key,
     /// or the signature/key encoding was malformed.
     BadSignature,
+    /// A structural chain-policy violation: a non-CA or non-signing issuer, a
+    /// NameConstraints exclusion/omission, or a pathLenConstraint breach. Shared
+    /// by `enforceNameConstraints`/`enforcePathLen` below, and by the TLS 1.3
+    /// and hardened TLS 1.2 clients' own leaf/issuer policy checks.
+    BadCertificate,
 };
 
 /// Signature-algorithm OIDs found in a certificate's outer AlgorithmIdentifier.
@@ -274,6 +279,181 @@ pub fn verifySimpleChainAt(chain_der: []const []const u8, now_epoch_seconds: i64
 pub fn validateServerChainAt(chain_der: []const []const u8, now_epoch_seconds: i64) Error!void {
     if (chain_der.len == 0) return error.EmptyChain;
     try validateDerAt(chain_der[0], now_epoch_seconds);
+}
+
+/// One certificate's inputs to path-length checking. `path_len` is its
+/// basicConstraints pathLenConstraint (null = absent); `self_issued` is
+/// subject DN == issuer DN. Shared by the TLS 1.3 and hardened TLS 1.2
+/// clients' `verifyChainToTrustAnchors` (see `enforcePathLen` below) so the
+/// two engines cannot silently diverge on path-length enforcement.
+pub const CaPathFact = struct { path_len: ?u32, self_issued: bool };
+
+/// RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement. `facts[0]`
+/// is the leaf; `facts[1..]` are the CAs from the leaf toward the trust
+/// anchor. A CA's pathLenConstraint bounds the number of NON-self-issued
+/// intermediate CAs strictly between it and the leaf. This per-CA check is
+/// equivalent to the RFC's running-budget algorithm.
+pub fn enforcePathLen(facts: []const CaPathFact) Error!void {
+    var ci: usize = 1;
+    while (ci < facts.len) : (ci += 1) {
+        const limit = facts[ci].path_len orelse continue;
+        var below: u32 = 0;
+        var bi: usize = 1;
+        while (bi < ci) : (bi += 1) {
+            if (!facts[bi].self_issued) below += 1;
+        }
+        if (below > limit) return error.BadCertificate;
+    }
+}
+
+/// Reduce a leaf-first DER chain into `enforcePathLen`'s per-certificate
+/// facts, writing at most `out.len` entries and returning the count written.
+/// A certificate that fails to parse degrades to `{null, false}` for this
+/// check only (the chain's signature/DN linkage is verified elsewhere; this
+/// reduction only feeds pathLenConstraint enforcement).
+pub fn buildPathFacts(chain: []const []const u8, out: []CaPathFact) usize {
+    const n = @min(chain.len, out.len);
+    for (chain[0..n], 0..) |der, idx| {
+        const path_len = if (x509.parse(der)) |p| p.basic_constraints_path_len else |_| null;
+        const self_issued = if (linkInfo(der)) |info| info.isSelfIssued() else |_| false;
+        out[idx] = .{ .path_len = path_len, .self_issued = self_issued };
+    }
+    return n;
+}
+
+/// Enforce an issuing CA's NameConstraints (dNSName) against the leaf's SAN
+/// dNSNames (RFC 5280 §4.2.1.10). Each leaf name must match no excluded
+/// subtree and, when permitted dNSName subtrees exist, at least one permitted
+/// subtree. Shared by the TLS 1.3 and hardened TLS 1.2 clients so a
+/// name-constrained CA in the anchor set is enforced identically by both —
+/// previously the TLS 1.2 client omitted this check entirely, letting a
+/// name-constrained sub-CA mint an out-of-scope leaf that TLS 1.3 correctly
+/// rejected but TLS 1.2 silently accepted.
+pub fn enforceNameConstraints(issuer: x509.Certificate, leaf: x509.Certificate) Error!void {
+    if (!issuer.name_constraints_present) return;
+    var li: usize = 0;
+    while (li < leaf.san_dns_count) : (li += 1) {
+        const name = leaf.san_dns[li];
+        var ei: usize = 0;
+        while (ei < issuer.nc_excluded_dns_count) : (ei += 1) {
+            if (dnsConstraintMatches(issuer.nc_excluded_dns[ei], name)) return error.BadCertificate;
+        }
+        if (issuer.nc_permitted_dns_count > 0) {
+            var ok = false;
+            var pi: usize = 0;
+            while (pi < issuer.nc_permitted_dns_count) : (pi += 1) {
+                if (dnsConstraintMatches(issuer.nc_permitted_dns[pi], name)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return error.BadCertificate;
+        }
+    }
+}
+
+/// dNSName name-constraint match (RFC 5280): the constraint matches the name
+/// and any name with additional left-hand labels. An empty constraint matches
+/// all; a leading-dot constraint matches strict subdomains only.
+fn dnsConstraintMatches(constraint: []const u8, name: []const u8) bool {
+    if (constraint.len == 0) return true;
+    if (constraint[0] == '.') return asciiEndsWithIgnoreCase(name, constraint);
+    if (asciiEqlIgnoreCase(name, constraint)) return true;
+    // name == "<labels>." ++ constraint
+    if (name.len > constraint.len + 1 and
+        name[name.len - constraint.len - 1] == '.' and
+        asciiEqlIgnoreCase(name[name.len - constraint.len ..], constraint))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+fn asciiEndsWithIgnoreCase(name: []const u8, suffix: []const u8) bool {
+    if (name.len < suffix.len) return false;
+    return asciiEqlIgnoreCase(name[name.len - suffix.len ..], suffix);
+}
+
+test "enforcePathLen: pathLenConstraint bounds intermediates below a CA" {
+    const F = CaPathFact;
+    // Normal chain [leaf, R3(pathLen:0), root]: 0 intermediates below R3 — OK.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 0, .self_issued = false },
+    });
+    // [leaf, subCA, root(pathLen:0)]: subCA is a non-self-issued intermediate
+    // below the pathLen:0 root — REJECT.
+    try std.testing.expectError(error.BadCertificate, enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 0, .self_issued = false },
+    }));
+    // pathLen:1 permits exactly one intermediate below.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 1, .self_issued = false },
+    });
+    // Two intermediates below a pathLen:1 CA — REJECT.
+    try std.testing.expectError(error.BadCertificate, enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = 1, .self_issued = false },
+    }));
+    // A self-issued (cross-signed) intermediate is exempt from the count.
+    try enforcePathLen(&[_]F{
+        .{ .path_len = null, .self_issued = false },
+        .{ .path_len = null, .self_issued = true },
+        .{ .path_len = 0, .self_issued = false },
+    });
+}
+
+test "dnsConstraintMatches follows RFC 5280 subtree rules" {
+    try std.testing.expect(dnsConstraintMatches("example.com", "example.com"));
+    try std.testing.expect(dnsConstraintMatches("example.com", "host.example.com"));
+    try std.testing.expect(dnsConstraintMatches("example.com", "a.b.example.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "notexample.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "example.com.evil.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "other.com"));
+    // Empty constraint matches everything; leading-dot matches subdomains only.
+    try std.testing.expect(dnsConstraintMatches("", "anything.test"));
+    try std.testing.expect(dnsConstraintMatches(".example.com", "host.example.com"));
+    try std.testing.expect(!dnsConstraintMatches(".example.com", "example.com"));
+}
+
+test "enforceNameConstraints applies permitted + excluded dNSName subtrees" {
+    var issuer = std.mem.zeroes(x509.Certificate);
+    issuer.name_constraints_present = true;
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_permitted_dns_count = 1;
+    issuer.nc_excluded_dns[0] = "bad.example.com";
+    issuer.nc_excluded_dns_count = 1;
+
+    var leaf = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns_count = 1;
+
+    leaf.san_dns[0] = "host.example.com"; // permitted, not excluded
+    try enforceNameConstraints(issuer, leaf);
+
+    leaf.san_dns[0] = "host.other.com"; // outside the permitted subtree
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+
+    leaf.san_dns[0] = "bad.example.com"; // excluded wins over permitted
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+
+    // A CA without NameConstraints imposes nothing.
+    const plain = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns[0] = "anything.test";
+    try enforceNameConstraints(plain, leaf);
 }
 
 fn requireSignature(info: LinkInfo) Error!void {
@@ -964,6 +1144,142 @@ pub fn mintEd25519Leaf(
     const sig_bytes = sig.toBytes();
 
     var body: [700]u8 = undefined;
+    var bw = W.init(&body);
+    bw.raw(tbs_der);
+    writeAlgEd25519(&bw);
+    var bit: [65]u8 = undefined;
+    bit[0] = 0;
+    @memcpy(bit[1..], &sig_bytes);
+    bw.tlv(0x03, &bit);
+
+    var cert = W.init(out);
+    cert.tlv(0x30, bw.bytes());
+    return cert.bytes();
+}
+
+const oid_basic_constraints_bytes = [_]u8{ 0x55, 0x1D, 0x13 };
+const oid_subject_alt_name_bytes = [_]u8{ 0x55, 0x1D, 0x11 };
+const oid_name_constraints_bytes = [_]u8{ 0x55, 0x1D, 0x1E };
+
+/// Extension inputs for `mintEd25519CertExt`. All fields default to "omit this
+/// extension" so a plain leaf needs only `dns_names`.
+const CertExtOpts = struct {
+    /// Emit BasicConstraints `cA:TRUE` (critical flag omitted; the parser does
+    /// not require it) with an optional pathLenConstraint.
+    is_ca: bool = false,
+    path_len: ?u8 = null,
+    /// SubjectAltName dNSName entries.
+    dns_names: []const []const u8 = &.{},
+    /// NameConstraints permittedSubtrees (dNSName only; no excludedSubtrees —
+    /// the F1 regression tests below only need permitted-subtree rejection).
+    permitted_dns: []const []const u8 = &.{},
+};
+
+fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
+    var body: [224]u8 = undefined;
+    var b = W.init(&body);
+    b.tlv(0x06, oid); // extnID
+    b.tlv(0x04, ext_value); // extnValue OCTET STRING
+    w.tlv(0x30, b.bytes()); // Extension SEQUENCE
+}
+
+fn writeBasicConstraintsExt(w: *W, path_len: ?u8) void {
+    var body: [8]u8 = undefined;
+    var b = W.init(&body);
+    b.tlv(0x01, &[_]u8{0xff}); // cA: TRUE
+    if (path_len) |pl| b.tlv(0x02, &[_]u8{pl});
+    var val: [16]u8 = undefined;
+    var v = W.init(&val);
+    v.tlv(0x30, b.bytes());
+    writeExtTlv(w, &oid_basic_constraints_bytes, v.bytes());
+}
+
+fn writeSanExt(w: *W, dns_names: []const []const u8) void {
+    var body: [160]u8 = undefined;
+    var b = W.init(&body);
+    for (dns_names) |name| b.tlv(0x82, name); // dNSName [2]
+    var val: [176]u8 = undefined;
+    var v = W.init(&val);
+    v.tlv(0x30, b.bytes());
+    writeExtTlv(w, &oid_subject_alt_name_bytes, v.bytes());
+}
+
+/// NameConstraints permittedSubtrees only (RFC 5280 §4.2.1.10):
+/// SEQUENCE { permittedSubtrees [0] GeneralSubtrees }, GeneralSubtrees =
+/// SEQUENCE OF GeneralSubtree, GeneralSubtree = SEQUENCE { base GeneralName }
+/// (minimum/maximum omitted — both OPTIONAL/DEFAULT).
+fn writeNameConstraintsExt(w: *W, permitted_dns: []const []const u8) void {
+    var subtrees_body: [160]u8 = undefined;
+    var sb = W.init(&subtrees_body);
+    for (permitted_dns) |name| {
+        var gs_body: [96]u8 = undefined;
+        var gsb = W.init(&gs_body);
+        gsb.tlv(0x82, name); // base: dNSName [2]
+        sb.tlv(0x30, gsb.bytes()); // GeneralSubtree SEQUENCE
+    }
+    var nc_body: [176]u8 = undefined;
+    var ncb = W.init(&nc_body);
+    ncb.tlv(0xa0, sb.bytes()); // permittedSubtrees [0]
+    var val: [192]u8 = undefined;
+    var v = W.init(&val);
+    v.tlv(0x30, ncb.bytes());
+    writeExtTlv(w, &oid_name_constraints_bytes, v.bytes());
+}
+
+/// Mint an Ed25519 certificate (issuer DN `issuer_cn`, subject DN
+/// `subject_cn`, self-signed when the two DNs and `signing_kp` describe the
+/// same certificate) carrying the extensions in `opts`. `mintEd25519Leaf`
+/// above has no extensions support at all, and none of `x509_selfsign.zig`'s
+/// builders support NameConstraints or an Ed25519 "issued by" CA — this helper
+/// exists only for the F1 NameConstraints/pathLenConstraint enforcement
+/// regression tests below (and their mirror in `tls12_client.zig`/
+/// `tls_client.zig`), which need small, fully ad hoc chains. `pub` so both
+/// TLS client engines' own test sections can mint the same fixtures.
+pub fn mintEd25519CertExt(
+    out: []u8,
+    issuer_cn: []const u8,
+    subject_cn: []const u8,
+    subject_pub: [32]u8,
+    signing_kp: StdEd25519.KeyPair,
+    nb: i64,
+    na: i64,
+    opts: CertExtOpts,
+) ![]const u8 {
+    var tbs_body: [768]u8 = undefined;
+    var tb = W.init(&tbs_body);
+    // version [0] EXPLICIT INTEGER 2
+    var ver: [5]u8 = undefined;
+    var vw = W.init(&ver);
+    vw.tlv(0x02, &[_]u8{0x02});
+    tb.tlv(0xa0, vw.bytes());
+    tb.tlv(0x02, &[_]u8{ 0x12, 0x34 }); // serial
+    writeAlgEd25519(&tb); // signature alg in TBS
+    writeNameCn(&tb, issuer_cn);
+    writeValidity(&tb, nb, na);
+    writeNameCn(&tb, subject_cn);
+    writeSpkiEd25519(&tb, subject_pub);
+
+    var ext_seq_body: [512]u8 = undefined;
+    var esb = W.init(&ext_seq_body);
+    if (opts.is_ca) writeBasicConstraintsExt(&esb, opts.path_len);
+    if (opts.dns_names.len != 0) writeSanExt(&esb, opts.dns_names);
+    if (opts.permitted_dns.len != 0) writeNameConstraintsExt(&esb, opts.permitted_dns);
+    if (esb.pos != 0) {
+        var ext_seq: [520]u8 = undefined;
+        var es = W.init(&ext_seq);
+        es.tlv(0x30, esb.bytes()); // Extensions SEQUENCE
+        tb.tlv(0xa3, es.bytes()); // [3] EXPLICIT
+    }
+
+    var tbs: [800]u8 = undefined;
+    var tw = W.init(&tbs);
+    tw.tlv(0x30, tb.bytes());
+    const tbs_der = tw.bytes();
+
+    const sig = try StdEd25519.KeyPair.sign(signing_kp, tbs_der, null);
+    const sig_bytes = sig.toBytes();
+
+    var body: [900]u8 = undefined;
     var bw = W.init(&body);
     bw.raw(tbs_der);
     writeAlgEd25519(&bw);

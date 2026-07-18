@@ -275,6 +275,45 @@ pub const PublicKey = struct {
     e: []const u8,
 };
 
+/// Modern-hardening floor (defense-in-depth, not required for the RFC 8017
+/// math to be correct): no certificate a real trusted CA issues today carries
+/// an RSA modulus below this width. Verification itself now fails closed on
+/// one anyway, rather than relying entirely on chain-building policy upstream
+/// to have already refused it.
+pub const min_modulus_bits: usize = 2048;
+
+/// Reject a public key with no security value as an RSA signer: `e` even (RSA
+/// requires gcd(e, λ(n)) = 1, and λ(n) is always even for a modulus with two
+/// odd prime factors, so any even `e` is invalid by construction — this also
+/// catches `e == 0`) or `e == 1` (the identity map; "signing" a document with
+/// it proves nothing, since `s^1 mod n = s` for any `s`), and a modulus
+/// narrower than `min_modulus_bits`. A real trusted CA never mints either;
+/// this closes off a maliciously/accidentally weak key before it ever reaches
+/// a signature comparison.
+fn publicKeyIsAcceptable(pub_key: PublicKey) bool {
+    const n = Big.fromBytesBE(pub_key.n) catch return false;
+    if (n.bitLen() < min_modulus_bits) return false;
+    const e = Big.fromBytesBE(pub_key.e) catch return false;
+    if (e.bit(0) == 0) return false; // even (including zero)
+    if (e.len == 1 and e.limbs[0] == 1) return false; // e == 1
+    return true;
+}
+
+/// A signature representative must be a canonical member of Z_n (`0 <= s <
+/// n`); `modExp` would silently reduce an out-of-range value mod `n` and
+/// verify it anyway, which lets a byte-distinct "signature" (`s + n`, `s +
+/// 2n`, …, so long as it still fits in the modulus byte width) verify
+/// identically to `s`. Not a forgery — it does not let an attacker produce a
+/// signature for a NEW message — but rejecting it up front keeps every
+/// accepted signature representative canonical, matching RFC 8017's IR
+/// (integer representative) range and closing off any downstream code that
+/// might treat the raw signature bytes as a unique identifier.
+fn signatureIsCanonical(signature: []const u8, modulus: []const u8) bool {
+    const s = Big.fromBytesBE(signature) catch return false;
+    const n = Big.fromBytesBE(modulus) catch return false;
+    return s.cmp(&n) == .lt;
+}
+
 /// DER DigestInfo prefix for each hash (RFC 8017 §9.2).
 fn digestInfoPrefix(alg: HashAlg) []const u8 {
     return switch (alg) {
@@ -311,6 +350,8 @@ pub fn verifyPkcs1v15(pub_key: PublicKey, alg: HashAlg, digest: []const u8, sign
     if (k == 0 or k > max_bytes / 2) return false;
     if (signature.len != k) return false;
     if (digest.len != alg.digestLen()) return false;
+    if (!publicKeyIsAcceptable(pub_key)) return false;
+    if (!signatureIsCanonical(signature, pub_key.n)) return false;
 
     var em: [max_bytes]u8 = undefined;
     modExp(signature, pub_key.e, pub_key.n, em[0..k]) catch return false;
@@ -356,6 +397,8 @@ pub fn verifyPss(pub_key: PublicKey, alg: HashAlg, mhash: []const u8, signature:
     if (signature.len != k) return false;
     const h_len = alg.digestLen();
     if (mhash.len != h_len) return false;
+    if (!publicKeyIsAcceptable(pub_key)) return false;
+    if (!signatureIsCanonical(signature, pub_key.n)) return false;
     // Defensive overflow guard: `salt_len` is attacker-influenced — it originates
     // from a certificate's RSASSA-PSS-params. The `em_len < h_len + salt_len + 2`
     // bound below adds it to usizes; a colossal value would wrap in a ReleaseFast
@@ -441,21 +484,26 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return out;
 }
 
-// Self-contained verification key: n = M521 = 2^521 - 1 (a well-known Mersenne
-// PRIME), so x^(n-1) ≡ 1 (Fermat). With e = d = n-2 ≡ -1 (mod n-1) we get
-// e·d ≡ 1 (mod n-1), hence s = EM^d, EM = s^e round-trips with NO key
-// generation, NO modular inverse, and NO external tooling — only our own
-// modExp. n is 521 bits = 66 bytes: 0x01 followed by 65 × 0xFF.
-const m521_n = blk: {
-    var n: [66]u8 = @splat(0xFF);
+// Self-contained verification key: n = M2281 = 2^2281 - 1 (a well-known
+// Mersenne PRIME, comfortably above `min_modulus_bits` so it still exercises
+// `verifyPkcs1v15`/`verifyPss` post-hardening), so x^(n-1) ≡ 1 (mod n) for any
+// x coprime to n (Fermat). With e = d = n-2 ≡ -1 (mod n-1) we get e·d ≡ 1
+// (mod n-1), hence s = EM^d, EM = s^e round-trips with NO key generation, NO
+// modular inverse, and NO external tooling — only our own modExp. n is 2281
+// bits = 286 bytes: 0x01 followed by 285 × 0xFF (chosen, like the M521 key
+// this replaced, so mod_bits ≡ 1 (mod 8): em_bits = mod_bits-1 is then an
+// exact multiple of 8 and PSS's top-bit masking is a no-op here — the
+// OpenSSL 2048-bit vector below exercises that masking path instead).
+const m2281_n = blk: {
+    var n: [286]u8 = @splat(0xFF);
     n[0] = 0x01;
     break :blk n;
 };
 // n - 2: low byte 0xFF -> 0xFD, all else identical to n.
-const m521_ed = blk: {
-    var e: [66]u8 = @splat(0xFF);
+const m2281_ed = blk: {
+    var e: [286]u8 = @splat(0xFF);
     e[0] = 0x01;
-    e[65] = 0xFD;
+    e[285] = 0xFD;
     break :blk e;
 };
 const test_digest = hexToBytes("24ddade2122077b86a4ea8ed269ec44c16e3c7105d30c28c3a7060bc718f89a5");
@@ -498,11 +546,11 @@ test "modExp matches the textbook RSA example (65^17 mod 3233 = 2790, back to 65
 
 test "verifyPkcs1v15 round-trips a self-signed EM and rejects tampering" {
     // Arrange: encode EM = 00 01 FF.. 00 || DigestInfo || digest, then "sign"
-    // it ourselves: s = EM^d mod n (d = m521_ed). Pure self-contained KAT.
-    const k = m521_n.len; // 66
+    // it ourselves: s = EM^d mod n (d = m2281_ed). Pure self-contained KAT.
+    const k = m2281_n.len; // 286
     const prefix = digestInfoPrefix(.sha256);
     const t_len = prefix.len + test_digest.len;
-    var em: [66]u8 = undefined;
+    var em: [286]u8 = undefined;
     em[0] = 0x00;
     em[1] = 0x01;
     const ps_len = k - t_len - 3;
@@ -510,10 +558,10 @@ test "verifyPkcs1v15 round-trips a self-signed EM and rejects tampering" {
     em[2 + ps_len] = 0x00;
     @memcpy(em[3 + ps_len ..][0..prefix.len], prefix);
     @memcpy(em[3 + ps_len + prefix.len ..][0..test_digest.len], &test_digest);
-    var sig: [66]u8 = undefined;
-    try modExp(&em, &m521_ed, &m521_n, &sig);
+    var sig: [286]u8 = undefined;
+    try modExp(&em, &m2281_ed, &m2281_n, &sig);
 
-    const pk = PublicKey{ .n = &m521_n, .e = &m521_ed };
+    const pk = PublicKey{ .n = &m2281_n, .e = &m2281_ed };
     // Act + Assert: our signature verifies.
     try testing.expect(verifyPkcs1v15(pk, .sha256, &test_digest, &sig));
     // A flipped signature bit fails.
@@ -527,11 +575,11 @@ test "verifyPkcs1v15 round-trips a self-signed EM and rejects tampering" {
 }
 
 test "verifyPss round-trips a self-encoded EM and rejects tampering" {
-    // Arrange: EMSA-PSS-ENCODE (RFC 8017 §9.1.1) with a fixed salt, emLen=65
-    // (emBits = 521-1 = 520), then self-sign s = EM^d mod n.
+    // Arrange: EMSA-PSS-ENCODE (RFC 8017 §9.1.1) with a fixed salt, emLen=285
+    // (emBits = 2281-1 = 2280), then self-sign s = EM^d mod n.
     const h_len: usize = 32;
     const salt_len: usize = 16;
-    const em_len: usize = 65; // ceil((521-1)/8)
+    const em_len: usize = 285; // ceil((2281-1)/8)
     const salt = @as([salt_len]u8, @splat(0xA7));
 
     // M' = 0x00*8 || mHash || salt; H = SHA-256(M').
@@ -543,23 +591,23 @@ test "verifyPss round-trips a self-encoded EM and rejects tampering" {
     hashOf(.sha256, &mprime, h[0..h_len]);
 
     // DB = PS(0x00) || 0x01 || salt; then maskedDB = DB XOR MGF1(H, dbLen).
-    const db_len = em_len - h_len - 1; // 32
-    const ps_len = db_len - salt_len - 1; // 15
-    var db: [32]u8 = undefined;
+    const db_len = em_len - h_len - 1; // 252
+    const ps_len = db_len - salt_len - 1; // 235
+    var db: [252]u8 = undefined;
     @memset(db[0..ps_len], 0);
     db[ps_len] = 0x01;
     @memcpy(db[ps_len + 1 ..][0..salt_len], &salt);
     mgf1(.sha256, h[0..h_len], db[0..db_len]); // db := maskedDB (top_bits=0 here)
 
-    // EM = maskedDB || H || 0xbc  (em_len = 65); left-pad to k=66 for modExp.
-    var em: [65]u8 = undefined;
+    // EM = maskedDB || H || 0xbc  (em_len = 285); left-pad to k=286 for modExp.
+    var em: [285]u8 = undefined;
     @memcpy(em[0..db_len], db[0..db_len]);
     @memcpy(em[db_len..][0..h_len], h[0..h_len]);
     em[em_len - 1] = 0xbc;
-    var sig: [66]u8 = undefined;
-    try modExp(&em, &m521_ed, &m521_n, &sig);
+    var sig: [286]u8 = undefined;
+    try modExp(&em, &m2281_ed, &m2281_n, &sig);
 
-    const pk = PublicKey{ .n = &m521_n, .e = &m521_ed };
+    const pk = PublicKey{ .n = &m2281_n, .e = &m2281_ed };
     // Act + Assert
     try testing.expect(verifyPss(pk, .sha256, &test_digest, &sig, salt_len));
     var bad_sig = sig;
@@ -584,6 +632,48 @@ test "verifyPss accepts a real 2048-bit RSASSA-PSS-SHA256 signature (OpenSSL vec
     var bad = sig;
     bad[0] ^= 0x01;
     try testing.expect(!verifyPss(pk, .sha256, &digest, &bad, 32));
+}
+
+test "publicKeyIsAcceptable rejects a weak exponent or a sub-floor modulus" {
+    // A 2048-bit modulus (bitLen == the floor exactly) with the standard
+    // e=65537 passes.
+    var n2048: [256]u8 = @splat(0xFF);
+    const e65537 = [_]u8{ 0x01, 0x00, 0x01 };
+    try testing.expect(publicKeyIsAcceptable(.{ .n = &n2048, .e = &e65537 }));
+
+    // e == 1: the identity map — "signing" with it proves nothing.
+    const e1 = [_]u8{0x01};
+    try testing.expect(!publicKeyIsAcceptable(.{ .n = &n2048, .e = &e1 }));
+
+    // e == 0 and any even e: gcd(e, λ(n)) can never be 1 for an even e.
+    const e0 = [_]u8{0x00};
+    try testing.expect(!publicKeyIsAcceptable(.{ .n = &n2048, .e = &e0 }));
+    const e_even = [_]u8{ 0x01, 0x00, 0x00 }; // 65536
+    try testing.expect(!publicKeyIsAcceptable(.{ .n = &n2048, .e = &e_even }));
+
+    // A sub-floor modulus (2040 bits — one byte shorter) fails even at e=65537.
+    var n_short: [255]u8 = @splat(0xFF);
+    try testing.expect(!publicKeyIsAcceptable(.{ .n = &n_short, .e = &e65537 }));
+}
+
+test "verifyPkcs1v15 and verifyPss fail closed on a sub-floor modulus regardless of the signature" {
+    // The floor check runs before any modexp/EM comparison, so a tiny (16-bit)
+    // modulus is rejected outright — the signature's shape is irrelevant.
+    const tiny_n = [_]u8{ 0x0c, 0xa1 }; // 3233, from the textbook modExp example
+    const tiny_e = [_]u8{0x11}; // 17
+    const pk = PublicKey{ .n = &tiny_n, .e = &tiny_e };
+    const sig = [_]u8{ 0x00, 0x00 };
+    try testing.expect(!verifyPkcs1v15(pk, .sha256, &test_digest, &sig));
+    try testing.expect(!verifyPss(pk, .sha256, &test_digest, &sig, 0));
+}
+
+test "verifyPkcs1v15 and verifyPss reject a non-canonical signature representative (s >= n)" {
+    // Same byte length as the modulus (k), but its numeric value equals n
+    // exactly — not a canonical member of Z_n — so it must be rejected before
+    // ever reaching modExp, regardless of what it would reduce to.
+    const pk = PublicKey{ .n = &m2281_n, .e = &m2281_ed };
+    try testing.expect(!verifyPkcs1v15(pk, .sha256, &test_digest, &m2281_n));
+    try testing.expect(!verifyPss(pk, .sha256, &test_digest, &m2281_n, 32));
 }
 
 test "fromBytesBE / toBytesBE round-trip" {

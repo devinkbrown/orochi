@@ -28,11 +28,20 @@ pub const SecretKey = Secret([secret_key_len]u8);
 pub const SignError = std.crypto.errors.IdentityElementError ||
     std.crypto.errors.KeyMismatchError ||
     std.crypto.errors.NonCanonicalError ||
-    std.crypto.errors.WeakPublicKeyError;
+    std.crypto.errors.WeakPublicKeyError ||
+    error{InvalidInfixWidth};
 
-pub const VerifyError = StdEd25519.Signature.VerifyError;
+pub const VerifyError = StdEd25519.Signature.VerifyError || error{InvalidInfixWidth};
 
 const domain_prefix_magic = "orochi-ed25519ctx-v1";
+
+/// The `infix` in signCtxInfix/verifyCtxInfix is concatenated with `msg` WITHOUT
+/// a length delimiter, so (infix="AB",msg="C") and (infix="A",msg="BC") would
+/// sign identical bytes. Every real caller (suimyaku signed_frame) passes a
+/// fixed-width 1-byte frame-type tag, so we enforce that width here — a future
+/// variable-length infix is rejected fail-closed rather than producing an
+/// ambiguous signature. AUDIT every caller before widening this.
+const known_infix_len: usize = 1;
 
 /// Ed25519 key pair. `secret_key` is seed || public key, matching std/RFC
 /// Ed25519 storage, and is wiped by `deinit`.
@@ -94,6 +103,7 @@ pub const KeyPair = struct {
         infix: []const u8,
         msg: []const u8,
     ) SignError!Signature {
+        if (infix.len != known_infix_len) return error.InvalidInfixWidth;
         const prefix = domainPrefix(domain);
         return self.signPrefixed(&prefix, infix, msg);
     }
@@ -183,6 +193,7 @@ pub fn verifyCtxInfix(
     sig: Signature,
     public_key: PublicKey,
 ) VerifyError!bool {
+    if (infix.len != known_infix_len) return error.InvalidInfixWidth;
     const prefix = domainPrefix(domain);
     return verifyPrefixed(&prefix, infix, msg, sig, public_key);
 }
@@ -302,6 +313,22 @@ test "domain separation prevents cross-use" {
     try std.testing.expect(try verifyCtx("capability-token", msg, cap_sig, kp.public_key));
     try std.testing.expect(!try verifyCtx("capability-token", msg, node_sig, kp.public_key));
     try std.testing.expect(!try verify(msg, node_sig, kp.public_key));
+}
+
+test "LOW-2: signCtxInfix/verifyCtxInfix reject a non-fixed-width infix" {
+    var kp = try KeyPair.fromSeed(hex("4ccd089b28ff96da9db6c346ec114e0f" ++
+        "5b8a319f35aba624da8cf6ed4fb8a6fb"));
+    defer kp.deinit();
+
+    // The one width every real caller uses (a 1-byte frame-type tag) works.
+    const sig = try kp.signCtxInfix("orochi-low2-guard-test-v1", &[_]u8{0x07}, "msg");
+    try std.testing.expect(try verifyCtxInfix("orochi-low2-guard-test-v1", &[_]u8{0x07}, "msg", sig, kp.public_key));
+
+    // A 0-byte or >1-byte infix is rejected fail-closed (the infix/msg-boundary
+    // ambiguity guard), on both the sign and verify side — no ambiguous signature.
+    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("orochi-low2-guard-test-v1", "", "msg"));
+    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("orochi-low2-guard-test-v1", "AB", "msg"));
+    try std.testing.expectError(error.InvalidInfixWidth, verifyCtxInfix("orochi-low2-guard-test-v1", "AB", "msg", sig, kp.public_key));
 }
 
 test {

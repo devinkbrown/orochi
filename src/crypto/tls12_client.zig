@@ -57,6 +57,17 @@ const downgrade_sentinel_tls11 = [8]u8{ 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44
 /// genuine fallback) activates a conformant check by flipping one value.
 const client_offered_tls13 = false;
 
+/// Bound on plaintext handshake bytes reassembled across TLS records for any
+/// message OTHER than Certificate (ServerHello, ServerKeyExchange,
+/// CertificateRequest, ServerHelloDone, CertificateStatus, NewSessionTicket) —
+/// real messages of these types are at most a few KB. A hostile peer claiming
+/// more is rejected fail-closed rather than growing `hs_plain` without bound.
+const max_reassembled_handshake_bytes: usize = 64 * 1024;
+/// Bound on a reassembled Certificate message specifically: a realistic chain
+/// (leaf + several intermediates, RSA-4096 or several EC certs) comfortably
+/// fits well under this.
+const max_reassembled_certificate_bytes: usize = 512 * 1024;
+
 pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     ecdsa_p256.Sec1Error || rsa_verify.Error || x509.Error || x509_verify.Error ||
     tls_resumption.Error || Allocator.Error || error{
@@ -69,6 +80,10 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     EmptyCertificateChain,
     EmsRequired,
     FinishedMismatch,
+    /// A handshake message (or the still-incomplete head of one) reassembled
+    /// across TLS records exceeded `max_reassembled_handshake_bytes` /
+    /// `max_reassembled_certificate_bytes`. See `foldHandshakeFragment`.
+    HandshakeMessageTooLarge,
     NeedMore,
     NoServerCertificate,
     ProtocolVersion,
@@ -143,6 +158,15 @@ pub const Client = struct {
     state: State = .idle,
     recv_buf: std.ArrayList(u8) = .empty,
     transcript: std.ArrayList(u8) = .empty,
+    /// Plaintext handshake bytes reassembled across TLS records: a handshake
+    /// MESSAGE (e.g. a large Certificate chain) can span multiple records, but
+    /// `wait_server_flight`/`wait_server_ccs`/`wait_resumed_server_ccs` only
+    /// ever see one record's fragment at a time. Each record's fragment is
+    /// folded in here (see `foldHandshakeFragment`) and messages are parsed
+    /// off the accumulated stream, not off a single record — fixing a hang
+    /// where an unconsumed record (a message still incomplete) was re-parsed
+    /// from `recv_buf` forever without ever advancing.
+    hs_plain: std.ArrayList(u8) = .empty,
 
     key_pair: ecdh_p256.KeyPair,
     client_random: [32]u8,
@@ -246,6 +270,7 @@ pub const Client = struct {
         if (self.captured_session_ticket) |t| self.allocator.free(t);
         self.recv_buf.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
+        self.hs_plain.deinit(self.allocator);
         std.crypto.secureZero(u8, &self.key_pair.secret);
         std.crypto.secureZero(u8, &self.pre_master_secret);
         std.crypto.secureZero(u8, &self.master_secret);
@@ -267,6 +292,25 @@ pub const Client = struct {
         return tls12.writePlainRecord(self.allocator, .handshake, hs.items);
     }
 
+    /// Fold one TLS record's handshake fragment into the plaintext-handshake
+    /// reassembly buffer (`hs_plain`) and cap its size. Record-layer parsing
+    /// is complete the moment `tls12.completeRecord` returns a `Record` — the
+    /// record's wire bytes are consumed from `recv_buf` unconditionally here.
+    /// What may still be incomplete is a handshake MESSAGE spanning further
+    /// records, which `hs_plain` carries forward across `feed` calls (fixing a
+    /// hang where an unconsumed record was re-parsed from `recv_buf` forever;
+    /// see the F5 comment on `hs_plain`'s declaration). The cap is keyed off
+    /// the type byte of the oldest not-yet-fully-parsed message (index 0):
+    /// Certificate gets the larger allowance, everything else the smaller one.
+    fn foldHandshakeFragment(self: *Client, rec: tls12.Record) Error!void {
+        try self.hs_plain.appendSlice(self.allocator, rec.fragment);
+        consumePrefix(&self.recv_buf, rec.wire_len);
+        if (self.hs_plain.items.len == 0) return;
+        const head_typ: tls12.HandshakeType = @enumFromInt(self.hs_plain.items[0]);
+        const cap: usize = if (head_typ == .certificate) max_reassembled_certificate_bytes else max_reassembled_handshake_bytes;
+        if (self.hs_plain.items.len > cap) return error.HandshakeMessageTooLarge;
+    }
+
     pub fn feed(self: *Client, received: []const u8) Error!FeedResult {
         if (self.state == .idle or self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);
@@ -277,46 +321,54 @@ pub const Client = struct {
                 .wait_server_flight => {
                     if (rec.content_type == .alert) return error.TlsAlert;
                     if (rec.content_type != .handshake) return error.BadHandshake;
+                    try self.foldHandshakeFragment(rec);
+
                     var off: usize = 0;
-                    while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                    while (parseHandshakeMaybe(self.hs_plain.items, &off)) |msg| {
                         try self.handleServerHandshake(msg);
                         if (self.state == .wait_server_ccs) {
-                            consumePrefix(&self.recv_buf, rec.wire_len);
+                            // ServerHelloDone ends this flight; discard
+                            // whatever's buffered (matches the pre-fix
+                            // behavior of dropping the whole record here).
+                            self.hs_plain.clearRetainingCapacity();
                             const reply = try self.buildClientFlight();
                             return .{ .bytes_to_send = reply };
                         }
                         // After ServerHello, decide abbreviated vs full. Our
                         // server frames a full first flight (ServerHello +
-                        // Certificate + ...) in ONE record but a resumed
-                        // ServerHello ALONE; so if we presented a ticket, the
-                        // server signaled one, and ServerHello is the lone
-                        // message in this record, take the abbreviated path.
+                        // Certificate + ...) across one or more records but a
+                        // resumed ServerHello ALONE; so if we presented a
+                        // ticket, the server signaled one, and ServerHello is
+                        // the only thing reassembled so far, take the
+                        // abbreviated path.
                         if (msg.typ == .server_hello and self.resume_ticket != null and
-                            self.server_signaled_ticket and off == rec.fragment.len)
+                            self.server_signaled_ticket and off == self.hs_plain.items.len)
                         {
                             self.resuming = true;
                             try self.beginResumedHandshake();
-                            consumePrefix(&self.recv_buf, rec.wire_len);
+                            self.hs_plain.clearRetainingCapacity();
                             break;
                         }
                     }
-                    if (!self.resuming and off != rec.fragment.len) return .need_more;
-                    if (!self.resuming) consumePrefix(&self.recv_buf, rec.wire_len);
+                    if (!self.resuming) consumePrefix(&self.hs_plain, off);
                 },
                 .wait_server_ccs => {
                     // RFC 5077 (full handshake + issue): the server's final
                     // flight is NewSessionTicket, CCS, Finished — the ticket is a
                     // plaintext handshake record that precedes the CCS.
                     if (rec.content_type == .handshake) {
+                        try self.foldHandshakeFragment(rec);
                         var off: usize = 0;
-                        while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                        while (parseHandshakeMaybe(self.hs_plain.items, &off)) |msg| {
                             if (msg.typ != .new_session_ticket) return error.BadHandshake;
                             try self.handleServerHandshake(msg);
                         }
-                        if (off != rec.fragment.len) return .need_more;
-                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        consumePrefix(&self.hs_plain, off);
                         continue;
                     }
+                    // A change_cipher_spec record while a handshake message is
+                    // still mid-reassembly is out of order — reject fail-closed.
+                    if (self.hs_plain.items.len != 0) return error.BadHandshake;
                     if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_server_finished;
@@ -325,14 +377,15 @@ pub const Client = struct {
                     // A NewSessionTicket may still arrive as a plaintext
                     // handshake record before the server CCS.
                     if (rec.content_type == .handshake) {
+                        try self.foldHandshakeFragment(rec);
                         var off: usize = 0;
-                        while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                        while (parseHandshakeMaybe(self.hs_plain.items, &off)) |msg| {
                             try self.handleServerHandshake(msg);
                         }
-                        if (off != rec.fragment.len) return .need_more;
-                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        consumePrefix(&self.hs_plain, off);
                         continue;
                     }
+                    if (self.hs_plain.items.len != 0) return error.BadHandshake;
                     if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_resumed_server_finished;
@@ -1123,7 +1176,19 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         if (!issuer.basic_constraints_ca) return error.BadCertificate;
         if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
         if (now) |t| try x509_verify.validateParsedAt(issuer, t);
+        // RFC 5280 §4.2.1.10: a CA's NameConstraints bind the leaf's SAN
+        // dNSNames. Shared with the TLS 1.3 client (x509_verify.zig) so the
+        // two engines cannot silently diverge — this hardened 1.2 client
+        // previously omitted the check entirely.
+        try x509_verify.enforceNameConstraints(issuer, leaf);
     }
+
+    // RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement, shared
+    // with the TLS 1.3 client. Reduce the chain to per-cert facts (path limit
+    // + self-issued) then check with the pure `enforcePathLen` helper.
+    var facts_buf: [16]x509_verify.CaPathFact = undefined;
+    const fn_count = x509_verify.buildPathFacts(chain, &facts_buf);
+    try x509_verify.enforcePathLen(facts_buf[0..fn_count]);
 
     // Anchor the chain tip: its issuer DN (or, for a self-issued tip, its own
     // subject DN) must match a configured anchor's subject, and its signature
@@ -1558,4 +1623,288 @@ test "TLS 1.2 client rejects a self-signed chain whose signature byte was flippe
     @memcpy(tampered[0..der.len], der);
     tampered[der.len - 1] ^= 0x01;
     try std.testing.expectError(error.UnknownCa, verifySelfAnchored(tampered[0..der.len]));
+}
+
+// ===========================================================================
+// F1 regression: this hardened TLS 1.2 client previously enforced neither a
+// CA's NameConstraints nor pathLenConstraint at all (only CA:TRUE and
+// keyCertSign), while the TLS 1.3 client already enforced both — letting a
+// name-constrained sub-CA in the anchor set mint an out-of-scope leaf that
+// TLS 1.3 correctly rejected but TLS 1.2 silently accepted. Both checks now
+// live once in `x509_verify.zig` and are called from both clients, so they
+// cannot diverge again. See `tls_client.zig`'s mirror test for the TLS 1.3
+// control proving the two engines agree.
+// ===========================================================================
+
+test "TLS 1.2 client rejects a name-constrained CA's cross-domain leaf (F1)" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const ca_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc1)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc2)));
+
+    // The CA is constrained to `.corp.example` (permittedSubtrees, dNSName).
+    var ca_buf: [1024]u8 = undefined;
+    const ca_der = try x509_verify.mintEd25519CertExt(
+        &ca_buf,
+        "Orochi Name-Constrained CA",
+        "Orochi Name-Constrained CA",
+        ca_kp.public_key.toBytes(),
+        ca_kp,
+        1_704_067_200,
+        1_924_991_999,
+        .{ .is_ca = true, .permitted_dns = &.{".corp.example"} },
+    );
+
+    // The CA (mis)issues a leaf entirely outside its permitted subtree.
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf_der = try x509_verify.mintEd25519CertExt(
+        &leaf_buf,
+        "Orochi Name-Constrained CA",
+        "login.victim-bank.com",
+        leaf_kp.public_key.toBytes(),
+        ca_kp,
+        1_704_067_200,
+        1_924_991_999,
+        .{ .dns_names = &.{"login.victim-bank.com"} },
+    );
+
+    const chain = [_][]const u8{ leaf_der, ca_der };
+    const anchors = [_][]const u8{ca_der};
+    try std.testing.expectError(
+        error.BadCertificate,
+        verifyChainToTrustAnchors(&chain, &anchors, "login.victim-bank.com", null),
+    );
+}
+
+test "TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const root_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xd1)));
+    const mid_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xd2)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xd3)));
+
+    // Root asserts pathLenConstraint:0 — no intermediates permitted below it.
+    var root_buf: [1024]u8 = undefined;
+    const root_der = try x509_verify.mintEd25519CertExt(
+        &root_buf,
+        "Orochi PathLen0 Root",
+        "Orochi PathLen0 Root",
+        root_kp.public_key.toBytes(),
+        root_kp,
+        1_704_067_200,
+        1_924_991_999,
+        .{ .is_ca = true, .path_len = 0 },
+    );
+
+    // A non-self-issued intermediate spliced in anyway (a misissuance/attack
+    // scenario the root's pathLen:0 exists to forbid).
+    var mid_buf: [1024]u8 = undefined;
+    const mid_der = try x509_verify.mintEd25519CertExt(
+        &mid_buf,
+        "Orochi PathLen0 Root",
+        "Orochi Spliced Intermediate",
+        mid_kp.public_key.toBytes(),
+        root_kp,
+        1_704_067_200,
+        1_924_991_999,
+        .{ .is_ca = true },
+    );
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf_der = try x509_verify.mintEd25519CertExt(
+        &leaf_buf,
+        "Orochi Spliced Intermediate",
+        "leaf.pathlen0.test",
+        leaf_kp.public_key.toBytes(),
+        mid_kp,
+        1_704_067_200,
+        1_924_991_999,
+        .{ .dns_names = &.{"leaf.pathlen0.test"} },
+    );
+
+    const chain = [_][]const u8{ leaf_der, mid_der, root_der };
+    const anchors = [_][]const u8{root_der};
+    try std.testing.expectError(
+        error.BadCertificate,
+        verifyChainToTrustAnchors(&chain, &anchors, "leaf.pathlen0.test", null),
+    );
+}
+
+// ===========================================================================
+// F5 regression: `wait_server_flight` (and its `wait_server_ccs` /
+// `wait_resumed_server_ccs` siblings) used to parse handshake messages only
+// from the CURRENT TLS record's fragment. When a message spanned multiple
+// records (e.g. a large Certificate chain), the incomplete record was
+// returned as `.need_more` WITHOUT being consumed from `recv_buf` — so the
+// NEXT `feed()` call re-parsed the exact same still-head-of-buffer record
+// forever: `completeRecord` always finds the same first record, ServerHello
+// gets re-handled every time (corrupting the transcript), and the
+// newly-arrived bytes after it are never reached. `hs_plain` (see its field
+// doc above) now reassembles across records and is capped so a message that
+// never completes cannot grow the client's memory without bound.
+// ===========================================================================
+
+const tls12_server = @import("tls12_server.zig");
+
+/// Locate the Certificate handshake message within one record's fragment and
+/// return an offset strictly inside its declared body — the split point used
+/// to re-frame a single-record test flight as two records for the reassembly
+/// regression below.
+fn splitOffsetInsideCertificate(fragment: []const u8) usize {
+    var off: usize = 0;
+    while (off + 4 <= fragment.len) {
+        const typ = fragment[off];
+        const len = (@as(usize, fragment[off + 1]) << 16) | (@as(usize, fragment[off + 2]) << 8) | fragment[off + 3];
+        if (typ == @intFromEnum(tls12.HandshakeType.certificate)) return off + 4 + len / 2;
+        off += 4 + len;
+    }
+    unreachable; // test-only: the fixture flight always carries a Certificate.
+}
+
+/// Re-frame a single TLS record's fragment as two records, split at `split`
+/// (a fragment-relative offset). Returns both owned record buffers.
+fn reframeAsTwoRecords(allocator: Allocator, sf: []const u8, split: usize) !struct { a: []u8, b: []u8 } {
+    const content_type = sf[0];
+    const version = sf[1..3];
+    const fragment = sf[tls12.record_header_len..];
+
+    var a: std.ArrayList(u8) = .empty;
+    errdefer a.deinit(allocator);
+    try a.append(allocator, content_type);
+    try a.appendSlice(allocator, version);
+    var len_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_buf, @intCast(split), .big);
+    try a.appendSlice(allocator, &len_buf);
+    try a.appendSlice(allocator, fragment[0..split]);
+
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(allocator);
+    try b.append(allocator, content_type);
+    try b.appendSlice(allocator, version);
+    std.mem.writeInt(u16, &len_buf, @intCast(fragment.len - split), .big);
+    try b.appendSlice(allocator, &len_buf);
+    try b.appendSlice(allocator, fragment[split..]);
+
+    return .{ .a = try a.toOwnedSlice(allocator), .b = try b.toOwnedSlice(allocator) };
+}
+
+test "TLS 1.2 client reassembles a Certificate message split across two TLS records (F5)" {
+    const allocator = std.testing.allocator;
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x5a)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "orochi tls12 split test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x5a, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"localhost"},
+    });
+    const chain = [_][]const u8{cert};
+    const anchors = [_][]const u8{cert};
+
+    var server = try tls12_server.Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = kp,
+    });
+    defer server.deinit();
+    var client = try Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+
+    // Split the server's ONE flight record into two records at a point
+    // strictly inside the Certificate handshake message — the exact class of
+    // split this client previously hung (or corrupted its transcript) on.
+    const fragment = sf[tls12.record_header_len..];
+    const split = splitOffsetInsideCertificate(fragment);
+    try std.testing.expect(split > 0 and split < fragment.len);
+    const parts = try reframeAsTwoRecords(allocator, sf, split);
+    defer allocator.free(parts.a);
+    defer allocator.free(parts.b);
+
+    // First record alone: the Certificate message is incomplete — must be
+    // `.need_more`, not an error and not a completed flight.
+    switch (try client.feed(parts.a)) {
+        .need_more => {},
+        .bytes_to_send => |b| {
+            allocator.free(b);
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // Second record completes Certificate + ServerKeyExchange +
+    // ServerHelloDone; the client must reassemble across the split and
+    // produce its own flight rather than re-looping on the first record.
+    const cf = switch (try client.feed(parts.b)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    try std.testing.expectEqual(State.wait_server_ccs, client.state);
+}
+
+test "TLS 1.2 client rejects a handshake message whose reassembled size exceeds the cap (F5, fail-closed)" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &[_][]const u8{},
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    const ch = try client.start();
+    defer allocator.free(ch);
+
+    // A bogus handshake message (type=2/server_hello — any non-Certificate
+    // type exercises the smaller 64 KiB cap) claims a declared body length
+    // far larger than the cap; the filler records below never complete it.
+    const header = [_]u8{ 2, 0xff, 0xff, 0xff };
+    switch (try feedOneHandshakeRecord(&client, allocator, &header)) {
+        .need_more => {},
+        .bytes_to_send => |b| {
+            allocator.free(b);
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    var filler: [tls12.max_plaintext_len]u8 = @splat(0xAA);
+    var saw_too_large = false;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const result = feedOneHandshakeRecord(&client, allocator, &filler) catch |err| {
+            try std.testing.expectEqual(error.HandshakeMessageTooLarge, err);
+            saw_too_large = true;
+            break;
+        };
+        switch (result) {
+            .need_more => {},
+            .bytes_to_send => |b| {
+                allocator.free(b);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    try std.testing.expect(saw_too_large);
+}
+
+fn feedOneHandshakeRecord(client: *Client, allocator: Allocator, fragment: []const u8) Error!FeedResult {
+    var rec: std.ArrayList(u8) = .empty;
+    defer rec.deinit(allocator);
+    try rec.append(allocator, @intFromEnum(tls12.ContentType.handshake));
+    var ver: [2]u8 = undefined;
+    std.mem.writeInt(u16, &ver, tls12.tls_version, .big);
+    try rec.appendSlice(allocator, &ver);
+    var len_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_buf, @intCast(fragment.len), .big);
+    try rec.appendSlice(allocator, &len_buf);
+    try rec.appendSlice(allocator, fragment);
+    return client.feed(rec.items);
 }

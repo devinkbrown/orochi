@@ -31,8 +31,17 @@ pub const CertfpBindStore = struct {
     allocator: std.mem.Allocator,
     /// fingerprint (lowercase hex) -> owned account name.
     entries: std.StringHashMapUnmanaged([]u8),
-    lookup_accounts: std.ArrayListUnmanaged([]u8) = .empty,
     lock: rwlock.RwLock = .{},
+
+    /// Per-thread scratch `accountForFingerprint` copies its result into. Every
+    /// current caller (SASL EXTERNAL verify -> `Router.copyAccount`,
+    /// `certfpOwnerUnlocked`, `sessionCertVerifiedFor`) consumes the returned
+    /// slice synchronously, on the calling thread, before making any further
+    /// call into this store — so a thread-local slot is a stable "valid until
+    /// this thread's next lookup" borrow with no cross-thread aliasing and,
+    /// unlike a retained-copy list, no growth (fixes an unbounded
+    /// `lookup_accounts` leak that never freed until `deinit`).
+    threadlocal var lookup_scratch: [max_account_len]u8 = undefined;
 
     pub fn init(allocator: std.mem.Allocator) CertfpBindStore {
         return .{ .allocator = allocator, .entries = .empty };
@@ -49,8 +58,6 @@ pub const CertfpBindStore = struct {
                 self.allocator.free(e.value_ptr.*);
             }
             self.entries.deinit(self.allocator);
-            for (self.lookup_accounts.items) |account| self.allocator.free(account);
-            self.lookup_accounts.deinit(self.allocator);
         }
         self.* = undefined;
     }
@@ -77,20 +84,21 @@ pub const CertfpBindStore = struct {
         try self.entries.put(self.allocator, key, val);
     }
 
-    /// The account owning `fingerprint`, or null. Retained by this store.
+    /// The account owning `fingerprint`, or null. The returned slice borrows
+    /// this thread's `lookup_scratch` — valid until this thread's next call
+    /// into this store (every caller today copies it out synchronously before
+    /// that, e.g. SASL EXTERNAL's `Router.copyAccount`). A shared (read) lock
+    /// suffices: nothing under it mutates `self`.
     pub fn accountForFingerprint(self: *const CertfpBindStore, fingerprint: []const u8) ?[]const u8 {
         const self_mut = @constCast(self);
-        self_mut.lock.lockExclusive();
-        defer self_mut.lock.unlockExclusive();
+        self_mut.lock.lockShared();
+        defer self_mut.lock.unlockShared();
 
         if (fingerprint.len != certfp.fingerprint_len) return null;
         const account = self_mut.entries.get(fingerprint) orelse return null;
-        const copy = self_mut.allocator.dupe(u8, account) catch return null;
-        self_mut.lookup_accounts.append(self_mut.allocator, copy) catch {
-            self_mut.allocator.free(copy);
-            return null;
-        };
-        return copy;
+        // `bind` enforces account.len <= max_account_len, so this always fits.
+        @memcpy(lookup_scratch[0..account.len], account);
+        return lookup_scratch[0..account.len];
     }
 
     /// Remove a binding; returns whether one was present.
@@ -150,6 +158,27 @@ test "unbind removes a present binding" {
     try std.testing.expect(store.unbind(fp));
     try std.testing.expect(!store.unbind(fp));
     try std.testing.expect(store.accountForFingerprint(fp) == null);
+}
+
+test "repeated lookups of the same bound fingerprint do not grow memory" {
+    // F9 regression: `accountForFingerprint` used to dupe+append the account
+    // name into a `lookup_accounts` list on every call, freed only in
+    // `deinit` — an ever-growing retained-copy list keyed by call count, not
+    // by distinct fingerprints. It now copies into a fixed thread-local
+    // scratch buffer, so no per-call allocation exists to leak; the testing
+    // allocator's leak check on `deinit` below would fail if that ever
+    // regressed.
+    const alloc = std.testing.allocator;
+    var store = CertfpBindStore.init(alloc);
+    defer store.deinit();
+
+    const fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try store.bind("alice", fp);
+
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        try std.testing.expectEqualStrings("alice", store.accountForFingerprint(fp).?);
+    }
 }
 
 const CertfpMtCtx = struct {

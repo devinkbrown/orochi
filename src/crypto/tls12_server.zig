@@ -769,7 +769,9 @@ pub const Server = struct {
         try writeHandshake(self.allocator, &hs, .server_hello_done, "");
 
         try self.transcript.appendSlice(self.allocator, hs.items);
-        return tls12.writePlainRecord(self.allocator, .handshake, hs.items);
+        // F6: a sizeable cert chain (+ OCSP staple) can exceed the 16 KiB
+        // single-record limit; fragment across records rather than erroring.
+        return writeFragmentedHandshakeFlight(self.allocator, hs.items);
     }
 
     /// CertificateRequest (RFC 5246 §7.4.4): certificate_types (rsa_sign +
@@ -916,7 +918,7 @@ pub const Server = struct {
             const nst = try self.buildNewSessionTicket();
             defer self.allocator.free(nst);
             try self.transcript.appendSlice(self.allocator, nst);
-            const nst_rec = try tls12.writePlainRecord(self.allocator, .handshake, nst);
+            const nst_rec = try writeFragmentedHandshakeFlight(self.allocator, nst);
             defer self.allocator.free(nst_rec);
             try out.appendSlice(self.allocator, nst_rec);
         }
@@ -1039,14 +1041,18 @@ pub const Server = struct {
             return false;
         }
 
-        // Lifetime enforcement (when a real clock and issue time are present):
-        // reject expired or future tickets.
-        if (self.config.now_unix_seconds != 0) {
-            const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
-            if (issued_s != 0) {
-                if (self.config.now_unix_seconds < issued_s) return false;
-                if (self.config.now_unix_seconds - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return false;
-            }
+        // Lifetime enforcement: a ticket's freshness can only be judged
+        // against a real clock. Absent one (now_unix_seconds == 0, the
+        // no-clock sentinel) we cannot validate a ticket's age at all —
+        // refuse resumption fail-closed rather than silently accepting a
+        // ticket of unknown/unbounded age. The caller always falls back to a
+        // full handshake on a `false` return, so this never fails the
+        // connection, only the resumption fast path.
+        if (self.config.now_unix_seconds == 0) return false;
+        const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
+        if (issued_s != 0) {
+            if (self.config.now_unix_seconds < issued_s) return false;
+            if (self.config.now_unix_seconds - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return false;
         }
 
         // Replay defence: a ticket presented twice must NOT take the abbreviated
@@ -1122,7 +1128,7 @@ pub const Server = struct {
         // ServerHello goes out as one plaintext record; then optionally the
         // NewSessionTicket (also plaintext, hashed into the transcript), then
         // CCS, then the encrypted server Finished.
-        const sh_rec = try tls12.writePlainRecord(self.allocator, .handshake, hs.items);
+        const sh_rec = try writeFragmentedHandshakeFlight(self.allocator, hs.items);
         defer self.allocator.free(sh_rec);
         try out.appendSlice(self.allocator, sh_rec);
 
@@ -1130,7 +1136,7 @@ pub const Server = struct {
             const nst = try self.buildNewSessionTicket();
             defer self.allocator.free(nst);
             try self.transcript.appendSlice(self.allocator, nst);
-            const nst_rec = try tls12.writePlainRecord(self.allocator, .handshake, nst);
+            const nst_rec = try writeFragmentedHandshakeFlight(self.allocator, nst);
             defer self.allocator.free(nst_rec);
             try out.appendSlice(self.allocator, nst_rec);
         }
@@ -1190,6 +1196,34 @@ fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: tls12.Hand
     try out.append(allocator, @intFromEnum(typ));
     try appendU24(allocator, out, @intCast(body.len));
     try out.appendSlice(allocator, body);
+}
+
+/// Write `plaintext` (a concatenation of one or more handshake MESSAGES) as
+/// one or more TLS 1.2 plaintext handshake RECORDS, each bounded by
+/// `tls12.max_plaintext_len` (RFC 5246 §6.2.1) — `tls12.writePlainRecord`
+/// alone rejects anything over that with `error.PlaintextTooLong`. A sizeable
+/// certificate chain (several intermediates, or a chain plus a large OCSP
+/// staple) easily exceeds the single-record 16 KiB limit. Record-layer
+/// fragmentation is transparent to the handshake-message layer — a message
+/// may span record boundaries however this splits it, and the peer
+/// reassembles by message length regardless (see `tls12_client.zig`'s
+/// `hs_plain` reassembly). The transcript hashes `plaintext` directly, never
+/// the record framing, so fragmentation cannot change what gets hashed.
+fn writeFragmentedHandshakeFlight(allocator: Allocator, plaintext: []const u8) Error![]u8 {
+    if (plaintext.len <= tls12.max_plaintext_len) {
+        return tls12.writePlainRecord(allocator, .handshake, plaintext);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var off: usize = 0;
+    while (off < plaintext.len) {
+        const n = @min(tls12.max_plaintext_len, plaintext.len - off);
+        const rec = try tls12.writePlainRecord(allocator, .handshake, plaintext[off .. off + n]);
+        defer allocator.free(rec);
+        try out.appendSlice(allocator, rec);
+        off += n;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseHandshake(bytes: []const u8, off: *usize) Error!HandshakeMsg {
@@ -1414,6 +1448,69 @@ fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
     const c_plain = try client.decrypt(s_app);
     defer allocator.free(c_plain);
     try std.testing.expectEqualSlices(u8, "server to client", c_plain);
+}
+
+// F6 regression: `buildServerFlight` used to wrap the WHOLE first flight
+// (ServerHello + Certificate + ...) in a single `tls12.writePlainRecord`
+// call, which rejects anything over 16 KiB with `error.PlaintextTooLong` — a
+// realistic-sized certificate chain (several intermediates, or a chain plus a
+// large OCSP staple) can easily exceed that. `writeFragmentedHandshakeFlight`
+// now splits the flight across multiple `<= max_plaintext_len` records, which
+// (paired with the TLS 1.2 client's F5 cross-record reassembly fix) the peer
+// consumes exactly as if it had arrived in one record.
+test "TLS 1.2 server fragments a flight larger than 16 KiB across multiple records (F6, large cert chain)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+
+    // Repeat the (self-signed, CA) fixture certificate many times to build a
+    // certificate_list comfortably past the 16 KiB single-record limit. Every
+    // chain entry is the SAME self-signed CA certificate, so each adjacent
+    // link still verifies (issuer DN == subject DN, self-signature checks)
+    // and the chain tip anchors directly against `anchors` below.
+    const repeat_count = 80;
+    const chain: [repeat_count][]const u8 = @splat(fixture.cert);
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // Precondition: this genuinely exercises record fragmentation rather than
+    // the pre-existing single-record path.
+    try std.testing.expect(sf.len > tls12.max_plaintext_len);
+
+    // Feed the (multi-record) flight in one shot; correct reassembly on the
+    // client side consumes every record and completes ServerHello through
+    // ServerHelloDone before producing the client flight.
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
 }
 
 test "TLS 1.2 ServerHello.random carries the RFC 8446 downgrade sentinel" {
@@ -2355,6 +2452,66 @@ test "TLS 1.2 expired ticket falls back to a full handshake" {
         .ticket_key = test_ticket_key,
         .replay_guard = &guard,
         .now_unix_seconds = 1_700_000_000 + 7200 + 60,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.setSessionTicket(stored);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // A full handshake flight carries a Certificate message; resume would not.
+    try std.testing.expect(serverHelloFlightHasCertificate(sf));
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+}
+
+// F7 regression: `tryResume`'s lifetime check used to be gated on
+// `now_unix_seconds != 0`, so a server with NO configured clock (the
+// `now_unix_seconds == 0` default/sentinel) skipped freshness enforcement
+// entirely and would resume a ticket of ANY age. Absent a clock, freshness
+// cannot be judged at all — the fix refuses resumption outright rather than
+// silently accepting an unbounded-age ticket.
+test "TLS 1.2 ticket resumption is refused when the server has no clock (now_unix_seconds == 0)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    // Issue with a real clock so the ticket carries a genuine issue time.
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // The resuming server has NO clock configured at all (now_unix_seconds
+    // defaults to 0) — it must refuse the fast path, not silently accept it.
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
     });
     defer server.deinit();
     var client = try tls12_client.Client.init(allocator, .{

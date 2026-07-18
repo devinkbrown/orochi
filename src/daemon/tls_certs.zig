@@ -240,10 +240,22 @@ const LoadedKey = struct {
 /// Read a private key file (PEM or DER) and return Ed25519 or RSA signing material.
 fn loadPrivateKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!LoadedKey {
     const raw = try readFileOwned(allocator, io, path);
-    defer allocator.free(raw);
+    // `raw` holds the private key in its serialized on-disk form (PEM armor or
+    // raw DER, and for the non-PEM path it IS `der` below) — wipe before free
+    // so the key material doesn't linger in freed heap memory, matching the
+    // parsed-form zeroing this module already does elsewhere.
+    defer {
+        std.crypto.secureZero(u8, raw);
+        allocator.free(raw);
+    }
 
     var der_buf: ?[]u8 = null;
-    defer if (der_buf) |buf| allocator.free(buf);
+    // Same rationale as `raw`: this is the PEM-decoded DER copy of the key,
+    // still serialized secret material.
+    defer if (der_buf) |buf| {
+        std.crypto.secureZero(u8, buf);
+        allocator.free(buf);
+    };
     // A SEC1 EC key carries its own PEM label; the PKCS#8 and PKCS#1 labels
     // cover Ed25519/RSA and PKCS#8-wrapped EC. `is_sec1_ec` forces the EC path.
     var is_sec1_ec = false;

@@ -40,6 +40,26 @@ const Sha384 = hkdf.Sha384;
 /// Largest transcript-hash / traffic-secret length handled (SHA-384).
 const max_hash_len = Sha384.hash_len;
 
+/// Fail-closed caps on a client-flight handshake message's declared u24 body
+/// length (hardening against buffering a hostile ~16 MiB declared length
+/// before ever validating it — see `processClientFlightMessage`). Finished is
+/// tens of bytes and CertificateVerify's signature is itself u16-bounded
+/// (~64 KiB total), so both fit comfortably under `max_client_flight_small_len`;
+/// a client Certificate carries a full chain, which needs the larger, still
+/// firmly bounded `max_client_flight_cert_len` (matches the on-disk
+/// multi-cert PEM bound in `daemon/tls_certs.zig`'s `max_file_bytes`).
+const max_client_flight_small_len: usize = 64 * 1024;
+const max_client_flight_cert_len: usize = 256 * 1024;
+
+/// Fixed ceiling on bytes discarded by `skipRejectedEarlyRecords` (a rejected
+/// 0-RTT offer's early data, silently dropped per RFC 8446 §4.2.10).
+/// Deliberately independent of any connection's own `accepted_early_data_limit`
+/// / `config.max_early_data_size` — both can be legitimately zero while still
+/// needing to tolerate a real client's early-data flight — sized generously
+/// above any real 0-RTT payload while still bounding a hostile peer's
+/// discard channel to a small, fixed amount.
+const max_rejected_early_data_bytes: u64 = 16 * 1024;
+
 const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
@@ -543,6 +563,14 @@ pub const Server = struct {
     early_data_accepted: bool = false,
     early_data_done: bool = false,
     accepted_early_data_limit: u32 = 0,
+    /// Cumulative wire bytes discarded as rejected-0-RTT early data across the
+    /// whole connection (both the one-shot skip right after ClientHello1 and
+    /// the per-record catch-and-discard in the post-flight drain loop share
+    /// this one running total) — a persistent field, not a per-`feed()`-call
+    /// local, so a client that dribbles bytes across many small `feed()`
+    /// invocations cannot bypass `max_rejected_early_data_bytes` by simply
+    /// splitting the flood across more reads.
+    rejected_early_data_skipped: u64 = 0,
     /// PSK binder of the accepted resumption (for the 0-RTT anti-replay check).
     accepted_binder: [tls_resumption.max_binder_len]u8 = undefined,
     accepted_binder_len: usize = 0,
@@ -980,6 +1008,11 @@ pub const Server = struct {
             const ch_body = if (inner) |b| b[4..] else msg.body;
             try self.appendTranscript(ch_raw);
             const reply = try self.buildServerFlight(ch_body, ch_raw);
+            // `skipRejectedEarlyRecords`/`processAcceptedEarlyRecords` can now
+            // fail closed (F3) AFTER `reply` is already built — free it on
+            // that path instead of leaking; the two successful returns below
+            // both hand `reply` to the caller, so this never double-frees.
+            errdefer self.allocator.free(reply);
             consumePrefix(&self.recv_buf, rec.wire_len);
             if (self.hrr_sent) {
                 // We emitted a HelloRetryRequest; await ClientHello2. 0-RTT is
@@ -990,7 +1023,7 @@ pub const Server = struct {
             if (self.early_data_accepted) {
                 try self.processAcceptedEarlyRecords();
             } else if (self.early_data_offered) {
-                self.skipRejectedEarlyRecords();
+                try self.skipRejectedEarlyRecords();
             }
             // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
             // just the client Finished.
@@ -1041,6 +1074,14 @@ pub const Server = struct {
             if (rec.content_type != .application_data) return error.BadRecord;
             const opened = openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]) catch |err| {
                 if (self.early_data_offered and !self.early_data_accepted and err == error.BadRecord) {
+                    // A record that fails to decrypt under the handshake
+                    // traffic key while a 0-RTT offer was rejected is treated
+                    // as rejected early data arriving late (RFC 8446 §4.2.10)
+                    // and discarded — but unboundedly so is exactly the F3
+                    // DoS this connection-lifetime counter closes (shared with
+                    // `skipRejectedEarlyRecords`'s one-shot call).
+                    self.rejected_early_data_skipped += rec.wire_len;
+                    if (self.rejected_early_data_skipped > max_rejected_early_data_bytes) return error.BadRecord;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     continue;
                 }
@@ -1054,6 +1095,13 @@ pub const Server = struct {
             // receiving one is fatal rather than an ignorable no-op.
             if (opened.content.len == 0) return error.BadHandshake;
             try self.client_flight.appendSlice(self.allocator, opened.content);
+            // Defense in depth alongside the per-message-type cap in
+            // `processClientFlightMessage`: never let the reassembly buffer
+            // itself grow past the largest bound any single message is
+            // allowed (F2) — catches an oversized declared length before it
+            // is even fully visible as a header, and guards any future
+            // change to the per-type check above.
+            if (self.client_flight.items.len > max_client_flight_cert_len) return error.BadHandshake;
             while (try self.processClientFlightMessage()) {}
         }
         return .need_more;
@@ -1062,7 +1110,23 @@ pub const Server = struct {
     /// Parse and consume one complete handshake message from the accumulated
     /// client flight, advancing the sub-state. Returns false when no complete
     /// message remains (await more bytes).
+    ///
+    /// The wire format lets a handshake message declare a u24 (~16 MiB) body
+    /// length in its 4-byte header, and `parseHandshakeMaybe` only returns
+    /// once that many bytes have actually arrived — so before checking that,
+    /// peek the (already-visible) header and reject a declared length above a
+    /// bound appropriate to what this sub-state expects. That fails closed on
+    /// the very first record carrying the header, rather than after buffering
+    /// up to ~16 MiB of a hostile client's declared-but-never-delivered
+    /// Finished/CertificateVerify/Certificate.
     fn processClientFlightMessage(self: *Server) Error!bool {
+        if (peekHandshakeBodyLen(self.client_flight.items, 0)) |declared| {
+            const cap: usize = if (self.state == .wait_client_cert)
+                max_client_flight_cert_len
+            else
+                max_client_flight_small_len;
+            if (declared > cap) return error.BadHandshake;
+        }
         var off: usize = 0;
         const msg = parseHandshakeMaybe(self.client_flight.items, &off) orelse return false;
         switch (self.state) {
@@ -1618,8 +1682,18 @@ pub const Server = struct {
             self.allocator.free(old);
             self.client_sig_algs_cert = null;
         }
+        // RFC 8446 §4.2: "There MUST NOT be more than one extension of the
+        // same type in a given extension block." `ext_type` is the raw wire
+        // u16, so a full 65536-bit set (one bit per possible value, 8 KiB on
+        // the stack for this one ClientHello parse) makes membership exact —
+        // no false collisions between distinct types. A conforming peer never
+        // repeats a type; one that does is fail-closed rejected before any of
+        // its extension handling below runs.
+        var seen_ext_types = std.bit_set.StaticBitSet(std.math.maxInt(u16) + 1).empty;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
+            if (seen_ext_types.isSet(ext.ext_type)) return error.BadHandshake;
+            seen_ext_types.set(ext.ext_type);
             switch (ext.typed()) {
                 .supported_versions => {
                     if (tls_supported_versions.clientOffers(ext.data, tls_supported_versions.tls13)) offered_tls13 = true;
@@ -2706,13 +2780,38 @@ pub const Server = struct {
         }
     }
 
-    fn skipRejectedEarlyRecords(self: *Server) void {
+    /// RFC 8446 §4.2.10: early data sent under a 0-RTT offer the server
+    /// rejected is discarded, never decrypted (the server never derived the
+    /// early traffic keys for it). Without a bound, a client can keep
+    /// streaming records tagged `application_data` indefinitely and the
+    /// server will silently drop every one of them forever, on a connection
+    /// that never advances past this state — an unbounded discard channel.
+    /// (A second, later discard channel for the same rejected-early-data case
+    /// exists in the post-flight drain loop below, for records that arrive
+    /// after this one-shot call already returned; both share
+    /// `self.rejected_early_data_skipped` so the total is bounded regardless
+    /// of which path the bytes flow through.)
+    ///
+    /// The cap is a fixed, generous ceiling rather than this connection's own
+    /// `accepted_early_data_limit` or `config.max_early_data_size`: the reject
+    /// path is reached precisely BECAUSE this server does not trust (or does
+    /// not currently grant) whatever early-data budget is in play, and both of
+    /// those can legitimately be zero for an honestly-behaving client — e.g.
+    /// a resumed session whose sealed ticket was minted with 0-RTT disabled,
+    /// where the client still attempts (a now-stale) early data. Rejecting
+    /// that outright would abort a handshake RFC 8446 says should complete via
+    /// 1-RTT. `max_rejected_early_data_bytes` is independent of any such
+    /// per-ticket/per-config value, sized comfortably above any real 0-RTT
+    /// payload while still bounding a hostile peer's discard channel.
+    fn skipRejectedEarlyRecords(self: *Server) Error!void {
         while (completePlainRecord(self.recv_buf.items)) |rec| {
             if (rec.content_type == .change_cipher_spec) {
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
             if (rec.content_type != .application_data) return;
+            self.rejected_early_data_skipped += rec.wire_len;
+            if (self.rejected_early_data_skipped > max_rejected_early_data_bytes) return error.BadRecord;
             consumePrefix(&self.recv_buf, rec.wire_len);
         }
     }
@@ -3297,12 +3396,22 @@ const Cursor = struct {
     }
 };
 
+/// Read a handshake message's declared u24 body length from its 4-byte header
+/// once at least that header is buffered — without requiring the (possibly
+/// not-yet-arrived) body itself. Returns null when even the header isn't
+/// fully buffered yet. Lets a caller reject an oversized declared length
+/// before waiting for it to be fully received (see
+/// `processClientFlightMessage`'s F2 hardening).
+fn peekHandshakeBodyLen(input: []const u8, offset: usize) ?usize {
+    if (input.len - offset < 4) return null;
+    const hdr = input[offset..];
+    return (@as(usize, hdr[1]) << 16) | (@as(usize, hdr[2]) << 8) | hdr[3];
+}
+
 /// Like parseHandshake but returns null (instead of erroring) when fewer than a
 /// full handshake message is buffered yet — used to drain the client flight.
 fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
-    if (input.len - offset.* < 4) return null;
-    const hdr = input[offset.*..];
-    const len = (@as(usize, hdr[1]) << 16) | (@as(usize, hdr[2]) << 8) | hdr[3];
+    const len = peekHandshakeBodyLen(input, offset.*) orelse return null;
     if (input.len - offset.* < 4 + len) return null;
     return parseHandshake(input, offset) catch null;
 }
@@ -5397,6 +5506,108 @@ test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refus
     try std.testing.expect(!server_b.earlyDataAccepted());
 }
 
+test "loopback: rejected 0-RTT early data beyond the fixed discard ceiling fails closed (F3)" {
+    // Same replay-refusal shape as the test above, but the early-data payload
+    // (still within the ticket's own 20000-byte grant, so `server_a` accepts
+    // it cleanly — proving the payload itself is legitimate) is bigger than
+    // `max_rejected_early_data_bytes`. Reused against a second server sharing
+    // the replay guard, the SAME bytes are rejected-early-data there, and
+    // without a bound the server would silently discard all of it; with the
+    // bound it must fail closed instead.
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xF3)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xF3, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 20_000,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+    // A full 16 KiB (2^14) plaintext record — the wire format's own per-record
+    // ceiling, so this is the largest single early-data record a client can
+    // ever send — sealed into ~16406 wire bytes (record header + AEAD tag +
+    // inner content-type byte). Within the ticket's 20000-byte grant (so the
+    // client accepts it and `server_a` will too), but over the fixed 16 KiB
+    // rejected-early-data ceiling once it is instead discarded.
+    const big_early_data: [16 * 1024]u8 = @splat('A');
+    try resumed_client.setEarlyData(&big_early_data);
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+
+    var guard = tls_resumption.ReplayGuard{};
+
+    // First delivery: 0-RTT accepted — proves the payload is otherwise valid.
+    var server_a = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 20_000,
+        .replay_guard = &guard,
+    });
+    defer server_a.deinit();
+    const a_flight = switch (try server_a.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(a_flight);
+    try std.testing.expect(server_a.acceptedSessionTicket());
+    try std.testing.expect(server_a.earlyDataAccepted());
+
+    // Replay to a second server sharing the guard: early data is refused
+    // (binder already seen), so the ~16 KiB early-data record is discarded
+    // via the rejected-early-data path instead — over the fixed ceiling, so
+    // this must fail closed rather than silently drop it all.
+    var server_b = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 20_000,
+        .replay_guard = &guard,
+    });
+    defer server_b.deinit();
+    try std.testing.expectError(error.BadRecord, server_b.feed(rch));
+}
+
 test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limit is zero" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
@@ -6002,6 +6213,100 @@ test "server rejects a ClientHello2 whose SNI differs from ClientHello1 (RFC 844
     tampered[at] = 'X'; // "Xrc.test" ⇒ different digest ⇒ rejection
 
     try std.testing.expectError(error.BadHandshake, server.feed(tampered));
+}
+
+test "client-flight message with an oversized declared length is rejected without buffering it all (F2)" {
+    // A handshake message's 4-byte header can declare a u24 (~16 MiB) body
+    // length; without the F2 cap, the server would wait for that many bytes
+    // to arrive before validating anything. This feeds ONLY the 4-byte
+    // header (declaring the wire format's absolute max, 0x00FFFFFF) with NO
+    // body bytes following — if the server needed the full declared length
+    // buffered, this would return `.need_more`, not an error. Getting
+    // `error.BadHandshake` back proves the reject fires off the header alone.
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xF2)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0xF2},
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+    });
+    var server = try Server.init(allocator, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    server.state = .wait_client_finished;
+    server.selected_suite = .tls_aes_128_gcm_sha256;
+    server.client_hs_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+    server.client_hs_keys.iv = @as([12]u8, @splat(0xA5));
+
+    // Just the header: type=Finished, declared length = 0x00FFFFFF (the u24
+    // wire-format max). No body bytes at all.
+    const oversized_header = [_]u8{ @intFromEnum(HandshakeType.finished), 0xFF, 0xFF, 0xFF };
+    const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_hs_keys, 0, .handshake, &oversized_header);
+    defer allocator.free(rec);
+
+    try std.testing.expectError(error.BadHandshake, server.feed(rec));
+}
+
+test "processClientHello rejects a ClientHello with a duplicate extension type (RFC 8446 §4.2)" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x44)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x44, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+
+    // A minimal ClientHello body: legacy_version, random, empty session_id, one
+    // cipher suite, null compression, then a caller-supplied extensions block —
+    // just enough structure to reach the extension-iteration loop.
+    const buildBody = struct {
+        fn f(buf: []u8, exts: []const u8) []const u8 {
+            var n: usize = 0;
+            std.mem.writeInt(u16, buf[n..][0..2], tls_record.legacy_record_version, .big);
+            n += 2;
+            @memset(buf[n..][0..32], 0xAB);
+            n += 32; // random
+            buf[n] = 0;
+            n += 1; // session_id length 0
+            std.mem.writeInt(u16, buf[n..][0..2], 2, .big);
+            n += 2; // cipher_suites length
+            std.mem.writeInt(u16, buf[n..][0..2], @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256), .big);
+            n += 2;
+            buf[n] = 1;
+            n += 1; // compression length
+            buf[n] = 0;
+            n += 1; // null compression
+            std.mem.writeInt(u16, buf[n..][0..2], @intCast(exts.len), .big);
+            n += 2; // extensions length
+            @memcpy(buf[n..][0..exts.len], exts);
+            n += exts.len;
+            return buf[0..n];
+        }
+    }.f;
+
+    // A single `supported_versions` extension (type 43) offering TLS 1.3 —
+    // trivially well-formed, so only a SECOND copy of it can be rejected.
+    const one_ext = [_]u8{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 };
+    var dup_exts: [one_ext.len * 2]u8 = undefined;
+    @memcpy(dup_exts[0..one_ext.len], &one_ext);
+    @memcpy(dup_exts[one_ext.len..], &one_ext);
+
+    var body_buf: [128]u8 = undefined;
+    const body = buildBody(&body_buf, &dup_exts);
+    try std.testing.expectError(error.BadHandshake, server.processClientHello(body, body));
 }
 
 test "sniDigest / sniDigestEql: presence and byte-exact equality" {
