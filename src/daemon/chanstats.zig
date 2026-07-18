@@ -29,6 +29,7 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 }
 
 /// Caps — generous for real channels, hard ceilings against abuse.
+const max_channels: usize = 8192;
 const max_users_per_channel: usize = 4096;
 const max_words_per_channel: usize = 8192;
 const max_days_kept: usize = 60;
@@ -192,6 +193,13 @@ pub const ChanStats = struct {
 
     fn channel(self: *ChanStats, name: []const u8, now_ms: i64) ?*ChannelAgg {
         if (self.channels.getEntry(name)) |e| return e.value_ptr.*;
+        // Cap the number of DISTINCT channels tracked. Per-channel sub-tables are
+        // already bounded (see `userOf`/`max_users_per_channel`); this bounds the
+        // channel COUNT so a burst of unique channel names within one flush
+        // interval cannot spike memory faster than `pruneDeadChannels` reclaims
+        // it. Fail closed: an over-cap channel is simply not tracked (analytics
+        // degrade, nothing crashes) until the pruner frees room.
+        if (self.channels.count() >= max_channels) return null;
         const key = self.allocator.dupe(u8, name) catch return null;
         errdefer self.allocator.free(key);
         const agg = self.allocator.create(ChannelAgg) catch {
@@ -809,7 +817,13 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 /// Write `bytes` to `dir/name` via a temp file + rename so nginx never serves a
 /// half-written file. Uses the Zig 0.16 `std.Io` file API (mirrors the daemon's
 /// own `writeStatsFileAtomic`). Best-effort: errors are swallowed.
-fn writeFileAtomicIo(io: std.Io, dir: []const u8, name: []const u8, bytes: []const u8) void {
+/// Atomically replace `dir`/`name` with `bytes`: write a sibling dotfile
+/// (`.{name}.tmp`) then `rename` it over the target, so a crash or power loss
+/// mid-write leaves the previous file intact rather than a truncated one. Shared
+/// with other snapshot writers (e.g. the Event Spine history) that need the same
+/// tmp+rename guarantee. Best-effort — any failure is swallowed (persistence is
+/// non-authoritative), but a partial write can never clobber a good file.
+pub fn writeFileAtomicIo(io: std.Io, dir: []const u8, name: []const u8, bytes: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return;
     var tmp_buf: [1024]u8 = undefined;
@@ -1119,6 +1133,28 @@ test "writeJson prunes channels that no longer exist (unregistered + empty)" {
     try std.testing.expect(s.channels.get("#live") != null);
     try std.testing.expect(s.channels.get("#registered") != null);
     try std.testing.expect(s.channels.get("#probe-123") == null);
+}
+
+test "distinct-channel count is capped against a unique-name burst" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const ts: i64 = 1_700_000_000_000;
+
+    // Flood more unique channel names than the ceiling within one interval.
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < max_channels + 64) : (i += 1) {
+        const name = std.fmt.bufPrint(&buf, "#c{d}", .{i}) catch unreachable;
+        s.recordMessage(name, "nick", "hello there", ts);
+    }
+
+    // The tracked-channel count never exceeds the hard ceiling, regardless of
+    // how many unique names arrived.
+    try std.testing.expectEqual(max_channels, s.channels.count());
+    // A name that arrived after the cap was reached is simply not tracked
+    // (fail closed, no crash).
+    const overflow = std.fmt.bufPrint(&buf, "#c{d}", .{max_channels + 63}) catch unreachable;
+    try std.testing.expect(s.channels.getEntry(overflow) == null);
 }
 
 test "writeJson without an exists_fn prunes nothing (backward compatible)" {

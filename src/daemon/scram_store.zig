@@ -63,6 +63,25 @@ pub const ScramStoreError = error{
 /// `account_max` so any registrable account name fits.
 const MAX_ACCOUNT_LEN: usize = 32;
 
+/// Capacity of the ring that briefly retains salt duplicates handed back by
+/// `lookup`/`lookup512`. A returned `salt` borrows store-owned memory because a
+/// concurrent overwrite (e.g. a password change on the same account) can free
+/// the entry's own salt once the lookup lock is released. The SASL exchange,
+/// however, consumes that salt SYNCHRONOUSLY and without blocking inside a
+/// single `Router.receive()` call — it is base64-encoded into the server-first
+/// message immediately and is never retained across client messages — so a
+/// returned dupe is live only for a brief, lock-free window on one thread.
+///
+/// The store therefore keeps at most this many recent dupes and frees the
+/// oldest when the ring recycles a slot. This bounds what was a process-lifetime
+/// leak: `lookup` duplicated the salt into an ever-growing list freed only at
+/// `deinit`, so any client that could begin a SASL-SCRAM exchange (no auth
+/// required — the salt is returned before proof verification) leaked one dupe
+/// per start. The capacity vastly exceeds the number of reactor threads that can
+/// be mid-exchange at once, so a recycled slot is always past its consumer's
+/// synchronous window.
+const salt_ring_capacity: usize = 512;
+
 /// One account's stored SCRAM material. The salt is an owned, heap-allocated
 /// slice; the digests are inline fixed arrays.
 ///
@@ -87,7 +106,11 @@ pub const ScramStore = struct {
     allocator: std.mem.Allocator,
     /// Maps canonical account name -> SCRAM material. Keys and salt bytes owned.
     entries: std.StringHashMapUnmanaged(Entry),
-    lookup_salts: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Bounded ring of recently-returned salt dupes (see `salt_ring_capacity`).
+    /// Each returned `lookup` salt lives here only until the ring recycles its
+    /// slot, replacing the old process-lifetime retention.
+    lookup_salts: [salt_ring_capacity]?[]u8 = @splat(null),
+    lookup_salt_head: usize = 0,
     lock: rwlock.RwLock = .{},
     /// Optional durable backfill source consulted by `resolve` on a miss.
     loader: ?Loader = null,
@@ -117,13 +140,27 @@ pub const ScramStore = struct {
                 secureZero(&entry.value_ptr.server_key_512);
             }
             self.entries.deinit(self.allocator);
-            for (self.lookup_salts.items) |salt| {
-                secureZero(salt);
-                self.allocator.free(salt);
+            for (self.lookup_salts) |maybe_salt| {
+                if (maybe_salt) |salt| {
+                    secureZero(salt);
+                    self.allocator.free(salt);
+                }
             }
-            self.lookup_salts.deinit(self.allocator);
         }
         self.* = undefined;
+    }
+
+    /// Retain a store-owned salt dupe in the bounded ring, freeing (and
+    /// scrubbing) whatever dupe its slot recycles. The caller must hold the
+    /// exclusive lock. Never fails — the ring is fixed-size, so a returned
+    /// `lookup` never has to unwind a failed retain.
+    fn retainLookupSalt(self: *ScramStore, salt: []u8) void {
+        if (self.lookup_salts[self.lookup_salt_head]) |old| {
+            secureZero(old);
+            self.allocator.free(old);
+        }
+        self.lookup_salts[self.lookup_salt_head] = salt;
+        self.lookup_salt_head = (self.lookup_salt_head + 1) % salt_ring_capacity;
     }
 
     /// Derive SCRAM-SHA-256 credentials for `account` from `password` using a
@@ -462,9 +499,11 @@ pub const ScramStore = struct {
         return rec;
     }
 
-    /// Look up SCRAM-SHA-256 credentials for `account`, returning a `ScramRecord`
-    /// whose `salt` slice is retained by the store until teardown. Returns null
-    /// for an unknown account or allocation failure.
+    /// Look up SCRAM-SHA-256 credentials for `account`. The returned `ScramRecord`
+    /// borrows a store-owned `salt` valid for the caller's synchronous use during
+    /// the SASL exchange; the store keeps it only briefly in a bounded ring (see
+    /// `salt_ring_capacity`), not for the process lifetime. Returns null for an
+    /// unknown account or allocation failure.
     pub fn lookup(self: *const ScramStore, account: []const u8) ?sasl.ScramRecord {
         const self_mut = @constCast(self);
         self_mut.lock.lockExclusive();
@@ -472,10 +511,7 @@ pub const ScramStore = struct {
 
         const entry = self_mut.entries.get(account) orelse return null;
         const salt = self_mut.allocator.dupe(u8, entry.salt) catch return null;
-        self_mut.lookup_salts.append(self_mut.allocator, salt) catch {
-            self_mut.allocator.free(salt);
-            return null;
-        };
+        self_mut.retainLookupSalt(salt);
         return .{
             .salt = salt,
             .iterations = entry.iterations,
@@ -486,8 +522,9 @@ pub const ScramStore = struct {
 
     /// Look up SCRAM-SHA-512 credentials for `account`. Returns null for an
     /// unknown account, an account with no SHA-512 material, or allocation
-    /// failure. The returned `salt` slice is retained by the store until
-    /// teardown (same lifetime contract as `lookup`).
+    /// failure. The returned `salt` borrows store-owned memory kept only briefly
+    /// in the bounded ring (same lifetime contract as `lookup`), not for the
+    /// process lifetime.
     pub fn lookup512(self: *const ScramStore, account: []const u8) ?scram512.Credential {
         const self_mut = @constCast(self);
         self_mut.lock.lockExclusive();
@@ -496,10 +533,7 @@ pub const ScramStore = struct {
         const entry = self_mut.entries.get(account) orelse return null;
         if (!entry.has_512) return null;
         const salt = self_mut.allocator.dupe(u8, entry.salt) catch return null;
-        self_mut.lookup_salts.append(self_mut.allocator, salt) catch {
-            self_mut.allocator.free(salt);
-            return null;
-        };
+        self_mut.retainLookupSalt(salt);
         return .{
             .salt = salt,
             .iterations = entry.iterations,
@@ -685,6 +719,33 @@ test "ScramStore concurrent writers and readers preserve entries" {
             try std.testing.expect(store.lookup(name) != null);
         }
     }
+}
+
+test "lookup salt retention is bounded across many SCRAM starts" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.deriveAndStore("alice", "correct horse battery staple");
+
+    // Each SCRAM server-first (a `lookup`) duplicates the salt. Historically
+    // every dupe was retained for the process lifetime — an unauthenticated slow
+    // leak, since the salt is returned before proof verification. Run far more
+    // exchanges than the ring holds and assert retention is capped. The testing
+    // allocator additionally proves no dupe leaks at deinit.
+    var i: usize = 0;
+    while (i < salt_ring_capacity * 4) : (i += 1) {
+        const rec = store.lookup("alice") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, salt_len), rec.salt.len);
+        const rec512 = store.lookup512("alice") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, salt_len), rec512.salt.len);
+    }
+
+    var held: usize = 0;
+    for (store.lookup_salts) |slot| {
+        if (slot != null) held += 1;
+    }
+    // The ring fills to exactly its capacity and never grows past it, regardless
+    // of how many exchanges ran.
+    try std.testing.expectEqual(salt_ring_capacity, held);
 }
 
 test "serialize/deserialize round-trips a SCRAM record" {
