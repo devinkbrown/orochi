@@ -691,7 +691,7 @@ allow_anonymous = false
 # window. Remove it once the old bans have aged out.
 # previous_secret = "env:OROCHI_CLOAK_SECRET_PREV"
 # Optional network-identifying suffix used in generated cloak hostnames.
-# suffix = "ircxnet"
+# suffix = "onyx"
 # IP cloak granularity:
 #   "hierarchical" (default) — subnet-bannable prefix tokens + a<asn>.<cc> geo labels.
 #   "opaque"                 — one token over the whole address; nothing leaks (not

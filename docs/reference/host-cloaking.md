@@ -37,11 +37,11 @@ in `macTag`).
 `cloak()` routes on `classify()`:
 
 ```text
-IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet
-IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet
-opaque             -> <f>.opq.ircxnet
-opaque + epoch     -> <f(epoch)>.opq.ircxnet   (anon auth-split; see below)
-account            -> kain.users.ircxnet
+IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.onyx
+IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.onyx
+opaque             -> <f>.opq.onyx
+opaque + epoch     -> <f(epoch)>.opq.onyx   (anon auth-split; see below)
+account            -> kain.users.onyx
 ```
 
 The most specific token comes **first** (leftmost), matching DNS semantics where
@@ -228,7 +228,7 @@ wired in [src/main.zig](../../src/main.zig).
 | --- | --- | --- | --- |
 | `secret` | string | random per-boot | Passphrase stretched to the 32-byte cloak key by **argon2id** (64 MiB / t=2 / p=1, fixed salt). Absent → random key (privacy still on; cloaks are not stable across restarts). |
 | `previous_secret` | string | none | Prior secret (same argon2id path) kept live so WARD host/mask bans written under it keep matching during a rotation grace window. Drop once old bans age out. |
-| `suffix` | string | `ircxnet` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
+| `suffix` | string | `onyx` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
 | `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one token, no subnet/geo leak, not subnet-bannable. |
 | `account_cloak` | bool | `false` | Logged-in clients show the key-free `<account>.users.<suffix>`. Explicit VHOST personas still override. |
 | `anon_epoch_secs` | integer (seconds) | `86400` | Anonymous auth-split cadence. Non-zero → unauthenticated clients get the epoch-rotating opaque cloak (above). `0` disables the split (anonymous clients keep the stable hierarchical cloak). |

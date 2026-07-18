@@ -53,7 +53,7 @@ pub const full_token_hex_len = 16;
 /// Default network-identifying suffix carried by every cloaked host so users
 /// and opers can tell at a glance that a host is cloaked. Configurable via
 /// `[cloak] suffix`.
-pub const default_suffix = "ircxnet";
+pub const default_suffix = "onyx";
 
 /// Label between the account name and the network in account cloaks
 /// (`<account>.users.<network>`).
@@ -669,9 +669,9 @@ test "IPv4 /16 shared but /24 differs" {
 test "geo labels ban a country and an ASN via wildcards" {
     var out: [max_cloak_len]u8 = undefined;
     const c = try cloak(&out, &test_key, "203.0.113.99", geo_us, .{});
-    // Country ban `*.us.ip.ircxnet`
-    try testing.expect(std.mem.endsWith(u8, c, ".us.ip.ircxnet"));
-    // ASN label present for `*.a13335.*.ip.ircxnet`
+    // Country ban `*.us.ip.onyx`
+    try testing.expect(std.mem.endsWith(u8, c, ".us.ip." ++ default_suffix));
+    // ASN label present for `*.a13335.*.ip.onyx`
     try testing.expect(std.mem.containsAtLeast(u8, c, 1, ".a13335."));
 }
 
@@ -892,7 +892,7 @@ test "opaque epoch cloak: IPv6 rotates and keeps the opaque tail" {
     const e1 = try cloakOpaqueEpoch(&a, &test_key, "2001:db8::1", 5, .{});
     const e2 = try cloakOpaqueEpoch(&b, &test_key, "2001:db8::1", 6, .{});
     try testing.expect(!std.mem.eql(u8, e1, e2));
-    try testing.expect(std.mem.endsWith(u8, e1, ".opq.ircxnet"));
+    try testing.expect(std.mem.endsWith(u8, e1, ".opq." ++ default_suffix));
 }
 
 test "opaque epoch cloak: a different key yields an unlinkable rotation" {
