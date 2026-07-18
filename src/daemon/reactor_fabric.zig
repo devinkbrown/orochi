@@ -36,6 +36,18 @@
 //!     and on readiness calls `drainWake(shard)` then `drain(shard, out)`,
 //!     consuming each `DeliverMsg` and `release`-ing its buffer back to the pool.
 //!
+//! IMPORTANT — the live daemon does NOT use this fabric's own wake fds. It uses
+//! the inbox + pool handoff (`acquire`/`sendTo`/`drain`/`release`) but wakes the
+//! owning reactor through that reactor's OWN `Reactor.wake` eventfd, which its
+//! io_uring loop already arms a poll on, rather than through `wake`/`wakeFd`/
+//! `drainWake` here (see `enqueueDeliveryMaybeCloseEx` in server.zig: "We
+//! deliberately do not use the fabric's own wake fds"). The per-shard `wakes`
+//! slice therefore exists only so this fabric is a self-contained, independently
+//! testable primitive: it lets the smoke test and this module's own tests drive
+//! the full acquire→sendTo→wake→drainWake→drain→release handshake — including the
+//! eventfd wake — without standing up a whole `LinuxServer`. Do not read the
+//! `wakeFd`-registration steps above as the daemon's live wake contract.
+//!
 //! Linux-only: the wake fds are kernel eventfds and `ReactorWake.init()` may fail
 //! with `error.ReactorWakeUnsupported`, which `init` propagates.
 

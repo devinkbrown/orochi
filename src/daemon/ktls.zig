@@ -379,8 +379,12 @@ fn parseRecordTypeCmsg(msg: *const linux.msghdr) ?u8 {
         const clen = hdr.len;
         if (clen < cmsg_hdr_len or off + clen > control_len) break;
         if (hdr.level == @as(i32, @intCast(SOL_TLS)) and hdr.type == @as(i32, @intCast(TLS_GET_RECORD_TYPE))) {
+            // The content byte lives at base+CMSG_ALIGN(hdr) and must belong to
+            // THIS cmsg: require CMSG_LEN(1) worth of length (clen >=
+            // CMSG_ALIGN(hdr)+1). A header-only match (clen == cmsg_hdr_len)
+            // would otherwise read the first byte of the next cmsg's header.
             const data_off = off + cmsgAlign(cmsg_hdr_len);
-            if (data_off < control_len) return base[data_off];
+            if (clen >= cmsgAlign(cmsg_hdr_len) + 1 and data_off < control_len) return base[data_off];
         }
         const step = cmsgAlign(clen);
         if (step == 0) break;
@@ -593,6 +597,45 @@ test "parseRecordTypeCmsg reads the TLS_GET_RECORD_TYPE content byte" {
     // A cmsg for a different (level,type) is ignored ⇒ null.
     msg.flags = 0;
     hdr.type = @intCast(TLS_SET_RECORD_TYPE);
+    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+}
+
+test "parseRecordTypeCmsg rejects a data-less matching cmsg instead of reading the next header" {
+    // A matching TLS_GET_RECORD_TYPE cmsg carrying ONLY its header (len ==
+    // sizeof(cmsghdr), no content byte) must not be trusted: the content byte
+    // would otherwise be read from base+CMSG_ALIGN(hdr), which — when another
+    // cmsg follows — is the first byte of that next cmsg's header, not a record
+    // type. Today's kernel always writes CMSG_LEN(1); this guards a future or
+    // refactor regression that emits a header-only SOL_TLS cmsg.
+    var cbuf: [64]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const base: [*]u8 = &cbuf;
+
+    // cmsg[0]: matching (level,type) but header-only — carries no content byte.
+    const hdr0: *linux.cmsghdr = @ptrCast(@alignCast(base));
+    hdr0.len = cmsg_hdr_len; // header only, NOT CMSG_LEN(1)
+    hdr0.level = @intCast(SOL_TLS);
+    hdr0.type = @intCast(TLS_GET_RECORD_TYPE);
+
+    // cmsg[1]: a following cmsg whose first header byte (its len low byte, LE) is
+    // a plausible record type (handshake=22) — exactly the value the pre-fix read
+    // returned by misreading this adjacent header as ancillary content.
+    const next_off = cmsgAlign(cmsg_hdr_len);
+    const hdr1: *linux.cmsghdr = @ptrCast(@alignCast(base + next_off));
+    hdr1.len = @intFromEnum(RecordType.handshake); // low byte == 22
+    hdr1.level = 0;
+    hdr1.type = 0;
+
+    var iov = [_]posix.iovec{.{ .base = undefined, .len = 0 }};
+    const msg = linux.msghdr{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = &cbuf,
+        .controllen = next_off + cmsg_hdr_len, // both headers fully in-bounds
+        .flags = 0,
+    };
+    // Fail-closed: a data-less match yields null, never the adjacent header byte.
     try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
 }
 

@@ -221,8 +221,10 @@ pub const RecvEvent = struct {
     buffer_id: ?u16,
 };
 
-/// A send completion. Copy sends have copy semantics at submission time and do
-/// not need a release notification. Zero-copy sends emit a primary CQE plus a
+/// A send completion. A copy send emits exactly one CQE and needs no separate
+/// release notification: reaping that CQE is the point at which the send buffer
+/// is free to reuse (the kernel may read it any time up to then — it is NOT
+/// copied at submission). Zero-copy sends instead emit a primary CQE plus a
 /// notification CQE; `more` on the primary zero-copy CQE means "notification
 /// pending, buffer still kernel-owned", not multishot continuation. Callers must
 /// use `bufferReleased()` instead of hand-rolling `more`/`notif` checks.
@@ -378,9 +380,12 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         _ = try self.inner.recv(ud, fd, .{ .buffer_selection = .{ .group_id = group_id, .len = 0 } }, 0);
     }
 
-    /// Queue a copy send of `buffer` on `fd` for `token`. The kernel copies the
-    /// bytes during submission, so the caller may free or reuse `buffer`
-    /// immediately after this SQE is submitted with `submit`/`submitAndWait`.
+    /// Queue a copy send of `buffer` on `fd` for `token`. `IORING_OP_SEND` does
+    /// NOT copy at submission time — a send that cannot complete inline is punted
+    /// to async work and the kernel reads `buffer` at execution time — so the
+    /// caller MUST keep `buffer` stable and live until the matching send CQE is
+    /// reaped. Unlike a zero-copy send there is no separate release notification:
+    /// reaping that one send CQE is the signal that `buffer` is free to reuse.
     /// Does not use zero-copy even when `features.send_zc` is enabled.
     pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         const ud = try encodeUserData(.send, token);
