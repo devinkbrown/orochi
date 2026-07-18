@@ -56,6 +56,12 @@ pub const ParseError = error{
     DuplicateKey,
     /// An invalid Unicode scalar appeared in a \u / \U escape.
     InvalidUnicode,
+    /// Arrays / inline tables were nested past `max_nesting_depth`. Rejecting
+    /// deep nesting keeps the recursive-descent value parser off the path to a
+    /// stack overflow on a hostile (operator-supplied) config — a REHASH of a
+    /// malformed file fails closed with this typed error instead of crashing
+    /// the running daemon.
+    NestingTooDeep,
     /// Allocation failure.
     OutOfMemory,
 };
@@ -203,6 +209,16 @@ const Parser = struct {
     allocator: Allocator,
     src: []const u8,
     pos: usize = 0,
+    /// Current array / inline-table value-nesting depth. Bumped on entry to
+    /// `parseValue` and released on exit; capped at `max_nesting_depth`.
+    depth: u16 = 0,
+
+    /// Maximum array / inline-table value-nesting depth. Real Orochi configs
+    /// nest values at most two deep (e.g. `[[1, 2], [3]]`, `{ a = { b = 1 } }`),
+    /// so 64 is ~20x headroom for any legitimate document while still rejecting
+    /// a pathological `x = [[[[…` (thousands of `[`) or deeply nested inline
+    /// tables long before the recursive descent can overflow the stack.
+    const max_nesting_depth: u16 = 64;
 
     // ---- low-level cursor helpers ---------------------------------------
 
@@ -396,6 +412,14 @@ const Parser = struct {
     // ---- value dispatch -------------------------------------------------
 
     fn parseValue(self: *Parser) ParseError!Value {
+        // Every array element and inline-table value routes through here, so a
+        // single depth guard bounds both recursion cycles
+        // (parseValue->parseArray->parseValue and
+        // parseValue->parseInlineTable->insertKeyValue->parseValue).
+        if (self.depth >= max_nesting_depth) return error.NestingTooDeep;
+        self.depth += 1;
+        defer self.depth -= 1;
+
         const c = self.peek() orelse return error.UnexpectedEof;
         switch (c) {
             '"', '\'' => return Value{ .string = try self.parseStringValue() },
@@ -1126,6 +1150,63 @@ test "parse arrays including nested and heterogeneous" {
 
     try std.testing.expectEqual(@as(usize, 0), doc.getArray("empty").?.len);
     try std.testing.expectEqual(@as(usize, 3), doc.getArray("multiline").?.len);
+}
+
+test "reject pathologically deep arrays with NestingTooDeep (no stack overflow)" {
+    // Arrange: `x = ` then thousands of `[` — the classic recursive-descent
+    // stack-overflow payload. A REHASH of such a config must fail closed with a
+    // typed error, never crash the running daemon.
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "x = ");
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) try buf.append(allocator, '[');
+
+    // Act + Assert
+    try std.testing.expectError(error.NestingTooDeep, parse(allocator, buf.items));
+}
+
+test "reject pathologically deep inline tables with NestingTooDeep" {
+    // Arrange: `x = ` then a long chain of `{ a = { a = { a = ...` inline
+    // tables — the inline-table recursion cycle. Deliberately never closed; the
+    // depth guard must fire before any stack-overflow risk.
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "x = ");
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) try buf.appendSlice(allocator, "{ a = ");
+
+    // Act + Assert
+    try std.testing.expectError(error.NestingTooDeep, parse(allocator, buf.items));
+}
+
+test "accept value nesting well past any real config (headroom under the bound)" {
+    // Arrange: 60 nested arrays around a scalar — deeper than any legitimate
+    // Orochi config (real ones nest values at most two deep) yet under the
+    // depth bound, proving the guard does not reject honest documents.
+    const allocator = std.testing.allocator;
+    const levels: usize = 60;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "x = ");
+    var i: usize = 0;
+    while (i < levels) : (i += 1) try buf.append(allocator, '[');
+    try buf.append(allocator, '1');
+    i = 0;
+    while (i < levels) : (i += 1) try buf.append(allocator, ']');
+
+    // Act
+    var doc = try parse(allocator, buf.items);
+    defer doc.deinit(allocator);
+
+    // Assert: walk every array level down to the surviving scalar.
+    var arr = doc.getArray("x").?;
+    var depth: usize = 1;
+    while (arr[0] == .array) : (depth += 1) arr = arr[0].array;
+    try std.testing.expectEqual(levels, depth);
+    try std.testing.expectEqual(@as(i64, 1), arr[0].integer);
 }
 
 test "parse array of tables grows correctly" {
