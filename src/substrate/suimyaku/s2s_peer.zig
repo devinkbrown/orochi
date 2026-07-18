@@ -193,6 +193,87 @@ const cap_session_attachment_lease_v2: u8 = s2s_frame.cap_session_attachment_lea
 /// The peer understands secured immutable-origin Event Spine v2 frames.
 const cap_event_spine_v2: u8 = s2s_frame.cap_event_spine_v2;
 
+/// Hard cap on the per-peer `channel_mode_state_clocks` LWW-dedup map. Each
+/// distinct `CHANNEL_MODE_STATE` channel name dupes an owned key, so without a
+/// bound an admitted signing peer streaming unbounded distinct channel names
+/// would grow the map without limit. Beyond the cap the oldest-inserted channel
+/// is FIFO-evicted (its owned key freed), matching `message_relay.SeenSet`. A
+/// legitimate mesh carries far fewer distinct channels than this; overflow only
+/// occurs under a name flood, where evicting a stale clock is a bounded-memory
+/// tradeoff (a later replay of that channel re-arms it, exactly as SeenSet).
+const max_channel_mode_state_clocks: usize = 4096;
+
+/// Bounded per-channel LWW-dedup clock map. Caps distinct channel-name keys at
+/// `max_channel_mode_state_clocks` with FIFO eviction — the same shape as
+/// `message_relay.SeenSet` — so an admitted signing peer streaming unbounded
+/// distinct `CHANNEL_MODE_STATE` channel names cannot exhaust memory. Owns each
+/// channel-name key; `order` BORROWS those owned slices (freed once, via the
+/// map, at eviction or `deinit`) and `next_evict` is the FIFO ring cursor. The
+/// map `count()` and `order.items.len` are kept in lockstep, so `next_evict`
+/// (always < capacity) is a valid `order` index whenever the cap is reached.
+const ChannelClockSet = struct {
+    clocks: std.StringHashMapUnmanaged(u64) = .empty,
+    order: std.ArrayListUnmanaged([]const u8) = .empty,
+    next_evict: usize = 0,
+
+    fn deinit(self: *ChannelClockSet, allocator: Allocator) void {
+        var it = self.clocks.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        self.clocks.deinit(allocator);
+        self.order.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// LWW admit: true iff `hlc` strictly beats the last clock seen for
+    /// `channel` (or the channel is new), recording it. False on a stale/equal
+    /// clock, and false (fail-closed drop) on any allocation failure. Updating
+    /// an existing channel never grows the map, so only a genuinely new key can
+    /// trip the cap.
+    fn observe(self: *ChannelClockSet, allocator: Allocator, channel: []const u8, hlc: u64) bool {
+        if (max_channel_mode_state_clocks == 0) return false;
+        if (self.clocks.getPtr(channel)) |cur| {
+            if (hlc <= cur.*) return false;
+            cur.* = hlc;
+            return true;
+        }
+        const owned = allocator.dupe(u8, channel) catch return false;
+
+        if (self.clocks.count() >= max_channel_mode_state_clocks) {
+            // At capacity: FIFO-evict the oldest-inserted channel, freeing its
+            // owned key, then reuse its ring slot. The put runs BEFORE the
+            // remove so a mid-op OOM leaves the map fully populated (never
+            // under-capacity), and `victim` is always distinct from `owned`
+            // (a new key missed `getPtr` above).
+            const victim = self.order.items[self.next_evict];
+            self.clocks.put(allocator, owned, hlc) catch {
+                allocator.free(owned);
+                return false;
+            };
+            if (self.clocks.fetchRemove(victim)) |kv| allocator.free(kv.key);
+            self.order.items[self.next_evict] = owned;
+            self.next_evict = (self.next_evict + 1) % max_channel_mode_state_clocks;
+            return true;
+        }
+
+        self.clocks.put(allocator, owned, hlc) catch {
+            allocator.free(owned);
+            return false;
+        };
+        self.order.append(allocator, owned) catch {
+            // Keep `order` and the map in lockstep: undo the map insert
+            // (freeing the just-duped key) rather than orphan an untracked
+            // entry the FIFO cursor could never reach.
+            if (self.clocks.fetchRemove(owned)) |kv| allocator.free(kv.key);
+            return false;
+        };
+        return true;
+    }
+
+    fn count(self: *const ChannelClockSet) usize {
+        return self.clocks.count();
+    }
+};
+
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const session_replica_frame = @import("../../proto/session_replica_frame.zig");
 const meshpass = @import("../../proto/meshpass.zig");
@@ -523,7 +604,9 @@ pub const S2sPeer = struct {
     /// Remote parameter/IRCX channel-state snapshots that won a per-channel LWW
     /// clock, awaiting daemon-side application and MODE emission.
     channel_mode_state_changes: std.ArrayListUnmanaged(ChannelModeStateDelta) = .empty,
-    channel_mode_state_clocks: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Per-channel LWW-dedup clocks for inbound `CHANNEL_MODE_STATE`, bounded to
+    /// `max_channel_mode_state_clocks` with FIFO eviction (see `ChannelClockSet`).
+    channel_mode_state_clocks: ChannelClockSet = .{},
     /// Direct-owned state frames rejected because their claimed origin did not
     /// match the authenticated peer. Drained by the daemon for audit logging.
     rejected_origin_frames: u64 = 0,
@@ -823,8 +906,6 @@ pub const S2sPeer = struct {
         self.channel_mode_flag_changes.deinit(self.allocator);
         for (self.channel_mode_state_changes.items) |*d| d.deinit(self.allocator);
         self.channel_mode_state_changes.deinit(self.allocator);
-        var state_clocks = self.channel_mode_state_clocks.iterator();
-        while (state_clocks.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.channel_mode_state_clocks.deinit(self.allocator);
         for (self.channel_list_changes.items) |*d| d.deinit(self.allocator);
         self.channel_list_changes.deinit(self.allocator);
@@ -2513,17 +2594,7 @@ pub const S2sPeer = struct {
     }
 
     fn noteChannelModeStateClock(self: *S2sPeer, channel: []const u8, hlc: u64) bool {
-        if (self.channel_mode_state_clocks.getPtr(channel)) |cur| {
-            if (hlc <= cur.*) return false;
-            cur.* = hlc;
-            return true;
-        }
-        const owned = self.allocator.dupe(u8, channel) catch return false;
-        self.channel_mode_state_clocks.put(self.allocator, owned, hlc) catch {
-            self.allocator.free(owned);
-            return false;
-        };
-        return true;
+        return self.channel_mode_state_clocks.observe(self.allocator, channel, hlc);
     }
 
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
@@ -3023,20 +3094,25 @@ pub const S2sPeer = struct {
         // self-certifying signature check is the authoritative origin gate.
         if (!signed and !self.acceptsDirectOrigin(ev.origin_node)) return;
 
+        // The first dupe is `catch return` (nothing to unwind yet); every later
+        // step is `try` so the `errdefer` chain above it is LIVE and frees the
+        // already-duped strings on a mid-sequence allocation failure instead of
+        // leaking them (mirrors `recvChannelModeState`). Both this fn and its
+        // caller are `!void`, so the OOM propagates and faults the link closed.
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
         errdefer self.allocator.free(ch);
-        const key = self.allocator.dupe(u8, ev.key) catch return;
+        const key = try self.allocator.dupe(u8, ev.key);
         errdefer self.allocator.free(key);
-        const value = self.allocator.dupe(u8, ev.value) catch return;
+        const value = try self.allocator.dupe(u8, ev.value);
         errdefer self.allocator.free(value);
-        const owner = self.allocator.dupe(u8, ev.owner) catch return;
+        const owner = try self.allocator.dupe(u8, ev.owner);
         errdefer self.allocator.free(owner);
-        const origin_pubkey = self.allocator.dupe(u8, ev.origin_pubkey) catch return;
+        const origin_pubkey = try self.allocator.dupe(u8, ev.origin_pubkey);
         errdefer self.allocator.free(origin_pubkey);
-        const origin_sig = self.allocator.dupe(u8, ev.origin_sig) catch return;
+        const origin_sig = try self.allocator.dupe(u8, ev.origin_sig);
         errdefer self.allocator.free(origin_sig);
 
-        self.prop_changes.append(self.allocator, .{
+        try self.prop_changes.append(self.allocator, .{
             .channel = ch,
             .key = key,
             .value = value,
@@ -3046,7 +3122,7 @@ pub const S2sPeer = struct {
             .origin_node = ev.origin_node,
             .origin_pubkey = origin_pubkey,
             .origin_sig = origin_sig,
-        }) catch return;
+        });
     }
 
     /// Origin attribution for a CHANNEL_PROP emit. A prop fact is a CRDT fact the
@@ -3110,20 +3186,23 @@ pub const S2sPeer = struct {
         const signed = ev.origin_pubkey.len != 0;
         if (!signed and !self.acceptsDirectOrigin(ev.origin_node)) return;
 
+        // See `recvChannelProp`: the first dupe is `catch return`, then every
+        // later step is `try` so the `errdefer` chain is LIVE and frees the
+        // already-duped strings on a mid-sequence OOM rather than leaking them.
         const entity = self.allocator.dupe(u8, ev.entity) catch return;
         errdefer self.allocator.free(entity);
-        const key = self.allocator.dupe(u8, ev.key) catch return;
+        const key = try self.allocator.dupe(u8, ev.key);
         errdefer self.allocator.free(key);
-        const value = self.allocator.dupe(u8, ev.value) catch return;
+        const value = try self.allocator.dupe(u8, ev.value);
         errdefer self.allocator.free(value);
-        const owner = self.allocator.dupe(u8, ev.owner) catch return;
+        const owner = try self.allocator.dupe(u8, ev.owner);
         errdefer self.allocator.free(owner);
-        const origin_pubkey = self.allocator.dupe(u8, ev.origin_pubkey) catch return;
+        const origin_pubkey = try self.allocator.dupe(u8, ev.origin_pubkey);
         errdefer self.allocator.free(origin_pubkey);
-        const origin_sig = self.allocator.dupe(u8, ev.origin_sig) catch return;
+        const origin_sig = try self.allocator.dupe(u8, ev.origin_sig);
         errdefer self.allocator.free(origin_sig);
 
-        self.entity_prop_changes.append(self.allocator, .{
+        try self.entity_prop_changes.append(self.allocator, .{
             .kind = ev.kind,
             .entity = entity,
             .key = key,
@@ -3134,7 +3213,7 @@ pub const S2sPeer = struct {
             .origin_node = ev.origin_node,
             .origin_pubkey = origin_pubkey,
             .origin_sig = origin_sig,
-        }) catch return;
+        });
     }
 
     /// Emit an ENTITY_PROP (user/member) event to the peer. Best-effort; only
@@ -4105,6 +4184,67 @@ fn newPeer(
             },
         },
     });
+}
+
+test "ChannelClockSet enforces LWW per channel and rejects stale/equal clocks" {
+    const allocator = std.testing.allocator;
+    var set = ChannelClockSet{};
+    defer set.deinit(allocator);
+
+    try std.testing.expect(set.observe(allocator, "#a", 10));
+    try std.testing.expect(!set.observe(allocator, "#a", 10)); // equal -> stale
+    try std.testing.expect(!set.observe(allocator, "#a", 5)); // older -> stale
+    try std.testing.expect(set.observe(allocator, "#a", 11)); // newer -> admit
+    try std.testing.expect(set.observe(allocator, "#b", 1)); // new channel -> admit
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+}
+
+test "ChannelClockSet is bounded and FIFO-evicts the oldest channel under a name flood" {
+    const allocator = std.testing.allocator;
+    var set = ChannelClockSet{};
+    defer set.deinit(allocator);
+
+    // Stream well past the cap with distinct channel names; the map must never
+    // exceed the cap (no unbounded growth) and each owned key is freed on
+    // eviction (the testing allocator would flag any leak at deinit).
+    var i: usize = 0;
+    while (i < max_channel_mode_state_clocks + 500) : (i += 1) {
+        var name_buf: [24]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "#flood{d}", .{i}) catch unreachable;
+        try std.testing.expect(set.observe(allocator, name, 1));
+        try std.testing.expect(set.count() <= max_channel_mode_state_clocks);
+    }
+    try std.testing.expectEqual(max_channel_mode_state_clocks, set.count());
+
+    // The earliest-inserted channel (#flood0) was FIFO-evicted, so its clock is
+    // gone: a replay re-arms it (returns true, treated as a fresh channel).
+    try std.testing.expect(set.observe(allocator, "#flood0", 1));
+    // A recently-inserted channel is still tracked, so a stale replay is
+    // rejected as a duplicate.
+    var last_buf: [24]u8 = undefined;
+    const last = std.fmt.bufPrint(&last_buf, "#flood{d}", .{max_channel_mode_state_clocks + 499}) catch unreachable;
+    try std.testing.expect(!set.observe(allocator, last, 1));
+}
+
+test "ChannelClockSet observe under allocation failure fails closed, never leaks, stays in lockstep" {
+    // Sweep every allocation-failure index across a short insert sequence. At
+    // whatever point the OOM lands (dupe, map put, or order append), `observe`
+    // must fail closed (drop, no partial state), the map and order list must
+    // stay in lockstep (`count == order.items.len`), and nothing may leak — the
+    // testing allocator flags any leaked owned key at `deinit`. This pins the
+    // three rollback branches the reviewers verified by hand.
+    var fail_at: usize = 0;
+    while (fail_at < 16) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        const allocator = failing.allocator();
+        var set = ChannelClockSet{};
+        _ = set.observe(allocator, "#a", 1);
+        _ = set.observe(allocator, "#b", 2);
+        _ = set.observe(allocator, "#a", 3); // getPtr hit: updates in place, no alloc
+        _ = set.observe(allocator, "#c", 4);
+        try std.testing.expectEqual(set.count(), set.order.items.len);
+        set.deinit(allocator);
+    }
 }
 
 test "identity transition queue preserves mixed order and legacy drains discard matching markers" {
