@@ -486,9 +486,10 @@ class Bot:
         if not trusted and topic_change_protected(line):
             log.info("blocked protected topic change: %s", line)
             return
-        # Log channel traffic at INFO so "announcing" is not a silent no-op in the journal.
+        # Log channel traffic at INFO with colors stripped so journalctl is readable.
         if line.startswith("PRIVMSG ") or line.startswith("NOTICE ") or line.startswith("TOPIC "):
-            log.info(">> %s", line[:200] + ("…" if len(line) > 200 else ""))
+            plain = re.sub(r"\x03\d{0,2}(?:,\d{1,2})?|[\x02\x1f\x0f\x16]", "", line)
+            log.info(">> %s", plain[:240] + ("…" if len(plain) > 240 else ""))
         else:
             log.debug(">> %s", line)
         try:
@@ -532,21 +533,24 @@ class Bot:
             return
         self.enqueue(f"NOTICE {CHANNEL} :{text}")
 
-    def plain_commit_line(self, p: Project, rev: str) -> str:
-        """Color-free one-liner so clients always show something useful."""
-        short = commit_field(p, "%h", rev) or rev[:7]
-        subj = commit_field(p, "%s", rev) or "(no subject)"
-        author = commit_field(p, "%an", rev) or "?"
-        when = commit_field(p, "%cr", rev) or ""
-        # Explicit repo path so operators can verify the watcher target live.
-        return f"[{p.key}] {short} {subj} · {author} · {when} · {p.repo}"
-
     def announce(self, lines: list[str], target: str | None = None) -> None:
+        """Post multi-line announce. First line goes out immediately; rest are paced."""
         dest = target or CHANNEL
-        for text in compact(lines):
-            if dest == CHANNEL:
+        # Prefer line-by-line so color + explanation stay readable (don't glue
+        # everything into one compact blob).
+        cleaned = []
+        for line in lines:
+            text = re.sub(r"\s+", " ", (line or "")).strip()
+            if text:
+                cleaned.append(text)
+        if not cleaned:
+            return
+        if dest == CHANNEL:
+            self.channel_say(cleaned[0], immediate=True)
+            for text in cleaned[1:]:
                 self.channel_say(text, immediate=False)
-            else:
+        else:
+            for text in cleaned:
                 self.msg(dest, text)
 
     def pump_out(self) -> None:
@@ -680,12 +684,7 @@ class Bot:
                 p.repo,
                 (prev[:12] if prev else "?"),
             )
-            # 1) Plain ASCII line first — always visible in clients that strip mIRC
-            #    colors, and sent immediately (not paced queue) so flood/TOPIC
-            #    ordering cannot strand the announce.
-            plain = self.plain_commit_line(p, rev)
-            self.channel_say(plain, immediate=True)
-            # 2) Optional colored detail (queued, best-effort).
+            # Rich multi-line color announce (headline immediate; body paced).
             self.announce(self.commit_lines(p, rev, tc, with_delta=(i == len(shown) - 1)))
         # One topic refresh after the whole project poll, not mid-burst.
         self.set_topic()
@@ -704,37 +703,117 @@ class Bot:
         self.last_tests[p.key] = n
         return out
 
-    def commit_lines(self, p: Project, rev: str, tc: str, with_delta: bool) -> list[str]:
-        """Fast, colorized commit announcement — git-only (no tree-walks).
+    def commit_body_explain(self, p: Project, rev: str, *, max_lines: int = 3) -> list[str]:
+        """Human explanation from the commit message body (git %b), cleaned."""
+        raw = git(p, "log", "-1", "--format=%b", rev)
+        if not raw:
+            return []
+        out: list[str] = []
+        for line in raw.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            # Skip co-author / signed-off / empty boilerplate.
+            if re.match(
+                r"^(co-authored-by|signed-off-by|reviewed-by|made-with|change-id):",
+                text,
+                re.I,
+            ):
+                continue
+            # Soft-wrap long body lines for IRC.
+            while byte_len(text) > MAX_MESSAGE_TEXT_BYTES - 24:
+                cut = text[:220]
+                # break on last space if possible
+                sp = cut.rfind(" ")
+                if sp > 80:
+                    cut, text = cut[:sp], text[sp:].lstrip()
+                else:
+                    text = text[220:]
+                out.append(cut)
+                if len(out) >= max_lines:
+                    return out
+            out.append(text)
+            if len(out) >= max_lines:
+                break
+        return out
 
-        Tree-walk module/loc counts used to block this call for minutes while
-        the IRC socket sat unanswered; reconnect then wiped the outq so
-        ``announcing`` never became a visible PRIVMSG.
+    def commit_lines(self, p: Project, rev: str, tc: str, with_delta: bool) -> list[str]:
+        """Rich colorized multi-line commit announce — git-only (no tree-walks).
+
+        Line 1: project · type · hash · subject
+        Line 2: author · when · diffstat · tests · commit #
+        Line 3+: body explanation (why / what), then optional files
         """
-        subj = commit_field(p, "%s", rev)
+        subj = commit_field(p, "%s", rev) or "(no subject)"
         typ = commit_type(subj)
         accent = TYPE_COLOR.get(typ, CYAN)
         glyph = TYPE_GLYPH.get(typ, "▶")
-        # Show the type as a colored tag and drop its "type(scope): " prefix from
-        # the subject so it is not printed twice.
+        # Drop conventional "type(scope): " prefix from the subject so the type
+        # color chip is not duplicated in the prose.
         clean = re.sub(r"^[a-z]+(?:\([^)]*\))?!?:\s*", "", subj) if typ else subj
-        tag = f"{B}{accent}{typ}{RST} " if typ else ""
-        author = commit_field(p, "%an", rev)
-        when = commit_field(p, "%cr", rev)  # "3 minutes ago"
+        scope_m = re.match(r"^[a-z]+\(([^)]+)\)!?:", subj)
+        scope = scope_m.group(1) if scope_m else ""
+        type_chip = f"{B}{accent}{typ}{RST}" if typ else f"{SILVER}commit{RST}"
+        if scope:
+            type_chip += f"{GREY}({scope}){RST}"
+        short = commit_field(p, "%h", rev) or rev[:7]
+        author = commit_field(p, "%an", rev) or "?"
+        when = commit_field(p, "%cr", rev) or ""
         delta = self.tests_delta(p, tc) if with_delta else ""
         total = git(p, "rev-list", "--count", "HEAD")
-        proj_tag = f"{p.accent}{B}[{p.key}]{RST} "
+        stat = commit_stat(p, rev)
+        proj = f"{p.accent}{B}[{p.key}]{RST}"
+
+        # Headline — the "what"
         lines = [
-            f"{proj_tag}{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field(p,'%h', rev)}{RST} "
-            f"{tag}{WHITE}{clean}{RST}"
-            f" {GREY}by{RST} {TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(p, rev)}"
-            f" {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}"
-            f" {GREY}#{total}{RST}",
+            f"{proj} {accent}{B}▌{RST}{glyph} {B}{accent}{short}{RST} "
+            f"{type_chip} {WHITE}{B}{clean}{RST}"
         ]
-        # Compact changed-files line for focused commits (git show --stat is cheap).
+        # Meta — who / when / size / tests
+        lines.append(
+            f"{proj} {GREY}by{RST} {TEAL}{author}{RST} {GREY}·{RST} {SILVER}{when}{RST} "
+            f"{GREY}·{RST} {stat} {GREY}· tests{RST} {B}{GREEN}{tc}{RST}{delta} "
+            f"{GREY}· #{total}{RST}"
+        )
+        # Explanation — body of the commit message (why / details)
+        body = self.commit_body_explain(p, rev, max_lines=3)
+        if body:
+            for i, bl in enumerate(body):
+                prefix = f"{proj} {CYAN}why{RST} {GREY}·{RST} " if i == 0 else f"{proj} {GREY}···{RST} "
+                lines.append(f"{prefix}{WHITE}{bl}{RST}")
+        else:
+            # No body: invent a short readable blurb from type + subject.
+            hint = {
+                "feat": "New capability",
+                "fix": "Bug fix",
+                "docs": "Documentation",
+                "refactor": "Internal restructure (no intended behavior change)",
+                "test": "Tests",
+                "chore": "Housekeeping",
+                "perf": "Performance",
+                "build": "Build / packaging",
+                "ci": "CI",
+                "style": "Style / formatting",
+                "revert": "Revert",
+            }.get(typ or "", "Update")
+            lines.append(
+                f"{proj} {CYAN}about{RST} {GREY}·{RST} {WHITE}{hint}: {clean}{RST}"
+            )
+        # Repo path (so operators can see which tree fired — still colored)
+        lines.append(
+            f"{proj} {GREY}repo{RST} {GREY}·{RST} {SILVER}{p.repo}{RST}"
+        )
+        # Files touched (focused commits only)
         files = [l.split("|")[0].strip() for l in changed_files(p, rev) if "|" in l]
-        if files and len(files) <= 6:
-            lines.append(f"{SILVER}[{p.key}] files: {' '.join(files)}{RST}")
+        if files and len(files) <= 8:
+            lines.append(
+                f"{proj} {GREY}files{RST} {GREY}·{RST} {SILVER}{' · '.join(files)}{RST}"
+            )
+        elif files:
+            lines.append(
+                f"{proj} {GREY}files{RST} {GREY}·{RST} {SILVER}{len(files)} paths "
+                f"({', '.join(files[:4])}…){RST}"
+            )
         return lines
 
     def set_topic(self) -> None:
