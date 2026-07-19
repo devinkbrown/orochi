@@ -68043,11 +68043,12 @@ test "exploit: OPER command grants no operator status (SASL-only elevation, fail
 }
 
 // --- Exploit / regression corpus: channel PRIVMSG under MESSAGE_V2 authoring.
-// mIRC formatting is legal body content. Prefer durable admit (RVG2/Lotus/RVL2/
-// RVO2) even when the mesh peer is unconnected — outbox retains until ACK.
-// Capacity / transient admit pressure is local-first: deliver to local members
-// without FAIL TEMPORARILY_UNAVAILABLE (clients would retry into already-served
-// recipients). Mesh durability may still publish without ADS1.
+// mIRC formatting is legal body content. Durable admit (RVG2/Lotus/RVL2/RVO2)
+// is mandatory even when the mesh peer is unconnected — outbox retains until
+// ACK. ADS1 attachment pressure is different: after the durable authorities
+// have accepted, attachment reservation may soft-fail to ordinary SendQ without
+// changing the accepted event. A failure in the durable admit itself is always
+// fail-closed before any local delivery.
 
 test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 authoring" {
     // Root cause of "bot colors never show" / #root FAIL: message_relay rejected
@@ -68113,8 +68114,8 @@ test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 a
     try expectContains(member_out, "\x0304red\x03");
     try expectContains(member_out, "\x02chip\x0f");
     // Durable path must succeed even with no live peer: RVL2 row + RVO2 retain
-    // for the configured neighbor. Local-first soft-fail alone is not enough —
-    // colored announce-bot lines must enter mesh authority, not only SendQ.
+    // for the configured neighbor. ADS1 soft-fail alone is not enough — colored
+    // announce-bot lines must enter mesh authority, not only SendQ.
     try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
     try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
     const accepted = server.relay_v2_event_log.viewAt(0);
@@ -68216,10 +68217,11 @@ test "exploit: channel PRIVMSG #root durably admits with mesh peer configured bu
     try std.testing.expectEqualStrings("durable local chat", recorded[0].text);
 }
 
-test "exploit: channel PRIVMSG local-first under ADS1 spool capacity still delivers and recovers" {
-    // Spool capacity soft-fails ADS1 reservation but must NOT FAIL PRIVMSG or
-    // silence the room. Local members still receive the line; once capacity
-    // returns, durable attachment batches resume. CWE-755 / #root brick.
+test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers and recovers" {
+    // Spool capacity soft-fails only ADS1 reservation after RVG2/Lotus/RVL2/RVO2
+    // accept. It must not turn that accepted event into FAIL or silence the room.
+    // Local members still receive the line; once capacity returns, durable
+    // attachment batches resume. CWE-755 / #root brick.
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
@@ -70024,7 +70026,7 @@ test "detached reusable attachment transfers retained event to resumed physical 
     try expectContains(conn.send_buf[0..conn.send_len], "PRIVMSG NewAttachment :resume-me");
 }
 
-test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authorities unchanged" {
+test "authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh authorities publish" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6d)), "authored-spool-cut-test");
@@ -70070,9 +70072,9 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
     const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
     defer allocator.free(spool_before);
 
-    // ADS1 spool pressure soft-fails the attachment batch only. RVG2/Lotus may
-    // still publish (when durable membership is configured); the spool itself
-    // must stay byte-identical so a full ADS1 never corrupts retained rows.
+    // ADS1 spool pressure soft-fails the attachment batch only. Durable
+    // membership is configured, so RVG2/RVL2/RVO2 must still publish; the spool
+    // itself stays byte-identical so a full ADS1 never corrupts retained rows.
     var admitted = try server.admitAuthoredRelayV2(
         .privmsg,
         "#durable",
@@ -70094,13 +70096,11 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
             .line = ":DurableAuthor!u@h PRIVMSG #durable :soft-fail-spool\r\n",
         },
     );
-    // Without a 2-node durable membership this fixture rejects mesh publish
-    // (returns null) OR accepts without an attachment batch. Either way the
-    // spool occupancy is unchanged and CapacityExceeded is never raised.
-    if (admitted) |*accepted| {
-        defer accepted.deinit(allocator);
-        try std.testing.expect(!accepted.has_attachment_batch);
-    }
+    var accepted = admitted orelse return error.TestExpectedEqual;
+    defer accepted.deinit(allocator);
+    try std.testing.expect(!accepted.has_attachment_batch);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
 
     const spool_after = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
     defer allocator.free(spool_after);
@@ -70108,12 +70108,12 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
     try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
 }
 
-// Local-first: when ADS1 spool is saturated (or durable admit soft-fails the
-// attachment batch), PRIVMSG/NOTICE must still fan out to local channel
-// members and must not emit FAIL TEMPORARILY_UNAVAILABLE (clients would retry
-// into members who already received the line). Mesh durability may still
-// publish without ADS1; local chat stays live via SendQ fallthrough.
-test "threaded server: PRIVMSG NOTICE local-first mesh admission busy still delivers to local members" {
+// Once durable MESSAGE_V2 admission succeeds, ADS1 attachment pressure may
+// soft-fail to ordinary SendQ. PRIVMSG/NOTICE must still fan out to local
+// channel members without FAIL because RVG2/Lotus/RVL2/RVO2 already accepted
+// the event. This is intentionally narrower than a durable-admission failure,
+// which remains fail-closed before any delivery.
+test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission still delivers locally" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
@@ -70158,8 +70158,8 @@ test "threaded server: PRIVMSG NOTICE local-first mesh admission busy still deli
     _ = try server.world.join("#local-first", worldIdFromClient(sender_id));
     _ = try server.world.join("#local-first", worldIdFromClient(member_id));
 
-    // Saturate ADS1 so durable admit fails with CapacityExceeded (the same
-    // transient-busy class as journal pressure / peer lag).
+    // Saturate ADS1 so attachment-batch preparation returns CapacityExceeded.
+    // The durable mesh authorities still have capacity and must accept.
     var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
         .max_attachments = 1,
         .max_records = 1,
@@ -70185,14 +70185,17 @@ test "threaded server: PRIVMSG NOTICE local-first mesh admission busy still deli
     try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #local-first :local-first-privmsg");
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
 
-    // Ordinary history path still records when durable admit did not publish.
+    // Lotus published inside the same durable-admission cut.
     var hbuf: [4]lotus.Message = undefined;
     const recorded = server.history.latest("#local-first", hbuf.len, &hbuf) catch &.{};
     try std.testing.expect(recorded.len >= 1);
     try std.testing.expectEqualStrings("local-first-privmsg", recorded[0].text);
 
-    // NOTICE: same local-first delivery, and never an error reply.
+    // NOTICE: same post-admit ADS1 soft-fail delivery, and never an error reply.
     member.send_len = 0;
     member.send_offset = 0;
     sender.send_len = 0;
@@ -70201,13 +70204,16 @@ test "threaded server: PRIVMSG NOTICE local-first mesh admission busy still deli
     try expectContains(member.send_buf[0..member.send_len], "NOTICE #local-first :local-first-notice");
     try std.testing.expectEqual(@as(usize, 0), sender.send_len); // NOTICE never errors
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expectEqual(@as(usize, 2), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 2), server.relay_v2_outbox.len());
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
 }
 
-// Multi-shard local-first: mesh_busy_local / ordinary delivery must still cross
-// the fabric (stable DeliverBuf copy → wake-after-enqueue → owner drain) when
-// ADS1 is saturated. A reusable-session recipient on a foreign shard must not
-// be left on the prepared_batch wake-only path (empty spool → silent drop).
-test "threaded server: cross-shard PRIVMSG local-first mesh-busy delivery reaches foreign-shard member via fabric" {
+// Multi-shard post-admit soft-fail: ordinary delivery must still cross the
+// fabric (stable DeliverBuf copy → wake-after-enqueue → owner drain) after ADS1
+// is saturated. A reusable-session recipient on a foreign shard must not be
+// left on the prepared_batch wake-only path (empty spool → silent drop).
+test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admission reaches foreign member" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
@@ -70294,6 +70300,9 @@ test "threaded server: cross-shard PRIVMSG local-first mesh-busy delivery reache
     try server.messageOne(sender_id, sender, "PRIVMSG", "#xshard-lf", "cross-shard-local-first", null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
 
     // Author's reactor enqueued a DeliverMsg; owning reactor drains fabric into
     // the foreign ConnState's inline send_buf (address-stable, single-writer).
