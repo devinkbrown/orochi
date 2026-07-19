@@ -15,7 +15,7 @@ interop**. It covers a full modern feature surface (IRCv3, IRCX, SASL, in-proces
 services, WebSocket, CHATHISTORY,
 voice/video), adds class-based connection policy with bounded growable SendQ/RecvQ and
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
-native **Suimyaku + Tsumugi** cryptographic mesh.
+native **Undertow + Mooring** cryptographic mesh.
 
 **Quick links:** [Quickstart](docs/guide/00-quickstart.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
@@ -69,8 +69,8 @@ verify it yourself (`packaging/verify-release.sh`).
 - **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are all
   Zig; `comptime` powers the module machinery and generates wire codecs and
   dispatch tables.
-- **Mesh, not tree.** **Suimyaku** (水脈) — a CRDT state mesh with Sazanami gossip and
-  Merkle anti-entropy — over **Tsumugi** (紬) — a post-quantum-hybrid (X25519 + ML-KEM-768)
+- **Mesh, not tree.** **Undertow** (水脈) — a CRDT state mesh with Ripple gossip and
+  Merkle anti-entropy — over **Mooring** (紬) — a post-quantum-hybrid (X25519 + ML-KEM-768)
   forward-secret ratchet. No TS6. Operator surfaces are network-wide: the Event Spine
   (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every event to
   all nodes rendered with the origin server, and a cross-node `MODE` shows the setter's
@@ -105,9 +105,9 @@ verify it yourself (`packaging/verify-release.sh`).
 
 | Package | Role |
 |---|---|
-| `src/substrate` | Ringlane `io_uring` reactor, lock-free queues, allocators, the Suimyaku math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Sazanami, sketches), and the Deterministic Ocean simulator |
-| `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, the Tsumugi ratchet, and the Yoroi TLS stack |
-| `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP state machine, Suimyaku frame layer, SASL |
+| `src/substrate` | Ringlane `io_uring` reactor, lock-free queues, allocators, the Undertow math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Ripple, sketches), and the Deterministic Ocean simulator |
+| `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, the Mooring ratchet, and the Armor TLS stack |
+| `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP state machine, Undertow frame layer, SASL |
 | `src/daemon` | SerpentRegistry (comptime modules), client/channel model, connection classes, growable SendQ/RecvQ, nick delay and nick services, runtime flood guard, `+j` raid guard, spam-trap, command dispatch, OroStore, `STATS`/`INFO`, and the live mesh server |
 
 See the [architecture overview](docs/architecture/00-overview.md) for subsystems, request

@@ -31,7 +31,7 @@ High-interest areas include:
   server pins the HelloRetryRequest cipher suite, validates the retried
   `key_share` group, enforces a 0-RTT ticket-age freshness window, and is
   fail-closed across the handshake state machine.
-- The Tsumugi handshake and Suimyaku mesh record layer (server-to-server crypto).
+- The Mooring handshake and Undertow mesh record layer (server-to-server crypto).
 - Authentication: SASL (PLAIN / SCRAM / EXTERNAL), session tokens, CERTFP.
 - Host cloaking: the Argon2id-derived cloak key and the epoch-rotated anonymous
   cloaks (`[cloak] anon_epoch_secs`).

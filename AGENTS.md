@@ -4,7 +4,7 @@
 
 - Work only in the Orochi repository unless the task explicitly names a deployment host.
 - Treat the current source and tests as authoritative. Roadmaps and prose may lag implementation.
-- Orochi is a pure-Zig IRC/IRCX daemon with a secured Suimyaku mesh. Do not introduce C interop or replace the native mesh with a tree protocol.
+- Orochi is a pure-Zig IRC/IRCX daemon with a secured Undertow mesh. Do not introduce C interop or replace the native mesh with a tree protocol.
 - The production contract is mesh-wide: every attached client in a reusable session remains connected, can participate independently, and observes the same accepted events after migration or Helix upgrade on any node.
 
 ## Parallel work
