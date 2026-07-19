@@ -880,8 +880,16 @@ class Bot:
                 self.send_raw(f"JOIN {CHANNEL}")
                 if not self.intro_done:
                     self.intro_done = True
+                    # One short colored line per project — never dump full blurbs
+                    # into #root (that interleaved with commit cards).
                     for p in PROJECTS:
-                        self.announce(project_lines(p) + stats_lines(p))
+                        head = git(p, "rev-parse", "--short", "HEAD") or "?"
+                        self.channel_say(
+                            f"{p.accent}{B}[{p.key}]{RST} {p.emoji} {B}{p.name}{RST} "
+                            f"{GREY}watching{RST} {SILVER}{p.repo}{RST} "
+                            f"{GREY}HEAD{RST} {p.accent}{head}{RST} {GREY}· !help{RST}",
+                            immediate=False,
+                        )
                 self.set_topic()
                 return True
 
