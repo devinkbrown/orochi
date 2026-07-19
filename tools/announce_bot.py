@@ -500,14 +500,54 @@ class Bot:
         self.outq.append(line)
 
     def msg(self, target: str, text: str) -> None:
+        if not text or not str(text).strip():
+            log.warning("refusing empty PRIVMSG to %s", target)
+            return
         self.enqueue(f"PRIVMSG {target} :{text}")
 
     def notice(self, target: str, text: str) -> None:
+        if not text or not str(text).strip():
+            return
         self.enqueue(f"NOTICE {target} :{text}")
 
+    def channel_say(self, text: str, *, immediate: bool = False) -> None:
+        """Speak in ANNOUNCE_CHANNEL. immediate=True bypasses the pace queue."""
+        text = (text or "").strip()
+        if not text:
+            log.warning("refusing empty channel message")
+            return
+        # Hard cap so the line always fits IRC (512) with room for prefix.
+        while byte_len(text) > MAX_MESSAGE_TEXT_BYTES:
+            text = text[: max(1, len(text) - 8)].rstrip() + "…"
+        line = f"PRIVMSG {CHANNEL} :{text}"
+        if immediate:
+            self.send_raw(line)
+            self.last_send = time.time()
+        else:
+            self.enqueue(line)
+
+    def channel_notice(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self.enqueue(f"NOTICE {CHANNEL} :{text}")
+
+    def plain_commit_line(self, p: Project, rev: str) -> str:
+        """Color-free one-liner so clients always show something useful."""
+        short = commit_field(p, "%h", rev) or rev[:7]
+        subj = commit_field(p, "%s", rev) or "(no subject)"
+        author = commit_field(p, "%an", rev) or "?"
+        when = commit_field(p, "%cr", rev) or ""
+        # Explicit repo path so operators can verify the watcher target live.
+        return f"[{p.key}] {short} {subj} · {author} · {when} · {p.repo}"
+
     def announce(self, lines: list[str], target: str | None = None) -> None:
+        dest = target or CHANNEL
         for text in compact(lines):
-            self.msg(target or CHANNEL, text)
+            if dest == CHANNEL:
+                self.channel_say(text, immediate=False)
+            else:
+                self.msg(dest, text)
 
     def pump_out(self) -> None:
         """Drain at most one queued line per SEND_INTERVAL — never blocks recv."""
@@ -538,6 +578,17 @@ class Bot:
         self.registered = False
         self.outq.clear()
         log.info("connecting to %s:%d as %s", SERVER, PORT, self.nick)
+        log.info(
+            "watching %d project(s): %s",
+            len(PROJECTS),
+            ", ".join(f"{p.key}={p.repo}" for p in PROJECTS),
+        )
+        for p in PROJECTS:
+            if not os.path.isdir(p.repo):
+                log.error("PROJECT PATH MISSING: %s -> %s", p.key, p.repo)
+            else:
+                head = git(p, "rev-parse", "--short", "HEAD") or "?"
+                log.info("  watch ok %s repo=%s HEAD=%s", p.key, p.repo, head)
         self.sock = socket.create_connection((SERVER, PORT), timeout=30)
         # CAP LS first so registration waits for our negotiation; PASS before NICK/USER.
         self.send_raw("CAP LS 302")
@@ -598,22 +649,45 @@ class Bot:
                     self.poll_project(p)
 
     def poll_project(self, p: Project) -> None:
+        if not os.path.isdir(p.repo):
+            log.error("watch path missing for %s: %s", p.key, p.repo)
+            return
         cur = git(p, "rev-parse", "HEAD")
-        if not cur or cur == self.last_commit[p.key]:
+        if not cur:
+            log.warning("git HEAD empty for %s repo=%s", p.key, p.repo)
+            return
+        if cur == self.last_commit[p.key]:
             return
         # Announce EVERY new commit since the last poll (oldest-first), not just
         # the newest — a burst of commits is fully reported.
-        revs = git(p, "rev-list", "--reverse", f"{self.last_commit[p.key]}..{cur}").split()
+        prev = self.last_commit[p.key]
+        revs = git(p, "rev-list", "--reverse", f"{prev}..{cur}").split()
         if not revs:
             revs = [cur]  # history diverged (rebase/reset): show the tip
         self.last_commit[p.key] = cur
         tc = test_count(p)
         shown = revs[-5:]  # cap the burst; summarize the rest
         if len(revs) > len(shown):
-            self.msg(CHANNEL, f"{GREY}[{p.key}] … +{len(revs) - len(shown)} earlier commit(s){RST}")
+            self.channel_notice(
+                f"[{p.key}] … +{len(revs) - len(shown)} earlier commit(s) in {p.repo}"
+            )
         for i, rev in enumerate(shown):
-            log.info("announcing %s commit %s", p.key, rev[:12])
+            short = rev[:12] if len(rev) >= 12 else rev
+            log.info(
+                "announcing %s commit %s repo=%s (was %s)",
+                p.key,
+                short,
+                p.repo,
+                (prev[:12] if prev else "?"),
+            )
+            # 1) Plain ASCII line first — always visible in clients that strip mIRC
+            #    colors, and sent immediately (not paced queue) so flood/TOPIC
+            #    ordering cannot strand the announce.
+            plain = self.plain_commit_line(p, rev)
+            self.channel_say(plain, immediate=True)
+            # 2) Optional colored detail (queued, best-effort).
             self.announce(self.commit_lines(p, rev, tc, with_delta=(i == len(shown) - 1)))
+        # One topic refresh after the whole project poll, not mid-burst.
         self.set_topic()
 
     def tests_delta(self, p: Project, tc: str) -> str:
