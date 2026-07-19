@@ -249,6 +249,31 @@ closes every inherited listener and rebuilds the complete shard set safely.
 | status feed | configured `[stats].channel_dir` `status.json` | current node and peer health |
 | Prometheus | configured `[metrics].listen` `/metrics` | Prometheus text body |
 
+### Certificate session-resume acceptance
+
+For a release that changes reusable sessions, keep two controlled clients open at
+the same time: one through each secured mesh node. Both must present the same
+configured client certificate and complete SASL EXTERNAL as the same account and
+requested nick. Do not put a session token in either registration flow.
+
+Require all of the following before declaring the mesh healthy:
+
+1. both clients receive SASL numerics `900` and `903`, then `001` under the same
+   nick and account;
+2. the server reports certificate-authenticated session restoration rather than
+   creating a guest or collision nick;
+3. each client can author one channel message and one direct message;
+4. every marker arrives exactly once on both clients, with identical `time` and
+   `msgid` tags on the two transports; and
+5. attaching the second client does not emit `MODE #channel +Y nick`. A cold
+   process may publish one genuine first grant transition while reconstructing
+   state, but later attachments and unchanged grant refreshes must stay silent.
+
+Also test the actual saved client profile, not only an ad-hoc TLS probe. WeeChat
+can contain similarly named profiles such as `ircx` and `ircx.us`; inspect each
+profile that users invoke and require `tls_cert`, `sasl_mechanism=external`, the
+intended account/nick, and reconnect policy to be set explicitly.
+
 `status.json` and channel stats are file outputs, not daemon-owned HTTP routes. Serve
 the configured stats directory with nginx or another static file server if needed.
 

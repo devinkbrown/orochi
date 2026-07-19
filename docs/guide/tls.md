@@ -87,6 +87,30 @@ shared nick, channels, member modes, and message routing without emitting anothe
 logical JOIN or derived operator-prefix grant. A configured client certificate alone
 is insufficient: the connection must complete SASL EXTERNAL successfully.
 
+For WeeChat, configure every server profile that can reach the node. Profile
+names are local identifiers: `ircx` and `ircx.us` are distinct profiles even when
+both resolve to the same host.
+
+```text
+/set irc.server.ircx.us.addresses ircx.us/6697
+/set irc.server.ircx.us.tls on
+/set irc.server.ircx.us.tls_cert /path/to/client-cert-and-key.pem
+/set irc.server.ircx.us.tls_verify on
+/set irc.server.ircx.us.sasl_mechanism external
+/set irc.server.ircx.us.sasl_username kain
+/set irc.server.ircx.us.nicks kain
+/set irc.server.ircx.us.username kain
+/set irc.server.ircx.us.autoconnect on
+/set irc.server.ircx.us.autoreconnect on
+/save
+```
+
+On reconnect, WeeChat should log that it sent one client certificate, then show
+SASL `900`/`903`, account `kain`, and `SESSION RESUME: certificate-authenticated
+session restored` (or `mesh session restored` when the authoritative session was
+reopened from the peer). Do not copy the issued session token into client config;
+the EXTERNAL path deliberately proves possession again on each transport.
+
 ## Protocol capabilities
 
 Onyx Server ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.

@@ -10,6 +10,35 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.5.6 (2026-07-19)
+
+Certificate-authenticated IRC clients can now resume one logical session across
+the secured mesh without knowing or replaying a session token.
+
+- **SASL EXTERNAL can attach a legacy client to its existing session.** After
+  possession of the configured client certificate is verified, an exact
+  account-and-requested-nick match resumes the one unambiguous session. Multiple
+  candidate tokens, account/nick disagreement, non-EXTERNAL SASL, and missing
+  mesh authority all fail closed. WeeChat therefore keeps the nick `kain` and
+  restores its channels when connecting through either live node.
+- **Every physical attachment remains independently live.** Attachments on both
+  nodes share the logical channel/member state while keeping separate sockets.
+  Channel messages and direct messages authored on either node are accepted
+  once and delivered once to every attachment with byte-identical `time` and
+  `msgid` tags.
+- **Operator-prefix routing follows authenticated account to display nick.**
+  Account-wide grant transitions update every local reactor and only
+  residence-verified remote projections. Identical grant refreshes are silent,
+  privilege narrowing emits one `-Y`, re-adding override emits one `+Y`, and a
+  tombstone de-elevates every attachment. Account literals are never substituted
+  for an unresolved display nick.
+- **Release tooling and frozen vectors were repaired.** Agent/reviewer filenames
+  now match their declared Onyx Server roles, toolkit validation is clean, and
+  canonical rename-era fixtures remain explicit where the wire format is frozen.
+
+Live release evidence and rollback identifiers are recorded in
+[`docs/ops/deploy-v0.5.6-cert-session-resume.md`](docs/ops/deploy-v0.5.6-cert-session-resume.md).
+
 ## 0.5.5 (2026-07-18)
 
 Two more Helix-upgrade re-announce artifacts fixed after a full audit of every
