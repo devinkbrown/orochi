@@ -104,18 +104,18 @@ jobs:
         run: zig build release -Dtarget=x86_64-linux-musl
       - name: Verify artifact
         run: |
-          file zig-out/bin/orochi
-          test -x zig-out/bin/orochi
+          file zig-out/bin/onyx-server
+          test -x zig-out/bin/onyx-server
           # The daemon core embeds @tagName(builtin.mode) for its VERSION line —
           # exactly one mode string ends up in the binary. Assert the core is
           # really ReleaseFast: a mis-wired build graph once shipped a "release"
           # shim wrapping a Debug core, and this catches that structurally.
-          grep -aq ReleaseFast zig-out/bin/orochi
-          ! grep -aq Debug zig-out/bin/orochi
+          grep -aq ReleaseFast zig-out/bin/onyx-server
+          ! grep -aq Debug zig-out/bin/onyx-server
       - name: Upload daemon binary
         uses: actions/upload-artifact@v4
         with:
-          name: orochi-x86_64-linux-musl
-          path: zig-out/bin/orochi
+          name: onyx-server-x86_64-linux-musl
+          path: zig-out/bin/onyx-server
           if-no-files-found: error
           retention-days: 14
