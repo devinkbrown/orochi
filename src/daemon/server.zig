@@ -68320,7 +68320,7 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
 }
 
 test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORARILY_UNAVAILABLE" {
-    // Unlike ADS1 soft-fail, a full RVL2 event log aborts durable admit. The
+    // Unlike ADS1 soft-fail, a full RVO2 outbox aborts durable admit. The
     // fail-closed contract: no local delivery, PRIVMSG gets TEMPORARILY_UNAVAILABLE.
     // NOTICE stays silent and also does not deliver.
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
