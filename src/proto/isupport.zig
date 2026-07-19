@@ -262,7 +262,7 @@ pub const default_tokens = [_]Token{
     .{ .name = "TOPICLEN", .value = "512" },
     .{ .name = "AWAYLEN", .value = "390" },
     .{ .name = "CASEMAPPING", .value = "ascii" },
-    .{ .name = "NETWORK", .value = "Orochi" },
+    .{ .name = "NETWORK", .value = "Onyx" },
     .{ .name = "ELIST", .value = "CMNTU" },
     .{ .name = "MONITOR", .value = "512" },
     .{ .name = "CHATHISTORY", .value = "1000" },

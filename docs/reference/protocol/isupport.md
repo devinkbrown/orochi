@@ -1,6 +1,6 @@
-# Orochi ISUPPORT (005)
+# Onyx Server ISUPPORT (005)
 
-*The `RPL_ISUPPORT` tokens Orochi advertises, their defaults, and their configuration override paths.*
+*The `RPL_ISUPPORT` tokens Onyx Server advertises, their defaults, and their configuration override paths.*
 
 `src/proto/protocol_inventory.zig` is the source of truth for static `RPL_ISUPPORT` tokens (`src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40`). At boot, `main.zig` installs the configured network name, builds config-driven ISUPPORT tokens, and stores runtime limits before serving clients (`src/main.zig:129`, `src/main.zig:134`, `src/main.zig:139`).
 
@@ -25,7 +25,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 | `MONITOR` | `128` | Maximum MONITOR targets. | Config-overridable via `[limits]`; a nonzero `[class.*] monitor` overrides the add cap for matching connections, allowing class-specific tightening. MONITOR handler maps list-full to `ERR_MONLISTFULL`. | `src/proto/protocol_inventory.zig:73`, `src/daemon/server.zig:1121`, `src/daemon/server.zig:10206`, `src/daemon/server.zig:10208` |
 | `SILENCE` | `32` | Maximum SILENCE masks. | Config-overridable via `[limits]`; a nonzero `[class.*] silence` overrides the owner cap for matching connections, allowing class-specific tightening. SILENCE query emits 271/272. | `src/proto/protocol_inventory.zig:74`, `src/daemon/server.zig:1123`, `src/daemon/server.zig:10461`, `src/daemon/server.zig:10463` |
 | `CASEMAPPING` | `ascii` | Case-folding policy for identifiers. | World maps use ASCII case-insensitive contexts for nicks/channels. | `src/proto/protocol_inventory.zig:55`, `src/daemon/world.zig:75` |
-| `PREFIX` | `(YQqov)*!.@+` | Member status modes and their prefix characters. | Network-operator `Y`/`*` is derived from oper override privilege and ranks above founder; founder `Q`/`!` is Orochi-native and ranks above owner. | `src/proto/protocol_inventory.zig:56`, `src/daemon/chanmode.zig:244`, `src/daemon/chanmode.zig:344` |
+| `PREFIX` | `(YQqov)*!.@+` | Member status modes and their prefix characters. | Network-operator `Y`/`*` is derived from oper override privilege and ranks above founder; founder `Q`/`!` is Onyx Server-native and ranks above owner. | `src/proto/protocol_inventory.zig:56`, `src/daemon/chanmode.zig:244`, `src/daemon/chanmode.zig:344` |
 | `CHANMODES` | `beIZ,k,lfj,imnstCTNMSgWOAVUFD` | Four channel-mode classes: list, param-always, param-on-set, flag. | Static token from `chanmodes_token`. `W` (NOWHISPER), `O` (oper-only), `A` (admin-only), `V` (NOCOMICDATA), `U` (OPMODERATE), `F` (FREETARGET), and `D` (DISFORWARD) are live flag modes; see `modes.md`. | `src/proto/protocol_inventory.zig` (`chanmodes_token`) |
 | `STATUSMSG` | `!.@+` | Allowed status-target prefixes for channel messages. | Server maps `!`, `.`, `@`, `+` to minimum delivery ranks. | `src/proto/protocol_inventory.zig:58`, `src/daemon/server.zig:10946`, `src/daemon/server.zig:11031` |
 | `BOT` | `B` | Bot user mode letter. | Mirrors user mode `+B` and IRCv3 bot support. | `src/proto/protocol_inventory.zig:59`, `src/proto/usermode.zig:141` |

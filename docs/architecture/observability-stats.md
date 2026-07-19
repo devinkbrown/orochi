@@ -1,8 +1,8 @@
-# Orochi observability: channel stats and status feed
+# Onyx Server observability: channel stats and status feed
 
 *The per-channel statistics engine, public status feed, and IRC-visible stats surfaces as implemented in the current source tree.*
 
-Orochi ships a native, in-process chanstats engine that aggregates live channel activity into per-channel counters and emits self-describing JSON for a static dashboard, plus a separate `status.json` public health feed. Both are pure data producers: no sockets, no SQLite. The daemon feeds the aggregate from its history chokepoints and flushes on a throttled cadence into a directory nginx serves at `/stats/data/`. The engine lives in [src/daemon/chanstats.zig](../../src/daemon/chanstats.zig); the daemon wiring, IRC `STATS`/`INFO` handlers, and `status.json` feed live in [src/daemon/server.zig](../../src/daemon/server.zig).
+Onyx Server ships a native, in-process chanstats engine that aggregates live channel activity into per-channel counters and emits self-describing JSON for a static dashboard, plus a separate `status.json` public health feed. Both are pure data producers: no sockets, no SQLite. The daemon feeds the aggregate from its history chokepoints and flushes on a throttled cadence into a directory nginx serves at `/stats/data/`. The engine lives in [src/daemon/chanstats.zig](../../src/daemon/chanstats.zig); the daemon wiring, IRC `STATS`/`INFO` handlers, and `status.json` feed live in [src/daemon/server.zig](../../src/daemon/server.zig).
 
 ## Per-channel statistics engine
 
@@ -113,7 +113,7 @@ The same chanstats flush also emits `status.json` beside the channel stats ([src
   "generated_at": 1700000000,
   "network": "Onyx",
   "node": "eshmaki.me",
-  "description": "Orochi flagship node",
+  "description": "Onyx Server flagship node",
   "icon_url": "https://example.test/orochi.png",
   "discoverable": true,
   "uptime_seconds": 86400,
@@ -130,7 +130,7 @@ The same chanstats flush also emits `status.json` beside the channel stats ([src
     "rank_score": 2678,
     "last_active": 1700000000,
     "entry": {"network": "Onyx", "node": "eshmaki.me",
-              "description": "Orochi flagship node", "users_online": 214,
+              "description": "Onyx Server flagship node", "users_online": 214,
               "channels": 12, "messages": 2048, "active_channels_24h": 5}
   },
   "features": {

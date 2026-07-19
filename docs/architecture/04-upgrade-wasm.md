@@ -49,7 +49,7 @@ a successor that cannot preserve this authority.
 
 ## Successor adoption
 
-The successor path is driven by `orochi --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, preserves those handoff-only config fields when loading the real config file, loads OroWasm plugins, then calls `srv.adoptInheritedSessions()` after the server and ring exist. Evidence: `src/main.zig:140`, `src/main.zig:146`, `src/main.zig:147`, `src/main.zig:150`, `src/main.zig:157`, `src/main.zig:257`, `src/main.zig:260`, `src/main.zig:264`, `src/main.zig:895`, `src/main.zig:900`.
+The successor path is driven by `onyx-server --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, preserves those handoff-only config fields when loading the real config file, loads OroWasm plugins, then calls `srv.adoptInheritedSessions()` after the server and ring exist. Evidence: `src/main.zig:140`, `src/main.zig:146`, `src/main.zig:147`, `src/main.zig:150`, `src/main.zig:157`, `src/main.zig:257`, `src/main.zig:260`, `src/main.zig:264`, `src/main.zig:895`, `src/main.zig:900`.
 
 | Adoption stage | Behavior | Evidence |
 | --- | --- | --- |

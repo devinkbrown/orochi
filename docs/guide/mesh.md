@@ -2,7 +2,7 @@
 
 *Configure server-to-server linking over the [Undertow](../reference/glossary.md) mesh, including secured and plaintext links and operator inspection views.*
 
-Orochi server-to-server (S2S) linking runs on the [Undertow](../reference/glossary.md) mesh runtime. Configure node identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
+Onyx Server's server-to-server (S2S) linking runs on the [Undertow](../reference/glossary.md) mesh runtime. Configure node identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
 
 ```toml
 [node]
@@ -72,7 +72,7 @@ the latter is the local node's direct-neighbor allowlist and, under a staged
 plan, its MESSAGE_V2 **custody membership** — the confirmed-node set each durable
 RVL2 accepted-event row collects ACKs from before it retires its retained wire
 (`src/daemon/config_format.zig:1855`, `src/daemon/relay_v2_event_log.zig:25`). It
-is also distinct from `admission_roots` (MeshPass signer roots). Orochi canonicalizes
+is also distinct from `admission_roots` (MeshPass signer roots). Onyx Server canonicalizes
 the full public keys into a roster digest and carries `{mode, epoch, digest}` in
 the mandatory MHLC v3 Helix checkpoint. Current handoff rejects an unstaged
 activation, a roster mismatch, active-to-compat downgrade, malformed state, or

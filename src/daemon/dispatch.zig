@@ -33,7 +33,7 @@ pub const DispatchError = error{
 
 const SERVER_NAME = "orochi.local";
 const NETWORK_NAME = protocol_inventory.network_name;
-const SERVER_VERSION = "orochi-" ++ @import("build_info").version;
+const SERVER_VERSION = "onyx-server-" ++ @import("build_info").version;
 const DEFAULT_HOST = "localhost";
 const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;
@@ -2104,7 +2104,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
         &welcome_buf,
         "Welcome to the {s} network, {s} - you are {s}",
         .{ replies.network_name, nick, mask },
-    ) catch "Welcome to Orochi";
+    ) catch "Welcome to Onyx Server";
     try replies.numeric(session, .RPL_WELCOME, &.{}, welcome_line);
 
     var host_buf: [256]u8 = undefined;

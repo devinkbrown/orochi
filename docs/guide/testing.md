@@ -1,6 +1,6 @@
 # Testing guide
 
-Orochi's test suite is large, so the build graph exposes several lanes. Use the
+Onyx Server's test suite is large, so the build graph exposes several lanes. Use the
 smallest lane that proves the change, then run a broader gate before pushing.
 
 ## Fast lanes
@@ -57,8 +57,8 @@ These helpers run a real daemon binary, not only `test` blocks:
 
 | Command | Use it for |
 |---|---|
-| `python3 tools/runtime_smoke.py zig-out/bin/orochi` | Cold-boot a loopback daemon, register a client, verify PING/PONG, and shut down cleanly. |
-| `python3 tools/upgrade_smoke.py zig-out/bin/orochi` | Exercise Helix/SIGUSR2 hot-upgrade, inherited listener adoption, carried connection survival, WHOIS, NAMES, and post-upgrade registration. |
+| `python3 tools/runtime_smoke.py zig-out/bin/onyx-server` | Cold-boot a loopback daemon, register a client, verify PING/PONG, and shut down cleanly. |
+| `python3 tools/upgrade_smoke.py zig-out/bin/onyx-server` | Exercise Helix/SIGUSR2 hot-upgrade, inherited listener adoption, carried connection survival, WHOIS, NAMES, and post-upgrade registration. |
 
 Run them after `zig build` or against a staged release binary when validating an
 operator-facing change.
@@ -79,12 +79,12 @@ For deploy or Helix work, add:
 
 ```sh
 zig build
-python3 tools/runtime_smoke.py zig-out/bin/orochi
-python3 tools/upgrade_smoke.py zig-out/bin/orochi
+python3 tools/runtime_smoke.py zig-out/bin/onyx-server
+python3 tools/upgrade_smoke.py zig-out/bin/onyx-server
 ```
 
 When config files changed, also run:
 
 ```sh
-zig build run -- --check-config etc/orochi.reference.toml
+zig build run -- --check-config etc/onyx-server.reference.toml
 ```

@@ -1,8 +1,8 @@
 # Build guide
 
-*Build, test, and cross-compile the Orochi daemon with Zig.*
+*Build, test, and cross-compile the Onyx Server daemon with Zig.*
 
-Orochi builds with Zig's build system and has no package dependencies in
+Onyx Server builds with Zig's build system and has no package dependencies in
 `build.zig.zon`. Linux builds do not link libc; macOS and BSD targets link libc
 only for the platform syscalls that require it.
 
@@ -15,7 +15,7 @@ only for the platform syscalls that require it.
 
 | Command | What it does | Source |
 |---|---|---|
-| `zig build` | Builds and installs `zig-out/bin/orochi` and the `armor` crypto CLI (`zig-out/bin/armor`). | `build.zig` |
+| `zig build` | Builds and installs `zig-out/bin/onyx-server` and the `armor` crypto CLI (`zig-out/bin/armor`). | `build.zig` |
 | `zig build run -- <config.toml>` | Builds, installs, then runs the daemon with forwarded args. | `build.zig` |
 | `zig build test` | Runs module tests and executable-root tests. | `build.zig` |
 | `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig` |
@@ -81,8 +81,8 @@ The staged layout is:
 
 | Path | Contents |
 |---|---|
-| `bin/orochi` | ReleaseFast stripped daemon |
+| `bin/onyx-server` | ReleaseFast stripped daemon |
 | `etc/orochi/orochi.reference.toml` | Annotated reference config |
-| `lib/systemd/system/orochi.service` | systemd unit for production deployment |
+| `lib/systemd/system/onyx-server.service` | systemd unit for production deployment |
 
 See the [runbook](../RUNBOOK.md) for install, reload, and rollback procedures.

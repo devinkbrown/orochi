@@ -388,7 +388,7 @@ test "renderJson emits well-formed, escaped JSON" {
     const snap = Snapshot{
         .server_name = "suzu.example",
         .network = "Orochi",
-        .version = "orochi-0.1",
+        .version = "onyx-server-0.1",
         .generated_unix = 1700000000,
         .uptime_secs = 3661,
         .clients = 42,

@@ -1,8 +1,8 @@
 # Accounts and services commands
 
-*Account, service, and persona commands exposed as real server commands — Orochi has no pseudo-clients.*
+*Account, service, and persona commands exposed as real server commands — Onyx Server has no pseudo-clients.*
 
-The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:125`, `src/daemon/modules/accounts.zig:155`), with additional commands from feature and service modules. Orochi services are real server commands that reply through raw server lines and server notices; these handlers do not model pseudo-clients (`src/daemon/server.zig:22987`, `src/daemon/server.zig:23472`).
+The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:125`, `src/daemon/modules/accounts.zig:155`), with additional commands from feature and service modules. Onyx Server services are real server commands that reply through raw server lines and server notices; these handlers do not model pseudo-clients (`src/daemon/server.zig:22987`, `src/daemon/server.zig:23472`).
 
 ## REGISTER
 
@@ -249,7 +249,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## IDENTITY
 
 - Syntax: `IDENTITY [STATUS|LIST [account]|ADD <label> <ed25519-pubkey-hex> <signature-hex>|DEL <label>|VERIFY <account> <label> <ed25519-pubkey-hex> <signature-hex>]`
-- Description: Manages portable account identity keys. `ADD` requires the caller to be logged in and stores a public Ed25519 key only after verifying that the key signed Orochi's account-binding transcript for the logged-in account and label. Stored records are account-scoped user PROP metadata under `identity.key.<label>` with value `<pubkey-hex>:<signature-hex>`, so the assertion replicates over signed `ENTITY_PROP`. `VERIFY` checks a supplied assertion without mutating state.
+- Description: Manages portable account identity keys. `ADD` requires the caller to be logged in and stores a public Ed25519 key only after verifying that the key signed Onyx Server's account-binding transcript for the logged-in account and label. Stored records are account-scoped user PROP metadata under `identity.key.<label>` with value `<pubkey-hex>:<signature-hex>`, so the assertion replicates over signed `ENTITY_PROP`. `VERIFY` checks a supplied assertion without mutating state.
 - Privileges: Registered client; account login required for `STATUS`, `ADD`, `DEL`, and caller-default `LIST`.
 - Parameters: Optional subcommand; `ADD` takes a bounded label, 64-hex Ed25519 public key, and 128-hex Ed25519 signature.
 - Replies: Server notices: `IDENTITY STATUS account=<account> keys=<n>`, `IDENTITY KEY account=<account> label=<label> pub=<hex> sig=<hex>`, `IDENTITY END account=<account> keys=<n>`, `IDENTITY VERIFY ... result=<valid|invalid>`, `IDENTITY ADDED ...`, or `IDENTITY DELETED ...`.

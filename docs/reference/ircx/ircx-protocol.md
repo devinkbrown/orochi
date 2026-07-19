@@ -3,8 +3,8 @@
 _Opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration._
 
 > Historical reference only: this page describes a legacy C IRCX implementation
-> (`modules/m_ircx_*.c`). It is not the Orochi Zig implementation source of truth.
-> For Orochi, verify current behavior in `src/daemon/modules/ircx.zig`,
+> (`modules/m_ircx_*.c`). It is not the Onyx Server Zig implementation source of truth.
+> For Onyx Server, verify current behavior in `src/daemon/modules/ircx.zig`,
 > `src/daemon/server.zig`, and the relevant `src/proto/ircx_*.zig` files.
 
 ## Overview

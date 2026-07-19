@@ -1,8 +1,8 @@
-# Orochi architecture overview
+# Onyx Server architecture overview
 
 _System overview of the client-facing daemon, request flow, source map, and the architecture document index._
 
-Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.17.0-dev.1282+c0f9b51d8"` and lists an empty `.dependencies` table, so the current tree builds from checked-in Zig source. Evidence: `build.zig.zon:34`, `build.zig.zon:40`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, plus the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:20`, `src/root.zig:21`, `src/root.zig:22`, `src/root.zig:23`, `src/root.zig:29`, `src/root.zig:34`.
+Onyx Server is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.17.0-dev.1282+c0f9b51d8"` and lists an empty `.dependencies` table, so the current tree builds from checked-in Zig source. Evidence: `build.zig.zon:34`, `build.zig.zon:40`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, plus the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:20`, `src/root.zig:21`, `src/root.zig:22`, `src/root.zig:23`, `src/root.zig:29`, `src/root.zig:34`.
 
 This overview covers the client-facing daemon, local world, module dispatch, Ringlane reactor model, media, Helix upgrade, OroWasm, and source-tree orientation. Undertow mesh/S2S and cryptography are summarized here only at subsystem level; see [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md) for their deeper design.
 
@@ -10,7 +10,7 @@ This overview covers the client-facing daemon, local world, module dispatch, Rin
 
 | Area | Current source of truth | What it owns | Evidence |
 | --- | --- | --- | --- |
-| Build/package | `build.zig`, `build.zig.zon`, `etc/systemd/orochi.service` | Zig package metadata, `orochi` executable, focused test/run steps, ReleaseFast package staging, systemd unit, 64-bit daemon target guard | `build.zig`, `build.zig.zon`, `etc/systemd/orochi.service` |
+| Build/package | `build.zig`, `build.zig.zon`, `etc/systemd/onyx-server.service` | Zig package metadata, `onyx-server` executable, focused test/run steps, ReleaseFast package staging, systemd unit, 64-bit daemon target guard | `build.zig`, `build.zig.zon`, `etc/systemd/onyx-server.service` |
 | Daemon server | `src/daemon/server.zig` | Linux TCP server, connection table, registration integration, live stores, registry/WASM dispatch, media/upgrade wiring | `src/daemon/server.zig:2777`, `src/daemon/server.zig:30232` |
 | Ringlane I/O | `src/substrate/io/root.zig`, `src/substrate/io/ring.zig`, `src/substrate/io/buf_ring.zig`, `src/daemon/server.zig` | Linux io_uring fast path, completion decoding, provided-buffer bookkeeping, per-shard reactor rings | `src/substrate/io/root.zig:4`, `src/substrate/io/ring.zig:4`, `src/substrate/io/buf_ring.zig:4`, `src/daemon/server.zig:711` |
 | Connection classes | `src/daemon/conn_class.zig`, `src/daemon/server.zig` | Named per-connection policy: sendq/recvq ceilings, max_clients/per_ip/channels, timeouts, TLS/SASL requirements, flood control, nick-delay exemption; CIDR/TLS/account/oper/ident/host matching; per-class assignment at registration | `src/daemon/conn_class.zig:4`, `src/daemon/server.zig:9766` |

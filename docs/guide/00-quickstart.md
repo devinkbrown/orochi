@@ -1,8 +1,8 @@
 # Quickstart
 
-*Build Orochi, write a minimal config, and start the daemon.*
+*Build Onyx Server, write a minimal config, and start the daemon.*
 
-Orochi is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares
+Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares
 Zig `0.17.0-dev.1282+c0f9b51d8` as the minimum supported compiler, and the
 daemon build rejects 32-bit targets. The browser WASM artifacts are the only
 deliberate 32-bit exception.
@@ -15,7 +15,7 @@ From the repository root:
 zig build
 ```
 
-The default build installs the `orochi` executable under `zig-out/bin`.
+The default build installs the `onyx-server` executable under `zig-out/bin`.
 
 For a fast semantic check:
 
@@ -38,12 +38,12 @@ host = "127.0.0.1"
 irc = 6680
 ```
 
-Save this as a local TOML file, or start from the runnable reference at `etc/orochi.reference.toml`. The current source still requires `[listen].irc` even for TLS-first deployments.
+Save this as a local TOML file, or start from the runnable reference at `etc/onyx-server.reference.toml`. The current source still requires `[listen].irc` even for TLS-first deployments.
 
 Validate a config without binding ports or dialing mesh peers:
 
 ```sh
-zig build run -- --check-config etc/orochi.reference.toml
+zig build run -- --check-config etc/onyx-server.reference.toml
 ```
 
 ## First run
@@ -51,7 +51,7 @@ zig build run -- --check-config etc/orochi.reference.toml
 Run the daemon with an explicit config path:
 
 ```sh
-zig build run -- etc/orochi.reference.toml
+zig build run -- etc/onyx-server.reference.toml
 ```
 
 `src/main.zig` treats the first non-command argument as the config file path. It
@@ -67,7 +67,7 @@ starting the server loop.
 For an end-to-end local smoke after `zig build`:
 
 ```sh
-python3 tools/runtime_smoke.py zig-out/bin/orochi
+python3 tools/runtime_smoke.py zig-out/bin/onyx-server
 ```
 
 This boots a temporary loopback daemon, registers a client, verifies PING/PONG,

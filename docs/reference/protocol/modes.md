@@ -1,6 +1,6 @@
-# Orochi modes
+# Onyx Server modes
 
-*Current user, member-status, and channel modes Orochi recognizes, drawn from live source.*
+*Current user, member-status, and channel modes Onyx Server recognizes, drawn from live source.*
 
 This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD` (`src/proto/protocol_inventory.zig:58`, `src/proto/protocol_inventory.zig:59`). `PREFIX` is appended by the daemon from `chanmode.MemberModes.isupport_prefix`, whose current value is `PREFIX=(YQqov)*!.@+` (`src/daemon/server.zig:1309`, `src/daemon/server.zig:1311`, `src/daemon/chanmode.zig:399`, `src/daemon/chanmode.zig:405`). The advertised `CHANMODES` token is guarded by an honesty test that checks every advertised letter against the live mode handlers (`src/daemon/dispatch.zig:2777`, `src/daemon/dispatch.zig:2789`, `src/daemon/dispatch.zig:2820`).
 
@@ -28,7 +28,7 @@ This page documents current source only. The advertised channel-mode token is `C
 | `a` | admin | server-managed | Server on operator elevation with `server_admin`. | Tracks network-administrator privilege; cleared when oper status is cleared. | `src/proto/usermode.zig:162`, `src/daemon/dispatch.zig:980`, `src/daemon/dispatch.zig:1001`, `src/daemon/dispatch.zig:1022` |
 | `j` | override | client-writable, privilege-gated | Operator holding `oper_override`; optional auto-enable at elevation. | Enables audited channel override behavior. | `src/proto/usermode.zig:163`, `src/daemon/server.zig:12503`, `src/daemon/server.zig:22606`, `src/daemon/server.zig:27318` |
 
-Orochi divergence: legacy wallops and snomask do not use user `+w`. Operator notifications ride the Event Spine as raw `EVENT` lines, replacing legacy snote/wallops broadcast channels (`src/daemon/dispatch.zig:910`).
+Onyx Server divergence: legacy wallops and snomask do not use user `+w`. Operator notifications ride the Event Spine as raw `EVENT` lines, replacing legacy snote/wallops broadcast channels (`src/daemon/dispatch.zig:910`).
 
 ## Member status modes and prefixes
 

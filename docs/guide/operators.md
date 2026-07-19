@@ -2,7 +2,7 @@
 
 *Configure operator privileges, connection classes, flood control, and network-wide event subscriptions.*
 
-Orochi operators are SASL-only. `OPER` never accepts a password; it returns an error instructing the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
+Onyx Server operators are SASL-only. `OPER` never accepts a password; it returns an error instructing the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
 
 ## Connection classes
 

@@ -7,7 +7,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 ## OPER
 
 - Syntax: `OPER <ignored...>`
-- Description: Password `OPER` is disabled. Orochi grants operator status only from authenticated accounts with configured oper bindings via `elevateOperFromAccount`.
+- Description: Password `OPER` is disabled. Onyx Server grants operator status only from authenticated accounts with configured oper bindings via `elevateOperFromAccount`.
 - Privileges: Registered client; never grants by command password.
 - Parameters: Ignored by handler.
 - Replies: None on success because the command always fails.

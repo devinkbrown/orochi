@@ -1,4 +1,4 @@
-# Orochi — minimal, reproducible container image.
+# Onyx Server — minimal, reproducible container image.
 #
 # The daemon is a single static x86_64-linux-musl binary with ZERO external
 # dependencies, so the runtime image is just the binary + a quickstart config.
@@ -6,8 +6,8 @@
 # and confirm it byte-for-byte with `packaging/verify-release.sh`.
 #
 #   1. Build the verified artifact:   packaging/release.sh
-#   2. Build the image:               docker build -f packaging/Dockerfile -t orochi:latest .
-#   3. Run it:                        docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest
+#   2. Build the image:               docker build -f packaging/Dockerfile -t onyx-server:latest .
+#   3. Run it:                        docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 #
 # The node's sovereign identity key + account store live in /data — mount a
 # volume to persist them across restarts. Point the Onyx web client at
@@ -18,19 +18,19 @@
 # reproducible binary the release script already produces + verifies.)
 FROM alpine:3.20
 
-RUN adduser -D -u 10001 orochi \
+RUN adduser -D -u 10001 onyx-server \
     && mkdir -p /data \
-    && chown orochi:orochi /data
+    && chown onyx-server:onyx-server /data
 
 # The reproducible artifact produced by packaging/release.sh.
-COPY dist/orochi-*-x86_64-linux-musl /usr/local/bin/orochi
-COPY packaging/orochi.quickstart.toml /etc/orochi/orochi.toml
+COPY dist/onyx-server-*-x86_64-linux-musl /usr/local/bin/onyx-server
+COPY packaging/onyx-server.quickstart.toml /etc/onyx-server/onyx-server.toml
 
-USER orochi
+USER onyx-server
 WORKDIR /data
 
 # 6667 = plaintext IRC · 8080 = browser WebSocket (Onyx). Add TLS (6697/wss) via
 # a production config with real certs.
 EXPOSE 6667 8080
 
-ENTRYPOINT ["/usr/local/bin/orochi", "/etc/orochi/orochi.toml"]
+ENTRYPOINT ["/usr/local/bin/onyx-server", "/etc/onyx-server/onyx-server.toml"]

@@ -1,8 +1,8 @@
-# Orochi documentation
+# Onyx Server documentation
 
-*The complete guide, architecture, and reference for the Orochi IRC daemon — grounded in, and cited against, the live source.*
+*The complete guide, architecture, and reference for the Onyx Server IRC daemon — grounded in, and cited against, the live source.*
 
-Orochi is a pure-Zig (0.17-dev) clean-room IRC daemon, built from first principles — not a
+Onyx Server is a pure-Zig (0.17-dev) clean-room IRC daemon, built from first principles — not a
 clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT mesh with
 forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
 (CadenceVox/CadenceVis), and in-place upgrade (Helix).
@@ -95,7 +95,7 @@ authoritative.
 ## Configuration
 
 - [Config reference](reference/config.md) — every section and key, including `[limits].nick_delay` and `[class.*]`, cited to `src/daemon/config_format.zig`
-- [`etc/orochi.reference.toml`](../etc/orochi.reference.toml) — runnable, annotated example
+- [`etc/onyx-server.reference.toml`](../etc/onyx-server.reference.toml) — runnable, annotated example
 
 ## Project
 

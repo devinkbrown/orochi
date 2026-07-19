@@ -2,7 +2,7 @@
 
 Status: **implemented in the working tree** · Updated: 2026-07-15
 
-This document is the lifecycle and security contract for Orochi session resume. A
+This document is the lifecycle and security contract for Onyx Server session resume. A
 session credential identifies one reusable logical session. It is not a lease on a
 single socket and it does not transfer ownership from one client or node to another.
 
@@ -60,7 +60,7 @@ later RESUME restores or joins the same logical session
 ```
 
 For a detached local ghost, restore binds the new client to the token before removing
-the ghost. For a live sibling, Orochi snapshots the current state, attaches the new
+the ghost. For a live sibling, Onyx Server snapshots the current state, attaches the new
 client to the same token group, and leaves the source client untouched. For a staged
 mesh replica, restore borrows the signed snapshot; it does not remove it, so other
 clients can attach with the same valid MTOKEN.
@@ -95,7 +95,7 @@ Retryable outcomes use `WARN SESSION` and preserve the credential:
 - snapshot, registry, or restore work could not complete: `TEMPORARILY_UNAVAILABLE`
 
 Onyx normally sends `SESSION RESUME <stored>` followed immediately by `SESSION TOKEN`.
-After a retryable result or redirect, Orochi suppresses that next token response once
+After a retryable result or redirect, Onyx Server suppresses that next token response once
 and emits `RESUME_CREDENTIAL_PRESERVED`. This prevents the reconnecting client from
 overwriting a still-valid credential. A second explicit `SESSION TOKEN` deliberately
 requests the credential for the current attachment. Successful attachment clears the

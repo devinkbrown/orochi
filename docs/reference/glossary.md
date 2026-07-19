@@ -1,7 +1,8 @@
 # Glossary & brand names
 
 *Audience: all readers. The one authoritative key to the naming — the branded
-house (Onyx / Orochi / IRCXNet) and the Orochi mythos vocabulary. Each invented
+house (Onyx network / Onyx Server engine / retired IRCXNet) and the engine's
+mythos-derived subsystem vocabulary. Each invented
 codename says what it actually is and where it lives in the source. Every
 codename entry is cited to `src/`; the daemon's own `/INFO` body renders the
 same subsystem summary (`src/proto/server_about.zig:63`). The site, the Onyx
@@ -16,9 +17,9 @@ use "IRCXNet" as a public product or network identity in new copy.
 | Name | What it is | Use it for |
 | --- | --- | --- |
 | **Onyx** | The consumer-facing **network and product** — the thing people join. It is the browser client (`/home/kain/onyx`, SolidJS) *and* the community/network that client connects to. | "Join **Onyx**." The network name, the web app, the brand a user sees. |
-| **Orochi** | The **engine**: the pure-Zig, clean-room daemon you self-host (`/home/kain/orochi`), the `orochi/*` protocol/config namespace, and the internal subsystem codenames below (Undertow, Ripple, Mooring, Armor, Helix …). | "Run your own **Orochi** node." The daemon, the wire/config surface, the codebase. |
+| **Onyx Server** (formerly **Orochi**) | The **engine**: the pure-Zig, clean-room daemon you self-host (`/home/kain/onyx-server`, binary `onyx-server`) and the internal subsystem codenames below (Undertow, Ripple, Mooring, Armor, Helix …). The `orochi/*` protocol/config namespace and `orochi.local`/`orochi-node.key`-style tokens survive as **legacy wire/config literals** where the code still emits them (like IRCXNet), not as the product name. | "Run your own **Onyx Server** node." The daemon, the wire/config surface, the codebase. |
 | **IRCXNet** | **Retired** as a public identity. Survives **only** as a legacy/wire token where it is a literal value, not a brand — e.g. the `[cloak] suffix` tail (`kain.users.ircxnet`) and existing server/host slugs. | Never in new user-facing copy. Leave in place only as a wire/legacy literal. |
-| **IRCX** | The **protocol** (extended IRC: `PROP`/`ACCESS`/`EVENT`/`AUTH`). Unrelated to the retired "IRCXNet" name — do not conflate. | The wire protocol Orochi speaks. |
+| **IRCX** | The **protocol** (extended IRC: `PROP`/`ACCESS`/`EVENT`/`AUTH`). Unrelated to the retired "IRCXNet" name — do not conflate. | The wire protocol Onyx Server speaks. |
 | **Ink & Vermillion** | The **visual identity** — the palette/typography direction of the Onyx surfaces. | The look-and-feel, not the product name. |
 
 The **network name is operator-configured**, not hard-coded to any brand: `[network]
@@ -35,7 +36,7 @@ name via `[network] name`.
 
 ## Subsystems
 
-Orochi gives its major subsystems evocative codenames rather than generic
+Onyx Server gives its major subsystems evocative codenames rather than generic
 acronyms. Several started as Japanese mythos/terms and are now rendered in
 English, with the original term kept in parentheses as etymology. First use of a
 codename in the guides and architecture docs links here.
@@ -51,7 +52,7 @@ codename in the guides and architecture docs links here.
 | **Ringlane** | The reactor seam: all time and I/O flow through `Reactor`, so the daemon runs unchanged against either the real io_uring/system backend or the deterministic simulator (Deterministic Ocean). | `src/substrate/reactor.zig:4` |
 | **Helix** | The in-place `USR2` hot-upgrade: a replacement image is `execve`'d and adopts the running listener, live sessions, and the converged mesh view (each link's remote-member roster + the cross-mesh oper-grant registry) through typed migration capsules, with no connection-refused window. These capsules ride in memory across `execve`, so the carried mesh state survives a hot-upgrade but not a cold restart. | `src/daemon/helix/live.zig:4`, `src/substrate/upgrade_capsule.zig:4` |
 | **Koshi** | The operator-curated content filter: a small set of oper-curated patterns matched against outbound `PRIVMSG`/`NOTICE` bodies, where a hit blocks the message. | `src/daemon/content_filter.zig:4` |
-| **Tegami** (手紙) | Orochi-native offline messaging keyed by account: a direct message left for an account with no attached session is stored and delivered when that account next logs in (with an optional Web Push nudge). | `src/daemon/tegami.zig:4`, `src/proto/tegami_push_relay.zig:5` |
+| **Tegami** (手紙) | Onyx Server-native offline messaging keyed by account: a direct message left for an account with no attached session is stored and delivered when that account next logs in (with an optional Web Push nudge). | `src/daemon/tegami.zig:4`, `src/proto/tegami_push_relay.zig:5` |
 
 ## Media codecs
 
@@ -69,7 +70,7 @@ the TLS, cloak, and account docs.
 | --- | --- | --- |
 | **argon2id** | Memory-hard KDF (Password Hashing Competition winner). Used for account-password storage (PHC strings) and to stretch the `[cloak] secret` into the cloak key with a fixed domain-separation salt — so a low-entropy operator passphrase is not offline-brute-forceable against the enumerable IPv4 space. | `src/crypto/argon2_kdf.zig:130` (`deriveKey`), `src/crypto/argon2_kdf.zig:117` (`cloak_key_salt`) |
 | **Epoch cloak** | The auth-split anonymous cloak: an unauthenticated client's IP is cloaked with an opaque 64-bit token that folds in a wall-clock epoch (`floor(now/anon_epoch_secs)`), so the same address is unlinkable across epochs and leaks no subnet co-membership. See [host cloaking](host-cloaking.md#anonymous-auth-split-cloak-epoch-rotating). | `src/proto/cloak.zig:187` (`cloakOpaqueEpoch`), `src/daemon/server.zig:5981` (`anonCloakEpoch`) |
-| **EMS** (Extended Master Secret, RFC 7627) | TLS-1.2 master-secret derivation bound to the full handshake transcript, closing the triple-handshake class of attacks. Orochi's hardened TLS 1.2 profile **refuses a non-EMS handshake**. | `src/crypto/tls12.zig:302` (`deriveExtendedMasterSecret`), `src/crypto/tls_server.zig:343` |
+| **EMS** (Extended Master Secret, RFC 7627) | TLS-1.2 master-secret derivation bound to the full handshake transcript, closing the triple-handshake class of attacks. Onyx Server's hardened TLS 1.2 profile **refuses a non-EMS handshake**. | `src/crypto/tls12.zig:302` (`deriveExtendedMasterSecret`), `src/crypto/tls_server.zig:343` |
 | **0-RTT freshness window** | The RFC 8446 §8.2–8.3 anti-replay bound on TLS 1.3 early data. v3 session tickets seal the `ticket_age_add`, so any node holding the ticket key can un-obfuscate the client's reported `obfuscated_ticket_age` and enforce the window; legacy v1/v2 tickets degrade to no window check (never a failure). | `src/crypto/tls_resumption.zig:27`, `src/crypto/tls_resumption.zig:386` |
 
 ## See also

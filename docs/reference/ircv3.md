@@ -1,6 +1,6 @@
 # IRCv3 spec coverage
 
-*The full IRCv3 extension catalog mapped to Orochi modules and implementation status.*
+*The full IRCv3 extension catalog mapped to Onyx Server modules and implementation status.*
 
 Extensions are drawn from the IRCv3 specifications repository (`github.com/ircv3/ircv3-specifications`).
 Always implement to the actual spec text; this table is the work map, not the spec.
@@ -14,7 +14,7 @@ Status legend:
 | TODO | Planned, not yet started. |
 | Removed | Intentionally excluded (clean-room, no legacy). |
 
-| IRCv3 extension | Orochi | Status |
+| IRCv3 extension | Onyx Server | Status |
 |---|---|---|
 | capability-negotiation | `proto/cap.zig` | Implemented |
 | message-tags | `proto/irc_line.zig` (parse) + `proto/msgtags.zig` (emit) | Implemented |
@@ -61,6 +61,6 @@ Status legend:
 | webirc | — | Removed (clean-room: WebSocket only) |
 | deprecated: tls (STARTTLS), sasl-dh-* | — | Removed (TLS-native / modern SASL) |
 
-Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Orochi exposes one
+Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Onyx Server exposes one
 unified property system (lean IRCX `PROP` with a metadata-compatible view). `oper-tag` integrates with
 the SASL-only oper system. `labeled-response` rides the `batch` machinery.

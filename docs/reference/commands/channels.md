@@ -90,7 +90,7 @@ The channel command module registers the base membership and moderation commands
 - Parameters: Channel; optional topic.
 - Replies: `RPL_TOPIC 332`, `RPL_NOTOPIC 331`, or `TOPIC` broadcast.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`.
-- Example: `TOPIC #zig :Orochi development`
+- Example: `TOPIC #zig :Onyx Server development`
 - Sources: `src/daemon/modules/channel_ops.zig:65`, `src/daemon/server.zig:29987`, `src/daemon/server.zig:29999`, `src/daemon/server.zig:30008`, `src/daemon/server.zig:30024`, `src/daemon/server.zig:30036`
 
 ## KNOCK
@@ -124,7 +124,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_PROPLIST 818`, `RPL_PROPEND 819`; successful built-in writes may also broadcast equivalent `MODE`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOACCESS 913`, `ERR_BADVALUE 906`.
 - IRCX key ladder: secret channel keys are read-gated per tier: `FOUNDERKEY` requires founder, `OWNERKEY` owner, `HOSTKEY` operator, `VOICEKEY` voice, and `MEMBERKEY` any member; server operators can read all. On keyed JOIN, the current handler reads `FOUNDERKEY`, `OWNERKEY`, and `HOSTKEY` as raw secret props and grants founder, owner, or operator status respectively when the presented key matches.
-- Example: `PROP #zig SUBJECT :Orochi development`
+- Example: `PROP #zig SUBJECT :Onyx Server development`
 - Sources: `src/daemon/modules/ircx.zig:65`, `src/daemon/server.zig:11665`, `src/daemon/server.zig:11678`, `src/daemon/server.zig:11683`, `src/daemon/server.zig:19694`, `src/daemon/server.zig:19738`, `src/daemon/server.zig:19759`, `src/daemon/server.zig:20437`, `src/daemon/server.zig:20449`, `src/daemon/server.zig:20464`, `src/daemon/server.zig:20499`, `src/daemon/server.zig:20509`, `src/proto/ircx_prop_store.zig:111`, `src/proto/ircx_prop_store.zig:187`
 
 ## ACCESS

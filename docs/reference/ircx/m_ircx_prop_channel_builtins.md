@@ -1,6 +1,6 @@
 # IRCX built-in channel properties
 
-_The channel properties Orochi knows by name — computed built-ins, mode-linked keys, the secret key ladder, and the server-policy properties._
+_The channel properties Onyx Server knows by name — computed built-ins, mode-linked keys, the secret key ladder, and the server-policy properties._
 
 Channel properties are served by `LinuxServer.handleProp` in
 [`src/daemon/server.zig`](../../../src/daemon/server.zig) over the store in
@@ -111,7 +111,7 @@ PROP <#channel> history-policy :opers     # only opers may replay
 PROP <#channel> history-policy :          # delete the policy
 ```
 
-This is Orochi's live Aegis policy hook for history reads. `channelBuiltinSet`
+This is Onyx Server's live Aegis policy hook for history reads. `channelBuiltinSet`
 accepts only `public`, `members`, or `opers`; invalid values return
 `906 ERR_BADVALUE`. The value is stored as an ordinary signed channel property
 and enforced at the CHATHISTORY target-visibility gate after normal channel

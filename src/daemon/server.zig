@@ -567,9 +567,9 @@ fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
 }
 
 // The IRC version token (RPL_MYINFO 004 / RPL_VERSION 351 / INFO) carries the
-// release semver plus the build's git commit ("orochi-0.1.0+8fba2c5") so
+// release semver plus the build's git commit ("onyx-server-0.1.0+8fba2c5") so
 // `/version` shows the release AND traces back to the exact source revision.
-const server_version = "orochi-" ++ build_info.version;
+const server_version = "onyx-server-" ++ build_info.version;
 /// Personalized default MOTD, expanded per connection by `motd_template`
 /// (operators override the whole thing via `[motd] text`). Conditional blocks
 /// begin right after the prior line so an inactive branch leaves no blank line.
@@ -582,7 +582,7 @@ const default_motd_template =
     "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
     "Operator privileges are active on this connection - wield them with care.{/if}{if:secure}{else}\n" ++
     "Note: this link is not encrypted - reconnect over TLS for privacy.{/if}\n" ++
-    "Orochi - a clean-room, Zig-native IRCX/IRCv3 daemon: Undertow CRDT mesh, forward-secret Mooring links.";
+    "Onyx Server - a clean-room, Zig-native IRCX/IRCv3 daemon: Undertow CRDT mesh, forward-secret Mooring links.";
 
 /// Reserved pseudo-channel used to gossip per-user PRESENCE across the mesh.
 ///
@@ -1528,7 +1528,7 @@ pub const Config = struct {
     /// (312) trailing for local users, and advertised to S2S peers so remote
     /// WHOIS names the right per-server description. Configurable via
     /// `[network] description`; defaults to the generic daemon tagline.
-    server_description: []const u8 = "Orochi - pure-Zig mesh IRC daemon",
+    server_description: []const u8 = "Onyx Server - pure-Zig mesh IRC daemon",
     /// IRCv3 network icon URL, advertised as the `NETWORKICON=<url>` ISUPPORT
     /// token when non-empty. Configurable via `[network] icon_url`; empty omits
     /// the token (NETWORKICON support).
@@ -42651,7 +42651,7 @@ pub const LinuxServer = struct {
             if (slot.health.state == .established) peers_up += 1;
         }
 
-        try queueNumeric(conn, .RPL_INFOSTART, &.{}, "Orochi discovery directory");
+        try queueNumeric(conn, .RPL_INFOSTART, &.{}, "Onyx Server discovery directory");
         var b: [640]u8 = undefined;
         if (std.fmt.bufPrint(&b, "listed={s} network={s} node={s} description={s}", .{
             if (self.config.network_discoverable) "true" else "false",
@@ -42707,7 +42707,7 @@ pub const LinuxServer = struct {
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [256]u8 = undefined;
         // This server's own line carries its CONFIGURED description.
-        const own_desc = if (self.config.server_description.len != 0) self.config.server_description else "Orochi IRC daemon";
+        const own_desc = if (self.config.server_description.len != 0) self.config.server_description else "Onyx Server IRC daemon";
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{own_desc}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ self.serverName(), protocol_inventory.currentServerName() }, detail);
         var seen: [32][]const u8 = undefined;
@@ -53805,7 +53805,7 @@ test "processLine registration sequence emits welcome numerics" {
 
     try std.testing.expect(conn.session.registered());
     try expectCodesInOrder(sink.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
-    try expectContains(sink.written(), " 001 kain :Welcome to the Orochi network, kain");
+    try expectContains(sink.written(), " 001 kain :Welcome to the Onyx network, kain");
     try expectContains(sink.written(), "you are kain!kain@cloak-test.orochi");
     try expectContains(sink.written(), " 002 kain :Your host is orochi.local (node 99), running " ++ server_version);
     try expectContains(sink.written(), " 003 kain :This node has been weaving the mesh since 01 Jan 2025 00:00 UTC");
@@ -64475,7 +64475,7 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try recvUntil(&a, " 371 A ", 200);
     a.reset();
     try writeAllFd(fd_a, "DIRECTORY\r\n");
-    try recvUntil(&a, " 373 A :Orochi discovery directory\r\n", 200);
+    try recvUntil(&a, " 373 A :Onyx Server discovery directory\r\n", 200);
     try recvUntil(&a, " 371 A :listed=", 200);
     try recvUntil(&a, " 374 A :End of /DIRECTORY\r\n", 200);
     a.reset();
@@ -65648,7 +65648,7 @@ test "threaded server: ctcp VERSION direct PRIVMSG gets NOTICE reply" {
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :\x01VERSION\x01\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG B :\x01VERSION\x01\r\n", 200);
-    try recvUntil(&a, ":B!bob@localhost NOTICE A :\x01VERSION orochi-", 200);
+    try recvUntil(&a, ":B!bob@localhost NOTICE A :\x01VERSION onyx-server-", 200);
 }
 
 test "threaded server: user +C blocks direct CTCP except ACTION" {

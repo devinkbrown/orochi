@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build a reproducible, attested, optionally-signed Orochi release.
+# Build a reproducible, attested, optionally-signed Onyx Server release.
 #
-# Orochi's build is hermetic (pure Zig, zero external/C dependencies) and static
+# Onyx Server's build is hermetic (pure Zig, zero external/C dependencies) and static
 # (x86_64-linux-musl), so a ReleaseFast build at a fixed commit is bit-for-bit
 # reproducible — anyone can rebuild it and get the same bytes. This script emits,
 # next to the binary:
 #
 #   * SHA256SUMS            — integrity manifest over ALL artifacts (binary first)
-#   * orochi.cdx.json       — a one-screen CycloneDX SBOM
-#   * orochi.provenance.json — an SLSA-provenance-v1-shaped build attestation
+#   * onyx-server.cdx.json       — a one-screen CycloneDX SBOM
+#   * onyx-server.provenance.json — an SLSA-provenance-v1-shaped build attestation
 #   * SHA256SUMS.sig        — a cosign signature over SHA256SUMS (when configured)
 #
 # Every artifact is reproducible for a given (commit, Zig toolchain): the SBOM
@@ -48,7 +48,7 @@ FULLSHA="$(git rev-parse HEAD)"
 # authoritative source identity; the transient branch name is not recorded.
 REF="refs/commits/${FULLSHA}"
 VERSION="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-ARTIFACT="orochi-${VERSION}-${TARGET}"
+ARTIFACT="onyx-server-${VERSION}-${TARGET}"
 ZIGVER="$(zig version)"
 
 # Pin build metadata to the source commit so the whole release is reproducible:
@@ -65,7 +65,7 @@ trap 'rm -rf "$CACHE"' EXIT
 $BUILD_CMD --cache-dir "$CACHE" --prefix "$CACHE/out"
 
 mkdir -p "$OUT"
-cp "$CACHE/out/bin/orochi" "$OUT/$ARTIFACT"
+cp "$CACHE/out/bin/onyx-server" "$OUT/$ARTIFACT"
 chmod 755 "$OUT/$ARTIFACT"
 
 SIZE="$(stat -c%s "$OUT/$ARTIFACT")"
@@ -75,36 +75,36 @@ DIGEST="$(sha256sum "$OUT/$ARTIFACT" | cut -d' ' -f1)"
 # Genuinely one screen: the dependency graph is a single self-contained binary
 # with zero external components. The only "component" is the Zig toolchain that
 # produced it, recorded as a build tool (not a runtime dependency).
-cat > "$OUT/orochi.cdx.json" <<JSON
+cat > "$OUT/onyx-server.cdx.json" <<JSON
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "metadata": {
     "component": {
       "type": "application",
-      "name": "orochi",
+      "name": "onyx-server",
       "version": "${VERSION}+${COMMIT}",
       "description": "Clean-room, pure-Zig, zero-external-dependency IRC/IRCX mesh daemon with its own TLS 1.3 stack.",
       "licenses": [{ "license": { "id": "AGPL-3.0-or-later" } }],
-      "purl": "pkg:generic/orochi@${VERSION}?arch=x86_64&os=linux&libc=musl"
+      "purl": "pkg:generic/onyx-server@${VERSION}?arch=x86_64&os=linux&libc=musl"
     },
     "tools": [{ "vendor": "ziglang", "name": "zig", "version": "${ZIGVER}" }],
     "properties": [
-      { "name": "orochi:reproducible", "value": "true" },
-      { "name": "orochi:target", "value": "${TARGET}" },
-      { "name": "orochi:linkage", "value": "static" },
-      { "name": "orochi:commit", "value": "${FULLSHA}" },
-      { "name": "orochi:sizeBytes", "value": "${SIZE}" }
+      { "name": "onyx-server:reproducible", "value": "true" },
+      { "name": "onyx-server:target", "value": "${TARGET}" },
+      { "name": "onyx-server:linkage", "value": "static" },
+      { "name": "onyx-server:commit", "value": "${FULLSHA}" },
+      { "name": "onyx-server:sizeBytes", "value": "${SIZE}" }
     ]
   },
   "components": [],
   "properties": [
-    { "name": "orochi:externalDependencies", "value": "0" },
-    { "name": "orochi:sha256", "value": "${DIGEST}" }
+    { "name": "onyx-server:externalDependencies", "value": "0" },
+    { "name": "onyx-server:sha256", "value": "${DIGEST}" }
   ]
 }
 JSON
-echo "release: SBOM → $OUT/orochi.cdx.json (0 external components)"
+echo "release: SBOM → $OUT/onyx-server.cdx.json (0 external components)"
 
 # --- SLSA provenance (in-toto Statement v1 / SLSA provenance v1 predicate) -----
 # Hand-authored to the SLSA v1.0 provenance shape. It records WHAT was built (the
@@ -117,7 +117,7 @@ echo "release: SBOM → $OUT/orochi.cdx.json (0 external components)"
 # of L2. Running the same steps on a hosted runner (e.g. the slsa-github-generator
 # GitHub Action) with an isolated builder identity is what elevates it to true
 # SLSA L2/L3; the field shapes here are drop-in compatible with that upgrade.
-cat > "$OUT/orochi.provenance.json" <<JSON
+cat > "$OUT/onyx-server.provenance.json" <<JSON
 {
   "_type": "https://in-toto.io/Statement/v1",
   "subject": [
@@ -126,7 +126,7 @@ cat > "$OUT/orochi.provenance.json" <<JSON
   "predicateType": "https://slsa.dev/provenance/v1",
   "predicate": {
     "buildDefinition": {
-      "buildType": "https://orochi.build/zig-static-musl/v1",
+      "buildType": "https://onyx-server.build/zig-static-musl/v1",
       "externalParameters": {
         "source": "${REPO_URL}",
         "ref": "${REF}",
@@ -159,18 +159,18 @@ cat > "$OUT/orochi.provenance.json" <<JSON
         "finishedOn": "${COMMIT_ISO}"
       },
       "byproducts": [
-        { "name": "orochi.cdx.json", "mediaType": "application/vnd.cyclonedx+json" }
+        { "name": "onyx-server.cdx.json", "mediaType": "application/vnd.cyclonedx+json" }
       ]
     }
   }
 }
 JSON
-echo "release: provenance → $OUT/orochi.provenance.json (SLSA provenance v1 shape)"
+echo "release: provenance → $OUT/onyx-server.provenance.json (SLSA provenance v1 shape)"
 
 # Validate the emitted JSON when jq is available. A malformed doc is OUR bug, so
 # fail loudly; when jq is absent we degrade to a note rather than blocking.
 if command -v jq >/dev/null 2>&1; then
-  for j in orochi.cdx.json orochi.provenance.json; do
+  for j in onyx-server.cdx.json onyx-server.provenance.json; do
     jq empty "$OUT/$j" || { echo "release: FATAL — $j is not valid JSON" >&2; exit 1; }
   done
   echo "release: JSON validated (jq)"
@@ -182,7 +182,7 @@ fi
 # The binary is listed FIRST so `verify-release.sh` can read it as line 1. The
 # SBOM and provenance are included too, so a single cosign signature over
 # SHA256SUMS anchors the entire release.
-( cd "$OUT" && sha256sum "$ARTIFACT" "orochi.cdx.json" "orochi.provenance.json" > SHA256SUMS )
+( cd "$OUT" && sha256sum "$ARTIFACT" "onyx-server.cdx.json" "onyx-server.provenance.json" > SHA256SUMS )
 echo "release: SHA256SUMS →"
 sed 's/^/release:   /' "$OUT/SHA256SUMS"
 
@@ -211,4 +211,4 @@ else
   echo "release: no signer configured — skipping signature (set COSIGN_KEY=<key> or COSIGN_EXPERIMENTAL=1 for keyless OIDC)"
 fi
 
-echo "release: done → $OUT/ (${ARTIFACT}, SHA256SUMS, orochi.cdx.json, orochi.provenance.json)"
+echo "release: done → $OUT/ (${ARTIFACT}, SHA256SUMS, onyx-server.cdx.json, onyx-server.provenance.json)"

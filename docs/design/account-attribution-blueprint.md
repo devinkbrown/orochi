@@ -6,7 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 # Blueprint — Cryptographic account attribution for mesh membership (F1 proper fix)
 
 Status: **DESIGN — GO** (no open CRITICAL; one HIGH owned + DST-gated — the liveness/value
-sticky-trust rule in §4.4). Grounded against orochi @ HEAD and onyx @ HEAD.
+sticky-trust rule in §4.4). Grounded against onyx-server @ HEAD and onyx @ HEAD.
 Author: stack-architect. Reconciled after a 3-lens adversarial refute pass (§7).
 
 Scope: close the Byzantine-account-forgery hole (F1) **while restoring** legitimate multi-device

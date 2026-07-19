@@ -3,7 +3,7 @@
 *From client-only E2EE DMs to group/channel end-to-end encryption. Roadmap v1.5
 "Kintsugi" — the fortress era. Status: design. Author: stack-architect. Date: 2026-07-11.*
 
-> This is a **blueprint**, not an implementation. Orochi Zig → zig-coder; Onyx
+> This is a **blueprint**, not an implementation. Onyx Server Zig → zig-coder; Onyx
 > TypeScript → solidjs-coder; external-fact confirmation → deep-researcher. No source
 > in either repo is modified by this document.
 
@@ -115,7 +115,7 @@ on the same account shows the locked placeholder — `dmCipher.ts:16-17`). It is
 correct *foundation* (a pairwise secure channel to bootstrap group key delivery) but is
 **not** the group solution.
 
-### 2.2 Orochi — the group-crypto primitives (in tree, server-side today)
+### 2.2 Onyx Server — the group-crypto primitives (in tree, server-side today)
 
 | File | What it is | RFC | Gap for E2EE-everywhere |
 | --- | --- | --- | --- |
@@ -125,7 +125,7 @@ correct *foundation* (a pairwise secure channel to bootstrap group key delivery)
 | `src/crypto/hpke.zig` | HPKE base mode DHKEM(X25519)/HKDF-SHA256/ChaCha20 | RFC 9180 | The KEM for KeyPackage/Welcome sealing; not wired |
 | `src/crypto/sframe.zig` | SFrame media frame encryption, AES-128-GCM / ChaCha20 | RFC 9605 | For E2EE **media** (v2.3); keys must come from the MLS exporter |
 
-### 2.3 Orochi — control plane + transport (untrusted-for-content)
+### 2.3 Onyx Server — control plane + transport (untrusted-for-content)
 
 - `src/proto/e2ee_policy.zig` — server-enforceable policy: channel `encryption-policy`,
   the `+orochi/e2ee` tag validator, bounded `e2ee.device.*` device-key PROP
@@ -149,7 +149,7 @@ correct *foundation* (a pairwise secure channel to bootstrap group key delivery)
 ### 2.4 The seam, drawn
 
 ```
-        ONYX (browser)                       OROCHI (daemon, untrusted for content)
+        ONYX (browser)                       ONYX SERVER (daemon, untrusted for content)
   ┌───────────────────────────┐        ┌──────────────────────────────────────────┐
   │ group crypto (MUST live    │        │ control plane it CAN see:                 │
   │ here): TreeKEM epoch, key   │  wss   │  • encryption-policy PROP (enforce)        │

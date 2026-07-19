@@ -68,8 +68,8 @@ pub const Error = error{
 
 pub fn usage() void {
     dlog.log(
-        \\usage: orochi delegated-credential inspect --dc <wire> [--cert <chain.pem>] [--time <unix>]
-        \\       orochi delegated-credential validate --dc <wire> --cert <chain.pem> [--time <unix>]
+        \\usage: onyx-server delegated-credential inspect --dc <wire> [--cert <chain.pem>] [--time <unix>]
+        \\       onyx-server delegated-credential validate --dc <wire> --cert <chain.pem> [--time <unix>]
         \\  --dc <path>      raw DelegatedCredential extension data
         \\  --cert <path>    PEM/DER leaf or chain whose leaf signed the DC
         \\  --time <unix>    validation time; default is current wall clock

@@ -1,8 +1,8 @@
-# Orochi mesh and S2S architecture
+# Onyx Server mesh and S2S architecture
 
 *The Undertow mesh and server-to-server layer as implemented in the current source tree.*
 
-The mesh vocabulary (see the [glossary](../reference/glossary.md)): Undertow is the S2S CRDT mesh state model, Mooring is the secure handshake layer, Ripple is the witnessed failure-detection gossip, and Concord is the CRDT library. The design uses a sovereign node identity and does not key the mesh on server names, origins, or nicks. The code today implements a clean-room Orochi mesh.
+The mesh vocabulary (see the [glossary](../reference/glossary.md)): Undertow is the S2S CRDT mesh state model, Mooring is the secure handshake layer, Ripple is the witnessed failure-detection gossip, and Concord is the CRDT library. The design uses a sovereign node identity and does not key the mesh on server names, origins, or nicks. The code today implements a clean-room Onyx Server mesh.
 
 ## Layer map
 

@@ -1,4 +1,4 @@
-# Orochi quickstart — a single self-hosted node for local evaluation.
+# Onyx Server quickstart — a single self-hosted node for local evaluation.
 #
 # Boots a working node on plaintext ws://<host>:8080 (the Onyx web client) and
 # irc://<host>:6667 (any IRC client). The node's sovereign identity key is
@@ -15,7 +15,7 @@ id = 1 # this node's mesh id; the sovereign identity key self-generates on first
 [network]
 name = "Onyx"
 server_name = "localhost"
-description = "A self-hosted Orochi node."
+description = "A self-hosted Onyx node."
 
 [listen]
 host = "::" # dual-stack: binds IPv6 + IPv4-mapped
@@ -25,7 +25,7 @@ ws_plain = true # plaintext ws for LOCAL evaluation — use TLS in production
 
 [sasl]
 enabled = true
-realm = "Orochi"
+realm = "Onyx"
 account_db = "accounts.db" # relative to the working directory (/data)
 
 # Passwordless login (WebAuthn / passkeys) via the WEBAUTHN command. Inert until
@@ -42,6 +42,6 @@ num_shards = 1 # single-node quickstart; raise on multi-core hosts
 
 [motd]
 text = """
-Welcome to Orochi, {nick}.
+Welcome to Onyx, {nick}.
 This is a self-hosted single node — sovereign, mesh-capable, yours.
 Register an account to reserve your nick and unlock services."""

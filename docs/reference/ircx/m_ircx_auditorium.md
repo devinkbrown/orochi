@@ -2,7 +2,7 @@
 
 _Two IRCX channel visibility modes: `+x AUDITORIUM` hides ordinary members from each other, and `+h HIDDEN` hides the channel itself from listings._
 
-These are named channel modes, not commands. They live in Orochi's Zig channel
+These are named channel modes, not commands. They live in Onyx Server's Zig channel
 model, not a C module. The mode letters and MODEX names are declared in
 [`src/proto/chanmode_ext.zig`](../../../src/proto/chanmode_ext.zig); the
 auditorium visibility predicates are in

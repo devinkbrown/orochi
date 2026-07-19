@@ -1,8 +1,8 @@
 # Helix upgrade
 
-*Hot-restart Orochi in place with the Helix workflow, preserving every shard's listener and live sessions.*
+*Hot-restart Onyx Server in place with the Helix workflow, preserving every shard's listener and live sessions.*
 
-Helix is Orochi's in-place upgrade workflow. The operator-facing command is
+Helix is Onyx Server's in-place upgrade workflow. The operator-facing command is
 `UPGRADE`, implemented by `LinuxServer.handleUpgrade` as an oper-only hot re-exec
 on Linux.
 
@@ -93,7 +93,7 @@ the explicit RESTART path, not UPGRADE.
 
 Hot rollback is safe only when the target exposes the exact full Helix capability
 token required by the running predecessor; listener compatibility alone is not
-enough. In particular, do **not** hot-roll back a multi-shard Orochi 0.5.2+
+enough. In particular, do **not** hot-roll back a multi-shard Onyx Server 0.5.2+
 process to a pre-0.5.2 binary. Before MESSAGE_V2 activation, use a cold restart
 across that boundary. After activation, hot or cold rollback is allowed only to
 an image that implements the activation boundary and preserves the exact active

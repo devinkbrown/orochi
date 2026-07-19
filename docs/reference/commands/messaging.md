@@ -40,7 +40,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 
 - CTCP payloads are parsed from `PRIVMSG` and `NOTICE` bodies. Direct `PRIVMSG` CTCP requests for `VERSION`, `PING`, `TIME`, `CLIENTINFO`, and `SOURCE` receive CTCP `NOTICE` replies; `ACTION` is delivered as ordinary message content.
 - User mode `+C` and channel mode `+C` block CTCP requests except `ACTION`, returning `FAIL PRIVMSG CTCP_BLOCKED` for direct messages or `ERR_CANNOTSENDTOCHAN 404` for channels.
-- DCC is parser-only in Orochi: CTCP can classify DCC frames, but the server provides no DCC proxy, filehost, or relay behavior.
+- DCC is parser-only in Onyx Server: CTCP can classify DCC frames, but the server provides no DCC proxy, filehost, or relay behavior.
 - Sources: `src/proto/ctcp.zig:4`, `src/proto/ctcp.zig:45`, `src/daemon/server.zig:29960`, `src/daemon/server.zig:38541`, `src/daemon/server.zig:38576`, `src/daemon/server.zig:38663`
 
 ## TAGMSG

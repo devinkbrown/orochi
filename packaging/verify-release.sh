@@ -46,7 +46,7 @@ trap 'rm -rf "$CACHE"' EXIT
 export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 zig build -Dtarget="$TARGET" -Doptimize=ReleaseFast --cache-dir "$CACHE" --prefix "$CACHE/out" >/dev/null
 
-ACTUAL="$(sha256sum "$CACHE/out/bin/orochi" | cut -d' ' -f1)"
+ACTUAL="$(sha256sum "$CACHE/out/bin/onyx-server" | cut -d' ' -f1)"
 echo "verify: rebuilt  $ACTUAL"
 
 if [ "$ACTUAL" != "$EXPECTED" ]; then

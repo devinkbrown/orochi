@@ -1,6 +1,6 @@
-# Orochi agent workflow
+# Onyx Server agent workflow
 
-Orochi uses agents for context and authority isolation, skills for reusable
+Onyx Server uses agents for context and authority isolation, skills for reusable
 procedures, and scripts for deterministic validation. `AGENTS.md` remains the
 mandatory contract; this document is the routing map.
 

@@ -38,7 +38,7 @@ There is no `STARTTLS` command; TLS is listener-level implicit TLS (`src/daemon/
 - Parameters: Four parameters are required by the lower command table; the handler uses parameter 1 as username and parameter 4 as realname.
 - Replies: May complete registration and emit welcome numerics when `NICK`, `USER`, and capability negotiation permit it.
 - Errors: `ERR_ALREADYREGISTRED 462`; `ERR_NEEDMOREPARAMS 461`.
-- Example: `USER suzu 0 * :Orochi User`
+- Example: `USER suzu 0 * :Onyx Server User`
 - Sources: `src/daemon/dispatch.zig:1711`, `src/daemon/dispatch.zig:1761`, `src/daemon/dispatch.zig:1775`, `src/daemon/dispatch.zig:2067`, `src/daemon/dispatch.zig:2074`
 
 ## CAP

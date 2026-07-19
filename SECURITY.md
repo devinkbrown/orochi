@@ -1,6 +1,6 @@
 # Security Policy
 
-Orochi is a network daemon with its own TLS stack, post-quantum server-to-server
+Onyx Server is a network daemon with its own TLS stack, post-quantum server-to-server
 cryptography, and authentication surface. We take security reports seriously.
 
 ## Reporting a vulnerability
@@ -40,7 +40,7 @@ High-interest areas include:
 
 ## Adversarial testing
 
-Beyond the deterministic-simulation suite, Orochi is building a dedicated
+Beyond the deterministic-simulation suite, Onyx Server is building a dedicated
 adversarial **exploit/attack test harness** — protocol fuzzing and abuse-path
 regression tests aimed at the parser, authentication, TLS, and admission
 surfaces. The direction and coverage plan live in
@@ -49,6 +49,6 @@ surfaces. The direction and coverage plan live in
 
 ## Supported versions
 
-Orochi is developed on a rolling basis; fixes land on `main` (current release
+Onyx Server is developed on a rolling basis; fixes land on `main` (current release
 line: **0.4.0**). Operators should track `main` and apply security fixes via the
 session-preserving `USR2` hot-upgrade.

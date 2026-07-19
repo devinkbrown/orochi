@@ -1,25 +1,25 @@
 # =============================================================================
-# Orochi IRC daemon — systemd service unit
+# Onyx Server IRC daemon — systemd service unit
 # =============================================================================
-# Install to /etc/systemd/system/orochi.service (or let `zig build install`
-# stage it under <prefix>/lib/systemd/system/orochi.service and symlink it).
+# Install to /etc/systemd/system/onyx-server.service (or let `zig build install`
+# stage it under <prefix>/lib/systemd/system/onyx-server.service and symlink it).
 #
 # Then:
-#   useradd --system --home-dir /var/lib/orochi --shell /usr/sbin/nologin orochi
-#   install -d -o orochi -g orochi /var/lib/orochi /etc/orochi
-#   install -m 0640 -o orochi -g orochi etc/orochi.reference.toml /etc/orochi/orochi.toml
-#   systemctl daemon-reload && systemctl enable --now orochi
+#   useradd --system --home-dir /var/lib/onyx-server --shell /usr/sbin/nologin onyx-server
+#   install -d -o onyx-server -g onyx-server /var/lib/onyx-server /etc/onyx-server
+#   install -m 0640 -o onyx-server -g onyx-server etc/onyx-server.reference.toml /etc/onyx-server/onyx-server.toml
+#   systemctl daemon-reload && systemctl enable --now onyx-server
 #
 # HOT UPGRADE (the whole point — see ExecReload):
 #   # stage the freshly-built binary at the ExecStart path, then:
-#   systemctl reload orochi          # -> kill -USR2 $MAINPID -> session-preserving execve
-# A plain `systemctl restart orochi` is the BOOTSTRAP / fallback path: it drops
+#   systemctl reload onyx-server          # -> kill -USR2 $MAINPID -> session-preserving execve
+# A plain `systemctl restart onyx-server` is the BOOTSTRAP / fallback path: it drops
 # sessions. SIGUSR2 (reload) re-execs in place, keeping the listener fd and all
 # live client sessions across the swap. See tools/upgrade_smoke.py.
 # =============================================================================
 
 [Unit]
-Description=Orochi IRC daemon (Suimyaku + Tsumugi mesh)
+Description=Onyx Server IRC daemon (Undertow + Mooring mesh)
 Documentation=https://github.com/devinkbrown/onyx-server
 After=network-online.target
 Wants=network-online.target
@@ -31,10 +31,10 @@ Wants=network-online.target
 Type=simple
 
 # argv[1] is the config path (src/main.zig parses the config from argv[1]).
-ExecStart=/usr/local/bin/orochi /etc/orochi/orochi.toml
+ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml
 
 # --- Hot upgrade: SIGUSR2 triggers the session-preserving execve handoff. -----
-# This is why a dedicated reload verb exists: `systemctl reload orochi` keeps the
+# This is why a dedicated reload verb exists: `systemctl reload onyx-server` keeps the
 # bound socket and every live client session across the new image (a restart does
 # not). Stage the new binary at the ExecStart path first, then reload.
 ExecReload=/bin/kill -USR2 $MAINPID
@@ -51,20 +51,20 @@ KillMode=mixed
 
 # --- Identity -----------------------------------------------------------------
 # Dedicated unprivileged service account (create it; see header). DynamicUser is
-# avoided because the daemon owns persistent state under /var/lib/orochi
+# avoided because the daemon owns persistent state under /var/lib/onyx-server
 # (accounts.db WAL, oper grants, bootstrapped TLS key) that must survive restarts.
-User=orochi
-Group=orochi
+User=onyx-server
+Group=onyx-server
 
-# State directory: systemd creates/chowns /var/lib/orochi (0750) and exports it
+# State directory: systemd creates/chowns /var/lib/onyx-server (0750) and exports it
 # as $STATE_DIRECTORY. House accounts.db, oper_grants.tsv, the bootstrapped TLS
 # leaf, and the news cache here.
-StateDirectory=orochi
+StateDirectory=onyx-server
 StateDirectoryMode=0750
-WorkingDirectory=/var/lib/orochi
+WorkingDirectory=/var/lib/onyx-server
 
 # --- Capabilities -------------------------------------------------------------
-# Needed only to bind privileged ports (6667/6697 < 1024). If you run Orochi on
+# Needed only to bind privileged ports (6667/6697 < 1024). If you run Onyx Server on
 # high ports exclusively (e.g. 6680/16720 as in the configs), delete BOTH lines
 # below — the daemon then needs no capabilities at all.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -73,7 +73,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # --- Sandboxing / hardening ---------------------------------------------------
 NoNewPrivileges=true
 # ProtectSystem=strict makes the whole FS read-only except ReadWritePaths; the
-# StateDirectory is writable automatically. Add /etc/orochi as RW only if the
+# StateDirectory is writable automatically. Add /etc/onyx-server as RW only if the
 # daemon must rewrite config in place (it does not by default — REHASH re-reads).
 ProtectSystem=strict
 ProtectHome=true

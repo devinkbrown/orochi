@@ -1,6 +1,6 @@
 # Media architecture
 
-*Orochi's media stack: an Undertow SFU control plane, RTP/SRTP and native Cadence UDP legs, header-only Cadence-frame <-> RTP rewrap, DTLS-SRTP keying, WebTransport framing, and browser/WASM codec exports.*
+*Onyx Server's media stack: an Undertow SFU control plane, RTP/SRTP and native Cadence UDP legs, header-only Cadence-frame <-> RTP rewrap, DTLS-SRTP keying, WebTransport framing, and browser/WASM codec exports.*
 
 This document covers the current source tree only.
 

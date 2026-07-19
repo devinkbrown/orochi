@@ -172,7 +172,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## SUMMON
 
 - Syntax: `SUMMON <nick> <#channel>`
-- Description: Oper-only force-join. Orochi repurposes the obsolete host-paging
+- Description: Oper-only force-join. Onyx Server repurposes the obsolete host-paging
   command as a direct operator command that resolves the target user, runs the
   same join path as `FORCEJOIN`, and returns `RPL_SUMMONING 342`.
 - Privileges: Operator.

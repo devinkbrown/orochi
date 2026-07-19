@@ -2,7 +2,7 @@
 
 *The client contract for authenticating Cadence-frame native media datagrams end to end.*
 
-Orochi can authenticate each native media transport (CadenceVox/CadenceVis)
+Onyx Server can authenticate each native media transport (CadenceVox/CadenceVis)
 datagram with a keyed MAC, so a forged or tampered datagram is dropped before
 the SFU learns the sender, meters it, or forwards it. Source of truth:
 `src/substrate/cadence_frame.zig`, `src/daemon/native_media_transport.zig`,

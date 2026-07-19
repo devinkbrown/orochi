@@ -89,7 +89,7 @@ pub const Limits = struct {
     prefix: Str = Str.fromLiteral("(qaohv)~&@%+"),
     chanmodes: Str = Str.fromLiteral("b,k,l,imnpst"),
     casemapping: Str = Str.fromLiteral("ascii"),
-    network: Str = Str.fromLiteral("Orochi"),
+    network: Str = Str.fromLiteral("Onyx"),
     elist: Str = Str.fromLiteral("CMNTU"),
     statusmsg: Str = Str.fromLiteral("~&@%+"),
     targmax: Str = Str.fromLiteral("JOIN:,WHOIS:1,PRIVMSG:,NOTICE:,MONITOR:"),
@@ -420,7 +420,7 @@ test "defaults reproduce historical values" {
     try std.testing.expectEqual(@as(u32, 1000), l.history_max_messages_advertised);
     try std.testing.expectEqual(@as(u32, 5), l.dns_timeout_secs);
     try std.testing.expectEqual(@as(u32, 60), l.nick_quit_delay_secs);
-    try std.testing.expectEqualStrings("Orochi", l.network.slice());
+    try std.testing.expectEqualStrings("Onyx", l.network.slice());
     try std.testing.expectEqualStrings("#&", l.chantypes.slice());
 }
 

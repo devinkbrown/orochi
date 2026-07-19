@@ -1,8 +1,8 @@
-# Orochi host cloaking
+# Onyx Server host cloaking
 
-*How Orochi masks a client's real address from other users, and how an operator recovers the real identity — locally and across the mesh.*
+*How Onyx Server masks a client's real address from other users, and how an operator recovers the real identity — locally and across the mesh.*
 
-Orochi never shows a client's raw IP or reverse-DNS name to other users by
+Onyx Server never shows a client's raw IP or reverse-DNS name to other users by
 default. The visible host is a deterministic **cloak**: a keyed one-way token
 that hides the address while still supporting coherent wildcard bans. The real
 identity is surfaced only to operators (and to the user themselves), and only

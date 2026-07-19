@@ -1,8 +1,8 @@
-# IRCX reference (Orochi)
+# IRCX reference (Onyx Server)
 
-_Index of Orochi's IRCX command family, with a cross-check of the live surface against the canonical draft._
+_Index of Onyx Server's IRCX command family, with a cross-check of the live surface against the canonical draft._
 
-Orochi implements IRCX natively in Zig. There is **no `modules/` directory, no
+Onyx Server implements IRCX natively in Zig. There is **no `modules/` directory, no
 MAPI, and no pseudo-clients** — every IRCX verb is a real server command
 registered in the SerpentRegistry module table
 [`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig) as a thin
@@ -39,7 +39,7 @@ module.
 | Document | Role |
 | --- | --- |
 | [`ircx-draft-pfenning-04.md`](ircx-draft-pfenning-04.md) | Canonical IETF draft — source of truth for numerics, commands, modes, and properties. |
-| [`ircx-protocol.md`](ircx-protocol.md) | Legacy behavioral blueprint (prior C IRCX daemon). Historical only — not authoritative on identity/SID; Orochi is SID-free. |
+| [`ircx-protocol.md`](ircx-protocol.md) | Legacy behavioral blueprint (prior C IRCX daemon). Historical only — not authoritative on identity/SID; Onyx Server is SID-free. |
 | [../../architecture/event-spine.md](../../architecture/event-spine.md) | Full architecture behind `EVENT`, OBSERVE, BROADCAST, categories, and severity. |
 
 ## Numeric map (live)
@@ -51,7 +51,7 @@ module.
 | `806–810` | `EVENT` — ADD / DELETE / START / LIST / END |
 | `818–819` | `PROP` — `RPL_PROPLIST` / `RPL_PROPEND` |
 | `821–823`, `825` | `EVENT` — EVENTDUP / EVENTMIS / NOSUCHEVENT / EVENTCHANGE |
-| `826–827` | `MODEX` — `RPL_MODEXLIST` / `RPL_MODEXEND` (an Orochi extension, kept clear of draft-reserved codes) |
+| `826–827` | `MODEX` — `RPL_MODEXLIST` / `RPL_MODEXEND` (an Onyx Server extension, kept clear of draft-reserved codes) |
 | `906` | `ERR_BADVALUE` (invalid `PROP` value) |
 | `913` | `ERR_NOACCESS` (`PROP`/property permission denial) |
 | `923` | `ERR_NOWHISPER` (`+w` channel) |
@@ -60,14 +60,14 @@ module.
 
 - **PROP permission denials** use `913 ERR_NOACCESS` and invalid values use
   `906 ERR_BADVALUE` — no `918` squatting (918 is left free for the draft's
-  `EVENTDUP` family; Orochi uses `821` for event-dup).
+  `EVENTDUP` family; Onyx Server uses `821` for event-dup).
 - **EVENT numerics** follow the draft `806–810` band; the IRCX event types are
-  `CHANNEL/MEMBER/USER` plus the Orochi-specific `MEDIA` call-presence type.
+  `CHANNEL/MEMBER/USER` plus the Onyx Server-specific `MEDIA` call-presence type.
   Delivery maps these onto Event-Spine categories while replies stay on the IRCX
   numeric surface — see [event-spine.md](../../architecture/event-spine.md).
-- **MODEX** (`826/827`) is a deliberate Orochi extension and is kept clear of
+- **MODEX** (`826/827`) is a deliberate Onyx Server extension and is kept clear of
   ACCESS/EVENT/PROP draft codes.
-- **AUTH ordering.** Orochi's primary authentication is IRCv3 SASL via `CAP`;
+- **AUTH ordering.** Onyx Server's primary authentication is IRCv3 SASL via `CAP`;
   IRCX `AUTH` is the legacy pre-CAP path, layered over the same mechanisms.
 - **WALLOPS is folded into the Event Spine** (`EVENT BROADCAST`) rather than a
   `+w` umode — an intentional divergence from the draft.

@@ -1,8 +1,8 @@
-# Orochi mesh security architecture
+# Onyx Server mesh security architecture
 
 *The security model for server-to-server (Undertow) traffic: what each layer guarantees, against which adversary, and how the wire enforces it.*
 
-This document describes how Orochi authenticates and protects server-to-server
+This document describes how Onyx Server authenticates and protects server-to-server
 (Undertow) traffic as it exists in the current source tree. It complements
 [crypto.md](crypto.md) (primitives, TLS, Mooring AKE) and
 [mesh-s2s.md](mesh-s2s.md) (frame transport, CRDT convergence, routing) by
@@ -11,7 +11,7 @@ adversary, and how the wire enforces it.
 
 The headline property: a mesh peer — even a fully trusted, pinned peer that has
 been compromised — **cannot forge or alter a frame attributed to another node**.
-Orochi achieves this without any key-distribution subsystem, because node
+Onyx Server achieves this without any key-distribution subsystem, because node
 identity is self-certifying.
 
 ## Threat model

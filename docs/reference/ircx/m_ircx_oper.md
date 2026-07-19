@@ -1,8 +1,8 @@
 # IRCX oper surface
 
-_The operator-gated corner of Orochi's IRCX family — server access lists (`SACCESS`), the `+z` GAG umode, and the operator `EVENT` plane._
+_The operator-gated corner of Onyx Server's IRCX family — server access lists (`SACCESS`), the `+z` GAG umode, and the operator `EVENT` plane._
 
-Orochi is not a legacy C IRC daemon: there is no `modules/m_ircx_oper.c`, no
+Onyx Server is not a legacy C IRC daemon: there is no `modules/m_ircx_oper.c`, no
 MAPI, and no `OPFORCE`/`SVSJOIN` pseudo-commands. The operator surface is plain
 English and rides real server commands in
 [`src/daemon/server.zig`](../../../src/daemon/server.zig), registered through

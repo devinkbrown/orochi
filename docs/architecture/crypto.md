@@ -1,13 +1,13 @@
 # Cryptography and secure-channel architecture
 
-*The cryptography implemented in the current Orochi source tree: primitives, TLS, the Mooring AKE, and the signed-object formats that protect mesh traffic.*
+*The cryptography implemented in the current Onyx Server source tree: primitives, TLS, the Mooring AKE, and the signed-object formats that protect mesh traffic.*
 
-This document describes the cryptography that exists in the current Orochi
+This document describes the cryptography that exists in the current Onyx Server
 source tree. Every behavioral claim is cited to `src/`.
 
 ## Scope and stance
 
-Orochi is a clean-room, pure-Zig IRC daemon built from first principles: the daemon,
+Onyx Server is a clean-room, pure-Zig IRC daemon built from first principles: the daemon,
 substrate, and crypto/TLS library are all written from scratch in Zig, and
 no prior daemon is derived from as source (`README.md:3`, `README.md:133`).
 The pinned toolchain target is Zig 0.17.0-dev.1282+c0f9b51d8 (`build.zig.zon:34`).
@@ -85,7 +85,7 @@ path and peak hashes needed to verify one inclusion proof
 
 ## E2EE control plane
 
-Orochi's daemon does not decrypt client E2EE payloads. The implemented server
+Onyx Server's daemon does not decrypt client E2EE payloads. The implemented server
 surface is a control plane: the `orochi/e2ee` capability allows the client-only
 `+orochi/e2ee` message tag, and the channel PROP `encryption-policy` accepts
 `off`, `optional`, or `required`. Required rooms reject plaintext `PRIVMSG`
@@ -102,7 +102,7 @@ server-side plaintext path.
 ## Portable account identity
 
 Ryujin portable identity starts as account-owned Ed25519 assertions. `IDENTITY`
-does not generate keys; it verifies that a supplied public key signed Orochi's
+does not generate keys; it verifies that a supplied public key signed Onyx Server's
 domain-separated account-binding transcript for `{account, label, public_key}`.
 Verified records are stored as account user PROP facts under
 `identity.key.<label>` with value `<pubkey-hex>:<signature-hex>`, then announced
@@ -805,7 +805,7 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 | Do not claim `secure_channel.zig` is live S2S wiring. | Its own header comment says live wiring waits on Mooring and the module is transport-agnostic. |
 | Do not claim `Secret(T)` makes all secret-dependent branches impossible by itself. | `Secret(T)` enforces explicit exposure/declassification, redacted formatting, constant-time equality, byte-wrapper checks, and wipes, but exposed/declassified bytes can still be branched on by ordinary code (`src/crypto/secret.zig:27`, `src/crypto/secret.zig:63`, `src/crypto/secret.zig:100`, `src/crypto/secret.zig:129`). |
 | Do not claim TLS 1.3 or TLS 1.2 `sealRecord`/`openRecord` stack key copies are currently secure-zeroed. | The current TLS record helpers copy AEAD keys into local arrays/values without a matching `defer secureZero(&key)`: TLS 1.3 server seal/open copies at `src/crypto/tls_server.zig:2899`, `src/crypto/tls_server.zig:2905`, `src/crypto/tls_server.zig:2911`, `src/crypto/tls_server.zig:2930`, `src/crypto/tls_server.zig:2935`, `src/crypto/tls_server.zig:2940`; TLS 1.2 seal/open copies at `src/crypto/tls12.zig:405`, `src/crypto/tls12.zig:412`, `src/crypto/tls12.zig:419`, `src/crypto/tls12.zig:464`, `src/crypto/tls12.zig:471`, `src/crypto/tls12.zig:478`. |
-| Do not claim ECH is signaled across a HelloRetryRequest. | ECH acceptance is confirmed ONLY on the ServerHello of a single-round handshake. ECH+HRR is deferred: a `ClientHelloOuter` the server opened (`ech_accepted`) that then needs an HRR reaches `writeServerHello` again with `hrr_sent` set, where the confirmation is deliberately NOT stamped so the path fail-closes rather than emitting an unreproducible signal (`signal_ech = ech_accepted and !hrr_sent`). The orochi client stands ECH+HRR down to plain; only a client withholding its inner key_share could reach this path. Status is being revisited in a parallel change — treat this as the verified current behavior, not the final design. | `src/crypto/tls_server.zig:1906`, `src/crypto/tls_server.zig:1911` |
+| Do not claim ECH is signaled across a HelloRetryRequest. | ECH acceptance is confirmed ONLY on the ServerHello of a single-round handshake. ECH+HRR is deferred: a `ClientHelloOuter` the server opened (`ech_accepted`) that then needs an HRR reaches `writeServerHello` again with `hrr_sent` set, where the confirmation is deliberately NOT stamped so the path fail-closes rather than emitting an unreproducible signal (`signal_ech = ech_accepted and !hrr_sent`). The Onyx Server client stands ECH+HRR down to plain; only a client withholding its inner key_share could reach this path. Status is being revisited in a parallel change — treat this as the verified current behavior, not the final design. | `src/crypto/tls_server.zig:1906`, `src/crypto/tls_server.zig:1911` |
 | `signature_algorithms_cert` (RFC 8446 §4.2.3) is implemented (opt-in, fail-closed). | Extension type 50 modeled in `tls_extension.zig`. The client emits it opt-in (`Options.cert_signature_schemes`, byte-identical when unset, re-emitted across HRR / in the ECH inner); the server retains it and — gated behind `enforce_cert_signature_algorithms` (OFF by default ⇒ byte-identical when off) — constrains chain-cert signature acceptance to the client's cert list (falling back to `signature_algorithms`), fail-closed on unclassifiable OIDs. Validated by the full external BoGo suite. | `src/crypto/tls_server.zig:384`, `:2192`, `src/proto/cert_sig_scheme.zig` |
 
 The following former guardrails are now OBSOLETE — the capabilities they cautioned against ARE implemented as of this writing, so claiming them is correct:

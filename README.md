@@ -1,4 +1,4 @@
-# Orochi 🐉
+# Onyx Server
 
 > A pure-Zig, clean-room IRC daemon — IRCv3 · IRCX · SASL · in-process services ·
 > browser WebSocket · voice/video — over a post-quantum cryptographic mesh, with no C interop.
@@ -8,7 +8,7 @@
 [![C interop: none](https://img.shields.io/badge/C%20interop-none-success.svg)](#design-pillars)
 [![Status: in production](https://img.shields.io/badge/status-in%20production-success.svg)](#status)
 
-**Orochi** (水蛟 — the coiling water-dragon) is a **100% clean-slate, fully Zig-native**
+**Onyx Server** is a **100% clean-slate, fully Zig-native**
 IRC daemon built from first principles. The daemon *and its entire substrate* — the
 systems library and the crypto/TLS stack — are written from scratch in Zig with **no C
 interop**. It covers a full modern feature surface (IRCv3, IRCX, SASL, in-process
@@ -25,24 +25,24 @@ native **Undertow + Mooring** cryptographic mesh.
 
 ## From clone to live chat
 
-Orochi is a single static binary with **zero external dependencies** — no database
+Onyx Server is a single static binary with **zero external dependencies** — no database
 server, no OpenSSL, no runtime to install.
 
 **Docker (build from source).** There is no published registry image yet, so you
-build `orochi:latest` locally from the verified static binary:
+build `onyx-server:latest` locally from the verified static binary:
 
 ```sh
 git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
 packaging/release.sh                                   # reproducible static binary → dist/
-docker build -f packaging/Dockerfile -t orochi:latest .
-docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest
+docker build -f packaging/Dockerfile -t onyx-server:latest .
+docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 ```
 
 **Native (fastest to a running node).**
 
 ```sh
-zig build                                              # → zig-out/bin/orochi
-./zig-out/bin/orochi packaging/orochi.quickstart.toml
+zig build                                              # → zig-out/bin/onyx-server
+./zig-out/bin/onyx-server packaging/onyx-server.quickstart.toml
 ```
 
 Either way you get a working node — **`ws://localhost:8080`** for the Onyx browser
@@ -115,7 +115,7 @@ flow, and a full source map.
 
 ## Build & run
 
-Orochi targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
+Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
 
 ```sh
 zig build              # build the daemon (and the `yoroi` crypto CLI) into zig-out/bin
@@ -125,7 +125,7 @@ zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config su
 zig build test-roadmap # server roadmap gate: check + focused daemon/protocol suites
 zig build all-checks   # deterministic pre-push gate: check + wasm + tests + fuzz + BoGo smokes
 zig build all-checks-verbose # same gate with per-test progress for long runs
-zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/orochi
+zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/onyx-server
 zig build package      # stage release binary + reference config + systemd unit
 zig build run          # run the daemon locally
 ./tools/genroots.sh    # regenerate package-root imports from the files present
@@ -136,7 +136,7 @@ Start from the [quickstart](docs/guide/00-quickstart.md), then see the
 [runbook](docs/RUNBOOK.md), [TLS guide](docs/guide/tls.md), and
 [mesh guide](docs/guide/mesh.md). A complete, commented configuration reference lives in
 [`docs/reference/config.md`](docs/reference/config.md) and
-[`etc/orochi.reference.toml`](etc/orochi.reference.toml).
+[`etc/onyx-server.reference.toml`](etc/onyx-server.reference.toml).
 
 ## Documentation
 
@@ -149,7 +149,7 @@ The [`docs/`](docs/README.md) tree is grounded in, and cites, the live source:
 
 ## Status
 
-**In production.** Orochi runs a live two-node post-quantum mesh with session-preserving
+**In production.** Onyx Server runs a live two-node post-quantum mesh with session-preserving
 `USR2` hot-upgrades, serving IRCv3/IRCX clients and a browser WebSocket client. The
 surface includes full IRCv3 + IRCX + SASL, in-process channel/nick services, class-based
 connection policy, a single runtime flood guard, `+j` network raid protection, and
@@ -163,13 +163,13 @@ pull-request guidance. Report security issues privately per [SECURITY.md](SECURI
 
 ## License
 
-Orochi is licensed under the **GNU Affero General Public License v3.0 or later
+Onyx Server is licensed under the **GNU Affero General Public License v3.0 or later
 (AGPL-3.0-or-later)**. See [`LICENSE`](LICENSE) for the full text; every source file
 carries an SPDX header.
 
-Orochi is clean-room — it does **not** derive from any prior daemon's code, so this license is
-chosen freely rather than inherited. AGPL is deliberate: Orochi is a network server, and
-§13 ("Remote Network Interaction") means **anyone who runs a modified Orochi as a network
+Onyx Server is clean-room — it does **not** derive from any prior daemon's code, so this license is
+chosen freely rather than inherited. AGPL is deliberate: Onyx Server is a network server, and
+§13 ("Remote Network Interaction") means **anyone who runs a modified Onyx Server as a network
 service — for example, operating an IRC network — must offer that service's users the
 complete corresponding source of their modifications.** Running a private, unmodified
 copy carries no such obligation; the requirement attaches only to changes you put into

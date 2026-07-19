@@ -1,17 +1,17 @@
-# Orochi runbook
+# Onyx Server runbook
 
-*Build, stage, validate, deploy, monitor, hot-upgrade, and roll back an Orochi node.*
+*Build, stage, validate, deploy, monitor, hot-upgrade, and roll back an Onyx Server node.*
 
 This runbook describes the shipped tree. For full configuration details, use
-[reference/config.md](reference/config.md) and `etc/orochi.reference.toml`.
+[reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
 ## Operator Model
 
-Orochi runs as a long-lived network daemon with:
+Onyx Server runs as a long-lived network daemon with:
 
 - a config file passed as `argv[1]`;
-- a systemd unit source at `etc/systemd/orochi.service`, packaged to
-  `lib/systemd/system/orochi.service` and normally installed as
+- a systemd unit source at `etc/systemd/onyx-server.service`, packaged to
+  `lib/systemd/system/onyx-server.service` and normally installed as
   `/etc/systemd/system/orochi.service`;
 - state under `/var/lib/orochi` in the packaged unit;
 - ReleaseFast production binaries from `zig build release` or `zig build package`;
@@ -36,16 +36,16 @@ The package step stages:
 
 | Path | Contents |
 |---|---|
-| `/tmp/orochi-stage/bin/orochi` | ReleaseFast stripped daemon |
-| `/tmp/orochi-stage/etc/orochi/orochi.reference.toml` | Annotated reference config |
-| `/tmp/orochi-stage/lib/systemd/system/orochi.service` | systemd service unit |
+| `/tmp/orochi-stage/bin/onyx-server` | ReleaseFast stripped daemon |
+| `/tmp/orochi-stage/etc/onyx-server/onyx-server.reference.toml` | Annotated reference config |
+| `/tmp/orochi-stage/lib/systemd/system/onyx-server.service` | systemd service unit |
 
 For local smoke tests against the debug binary:
 
 ```sh
 zig build
-python3 tools/runtime_smoke.py zig-out/bin/orochi
-python3 tools/upgrade_smoke.py zig-out/bin/orochi
+python3 tools/runtime_smoke.py zig-out/bin/onyx-server
+python3 tools/upgrade_smoke.py zig-out/bin/onyx-server
 ```
 
 ## Pre-Deploy Config Validation
@@ -67,9 +67,9 @@ After `zig build package --prefix /tmp/orochi-stage`, install the staged assets:
 ```sh
 useradd --system --home-dir /var/lib/orochi --shell /usr/sbin/nologin orochi
 install -d -o orochi -g orochi /var/lib/orochi /etc/orochi
-install -m 0640 -o orochi -g orochi /tmp/orochi-stage/etc/orochi/orochi.reference.toml /etc/orochi/orochi.toml
-install -m 0755 /tmp/orochi-stage/bin/orochi /usr/local/bin/orochi
-install -m 0644 /tmp/orochi-stage/lib/systemd/system/orochi.service /etc/systemd/system/orochi.service
+install -m 0640 -o orochi -g orochi /tmp/orochi-stage/etc/onyx-server/onyx-server.reference.toml /etc/orochi/orochi.toml
+install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
+install -m 0644 /tmp/orochi-stage/lib/systemd/system/onyx-server.service /etc/systemd/system/orochi.service
 systemctl daemon-reload
 systemctl enable --now orochi
 ```
@@ -84,7 +84,7 @@ Use Helix reload for normal production upgrades:
 ```sh
 zig build package --prefix /tmp/orochi-stage
 zig build run -- --check-config /etc/orochi/orochi.toml
-install -m 0755 /tmp/orochi-stage/bin/orochi /usr/local/bin/orochi
+install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
 systemctl reload orochi
 ```
 
@@ -191,7 +191,7 @@ the exact active tuple. Keep the previous known-good binary before replacing
 
 ```sh
 install -m 0755 /usr/local/bin/orochi /usr/local/bin/orochi.prev
-install -m 0755 /tmp/orochi-stage/bin/orochi /usr/local/bin/orochi
+install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
 systemctl reload orochi
 ```
 
@@ -204,7 +204,7 @@ install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
 systemctl reload orochi
 ```
 
-**Compatibility boundary:** never hot-roll back a multi-shard node from Orochi 0.5.2
+**Compatibility boundary:** never hot-roll back a multi-shard node from Onyx Server 0.5.2
 or newer to a pre-0.5.2 binary. The newer predecessor passes one inherited listener
 fd per shard through `OROCHI_HELIX_LISTEN_FDS`; an older successor only adopts shard
 0 and leaves the sibling fds open but unserved. Because those fds remain in the

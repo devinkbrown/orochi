@@ -1,6 +1,6 @@
-# Orochi numeric replies
+# Onyx Server numeric replies
 
-*The numeric reply codes Orochi emits, where each originates, and the message text clients receive.*
+*The numeric reply codes Onyx Server emits, where each originates, and the message text clients receive.*
 
 This reference documents current source only. The daemon-local live-handler enum is
 `src/daemon/server.zig:1057`; pre-registration dispatch uses its own enum at

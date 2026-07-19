@@ -1,5 +1,5 @@
 # =============================================================================
-# Orochi — reference configuration
+# Onyx Server — reference configuration
 # =============================================================================
 # This file documents every configuration section and key the daemon accepts,
 # with its type, default, and accepted range. It is exhaustive: copy it, delete
@@ -82,8 +82,8 @@ name = "Onyx"
 # --- [admin] — ADMIN command contact details ---------------------------------
 [admin]
 # Shown in the ADMIN reply (RPL_ADMINLOC1 / RPL_ADMINEMAIL).
-location = "Orochi IRC network"
-email = "admin@orochi.local"
+location = "Onyx IRC network"
+email = "admin@onyx-server.local"
 
 
 # --- [weather] — localized weather for the MOTD {weather} placeholder --------
@@ -99,7 +99,7 @@ enabled = false
 #   wind_kph=20
 #   desc=Partly cloudy
 # A ready sample ships in etc/weather.example.kv. Example updater (cron):
-#   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/orochi/weather.kv
+#   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/onyx-server/weather.kv
 # source = "etc/weather.example.kv"
 # Override the display location (else the file's `location`).
 # location = "Austin, TX"
@@ -142,8 +142,8 @@ cmd_cooldown_ms = 3000
 # so it covers EVERY feed, including those the in-daemon clean-room TLS can't
 # reach). When set, !news reads these files instead of fetching live — robust,
 # key-free, never blocks. Run the updater from cron, e.g.:
-#   */5 * * * * /path/to/orochi/tools/news_update.sh /var/lib/orochi/news 10
-# news_cache_dir = "/var/lib/orochi/news"
+#   */5 * * * * /path/to/onyx-server/tools/news_update.sh /var/lib/onyx-server/news 10
+# news_cache_dir = "/var/lib/onyx-server/news"
 
 
 # --- [listen] — listener sockets ---------------------------------------------
@@ -187,8 +187,8 @@ enabled = false
 # TLS port (conventional IRCS port is 6697).
 port = 6697
 # On-disk PEM/DER material; set both to load instead of bootstrapping.
-# cert_path = "/etc/orochi/tls/cert.pem"
-# key_path  = "/etc/orochi/tls/key.pem"
+# cert_path = "/etc/onyx-server/tls/cert.pem"
+# key_path  = "/etc/onyx-server/tls/key.pem"
 # CN/SAN for the self-signed bootstrap leaf.
 dns_name = "irc.example.net"
 # Request a client certificate (mTLS) so SASL EXTERNAL can match the presented
@@ -216,13 +216,13 @@ ktls = "off"
 # partial certificate set.
 # [[tls.sni]]
 # server_names = ["irc.example.net", "*.example.net"]
-# cert_path = "/etc/orochi/tls/example.pem"
-# key_path  = "/etc/orochi/tls/example.key"
+# cert_path = "/etc/onyx-server/tls/example.pem"
+# key_path  = "/etc/onyx-server/tls/example.key"
 # Server-side Encrypted Client Hello acceptance. The ECHConfigList is published
 # out-of-band (for example DNS HTTPS RR); the daemon only consumes the local copy
 # and the matching X25519 HPKE private key. Omit to keep ECH off.
 # [[tls.ech_keys]]
-# config_path = "/etc/orochi/tls/echconfig.bin"
+# config_path = "/etc/onyx-server/tls/echconfig.bin"
 # private_key = "0000000000000000000000000000000000000000000000000000000000000000"
 
 
@@ -379,7 +379,7 @@ enabled = false
 # relay_host = "localhost"
 # relay_port = 587            # 587 = STARTTLS (default); 465 = implicit TLS
 # starttls = true             # false => port 465 implicit TLS
-# from = "orochi@example.org" # envelope sender + From: address
+# from = "onyx-server@example.org" # envelope sender + From: address
 # AUTH credentials for the relay (optional; omit for an open/local relay).
 # user = "env:MAIL_USER"
 # pass = "env:MAIL_PASS"
@@ -578,7 +578,7 @@ enabled = false
 # SESSION-TOKEN (opaque reconnect tokens, issued only over TLS) is also available;
 # SCRAM-SHA-512-PLUS is offered automatically to TLS clients (tls-exporter channel
 # binding, RFC 9266).
-# account_db = "/var/lib/orochi/accounts.db"
+# account_db = "/var/lib/onyx-server/accounts.db"
 # Allow SASL ANONYMOUS guest logins (RFC 4505). Default false — anonymous is a
 # spam/abuse vector; a guest binds NO account and gets NO oper/services privileges.
 allow_anonymous = false
@@ -586,10 +586,10 @@ allow_anonymous = false
 # configured key. Advertised ONLY when exactly one key source below is set. OAuth
 # identities are federated and are NEVER auto-elevated to oper.
 #   oauth_hmac_key  = "env:OROCHI_OAUTH_HS256_SECRET"  # HS256 shared secret
-#   oauth_jwks_file = "/etc/orochi/oauth/jwks.json"    # RS256/ES256 JWKS
-#   oauth_pubkey    = "/etc/orochi/oauth/pub.pem"      # RS256/ES256 PEM/DER public key
+#   oauth_jwks_file = "/etc/onyx-server/oauth/jwks.json"    # RS256/ES256 JWKS
+#   oauth_pubkey    = "/etc/onyx-server/oauth/pub.pem"      # RS256/ES256 PEM/DER public key
 # oauth_issuer        = "https://idp.example.net/"     # require this `iss` when set
-# oauth_audience      = "orochi"                        # require this `aud` when set
+# oauth_audience      = "onyx-server"                        # require this `aud` when set
 # oauth_account_claim = "sub"                           # JWT claim -> account (default "sub")
 
 
@@ -602,7 +602,7 @@ allow_anonymous = false
 # host capabilities they negotiate (reply/log/time). Unset = the system stays
 # dormant (no plugins loaded). A missing dir / malformed plugin is logged, never
 # fatal.
-# plugin_dir = "/var/lib/orochi/plugins"
+# plugin_dir = "/var/lib/onyx-server/plugins"
 # Maximum bytes read for one `.wasm` plugin file. Large plugins are rejected
 # before interpretation. Default: 8388608 (8 MiB).
 # max_plugin_bytes = 8388608
@@ -649,11 +649,11 @@ allow_anonymous = false
 # grants (from the GRANT command) are written here on change and reloaded at
 # boot, so runtime-granted opers survive a restart. Revoked accounts are dropped
 # from the file. Leave unset to keep runtime grants in-memory only.
-# grants_path = "/var/lib/orochi/oper_grants.tsv"
+# grants_path = "/var/lib/onyx-server/oper_grants.tsv"
 # Path for persisting the Event Spine history ring so `EVENT REPLAY` survives a
 # USR2 hot-upgrade and a cold restart. Rewritten on the stats cadence, loaded at
 # boot. Leave unset to keep event history in-memory (per-process lifetime).
-# event_history_path = "/var/lib/orochi/event_history.bin"
+# event_history_path = "/var/lib/onyx-server/event_history.bin"
 
 
 # --- [[opers]] — operator bindings (SASL-only) -------------------------------
@@ -796,10 +796,10 @@ max_token_bytes = 32
 [stats]
 # Directory to publish stats.json + index.html into (e.g. an nginx root).
 # Empty = disabled.
-# dir = "/var/www/orochi"
+# dir = "/var/www/onyx-server"
 # Directory to publish channel statistics JSON and .chanstats.snapshot.
 # Empty = disabled.
-# channel_dir = "/var/www/orochi/stats/data"
+# channel_dir = "/var/www/onyx-server/stats/data"
 interval = "30s"       # minimum interval between stats writes
 
 
@@ -807,7 +807,7 @@ interval = "30s"       # minimum interval between stats writes
 [backup]
 # Directory that receives timestamped accounts-*.db.snap, chanstats-*.snapshot,
 # and latest.json. Empty = disabled. Point this at a vault/sync-managed path.
-# dir = "/var/backups/orochi"
+# dir = "/var/backups/onyx-server"
 interval = "24h"
 
 

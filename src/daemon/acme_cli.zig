@@ -74,7 +74,7 @@ pub fn applyToml(opts: *Options, doc: *const toml.Document) void {
 /// Print a one-line usage summary for the acme-issue subcommand.
 pub fn usage() void {
     dlog.log(
-        \\usage: orochi acme-issue --domain <fqdn> --out <path> [options]
+        \\usage: onyx-server acme-issue --domain <fqdn> --out <path> [options]
         \\  --domain <fqdn>        domain to issue for (required)
         \\  --out <path>           cert chain output path (required; kain-owned dir)
         \\  --key-out <path>       cert key output path (default: <out>.key.pem)

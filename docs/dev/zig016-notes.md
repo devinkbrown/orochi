@@ -1,7 +1,7 @@
 # Zig 0.16 notes and worker integration rules
-*Historical design note: records Zig 0.16 API facts and worker integration rules for internal Orochi development.*
+*Historical design note: records Zig 0.16 API facts and worker integration rules for internal Onyx Server development.*
 
-Orochi targets **Zig 0.16.0**. The standard library differs significantly from older Zig releases; code written from memory of 0.11–0.14 will not compile reliably. Verify every change by compiling.
+Onyx Server targets **Zig 0.16.0**. The standard library differs significantly from older Zig releases; code written from memory of 0.11–0.14 will not compile reliably. Verify every change by compiling.
 
 ## Confirmed Zig 0.16 API facts
 
@@ -54,7 +54,7 @@ Each file you create must be self-contained (import only `std`) so it can be tes
 
 This mandate applies to every module and has highest priority.
 
-Orochi is a **clean-room, modern, inventive** IRC daemon. Do not port or copy legacy IRC daemon code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT mesh world.
+Onyx Server is a **clean-room, modern, inventive** IRC daemon. Do not port or copy legacy IRC daemon code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT mesh world.
 
 **Banned legacy behavior — never implement, and remove if found:**
 
@@ -82,7 +82,7 @@ The services.zig backend stays I/O-free (typed results); the daemon command laye
 
 ## Cross-platform mandate
 
-Orochi targets **x86_64/aarch64 on linux, macos, freebsd, and windows**. Write portable code:
+Onyx Server targets **x86_64/aarch64 on linux, macos, freebsd, and windows**. Write portable code:
 - Never call `std.os.linux.*` directly in portable modules. Gate OS-specifics behind
   `comptime switch (@import("builtin").os.tag)`. Provide a portable fallback for every fast path.
 - **Reactor:** io_uring is a Linux-only fast path behind the `Reactor` seam. The portable backend is

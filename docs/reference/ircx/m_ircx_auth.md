@@ -1,6 +1,6 @@
 # IRCX AUTH
 
-_The IRCX `AUTH` command — a SASL negotiation surface for the legacy, pre-CAP IRCX path, layered over Orochi's live SASL mechanisms._
+_The IRCX `AUTH` command — a SASL negotiation surface for the legacy, pre-CAP IRCX path, layered over Onyx Server's live SASL mechanisms._
 
 `AUTH` is a real server command registered in
 [`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig), handled
@@ -11,7 +11,7 @@ and reply builders are in
 through the shared `sasl_mechrouter`, so IRCX AUTH and IRCv3
 `CAP`/`AUTHENTICATE` share one mechanism backend.
 
-> Orochi's primary authentication is IRCv3 SASL over `CAP`/`AUTHENTICATE`. IRCX
+> Onyx Server's primary authentication is IRCv3 SASL over `CAP`/`AUTHENTICATE`. IRCX
 > `AUTH` is the alternate path for IRCX clients that negotiate before (or
 > without) CAP; it is not the recommended surface.
 

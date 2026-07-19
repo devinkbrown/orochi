@@ -1,8 +1,8 @@
-# Orochi Event Spine
+# Onyx Server Event Spine
 
 *The typed, mesh-propagated operator/observer event bus as implemented in the current source tree.*
 
-Orochi replaces the untyped snote/wallops broadcast channels of classic IRC with a typed **Event Spine**: daemon subsystems publish structured events, operator (and, for one type, ordinary) sessions subscribe by category or by subject glob, the events are rendered as chatsvc-faithful `:<server> EVENT <target> <body>` lines, and every event is fanned network-wide over the signed [Undertow](../reference/glossary.md) S2S link so opers on every node see it. The pure event model owns no allocation and keeps no global state — the daemon supplies subscriber storage, publish sinks, and render buffers ([src/daemon/event_spine.zig](../../src/daemon/event_spine.zig)).
+Onyx Server replaces the untyped snote/wallops broadcast channels of classic IRC with a typed **Event Spine**: daemon subsystems publish structured events, operator (and, for one type, ordinary) sessions subscribe by category or by subject glob, the events are rendered as chatsvc-faithful `:<server> EVENT <target> <body>` lines, and every event is fanned network-wide over the signed [Undertow](../reference/glossary.md) S2S link so opers on every node see it. The pure event model owns no allocation and keeps no global state — the daemon supplies subscriber storage, publish sinks, and render buffers ([src/daemon/event_spine.zig](../../src/daemon/event_spine.zig)).
 
 ## Two subscription planes, one delivery path
 

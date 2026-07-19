@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "orochi",
+        .name = "onyx-server",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -844,7 +844,7 @@ pub fn build(b: *std.Build) void {
     release_mod.addImport("build_info", build_info_mod);
     const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");
     const release_exe = b.addExecutable(.{
-        .name = "orochi",
+        .name = "onyx-server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -863,13 +863,13 @@ pub fn build(b: *std.Build) void {
     // `zig build` stays a plain binary install.
     //
     // Layout under <prefix>:
-    //   bin/orochi                              (ReleaseFast, stripped)
-    //   etc/orochi/orochi.reference.toml        (annotated reference config)
-    //   lib/systemd/system/orochi.service       (the unit; see its header)
+    //   bin/onyx-server                              (ReleaseFast, stripped)
+    //   etc/onyx-server/onyx-server.reference.toml   (annotated reference config)
+    //   lib/systemd/system/onyx-server.service       (the unit; see its header)
     const package_step = b.step("package", "Stage the daemon + deployment assets (binary, reference config, systemd unit) into the install prefix");
     package_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
-    package_step.dependOn(&b.addInstallFile(b.path("etc/orochi.reference.toml"), "etc/orochi/orochi.reference.toml").step);
-    package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/orochi.service"), "lib/systemd/system/orochi.service").step);
+    package_step.dependOn(&b.addInstallFile(b.path("etc/onyx-server.reference.toml"), "etc/onyx-server/onyx-server.reference.toml").step);
+    package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/onyx-server.service"), "lib/systemd/system/onyx-server.service").step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

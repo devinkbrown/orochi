@@ -1,4 +1,4 @@
-# Orochi IRCv3 capabilities
+# Onyx Server IRCv3 capabilities
 
 *Live CAP registry advertised during capability negotiation, sourced from `src/daemon/dispatch.zig`.*
 
@@ -19,10 +19,10 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `extended-join` | none | Extended JOIN support. | `src/daemon/dispatch.zig:303` |
 | `invite-notify` | none | Invite notifications. | `src/daemon/dispatch.zig:304` |
 | `account-tag` | none | Enables account tags. | `src/daemon/dispatch.zig:305` |
-| `orochi/session-sync` | none | Orochi vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
-| `orochi/bouncer` | none | Orochi vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
-| `orochi/topics` | none | Orochi vendor cap for named conversations: clients can receive `+orochi/topic=<label>` without generic `message-tags`, and discover topic-filtered CHATHISTORY. | `src/daemon/dispatch.zig` (`orochi_topics`) |
-| `orochi/e2ee` | none | Orochi vendor cap for the `+orochi/e2ee` client tag used by encrypted-room policy. | `src/daemon/dispatch.zig` (`orochi_e2ee`) |
+| `orochi/session-sync` | none | Onyx Server vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
+| `orochi/bouncer` | none | Onyx Server vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
+| `orochi/topics` | none | Onyx Server vendor cap for named conversations: clients can receive `+orochi/topic=<label>` without generic `message-tags`, and discover topic-filtered CHATHISTORY. | `src/daemon/dispatch.zig` (`orochi_topics`) |
+| `orochi/e2ee` | none | Onyx Server vendor cap for the `+orochi/e2ee` client tag used by encrypted-room policy. | `src/daemon/dispatch.zig` (`orochi_e2ee`) |
 | `chghost` | none | Receive CHGHOST lines for common-user host changes. | `src/daemon/dispatch.zig:316` |
 | `no-implicit-names` | none | Suppress automatic NAMES burst on JOIN for capable clients. | `src/daemon/dispatch.zig:319` |
 | `draft/no-implicit-names` | none | Draft spelling for the same negotiated capability as `no-implicit-names`; ACK echoes the requested token. | `src/daemon/dispatch.zig` (`no_implicit_names`) |

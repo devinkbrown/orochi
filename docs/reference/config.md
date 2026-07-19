@@ -1,12 +1,12 @@
-# Orochi configuration reference
+# Onyx Server configuration reference
 
 *Complete operator-facing reference for the daemon TOML format.*
 
 This reference is verified against `Config` and `parseToml` in `src/daemon/config_format.zig:29`, `src/daemon/config_format.zig:310`, and the live boot projection in `src/daemon/config_boot.zig:18`.
 
-Orochi is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native OroStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
+Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native OroStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
 
-Use `etc/orochi.reference.toml` as the runnable example and copy from it when building an instance config. Two keys are required: `[node].id >= 1` and `[listen].irc != 0`. Missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
+Use `etc/onyx-server.reference.toml` as the runnable example and copy from it when building an instance config. Two keys are required: `[node].id >= 1` and `[listen].irc != 0`. Missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
 
 ## Format rules
 
@@ -151,7 +151,7 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `admission_min_revocation_epoch` | integer | `0` | `0..u64_max` | Minimum accepted MeshPass token revocation epoch for all configured `admission_roots`. |
 | `relay_v2_authoring` | string | `"compat"` | `"compat"`, `"active"` | Controls only local MESSAGE_V2 authoring. Compatibility nodes receive, ACK, retain, and forward V2 but author legacy only. Active nodes author each V2-eligible mesh event as V2 only; an admitted event never falls back to a legacy twin. Active mode requires a complete staged epoch/roster plan. |
 | `relay_v2_activation_epoch` | integer | `0` | `0..i64_max` | Monotonic operator rollout generation, not a timestamp. Zero means no plan. A non-zero value requires `relay_v2_roster`; the exact value is bound into current Helix state. |
-| `relay_v2_roster` | array of strings | `[]` | 2..4096 unique hex/base64 Ed25519 public keys | Complete secured-mesh node roster for the activation generation, distinct from direct-neighbor `trust_roots`. Orochi decodes and sorts the full keys, requires the local key and every direct-neighbor pin, and binds a domain-separated BLAKE3 digest into Helix. |
+| `relay_v2_roster` | array of strings | `[]` | 2..4096 unique hex/base64 Ed25519 public keys | Complete secured-mesh node roster for the activation generation, distinct from direct-neighbor `trust_roots`. Onyx Server decodes and sorts the full keys, requires the local key and every direct-neighbor pin, and binds a domain-separated BLAKE3 digest into Helix. |
 | `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 | `require_signed_frames` | bool | `true` | `true`/`false` | For secured S2S peers with a node signing key, require the remote handshake to advertise signed-frame support and reject unsigned direct-owned mesh state frames. Set false only for an explicit mixed-rollout window. |
@@ -597,7 +597,7 @@ Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/con
 | `[[tls.sni]]` | array of tables | empty | `server_names`, `cert_path`, `key_path` | Adds SNI-selectable certificate material. Each entry is loaded with the same cert/key loader as the default leaf, validated before the listener is wired, and handed to the TLS engine as a `tls_server.SniCert`. A bad entry disables TLS startup rather than running a half-configured listener. |
 | `[[tls.ech_keys]]` | array of tables | empty | `config_path` plus 64-hex-byte `private_key` | Opt-in server ECH acceptance. `config_path` is a single-entry ECHConfigList file; `private_key` is the matching X25519 HPKE recipient key. Bad files or key/config mismatches disable TLS at boot before the listener is wired. Empty keeps ECH off and preserves existing ClientHelloOuter behavior. |
 
-Orochi has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
+Onyx Server has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
 
 ## `[sts]`
 

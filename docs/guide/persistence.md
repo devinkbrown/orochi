@@ -2,7 +2,7 @@
 
 *Configure OroStore, the Zig-native key/value store that backs accounts and services.*
 
-Orochi persistence is OroStore, a Zig-native store rather than LMDB. OroStore is an in-memory typed key/value database backed by a checksummed append-only WAL, snapshot compaction, and a bounded recent-mutation feed (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
+Onyx Server persistence is OroStore, a Zig-native store rather than LMDB. OroStore is an in-memory typed key/value database backed by a checksummed append-only WAL, snapshot compaction, and a bounded recent-mutation feed (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
 
 ## Opening a store
 

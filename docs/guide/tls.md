@@ -1,8 +1,8 @@
 # TLS and STS
 
-*Configure implicit TLS listeners and Strict Transport Security (STS) for a modern-only Orochi deployment.*
+*Configure implicit TLS listeners and Strict Transport Security (STS) for a modern-only Onyx Server deployment.*
 
-Orochi is modern-only: TLS is implicit on a separate listener, and there is no STARTTLS command path (`src/main.zig:216`, `src/main.zig:219`, `src/daemon/dispatch.zig:369`). A TLS-first deployment enables `[tls]` and usually `[sts]`, while still providing the currently required `[listen].irc` parser key.
+Onyx Server is modern-only: TLS is implicit on a separate listener, and there is no STARTTLS command path (`src/main.zig:216`, `src/main.zig:219`, `src/daemon/dispatch.zig:369`). A TLS-first deployment enables `[tls]` and usually `[sts]`, while still providing the currently required `[listen].irc` parser key.
 
 ## TLS listener
 
@@ -27,7 +27,7 @@ Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine reques
 
 ## Protocol capabilities
 
-Orochi ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.
+Onyx Server ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.
 
 A hardened TLS 1.2 client and server engine also exists as standalone modules (`src/crypto/tls12{,_client,_server}.zig`) for interop where TLS 1.3 is unavailable. It is deliberately restricted to ECDHE key exchange with AEAD suites only — ECDHE-ECDSA/RSA with AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 over secp256r1 — with no CBC, RC4, static-RSA key exchange, compression, or renegotiation. The TLS 1.2 PRF, key schedule, GCM (RFC 5288) and ChaCha20-Poly1305 (RFC 7905) record layer, and Finished message are all implemented and loopback-tested. Server-side ServerKeyExchange signing is ECDSA-P256.
 
@@ -39,7 +39,7 @@ A hardened TLS 1.2 client and server engine also exists as standalone modules (`
 | HelloRetryRequest | The client handles HRR (cookie echo, RFC 5280 group rules, synthetic `message_hash` transcript, second-HRR-fatal). |
 | Post-handshake KeyUpdate | Honored in both directions: the receiving side rotates its traffic keys and replies with its own KeyUpdate when requested. |
 | Mutual TLS | The server can request an Ed25519 client certificate; its fingerprint (CertFP) backs SASL EXTERNAL (see below). |
-| Delegated credentials | TLS client/server consume RFC 9345 delegated credentials when explicitly configured/offered. The out-of-band helper `orochi delegated-credential inspect|validate` parses ready-made DC wire bytes and can validate the leaf signature, DelegationUsage, KeyUsage, and lifetime window against a leaf certificate. Minting/rotation is still not shipped because it needs production private-key loading and safe DC key-output policy. |
+| Delegated credentials | TLS client/server consume RFC 9345 delegated credentials when explicitly configured/offered. The out-of-band helper `onyx-server delegated-credential inspect|validate` parses ready-made DC wire bytes and can validate the leaf signature, DelegationUsage, KeyUsage, and lifetime window against a leaf certificate. Minting/rotation is still not shipped because it needs production private-key loading and safe DC key-output policy. |
 
 **TLS 1.3 handshake hardening (server):** the server side is fail-closed across the handshake state machine (`src/crypto/tls_server.zig`):
 
@@ -57,9 +57,9 @@ The helper is an offline inspection/validation path. It never starts the daemon,
 binds a listener, loads the server's private key, or mints new credentials.
 
 ```sh
-orochi delegated-credential inspect --dc dc.wire
-orochi delegated-credential validate --dc dc.wire --cert fullchain.pem
-orochi delegated-credential validate --dc dc.wire --cert fullchain.pem --time 1704067200
+onyx-server delegated-credential inspect --dc dc.wire
+onyx-server delegated-credential validate --dc dc.wire --cert fullchain.pem
+onyx-server delegated-credential validate --dc dc.wire --cert fullchain.pem --time 1704067200
 ```
 
 `--dc` is the raw `DelegatedCredential` extension payload. `inspect` validates

@@ -109,7 +109,7 @@ fn svcDropChannel(ctx: *anyopaque, channel: []const u8) orochi.daemon.services.S
 pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\
-        \\  Orochi {s}  (大蛇)
+        \\  Onyx Server {s}
         \\  Zig-native mesh IRC daemon — Undertow + Mooring mesh
         \\
         \\
@@ -207,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
         // validation. Exits 0 on success, 1 on any read/parse error.
         if (std.mem.eql(u8, first, "--check-config")) {
             const path = args.next() orelse {
-                std.debug.print("usage: orochi --check-config <path>\n", .{});
+                std.debug.print("usage: onyx-server --check-config <path>\n", .{});
                 std.process.exit(2);
             };
             const resolver = orochi.daemon.config_format.Resolver{
@@ -315,11 +315,11 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
             std.debug.print(
-                \\usage: orochi [CONFIG_PATH]
-                \\       orochi --check-config <path>
-                \\       orochi --version
-                \\       orochi acme-issue ...
-                \\       orochi delegated-credential inspect|validate ...
+                \\usage: onyx-server [CONFIG_PATH]
+                \\       onyx-server --check-config <path>
+                \\       onyx-server --version
+                \\       onyx-server acme-issue ...
+                \\       onyx-server delegated-credential inspect|validate ...
                 \\
             , .{});
             return;

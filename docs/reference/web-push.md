@@ -1,9 +1,9 @@
-# Orochi Web Push
+# Onyx Server Web Push
 
 *Server-sent browser push notifications for offline recipients — RFC 8291 message
 encryption and RFC 8292 VAPID authorization, delivered by a background worker.*
 
-Orochi can nudge a logged-out account's browser when an offline DM (tegami) arrives,
+Onyx Server can nudge a logged-out account's browser when an offline DM (tegami) arrives,
 so the recipient sees it "with the tab closed." The push body is encrypted
 end-to-end to the browser: the server never holds a plaintext channel to the push
 service, only ciphertext it forwards. The message crypto is a pure, deterministic

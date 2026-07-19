@@ -87,7 +87,7 @@ pub fn buildNewsRequest(buf: []u8, host: []const u8, path: []const u8) Error![]c
     try c.write(if (path.len == 0) "/" else path);
     try c.write(" HTTP/1.1\r\nHost: ");
     try c.write(host);
-    try c.write("\r\nUser-Agent: Orochi-news/1\r\nAccept: application/rss+xml, application/xml, text/xml\r\nConnection: close\r\n\r\n");
+    try c.write("\r\nUser-Agent: onyx-server-news/1\r\nAccept: application/rss+xml, application/xml, text/xml\r\nConnection: close\r\n\r\n");
     return c.written();
 }
 

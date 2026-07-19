@@ -1,8 +1,8 @@
 # Command reference
 
-*The complete client command surface of the Orochi daemon, sourced from the live dispatch path.*
+*The complete client command surface of the Onyx Server daemon, sourced from the live dispatch path.*
 
-Orochi is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:3413`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1233`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
+Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:3413`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1233`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
 
 Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:239`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:3450`). Numeric names and codes are verified against `src/proto/numeric.zig:9` and the server-local enum (`src/daemon/server.zig:701`).
 

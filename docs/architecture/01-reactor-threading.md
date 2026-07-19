@@ -2,7 +2,7 @@
 
 _The Ringlane io_uring reactor, per-reactor connection state, worker shards, cross-shard delivery, world locking, and the live multithreading status._
 
-Orochi's live Linux server still owns an embedded Ringlane wrapper in `src/daemon/server.zig`, while the reusable substrate Ringlane backend now lives under `src/substrate/io/`. The live server comment defines the socket path as TCP accept, receive IRC bytes through `Ring`, feed complete LF-terminated lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:4`, `src/daemon/server.zig:6`, `src/daemon/server.zig:7`, `src/daemon/server.zig:8`.
+Onyx Server's live Linux server still owns an embedded Ringlane wrapper in `src/daemon/server.zig`, while the reusable substrate Ringlane backend now lives under `src/substrate/io/`. The live server comment defines the socket path as TCP accept, receive IRC bytes through `Ring`, feed complete LF-terminated lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:4`, `src/daemon/server.zig:6`, `src/daemon/server.zig:7`, `src/daemon/server.zig:8`.
 
 ## Ringlane reactor core
 

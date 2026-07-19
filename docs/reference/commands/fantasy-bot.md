@@ -2,7 +2,7 @@
 
 *Server-answered in-channel `!` commands for weather and news, with no pseudo-clients.*
 
-Orochi answers a small set of in-channel `!` fantasy commands directly from the
+Onyx Server answers a small set of in-channel `!` fantasy commands directly from the
 server, with no pseudo-clients (`src/daemon/server.zig:11150`, `handleFantasy`).
 The triggering message reaches the channel normally; the server posts the answer
 as a `NOTICE` sourced from this node's `server_name` and relays it once across the
