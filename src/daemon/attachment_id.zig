@@ -212,11 +212,11 @@ test "presence and route derivation are deterministic and domain separated" {
     // Fixed vectors pin the domain, token/attachment ordering, hash, and
     // 128-bit truncation.
     try std.testing.expectEqualStrings(
-        "80a5882324b7c821c0746a6c1ee9277b",
+        "304949eb731faac4759e201cfd370777",
         &std.fmt.bytesToHex(presence_a, .lower),
     );
     try std.testing.expectEqualStrings(
-        "5b822bd872fc48fbf86f62db678f59ca",
+        "c6a0443c4add50bf005e9f23fb3f6b80",
         &std.fmt.bytesToHex(route_a, .lower),
     );
 }

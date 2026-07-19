@@ -611,11 +611,11 @@ test "SRM2 deterministic claim and consume vectors round trip" {
     try testing.expect(claimEql(claim, signed_consume.claim.claim));
 
     try testing.expectEqualStrings(
-        "5d8c34291616abcaef9e3fc3897dc468f94ce67526a5c520b038625660b60363",
+        "3060deee227454b0aac36a47bd1423cac2157ffa15a798177fab1253d9a999f3",
         &std.fmt.bytesToHex(digestBytes(claim_wire), .lower),
     );
     try testing.expectEqualStrings(
-        "3ce5ec014866e4ac628350a4bf73ef937b6f67ca66eb3826e04d711736dd1f25",
+        "4b8c9485bff31ce19b9fb5abaca4fd637ecc9a044c27045b292eb765caa2a6ae",
         &std.fmt.bytesToHex(digestBytes(consume_wire), .lower),
     );
 }

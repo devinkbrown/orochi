@@ -4341,7 +4341,7 @@ test "channel register and access grant" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-    const registered = try services.registerChannel("#OnyxServer", "alice", &scratch);
+    const registered = try services.registerChannel("#Onyx", "alice", &scratch);
     try std.testing.expectEqualStrings("#onyx", registered.registered_channel.name.asSlice());
     try std.testing.expectEqualStrings("alice", registered.registered_channel.founder.asSlice());
 
@@ -4367,7 +4367,7 @@ test "channel mlock access akick and ward replay from durable services" {
 
         _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
         _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-        _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
+        _ = try services.registerChannel("#Onyx", "alice", &scratch);
         _ = try services.setChannel("#onyx", "alice", .{ .mlock = "+nt-k" }, &scratch);
         _ = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
         _ = try services.channelAkick("#onyx", "alice", "Bad!*@*", .add, "go away", &scratch);
@@ -4591,7 +4591,7 @@ test "channel access and akick query require admin" {
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
     _ = try services.registerAccount("mallory", "a third correct battery staple", &scratch);
-    _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
+    _ = try services.registerChannel("#Onyx", "alice", &scratch);
     _ = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
     _ = try services.channelAkick("#onyx", "alice", "Bad!*@*", .add, "go away", &scratch);
 
@@ -4728,7 +4728,7 @@ test "state hook fires on channel register and drop" {
     var scratch: [record_max]u8 = undefined;
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
-    _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
+    _ = try services.registerChannel("#Onyx", "alice", &scratch);
     // The canonical (lowercased) channel name is bridged to the live world.
     try std.testing.expectEqualStrings("#onyx", rec.created[0..rec.created_len]);
     try std.testing.expectEqual(@as(usize, 0), rec.dropped_len);

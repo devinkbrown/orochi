@@ -300,6 +300,179 @@ pub const TokenBindRowSnapshot = struct {
     portable_resume: bool,
 };
 
+pub const BootstrapDetachedSource = struct {
+    client: ClientId,
+    snapshot: []const u8,
+};
+
+/// Prepared insertion of a new runtime claimant directly into a preselected
+/// reusable-token group. Unlike `attachReportingEviction`, preparation never
+/// removes a detached row: all map/list/index capacity and per-row journal
+/// storage is reserved first, then the retained exclusive lock freezes the
+/// selected local source until the caller's restore staging is complete.
+pub const PreparedBootstrapTokenAttach = struct {
+    const State = enum { prepared, committed, aborted, finished };
+
+    store: *SessionStore,
+    account: []const u8,
+    list: *SessionList,
+    client: ClientId,
+    token: Token,
+    signon_ms: i64,
+    kind: TokenBindKind,
+    target_portable: bool,
+    target_dirty: bool,
+    target_projection_dirty: bool,
+    target_local_projections: LocalChannelProjectionSet,
+    locked_account_rows: []TokenBindRowSnapshot,
+    projection_storage: ?*LocalChannelProjectionSet = null,
+    staged_target_token_entry: ?TokenIndexEntry = null,
+    staged_account_key: ?[]u8 = null,
+    staged_account_list: ?*SessionList = null,
+    evict_index: ?usize,
+    detached_source_list: ?*SessionList,
+    detached_source_index: ?usize,
+    state: State = .prepared,
+
+    pub fn accountRows(self: *const PreparedBootstrapTokenAttach) []const TokenBindRowSnapshot {
+        std.debug.assert(self.state == .prepared or self.state == .committed);
+        return self.locked_account_rows;
+    }
+
+    pub fn resultPortable(self: *const PreparedBootstrapTokenAttach) bool {
+        return switch (self.kind) {
+            .join_existing => self.target_portable,
+            .adopt_verified => |portable| portable or self.target_portable,
+        };
+    }
+
+    pub fn mergedLocalChannelProjectionsInto(
+        self: *const PreparedBootstrapTokenAttach,
+        out: []LocalChannelProjection,
+    ) []const LocalChannelProjection {
+        const source = self.target_local_projections.slice();
+        std.debug.assert(out.len >= source.len);
+        if (out.len < source.len) return out[0..0];
+        @memcpy(out[0..source.len], source);
+        return out[0..source.len];
+    }
+
+    /// Borrow the newest exact-token detached image while the ticket retains
+    /// the store lock. This source is never consumed before `commit`.
+    pub fn detachedSource(self: *const PreparedBootstrapTokenAttach) ?BootstrapDetachedSource {
+        if (self.state != .prepared) return null;
+        const index = self.detached_source_index orelse return null;
+        const row = self.detached_source_list.?.items.items[index];
+        return .{ .client = row.client, .snapshot = row.snapshot orelse return null };
+    }
+
+    /// Publish the already-reserved row insertion and optional cap eviction.
+    /// No allocation or failure remains after preparation.
+    pub fn commit(self: *PreparedBootstrapTokenAttach) AttachOutcome {
+        std.debug.assert(self.state == .prepared);
+        const account_list = if (self.staged_account_list) |staged| blk: {
+            const key = self.staged_account_key.?;
+            self.store.accounts.putAssumeCapacity(key, staged.*);
+            self.store.allocator.destroy(staged);
+            self.staged_account_list = null;
+            self.staged_account_key = null;
+            self.list = self.store.accounts.getPtr(key).?;
+            self.account = self.store.accounts.getEntry(key).?.key_ptr.*;
+            break :blk self.list;
+        } else self.list;
+
+        var evicted: ?EvictedSession = null;
+        if (self.evict_index) |index| {
+            const displaced = account_list.items.items[index];
+            evicted = .{
+                .client = displaced.client,
+                .token = displaced.token,
+                .attachment_id = displaced.attachment_id,
+                .portable = displaced.portable_resume,
+            };
+            self.store.removeDirtyRowLocked(&account_list.items.items[index]);
+            self.store.removeTokenRowLocked(
+                self.account,
+                displaced,
+                std.crypto.timing_safe.eql(Token, displaced.token, self.token),
+            );
+            self.store.removeAttachmentIndexLocked(displaced);
+            freeSessionOwned(self.store.allocator, &account_list.items.items[index]);
+            _ = account_list.items.swapRemove(index);
+        }
+
+        const session = Session{
+            .client = self.client,
+            .token = self.token,
+            .signon_ms = self.signon_ms,
+            .portable_resume = self.resultPortable(),
+            .replica_dirty = self.target_dirty,
+            .replica_projection_dirty = self.target_projection_dirty,
+            .local_channel_projections = self.projection_storage,
+        };
+        self.projection_storage = null;
+        account_list.items.appendAssumeCapacity(session);
+        if (session.replica_dirty) self.store.dirty_replica_rows += 1;
+        if (session.replica_projection_dirty) self.store.dirty_projection_rows += 1;
+        if (session.local_channel_projections != null) self.store.dirty_local_projection_rows += 1;
+        self.store.addTokenRowLocked(self.account, session, &self.staged_target_token_entry);
+        self.state = .committed;
+        return .{ .session = session, .evicted = evicted };
+    }
+
+    pub fn finish(self: *PreparedBootstrapTokenAttach) void {
+        if (self.state == .finished) return;
+        std.debug.assert(self.state == .committed);
+        if (self.state != .committed) return;
+        self.destroyLockedRows();
+        self.state = .finished;
+        self.store.lock.unlockExclusive();
+    }
+
+    pub fn abort(self: *PreparedBootstrapTokenAttach) void {
+        if (self.state == .aborted or self.state == .finished) return;
+        std.debug.assert(self.state == .prepared);
+        if (self.state != .prepared) return;
+        self.destroyStaged();
+        self.destroyLockedRows();
+        self.state = .aborted;
+        self.store.lock.unlockExclusive();
+    }
+
+    pub fn deinit(self: *PreparedBootstrapTokenAttach) void {
+        switch (self.state) {
+            .prepared => self.abort(),
+            .committed => {
+                self.destroyStaged();
+                self.destroyLockedRows();
+                self.state = .finished;
+                self.store.lock.unlockExclusive();
+                std.debug.assert(false);
+            },
+            .aborted, .finished => {},
+        }
+    }
+
+    fn destroyStaged(self: *PreparedBootstrapTokenAttach) void {
+        if (self.projection_storage) |storage| self.store.allocator.destroy(storage);
+        self.projection_storage = null;
+        if (self.staged_target_token_entry) |*entry| entry.deinit(self.store.allocator);
+        self.staged_target_token_entry = null;
+        if (self.staged_account_list) |list| {
+            list.deinit(self.store.allocator);
+            self.store.allocator.destroy(list);
+        }
+        self.staged_account_list = null;
+        if (self.staged_account_key) |key| self.store.allocator.free(key);
+        self.staged_account_key = null;
+    }
+
+    fn destroyLockedRows(self: *PreparedBootstrapTokenAttach) void {
+        if (self.locked_account_rows.len != 0) self.store.allocator.free(self.locked_account_rows);
+        self.locked_account_rows = &.{};
+    }
+};
+
 /// A token bind prepared while holding the store's exclusive lock. Preparation
 /// captures every value needed by the commit, so `commit` performs no allocation
 /// and cannot expose a half-applied token-group merge. The lock remains held after
@@ -1378,6 +1551,163 @@ pub const SessionStore = struct {
             .ghost_client = target_list.items.items[target_index].client,
             .token = token,
             .attachment_id = attachment_id,
+        };
+    }
+
+    /// Prepare a brand-new claimant directly under a caller-selected token.
+    /// This is the bootstrap counterpart to `prepareTokenBind`: no provisional
+    /// generated-token row is published, and an account-cap victim remains
+    /// fully live in the store until the caller has staged its restore.
+    pub fn prepareBootstrapTokenAttach(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        kind: TokenBindKind,
+        signon_ms: i64,
+    ) ?PreparedBootstrapTokenAttach {
+        if (tokenIsSentinel(token)) return null;
+        self.lock.lockExclusive();
+        var keep_locked = false;
+        defer if (!keep_locked) self.lock.unlockExclusive();
+
+        const target = self.tokenGroupStateForAccountLocked(account, token) orelse return null;
+        if (kind == .join_existing and !target.found) return null;
+
+        // Reject a duplicate runtime id even when case-variant account keys
+        // exist. The ticket must represent a genuinely new claimant.
+        var folded_row_count: usize = 0;
+        var count_it = self.accounts.iterator();
+        while (count_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            folded_row_count = std.math.add(
+                usize,
+                folded_row_count,
+                entry.value_ptr.items.items.len,
+            ) catch return null;
+            if (entry.value_ptr.indexOfClient(client) != null) return null;
+        }
+
+        const existing_entry = self.accounts.getEntry(account);
+        var staged_account_key: ?[]u8 = null;
+        defer if (staged_account_key) |key| self.allocator.free(key);
+        var staged_account_list: ?*SessionList = null;
+        defer if (staged_account_list) |list| {
+            list.deinit(self.allocator);
+            self.allocator.destroy(list);
+        };
+        var list: *SessionList = undefined;
+        var evict_index: ?usize = null;
+        if (existing_entry) |entry| {
+            list = entry.value_ptr;
+            if (list.items.items.len >= self.cfg.max_sessions_per_account) {
+                evict_index = oldestDetached(list) orelse return null;
+            } else {
+                list.items.ensureUnusedCapacity(self.allocator, 1) catch return null;
+            }
+        } else {
+            if (self.accounts.count() >= self.cfg.max_accounts or
+                self.cfg.max_sessions_per_account == 0) return null;
+            self.accounts.ensureUnusedCapacity(1) catch return null;
+            staged_account_key = self.allocator.dupe(u8, account) catch return null;
+            staged_account_list = self.allocator.create(SessionList) catch return null;
+            staged_account_list.?.* = .{};
+            staged_account_list.?.items.ensureUnusedCapacity(self.allocator, 1) catch return null;
+            list = staged_account_list.?;
+        }
+
+        var staged_target_token_entry = self.reserveTokenRowInsertLocked(token) catch return null;
+        defer if (staged_target_token_entry) |*entry| entry.deinit(self.allocator);
+        var projection_storage: ?*LocalChannelProjectionSet = null;
+        defer if (projection_storage) |storage| self.allocator.destroy(storage);
+        if (!target.local_projections.isEmpty()) {
+            projection_storage = self.allocator.create(LocalChannelProjectionSet) catch return null;
+            projection_storage.?.* = target.local_projections;
+        }
+
+        const preview_count = std.math.add(usize, folded_row_count, 1) catch return null;
+        const locked_account_rows = self.allocator.alloc(TokenBindRowSnapshot, preview_count) catch return null;
+        var rows_transferred = false;
+        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        var preview_index: usize = 0;
+        var rows_it = self.accounts.iterator();
+        while (rows_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            for (entry.value_ptr.items.items) |row| {
+                locked_account_rows[preview_index] = .{
+                    .client = row.client,
+                    .token = row.token,
+                    .attachment_id = row.attachment_id,
+                    .attached = row.attached,
+                    .portable_resume = row.portable_resume,
+                };
+                preview_index += 1;
+            }
+        }
+        locked_account_rows[preview_index] = .{
+            .client = client,
+            .token = token,
+            .attachment_id = null,
+            .attached = true,
+            .portable_resume = switch (kind) {
+                .join_existing => target.portable,
+                .adopt_verified => |portable| portable or target.portable,
+            },
+        };
+
+        var detached_source_list: ?*SessionList = null;
+        var detached_source_index: ?usize = null;
+        var detached_signon: i64 = std.math.minInt(i64);
+        if (existing_entry != null) {
+            for (list.items.items, 0..) |row, row_index| {
+                if (row.attached or row.snapshot == null or
+                    !std.crypto.timing_safe.eql(Token, row.token, token)) continue;
+                if (detached_source_index == null or row.signon_ms > detached_signon or
+                    (row.signon_ms == detached_signon and
+                        row.client > list.items.items[detached_source_index.?].client))
+                {
+                    detached_source_list = list;
+                    detached_source_index = row_index;
+                    detached_signon = row.signon_ms;
+                }
+            }
+        }
+        // A detached exact-token restore replaces that selected ghost even when
+        // the account has spare capacity. This transfers, rather than
+        // duplicates, the retained physical authority. At cap it is also the
+        // only victim; no unrelated detached session is sacrificed.
+        if (detached_source_index) |source_index| evict_index = source_index;
+
+        rows_transferred = true;
+        const transferred_projection = projection_storage;
+        projection_storage = null;
+        const transferred_token_entry = staged_target_token_entry;
+        staged_target_token_entry = null;
+        const transferred_key = staged_account_key;
+        staged_account_key = null;
+        const transferred_list = staged_account_list;
+        staged_account_list = null;
+        keep_locked = true;
+        return .{
+            .store = self,
+            .account = if (existing_entry) |entry| entry.key_ptr.* else account,
+            .list = list,
+            .client = client,
+            .token = token,
+            .signon_ms = signon_ms,
+            .kind = kind,
+            .target_portable = target.portable,
+            .target_dirty = target.dirty,
+            .target_projection_dirty = target.projection_dirty,
+            .target_local_projections = target.local_projections,
+            .locked_account_rows = locked_account_rows,
+            .projection_storage = transferred_projection,
+            .staged_target_token_entry = transferred_token_entry,
+            .staged_account_key = transferred_key,
+            .staged_account_list = transferred_list,
+            .evict_index = evict_index,
+            .detached_source_list = detached_source_list,
+            .detached_source_index = detached_source_index,
         };
     }
 
@@ -5185,6 +5515,189 @@ test "prepared token join aborts cleanly then prepared commit needs no allocatio
     try testing.expect(s.tokenReplicaProjectionDirty(target));
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaRowCount());
     try testing.expectEqual(@as(usize, 2), s.dirtyReplicaProjectionRowCount());
+}
+
+test "prepared bootstrap joins a live token without publishing before commit" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const token = tok(0xD1);
+    _ = try s.attach("alice", 1, token, 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+
+    var prepared = s.prepareBootstrapTokenAttach(
+        "alice",
+        2,
+        token,
+        .join_existing,
+        20,
+    ) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expectEqual(@as(usize, 2), prepared.accountRows().len);
+    try testing.expect(prepared.resultPortable());
+    try testing.expect(prepared.detachedSource() == null);
+    try testing.expect(!s.lock.tryLockExclusive());
+
+    const outcome = prepared.commit();
+    try testing.expect(outcome.evicted == null);
+    prepared.finish();
+    try testing.expect(s.clientHasToken("alice", 1, token));
+    try testing.expect(s.clientHasToken("alice", 2, token));
+    try expectTokenIndexCoherent(&s);
+}
+
+test "prepared bootstrap abort preserves detached cap victim and exact snapshot" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+
+    const target = tok(0xD2);
+    const unrelated = tok(0xD3);
+    _ = try s.attach("alice", 1, target, 20);
+    _ = try s.attach("alice", 2, unrelated, 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "selected-snapshot"));
+    try testing.expect(s.markDetachedWithSnapshot("alice", 2, "unrelated-snapshot"));
+
+    var abandoned = s.prepareBootstrapTokenAttach(
+        "alice",
+        3,
+        target,
+        .join_existing,
+        30,
+    ) orelse return error.TestUnexpectedResult;
+    defer abandoned.deinit();
+    const source = abandoned.detachedSource() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ClientId, 1), source.client);
+    try testing.expectEqualStrings("selected-snapshot", source.snapshot);
+    abandoned.abort();
+
+    var rows: [2]Session = undefined;
+    const unchanged = s.sessionsInto("alice", &rows);
+    try testing.expectEqual(@as(usize, 2), unchanged.len);
+    try testing.expect(s.findDetachedTokenSessionInAccount("alice", target) != null);
+    const selected = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", target)).?;
+    defer testing.allocator.free(selected);
+    try testing.expectEqualStrings("selected-snapshot", selected);
+    const other = (try s.copyDetachedSnapshotInAccount(testing.allocator, "alice", unrelated)).?;
+    defer testing.allocator.free(other);
+    try testing.expectEqualStrings("unrelated-snapshot", other);
+
+    var committed = s.prepareBootstrapTokenAttach(
+        "alice",
+        3,
+        target,
+        .join_existing,
+        30,
+    ) orelse return error.TestUnexpectedResult;
+    defer committed.deinit();
+    const outcome = committed.commit();
+    try testing.expectEqual(@as(ClientId, 1), outcome.evicted.?.client);
+    try testing.expectEqual(target, outcome.evicted.?.token);
+    committed.finish();
+    try testing.expect(s.clientHasToken("alice", 3, target));
+    try testing.expect(s.findDetachedTokenSessionInAccount("alice", unrelated) != null);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "prepared bootstrap replaces selected detached ghost below account cap" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 3 });
+    defer s.deinit();
+
+    const target = tok(0xDA);
+    _ = try s.attach("alice", 1, target, 10);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "retained"));
+    var prepared = s.prepareBootstrapTokenAttach(
+        "alice",
+        2,
+        target,
+        .join_existing,
+        20,
+    ) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expectEqual(@as(ClientId, 1), prepared.detachedSource().?.client);
+    const outcome = prepared.commit();
+    try testing.expectEqual(@as(ClientId, 1), outcome.evicted.?.client);
+    prepared.finish();
+
+    var rows: [3]Session = undefined;
+    const current = s.sessionsInto("alice", &rows);
+    try testing.expectEqual(@as(usize, 1), current.len);
+    try testing.expectEqual(@as(ClientId, 2), current[0].client);
+    try testing.expect(current[0].attached);
+    try testing.expectEqual(target, current[0].token);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "prepared bootstrap verified mesh token creates a rowless account atomically" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    const verified = tok(0xD4);
+    var abandoned = s.prepareBootstrapTokenAttach(
+        "mesh-account",
+        9,
+        verified,
+        .{ .adopt_verified = true },
+        40,
+    ) orelse return error.TestUnexpectedResult;
+    defer abandoned.deinit();
+    try testing.expect(s.accounts.getPtr("mesh-account") == null);
+    abandoned.abort();
+    try testing.expect(s.accounts.getPtr("mesh-account") == null);
+    try testing.expect(!s.containsToken(verified));
+
+    var committed = s.prepareBootstrapTokenAttach(
+        "mesh-account",
+        9,
+        verified,
+        .{ .adopt_verified = true },
+        40,
+    ) orelse return error.TestUnexpectedResult;
+    defer committed.deinit();
+    const outcome = committed.commit();
+    try testing.expect(outcome.evicted == null);
+    committed.finish();
+    try testing.expect(s.clientHasToken("mesh-account", 9, verified));
+    try testing.expect(s.resumeHandleForClient("mesh-account", 9).?.portable);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "prepared bootstrap is leak-clean and non-destructive at every allocation failure" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var s = SessionStore.initWithConfig(allocator, .{ .max_sessions_per_account = 2 });
+            defer s.deinit();
+
+            const target = tok(0xD5);
+            const unrelated = tok(0xD6);
+            _ = try s.attach("alice", 1, target, 10);
+            _ = try s.attach("alice", 2, unrelated, 20);
+            if (!s.markDetachedWithSnapshot("alice", 1, "target-state")) return error.OutOfMemory;
+            if (!s.markDetachedWithSnapshot("alice", 2, "other-state")) return error.OutOfMemory;
+
+            var prepared = s.prepareBootstrapTokenAttach(
+                "alice",
+                3,
+                target,
+                .join_existing,
+                30,
+            ) orelse {
+                var rows: [2]Session = undefined;
+                const unchanged = s.sessionsInto("alice", &rows);
+                try testing.expectEqual(@as(usize, 2), unchanged.len);
+                try testing.expect(s.findDetachedTokenSessionInAccount("alice", target) != null);
+                try testing.expect(s.findDetachedTokenSessionInAccount("alice", unrelated) != null);
+                return error.OutOfMemory;
+            };
+            defer prepared.deinit();
+            _ = prepared.commit();
+            prepared.finish();
+            try testing.expect(s.clientHasToken("alice", 3, target));
+            try testing.expect(s.findDetachedTokenSessionInAccount("alice", unrelated) != null);
+            try expectTokenIndexCoherent(&s);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
 }
 
 test "prepared verified adopt rejects cross-account tokens and preserves rowless retry state" {

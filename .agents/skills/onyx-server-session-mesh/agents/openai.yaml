@@ -1,4 +1,4 @@
 interface:
   display_name: "Onyx Server Session Mesh"
   short_description: "Build exact mesh-wide reusable sessions"
-  default_prompt: "Use $onyx-session-mesh to implement and verify mesh-wide session resume and migration."
+  default_prompt: "Use $onyx-server-session-mesh to implement and verify mesh-wide session resume and migration."

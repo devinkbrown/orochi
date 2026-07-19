@@ -168,7 +168,7 @@ test_multi_request() {
         fail "curl --http3 exited $rc on the multi-request run"; dump_server_err; return 1
     fi
     # Expected (code size) per line, in order. num_connects must be 1 then 0,0,0.
-    local expected=$'200 15\n200 65536\n404 10\n200 131072'
+    local expected=$'200 13\n200 65536\n404 10\n200 131072'
     local got_codes; got_codes="$(printf '%s\n' "$summary" | awk '{print $1, $2}')"
     if [[ "$got_codes" != "$expected" ]]; then
         fail "multi-request results mismatch:"

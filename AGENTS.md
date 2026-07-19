@@ -58,7 +58,7 @@
 ## Skills and deterministic tooling
 
 - Canonical project skills live under `.agents/skills`; `.claude/skills` exposes the same tree so Codex and Claude use one source of truth.
-- Use `onyx-server-roadmap-execution` to resume or select roadmap slices, `onyx-session-mesh` for reusable sessions, `onyx-message-spine` for exact-once events, and `onyx-server-integration` for live daemon wiring.
+- Use `onyx-server-roadmap-execution` to resume or select roadmap slices, `onyx-server-session-mesh` for reusable sessions, `onyx-server-message-spine` for exact-once events, and `onyx-server-integration` for live daemon wiring.
 - Use `onyx-server-zig-verification` for gate selection and fault evidence, `onyx-server-cross-model-review` for grounded Claude review, and `onyx-server-release-deploy` for the ordered release workflow.
 - Use `onyx-server-agent-toolkit` only when changing the workflow itself. After agent, skill, or review-launcher changes, run its validator, Python authority tests, and snapshot-isolation shell regression.
 

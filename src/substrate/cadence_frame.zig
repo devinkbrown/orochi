@@ -862,11 +862,11 @@ test "ws-media MAC cross-repo KAT (shared with Onyx JS)" {
     var k32: [MAC_KEY_BYTES]u8 = undefined;
     deriveNativeMediaMacKey(&root, channel, participant, &k32);
     try testing.expectEqualSlices(u8, &hexBytes(
-        "0061a45986adfe168b5b661106ef8a41acb923c35b24c0825a021e3b979fe85e",
+        "1d4bbde57332c226590945e5a94259b4befe68264f6eeee864fe5adb741c2f0b",
     ), &k32);
 
     const tag = nativeMediaMacTag(&root, channel, participant, frame_buf[0..frame_len]);
-    try testing.expectEqualSlices(u8, &hexBytes("9f9e752df2696d9c3f2997f2113bd9dd"), &tag);
+    try testing.expectEqualSlices(u8, &hexBytes("5f274db2216a610c62affc09a34eebc9"), &tag);
 }
 
 /// Decode a compile-time hex literal to a fixed byte array (test helper).

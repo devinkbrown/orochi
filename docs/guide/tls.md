@@ -78,6 +78,15 @@ When `[tls].enabled` is true, `main.zig` loads the configured cert/key or bootst
 
 Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine requests a client certificate (`src/daemon/server.zig:2433`, `src/daemon/server.zig:2439`), and the SASL bridge maps the presented certificate fingerprint to an account binding (`src/daemon/sasl_bridge.zig:70`).
 
+Legacy clients such as WeeChat may use that binding for mesh-wide session resume
+without implementing the `SESSION RESUME` command. After SASL EXTERNAL succeeds, an
+exact account-and-requested-nick match attaches to the one matching logical session;
+multiple distinct session tokens fail closed. The first EXTERNAL login proactively
+offers signed portable state to secured peers, and a resumed attachment inherits the
+shared nick, channels, member modes, and message routing without emitting another
+logical JOIN or derived operator-prefix grant. A configured client certificate alone
+is insufficient: the connection must complete SASL EXTERNAL successfully.
+
 ## Protocol capabilities
 
 Onyx Server ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.

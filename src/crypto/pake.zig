@@ -33,8 +33,8 @@
 //! into a 64-byte value (SHA-512), reducing mod L to a scalar, then computing
 //! scalar·G.  This is a deterministic, verifiable construction.
 //!
-//!   M = SHA-512("onyx-spake2-M-v1") mod L · G
-//!   N = SHA-512("onyx-spake2-N-v1") mod L · G
+//!   M = SHA-512("orochi-spake2-M-v1") mod L · G
+//!   N = SHA-512("orochi-spake2-N-v1") mod L · G
 //!
 //! The resulting compressed byte values are embedded as constants below and
 //! were verified with the standalone helper at the bottom of this file.
@@ -100,7 +100,7 @@ pub const mac_len: usize = HmacSha256.mac_length; // 32
 // asserts equality, providing an audit trail without comptime overhead.
 // ---------------------------------------------------------------------------
 
-/// Party A's blinding point M = SHA-512("onyx-spake2-M-v1") mod L · G.
+/// Party A's wire-stable blinding point M = SHA-512("orochi-spake2-M-v1") mod L · G.
 const point_M_bytes: [point_len]u8 = .{
     0xB5, 0x38, 0x9D, 0xD4, 0x3A, 0xB9, 0x36, 0x39,
     0x50, 0x1F, 0x84, 0xCF, 0x69, 0xC5, 0xC3, 0xF0,
@@ -108,7 +108,7 @@ const point_M_bytes: [point_len]u8 = .{
     0xF8, 0x4F, 0xA2, 0x9F, 0x97, 0x73, 0xF3, 0xFA,
 };
 
-/// Party B's blinding point N = SHA-512("onyx-spake2-N-v1") mod L · G.
+/// Party B's wire-stable blinding point N = SHA-512("orochi-spake2-N-v1") mod L · G.
 const point_N_bytes: [point_len]u8 = .{
     0xC7, 0x3D, 0x5F, 0x5B, 0xAF, 0x83, 0x36, 0xC1,
     0xC6, 0x74, 0x6F, 0x4A, 0x7E, 0x86, 0x59, 0xC8,
@@ -540,8 +540,8 @@ test "deterministic: same seeds produce identical messages and keys" {
 
 test "blinding points match derivation and are distinct" {
     // Re-derive M and N at runtime and compare against embedded constants.
-    const derived_M = try deriveBlindingPoint("onyx-spake2-M-v1");
-    const derived_N = try deriveBlindingPoint("onyx-spake2-N-v1");
+    const derived_M = try deriveBlindingPoint("orochi-spake2-M-v1");
+    const derived_N = try deriveBlindingPoint("orochi-spake2-N-v1");
 
     try std.testing.expectEqualSlices(u8, &point_M_bytes, &derived_M);
     try std.testing.expectEqualSlices(u8, &point_N_bytes, &derived_N);

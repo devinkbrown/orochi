@@ -191,7 +191,7 @@ test "parseSeedHex rejects wrong lengths and non-hex input" {
 test "derivePath places the keyfile next to the config, or in the CWD" {
     const beside = try derivePath(testing.allocator, "/etc/onyx/onyx-server.toml");
     defer testing.allocator.free(beside);
-    try testing.expectEqualStrings("/etc/onyx-server/" ++ default_basename, beside);
+    try testing.expectEqualStrings("/etc/onyx/" ++ default_basename, beside);
 
     const bare = try derivePath(testing.allocator, "onyx_server.toml"); // no dir component
     defer testing.allocator.free(bare);

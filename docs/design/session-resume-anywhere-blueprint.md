@@ -16,6 +16,8 @@ different daemons in the secured mesh.
 - Every attachment inherits the logical session's identity and channel state.
 - Direct and channel events are delivered to every live attachment.
 - Any attachment may send messages, join, part, and otherwise participate.
+- A tokenless EXTERNAL reattachment does not emit a second logical JOIN or
+  re-announce an existing derived operator prefix such as `MODE #root +Y kain`.
 - A join or part made on one local attachment is reflected across its local siblings.
 - Detaching one socket does not publish a logical PART, QUIT, MONITOR-offline event,
   nick delay, or WHOWAS entry while another local attachment remains or a portable
@@ -33,11 +35,22 @@ The three credential types are intentionally separate:
 | 32 hex chars | Attach to one exact logical session on its origin daemon | `SESSION TOKEN`, then `SESSION RESUME` | While the logical session remains in `SessionStore` |
 | Mesh-sealed hex | Attach to that logical session on any secured mesh node | `SESSION MTOKEN`, then `SESSION RESUME` | 12 hours, absolute mesh wall clock |
 
-Account authentication does not select a device session. The client must present the
-exact local or portable session credential. Both forms are reusable capabilities:
-successful use adds an attachment and does not rotate, consume, or invalidate the
-credential. `SESSION MTOKEN` includes `expires=<unix-seconds>` so clients can discard
-stale portable state without decoding the sealed value.
+Account authentication normally does not select a device session. The client must
+present the exact local or portable session credential. The narrow compatibility
+exception is a possession-verified SASL EXTERNAL login: a client such as WeeChat that
+cannot send `SESSION RESUME` may attach automatically when its authenticated account
+and requested nick identify exactly one logical session. Multiple distinct matching
+tokens, malformed state, or allocation pressure fail closed without choosing a
+session. Merely presenting a certificate, or authenticating with PLAIN, SCRAM, or a
+session token, never enables this lookup.
+
+The first EXTERNAL attachment proactively publishes its signed portable session state
+without revealing a reclaim credential to the client. A later EXTERNAL attachment can
+therefore select the same unique account-and-nick session on another secured mesh node.
+Explicit local and portable credentials remain reusable capabilities: successful use
+adds an attachment and does not rotate, consume, or invalidate the credential.
+`SESSION MTOKEN` includes `expires=<unix-seconds>` so clients can discard stale
+portable state without decoding the sealed value.
 
 ## Lifecycle
 
@@ -103,7 +116,10 @@ preservation state.
 
 ## Mesh replication and authorization
 
-- Only a session for which an MTOKEN was issued is replicated.
+- Only a session for which an MTOKEN was issued, or whose connection completed
+  possession-verified SASL EXTERNAL, is replicated.
+- EXTERNAL portability is offered proactively so legacy clients can resume by a
+  unique account-and-nick match without implementing an MTOKEN command surface.
 - MTOKEN issuance offers the live snapshot immediately; waiting for detach would make
   simultaneous cross-node attachment impossible.
 - Snapshot offers are Ed25519-signed and travel only over Mooring-authenticated S2S

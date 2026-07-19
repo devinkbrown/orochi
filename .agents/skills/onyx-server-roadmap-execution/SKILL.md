@@ -13,4 +13,4 @@ description: Audit and execute Onyx Server roadmap work from current source trut
 6. Choose the smallest coherent slice that closes a user-visible contract end to end. Do not mark roadmap prose complete from a codec or helper test alone.
 7. Use `$onyx-server-zig-verification` for evidence and a fresh reviewer for release-critical work. Commit a coherent green slice locally; do not publish or deploy unless the release workflow is explicitly active.
 
-For reusable sessions or mesh migration, load `$onyx-session-mesh`. For Event Spine or message relay, load `$onyx-message-spine`. For `server.zig` wiring, load `$onyx-server-integration`.
+For reusable sessions or mesh migration, load `$onyx-server-session-mesh`. For Event Spine or message relay, load `$onyx-server-message-spine`. For `server.zig` wiring, load `$onyx-server-integration`.

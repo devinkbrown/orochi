@@ -2099,7 +2099,7 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
             else => return error.CurlFailed,
         }
         // Each request returned its correct status + body size, over one conn.
-        try testing.expect(asciiContainsIgnoreCase(multi.stdout, "200 15"));
+        try testing.expect(asciiContainsIgnoreCase(multi.stdout, "200 13"));
         try testing.expect(asciiContainsIgnoreCase(multi.stdout, "200 65536"));
         try testing.expect(asciiContainsIgnoreCase(multi.stdout, "404 10"));
 

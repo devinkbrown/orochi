@@ -1780,7 +1780,7 @@ test "set get overwrite delete and list properties" {
     var store = DefaultStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const entity = try Entity.fromId("#OnyxServer");
+    const entity = try Entity.fromId("#Onyx");
     const setter = Setter{ .id = "alice", .access = .owner };
 
     const first = try store.setProp(entity, "topic", "first", setter);

@@ -364,7 +364,7 @@ test "MetricsSnapshot set/copyInto round-trips owned text" {
     try testing.expectEqual(@as(usize, 0), snap.len());
 
     try snap.set("onyx_connections_total 7\n");
-    try testing.expectEqual(@as(usize, 27), snap.len());
+    try testing.expectEqual(@as(usize, 25), snap.len());
 
     var buf: [128]u8 = undefined;
     const got = try snap.copyInto(&buf);
@@ -401,7 +401,7 @@ test "handleRequest serves the snapshot for GET /metrics with the prom content t
 
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.containsAtLeast(u8, resp, 1, "Content-Type: " ++ content_type ++ "\r\n"));
-    try testing.expect(std.mem.containsAtLeast(u8, resp, 1, "Content-Length: 67\r\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, resp, 1, "Content-Length: 63\r\n"));
     try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n# TYPE onyx_connections_total counter\nonyx_connections_total 3\n"));
 }
 
