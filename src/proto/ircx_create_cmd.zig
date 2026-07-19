@@ -268,15 +268,15 @@ test "parse CREATE without modes" {
     const allocator = std.testing.allocator;
     const params = try allocator.alloc([]const u8, 1);
     defer allocator.free(params);
-    params[0] = "#orochi";
+    params[0] = "#onyx";
 
     const request = try parseParams(params);
-    try std.testing.expectEqualStrings("#orochi", request.channel);
+    try std.testing.expectEqualStrings("#onyx", request.channel);
     try std.testing.expectEqual(@as(?[]const u8, null), request.requestedModes());
     try std.testing.expectEqual(.founder, request.creator_status);
 
-    const line_request = try parse("CREATE #orochi\r\n");
-    try std.testing.expectEqualStrings("#orochi", line_request.channel);
+    const line_request = try parse("CREATE #onyx\r\n");
+    try std.testing.expectEqualStrings("#onyx", line_request.channel);
     try std.testing.expect(line_request.initial_modes == null);
 }
 
@@ -284,11 +284,11 @@ test "parse CREATE with modes and iterate changes" {
     const allocator = std.testing.allocator;
     const params = try allocator.alloc([]const u8, 2);
     defer allocator.free(params);
-    params[0] = "#orochi";
+    params[0] = "#onyx";
     params[1] = "+nt-i";
 
     const request = try parseParams(params);
-    try std.testing.expectEqualStrings("#orochi", request.channel);
+    try std.testing.expectEqualStrings("#onyx", request.channel);
     try std.testing.expectEqualStrings("+nt-i", request.requestedModes().?);
 
     var it = request.initial_modes.?.iterator();
@@ -297,7 +297,7 @@ test "parse CREATE with modes and iterate changes" {
     try std.testing.expectEqual(ModeChange{ .op = .remove, .mode = 'i' }, it.next().?);
     try std.testing.expectEqual(@as(?ModeChange, null), it.next());
 
-    const line_request = try parse("CREATE #orochi :+nt\r\n");
+    const line_request = try parse("CREATE #onyx :+nt\r\n");
     try std.testing.expectEqualStrings("+nt", line_request.requestedModes().?);
 }
 
@@ -330,22 +330,22 @@ test "validation rejects malformed CREATE input" {
     defer allocator.free(missing);
     try std.testing.expectError(error.MissingChannel, parseParams(missing));
 
-    const bad_channel = [_][]const u8{"orochi"};
+    const bad_channel = [_][]const u8{"onyx"};
     try std.testing.expectError(error.InvalidChannel, parseParams(&bad_channel));
 
-    const too_many = [_][]const u8{ "#orochi", "+nt", "#tmpl", "extra" };
+    const too_many = [_][]const u8{ "#onyx", "+nt", "#tmpl", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseParams(&too_many));
 
-    const bad_clone_source = [_][]const u8{ "#orochi", "+nt", "tmpl" };
+    const bad_clone_source = [_][]const u8{ "#onyx", "+nt", "tmpl" };
     try std.testing.expectError(error.InvalidChannel, parseParams(&bad_clone_source));
 
-    const bad_modes = [_][]const u8{ "#orochi", "+n t" };
+    const bad_modes = [_][]const u8{ "#onyx", "+n t" };
     try std.testing.expectError(error.InvalidModes, parseParams(&bad_modes));
 
-    const sign_only = [_][]const u8{ "#orochi", "+-" };
+    const sign_only = [_][]const u8{ "#onyx", "+-" };
     try std.testing.expectError(error.InvalidModes, parseParams(&sign_only));
 
-    try std.testing.expectError(error.UnknownCommand, parse("JOIN #orochi"));
+    try std.testing.expectError(error.UnknownCommand, parse("JOIN #onyx"));
 }
 
 test "reply builders render ack and error bytes" {
@@ -353,16 +353,16 @@ test "reply builders render ack and error bytes" {
     const out = try allocator.alloc(u8, 512);
     defer allocator.free(out);
 
-    const request = try parse("CREATE #orochi +nt");
+    const request = try parse("CREATE #onyx +nt");
     const ack = try buildAckReplies(out, .{
         .server_name = "irc.example",
         .recipient_nick = "alice",
         .creator = .{ .nick = "alice", .user = "u", .host = "cloak.example" },
     }, request);
     try std.testing.expectEqualStrings(
-        ":alice!u@cloak.example JOIN #orochi\r\n" ++
-            ":irc.example 353 alice = #orochi :!alice\r\n" ++
-            ":irc.example 366 alice #orochi :End of /NAMES list\r\n",
+        ":alice!u@cloak.example JOIN #onyx\r\n" ++
+            ":irc.example 353 alice = #onyx :!alice\r\n" ++
+            ":irc.example 366 alice #onyx :End of /NAMES list\r\n",
         ack,
     );
 
@@ -382,7 +382,7 @@ test "reply builders validate requests and buffer size" {
     const out = try allocator.alloc(u8, 16);
     defer allocator.free(out);
 
-    const request = try parse("CREATE #orochi");
+    const request = try parse("CREATE #onyx");
     try std.testing.expectError(error.OutputTooSmall, buildAckReplies(out, .{
         .server_name = "irc.example",
         .recipient_nick = "alice",

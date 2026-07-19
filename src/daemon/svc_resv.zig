@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Channel-name RESV registry for the Orochi IRC daemon.
+//! Channel-name RESV registry for the Onyx Server IRC daemon.
 //!
 //! This module is intentionally standalone: it imports only `std`, owns all
 //! reservation data it stores, and models real server command/numeric surfaces

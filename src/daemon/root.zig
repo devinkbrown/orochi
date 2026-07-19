@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! orochi-daemon — package root aggregating the daemon modules: the SerpentRegistry
+//! onyx-daemon — package root aggregating the daemon modules: the SerpentRegistry
 //! comptime command system, the CapProof permission lattice, in-process services,
 //! OroStore, and the media plane. See docs/architecture/ for the design. The live
 //! entry point is `LinuxServer` in `server.zig`, started from `src/main.zig`.

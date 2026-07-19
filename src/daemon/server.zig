@@ -600,7 +600,7 @@ const default_motd_template =
 /// so no fabricated JOIN/PART leaks. It must stay printable & space-free: the
 /// MEMBERSHIP codec (`membership_event.decode`) rejects control bytes (<0x20) in the
 /// channel field, so a control-char sentinel would be silently dropped on receive.
-/// See [[reference-orochi-crossnode-routing]].
+/// See [[reference-onyx-crossnode-routing]].
 const presence_channel: []const u8 = "~presence~";
 
 inline fn isPresenceChannel(name: []const u8) bool {
@@ -1109,7 +1109,7 @@ var upgrade_signal_requested = std.atomic.Value(bool).init(false);
 
 /// SIGUSR2 handler — async-signal-safe: records the request and returns. The
 /// re-exec runs later on reactor 0's loop (`onTimerTick`), so a shell-driven
-/// deploy (`systemctl kill -s USR2 orochi`) hot-upgrades the daemon while
+/// deploy (`systemctl kill -s USR2 onyx-server`) hot-upgrades the daemon while
 /// preserving every live client session, instead of dropping them all with a
 /// hard `systemctl restart`.
 fn onUpgradeSignal(_: posix.SIG) callconv(.c) void {
@@ -1182,7 +1182,7 @@ const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
 /// class policy means "use this default". Preserves the historical single-line
 /// LineTooLong bound when no class overrides recvq.
 const default_recvq_cap: usize = default_line_bytes;
-const server_name = "orochi.local";
+const server_name = "onyx.local";
 const default_host = "localhost";
 
 /// Number of channels tracked for the fantasy-bot per-channel cooldown.
@@ -1540,8 +1540,8 @@ pub const Config = struct {
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
     /// ADMIN command contact details. Configurable via `[admin] location/email`.
-    admin_location: []const u8 = "Orochi IRC network",
-    admin_email: []const u8 = "admin@orochi.local",
+    admin_location: []const u8 = "Onyx IRC network",
+    admin_email: []const u8 = "admin@onyx.local",
     /// Localized weather for the MOTD `{weather}` placeholder (`[weather]`).
     /// `weather_source` is a key=value file refreshed by an external updater;
     /// the daemon reads + localizes it per MOTD request.
@@ -2000,7 +2000,7 @@ pub const Config = struct {
     crypto_io: ?std.Io = null,
     /// Runtime Undertow peer-driver limits/timers/capacities for plaintext and
     /// secured inner S2S links. Configurable via `[mesh.routing]`,
-    /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]` Sazanami keys.
+    /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]` Ripple keys.
     s2s_config: s2s_link.PeerConfig = .{},
     mesh_realm: []const u8 = "local",
     mesh_pass: []const u8 = "",
@@ -3765,7 +3765,7 @@ pub const LinuxServer = struct {
     mesh_peer_name_lens: [32]u8 = @splat(0),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
-    /// Per-channel media rooms (Orochi media SFU control plane): who is in each call.
+    /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
     /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
     /// thread. Started on boot (`start`), torn down on `deinit`.
@@ -3945,7 +3945,7 @@ pub const LinuxServer = struct {
             break :blk null;
         };
         const listener_fd = if (inherited) |fd| blk: {
-            srvLog("orochi: adopting inherited listener fd {d} (shard {d})\n", .{ fd, shard_id });
+            srvLog("onyx-server: adopting inherited listener fd {d} (shard {d})\n", .{ fd, shard_id });
             // Restore exec hygiene: the fd survived ONE execve on purpose;
             // re-arm CLOEXEC so it never leaks into any other child. The next
             // UPGRADE clears it again for exactly the listeners it carries.
@@ -4106,7 +4106,7 @@ pub const LinuxServer = struct {
                 if (parseHostPort(spec) != null) {
                     valid += 1;
                 } else {
-                    srvLog("orochi: mesh auto-connect: bad peer spec '{s}' (want host:port); ignored\n", .{spec});
+                    srvLog("onyx-server: mesh auto-connect: bad peer spec '{s}' (want host:port); ignored\n", .{spec});
                 }
             }
             if (valid != 0) {
@@ -4129,7 +4129,7 @@ pub const LinuxServer = struct {
                 if (decodeMeshTrustRoot(root) != null) {
                     valid_roots += 1;
                 } else {
-                    srvLog("orochi: mesh trust root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
+                    srvLog("onyx-server: mesh trust root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
                 }
             }
             if (valid_roots != 0) {
@@ -4174,10 +4174,10 @@ pub const LinuxServer = struct {
                 relay_v2_required_nodes = nodes;
             } else {
                 allocator.free(nodes);
-                srvLog("orochi: MESSAGE_V2 durable membership disabled: trust roots contain the local node, duplicates, or short-id collisions\n", .{});
+                srvLog("onyx-server: MESSAGE_V2 durable membership disabled: trust roots contain the local node, duplicates, or short-id collisions\n", .{});
             }
         } else if (config.node_identity != null) {
-            srvLog("orochi: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set\n", .{});
+            srvLog("onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set\n", .{});
         }
         errdefer if (relay_v2_required_nodes.len != 0) allocator.free(relay_v2_required_nodes);
         if (relay_v2_activation_state.activation_epoch != 0 and
@@ -4191,7 +4191,7 @@ pub const LinuxServer = struct {
                 if (decodeMeshTrustRoot(root) != null) {
                     valid_roots += 1;
                 } else {
-                    srvLog("orochi: mesh admission root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
+                    srvLog("onyx-server: mesh admission root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
                 }
             }
             if (valid_roots != 0) {
@@ -4415,10 +4415,10 @@ pub const LinuxServer = struct {
             // leg). Independent of the WebRTC plane below; a bind failure logs and
             // the daemon keeps serving IRC.
             self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
-                srvLog("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: native media transport disabled ({s})\n", .{@errorName(e)});
             };
             if (self.native_media.port != 0) {
-                srvLog("orochi: native media on UDP :{d} (codec CadenceVox/CadenceVis)\n", .{self.native_media.port});
+                srvLog("onyx-server: native media on UDP :{d} (codec CadenceVox/CadenceVis)\n", .{self.native_media.port});
                 // Bridge native frames to any opt-in WebRTC members of each channel.
                 self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback });
             }
@@ -4431,12 +4431,12 @@ pub const LinuxServer = struct {
             // Bring the media transport plane online (bind UDP + pump thread). Media
             // is optional: a bind failure logs and the daemon keeps serving IRC.
             self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
-                srvLog("orochi: media plane disabled ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: media plane disabled ({s})\n", .{@errorName(e)});
                 return;
             };
             var host_buf: [16]u8 = undefined;
             const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-            srvLog("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
+            srvLog("onyx-server: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
             // Bridge WebRTC RTP frames to any native members of each channel.
             self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback });
         }
@@ -4462,18 +4462,18 @@ pub const LinuxServer = struct {
             self.config.metrics_port,
             .{ .bind_addr = self.config.metrics_bind_addr },
         ) catch |e| {
-            srvLog("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
             return;
         };
         // Spawn on the stored field so the accept loop's `self` pointer is stable
         // for the listener thread's lifetime.
         self.metrics_server.?.spawn() catch |e| {
-            srvLog("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
             self.metrics_server.?.shutdown();
             self.metrics_server = null;
             return;
         };
-        srvLog("orochi: /metrics on TCP :{d}\n", .{self.metrics_server.?.port});
+        srvLog("onyx-server: /metrics on TCP :{d}\n", .{self.metrics_server.?.port});
     }
 
     /// Render the current Prometheus exposition text and publish it into the
@@ -4502,11 +4502,11 @@ pub const LinuxServer = struct {
 
     fn writeNodeHealthPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         const health = self.currentNodeHealth();
-        try writePromGauge(allocator, out, "orochi_mesh_quorum", "Whether this node currently holds mesh quorum (1=yes, 0=no)", @as(u8, if (health.mesh_quorum) 1 else 0));
-        try writePromGauge(allocator, out, "orochi_mesh_partitioned", "Whether this node sees a mesh partition (1=yes, 0=no)", @as(u8, if (health.mesh_partitioned) 1 else 0));
-        try writePromGauge(allocator, out, "orochi_mesh_components", "Mesh connected components known to this node", health.mesh_components);
-        try writePromGauge(allocator, out, "orochi_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
-        try writePromGauge(allocator, out, "orochi_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
+        try writePromGauge(allocator, out, "onyx_mesh_quorum", "Whether this node currently holds mesh quorum (1=yes, 0=no)", @as(u8, if (health.mesh_quorum) 1 else 0));
+        try writePromGauge(allocator, out, "onyx_mesh_partitioned", "Whether this node sees a mesh partition (1=yes, 0=no)", @as(u8, if (health.mesh_partitioned) 1 else 0));
+        try writePromGauge(allocator, out, "onyx_mesh_components", "Mesh connected components known to this node", health.mesh_components);
+        try writePromGauge(allocator, out, "onyx_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
+        try writePromGauge(allocator, out, "onyx_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
     }
 
     /// The per-webhook rate policy assembled from config.
@@ -4523,7 +4523,7 @@ pub const LinuxServer = struct {
         // daemon is byte-identical to a build without the feature.
         if (!self.config.webhook_enabled) return;
         if (self.config.webhook_store_path.len == 0) {
-            srvLog("orochi: webhook endpoint has no [webhook] store_path — bindings will NOT survive a restart or USR2 upgrade\n", .{});
+            srvLog("onyx-server: webhook endpoint has no [webhook] store_path — bindings will NOT survive a restart or USR2 upgrade\n", .{});
         }
         self.restoreWebhooksAtStart();
         const sink = webhook_mod.PostSink{ .ctx = self, .submit = webhookSubmit };
@@ -4539,16 +4539,16 @@ pub const LinuxServer = struct {
                 },
             },
         ) catch |e| {
-            srvLog("orochi: webhook endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: webhook endpoint disabled ({s})\n", .{@errorName(e)});
             return;
         };
         self.webhook_server.?.spawn() catch |e| {
-            srvLog("orochi: webhook endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: webhook endpoint disabled ({s})\n", .{@errorName(e)});
             self.webhook_server.?.shutdown();
             self.webhook_server = null;
             return;
         };
-        srvLog("orochi: webhook endpoint on TCP :{d}\n", .{self.webhook_server.?.port});
+        srvLog("onyx-server: webhook endpoint on TCP :{d}\n", .{self.webhook_server.?.port});
     }
 
     /// `PostSink` callback: enqueue a validated post for reactor 0 and nudge it.
@@ -4639,7 +4639,7 @@ pub const LinuxServer = struct {
             self.webhook_resume_pending.store(true, .release);
             const old = self.webhook_resume_attempts.fetchAdd(1, .acq_rel);
             if (old == 0 or old % 64 == 63) {
-                srvLog("orochi: CRITICAL webhook listener remains paused: UPGRADE owners have not fully resumed\n", .{});
+                srvLog("onyx-server: CRITICAL webhook listener remains paused: UPGRADE owners have not fully resumed\n", .{});
             }
             return;
         }
@@ -4652,7 +4652,7 @@ pub const LinuxServer = struct {
             self.webhook_resume_pending.store(true, .release);
             const old = self.webhook_resume_attempts.fetchAdd(1, .acq_rel);
             if (old == 0 or old % 64 == 63) {
-                srvLog("orochi: CRITICAL webhook listener resume failed ({s}); retry scheduled\n", .{@errorName(e)});
+                srvLog("onyx-server: CRITICAL webhook listener resume failed ({s}); retry scheduled\n", .{@errorName(e)});
             }
             if (old == 0)
                 self.publishWebhookResumeHealth(world_locked, .critical, "Webhook listener resume failed after UPGRADE; bounded timer retry scheduled");
@@ -4661,7 +4661,7 @@ pub const LinuxServer = struct {
         const attempts = self.webhook_resume_attempts.swap(0, .acq_rel);
         self.webhook_resume_pending.store(false, .release);
         if (attempts != 0) {
-            srvLog("orochi: webhook listener resumed after {d} deferred attempt(s)\n", .{attempts});
+            srvLog("onyx-server: webhook listener resumed after {d} deferred attempt(s)\n", .{attempts});
             self.publishWebhookResumeHealth(world_locked, .info, "Webhook listener recovered after UPGRADE failure unwind");
         }
     }
@@ -4762,7 +4762,7 @@ pub const LinuxServer = struct {
         const text = std.Io.Dir.cwd().readFileAlloc(io, self.config.webhook_store_path, self.allocator, .limited(1 << 20)) catch return;
         defer self.allocator.free(text);
         const restored = self.webhook_store.load(text, self.nowMs(), self.webhookRate());
-        if (restored != 0) srvLog("orochi: restored {d} webhook binding(s)\n", .{restored});
+        if (restored != 0) srvLog("onyx-server: restored {d} webhook binding(s)\n", .{restored});
     }
 
     fn restoreWebhooksAtStart(self: *LinuxServer) void {
@@ -6618,7 +6618,7 @@ pub const LinuxServer = struct {
         const request = self.rx().deferred_upgrade orelse return;
         self.rx().deferred_upgrade = null;
         self.performUpgrade(request) catch |err| {
-            srvLog("orochi: deferred UPGRADE failed: {s}\n", .{@errorName(err)});
+            srvLog("onyx-server: deferred UPGRADE failed: {s}\n", .{@errorName(err)});
         };
     }
 
@@ -6700,7 +6700,7 @@ pub const LinuxServer = struct {
             .epoch = @intCast(@max(0, self.nowMs())),
             .now_ms = self.nowMs(),
             .timeout_ms = 5_000,
-            .arena_name = "orochi-test-live-upgrade",
+            .arena_name = "onyx-test-live-upgrade",
             .pieces = pieces.items,
             .fds = &.{},
         });
@@ -6781,7 +6781,7 @@ pub const LinuxServer = struct {
         // in-line reactor rather than running without cross-shard delivery.
         self.fabric = reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len) catch |err| {
             srvLog(
-                "orochi: cross-shard fabric init failed ({s}); running 1 reactor\n",
+                "onyx-server: cross-shard fabric init failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
             current_reactor = &self.reactors[0];
@@ -6789,10 +6789,10 @@ pub const LinuxServer = struct {
             return;
         };
 
-        srvLog("orochi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
+        srvLog("onyx-server: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
         self.pool.start(self.reactors.len, self, run, reactorWorker) catch |err| {
             srvLog(
-                "orochi: reactor pool spawn failed ({s}); running 1 reactor\n",
+                "onyx-server: reactor pool spawn failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
             if (self.fabric) |*f| f.deinit();
@@ -6836,11 +6836,11 @@ pub const LinuxServer = struct {
             } else |err| {
                 consecutive_failures += 1;
                 srvLog(
-                    "orochi: reactor loop error {s} ({d} consecutive)\n",
+                    "onyx-server: reactor loop error {s} ({d} consecutive)\n",
                     .{ @errorName(err), consecutive_failures },
                 );
                 if (consecutive_failures >= 64) {
-                    srvLog("orochi: reactor giving up after persistent errors\n", .{});
+                    srvLog("onyx-server: reactor giving up after persistent errors\n", .{});
                     return;
                 }
             }
@@ -7263,7 +7263,7 @@ pub const LinuxServer = struct {
         if (self.rx().socket_io_quiescing) self.resumeOwnedSocketIo();
         if (self.rx().socket_io_quiescing) {
             self.upgrade_io_failed.store(true, .release);
-            srvLog("orochi: UPGRADE quiesce left coordinator ring fail-closed in RESUMING\n", .{});
+            srvLog("onyx-server: UPGRADE quiesce left coordinator ring fail-closed in RESUMING\n", .{});
             return;
         }
         self.upgrade_coordinator_resumed.store(true, .release);
@@ -7279,12 +7279,12 @@ pub const LinuxServer = struct {
             }
             if (resumed > expected) {
                 self.upgrade_io_failed.store(true, .release);
-                srvLog("orochi: UPGRADE resume barrier over-counted; retaining RESUMING state\n", .{});
+                srvLog("onyx-server: UPGRADE resume barrier over-counted; retaining RESUMING state\n", .{});
                 return;
             }
             if (waited_ms >= 5_000) {
                 self.upgrade_io_failed.store(true, .release);
-                srvLog("orochi: UPGRADE resume barrier timed out; retaining RESUMING state\n", .{});
+                srvLog("onyx-server: UPGRADE resume barrier timed out; retaining RESUMING state\n", .{});
                 return;
             }
             var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
@@ -7645,7 +7645,7 @@ pub const LinuxServer = struct {
     /// mesh-wide. (An empty secret still yields a stable key — fine for hashing.)
     fn deriveCloneKey(mesh_pass: []const u8) [16]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("orochi-clone-salt\x00");
+        h.update("onyx-clone-salt\x00");
         h.update(mesh_pass);
         var digest: [32]u8 = undefined;
         h.final(&digest);
@@ -9298,7 +9298,7 @@ pub const LinuxServer = struct {
     fn attachmentEventId(msgid: []const u8) attachment_delivery_spool.EventId {
         var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         var hasher = std.crypto.hash.Blake3.init(.{});
-        hasher.update("orochi-attachment-delivery-v1\x00");
+        hasher.update("onyx-attachment-delivery-v1\x00");
         hasher.update(msgid);
         hasher.final(&digest);
         return digest[0..@sizeOf(attachment_delivery_spool.EventId)].*;
@@ -13084,7 +13084,7 @@ pub const LinuxServer = struct {
                 .ready => m.on_ready,
             };
             if (fn_opt) |f| f(self) catch |err| {
-                srvLog("orochi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
+                srvLog("onyx-server: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
             };
         }
     }
@@ -14263,7 +14263,7 @@ pub const LinuxServer = struct {
     /// A non-USER entity or a non-identity key is never gated (returns true) so
     /// ordinary ENTITY_PROP LWW is unchanged.
     ///
-    /// RESIDUAL (deferred, owner: orochi-mesh / stack-architect): a COLD third
+    /// RESIDUAL (deferred, owner: onyx-server-mesh / stack-architect): a COLD third
     /// node that has never seen the account — no local session, no clock — fails
     /// OPEN, so a Byzantine peer that WINS the ENTITY_PROP burst race to that node
     /// (delivers `identity.key.<victim>`=own-key before any honest node) binds the
@@ -15977,7 +15977,7 @@ pub const LinuxServer = struct {
     /// (not self-healing) on a genuinely cold process. Exact entity clocks now
     /// survive USR2, so a hot upgrade does not re-arm this window; the fully-sound
     /// cold-node anchor is the larger mesh-security design.
-    /// Owner: orochi-mesh / stack-architect.
+    /// Owner: onyx-server-mesh / stack-architect.
     fn accountKeyAuthorityGateAvailable() bool {
         return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
     }
@@ -17176,7 +17176,7 @@ pub const LinuxServer = struct {
 
             self.pushMarkreadOnJoin(conn, join_target) catch {};
 
-            // Bouncer rewind: a reconnecting client with orochi/bouncer gets the
+            // Bouncer rewind: a reconnecting client with onyx/bouncer gets the
             // channel messages it missed (everything after its stored read marker)
             // right after the NAMES burst. The replay renderer adds BATCH only when
             // the client negotiated the `batch` cap.
@@ -20401,7 +20401,7 @@ pub const LinuxServer = struct {
         for (messages) |message| {
             if (message.timestamp < floor) continue;
             // Named-conversation filter: when a topic label is requested, replay
-            // only messages carrying a matching (decoded) `+orochi/topic` tag.
+            // only messages carrying a matching (decoded) `+onyx/topic` tag.
             // Absent filter => every message, byte-identical to before.
             if (topic_filter) |want| {
                 var mbuf: [topic_tag.max_label_len]u8 = undefined;
@@ -20487,13 +20487,13 @@ pub const LinuxServer = struct {
         return @intCast(total_ms);
     }
 
-    /// Bouncer rewind: when a `orochi/bouncer` client (re)joins a channel,
+    /// Bouncer rewind: when a `onyx/bouncer` client (re)joins a channel,
     /// replay the messages it missed — everything after its stored read marker.
     /// No marker means there is nothing to rewind to
     /// (a fresh client has read everything), so we stay silent rather than dump
     /// the full ring. No-op for clients without the cap or without an account.
     fn replayRewindOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
-        if (!conn.session.hasCap(.orochi_bouncer)) return;
+        if (!conn.session.hasCap(.onyx_bouncer)) return;
         const owner = conn.session.account() orelse return;
         const marker = (self.read_markers.get(owner, channel) catch null) orelse return;
         const marker_ms = markerToMillis(marker.slice()) orelse return;
@@ -20609,7 +20609,7 @@ pub const LinuxServer = struct {
         var buf: [64]lotus.Message = undefined;
         var target: []const u8 = "";
         var found: []const lotus.Message = buf[0..0];
-        // Optional named-conversation filter: a `+orochi/topic=<label>` message
+        // Optional named-conversation filter: a `+onyx/topic=<label>` message
         // tag on the CHATHISTORY command restricts replay to one conversation.
         // Absent/invalid => null (all messages, exactly as before).
         var topic_buf: [topic_tag.max_label_len]u8 = undefined;
@@ -20754,7 +20754,7 @@ pub const LinuxServer = struct {
     /// per client and capped at `search_max_results` (newest-first).
     ///
     /// Design note: rather than a ranked full-text backend (e.g. SQLite FTS5),
-    /// Orochi uses a bounded in-memory inverted index with exact,
+    /// Onyx Server uses a bounded in-memory inverted index with exact,
     /// case-folded word AND-matching (no stemming, no substring, no relevance
     /// ranking) — results are ordered newest-first like CHATHISTORY LATEST.
     pub fn handleSearch(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
@@ -21247,7 +21247,7 @@ pub const LinuxServer = struct {
     /// that socket), while the attach is rendered only to the new client rather
     /// than as a duplicate logical JOIN to everyone else.
     fn syncLiveSessionChannels(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) void {
-        if (!conn.session.hasCap(.orochi_session_sync)) return;
+        if (!conn.session.hasCap(.onyx_session_sync)) return;
         const cid = monitorIdFromClient(id);
         const handle = self.sessions.resumeHandleForClient(account, cid) orelse return;
         if (tokenIsNull(handle.token)) return;
@@ -22369,7 +22369,7 @@ pub const LinuxServer = struct {
         if (requester) |c| {
             self.noticeTo(c, msg) catch {};
         } else {
-            srvLog("orochi: {s}\n", .{msg});
+            srvLog("onyx-server: {s}\n", .{msg});
         }
     }
 
@@ -22415,7 +22415,7 @@ pub const LinuxServer = struct {
     /// sockets. `requester` is the oper connection that ran `/UPGRADE` (carried
     /// like every other live client and also sent progress NOTICEs), or `null` for a
     /// SIGUSR2-triggered upgrade — a shell-driven deploy
-    /// (`systemctl kill -s USR2 orochi`) that has no requesting client, so every
+    /// (`systemctl kill -s USR2 onyx-server`) that has no requesting client, so every
     /// registered session is carried and status is logged. The oper privilege
     /// check lives in the `handleUpgrade` wrapper; a signal-triggered upgrade is
     /// implicitly privileged (it came from the service manager / root).
@@ -22791,16 +22791,16 @@ pub const LinuxServer = struct {
             &self.world,
             self.helixWorldRelationResolver(),
         ) catch |err| {
-            srvLog("orochi: UPGRADE World checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE World checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         blobs.append(self.allocator, world_wire) catch {
-            srvLog("orochi: UPGRADE World blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE World blob ownership append failed\n", .{});
             self.allocator.free(world_wire);
             return null;
         };
         pieces.append(self.allocator, .{ .kind = .channels, .bytes = world_wire }) catch {
-            srvLog("orochi: UPGRADE World piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE World piece append failed\n", .{});
             return null;
         };
 
@@ -22814,14 +22814,14 @@ pub const LinuxServer = struct {
         const lotus_wire = self.history.encodeCheckpoint(self.allocator) catch |err| {
             self.relay_v2_replay_mu.unlock();
             self.attachment_delivery_mu.unlock();
-            srvLog("orochi: UPGRADE Lotus checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE Lotus checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         const relay_replay_wire = self.relay_v2_replay_guard.encodeCheckpoint(self.allocator) catch |err| {
             self.allocator.free(lotus_wire);
             self.relay_v2_replay_mu.unlock();
             self.attachment_delivery_mu.unlock();
-            srvLog("orochi: UPGRADE MESSAGE_V2 replay checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 replay checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         const relay_outbox_wire = self.relay_v2_outbox.encodeCheckpoint(self.allocator) catch |err| {
@@ -22829,7 +22829,7 @@ pub const LinuxServer = struct {
             self.allocator.free(relay_replay_wire);
             self.relay_v2_replay_mu.unlock();
             self.attachment_delivery_mu.unlock();
-            srvLog("orochi: UPGRADE MESSAGE_V2 outbox checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 outbox checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         const relay_event_log_wire = self.relay_v2_event_log.encodeCheckpoint(self.allocator) catch |err| {
@@ -22838,7 +22838,7 @@ pub const LinuxServer = struct {
             self.allocator.free(relay_outbox_wire);
             self.relay_v2_replay_mu.unlock();
             self.attachment_delivery_mu.unlock();
-            srvLog("orochi: UPGRADE MESSAGE_V2 event-log checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 event-log checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         const attachment_delivery_wire = self.attachment_delivery_spool.encodeCheckpoint(self.allocator) catch |err| {
@@ -22848,7 +22848,7 @@ pub const LinuxServer = struct {
             self.allocator.free(relay_event_log_wire);
             self.relay_v2_replay_mu.unlock();
             self.attachment_delivery_mu.unlock();
-            srvLog("orochi: UPGRADE attachment-delivery checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE attachment-delivery checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         self.relay_v2_replay_mu.unlock();
@@ -22863,14 +22863,14 @@ pub const LinuxServer = struct {
         var attachment_delivery_owned = true;
         defer if (attachment_delivery_owned) self.allocator.free(attachment_delivery_wire);
         const search_wire = self.search_index.encodeCheckpoint(self.allocator) catch |err| {
-            srvLog("orochi: UPGRADE search checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE search checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         defer self.allocator.free(search_wire);
         var event_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer event_writer.deinit();
         self.event_history.serializeInto(&event_writer.writer) catch |err| {
-            srvLog("orochi: UPGRADE EventHistory checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE EventHistory checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         const history_wire = history_checkpoint.encode(self.allocator, .{}, .{
@@ -22878,42 +22878,42 @@ pub const LinuxServer = struct {
             .search_index = search_wire,
             .event_history = event_writer.written(),
         }) catch |err| {
-            srvLog("orochi: UPGRADE history bundle seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE history bundle seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         blobs.append(self.allocator, history_wire) catch {
-            srvLog("orochi: UPGRADE history blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE history blob ownership append failed\n", .{});
             self.allocator.free(history_wire);
             return null;
         };
         pieces.append(self.allocator, .{ .kind = .history, .bytes = history_wire }) catch {
-            srvLog("orochi: UPGRADE history piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE history piece append failed\n", .{});
             return null;
         };
 
         const webhook_wire = self.webhook_store.encodeUpgradeCheckpoint(self.allocator) catch |err| {
-            srvLog("orochi: UPGRADE webhook checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE webhook checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         blobs.append(self.allocator, webhook_wire) catch {
-            srvLog("orochi: UPGRADE webhook blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE webhook blob ownership append failed\n", .{});
             self.allocator.free(webhook_wire);
             return null;
         };
         pieces.append(self.allocator, .{ .kind = .webhook_store, .bytes = webhook_wire }) catch {
-            srvLog("orochi: UPGRADE webhook piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE webhook piece append failed\n", .{});
             return null;
         };
 
         lockSpin(&self.event_spine_replay_mu);
         const event_replay_wire = self.event_spine_replay_guard.encodeCheckpoint(self.allocator) catch |err| {
             self.event_spine_replay_mu.unlock();
-            srvLog("orochi: UPGRADE Event Spine replay checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE Event Spine replay checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         self.event_spine_replay_mu.unlock();
         blobs.append(self.allocator, event_replay_wire) catch {
-            srvLog("orochi: UPGRADE Event Spine replay blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE Event Spine replay blob ownership append failed\n", .{});
             self.allocator.free(event_replay_wire);
             return null;
         };
@@ -22924,12 +22924,12 @@ pub const LinuxServer = struct {
             // allow a v1 successor to ignore it and replay retired events.
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE Event Spine replay piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE Event Spine replay piece append failed\n", .{});
             return null;
         };
 
         blobs.append(self.allocator, relay_outbox_wire) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 outbox blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 outbox blob ownership append failed\n", .{});
             return null;
         };
         relay_outbox_owned = false;
@@ -22938,12 +22938,12 @@ pub const LinuxServer = struct {
             .bytes = relay_outbox_wire,
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 outbox piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 outbox piece append failed\n", .{});
             return null;
         };
 
         blobs.append(self.allocator, relay_replay_wire) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 replay blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 replay blob ownership append failed\n", .{});
             return null;
         };
         relay_replay_owned = false;
@@ -22954,12 +22954,12 @@ pub const LinuxServer = struct {
             // across exec would make already-delivered captures live again.
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 replay piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 replay piece append failed\n", .{});
             return null;
         };
 
         blobs.append(self.allocator, relay_event_log_wire) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 event-log blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 event-log blob ownership append failed\n", .{});
             return null;
         };
         relay_event_log_owned = false;
@@ -22968,12 +22968,12 @@ pub const LinuxServer = struct {
             .bytes = relay_event_log_wire,
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE MESSAGE_V2 event-log piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE MESSAGE_V2 event-log piece append failed\n", .{});
             return null;
         };
 
         blobs.append(self.allocator, attachment_delivery_wire) catch {
-            srvLog("orochi: UPGRADE attachment-delivery blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE attachment-delivery blob ownership append failed\n", .{});
             return null;
         };
         attachment_delivery_owned = false;
@@ -22982,7 +22982,7 @@ pub const LinuxServer = struct {
             .bytes = attachment_delivery_wire,
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE attachment-delivery piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE attachment-delivery piece append failed\n", .{});
             return null;
         };
 
@@ -23000,11 +23000,11 @@ pub const LinuxServer = struct {
             self.grantNowU64(),
             self.grant_incarnation,
         ) catch |err| {
-            srvLog("orochi: UPGRADE oper-grant checkpoint seal failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: UPGRADE oper-grant checkpoint seal failed ({s})\n", .{@errorName(err)});
             return null;
         };
         blobs.append(self.allocator, oper_grant_wire) catch {
-            srvLog("orochi: UPGRADE oper-grant blob ownership append failed\n", .{});
+            srvLog("onyx-server: UPGRADE oper-grant blob ownership append failed\n", .{});
             self.allocator.free(oper_grant_wire);
             return null;
         };
@@ -23015,7 +23015,7 @@ pub const LinuxServer = struct {
             // recognize it must refuse the arena, never silently drop it.
             .min_supported = 2,
         }) catch {
-            srvLog("orochi: UPGRADE oper-grant piece append failed\n", .{});
+            srvLog("onyx-server: UPGRADE oper-grant piece append failed\n", .{});
             return null;
         };
 
@@ -23138,7 +23138,7 @@ pub const LinuxServer = struct {
                     }
                     if (est) {
                         counts.s2s_preserve_failed = true;
-                        srvLog("orochi: UPGRADE — established secured S2S snapshot failed; exact upgrade will be refused\n", .{});
+                        srvLog("onyx-server: UPGRADE — established secured S2S snapshot failed; exact upgrade will be refused\n", .{});
                         continue;
                     }
                 }
@@ -23540,7 +23540,7 @@ pub const LinuxServer = struct {
 
     /// Post-capability-probe half of `performUpgrade`. Kept as a narrow test seam
     /// so failure-unwind tests can enter the producer barrier deterministically
-    /// without depending on a separately-installed Orochi executable. Production
+    /// without depending on a separately-installed Onyx Server executable. Production
     /// reaches this only after `openCompatibleUpgradeTarget` has pinned and
     /// successfully probed `executable_fd`.
     fn performUpgradeAfterCompatibleTarget(
@@ -23750,7 +23750,7 @@ pub const LinuxServer = struct {
             const shard_before = seal_counts.clients;
             self.sealShardClients(r, &pieces, &blobs, carried_fds, &carried_fd_count, &seal_counts);
             if (self.reactors.len > 1) {
-                srvLog("orochi: UPGRADE — shard {d}: {d} client(s) sealed\n", .{ r.shard_id, seal_counts.clients - shard_before });
+                srvLog("onyx-server: UPGRADE — shard {d}: {d} client(s) sealed\n", .{ r.shard_id, seal_counts.clients - shard_before });
             }
         }
         const tls_carried = seal_counts.tls;
@@ -23783,7 +23783,7 @@ pub const LinuxServer = struct {
             .epoch = @intCast(@max(0, now)),
             .now_ms = now,
             .timeout_ms = 5000,
-            .arena_name = "orochi-helix",
+            .arena_name = "onyx-helix",
             .pieces = pieces.items,
             .fds = &.{},
         }) catch |e| {
@@ -23801,7 +23801,7 @@ pub const LinuxServer = struct {
             return error.SessionReplicaConverging;
         };
         var sbuf: [224]u8 = undefined;
-        srvLog("orochi: {s}\n", .{std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), mandatory state {d}/{d}/{d}/{d}/{d} bytes); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed, mandatory_state_sealed.world_bytes, mandatory_state_sealed.history_bytes, mandatory_state_sealed.webhook_bytes, mandatory_state_sealed.relay_replay_bytes, mandatory_state_sealed.event_replay_bytes }) catch "UPGRADE: re-exec"});
+        srvLog("onyx-server: {s}\n", .{std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), mandatory state {d}/{d}/{d}/{d}/{d} bytes); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed, mandatory_state_sealed.world_bytes, mandatory_state_sealed.history_bytes, mandatory_state_sealed.webhook_bytes, mandatory_state_sealed.relay_replay_bytes, mandatory_state_sealed.event_replay_bytes }) catch "UPGRADE: re-exec"});
 
         // Preserve EVERY shard's client listener + the arena across execve
         // (clear FD_CLOEXEC). The successor adopts one listener per shard, so
@@ -24080,7 +24080,7 @@ pub const LinuxServer = struct {
         }
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
-        srvLog("orochi: UPGRADE resume refused inherited state: {s}\n", .{reason});
+        srvLog("onyx-server: UPGRADE resume refused inherited state: {s}\n", .{reason});
     }
 
     pub fn adoptInheritedSessions(self: *LinuxServer) error{InvalidInheritedHandoff}!void {
@@ -24097,7 +24097,7 @@ pub const LinuxServer = struct {
             if (self.config.inherited_state_fd_manifest_present) {
                 if (!self.inheritedStateFdManifestTrusted(-1))
                     return error.InvalidInheritedHandoff;
-                srvLog("orochi: UPGRADE resume DOWNGRADED to cold boot — state-fd manifest present but sealed arena fd absent; closing {d} carried descriptor(s) and booting fresh\n", .{self.config.inherited_state_fds.len});
+                srvLog("onyx-server: UPGRADE resume DOWNGRADED to cold boot — state-fd manifest present but sealed arena fd absent; closing {d} carried descriptor(s) and booting fresh\n", .{self.config.inherited_state_fds.len});
                 _ = self.closeInheritedStateFdManifest(-1);
             }
             return;
@@ -24117,7 +24117,7 @@ pub const LinuxServer = struct {
             _ = self.closeInheritedStateFdManifest(arena_fd);
             closeFd(arena_fd);
             self.config.resume_arena_fd = null;
-            srvLog("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
         defer {
@@ -24980,19 +24980,19 @@ pub const LinuxServer = struct {
             const descriptor = helix_capsule.descriptor(.tls_session);
             const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — incompatible TLS-session capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — incompatible TLS-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             };
             if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical TLS-session capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical TLS-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const ts = tls_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid TLS-session checkpoint ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid TLS-session checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (ts.fd < 0) {
@@ -25002,7 +25002,7 @@ pub const LinuxServer = struct {
             for (tls_snaps.items) |prior| {
                 if (prior.fd == ts.fd) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate TLS sidecar for fd {d}\n", .{ts.fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate TLS sidecar for fd {d}\n", .{ts.fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25026,19 +25026,19 @@ pub const LinuxServer = struct {
             const descriptor = helix_capsule.descriptor(.ws_session);
             const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — incompatible WebSocket-session capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — incompatible WebSocket-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             };
             if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical WebSocket-session capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical WebSocket-session capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const wss = ws_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid WebSocket-session checkpoint ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid WebSocket-session checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (wss.fd < 0 or !wss.phase_open) {
@@ -25048,7 +25048,7 @@ pub const LinuxServer = struct {
             for (ws_snaps.items) |prior| {
                 if (prior.fd == wss.fd) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate WebSocket sidecar for fd {d}\n", .{wss.fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate WebSocket sidecar for fd {d}\n", .{wss.fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25090,7 +25090,7 @@ pub const LinuxServer = struct {
             }
             if (snap.was_secured != (tls_state != null)) {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — client/TLS sidecar join mismatch for fd {d}\n", .{snap.fd});
+                srvLog("onyx-server: UPGRADE resume fatal — client/TLS sidecar join mismatch for fd {d}\n", .{snap.fd});
                 return error.InvalidInheritedHandoff;
             }
             if (tls_state != null) matched_tls += 1;
@@ -25103,7 +25103,7 @@ pub const LinuxServer = struct {
             }
             if (snap.was_websocket != (ws_state != null)) {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — client/WebSocket sidecar join mismatch for fd {d}\n", .{snap.fd});
+                srvLog("onyx-server: UPGRADE resume fatal — client/WebSocket sidecar join mismatch for fd {d}\n", .{snap.fd});
                 return error.InvalidInheritedHandoff;
             }
             if (ws_state != null) matched_ws += 1;
@@ -25129,12 +25129,12 @@ pub const LinuxServer = struct {
         }
         if (adopted != client_capsule_count) {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — adopted only {d} of {d} exact client snapshot(s)\n", .{ adopted, client_capsule_count });
+            srvLog("onyx-server: UPGRADE resume fatal — adopted only {d} of {d} exact client snapshot(s)\n", .{ adopted, client_capsule_count });
             return error.InvalidInheritedHandoff;
         }
         if (matched_tls != tls_snaps.items.len or matched_ws != ws_snaps.items.len) {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — orphan TLS/WebSocket sidecar(s) remain after exact client join\n", .{});
+            srvLog("onyx-server: UPGRADE resume fatal — orphan TLS/WebSocket sidecar(s) remain after exact client join\n", .{});
             return error.InvalidInheritedHandoff;
         }
         const adopted_world_resolver = self.helixWorldRelationResolver();
@@ -25148,7 +25148,7 @@ pub const LinuxServer = struct {
             // make startup exit; continuing would expose adopted sockets beside
             // a partial membership graph.
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — adopted World membership validation failed ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: UPGRADE resume fatal — adopted World membership validation failed ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
         world_replacement.applyInvitesResolved(
@@ -25159,7 +25159,7 @@ pub const LinuxServer = struct {
             // after a prefix was installed. The whole replacement World is
             // discarded and startup exits; no partially resumed daemon starts.
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — inherited invite publication failed ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: UPGRADE resume fatal — inherited invite publication failed ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
         // MONITOR's online index is derived from registered local occupancy and
@@ -25177,7 +25177,7 @@ pub const LinuxServer = struct {
                 if (nick.len == 0 or std.mem.eql(u8, nick, "*")) continue;
                 self.monitor.restoreOnline(nick) catch |e| {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — MONITOR online-index restore failed ({s})\n", .{@errorName(e)});
+                    srvLog("onyx-server: UPGRADE resume fatal — MONITOR online-index restore failed ({s})\n", .{@errorName(e)});
                     return error.InvalidInheritedHandoff;
                 };
             }
@@ -25191,7 +25191,7 @@ pub const LinuxServer = struct {
                 if (nick.len == 0 or std.mem.eql(u8, nick, "*")) continue;
                 self.monitor.restoreOnline(nick) catch |e| {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — MONITOR alias-index restore failed ({s})\n", .{@errorName(e)});
+                    srvLog("onyx-server: UPGRADE resume fatal — MONITOR alias-index restore failed ({s})\n", .{@errorName(e)});
                     return error.InvalidInheritedHandoff;
                 };
             }
@@ -25216,13 +25216,13 @@ pub const LinuxServer = struct {
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current MONITOR capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical current MONITOR capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             var tgt_buf: [max_carried_monitor_targets][]const u8 = undefined;
             const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid current MONITOR capsule ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid current MONITOR capsule ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (mc.client_id > std.math.maxInt(i32)) {
@@ -25237,7 +25237,7 @@ pub const LinuxServer = struct {
             for (monitor_fds[0..monitor_lists_restored]) |prior_fd| {
                 if (prior_fd == fd) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate MONITOR sidecar for fd {d}\n", .{fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate MONITOR sidecar for fd {d}\n", .{fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25247,14 +25247,14 @@ pub const LinuxServer = struct {
             }
             const watcher = self.adoptedClientIdByFd(fd) orelse {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — orphan MONITOR sidecar for fd {d}\n", .{fd});
+                srvLog("onyx-server: UPGRADE resume fatal — orphan MONITOR sidecar for fd {d}\n", .{fd});
                 return error.InvalidInheritedHandoff;
             };
             for (mc.targets) |t| {
                 const before_count = self.monitor.monitorCount(watcher);
                 self.monitor.restoreTarget(watcher, t) catch |e| {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — MONITOR restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
+                    srvLog("onyx-server: UPGRADE resume fatal — MONITOR restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
                     return error.InvalidInheritedHandoff;
                 };
                 // MonitorStore normalizes IRC casemapping before insertion and
@@ -25263,7 +25263,7 @@ pub const LinuxServer = struct {
                 // row contained a duplicate (including a case-fold alias).
                 if (self.monitor.monitorCount(watcher) != before_count + 1) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate MONITOR target for fd {d}\n", .{fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate MONITOR target for fd {d}\n", .{fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25272,7 +25272,7 @@ pub const LinuxServer = struct {
         }
         if (monitor_lists_restored != client_capsule_count) {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — restored {d} of {d} exact MONITOR sidecar(s)\n", .{ monitor_lists_restored, client_capsule_count });
+            srvLog("onyx-server: UPGRADE resume fatal — restored {d} of {d} exact MONITOR sidecar(s)\n", .{ monitor_lists_restored, client_capsule_count });
             return error.InvalidInheritedHandoff;
         }
 
@@ -25295,13 +25295,13 @@ pub const LinuxServer = struct {
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current SILENCE capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical current SILENCE capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             var mask_buf: [max_carried_silence_masks][]const u8 = undefined;
             const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid current SILENCE capsule ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid current SILENCE capsule ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (sc.client_id > std.math.maxInt(i32)) {
@@ -25316,7 +25316,7 @@ pub const LinuxServer = struct {
             for (silence_fds[0..silence_lists_restored]) |prior_fd| {
                 if (prior_fd == fd) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate SILENCE sidecar for fd {d}\n", .{fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate SILENCE sidecar for fd {d}\n", .{fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25326,19 +25326,19 @@ pub const LinuxServer = struct {
             }
             const owner_conn = self.adoptedConnByFd(fd) orelse {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — orphan SILENCE sidecar for fd {d}\n", .{fd});
+                srvLog("onyx-server: UPGRADE resume fatal — orphan SILENCE sidecar for fd {d}\n", .{fd});
                 return error.InvalidInheritedHandoff;
             };
             const owner = owner_conn.session.displayName();
             for (sc.masks) |m| {
                 const added = self.silence.add(owner, m) catch |e| {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — SILENCE restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
+                    srvLog("onyx-server: UPGRADE resume fatal — SILENCE restore failed for fd {d} ({s})\n", .{ fd, @errorName(e) });
                     return error.InvalidInheritedHandoff;
                 };
                 if (!added) {
                     world_replacement.swapWorldInto(&self.world);
-                    srvLog("orochi: UPGRADE resume fatal — duplicate SILENCE mask for fd {d}\n", .{fd});
+                    srvLog("onyx-server: UPGRADE resume fatal — duplicate SILENCE mask for fd {d}\n", .{fd});
                     return error.InvalidInheritedHandoff;
                 }
             }
@@ -25347,7 +25347,7 @@ pub const LinuxServer = struct {
         }
         if (silence_lists_restored != client_capsule_count) {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — restored {d} of {d} exact SILENCE sidecar(s)\n", .{ silence_lists_restored, client_capsule_count });
+            srvLog("onyx-server: UPGRADE resume fatal — restored {d} of {d} exact SILENCE sidecar(s)\n", .{ silence_lists_restored, client_capsule_count });
             return error.InvalidInheritedHandoff;
         }
 
@@ -25395,19 +25395,19 @@ pub const LinuxServer = struct {
             const descriptor = helix_capsule.descriptor(.sessions);
             const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — incompatible session-registry capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — incompatible session-registry capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             };
             if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical session-registry capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical session-registry capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const count = session_capsule.peekSessionCount(c.fields[0].bytes) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid session-registry header ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid session-registry header ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (count == 0) {
@@ -25424,7 +25424,7 @@ pub const LinuxServer = struct {
             else
                 session_capsule.SessionCapsule.decode(c.fields[0].bytes, entries)) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid session-registry checkpoint ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid session-registry checkpoint ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             const restored = self.adoptSessionRegistryAccount(
@@ -25435,7 +25435,7 @@ pub const LinuxServer = struct {
             );
             if (restored != cap.sessions.len) {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — restored only {d} of {d} exact session row(s) for {s}\n", .{ restored, cap.sessions.len, cap.account });
+                srvLog("onyx-server: UPGRADE resume fatal — restored only {d} of {d} exact session row(s) for {s}\n", .{ restored, cap.sessions.len, cap.account });
                 return error.InvalidInheritedHandoff;
             }
             session_accounts += 1;
@@ -25448,7 +25448,7 @@ pub const LinuxServer = struct {
         // handoff before any replacement authority is published.
         self.sessions.normalizePortableGroupsAfterRestore() catch |e| {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — could not normalize portable attachment groups ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: UPGRADE resume fatal — could not normalize portable attachment groups ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
         // ADS1 stores predecessor physical client ids. HSSN is the canonical
@@ -25459,14 +25459,14 @@ pub const LinuxServer = struct {
         if (attachment_remaps.items.len != attachment_clients.len) {
             world_replacement.swapWorldInto(&self.world);
             srvLog(
-                "orochi: UPGRADE resume fatal — mapped only {d} of {d} attachment-delivery owner(s)\n",
+                "onyx-server: UPGRADE resume fatal — mapped only {d} of {d} attachment-delivery owner(s)\n",
                 .{ attachment_remaps.items.len, attachment_clients.len },
             );
             return error.InvalidInheritedHandoff;
         }
         _ = attachment_delivery_replacement.remapAttachments(attachment_remaps.items) catch |e| {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — attachment-delivery client remap failed ({s})\n", .{@errorName(e)});
+            srvLog("onyx-server: UPGRADE resume fatal — attachment-delivery client remap failed ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
 
@@ -25504,12 +25504,12 @@ pub const LinuxServer = struct {
                 c.header.max_supported != descriptor.max_supported)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical current mesh re-dial capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical current mesh re-dial capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const peer = mesh_redial.decodeCurrent(c.fields[0].bytes) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — invalid current mesh re-dial capsule ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — invalid current mesh re-dial capsule ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             const addr = posix.sockaddr.in6{
@@ -25520,7 +25520,7 @@ pub const LinuxServer = struct {
             };
             redial_replacement.append(self.allocator, addr) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — could not stage exact mesh re-dial ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — could not stage exact mesh re-dial ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             redialed += 1;
@@ -25537,29 +25537,29 @@ pub const LinuxServer = struct {
             const descriptor = helix_capsule.descriptor(.s2s_link);
             const negotiated = helix_capsule.negotiate(descriptor, c.header) catch {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — incompatible secured-mesh capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — incompatible secured-mesh capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             };
             if (negotiated != c.header.version or
                 c.fields.len != 1 or c.fields[0].ordinal != 1)
             {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — noncanonical secured-mesh capsule\n", .{});
+                srvLog("onyx-server: UPGRADE resume fatal — noncanonical secured-mesh capsule\n", .{});
                 return error.InvalidInheritedHandoff;
             }
             const snap = s2s_snapshot.decode(c.fields[0].bytes, c.header.version) catch |e| {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — secured-mesh decode failed ({s})\n", .{@errorName(e)});
+                srvLog("onyx-server: UPGRADE resume fatal — secured-mesh decode failed ({s})\n", .{@errorName(e)});
                 return error.InvalidInheritedHandoff;
             };
             if (snap.fd < 0) {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
+                srvLog("onyx-server: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
                 return error.InvalidInheritedHandoff;
             }
             const adopted_id = self.adoptInheritedS2sLink(snap, false) orelse {
                 world_replacement.swapWorldInto(&self.world);
-                srvLog("orochi: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
+                srvLog("onyx-server: UPGRADE resume fatal — secured-mesh fd {d} could not be adopted exactly\n", .{snap.fd});
                 return error.InvalidInheritedHandoff;
             };
             adopted_s2s_ids.appendAssumeCapacity(adopted_id);
@@ -25579,7 +25579,7 @@ pub const LinuxServer = struct {
             self.session_replica_stage_retry_pending)
         {
             world_replacement.swapWorldInto(&self.world);
-            srvLog("orochi: UPGRADE resume fatal — inherited session-replica projection was incomplete\n", .{});
+            srvLog("onyx-server: UPGRADE resume fatal — inherited session-replica projection was incomplete\n", .{});
             return error.InvalidInheritedHandoff;
         }
 
@@ -25660,9 +25660,9 @@ pub const LinuxServer = struct {
             }
         }
         if (oper_grants_restored != 0)
-            srvLog("orochi: UPGRADE resume — primed {d} carried oper grant(s)\n", .{oper_grants_restored});
+            srvLog("onyx-server: UPGRADE resume — primed {d} carried oper grant(s)\n", .{oper_grants_restored});
         if (oper_grants_dropped != 0)
-            srvLog("orochi: UPGRADE resume — WARNING: dropped {d} carried oper grant(s) (registry capacity exhausted or superseded); a cross-mesh grant/revocation may be lost\n", .{oper_grants_dropped});
+            srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried oper grant(s) (registry capacity exhausted or superseded); a cross-mesh grant/revocation may be lost\n", .{oper_grants_dropped});
 
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
@@ -25686,7 +25686,7 @@ pub const LinuxServer = struct {
         }
         current_reactor = &self.reactors[0];
         srvLog(
-            "orochi: UPGRADE resume — restored mandatory World/history/events/replay/webhooks ({d}/{d}/{d}/exact/{d}), {d} property entity(s)/{d} clock(s), re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            "onyx-server: UPGRADE resume — restored mandatory World/history/events/replay/webhooks ({d}/{d}/{d}/exact/{d}), {d} property entity(s)/{d} clock(s), re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
             .{ self.world.channelCount(), self.history.totalStoredCount(), self.event_history.len(), self.webhook_store.len(), property_entities_restored, property_clocks_restored, adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, replica_objects_restored, migrations_staged, tombstones_staged, s2s_resumed, redialed },
         );
     }
@@ -26743,7 +26743,7 @@ pub const LinuxServer = struct {
             } else |err| switch (err) {
                 error.SubmissionQueueFull => return true,
                 else => {
-                    srvLog("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(err)});
+                    srvLog("onyx-server: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(err)});
                     self.inherited_mesh_redial_cursor += 1;
                     attempted += 1;
                 },
@@ -26776,7 +26776,7 @@ pub const LinuxServer = struct {
             if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) return .skipped;
             dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
                 dial.last_attempt_ms = now;
-                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
                 return .attempted;
             };
         }
@@ -26793,7 +26793,7 @@ pub const LinuxServer = struct {
         const addr = dial.addr.?;
         if (self.initiateS2sConnectToAddr(addr)) |tok| {
             dial.token = tok;
-            srvLog("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
+            srvLog("onyx-server: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
             return .attempted;
         } else |err| switch (err) {
             error.SubmissionQueueFull => {
@@ -26801,7 +26801,7 @@ pub const LinuxServer = struct {
                 return .sq_full;
             },
             else => {
-                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
                 return .attempted;
             },
         }
@@ -30119,7 +30119,7 @@ pub const LinuxServer = struct {
     }
 
     /// Record a conversation label into a channel's browsable topic registry (the
-    /// `orochi.topics` channel PROP). Best-effort and bounded: no-op if the label
+    /// `onyx_server.topics` channel PROP). Best-effort and bounded: no-op if the label
     /// is already registered or the registry is full. A change is written through
     /// the generic channel-prop store and mesh-propagated with the same signed
     /// CRDT sequence a local PROP SET uses, so the registry converges across the
@@ -30573,7 +30573,7 @@ pub const LinuxServer = struct {
     /// IRCX / ISIRCX — IRCX discovery + opt-in (draft-pfenning §IRCX). `IRCX`
     /// enables IRCX mode for the session; `ISIRCX` only queries. Both reply with
     /// RPL_IRCX (800): `<state> <version> <package-list> <maxmsg> <option-list>`.
-    /// Orochi advertises live SASL-backed IRCX AUTH packages for this session.
+    /// Onyx Server advertises live SASL-backed IRCX AUTH packages for this session.
     pub fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
         _ = self;
         if (enable) conn.ircx = true;
@@ -32886,7 +32886,7 @@ pub const LinuxServer = struct {
     /// single configured oper block; success sets the session oper flag, emits
     /// RPL_YOUREOPER (381) and the +o umode reflection.
     pub fn handleOper(self: *LinuxServer, conn: *ConnState, _: *const irc_line.LineView) !void {
-        // OPER is disabled: Orochi grants operator status SASL-only. A client is
+        // OPER is disabled: Onyx Server grants operator status SASL-only. A client is
         // elevated automatically on SASL login when its account has an `[oper]`
         // binding (see elevateOperFromAccount). There is no password credential.
         _ = self;
@@ -32895,7 +32895,7 @@ pub const LinuxServer = struct {
 
     /// SUMMON <nick> <channel> — force the target user into <channel>. Classic
     /// host-paging SUMMON (RFC 1459 §4.5) has no meaning on a modern network
-    /// daemon, so Orochi repurposes it as an operator force-join (the registry
+    /// daemon, so Onyx Server repurposes it as an operator force-join (the registry
     /// gates it `.access = .oper`). Reuses the same target resolution + join path
     /// as `FORCEJOIN`, then replies `RPL_SUMMONING` (342) to the requester.
     pub fn handleSummon(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -33477,7 +33477,7 @@ pub const LinuxServer = struct {
             self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
             restored += 1;
         }
-        if (restored != 0) srvLog("orochi: restored {d} runtime operator grant(s)\n", .{restored});
+        if (restored != 0) srvLog("onyx-server: restored {d} runtime operator grant(s)\n", .{restored});
     }
 
     /// Restore the per-channel statistics snapshot persisted by a previous run,
@@ -33605,12 +33605,12 @@ pub const LinuxServer = struct {
             .ward = ReplayCtx.onWard,
             .saccess = ReplayCtx.onSaccess,
         }) catch |err| {
-            srvLog("orochi: services live-state replay failed ({s})\n", .{@errorName(err)});
+            srvLog("onyx-server: services live-state replay failed ({s})\n", .{@errorName(err)});
             return;
         };
         if (summary.channels != 0 or summary.akicks != 0 or summary.wards != 0 or summary.saccesses != 0) {
             srvLog(
-                "orochi: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s), {d} SACCESS(es)\n",
+                "onyx-server: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s), {d} SACCESS(es)\n",
                 .{ summary.channels, summary.mlocks, summary.akicks, summary.wards, summary.saccesses },
             );
         }
@@ -35442,7 +35442,7 @@ pub const LinuxServer = struct {
     }
 
     /// Emit a `NOTICE` from the server to this connection (services replies use
-    /// real server NOTICEs — Orochi has NO pseudo-clients).
+    /// real server NOTICEs — Onyx Server has NO pseudo-clients).
     fn channelNotice(conn: *ConnState, comptime fmt: []const u8, args: anytype) !void {
         // Assemble the header and the (reflected-args) body into ONE contiguous
         // line so the whole thing routes through the emitReplyLine guard —
@@ -36253,7 +36253,7 @@ pub const LinuxServer = struct {
             // UNTRACKED (no reclaim token, no session-sync fan-out, absent from
             // SESSION LIST). Log so the condition is observable; the eviction
             // policy itself is a separate config/warden concern.
-            srvLog("orochi: session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
+            srvLog("onyx-server: session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
             return;
         };
         self.finalizeAttachEviction(outcome);
@@ -39425,7 +39425,7 @@ pub const LinuxServer = struct {
     }
 
     /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR | FORWARD <account>|OFF |
-    /// IGNORE ADD|DEL|LIST <account>>` — Orochi offline mail. SEND stores a message
+    /// IGNORE ADD|DEL|LIST <account>>` — Onyx Server offline mail. SEND stores a message
     /// for an account (delivered when it next logs in, following the recipient's
     /// forward chain, unless that account ignores the sender — then it is silently
     /// dropped); LIST shows the caller's own pending mail; CLEAR discards it;
@@ -39862,7 +39862,7 @@ pub const LinuxServer = struct {
     }
 
     /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind] [arg]` —
-    /// Orochi media control plane. Drives the per-channel SFU participant model and
+    /// Onyx Server media control plane. Drives the per-channel SFU participant model and
     /// emits call state through the MEDIA Event Spine plane. The media bytes flow
     /// over the transport substrate, not this control socket. Caller must be a
     /// channel member.
@@ -40582,7 +40582,7 @@ pub const LinuxServer = struct {
             var tbuf: [400]u8 = undefined;
             if (dtls_mode) {
                 // RFC 8122: advertise the server's DTLS certificate fingerprint +
-                // setup=passive (orochi is the DTLS server) INSTEAD of the SDES
+                // setup=passive (Onyx Server is the DTLS server) INSTEAD of the SDES
                 // group key. The peer's offered fingerprint was already stored
                 // (fail-closed) above, so the handshake fails closed on a cert
                 // mismatch. `dtls_mode` implies `dtlsFingerprint` is non-null.
@@ -42174,7 +42174,7 @@ pub const LinuxServer = struct {
     fn publishServerLink(self: *LinuxServer, remote: []const u8, up: bool) void {
         if (remote.len == 0) return;
         // chatsvc SERVER topology event body: `SERVER LINK <peer>` / `SERVER UNLINK
-        // <peer>` (the `<TYPE> <SUBTYPE> <args>` form). Orochi identifies peers by
+        // <peer>` (the `<TYPE> <SUBTYPE> <args>` form). Onyx Server identifies peers by
         // mesh server name rather than chatsvc's <ip>:<port> <id> <id>.
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "SERVER {s} {s}", .{ if (up) "LINK" else "UNLINK", remote }) catch return;
@@ -42213,7 +42213,7 @@ pub const LinuxServer = struct {
         if (!self.requirePriv(conn, .server_rehash)) return;
         // Operator gate enforced by the registry (access=.oper).
         const path = self.config.config_path orelse {
-            try queueNumeric(conn, .RPL_REHASHING, &.{"orochi.conf"}, "No config file; nothing to reload");
+            try queueNumeric(conn, .RPL_REHASHING, &.{"onyx_server.conf"}, "No config file; nothing to reload");
             return;
         };
         const io = self.config.crypto_io orelse {
@@ -42400,10 +42400,10 @@ pub const LinuxServer = struct {
     pub fn loadWasmPlugins(self: *LinuxServer) void {
         if (self.config.wasm_plugin_dir.len == 0) return;
         const n = self.wasm.loadFromDir(self.config.wasm_plugin_dir) catch |err| {
-            srvLog("orochi: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
+            srvLog("onyx-server: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
             return;
         };
-        if (n > 0) srvLog("orochi: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
+        if (n > 0) srvLog("onyx-server: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
@@ -42473,18 +42473,18 @@ pub const LinuxServer = struct {
     fn maybeReloadAcmeTls(self: *LinuxServer) void {
         if (!self.acme_reload_requested.swap(false, .acq_rel)) return;
         const tls = self.acme_reload_tls orelse {
-            srvLog("orochi: acme TLS reload requested but no [tls] config is registered\n", .{});
+            srvLog("onyx-server: acme TLS reload requested but no [tls] config is registered\n", .{});
             return;
         };
         const io = self.config.crypto_io orelse {
-            srvLog("orochi: acme TLS reload requested but no I/O handle is available\n", .{});
+            srvLog("onyx-server: acme TLS reload requested but no I/O handle is available\n", .{});
             return;
         };
         const outcome = self.reloadTlsCerts(io, tls) catch |err| {
-            srvLog("orochi: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
+            srvLog("onyx-server: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
             return;
         };
-        srvLog("orochi: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
+        srvLog("onyx-server: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
     }
 
     /// Re-read the TLS cert chain + signing key from the reloaded config's paths
@@ -44094,7 +44094,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
             if (filtered) {
-                if (!is_notice) try self.failReply(conn, command, "OROCHI_FILTERED", "Message blocked by the content filter");
+                if (!is_notice) try self.failReply(conn, command, "ONYX_FILTERED", "Message blocked by the content filter");
                 return false;
             }
         }
@@ -44105,7 +44105,7 @@ pub const LinuxServer = struct {
             if (!exempt) {
                 if (self.account_services) |svc| {
                     if (svc.chanBadwordMatches(target, text)) {
-                        if (!is_notice) try self.failReply(conn, command, "OROCHI_FILTERED", "Message blocked by the channel word filter");
+                        if (!is_notice) try self.failReply(conn, command, "ONYX_FILTERED", "Message blocked by the channel word filter");
                         return false;
                     }
                 }
@@ -44264,7 +44264,7 @@ pub const LinuxServer = struct {
         var topic_strip_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
         var topic_label_buf: [topic_tag.max_label_len]u8 = undefined;
         // Named conversations ("topics"): a channel message may carry a
-        // `+orochi/topic=<label>` client-only tag. A valid label is kept verbatim
+        // `+onyx/topic=<label>` client-only tag. A valid label is kept verbatim
         // (it rides the ordinary client-tag path to members, echo, mesh and
         // history) and captured for the per-channel topic registry; an
         // oversized/invalid label is stripped fail-closed so it never reaches the
@@ -45346,8 +45346,8 @@ fn findTagValue(tags_raw: []const u8, key: []const u8) ?[]const u8 {
 
 fn clientTagAllowedForSession(session: *const dispatch.ClientSession, key: []const u8) bool {
     if (session.hasCap(.message_tags)) return true;
-    if (std.mem.eql(u8, key, topic_tag.tag_key)) return session.hasCap(.orochi_topics);
-    if (e2ee_policy.isEncryptedTagKey(key)) return session.hasCap(.orochi_e2ee);
+    if (std.mem.eql(u8, key, topic_tag.tag_key)) return session.hasCap(.onyx_topics);
+    if (e2ee_policy.isEncryptedTagKey(key)) return session.hasCap(.onyx_e2ee);
     if (msgedit.isTypingTag(key)) return session.hasCap(.typing);
     if (std.mem.eql(u8, key, "+draft/react") or std.mem.eql(u8, key, "+draft/unreact")) return session.hasCap(.react);
     if (std.mem.eql(u8, key, "+draft/reply")) return session.hasCap(.reply);
@@ -45427,7 +45427,7 @@ fn allowsSessionSyncSibling(
     if (conn.s2s != null or conn.s2s_secured != null) return false;
     // Exact-token siblings use the mandatory logical-session path. This helper
     // is only optional mirroring to a differently named account session.
-    return conn.session.hasCap(.orochi_session_sync);
+    return conn.session.hasCap(.onyx_session_sync);
 }
 
 /// Map a MonitorStore numeric to the live server's numeric enum.
@@ -45451,7 +45451,7 @@ fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
     emitReplyLine(core.conn, line) catch {};
 }
 fn wasmLogCb(_: *anyopaque, text: []const u8) void {
-    srvLog("orochi: wasm-plugin: {s}\n", .{text});
+    srvLog("onyx-server: wasm-plugin: {s}\n", .{text});
 }
 fn wasmNowCb(_: *anyopaque) i64 {
     return platform.monotonicMillis();
@@ -48005,7 +48005,7 @@ test "UPGRADE restored property checkpoint bursts after preserved-link activatio
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-pass4-restored-properties",
+        .arena_name = "onyx-test-pass4-restored-properties",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -48615,12 +48615,12 @@ fn buildOperBindingsFromConfig(allocator: std.mem.Allocator, parsed: config_form
     errdefer bindings.deinit(allocator);
     for (parsed.opers) |o| {
         if (o.class.len == 0 or groups.get(o.class) == null) {
-            srvLog("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            srvLog("onyx-server: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
             continue;
         }
         const privileges = groups.effectivePrivileges(o.class);
         if (privileges.count() == 0) {
-            srvLog("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            srvLog("onyx-server: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
             continue;
         }
         try bindings.append(allocator, .{
@@ -48713,7 +48713,7 @@ fn decodeMeshTrustRoot(text: []const u8) ?[32]u8 {
 }
 
 const relay_v2_roster_max_nodes: usize = 4096;
-const relay_v2_roster_digest_domain = "orochi-relay-v2-full-mesh-roster-v1\x00";
+const relay_v2_roster_digest_domain = "onyx-relay-v2-full-mesh-roster-v1\x00";
 
 fn relayV2PublicKeyLessThan(_: void, lhs: [32]u8, rhs: [32]u8) bool {
     return std.mem.order(u8, &lhs, &rhs) == .lt;
@@ -49006,9 +49006,9 @@ fn socketPort(fd: linux.fd_t) ServerError!u16 {
 
 // --- SASL-oper test fixtures (oper is SASL-only) ---------------------------
 
-/// Test PLAIN verifier: accepts the account "admin" / password "orochi".
+/// Test PLAIN verifier: accepts the account "admin" / password "onyx".
 fn testOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
-    return std.mem.eql(u8, creds.authcid, "admin") and std.mem.eql(u8, creds.password, "orochi");
+    return std.mem.eql(u8, creds.authcid, "admin") and std.mem.eql(u8, creds.password, "onyx");
 }
 var test_oper_anchor: u8 = 0;
 const test_oper_checker = sasl.PlainChecker{ .ptr = &test_oper_anchor, .verifyFn = testOperVerify };
@@ -49039,7 +49039,7 @@ const test_oauth_admin_lookup = sasl_mechrouter.OAuthBearerLookup{ .ptr = &test_
 
 fn testMultiOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "oper")) and
-        std.mem.eql(u8, creds.password, "orochi");
+        std.mem.eql(u8, creds.password, "onyx");
 }
 var test_multi_oper_anchor: u8 = 0;
 const test_multi_oper_checker = sasl.PlainChecker{ .ptr = &test_multi_oper_anchor, .verifyFn = testMultiOperVerify };
@@ -49050,7 +49050,7 @@ const test_multi_oper_bindings = [_]oper_mod.OperBinding{
 
 fn testRuntimeGrantVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "target")) and
-        std.mem.eql(u8, creds.password, "orochi");
+        std.mem.eql(u8, creds.password, "onyx");
 }
 var test_runtime_grant_anchor: u8 = 0;
 const test_runtime_grant_checker = sasl.PlainChecker{ .ptr = &test_runtime_grant_anchor, .verifyFn = testRuntimeGrantVerify };
@@ -49161,7 +49161,7 @@ fn runBouncerRewindScenario(account: []const u8, set_opers_policy: bool, expect_
     }
 
     // Bouncer member M logs in (SASL PLAIN) and negotiates the rewind caps.
-    try saslPlainPreludeWithCaps(fd_m, account, "rewind", "draft/read-marker draft/chathistory batch orochi/bouncer");
+    try saslPlainPreludeWithCaps(fd_m, account, "rewind", "draft/read-marker draft/chathistory batch onyx/bouncer");
     try writeAllFd(fd_m, "NICK M\r\nUSER mem 0 * :Mem\r\n");
     try recvUntil(m, " 001 M ", 200);
 
@@ -49220,7 +49220,7 @@ fn runtimeGrantTestConfig(port: u16) Config {
 /// Drive a live client through SASL PLAIN as the "admin" oper account. Call
 /// before NICK/USER so the client is elevated automatically at registration.
 fn saslAdminPrelude(fd: linux.fd_t) ServerError!void {
-    try saslPlainPrelude(fd, "admin", "orochi");
+    try saslPlainPrelude(fd, "admin", "onyx");
 }
 
 fn saslPlainPrelude(fd: linux.fd_t, account: []const u8, password: []const u8) ServerError!void {
@@ -49287,7 +49287,7 @@ fn connectLoopback(port: u16) ServerError!linux.fd_t {
 /// futex_do_wait" hang. `requestStop` avoids the lottery: it clears the run flag
 /// AND writes every reactor's wake eventfd, so each blocked loop returns, re-reads
 /// the flag, and exits. A watchdog turns any residual hang (a wake regression, or
-/// an orphan `orochi`/`test` process from a force-killed prior run still holding a
+/// an orphan `onyx-server`/`test` process from a force-killed prior run still holding a
 /// loopback port) into a loud, bounded failure instead of an opaque futex park.
 fn stopThreadedServer(server: *Server, run: *std.atomic.Value(bool), thr: std.Thread) void {
     server.requestStop(run);
@@ -49300,7 +49300,7 @@ fn stopThreadedServer(server: *Server, run: *std.atomic.Value(bool), thr: std.Th
                 if (platform.monotonicMillis() >= deadline) {
                     std.debug.print(
                         "\nstopThreadedServer: reactor thread did not stop within 30s — a " ++
-                            "reactor is wedged in submitAndWait. Sweep stale `orochi`/`test` " ++
+                            "reactor is wedged in submitAndWait. Sweep stale `onyx-server`/`test` " ++
                             "processes holding a loopback port and re-run from a clean table.\n",
                         .{},
                     );
@@ -49779,7 +49779,7 @@ test "UPGRADE mandatory state round trip is exact and deterministic" {
     };
     defer alloc.destroy(successor);
     defer successor.deinit();
-    _ = try adoptUpgradePiecesForTest(successor, predecessor_pieces.items, "orochi-test-mandatory-exact");
+    _ = try adoptUpgradePiecesForTest(successor, predecessor_pieces.items, "onyx-test-mandatory-exact");
     current_reactor = null;
     try std.testing.expect(successor.inherited_event_history_restored);
     try std.testing.expect(successor.inherited_webhook_store_restored);
@@ -49867,7 +49867,7 @@ test "UPGRADE mandatory state round trip is exact and deterministic" {
     _ = try adoptUpgradePiecesForTest(
         second_successor,
         successor_pieces.items,
-        "orochi-test-mandatory-exact-second",
+        "onyx-test-mandatory-exact-second",
     );
     current_reactor = null;
     try std.testing.expect(second_successor.relay_v2_outbox.contains(event_peer.shortId(), stable_relay_id));
@@ -49907,7 +49907,7 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
         .privilege_bits = 0,
         .class = "revoked",
         .title = "",
-        .issuer_node = "orochi.local",
+        .issuer_node = "onyx.local",
         .incarnation = 200,
         .issued_ms = now,
         .expiry_ms = now + Server.oper_grant_ttl_ms,
@@ -49929,7 +49929,7 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
     };
     defer alloc.destroy(successor);
     defer successor.deinit();
-    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "orochi-test-oper-grants");
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-oper-grants");
     current_reactor = null;
 
     // The successor's registry converged BEFORE its io loop could process any
@@ -49949,7 +49949,7 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
         .privilege_bits = trev_bits,
         .class = "netadmin",
         .title = "",
-        .issuer_node = "orochi.local",
+        .issuer_node = "onyx.local",
         .incarnation = 150,
         .issued_ms = now,
         .expiry_ms = now + Server.oper_grant_ttl_ms,
@@ -50007,7 +50007,7 @@ test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor
     };
     defer alloc.destroy(successor);
     defer successor.deinit();
-    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "orochi-test-oper-grants-legacy");
+    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "onyx-test-oper-grants-legacy");
     current_reactor = null;
     try std.testing.expectEqual(@as(usize, 0), successor.oper_grants.count());
     try std.testing.expectEqual(@as(u64, 0), successor.grant_incarnation);
@@ -50067,7 +50067,7 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
     _ = try adoptUpgradePiecesForTest(
         successor,
         predecessor_pieces.items,
-        "orochi-test-ads1-two-hop-first",
+        "onyx-test-ads1-two-hop-first",
     );
     current_reactor = null;
     const first_successor_client = successor.sessions.findDetachedTokenInAccount("alice", token) orelse
@@ -50112,7 +50112,7 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
     _ = try adoptUpgradePiecesForTest(
         second_successor,
         successor_pieces.items,
-        "orochi-test-ads1-two-hop-second",
+        "onyx-test-ads1-two-hop-second",
     );
     current_reactor = null;
     const second_successor_client = second_successor.sessions.findDetachedTokenInAccount("alice", token) orelse
@@ -51150,7 +51150,7 @@ test "UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication" 
     defer alloc.destroy(successor);
     defer successor.deinit();
     _ = try successor.world.markRegistered("#old-sentinel", true);
-    _ = try rejectUpgradePiecesForTest(successor, torn.items, "orochi-test-rvl2-torn-relation");
+    _ = try rejectUpgradePiecesForTest(successor, torn.items, "onyx-test-rvl2-torn-relation");
     current_reactor = null;
     try std.testing.expect(successor.config.resume_arena_fd == null);
     try std.testing.expect(successor.world.channelExists("#old-sentinel"));
@@ -51695,7 +51695,7 @@ test "UPGRADE mandatory state rejects missing duplicate and late corruption with
         defer before_pieces.deinit(alloc);
         try appendCurrentMandatoryUpgradeStateForTest(successor, &before_pieces, &before_blobs);
 
-        _ = try rejectUpgradePiecesForTest(successor, scenario_pieces.items, "orochi-test-mandatory-reject");
+        _ = try rejectUpgradePiecesForTest(successor, scenario_pieces.items, "onyx-test-mandatory-reject");
         current_reactor = null;
         try std.testing.expect(successor.config.resume_arena_fd == null);
         try std.testing.expect(!successor.inherited_event_history_restored);
@@ -51769,7 +51769,7 @@ test "UPGRADE current mandatory handoff requires MHLC PRPC SRST and PMST" {
             else => return err,
         };
         defer successor.deinit();
-        _ = try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-required-current-state");
+        _ = try rejectUpgradePiecesForTest(&successor, pieces.items, "onyx-test-required-current-state");
         current_reactor = null;
         try std.testing.expect(successor.config.resume_arena_fd == null);
         try std.testing.expect(!successor.inherited_event_history_restored);
@@ -51831,7 +51831,7 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
     _ = try adoptUpgradePiecesForTest(
         active_successor,
         compat_pieces.items,
-        "orochi-test-relay-v2-activate",
+        "onyx-test-relay-v2-activate",
     );
     current_reactor = null;
     try std.testing.expect(active_successor.authoredRelayV2Configured());
@@ -51855,7 +51855,7 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
     _ = try rejectUpgradePiecesForTest(
         mismatched_successor,
         compat_pieces.items,
-        "orochi-test-relay-v2-roster-mismatch",
+        "onyx-test-relay-v2-roster-mismatch",
     );
     current_reactor = null;
     try std.testing.expectEqual(mismatched_clock_before, mismatched_successor.mesh_clock);
@@ -51885,7 +51885,7 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
     _ = try rejectUpgradePiecesForTest(
         downgrade,
         active_pieces.items,
-        "orochi-test-relay-v2-downgrade",
+        "onyx-test-relay-v2-downgrade",
     );
     current_reactor = null;
     try std.testing.expect(!downgrade.authoredRelayV2Configured());
@@ -52076,7 +52076,7 @@ test "UPGRADE exact client adoption failure is startup fatal and restores displa
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-client-fatal",
+        .arena_name = "onyx-test-client-fatal",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -52364,7 +52364,7 @@ test "UPGRADE successor adopts one canonical TLS ticket-key authority atomically
     }
     try std.testing.expect(ticket_replaced);
     const listener_fd = successor.reactors[0].listener_fd;
-    const arena_fd = try adoptUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-success");
+    const arena_fd = try adoptUpgradePiecesForTest(&successor, pieces.items, "onyx-test-ticket-key-success");
     current_reactor = null;
 
     try std.testing.expectEqualSlices(u8, &carried_current, &successor.tls_ticket_key);
@@ -52429,7 +52429,7 @@ test "UPGRADE successor rejects missing duplicate corrupt and late-failing TLS t
             },
         }
         const listener_fd = successor.reactors[0].listener_fd;
-        const arena_fd = try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-refuse");
+        const arena_fd = try rejectUpgradePiecesForTest(&successor, pieces.items, "onyx-test-ticket-key-refuse");
         current_reactor = null;
 
         try std.testing.expectEqualSlices(u8, &boot_current, &successor.tls_ticket_key);
@@ -52486,10 +52486,10 @@ test "UPGRADE successor rejects noncanonical TLS ticket wrapper and disabled aut
                 .tls_ticket_keys,
             );
             defer allocator.free(stream);
-            break :blk try rejectUpgradeStreamForTest(&successor, stream, "orochi-test-ticket-key-outer");
+            break :blk try rejectUpgradeStreamForTest(&successor, stream, "onyx-test-ticket-key-outer");
         } else blk: {
             try pieces.append(allocator, .{ .kind = .tls_ticket_keys, .bytes = blob });
-            break :blk try rejectUpgradePiecesForTest(&successor, pieces.items, "orochi-test-ticket-key-disabled");
+            break :blk try rejectUpgradePiecesForTest(&successor, pieces.items, "onyx-test-ticket-key-disabled");
         };
         current_reactor = null;
 
@@ -53600,7 +53600,7 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-multishard-adopt",
+        .arena_name = "onyx-test-multishard-adopt",
         .pieces = arena_pieces.items,
         .fds = &.{},
     });
@@ -53645,8 +53645,8 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
         thr.join();
     }
     for ([_]struct { fd: i32, ping: []const u8, pong: []const u8 }{
-        .{ .fd = peer_a, .ping = "PING :even\r\n", .pong = "PONG orochi.local :even" },
-        .{ .fd = peer_b, .ping = "PING :odd\r\n", .pong = "PONG orochi.local :odd" },
+        .{ .fd = peer_a, .ping = "PING :even\r\n", .pong = "PONG onyx.local :even" },
+        .{ .fd = peer_b, .ping = "PING :odd\r\n", .pong = "PONG onyx.local :odd" },
     }) |case| {
         try writeAllFd(case.fd, case.ping);
         var acc: std.ArrayList(u8) = .empty;
@@ -53779,7 +53779,7 @@ test "processLine answers PING with an RFC-compliant server-sourced PONG" {
     var sink = TestSink{ .storage = &storage };
 
     try processLine(&conn, "PING :abc", &sink);
-    try std.testing.expectEqualStrings(":orochi.local PONG orochi.local :abc\r\n", sink.written());
+    try std.testing.expectEqualStrings(":onyx.local PONG onyx.local :abc\r\n", sink.written());
 }
 
 test "processLine registration sequence emits welcome numerics" {
@@ -53794,24 +53794,24 @@ test "processLine registration sequence emits welcome numerics" {
     defer protocol_inventory.setMeshPeerCount(0);
 
     var conn = ConnState.init(-1);
-    conn.session.setVisibleHost("cloak-test.orochi");
+    conn.session.setVisibleHost("cloak-test.onyx");
     conn.session.tls_cipher = "TLS_AES_256_GCM_SHA384";
     var storage: [4096]u8 = undefined;
     var sink = TestSink{ .storage = &storage };
 
     try processLine(&conn, "NICK kain", &sink);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
-    try processLine(&conn, "USER kain 0 * :Kain Orochi", &sink);
+    try processLine(&conn, "USER kain 0 * :Kain Onyx", &sink);
 
     try std.testing.expect(conn.session.registered());
     try expectCodesInOrder(sink.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
     try expectContains(sink.written(), " 001 kain :Welcome to the Onyx network, kain");
-    try expectContains(sink.written(), "you are kain!kain@cloak-test.orochi");
-    try expectContains(sink.written(), " 002 kain :Your host is orochi.local (node 99), running " ++ server_version);
+    try expectContains(sink.written(), "you are kain!kain@cloak-test.onyx");
+    try expectContains(sink.written(), " 002 kain :Your host is onyx.local (node 99), running " ++ server_version);
     try expectContains(sink.written(), " 003 kain :This node has been weaving the mesh since 01 Jan 2025 00:00 UTC");
 
     var myinfo_buf: [256]u8 = undefined;
-    const myinfo = try std.fmt.bufPrint(&myinfo_buf, " 004 kain orochi.local {s} {s} {s} {s}\r\n", .{
+    const myinfo = try std.fmt.bufPrint(&myinfo_buf, " 004 kain onyx.local {s} {s} {s} {s}\r\n", .{
         server_version,
         usermode.default_mode_letters,
         chanmode.default_mode_letters,
@@ -53820,7 +53820,7 @@ test "processLine registration sequence emits welcome numerics" {
     try expectContains(sink.written(), myinfo);
     try expectContains(sink.written(), " 005 kain ");
     try expectContains(sink.written(), ":are supported by this server\r\n");
-    try expectContains(sink.written(), " NOTICE kain :secured (TLS1.3 AES-256-GCM) | you are cloak-test.orochi | not logged in\r\n");
+    try expectContains(sink.written(), " NOTICE kain :secured (TLS1.3 AES-256-GCM) | you are cloak-test.onyx | not logged in\r\n");
     try expectContains(sink.written(), " NOTICE kain :mesh: 3 nodes linked | /HELP to get started\r\n");
 }
 
@@ -53876,22 +53876,22 @@ test "emitLabeledIssuer: single captured line is tagged with the label" {
     var conn = ConnState.init(-1);
     var cb: [256]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
-    cap.append(":orochi 351 me v :info\r\n");
+    cap.append(":onyx 351 me v :info\r\n");
     try emitLabeledIssuer(&conn, "lbl1", &cap);
-    try std.testing.expectEqualStrings("@label=lbl1 :orochi 351 me v :info\r\n", conn.send_buf[0..conn.send_len]);
+    try std.testing.expectEqualStrings("@label=lbl1 :onyx 351 me v :info\r\n", conn.send_buf[0..conn.send_len]);
 }
 
 test "emitLabeledIssuer: multi-line response is a labeled BATCH" {
     var conn = ConnState.init(-1);
     var cb: [256]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
-    cap.append(":orochi 311 me nick u h * :n\r\n");
-    cap.append(":orochi 318 me nick :End\r\n");
+    cap.append(":onyx 311 me nick u h * :n\r\n");
+    cap.append(":onyx 318 me nick :End\r\n");
     try emitLabeledIssuer(&conn, "w1", &cap);
     const out = conn.send_buf[0..conn.send_len];
     try expectContains(out, "@label=w1 BATCH +suzu-label labeled-response\r\n");
-    try expectContains(out, "@batch=suzu-label :orochi 311 me nick u h * :n\r\n");
-    try expectContains(out, "@batch=suzu-label :orochi 318 me nick :End\r\n");
+    try expectContains(out, "@batch=suzu-label :onyx 311 me nick u h * :n\r\n");
+    try expectContains(out, "@batch=suzu-label :onyx 318 me nick :End\r\n");
     try expectContains(out, "BATCH -suzu-label\r\n");
 }
 
@@ -53907,7 +53907,7 @@ test "emitLabeledIssuer: capture overflow delivers the reply unwrapped" {
     var conn = ConnState.init(-1);
     var cb: [16]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
-    cap.append(":orochi 351 me v :a really long info line that overflows\r\n");
+    cap.append(":onyx 351 me v :a really long info line that overflows\r\n");
     try std.testing.expect(cap.overflowed);
     try emitLabeledIssuer(&conn, "x", &cap);
     const out = conn.send_buf[0..conn.send_len];
@@ -54254,7 +54254,7 @@ test "webhook: Block-Kit-lite actions are delivered as IRCv3 client tags" {
     try recvUntil(&hc, "204 No Content", 200);
 
     try recvUntil(&c, "PRIVMSG #hooks :deploy ok", 400);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+orochi/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+onyx/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3") != null);
 }
 
 test "webhook: CREATE/LIST/DELETE gate on channel operator status" {
@@ -55725,7 +55725,7 @@ test "session-sync unit: two sessions same account both session-sync get the DM"
     const sender_id = client_model.ClientId{ .shard = 0, .slot = 9, .gen = 1 };
     const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
     var sibling = ConnState.init(-1);
-    sibling.session.addCap(.orochi_session_sync);
+    sibling.session.addCap(.onyx_session_sync);
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
         .token = @as([16]u8, @splat(0)),
@@ -55763,7 +55763,7 @@ test "session-sync unit: optional account mirror requires the explicit cap" {
     // selector covers only optional differently-named account mirroring.
     const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
     const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
-    var sibling = ConnState.init(-1); // NO orochi_session_sync cap
+    var sibling = ConnState.init(-1); // NO onyx_session_sync cap
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
         .token = @as([16]u8, @splat(0)),
@@ -55782,7 +55782,7 @@ test "session-sync unit: sender other session gets outgoing DM echo" {
     const recipient_id = client_model.ClientId{ .shard = 0, .slot = 8, .gen = 1 };
     const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
     var sibling = ConnState.init(-1);
-    sibling.session.addCap(.orochi_session_sync);
+    sibling.session.addCap(.onyx_session_sync);
     const session = sessions_mod.Session{
         .client = monitorIdFromClient(sibling_id),
         .token = @as([16]u8, @splat(0)),
@@ -55804,7 +55804,7 @@ test "session-sync unit: single-session account has no sibling copies" {
     _ = try store.attach("alice", monitorIdFromClient(target_id), @as([16]u8, @splat(1)), 0);
 
     var target_conn = ConnState.init(-1);
-    target_conn.session.addCap(.orochi_session_sync);
+    target_conn.session.addCap(.onyx_session_sync);
     var copies: usize = 0;
     var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
     const account_sessions = store.sessionsInto("alice", &session_buf);
@@ -56807,7 +56807,7 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
         const target = server.connFor(target_id).?;
         const sibling = server.connFor(sibling_id).?;
         _ = target.session.setUmode(.regonly_pm, true);
-        sibling.session.addCap(.orochi_session_sync);
+        sibling.session.addCap(.onyx_session_sync);
 
         server.deliverRelay(.{
             .verb = .privmsg,
@@ -56994,8 +56994,8 @@ test "session-sync exact-once matrix: local same-account distinct tokens dedupe 
     try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(same_nick_decoy_id), token_decoy, false));
     try sender_exact.session.setNick("Sender");
     try same_nick_decoy.session.setNick("Sender");
-    account_sync.session.addCap(.orochi_session_sync);
-    same_nick_decoy.session.addCap(.orochi_session_sync);
+    account_sync.session.addCap(.onyx_session_sync);
+    same_nick_decoy.session.addCap(.onyx_session_sync);
 
     try server.messageOne(sender_id, sender, "PRIVMSG", "Recipient", "matrix-local", null);
 
@@ -57225,8 +57225,8 @@ test "session-sync exact-once matrix: authenticated inbound relay dedupes exact 
     try std.testing.expect(server.sessions.adoptTokenGroup(account, monitorIdFromClient(same_nick_decoy_id), token_decoy, false));
     try sender_exact.session.setNick("Remote");
     try same_nick_decoy.session.setNick("Remote");
-    account_sync.session.addCap(.orochi_session_sync);
-    same_nick_decoy.session.addCap(.orochi_session_sync);
+    account_sync.session.addCap(.onyx_session_sync);
+    same_nick_decoy.session.addCap(.onyx_session_sync);
 
     // The signed Store offer binds the remote author to exact token A. Therefore
     // both local A attachments receive the sent-copy, B receives as the target,
@@ -58013,7 +58013,7 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
         _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
         try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.required, server.channelEncryptionPolicy("#secure"));
         try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null));
-        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+orochi/e2ee=1"));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=1"));
 
         const id = try addTestLocalClient(&server, "alice", null);
         const conn = server.connFor(id).?;
@@ -58127,7 +58127,7 @@ test "topics: registry PROP gates, auto-adds, records a mesh clock, and is CRDT-
         server.registerChannelTopic("#topics", "random");
         try std.testing.expectEqualStrings("general,random", (try server.props.getProp(chan, topic_tag.registry_key)).value);
 
-        // CRDT-portable: a remote node's `orochi.topics` fact (unsigned legacy
+        // CRDT-portable: a remote node's `onyx_server.topics` fact (unsigned legacy
         // path) applies locally through the ordinary channel-prop receive path.
         try std.testing.expect(server.applyRemoteChannelProp(.{
             .channel = "#remote",
@@ -58157,10 +58157,10 @@ test "topics: CHATHISTORY topic filter replays only the matching conversation" {
         const member = server.connFor(member_id).?;
 
         const now: u64 = @intCast(platform.realtimeMillis());
-        _ = server.history.append("#tf", .{ .msgid = "g1", .sender = "a!u@h", .text = "in-general-one", .timestamp = now, .client_tags = "+orochi/topic=general" }) catch {};
-        _ = server.history.append("#tf", .{ .msgid = "r1", .sender = "b!u@h", .text = "in-random-one", .timestamp = now, .client_tags = "+orochi/topic=random" }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "g1", .sender = "a!u@h", .text = "in-general-one", .timestamp = now, .client_tags = "+onyx/topic=general" }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "r1", .sender = "b!u@h", .text = "in-random-one", .timestamp = now, .client_tags = "+onyx/topic=random" }) catch {};
         _ = server.history.append("#tf", .{ .msgid = "n1", .sender = "c!u@h", .text = "no-topic-here", .timestamp = now }) catch {};
-        _ = server.history.append("#tf", .{ .msgid = "g2", .sender = "d!u@h", .text = "in-general-two", .timestamp = now, .client_tags = "+orochi/topic=general" }) catch {};
+        _ = server.history.append("#tf", .{ .msgid = "g2", .sender = "d!u@h", .text = "in-general-two", .timestamp = now, .client_tags = "+onyx/topic=general" }) catch {};
 
         var hbuf: [16]lotus.Message = undefined;
         const all = server.history.latest("#tf", hbuf.len, &hbuf) catch &.{};
@@ -58192,13 +58192,13 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     // Locks the extraction contract renderHistoryReplay depends on: the daemon's
     // inline parser exposes an @-stripped, +-preserving `tags_raw`, and
     // `handleChathistory` reads the filter from it via `topic_tag.labelFromTags`.
-    const tagged = try irc_line.parseLine("@+orochi/topic=general CHATHISTORY LATEST #t * 50");
+    const tagged = try irc_line.parseLine("@+onyx/topic=general CHATHISTORY LATEST #t * 50");
     var tbuf: [topic_tag.max_label_len]u8 = undefined;
     const filter = if (tagged.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
     try std.testing.expectEqualStrings("general", filter.?);
 
     // Escaped value decodes (\s -> space) just as on the message path.
-    const escaped = try irc_line.parseLine("@+orochi/topic=release\\splan CHATHISTORY LATEST #t * 50");
+    const escaped = try irc_line.parseLine("@+onyx/topic=release\\splan CHATHISTORY LATEST #t * 50");
     const escaped_filter = if (escaped.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
     try std.testing.expectEqualStrings("release plan", escaped_filter.?);
 
@@ -58207,7 +58207,7 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     try std.testing.expect((if (plain.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null) == null);
 }
 
-test "threaded server: +orochi/topic tag rides fanout + echo; untagged is unchanged" {
+test "threaded server: +onyx/topic tag rides fanout + echo; untagged is unchanged" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -58249,23 +58249,23 @@ test "threaded server: +orochi/topic tag rides fanout + echo; untagged is unchan
     // tag, and A's echo carries it too.
     a.reset();
     b.reset();
-    try writeAllFd(fd_a, "@+orochi/topic=general PRIVMSG #t :hi\r\n");
+    try writeAllFd(fd_a, "@+onyx/topic=general PRIVMSG #t :hi\r\n");
     try recvUntil(&b, "PRIVMSG #t :hi\r\n", 200);
-    try expectContains(b.written(), "+orochi/topic=general");
+    try expectContains(b.written(), "+onyx/topic=general");
     try recvUntil(&a, "PRIVMSG #t :hi\r\n", 200); // echo-message
-    try expectContains(a.written(), "+orochi/topic=general");
+    try expectContains(a.written(), "+onyx/topic=general");
 
     // An untagged message is unchanged: no topic tag appears anywhere.
     a.reset();
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG #t :plain\r\n");
     try recvUntil(&b, "PRIVMSG #t :plain\r\n", 200);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+onyx/topic") == null);
     try recvUntil(&a, "PRIVMSG #t :plain\r\n", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "+onyx/topic") == null);
 }
 
-test "threaded server: orochi/topics receives topic tags without generic message-tags" {
+test "threaded server: onyx/topics receives topic tags without generic message-tags" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -58296,7 +58296,7 @@ test "threaded server: orochi/topics receives topic tags without generic message
     var c = LiveClient{ .fd = fd_c };
 
     try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
-    try writeAllFd(fd_b, "CAP REQ :orochi/topics\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "CAP REQ :onyx/topics\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
@@ -58311,13 +58311,13 @@ test "threaded server: orochi/topics receives topic tags without generic message
 
     b.reset();
     c.reset();
-    try writeAllFd(fd_a, "@+orochi/topic=general;+draft/react=ok PRIVMSG #topiccap :hi\r\n");
+    try writeAllFd(fd_a, "@+onyx/topic=general;+draft/react=ok PRIVMSG #topiccap :hi\r\n");
     try recvUntil(&b, "PRIVMSG #topiccap :hi\r\n", 200);
-    try expectContains(b.written(), "+orochi/topic=general");
+    try expectContains(b.written(), "+onyx/topic=general");
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "+draft/react") == null);
 
     try recvUntil(&c, "PRIVMSG #topiccap :hi\r\n", 200);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+onyx/topic") == null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "+draft/react") == null);
 }
 
@@ -58349,7 +58349,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
 
         // Seed a live peer and a downed one, then build the JSON in memory.
         server.config.server_description = "Alpha node";
-        server.config.network_icon_url = "https://example.test/orochi.png";
+        server.config.network_icon_url = "https://example.test/onyx_server.png";
         server.markPeerHealth("ircx.us", .established);
         server.markPeerHealth("stale.node", .down);
         _ = try server.history.append("#hist", .{ .msgid = "h1", .sender = "a!u@h", .text = "one", .timestamp = 1 });
@@ -58366,7 +58366,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
 
         // Node identity + health envelope.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"description\":\"Alpha node\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "\"icon_url\":\"https://example.test/orochi.png\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"icon_url\":\"https://example.test/onyx_server.png\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"discoverable\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"uptime_seconds\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"users_online\":") != null);
@@ -58465,12 +58465,12 @@ test "prometheus export includes mesh health gauges" {
         server.refreshMetricsSnapshot();
         var buf: [8192]u8 = undefined;
         const text = try server.metrics_snapshot.copyInto(&buf);
-        try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE orochi_mesh_quorum gauge") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_quorum 0") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_partitioned 1") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_components 2") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_peers_up 1") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "orochi_mesh_peers_total 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE onyx_mesh_quorum gauge") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_quorum 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_partitioned 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_components 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_peers_up 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_peers_total 2") != null);
     } else return error.SkipZigTest;
 }
 
@@ -59539,7 +59539,7 @@ test "signed session replica projects JOIN PART only to the exact token and neve
     sibling.session.addCap(.setname);
     decoy.session.addCap(.away_notify);
     decoy.session.addCap(.setname);
-    decoy.session.addCap(.orochi_session_sync);
+    decoy.session.addCap(.onyx_session_sync);
 
     const exact_token = server.sessions.resumeHandleForClient("shared-acct", monitorIdFromClient(exact_id)).?.token;
     try std.testing.expect(server.sessions.joinTokenGroup("shared-acct", monitorIdFromClient(sibling_id), exact_token));
@@ -60134,10 +60134,10 @@ test "deliverRelay binds sender nick to its home node: cross-node impersonation 
     // A peer link (node 1) that homes "ricky" on node 1 via a MEMBERSHIP gossip.
     // Keyless/plaintext interop mirrors the existing mesh-LIST scaffolding.
     var peer: s2s_link.S2sLink = undefined;
-    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi", .config = .{ .require_signed_frames = false } });
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.onyx", .config = .{ .require_signed_frames = false } });
     defer peer.deinit();
     const link = try alloc.create(s2s_link.S2sLink);
-    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi", .config = .{ .require_signed_frames = false } });
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.onyx", .config = .{ .require_signed_frames = false } });
     const link_id = try server.rx().clients.alloc(ConnState.init(-1));
     server.rx().clients.get(link_id).?.s2s = link;
 
@@ -60983,7 +60983,7 @@ test "S2S identity transition renders PART before NICK before JOIN" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "peer.orochi",
+        .server_name = "peer.onyx",
         .config = .{ .require_signed_frames = false },
     });
     defer sender.deinit();
@@ -60993,7 +60993,7 @@ test "S2S identity transition renders PART before NICK before JOIN" {
         .local_node_id = 2,
         .remote_node_id = 1,
         .local_epoch_ms = 1001,
-        .server_name = "self.orochi",
+        .server_name = "self.onyx",
         .config = .{ .require_signed_frames = false },
     });
     const link_id = try server.rx().clients.alloc(ConnState.init(-1));
@@ -61123,13 +61123,13 @@ test "mesh LIST: remote-only channels join the union with the global count, secr
     // deployment: a keyless node now fails CLOSED on unsigned in-scope frames when
     // require_signed_frames is set (the default), so this propagation test opts
     // into unsigned interop as a plaintext operator would.
-    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.orochi", .config = .{ .require_signed_frames = false } });
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.onyx", .config = .{ .require_signed_frames = false } });
     defer peer.deinit();
 
     // Server side of the link (node 2), attached to a conn slot; server.deinit
     // tears it down (deinit + destroy) as it would any real peer link.
     const link = try alloc.create(s2s_link.S2sLink);
-    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.orochi", .config = .{ .require_signed_frames = false } });
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.onyx", .config = .{ .require_signed_frames = false } });
     const link_id = try server.rx().clients.alloc(ConnState.init(-1));
     server.rx().clients.get(link_id).?.s2s = link;
 
@@ -61613,7 +61613,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     var fd_a_open = true;
     defer if (fd_a_open) closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK trev\r\nUSER trev 0 * :Trev\r\n");
     try recvUntil(&a, " 381 trev ", 200);
     a.reset();
@@ -61639,7 +61639,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     const fd_b = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_b);
     var b = LiveClient{ .fd = fd_b };
-    try saslPlainPrelude(fd_b, "admin", "orochi");
+    try saslPlainPrelude(fd_b, "admin", "onyx");
     try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
     try recvUntil(&b, " 381 TempOper ", 200);
     var resume_line: [128]u8 = undefined;
@@ -62902,7 +62902,7 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
     var admin = LiveClient{ .fd = fd_admin };
     var bob = LiveClient{ .fd = fd_bob };
 
-    try saslPlainPreludeWithCaps(fd_admin, "admin", "orochi", "standard-replies");
+    try saslPlainPreludeWithCaps(fd_admin, "admin", "onyx", "standard-replies");
     try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
     try recvUntil(&admin, " 381 Founder ", 200);
     try writeAllFd(fd_bob, "CAP REQ :standard-replies\r\nNICK Bob\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
@@ -63251,7 +63251,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     admin.reset();
     try writeAllFd(fd_admin, "OROWASM WIT\r\n");
     try recvUntil(&admin, "OroWasm ABI WIT v1", 200);
-    try recvUntil(&admin, "package orochi:orowasm@1.0.0;", 200);
+    try recvUntil(&admin, "package onyx:orowasm@1.0.0;", 200);
     try recvUntil(&admin, "net-connect: func(host: string, port: u16)", 200);
 
     admin.reset();
@@ -63922,7 +63922,7 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
     try writeAllFd(fd_alice, "GHOST AwayNick correcthorse\r\n");
     try recvUntil(&alice, "FAIL GHOST NICK_NOT_OWNED", 200);
     try writeAllFd(fd_victim, "PING :still-here\r\n");
-    try recvUntil(&victim, "PONG orochi.local :still-here", 200);
+    try recvUntil(&victim, "PONG onyx.local :still-here", 200);
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
@@ -64380,14 +64380,14 @@ test "threaded server IRCX: bare NAMES hides a private (+p) channel from a non-m
     // NAMES output is on the wire before we assert.
     b.reset();
     try writeAllFd(fd_b, "NAMES\r\nPING :namesync\r\n");
-    try recvUntil(&b, "PONG orochi.local :namesync", 200);
+    try recvUntil(&b, "PONG onyx.local :namesync", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "#pub") != null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "#priv") == null);
 
     // Sanity: the member (A) still sees its own +p channel in bare NAMES.
     a.reset();
     try writeAllFd(fd_a, "NAMES\r\nPING :namesync2\r\n");
-    try recvUntil(&a, "PONG orochi.local :namesync2", 200);
+    try recvUntil(&a, "PONG onyx.local :namesync2", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "#priv") != null);
 }
 
@@ -64414,7 +64414,7 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "setname"); // A authenticates as the admin oper account
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "setname"); // A authenticates as the admin oper account
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
@@ -64571,7 +64571,7 @@ test "threaded server: SETNAME self echo requires setname cap" {
 
     a.reset();
     try writeAllFd(fd_a, "SETNAME :No Echo\r\nPING :setname-gate\r\n");
-    try recvUntil(&a, "PONG orochi.local :setname-gate", 200);
+    try recvUntil(&a, "PONG onyx.local :setname-gate", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "SETNAME :No Echo\r\n") == null);
 }
 
@@ -65197,7 +65197,7 @@ test "threaded server: CHATHISTORY replays TAGMSG without BATCH when batch cap i
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "BATCH -") == null);
 }
 
-test "threaded server: TAGMSG strips invalid orochi topic tag before live delivery and replay" {
+test "threaded server: TAGMSG strips invalid onyx topic tag before live delivery and replay" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -65222,7 +65222,7 @@ test "threaded server: TAGMSG strips invalid orochi topic tag before live delive
 
     try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
-    try writeAllFd(fd_b, "CAP REQ :orochi/topics draft/typing draft/chathistory\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "CAP REQ :onyx/topics draft/typing draft/chathistory\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&b, " 001 B ", 200);
 
     try writeAllFd(fd_a, "JOIN #topicmsg\r\n");
@@ -65231,14 +65231,14 @@ test "threaded server: TAGMSG strips invalid orochi topic tag before live delive
     try recvUntil(&b, " 366 B #topicmsg ", 200);
 
     b.reset();
-    try writeAllFd(fd_a, "@+orochi/topic=bad,label;+typing=active TAGMSG #topicmsg\r\n");
+    try writeAllFd(fd_a, "@+onyx/topic=bad,label;+typing=active TAGMSG #topicmsg\r\n");
     try recvUntil(&b, "+typing=active :A!alice@localhost TAGMSG #topicmsg\r\n", 200);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+onyx/topic") == null);
 
     b.reset();
     try writeAllFd(fd_b, "CHATHISTORY LATEST #topicmsg * 10\r\n");
     try recvUntil(&b, "+typing=active :A!alice@localhost TAGMSG #topicmsg\r\n", 200);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+orochi/topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+onyx/topic") == null);
 }
 
 test "threaded server: TAGMSG strips forged server tags and duplicate client tags" {
@@ -65780,9 +65780,9 @@ test "threaded server: session-sync fans out inbound direct messages to account 
     var a2 = LiveClient{ .fd = fd_a2 };
 
     try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
-    try saslPlainPreludeWithCaps(fd_a1, "admin", "orochi", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a1, "admin", "onyx", "onyx/session-sync");
     try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
-    try saslPlainPreludeWithCaps(fd_a2, "admin", "orochi", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a2, "admin", "onyx", "onyx/session-sync");
     try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
     try recvUntil(&s, " 001 S ", 200);
     try recvUntil(&a1, " 001 A1 ", 200);
@@ -65825,9 +65825,9 @@ test "threaded server: session-sync does not fan out to sibling without cap" {
     var a2 = LiveClient{ .fd = fd_a2 };
 
     try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
-    try saslPlainPreludeWithCaps(fd_a1, "admin", "orochi", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a1, "admin", "onyx", "onyx/session-sync");
     try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
-    try saslPlainPrelude(fd_a2, "admin", "orochi");
+    try saslPlainPrelude(fd_a2, "admin", "onyx");
     try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
     try recvUntil(&s, " 001 S ", 200);
     try recvUntil(&a1, " 001 A1 ", 200);
@@ -65868,9 +65868,9 @@ test "threaded server: session-sync mirrors outgoing direct messages to sender s
     var a2 = LiveClient{ .fd = fd_a2 };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPrelude(fd_a1, "admin", "orochi");
+    try saslPlainPrelude(fd_a1, "admin", "onyx");
     try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
-    try saslPlainPreludeWithCaps(fd_a2, "admin", "orochi", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a2, "admin", "onyx", "onyx/session-sync");
     try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a1, " 001 A1 ", 200);
@@ -65908,7 +65908,7 @@ test "threaded server: session-sync single-session account keeps direct message 
     var a = LiveClient{ .fd = fd_a };
 
     try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "onyx/session-sync");
     try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :Admin\r\n");
     try recvUntil(&s, " 001 S ", 200);
     try recvUntil(&a, " 001 A ", 200);
@@ -65996,10 +65996,10 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     // A plain sender, plus two clients SASL-authed to the SAME account both
     // requesting the SAME nick "kain". The second must NOT be dropped.
     try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
-    try saslPlainPrelude(fd_k1, "admin", "orochi");
+    try saslPlainPrelude(fd_k1, "admin", "onyx");
     try writeAllFd(fd_k1, "NICK kain\r\nUSER kain 0 * :Kain One\r\n");
     try recvUntil(&k1, " 001 kain ", 200);
-    try saslPlainPrelude(fd_k2, "admin", "orochi");
+    try saslPlainPrelude(fd_k2, "admin", "onyx");
     try writeAllFd(fd_k2, "NICK kain\r\nUSER kain 0 * :Kain Two\r\n");
     // BOTH reach 001 (the second is NOT 433'd/closed). Display nick is "kain".
     try recvUntil(&k2, " 001 kain ", 200);
@@ -66091,7 +66091,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     try writeAllFd(fd_sender, "NICK Sender\r\nUSER sender 0 * :Sender\r\n");
     try recvUntil(&sender, " 001 Sender ", 200);
 
-    try saslPlainPreludeWithCaps(fd_one, "ruri", "pw", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_one, "ruri", "pw", "onyx/session-sync");
     try writeAllFd(fd_one, "NICK kain\r\nUSER one 0 * :One\r\n");
     try recvUntil(&one, " 001 kain ", 200);
     try writeAllFd(fd_one, "JOIN #shared\r\n");
@@ -66111,7 +66111,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     // it starts with a distinct generated token. Only presenting the SAME
     // credential joins the exact logical token group and restores #shared as a
     // real member. The first socket remains connected throughout.
-    try saslPlainPreludeWithCaps(fd_two, "ruri", "pw", "orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_two, "ruri", "pw", "onyx/session-sync");
     try writeAllFd(fd_two, "NICK kain\r\nUSER two 0 * :Two\r\n");
     try recvUntil(&two, " 001 kain ", 200);
     waitMillis(50);
@@ -66171,23 +66171,23 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     // Keep the semantic assertion independent of the per-connection command
     // flood bucket under a CPU-saturated full-suite run.
     testSleepMs(1_100);
-    try writeAllFd(fd_two, "NICK OrochiUser\r\n");
-    try recvUntil(&one, " NICK :OrochiUser", 200);
-    try recvUntil(&two, " NICK :OrochiUser", 200);
-    try recvUntil(&sender, " NICK :OrochiUser", 200);
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(one.written(), "NICK :OrochiUser"));
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(two.written(), "NICK :OrochiUser"));
+    try writeAllFd(fd_two, "NICK OnyxUser\r\n");
+    try recvUntil(&one, " NICK :OnyxUser", 200);
+    try recvUntil(&two, " NICK :OnyxUser", 200);
+    try recvUntil(&sender, " NICK :OnyxUser", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(one.written(), "NICK :OnyxUser"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(two.written(), "NICK :OnyxUser"));
     one.reset();
     two.reset();
-    try writeAllFd(fd_sender, "PRIVMSG OrochiUser :after-group-nick\r\n");
-    try recvUntil(&one, "PRIVMSG OrochiUser :after-group-nick", 200);
-    try recvUntil(&two, "PRIVMSG OrochiUser :after-group-nick", 200);
+    try writeAllFd(fd_sender, "PRIVMSG OnyxUser :after-group-nick\r\n");
+    try recvUntil(&one, "PRIVMSG OnyxUser :after-group-nick", 200);
+    try recvUntil(&two, "PRIVMSG OnyxUser :after-group-nick", 200);
 
     // Member MODE and KICK also target the logical token group, not whichever
     // transport happens to own the nick lookup.
     sender.reset();
-    try writeAllFd(fd_sender, "MODE #bootstrap +m\r\nMODE #bootstrap +v OrochiUser\r\n");
-    try recvUntil(&sender, "MODE #bootstrap +v OrochiUser", 200);
+    try writeAllFd(fd_sender, "MODE #bootstrap +m\r\nMODE #bootstrap +v OnyxUser\r\n");
+    try recvUntil(&sender, "MODE #bootstrap +v OnyxUser", 200);
     try writeAllFd(fd_one, "PRIVMSG #bootstrap :voice-from-one\r\n");
     try recvUntil(&sender, "PRIVMSG #bootstrap :voice-from-one", 200);
     try writeAllFd(fd_two, "PRIVMSG #bootstrap :voice-from-two\r\n");
@@ -66197,15 +66197,15 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     // Refill the sender's command-rate bucket after the rapid JOIN/TOPIC/MODE
     // setup so this assertion exercises KICK semantics rather than throttling.
     testSleepMs(1_100);
-    try writeAllFd(fd_sender, "KICK #bootstrap OrochiUser :group kick\r\n");
-    try recvUntil(&one, "KICK #bootstrap OrochiUser :group kick", 1000);
-    try recvUntil(&two, "KICK #bootstrap OrochiUser :group kick", 1000);
+    try writeAllFd(fd_sender, "KICK #bootstrap OnyxUser :group kick\r\n");
+    try recvUntil(&one, "KICK #bootstrap OnyxUser :group kick", 1000);
+    try recvUntil(&two, "KICK #bootstrap OnyxUser :group kick", 1000);
     one.reset();
     two.reset();
     try writeAllFd(fd_one, "PRIVMSG #bootstrap :must fail one\r\n");
     try writeAllFd(fd_two, "PRIVMSG #bootstrap :must fail two\r\n");
-    try recvUntil(&one, " 404 OrochiUser #bootstrap ", 1000);
-    try recvUntil(&two, " 404 OrochiUser #bootstrap ", 1000);
+    try recvUntil(&one, " 404 OnyxUser #bootstrap ", 1000);
+    try recvUntil(&two, " 404 OnyxUser #bootstrap ", 1000);
 
     // Losing the original world owner hands nick/channel ownership to the second
     // attachment without an offline transition or disconnecting it.
@@ -66213,8 +66213,8 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     one_open = false;
     testSleepMs(80);
     two.reset();
-    try writeAllFd(fd_sender, "PRIVMSG OrochiUser :after-handoff\r\n");
-    try recvUntil(&two, "PRIVMSG OrochiUser :after-handoff", 200);
+    try writeAllFd(fd_sender, "PRIVMSG OnyxUser :after-handoff\r\n");
+    try recvUntil(&two, "PRIVMSG OnyxUser :after-handoff", 200);
     sender.reset();
     try writeAllFd(fd_two, "PRIVMSG #shared :still-participating\r\n");
     try recvUntil(&sender, "PRIVMSG #shared :still-participating", 200);
@@ -67378,7 +67378,7 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
     // A param-less NOTICE must be silently dropped; the trailing PING proves the
     // server kept processing and that no 461 was interleaved.
     try writeAllFd(fd_a, "NOTICE\r\nPING :tok\r\n");
-    try recvUntil(&a, "PONG orochi.local :tok", 200);
+    try recvUntil(&a, "PONG onyx.local :tok", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 461 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
@@ -67393,7 +67393,7 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
 
     a.reset();
     try writeAllFd(fd_a, "NOTICE A\r\nPING :tok2\r\n");
-    try recvUntil(&a, "PONG orochi.local :tok2", 200);
+    try recvUntil(&a, "PONG onyx.local :tok2", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
 }
@@ -67445,7 +67445,7 @@ test "threaded server: control byte reflected into a reply closes only that clie
     try recvUntil(&b, " 001 ctlB ", 200);
     b.reset();
     try writeAllFd(fd_b, "PING :tok\r\n");
-    try recvUntil(&b, "PONG orochi.local :tok", 200);
+    try recvUntil(&b, "PONG onyx.local :tok", 200);
 }
 
 test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
@@ -67586,7 +67586,7 @@ test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
     defer conn.reply_capture = null;
 
     // e.g. a reflected WEBHOOK URL / echoed param carrying a forged line.
-    try server.noticeTo(conn, "WEBHOOK: created\r\n:orochi 001 victim :forged welcome");
+    try server.noticeTo(conn, "WEBHOOK: created\r\n:onyx 001 victim :forged welcome");
     try assertNoInjectedWireLine(capture.captured());
     try std.testing.expectEqual(@as(usize, 0), capture.captured().len);
 }
@@ -67642,19 +67642,19 @@ test "exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fa
     // an embedded CRLF mid-list-entry, and a NUL. Every one must be dropped.
     const hostile = [_][]const u8{
         // SHUN reason (oper/mesh-set, unvalidated storage).
-        ":orochi NOTICE victim :SHUN *!*@evil by admin :spam\r\n:orochi 001 victim :forged\r\n",
+        ":onyx NOTICE victim :SHUN *!*@evil by admin :spam\r\n:onyx 001 victim :forged\r\n",
         // WARD reason.
-        ":orochi NOTICE victim :WARD glob *!*@bad kill/net by op :abuse\r\n:evil!e@e PRIVMSG #c :owned\r\n",
+        ":onyx NOTICE victim :WARD glob *!*@bad kill/net by op :abuse\r\n:evil!e@e PRIVMSG #c :owned\r\n",
         // CHANBADWORDS pattern.
-        ":orochi NOTICE victim :CHANBADWORDS #room :ba\nd\r\n",
+        ":onyx NOTICE victim :CHANBADWORDS #room :ba\nd\r\n",
         // RESV pattern (lone CR).
-        ":orochi NOTICE victim :RESV #ev\ril :taken\r\n",
+        ":onyx NOTICE victim :RESV #ev\ril :taken\r\n",
         // channel ONJOIN PROP value (client-reachable shape).
-        ":orochi NOTICE victim :[#room] hi\r\n:orochi KILL victim :forged\r\n",
+        ":onyx NOTICE victim :[#room] hi\r\n:onyx KILL victim :forged\r\n",
         // NUL in a reflected account name.
-        ":orochi NOTICE victim :You are now identified as ev\x00il\r\n",
+        ":onyx NOTICE victim :You are now identified as ev\x00il\r\n",
         // A line missing the canonical trailing CRLF is not a valid wire line.
-        ":orochi NOTICE victim :no terminator",
+        ":onyx NOTICE victim :no terminator",
     };
     for (hostile) |line| {
         var cap_buf: [default_reply_bytes]u8 = undefined;
@@ -67680,9 +67680,9 @@ test "exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte" 
 
     // Legitimate single-line replies are unchanged (byte-identical passthrough).
     const clean = [_][]const u8{
-        ":orochi NOTICE victim :SHUN *!*@evil by admin :spammer\r\n",
-        ":orochi NOTICE victim :WARD glob *!*@bad kill/net by op :abuse\r\n",
-        ":orochi NOTICE victim :[#room] welcome to the room\r\n",
+        ":onyx NOTICE victim :SHUN *!*@evil by admin :spammer\r\n",
+        ":onyx NOTICE victim :WARD glob *!*@bad kill/net by op :abuse\r\n",
+        ":onyx NOTICE victim :[#room] welcome to the room\r\n",
     };
     for (clean) |line| {
         var cap_buf: [default_reply_bytes]u8 = undefined;
@@ -67710,7 +67710,7 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
     // hostile entry plus a clean one so we can prove the clean row still lists.
     try server.shuns.add(.{
         .mask = "*!*@evil",
-        .reason = "spam\r\n:orochi 001 operator :forged welcome",
+        .reason = "spam\r\n:onyx 001 operator :forged welcome",
         .set_by = "admin",
         .created_ms = 0,
     });
@@ -67765,7 +67765,7 @@ test "exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast
     // Hostile feed values: a full CRLF forging an OPER/KILL line, a lone CR, a
     // lone LF, and an embedded NUL. Every one must be dropped — nothing delivered.
     const hostile = [_][]const u8{
-        "sunny 25C\r\n:orochi 001 victim :forged welcome",
+        "sunny 25C\r\n:onyx 001 victim :forged welcome",
         "cloudy\rKILL victim :forged",
         "rain\nPRIVMSG #room :forged spoof",
         "wind \x00 gust",
@@ -68447,9 +68447,9 @@ test "threaded server: oper-only and admin-only channel join gates" {
     var c = LiveClient{ .fd = fd_c };
     var d = LiveClient{ .fd = fd_d };
 
-    try saslPlainPrelude(fd_a, "admin", "orochi");
-    try saslPlainPrelude(fd_b, "oper", "orochi");
-    try saslPlainPrelude(fd_d, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
+    try saslPlainPrelude(fd_b, "oper", "onyx");
+    try saslPlainPrelude(fd_d, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
@@ -68514,7 +68514,7 @@ test "threaded server: media user modes block transmit and hide automatic presen
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 381 A ", 200);
     try writeAllFd(fd_b, "CAP REQ :standard-replies\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
@@ -68539,7 +68539,7 @@ test "threaded server: media user modes block transmit and hide automatic presen
     a.reset();
     try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
     try writeAllFd(fd_a, "PING :media-private\r\n");
-    try recvUntil(&a, "PONG orochi.local :media-private", 200);
+    try recvUntil(&a, "PONG onyx.local :media-private", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "MEDIA JOIN #media B voice") == null);
 
     a.reset();
@@ -68587,7 +68587,7 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 381 A ", 200);
     try writeAllFd(fd_a, "JOIN #media\r\n");
@@ -68649,7 +68649,7 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 381 A ", 200);
     try writeAllFd(fd_a, "JOIN #media\r\n");
@@ -68854,8 +68854,8 @@ test "threaded server: sensitive oper commands require named privileges" {
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPrelude(fd_a, "admin", "orochi");
-    try saslPlainPrelude(fd_b, "oper", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
+    try saslPlainPrelude(fd_b, "oper", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 381 A ", 200);
@@ -71371,7 +71371,7 @@ test "threaded server: PROP user profile extended keys round-trip and enforce ac
         .{ .key = "URL", .value = "https://example.test/a", .profile_fragment = "url=https://example.test/a" },
         .{ .key = "GENDER", .value = "nonbinary", .profile_fragment = "gender=nonbinary" },
         .{ .key = "PICTURE", .value = "https://example.test/a.png", .profile_fragment = "picture=https://example.test/a.png" },
-        .{ .key = "BIO", .value = "Orochi operator", .profile_fragment = "bio=Orochi operator" },
+        .{ .key = "BIO", .value = "Onyx operator", .profile_fragment = "bio=Onyx operator" },
         .{ .key = "EMAIL", .value = "alice@example.test", .profile_fragment = "email=alice@example.test" },
     };
 
@@ -72026,9 +72026,9 @@ test "threaded server: override user mode gates and audits channel bypasses" {
     var o = LiveClient{ .fd = fd_o };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER admin 0 * :Admin\r\n");
-    try saslPlainPrelude(fd_o, "oper", "orochi");
+    try saslPlainPrelude(fd_o, "oper", "onyx");
     try writeAllFd(fd_o, "NICK O\r\nUSER oper 0 * :Oper\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 381 A ", 200);
@@ -72177,7 +72177,7 @@ test "migrated profile uses authenticated account and preserves local transport 
     session.setRealHost("203.0.113.41");
     session.setVisibleHost("old-cloak.example");
     session.addCap(.echo_message);
-    session.addCap(.orochi_session_sync);
+    session.addCap(.onyx_session_sync);
 
     const snap = migration_relay.Snapshot{
         .nick = "AlicePhone",
@@ -72196,7 +72196,7 @@ test "migrated profile uses authenticated account and preserves local transport 
     try std.testing.expectEqualStrings("203.0.113.41", session.realHost());
     try std.testing.expectEqualStrings("migrated-cloak.example", session.host());
     try std.testing.expect(session.hasCap(.echo_message));
-    try std.testing.expect(session.hasCap(.orochi_session_sync));
+    try std.testing.expect(session.hasCap(.onyx_session_sync));
 }
 
 test "migrated profile honors mode direction and rederives transport account and admin modes" {
@@ -72332,9 +72332,9 @@ test "threaded server: narrowing live GRANT clears armed override" {
     var a = LiveClient{ .fd = fd_a };
     var t = LiveClient{ .fd = fd_t };
 
-    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_a, "admin", "onyx");
     try writeAllFd(fd_a, "NICK A\r\nUSER admin 0 * :Admin\r\n");
-    try saslPlainPrelude(fd_t, "target", "orochi");
+    try saslPlainPrelude(fd_t, "target", "onyx");
     try writeAllFd(fd_t, "NICK T\r\nUSER target 0 * :Target\r\n");
     try recvUntil(&a, " 381 A ", 200);
     try recvUntil(&t, " 001 T ", 200);
@@ -72756,7 +72756,7 @@ test "threaded server: oper EVENT notes are tag-free chatsvc EVENT lines even wi
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "message-tags");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "message-tags");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
@@ -72794,7 +72794,7 @@ test "threaded server: EVENT requires event_subscribe privilege" {
     const fd = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd);
     var client = LiveClient{ .fd = fd };
-    try saslPlainPrelude(fd, "oper", "orochi");
+    try saslPlainPrelude(fd, "oper", "onyx");
     try writeAllFd(fd, "NICK O\r\nUSER oper 0 * :Limited Oper\r\n");
     try recvUntil(&client, " 001 O ", 200);
     try recvUntil(&client, " 381 O ", 200);
@@ -72834,7 +72834,7 @@ test "threaded server: REDACT broadcast + WARD alias oper events" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/message-redaction standard-replies message-tags echo-message");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "draft/message-redaction standard-replies message-tags echo-message");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
@@ -74102,10 +74102,10 @@ test "threaded server: SEARCH returns the requester's own DM history" {
     defer closeFd(fd_b);
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/search batch");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "draft/search batch");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 381 A ", 200);
-    try saslPlainPreludeWithCaps(fd_b, "oper", "orochi", "draft/search batch");
+    try saslPlainPreludeWithCaps(fd_b, "oper", "onyx", "draft/search batch");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 381 B ", 200);
 
@@ -74576,10 +74576,10 @@ test "threaded server: CHATHISTORY DM history follows accounts over reused nicks
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/chathistory batch");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "onyx", "draft/chathistory batch");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 381 A ", 200);
-    try saslPlainPreludeWithCaps(fd_b, "oper", "orochi", "draft/chathistory batch");
+    try saslPlainPreludeWithCaps(fd_b, "oper", "onyx", "draft/chathistory batch");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 381 B ", 200);
 
@@ -74601,7 +74601,7 @@ test "threaded server: CHATHISTORY DM history follows accounts over reused nicks
     const fd_c = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_c);
     var c = LiveClient{ .fd = fd_c };
-    try saslPlainPreludeWithCaps(fd_c, "oper", "orochi", "draft/chathistory batch");
+    try saslPlainPreludeWithCaps(fd_c, "oper", "onyx", "draft/chathistory batch");
     try writeAllFd(fd_c, "NICK A\r\nUSER carol 0 * :Carol\r\n");
     try recvUntil(&c, " 381 A ", 200);
 
@@ -75748,7 +75748,7 @@ test "failed inherited client adoption does not advance HLC or queue carried out
         .fd = sockets[0],
         .nick = "Rollback",
         .realname = "Rollback",
-        .pending_out = ":orochi NOTICE Rollback :carried\r\n",
+        .pending_out = ":onyx NOTICE Rollback :carried\r\n",
     }, null, null, true);
     failing.fail_index = std.math.maxInt(usize);
     inherited_fd_unconsumed = false; // adoption either owns it or closed it
@@ -75969,7 +75969,7 @@ fn reserveThreeLoopbackPorts() ServerError!struct { u16, u16, u16 } {
 fn acquireHeavyMeshAcceptanceTestLock() !linux.fd_t {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const open_rc = linux.open(
-        "/tmp/orochi-heavy-mesh-acceptance-test.lock",
+        "/tmp/onyx-heavy-mesh-acceptance-test.lock",
         .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
         0o600,
     );
@@ -76297,7 +76297,7 @@ const test_dm_relay_checker = sasl.PlainChecker{ .ptr = &test_dm_relay_anchor, .
 // to hold the B-C leg down and reconnect it deterministically.
 fn testLineMeshVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     if (std.mem.eql(u8, creds.authcid, "admin"))
-        return std.mem.eql(u8, creds.password, "orochi");
+        return std.mem.eql(u8, creds.password, "onyx");
     return (std.mem.eql(u8, creds.authcid, "ruri") or std.mem.eql(u8, creds.authcid, "kazu")) and
         std.mem.eql(u8, creds.password, "pw");
 }
@@ -76607,7 +76607,7 @@ test "threaded server: one reusable session stays live and participatory across 
     const sender = &clients[3];
     const sender2 = &clients[4];
 
-    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", "message-tags server-time draft/chathistory orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", "message-tags server-time draft/chathistory onyx/session-sync");
     try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Origin attachment\r\n");
     try recvUntil(a, " 001 Ruri ", 200);
     try writeAllFd(fd_a, "JOIN #mesh-session\r\n");
@@ -76634,7 +76634,7 @@ test "threaded server: one reusable session stays live and participatory across 
 
     // Attach B on the other node. Retrying the same credential while the signed
     // replica is in flight must be safe: no nonce burn and no source disconnect.
-    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", "echo-message message-tags server-time draft/chathistory orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_b, "ruri", "pw", "echo-message message-tags server-time draft/chathistory onyx/session-sync");
     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER ruri 0 * :Mesh attachment B\r\n");
     try recvUntil(b, " 001 DeviceB ", 200);
     var resume_line: [1200]u8 = undefined;
@@ -76662,7 +76662,7 @@ test "threaded server: one reusable session stays live and participatory across 
 
     // A second attachment on node 2 reuses the exact same staged replica while
     // A and B remain live; no attachment owns or consumes the session.
-    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", "message-tags server-time orochi/session-sync");
+    try saslPlainPreludeWithCaps(fd_c, "ruri", "pw", "message-tags server-time onyx/session-sync");
     try writeAllFd(fd_c, "NICK DeviceC\r\nUSER ruri 0 * :Mesh attachment C\r\n");
     try recvUntil(c, " 001 DeviceC ", 200);
     c.reset();
@@ -77114,7 +77114,7 @@ fn expectAllUpgradeClientsPing(clients: []const *LiveClient, phase: []const u8) 
         const line = try std.fmt.bufPrint(&line_buf, "PING :{s}-{d}\r\n", .{ phase, index });
         try writeAllFd(client.fd, line);
         var needle_buf: [96]u8 = undefined;
-        const needle = try std.fmt.bufPrint(&needle_buf, "PONG orochi.local :{s}-{d}", .{ phase, index });
+        const needle = try std.fmt.bufPrint(&needle_buf, "PONG onyx.local :{s}-{d}", .{ phase, index });
         try recvUntil(client, needle, 600);
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), needle));
     }
@@ -77272,7 +77272,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
     live_storage[2] = .{ .fd = fd_b };
     live_storage[3] = .{ .fd = fd_c };
     const clients = [_]*LiveClient{ &live_storage[0], &live_storage[1], &live_storage[2], &live_storage[3] };
-    const caps = "echo-message message-tags server-time orochi/session-sync";
+    const caps = "echo-message message-tags server-time onyx/session-sync";
 
     try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", caps);
     try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Helix origin\r\n");
@@ -77698,7 +77698,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     // Mint one portable credential on node 1. Only node 2 is directly connected,
     // so node 3 receives the SAME origin-signed OFFER only through node 2's v2
     // forwarding path; no direct edge or intermediate re-signing can help it.
-    const ruri_caps = "echo-message message-tags server-time orochi/session-sync";
+    const ruri_caps = "echo-message message-tags server-time onyx/session-sync";
     try saslPlainPreludeWithCaps(fd_a, "ruri", "pw", ruri_caps);
     try writeAllFd(fd_a, "NICK Ruri\r\nUSER ruri 0 * :Line attachment A\r\n");
     try recvUntil(a, " 001 Ruri ", 200);
@@ -78656,7 +78656,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-tls-adopt",
+        .arena_name = "onyx-test-tls-adopt",
         .pieces = arena_pieces.items,
         .fds = &.{sp[0]},
     });
@@ -78709,7 +78709,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     defer plain.deinit(alloc);
     var rbuf: [4096]u8 = undefined;
     var guard: usize = 0;
-    while (std.mem.indexOf(u8, plain.items, "PONG orochi.local :across-upgrade") == null) : (guard += 1) {
+    while (std.mem.indexOf(u8, plain.items, "PONG onyx.local :across-upgrade") == null) : (guard += 1) {
         if (guard > 64) return error.TestUnexpectedResult;
         const n = try readFd(sp[1], &rbuf);
         if (n == 0) return error.TestUnexpectedResult;
@@ -78729,9 +78729,9 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     // The predecessor's unflushed record arrived FIRST (no sequence hole) ...
     try expectContains(plain.items, ":upgrade.test NOTICE TLSY :carried-across");
     // ... and fresh traffic flows both ways on the resumed engine.
-    try expectContains(plain.items, "PONG orochi.local :across-upgrade");
+    try expectContains(plain.items, "PONG onyx.local :across-upgrade");
     const before = std.mem.indexOf(u8, plain.items, "carried-across").?;
-    const after = std.mem.indexOf(u8, plain.items, "PONG orochi.local :across-upgrade").?;
+    const after = std.mem.indexOf(u8, plain.items, "PONG onyx.local :across-upgrade").?;
     try std.testing.expect(before < after);
 }
 
@@ -78765,7 +78765,7 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-mesh-clock-adopt",
+        .arena_name = "onyx-test-mesh-clock-adopt",
         .pieces = arena_pieces.items,
         .fds = &.{},
     });
@@ -78887,7 +78887,7 @@ test "UPGRADE resume atomically restores exact property rows clocks and tombston
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-property-state-adopt",
+        .arena_name = "onyx-test-property-state-adopt",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -79020,7 +79020,7 @@ test "UPGRADE property checkpoint selection fails closed without tearing the liv
             .epoch = 1,
             .now_ms = 1,
             .timeout_ms = 1000,
-            .arena_name = "orochi-test-property-state-select",
+            .arena_name = "onyx-test-property-state-select",
             .pieces = pieces.items,
             .fds = &.{},
         });
@@ -79100,7 +79100,7 @@ test "UPGRADE property checkpoint rejects malformed required outer capsule shape
         var generic = try helix_capsule.decode(alloc, encoded);
         generic.deinit(alloc);
 
-        var arena = try helix_handoff.Arena.create("orochi-test-property-outer-shape");
+        var arena = try helix_handoff.Arena.create("onyx-test-property-outer-shape");
         defer arena.close();
         try arena.writeAll(encoded);
         try arena.seal();
@@ -79193,7 +79193,7 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-sess-adopt",
+        .arena_name = "onyx-test-sess-adopt",
         .pieces = arena_pieces.items,
         .fds = &.{sp[0]},
     });
@@ -79324,7 +79324,7 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-sess-fault",
+        .arena_name = "onyx-test-sess-fault",
         .pieces = arena_pieces.items,
         .fds = &.{inherited_pair[0]},
     });
@@ -79503,7 +79503,7 @@ test "UPGRADE resume arena re-stages carried .pending_migration capsules" {
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-pm-adopt",
+        .arena_name = "onyx-test-pm-adopt",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -79571,7 +79571,7 @@ test "UPGRADE arena read failure closes exact carried fd manifest but preserves 
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-state-fd-cleanup",
+        .arena_name = "onyx-test-state-fd-cleanup",
         .pieces = &arena_pieces,
         .fds = &.{},
     });
@@ -79651,7 +79651,7 @@ test "UPGRADE authoritative manifest accepts only open connected stream sockets"
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-state-fd-socket-kind",
+        .arena_name = "onyx-test-state-fd-socket-kind",
         .pieces = &pieces,
         .fds = &.{},
     });
@@ -79792,7 +79792,7 @@ test "UPGRADE authoritative state fd manifest requires an exact capsule bijectio
             .epoch = 1,
             .now_ms = 1,
             .timeout_ms = 1000,
-            .arena_name = "orochi-test-state-fd-bijection",
+            .arena_name = "onyx-test-state-fd-bijection",
             .pieces = pieces.items,
             .fds = &.{},
         });
@@ -79925,7 +79925,7 @@ test "UPGRADE duplicate owner capsules are rejected before fd or io_uring adopti
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-legacy-owner-dedup",
+        .arena_name = "onyx-test-legacy-owner-dedup",
         .pieces = pieces.items,
         .fds = &.{owner_pair[0]},
     });
@@ -80092,7 +80092,7 @@ test "UPGRADE exact Store and PMST singletons reject malformed outer shapes" {
         const encoded = try helix_capsule.encode(alloc, cap);
         defer alloc.free(encoded);
 
-        var arena = try helix_handoff.Arena.create("orochi-test-exact-singleton-shape");
+        var arena = try helix_handoff.Arena.create("onyx-test-exact-singleton-shape");
         defer arena.close();
         try arena.writeAll(encoded);
         switch (scenario) {
@@ -80147,7 +80147,7 @@ test "UPGRADE rejects SESSION_REPLICA Store from pre-manifest v1 predecessor" {
     const encoded = try helix_capsule.encode(alloc, cap);
     defer alloc.free(encoded);
 
-    var arena = try helix_handoff.Arena.create("orochi-test-legacy-srst-outer");
+    var arena = try helix_handoff.Arena.create("onyx-test-legacy-srst-outer");
     defer arena.close();
     try arena.writeAll(encoded);
     try arena.seal();
@@ -80222,7 +80222,7 @@ test "UPGRADE late corrupt Store leaves valid property and all live sentinels un
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1_000,
-        .arena_name = "orochi-test-atomic-bad-store",
+        .arena_name = "onyx-test-atomic-bad-store",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -80305,7 +80305,7 @@ test "UPGRADE late corrupt PMST leaves valid property Store and all live sentine
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1_000,
-        .arena_name = "orochi-test-atomic-bad-pmst",
+        .arena_name = "onyx-test-atomic-bad-pmst",
         .pieces = pieces.items,
         .fds = &.{},
     });
@@ -80404,7 +80404,7 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
         .epoch = 1,
         .now_ms = 1,
         .timeout_ms = 1000,
-        .arena_name = "orochi-test-redial",
+        .arena_name = "onyx-test-redial",
         .pieces = arena_pieces.items,
         .fds = &.{},
     });
@@ -80662,8 +80662,8 @@ test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" 
         // the absent reload generation) exactly as they were — failure keeps current.
         const tls_bad = config_format.Config.Tls{
             .enabled = true,
-            .cert_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.pem",
-            .key_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.key",
+            .cert_path = ".zig-cache/tmp/__onyx_rehash_missing__/nope.pem",
+            .key_path = ".zig-cache/tmp/__onyx_rehash_missing__/nope.key",
             .dns_name = "a.test",
         };
         try std.testing.expectError(error.FileNotFound, server.reloadTlsCerts(std.testing.io, &tls_bad));

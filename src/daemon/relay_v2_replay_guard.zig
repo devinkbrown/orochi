@@ -493,7 +493,7 @@ const checkpoint_header_len: usize = 19;
 const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
 const origin_prefix_len: usize = @sizeOf(PublicKey) + 1 + 8 + 2;
 const checkpoint_entry_len: usize = 8 + @sizeOf(RelayId);
-const checkpoint_checksum_domain = "orochi-relay-v2-replay-checkpoint-v1";
+const checkpoint_checksum_domain = "onyx-relay-v2-replay-checkpoint-v1";
 
 fn checkpointChecksum(prefix: []const u8, out: *[checksum_len]u8) void {
     var h = std.crypto.hash.Blake3.init(.{});

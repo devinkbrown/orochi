@@ -183,7 +183,7 @@ fn readStr(bytes: []const u8, pos: *usize) Error![]const u8 {
 test "round-trip a channel target with three metadata pairs" {
     const pairs = [_]Pair{
         .{ .key = "url", .value = "https://example.org", .visibility = 0 },
-        .{ .key = "topic-setter", .value = "Orochi", .visibility = 1 },
+        .{ .key = "topic-setter", .value = "Onyx", .visibility = 1 },
         .{ .key = "secret", .value = "", .visibility = 0xFF },
     };
     const original = MetadataCapsule{

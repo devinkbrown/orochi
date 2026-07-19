@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Object-capability admission grants for the Orochi mesh.
+//! Object-capability admission grants for the Onyx Server mesh.
 //!
 //! This module is intentionally self-contained. A grant body is encoded with a
 //! fixed-order canonical binary format and signed with Ed25519. Delegation is a
@@ -28,8 +28,8 @@ pub const Caps = u64;
 pub const max_scope_len = 1024;
 pub const max_chain_len = 16;
 
-const magic = "OROCHI-ADMISSION-GRANT-v1";
-const chain_magic = "OROCHI-ADMISSION-CHAIN-v1";
+const magic = "ONYX-ADMISSION-GRANT-v1";
+const chain_magic = "ONYX-ADMISSION-CHAIN-v1";
 const fixed_encoded_len = magic.len + public_key_len * 2 + 4 + @sizeOf(Caps) + @sizeOf(u64) * 2 + grant_id_len;
 const public_key_len = Ed25519.PublicKey.encoded_length;
 const signature_len = Ed25519.Signature.encoded_length;
@@ -459,12 +459,12 @@ test "issue verify authorize accept" {
     const issuer = try testKey(1);
     const subject = try testKey(2);
     const read = capBit(0);
-    const grant = makeGrant(issuer, subject, "#orochi", read, 9);
+    const grant = makeGrant(issuer, subject, "#onyx", read, 9);
     const signed = try issueGrant(grant, issuer);
 
     try verifyGrant(signed.grant, signed.signature);
     try verifyChain(issuer.public_key.toBytes(), &.{signed}, 1_500);
-    try std.testing.expect(authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#orochi", read, 1_500, &revocations));
+    try std.testing.expect(authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#onyx", read, 1_500, &revocations));
 }
 
 test "signed grant wire round-trip verifies without losing authority fields" {

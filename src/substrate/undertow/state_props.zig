@@ -62,7 +62,7 @@ fn nickAt(idx: usize) !state.Nick {
 
 fn channelAt(idx: usize) !state.ChannelName {
     return switch (idx % 4) {
-        0 => state.ChannelName.init("#orochi"),
+        0 => state.ChannelName.init("#onyx"),
         1 => state.ChannelName.init("#undertow"),
         2 => state.ChannelName.init("#crdt"),
         else => state.ChannelName.init("#mesh"),
@@ -460,7 +460,7 @@ test "membership tombstones suppress observed adds but not causal re-adds" {
 
 test "observable fingerprint changes for same-cardinality differing content" {
     const allocator = std.testing.allocator;
-    const chan = try state.ChannelName.init("#orochi");
+    const chan = try state.ChannelName.init("#onyx");
 
     var a = NetworkState.init(allocator, 1, 11);
     defer a.deinit();

@@ -518,7 +518,7 @@ test "round-trip i64 values and zigzag polarity" {
 
 test "round-trip bytes and string" {
     try roundTrip(.{ .bytes = "\x00\x01raw\xff" });
-    try roundTrip(.{ .string = "orochi coilpack \xc3\xb8" });
+    try roundTrip(.{ .string = "onyx coilpack \xc3\xb8" });
 }
 
 test "round-trip array" {

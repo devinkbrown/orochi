@@ -271,7 +271,7 @@ the WALLOPS path — there is no `+w` user mode). See
 
 ```toml
 [sasl]
-account_db = "/var/lib/orochi/accounts.wal"
+account_db = "/var/lib/onyx-server/accounts.wal"
 
 [[opers]]
 account = "alice"

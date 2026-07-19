@@ -1533,13 +1533,13 @@ test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> Pen
     const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7E)));
 
     // ORIGIN: build the full session snapshot and mint the relay frame.
-    const channels = [_][]const u8{ "#orochi", "#helix", "#ops" };
+    const channels = [_][]const u8{ "#onyx", "#helix", "#ops" };
     const snapshot = migration_relay.Snapshot{
         .nick = "kain",
         .umodes = "+iwx",
         .channels = channels[0..],
         .realname = "Kain Example",
-        .host = "cloak-ab12.orochi",
+        .host = "cloak-ab12.onyx",
         .account = "kain",
         .away = "migrating",
         .is_oper = true,
@@ -1590,10 +1590,10 @@ test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> Pen
     try testing.expectEqualStrings("kain", restored.nick);
     try testing.expectEqualStrings("+iwx", restored.umodes);
     try testing.expectEqual(@as(usize, 3), restored.channels.len);
-    try testing.expectEqualStrings("#orochi", restored.channels[0]);
+    try testing.expectEqualStrings("#onyx", restored.channels[0]);
     try testing.expectEqualStrings("#ops", restored.channels[2]);
     try testing.expectEqualStrings("Kain Example", restored.realname);
-    try testing.expectEqualStrings("cloak-ab12.orochi", restored.host);
+    try testing.expectEqualStrings("cloak-ab12.onyx", restored.host);
     try testing.expectEqualStrings("kain", restored.account);
     try testing.expectEqualStrings("migrating", restored.away);
     try testing.expect(restored.is_oper);
@@ -1605,7 +1605,7 @@ test "end-to-end: target rejects a capsule signed by the wrong key (no staging)"
     const real = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x01)));
     const attacker = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x02)));
 
-    const channels = [_][]const u8{"#orochi"};
+    const channels = [_][]const u8{"#onyx"};
     const snapshot = migration_relay.Snapshot{ .nick = "kain", .umodes = "+i", .channels = channels[0..] };
     var origin = migration_relay.MigrationOrigin.init(allocator, attacker); // signs with attacker key
     defer origin.deinit();

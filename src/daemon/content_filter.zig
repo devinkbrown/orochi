@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi content filter (Koshi) — operator-curated message screening.
+//! Onyx Server content filter (Koshi) — operator-curated message screening.
 //!
-//! A Orochi-native moderation primitive (not a clone of any other daemon's
+//! An Onyx Server-native moderation primitive (not a clone of any other daemon's
 //! "spamfilter"): a small set of oper-curated patterns is matched against
 //! outgoing PRIVMSG / NOTICE bodies and a hit blocks the message. Patterns are
 //! owned here and the Aho-Corasick automaton is rebuilt on every mutation — the

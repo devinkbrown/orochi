@@ -268,7 +268,7 @@ test "membership event round-trips" {
         .nick = "alice",
         .username = "alice",
         .realname = "Alice Liddell",
-        .host = "cloak-1a2b3c.users.orochi",
+        .host = "cloak-1a2b3c.users.onyx",
     };
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(ev, &buf);
@@ -283,7 +283,7 @@ test "membership event round-trips" {
     try testing.expectEqualStrings("alice", got.nick);
     try testing.expectEqualStrings("alice", got.username);
     try testing.expectEqualStrings("Alice Liddell", got.realname);
-    try testing.expectEqualStrings("cloak-1a2b3c.users.orochi", got.host);
+    try testing.expectEqualStrings("cloak-1a2b3c.users.onyx", got.host);
 }
 
 test "empty identity fields round-trip (legacy placeholder producers)" {

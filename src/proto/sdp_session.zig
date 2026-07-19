@@ -4,7 +4,7 @@
 //! Textual SDP parser and builder for WebRTC offer/answer metadata.
 //!
 //! This module handles the RFC 4566 / RFC 8866 text layer. It is intentionally
-//! separate from `sdp.zig`, which is Orochi's compact binary SDP-lite format.
+//! separate from `sdp.zig`, which is Onyx Server's compact binary SDP-lite format.
 const std = @import("std");
 
 pub const Error = error{

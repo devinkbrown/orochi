@@ -1,6 +1,6 @@
 # Armor TLS/Crypto Stack — Prioritized Feature-Gap Brief
 
-Research brief · 2026-07-11 · analyst: deep-researcher · scope: orochi `src/crypto`, `src/proto`, `src/daemon` + the `orochi` CLI
+Research brief · 2026-07-11 · analyst: deep-researcher · scope: Onyx Server `src/crypto`, `src/proto`, `src/daemon` + the `onyx-server` CLI
 
 ## BLUF
 
@@ -70,7 +70,7 @@ CRL (`crl.zig`), self-sign (`proto/x509_selfsign.zig`), ACME issuance (`daemon/a
 HKDF (TLS 1.3), Argon2 (`argon2_kdf.zig`); AEAD = AES-128/256-GCM + ChaCha20-Poly1305
 (`aead.zig:47`); kTLS offload (`daemon/ktls.zig`).
 
-**CLI subcommands (the entire operator surface)** — `orochi --check-config`, `--supervisor`
+**CLI subcommands (the entire operator surface)** — `onyx-server --check-config`, `--supervisor`
 (Helix upgrade), `acme-issue`, `delegated-credential inspect|validate` (`src/main.zig:172-238`).
 **That is all.** No `x509`, `req`, `genpkey`, `pkey`, `verify`, `s_client`, `s_server`, `ciphers`,
 `ocsp`, `crl`, `dgst`, `rand`, `pkcs12`.
@@ -120,7 +120,7 @@ brotli encoder — vendor or port). *Dependency:* a brotli/zstd encoder.
 
 **P1-5 · TLS ClientHello GREASE (RFC 8701)** — VERIFIED-missing (GREASE handling exists only in
 HTTP/3, `http3_conn.zig`; the TLS ClientHello sends no GREASE cipher/group/extension values).
-Absent outbound GREASE, orochi's own TLS *client* (ACME, S2S dial, media) risks ossification and
+Absent outbound GREASE, Onyx Server's own TLS *client* (ACME, S2S dial, media) risks ossification and
 is more fingerprintable/less "browser-like." *Spec:* RFC 8701. *Effort:* S. *Dependency:* none.
 
 ### P2 — convenience / forward-looking
@@ -149,12 +149,12 @@ for an outbound ACME/S2S client (soft-fail revocation, hard-fail forgery), but w
 
 ## §3 — openssl-CLI parity (the big convenience gap)
 
-Orochi exposes ~4 subcommands (§1). openssl(1) exposes ~50. Most operator pain for a self-hoster is
-**cert/key lifecycle and TLS debugging**, and orochi *already has the primitives internally*
+Onyx Server exposes ~4 subcommands (§1). openssl(1) exposes ~50. Most operator pain for a self-hoster is
+**cert/key lifecycle and TLS debugging**, and Onyx Server *already has the primitives internally*
 (x509 parse/verify, self-sign, keygen, OCSP, CRL) — so exposing them as CLI is disproportionately
 high-value for low effort. Recommended parity subset, ranked by value ÷ effort:
 
-| Rank | openssl subcmd | Orochi value | Backing primitive already in tree | Effort |
+| Rank | openssl subcmd | Onyx Server value | Backing primitive already in tree | Effort |
 |---|---|---|---|---|
 | 1 | `x509` (inspect/convert/self-sign) | Inspect a cert, check expiry/SAN, self-sign a dev cert | `x509.zig`, `proto/x509_selfsign.zig` | S |
 | 2 | `genpkey` / `ecparam` / `genrsa` | Generate ed25519/P-256/RSA keys without pulling in openssl | ecdsa/rsa/ed25519 modules | S |
@@ -169,10 +169,10 @@ high-value for low effort. Recommended parity subset, ranked by value ÷ effort:
 | — | `rand` | Emit N random bytes | `random.zig` | S |
 | — | `s_server` | Throwaway TLS server for client testing | `tls_server.zig` | M |
 
-**Lower value for orochi's audience (defer):** `enc`, `cms`, `ts`, `ca`, `asn1parse`, `speed`,
+**Lower value for Onyx Server's audience (defer):** `enc`, `cms`, `ts`, `ca`, `asn1parse`, `speed`,
 `srp`, `pkeyutl` — general-purpose crypto plumbing not tied to running an IRC node.
 
-**Recommended CLI shape:** a single `orochi tls <subcommand>` (or `orochi x509 …`, `orochi s_client …`)
+**Recommended CLI shape:** a single `onyx-server tls <subcommand>` (or `onyx-server x509 …`, `onyx-server s_client …`)
 umbrella that dispatches into the existing crypto modules — mirroring how `acme-issue` and
 `delegated-credential` already sit on `main.zig`. Ship subset ranks 1–4 first (all backed by
 existing primitives, mostly S effort); they cover the self-host "make/inspect/verify a cert" loop
@@ -196,7 +196,7 @@ that today forces operators to install openssl anyway.
 
 ## Sources
 
-- Orochi source (read directly, file:line inline above): `src/crypto/tls*.zig`,
+- Onyx Server source (read directly, file:line inline above): `src/crypto/tls*.zig`,
   `src/crypto/tls12*.zig`, `src/crypto/ech_seal.zig`, `src/crypto/{ocsp,sct,crl,x509,x509_verify}.zig`,
   `src/crypto/{ml_dsa,slh_dsa,aead,argon2_kdf}.zig`, `src/proto/{tls_extension,tls_signature_scheme,tls_keyshare,supported_groups,cert_compression,x509_selfsign}.zig`,
   `src/daemon/{config_format,tls_conn,ktls,acme_cli}.zig`, `src/main.zig`.

@@ -5,7 +5,7 @@
 // only — no npm, no puppeteer).
 //
 // Proves a REAL browser (headless Chromium) registers as an IRC client against
-// the REAL orochi daemon, end-to-end, over the from-scratch WebTransport stack:
+// the REAL onyx daemon, end-to-end, over the from-scratch WebTransport stack:
 //   1. Extended CONNECT (`:protocol=webtransport`) -> `await wt.ready`
 //   2. open a WT bidi stream (the IRC byte channel the listener bridges to the
 //      daemon's plaintext IRC port over a loopback TCP proxy)
@@ -20,13 +20,13 @@
 // as secure (localhost), so we serve the page over plain HTTP on 127.0.0.1 and
 // the page connects to `https://127.0.0.1:<P>/wt`. Chrome accepts the self-signed
 // server cert via `serverCertificateHashes` (ECDSA-P256, <=14-day validity, hash
-// = SHA-256 of the cert DER) — the orochi WT interop server mints exactly that
+// = SHA-256 of the cert DER) — the onyx WT interop server mints exactly that
 // and prints PORT + CERTHASH; this harness is handed those.
 //
 // Usage:
 //   node tools/quic_interop_irc_browser.mjs --port <UDP> --certhash <HEX>
 //     [--http-port <N>] [--chromium <path>] [--timeout-ms <N>]
-//   (or via env: OROCHI_WT_PORT / OROCHI_WT_CERTHASH / CHROMIUM)
+//   (or via env: ONYX_WT_PORT / ONYX_WT_CERTHASH / CHROMIUM)
 //
 // Exit 0 when the browser completed IRC registration (real 001) + JOIN + PRIVMSG
 // against the live daemon; non-zero with detail otherwise.
@@ -42,8 +42,8 @@ function argOf(name) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
 }
 
-const udpPort = argOf('port') ?? process.env.OROCHI_WT_PORT;
-const certHashHex = (argOf('certhash') ?? process.env.OROCHI_WT_CERTHASH ?? '').trim().toLowerCase();
+const udpPort = argOf('port') ?? process.env.ONYX_WT_PORT;
+const certHashHex = (argOf('certhash') ?? process.env.ONYX_WT_CERTHASH ?? '').trim().toLowerCase();
 const httpPort = parseInt(argOf('http-port') ?? '0', 10); // 0 -> ephemeral
 const chromiumBin = argOf('chromium') ?? process.env.CHROMIUM ?? '/usr/bin/chromium';
 const hardTimeoutMs = parseInt(argOf('timeout-ms') ?? '25000', 10);
@@ -64,7 +64,7 @@ const MESSAGE = 'hello from a browser';
 // ---- the test page --------------------------------------------------------
 
 function pageHtml() {
-  return `<!doctype html><meta charset="utf-8"><title>orochi irc-over-wt interop</title>
+  return `<!doctype html><meta charset="utf-8"><title>onyx irc-over-wt interop</title>
 <body><pre id="log"></pre><script>
 const UDP_PORT = ${JSON.stringify(String(udpPort))};
 const CERT_HASH_HEX = ${JSON.stringify(certHashHex)};
@@ -304,7 +304,7 @@ server.listen(httpPort, '127.0.0.1', () => {
     '--no-sandbox',
     '--disable-dev-shm-usage',
     '--disable-gpu',
-    `--user-data-dir=${process.env.TMPDIR || '/tmp'}/orochi-irc-wt-chrome-${process.pid}`,
+    `--user-data-dir=${process.env.TMPDIR || '/tmp'}/onyx-irc-wt-chrome-${process.pid}`,
     pageUrl,
   ];
   console.log(`[irc-browser-harness] launching ${chromiumBin} ${args.join(' ')}`);

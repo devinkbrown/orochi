@@ -34,10 +34,10 @@ pub const max_prefix_len: usize = max_nick_len + 1 + max_user_len + 1 + max_host
 
 /// Domain label folded into the Ed25519 transcript of a self-contained MESSAGE
 /// origin signature (via `sign.signCtx`). Distinct from `signed_frame`'s
-/// per-link `sign_domain` and from every other Ed25519 use in Orochi, so a
+/// per-link `sign_domain` and from every other Ed25519 use in Onyx Server, so a
 /// relay-message signature can never validate in another context (a per-link
 /// state frame, a node identity, an oper grant, or a migration token).
-pub const sign_domain = "orochi-s2s-relay-msg-v1";
+pub const sign_domain = "onyx-s2s-relay-msg-v1";
 
 pub const SignError = sign.SignError || error{NoSpaceLeft};
 pub const VerifyError = sign.VerifyError;
@@ -703,7 +703,7 @@ fn expectRoundTrip(msg: RelayMessage) !void {
 fn semanticSample() RelayMessage {
     return .{
         .verb = .privmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "alice",
         .source_prefix = "alice!user@example.invalid",
         .account = "alice",
@@ -1012,7 +1012,7 @@ test "semantic validation preserves supported UTF8 IRCX and prefix forms" {
 test "relay messages round-trip for each verb" {
     try expectRoundTrip(.{
         .verb = .privmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "alice",
         .source_prefix = "alice!u@example.invalid",
         .account = "alice",
@@ -1037,7 +1037,7 @@ test "relay messages round-trip for each verb" {
 
     try expectRoundTrip(.{
         .verb = .tagmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "carol",
         .source_prefix = "carol!u@example.invalid",
         .account = "",
@@ -1050,7 +1050,7 @@ test "relay messages round-trip for each verb" {
     // IRCX typed channel DATA carries the data tag; recipient stays empty.
     try expectRoundTrip(.{
         .verb = .data,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "dave",
         .source_prefix = "dave!u@example.invalid",
         .account = "dave",
@@ -1077,7 +1077,7 @@ test "relay messages round-trip for each verb" {
     // REPLY to a STATUSMSG channel target (min_rank floor), data tag present.
     try expectRoundTrip(.{
         .verb = .reply,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "erin",
         .source_prefix = "erin!u@example.invalid",
         .text = "pong",
@@ -1090,7 +1090,7 @@ test "relay messages round-trip for each verb" {
     // WHISPER: target is the shared channel, recipient is the co-member nick.
     try expectRoundTrip(.{
         .verb = .whisper,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "alice",
         .source_prefix = "alice!u@example.invalid",
         .text = "psst over the mesh",
@@ -1157,7 +1157,7 @@ fn signSample(
 ) !RelayMessage {
     var msg = RelayMessage{
         .verb = .privmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_nick = "alice",
         .source_prefix = "alice!u@example.invalid",
         .account = "alice",

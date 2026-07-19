@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Clean-room TOML v1.0.0 parser for the Orochi daemon.
+//! Clean-room TOML v1.0.0 parser for the Onyx Server daemon.
 //!
 //! Bytes in, typed tree out. The parser is PURE: it performs no file, network,
 //! or environment access. Callers supply an allocator and the raw document text
@@ -25,7 +25,7 @@
 //!
 //! Datetimes: TOML offset/local date-times, local dates, and local times are
 //! NOT given a dedicated typed variant. They are CAPTURED VERBATIM AS STRINGS
-//! (the `.string` Value). This is a deliberate, documented deferral — Orochi's
+//! (the `.string` Value). This is a deliberate, documented deferral — Onyx Server's
 //! config consumers want the raw RFC 3339 text and parse it downstream, so a
 //! bespoke datetime type would be dead weight here. See `looksLikeDateTime`.
 //!
@@ -213,7 +213,7 @@ const Parser = struct {
     /// `parseValue` and released on exit; capped at `max_nesting_depth`.
     depth: u16 = 0,
 
-    /// Maximum array / inline-table value-nesting depth. Real Orochi configs
+    /// Maximum array / inline-table value-nesting depth. Real Onyx Server configs
     /// nest values at most two deep (e.g. `[[1, 2], [3]]`, `{ a = { b = 1 } }`),
     /// so 64 is ~20x headroom for any legitimate document while still rejecting
     /// a pathological `x = [[[[…` (thousands of `[`) or deeply nested inline
@@ -1047,7 +1047,7 @@ test "parse bare key value pairs of every scalar type" {
     // Arrange
     const allocator = std.testing.allocator;
     const src =
-        \\name = "orochi"
+        \\name = "onyx"
         \\port = 6697
         \\ratio = 3.14
         \\enabled = true
@@ -1059,7 +1059,7 @@ test "parse bare key value pairs of every scalar type" {
     defer doc.deinit(allocator);
 
     // Assert
-    try std.testing.expectEqualStrings("orochi", doc.getString("name").?);
+    try std.testing.expectEqualStrings("onyx", doc.getString("name").?);
     try std.testing.expectEqual(@as(i64, 6697), doc.getInt("port").?);
     try std.testing.expectEqual(@as(u64, 6697), doc.getUint("port").?);
     try std.testing.expectApproxEqAbs(@as(f64, 3.14), doc.getFloat("ratio").?, 1e-9);
@@ -1184,7 +1184,7 @@ test "reject pathologically deep inline tables with NestingTooDeep" {
 
 test "accept value nesting well past any real config (headroom under the bound)" {
     // Arrange: 60 nested arrays around a scalar — deeper than any legitimate
-    // Orochi config (real ones nest values at most two deep) yet under the
+    // Onyx Server config (real ones nest values at most two deep) yet under the
     // depth bound, proving the guard does not reject honest documents.
     const allocator = std.testing.allocator;
     const levels: usize = 60;
@@ -1594,7 +1594,7 @@ test "no leaks under a large mixed document" {
     // Arrange
     const allocator = std.testing.allocator;
     const src =
-        \\title = "Orochi"
+        \\title = "Onyx"
         \\[owner]
         \\name = "Tom"
         \\dob = 1979-05-27T07:32:00Z
@@ -1623,7 +1623,7 @@ test "no leaks under a large mixed document" {
     defer doc.deinit(allocator);
 
     // Assert
-    try std.testing.expectEqualStrings("Orochi", doc.getString("title").?);
+    try std.testing.expectEqualStrings("Onyx", doc.getString("title").?);
     try std.testing.expectEqualStrings("Tom", doc.getString("owner.name").?);
     try std.testing.expectEqual(@as(i64, 8001), doc.getArray("database.ports").?[1].integer);
     try std.testing.expectEqualStrings("10.0.0.2", doc.getString("servers.beta.ip").?);

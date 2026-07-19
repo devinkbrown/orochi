@@ -9,7 +9,7 @@
 //!   * the Ed25519 static keypair (signs prekeys + transcripts),
 //!   * an X-Wing KEM keypair (seed = BLAKE3("MZ-KEM" ++ seed), domain-separated
 //!     so the KEM key can't be confused with the signing key),
-//!   * the 20-byte node id = BLAKE3-160(Ed25519 public key) — Orochi's sole
+//!   * the 20-byte node id = BLAKE3-160(Ed25519 public key) — Onyx Server's sole
 //!     identity (matches mooring_handshake's convention),
 //!   * the realm id = BLAKE3(realm string), so an operator can name a realm
 //!     ("local") and get a stable 32-byte RealmId.
@@ -69,7 +69,7 @@ fn nodeIdFromKey(pk: sign.PublicKey) [20]u8 {
     return full[0..20].*;
 }
 
-/// Derive Orochi's canonical 20-byte node id from an Ed25519 public key.
+/// Derive Onyx Server's canonical 20-byte node id from an Ed25519 public key.
 pub fn nodeIdFromPublicKey(pk: sign.PublicKey) [20]u8 {
     return nodeIdFromKey(pk);
 }

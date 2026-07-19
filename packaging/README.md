@@ -1,39 +1,146 @@
 # Onyx Server — self-host quickstart & reproducible releases
 
-Onyx Server is a single, static, **zero-external-dependency** binary. There is no
-database server to run, no OpenSSL to patch, no runtime to install — it ships
-its own TLS 1.3 stack, its own mesh, and its own services. This directory holds
-everything to run it and to prove the binary you run is the one from source.
+Onyx Server is a single, static, **zero-external-dependency** binary named
+**`onyx-server`**. There is no database server to run, no OpenSSL to patch, no
+runtime to install — it ships its own TLS 1.3 stack, its own mesh, and its own
+services. This directory holds everything to run it and to prove the binary you
+run is the one from source.
+
+## Honest release path (what you actually get)
+
+| Path | What it produces | When to use it |
+|---|---|---|
+| `zig build` | `zig-out/bin/onyx-server` (debug / local) | Development, smoke tests |
+| `zig build package --prefix <dir>` | staged `bin/onyx-server` + reference config + systemd unit | Production install from a built tree |
+| `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
+
+There is **no published GitHub Release / registry image yet**. Until a verified
+prebuilt is cut and published, every external self-host path still **builds from
+source** (minutes on a fresh clone, not wall-clock "seconds"). Do not claim a
+timed install until someone stopwatches download→chat against a real artifact.
+
+The daemon binary is always **`onyx-server`**. The release script only prefixes a
+version and target on the *artifact filename*
+(`onyx-server-0.x.y-x86_64-linux-musl`); install/copy it as `onyx-server` (the
+Dockerfile does this). Older `orochi-*` names in a local `dist/` are historical
+leftovers — ignore them; `release.sh` emits `onyx-server-*` only.
+
+Validate a config **without** booting:
+
+```sh
+./zig-out/bin/onyx-server --check-config packaging/onyx-server.quickstart.toml
+# or, once installed:
+onyx-server --check-config /etc/onyx-server/onyx-server.toml
+```
+
+`--check-config` is a real flag (`src/main.zig`): parse + preflight, print
+`config OK` / `config ERROR`, exit. No listeners, no mesh dial. The packaged
+systemd unit runs it as `ExecStartPre` so a bad config fails the start instead of
+risking a silent fall-through to the built-in DEFAULT identity.
 
 ## Quickstart (native)
 
 ```sh
-# 1. Build the binary (see "Reproducible releases" below — a few minutes on a
-#    fresh clone; there is no pre-built release to download yet).
+# 1. Build the binary (a few minutes on a fresh clone — there is no prebuilt
+#    download yet; see "Honest release path" above).
 packaging/release.sh
-# 2. Run a single self-hosted node with the zero-config quickstart:
-./dist/orochi-*-x86_64-linux-musl packaging/orochi.quickstart.toml
+# 2. Preflight, then run a single self-hosted node with the zero-config quickstart:
+./dist/onyx-server-*-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-*-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
-That boots a working node in well under a second:
+Once the process is running, the daemon itself is up quickly (typically well
+under a second to bind listeners on a warm host). That is **boot** time, not
+clone/build/DNS/ACME time.
 
 - **`ws://localhost:8080`** — the browser WebSocket endpoint for the Onyx web client.
 - **`irc://localhost:6667`** — plaintext IRC for any IRC client.
 
-The node's **sovereign identity key** (`orochi-node.key`) and the account store
+The node's **sovereign identity key** (`onyx-server-node.key`) and the account store
 (`accounts.db`) are generated in the working directory on first run — nothing to
-configure. For production, replace the quickstart config with a TLS config (real
-certs or the built-in ACME client) and set `ws_plain = false`.
+configure for local evaluation. For production, see [Production TLS card](#production-tls-card).
 
 ## Quickstart (Docker)
 
 ```sh
 packaging/release.sh                                   # build the verified static binary → dist/
-docker build -f packaging/Dockerfile -t orochi:latest .
-docker run -p 6667:6667 -p 8080:8080 -v orochi:/data orochi:latest
+docker build -f packaging/Dockerfile -t onyx-server:latest .
+docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 ```
 
-`/data` holds the node key + account store — the named volume persists them.
+`/data` holds the node key + account store — the named volume persists them. The
+image copies the release artifact to `/usr/local/bin/onyx-server` (binary name
+fixed; version stays in the `dist/` filename only).
+
+## Production TLS card
+
+Local quickstart is plaintext on purpose. A **public** node needs DNS, TLS, and
+`wss`. Checklist (single node; mesh is a later rung — see `docs/guide/mesh.md`):
+
+| Step | What to do |
+|---|---|
+| 1. DNS | Point `A`/`AAAA` for your hostname at the host. |
+| 2. Ports | Open client TLS (`6697/tcp` by default). For ACME HTTP-01, arrange port 80 reachability (daemon `challenge_port` + reverse proxy is the usual pattern). |
+| 3. Paths | Put cert/key PEMs on durable paths (e.g. `/etc/onyx-server/tls/{cert,key}.pem`), mode `0640` / `0600` on the key. |
+| 4. Config | Enable `[tls]` with `cert_path`/`key_path`/`dns_name`. Enable `[acme]` when using the built-in client. Set `[listen] ws_plain = false`. Set a real `[network].server_name`. |
+| 5. Preflight | `onyx-server --check-config /path/to.toml` must print `config OK`. |
+| 6. Run under systemd | Prefer the unit in `etc/systemd/onyx-server.service` (`ExecStartPre=… --check-config …`). Day-2 upgrade is `systemctl reload` (Helix), not a blind restart. |
+
+Minimal production sketch (fill in host, email, and paths):
+
+```toml
+[network]
+name = "Onyx"
+server_name = "irc.example.net"
+
+[listen]
+host = "::"
+irc = 6667          # optional plaintext; many operators fire-wall this off
+ws = 8080
+ws_plain = false    # browsers need wss for a public client
+
+[tls]
+enabled = true
+port = 6697
+cert_path = "/etc/onyx-server/tls/cert.pem"
+key_path = "/etc/onyx-server/tls/key.pem"
+dns_name = "irc.example.net"
+
+[sts]
+enabled = true
+duration = 2592000
+port = 6697
+
+[acme]
+enabled = true
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+domain = "irc.example.net"
+contact = "mailto:admin@example.net"
+# challenge_port = 14402   # loopback HTTP-01; reverse-proxy 80 → this port
+```
+
+Self-signed bootstrap (enabled `[tls]` with no cert/key paths) is fine for **local**
+eval only. Do not point a public web client origin at a self-signed leaf and call
+it production. Full field reference: `docs/guide/tls.md`, `docs/reference/config.md`,
+`etc/onyx-server.reference.toml`.
+
+## systemd (production UX)
+
+The source unit is `etc/systemd/onyx-server.service` (also staged by
+`zig build package` under `lib/systemd/system/onyx-server.service`):
+
+```ini
+ExecStartPre=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
+ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml
+ExecReload=/bin/kill -USR2 $MAINPID
+```
+
+- **Cold start / restart** runs `ExecStartPre` first — bad TOML or preflight failure
+  keeps the previous unit state from being replaced by a DEFAULT-identity daemon.
+- **`systemctl reload onyx-server`** is the normal upgrade path (Helix / SIGUSR2;
+  sessions kept). Reload does **not** re-run `ExecStartPre`; always
+  `--check-config` yourself before reloading after a config change.
+- Install steps and hardening notes: `docs/RUNBOOK.md`.
 
 ## Connecting the web client
 
@@ -45,7 +152,7 @@ VITE_IRC_WS=ws://localhost:8080 pnpm build   # dist/ now points at your node
 # serve dist/ with any static file server (or a hosted Onyx build)
 ```
 
-Any standard IRC client works too — point it at `localhost:6667`.
+Any standard IRC client works too — point it at `localhost:6667` (or `6697` with TLS).
 
 ## Reproducible releases (trust, not faith)
 
@@ -54,7 +161,7 @@ Because the build is hermetic (pure Zig, no C interop) and static
 reproducible**. You never have to trust the release machine.
 
 ```sh
-packaging/release.sh          # → dist/{orochi-<ver>-x86_64-linux-musl, SHA256SUMS, orochi.cdx.json, orochi.provenance.json}
+packaging/release.sh          # → dist/{onyx-server-<ver>-x86_64-linux-musl, SHA256SUMS, onyx-server.cdx.json, onyx-server.provenance.json}
 packaging/verify-release.sh   # rebuild from source with a clean cache; must match SHA256SUMS
 ```
 
@@ -94,7 +201,7 @@ signing is **skipped with a note** — the release still builds and verifies.
 
 ### SBOM (CycloneDX)
 
-`orochi.cdx.json` is a CycloneDX 1.5 SBOM — and it fits on one screen, because the
+`onyx-server.cdx.json` is a CycloneDX 1.5 SBOM — and it fits on one screen, because the
 component graph is a single binary with **zero external dependencies**. The only
 thing recorded is the Zig toolchain that produced it, as a build *tool* (not a
 runtime component). That is the whole security pitch: the software bill of
@@ -102,7 +209,7 @@ materials is effectively one line.
 
 ### Provenance (SLSA v1 shape)
 
-`orochi.provenance.json` is an in-toto Statement carrying an SLSA-provenance-v1
+`onyx-server.provenance.json` is an in-toto Statement carrying an SLSA-provenance-v1
 predicate. It records **what** was built (the artifact + its sha256), **from
 what** (repo, ref, full commit), **how** (the exact `zig build …` command +
 toolchain version), and **by whom** (the `release.sh` builder id). Because it is
@@ -111,3 +218,21 @@ equivalent of SLSA L2. Running the identical steps on a hosted runner (e.g. the
 `slsa-github-generator` GitHub Action with an isolated builder identity) is what
 elevates this to *true* SLSA L2/L3; the field shapes here are drop-in compatible
 with that upgrade.
+
+## A10 — First public GitHub Release (human-gated)
+
+Agents may prepare artifacts; **only a human publishes**. Do not let fleet
+copy claim a download URL until this checklist is green.
+
+1. Clean tree on the release commit: `git status` empty (else `release.sh` refuses).
+2. `packaging/release.sh` → `dist/onyx-server-<ver>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance.
+3. `packaging/verify-release.sh` on that `dist/` — binary bit-identical rebuild.
+4. Optional: cosign when `COSIGN_KEY` / keyless CI is ready.
+5. Create **GitHub Release** on `devinkbrown/onyx-server` attaching:
+   - the musl binary
+   - `SHA256SUMS` (+ `.sig` if present)
+   - SBOM + provenance JSON
+6. Smoke: download on a clean machine → `./onyx-server --check-config …` → chat on 8080.
+7. Only then update landing self-host CTAs from "build from source" to "download the release".
+
+Until step 6, landing and packaging docs stay on **build-from-source honesty**.

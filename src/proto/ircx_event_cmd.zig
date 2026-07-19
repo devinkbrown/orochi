@@ -96,8 +96,8 @@ pub fn lookupCategory(token: []const u8) ParseError!EventCategory {
 }
 
 /// Map the six IRCX draft EVENT types (CHANNEL, MEMBER, SERVER, CONNECTION,
-/// SOCKET, USER) onto Orochi's richer Event-Spine taxonomy so draft clients keep
-/// working. Orochi intentionally diverges from the flat draft set (Event-Spine
+/// SOCKET, USER) onto Onyx Server's richer Event-Spine taxonomy so draft clients keep
+/// working. Onyx Server intentionally diverges from the flat draft set (Event-Spine
 /// path B in docs/planning/14-ircx-remainder.md); these aliases are the bridge.
 pub fn draftAlias(token: []const u8) ?EventCategory {
     if (std.ascii.eqlIgnoreCase(token, "CHANNEL")) return .announce;

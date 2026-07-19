@@ -7,10 +7,10 @@
 //! process listings or shell history; the key buffer is wiped after use.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const hash = orochi.crypto.hash;
+const hash = onyx_server.crypto.hash;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;

@@ -127,7 +127,7 @@ test "decodeValue recovers the signed object" {
     const allocator = testing.allocator;
     const kp = try key(0x05);
     var entries = [_]MapEntry{
-        .{ .key = "name", .value = .{ .string = "orochi" } },
+        .{ .key = "name", .value = .{ .string = "onyx" } },
         .{ .key = "n", .value = .{ .unsigned = 9 } },
     };
     var obj = try sign(allocator, .{ .map = &entries }, kp);

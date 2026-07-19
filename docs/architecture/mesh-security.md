@@ -208,7 +208,7 @@ for the same input, which requires a mesh-shared cloak secret.
 
 - **Key derivation is Argon2id, not `SHA256`.** `[cloak] secret` is stretched
   through the memory-hard Argon2id KDF (`default_params` — t=2, m=64 MiB, p=1)
-  with a fixed domain-separation salt `"orochi/cloak-key/argon2id/v1"`
+  with a fixed domain-separation salt `"onyx/cloak-key/argon2id/v1"`
   (`src/main.zig:491`, `src/main.zig:492`, `src/main.zig:495`,
   `src/crypto/argon2_kdf.zig:40`, `src/crypto/argon2_kdf.zig:117`). The IPv4
   input space is fully enumerable, so the whole model rests on key secrecy; a

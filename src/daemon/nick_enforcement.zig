@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Fallback guest-nick generation for the Orochi IRC daemon.
+//! Fallback guest-nick generation for the Onyx Server IRC daemon.
 //!
 //! When the registration sweep (or a RECOVER) force-renames an unauthenticated
 //! connection off a registered nick, it needs a collision-resistant fallback

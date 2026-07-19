@@ -158,12 +158,12 @@ const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 /// a v2 peer that sees an unknown future version still reads the caps byte it
 /// understands. Bumping this is backward-compatible — see `decodeHandshake`.
 const handshake_version: u8 = 2;
-const relay_v2_extension_probe = "orochi-xcap-relay-v2-1?";
-const relay_v2_extension_reply = "orochi-xcap-relay-v2-1!";
-const relay_v2_ack_confirm_probe = "orochi-xcap-relay-v2-ack-confirm?";
-const relay_v2_ack_confirm_reply = "orochi-xcap-relay-v2-ack-confirm!";
-const session_replica_v3_probe = "orochi-xcap-session-replica-v3?";
-const session_replica_v3_reply = "orochi-xcap-session-replica-v3!";
+const relay_v2_extension_probe = "onyx-xcap-relay-v2-1?";
+const relay_v2_extension_reply = "onyx-xcap-relay-v2-1!";
+const relay_v2_ack_confirm_probe = "onyx-xcap-relay-v2-ack-confirm?";
+const relay_v2_ack_confirm_reply = "onyx-xcap-relay-v2-ack-confirm!";
+const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
+const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
 /// Handshake capability bits (forward-compatible bitfield). Unknown bits are
 /// ignored on decode, so future capabilities never break an older peer. The

@@ -16,7 +16,7 @@ const hkdf_tls13 = @import("../crypto/hkdf_tls13.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// SRTP protection profiles (RFC 5764 §4.1.2). Orochi offers the SDES-equivalent
+/// SRTP protection profiles (RFC 5764 §4.1.2). Onyx Server offers the SDES-equivalent
 /// AES-128-CM + HMAC-SHA1-80 profile that `srtp.zig` implements.
 pub const profile_aes128_cm_sha1_80: u16 = 0x0001;
 pub const profile_aes128_cm_sha1_32: u16 = 0x0002;

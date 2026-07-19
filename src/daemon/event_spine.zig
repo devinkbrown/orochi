@@ -8,7 +8,7 @@
 //! state: callers provide subscriber storage, publish sinks, and render buffers.
 const std = @import("std");
 
-/// Orochi event categories. These replace untyped oper broadcast channels.
+/// Onyx Server event categories. These replace untyped oper broadcast channels.
 pub const EventCategory = enum(u6) {
     connect,
     disconnect,
@@ -192,7 +192,7 @@ pub fn categoryMaskFromTokens(tokens: []const []const u8) CategoryMask {
 pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".field_names.len;
 
 /// IRCX EVENT subscription types supported by the client-facing command.
-/// These are intentionally distinct from Orochi's EventCategory taxonomy:
+/// These are intentionally distinct from Onyx Server's EventCategory taxonomy:
 /// command replies/listing use the IRCX names, while delivery maps each type to
 /// the closest existing Event Spine categories.
 pub const IrcxEventType = enum(u3) {
@@ -468,11 +468,11 @@ pub fn renderEvent(server_name: []const u8, target: []const u8, message: []const
 }
 
 /// Build the IRCv3 message-tag prefix for a structured event delivery, e.g.
-/// `orochi.io/category=KILL;orochi.io/severity=warn`. Both values come from
+/// `onyx_server.io/category=KILL;onyx_server.io/severity=warn`. Both values come from
 /// fixed `code()`/`token()` tables (uppercase / lowercase ASCII), so they are
 /// already tag-safe and need no escaping.
 pub fn buildEventTags(out: []u8, category: EventCategory, severity: EventSeverity) RenderError![]const u8 {
-    return std.fmt.bufPrint(out, "orochi.io/category={s};orochi.io/severity={s}", .{ category.code(), severity.token() }) catch error.OutputTooSmall;
+    return std.fmt.bufPrint(out, "onyx_server.io/category={s};onyx_server.io/severity={s}", .{ category.code(), severity.token() }) catch error.OutputTooSmall;
 }
 
 /// Like `renderEvent`, but prepends an IRCv3 message-tag block:
@@ -684,25 +684,25 @@ test "unsubscribe removes selected categories and drops empty subscribers" {
 test "tagged render prepends an IRCv3 message-tag block; empty tags degrade to plain" {
     var tbuf: [128]u8 = undefined;
     const tags = try buildEventTags(&tbuf, .kill, .warn);
-    try std.testing.expectEqualStrings("orochi.io/category=KILL;orochi.io/severity=warn", tags);
+    try std.testing.expectEqualStrings("onyx_server.io/category=KILL;onyx_server.io/severity=warn", tags);
 
     var out: [256]u8 = undefined;
-    const line = try renderEventTagged(tags, "orochi.local", "kain", "k killed s (flood)", &out);
+    const line = try renderEventTagged(tags, "onyx.local", "kain", "k killed s (flood)", &out);
     try std.testing.expectEqualStrings(
-        "@orochi.io/category=KILL;orochi.io/severity=warn :orochi.local EVENT kain k killed s (flood)\r\n",
+        "@onyx_server.io/category=KILL;onyx_server.io/severity=warn :onyx.local EVENT kain k killed s (flood)\r\n",
         line,
     );
     // Empty tags → identical to the plain renderer.
     var out2: [256]u8 = undefined;
-    const plain = try renderEventTagged("", "orochi.local", "kain", "SERVER LINK ircx.us", &out2);
-    try std.testing.expectEqualStrings(":orochi.local EVENT kain SERVER LINK ircx.us\r\n", plain);
+    const plain = try renderEventTagged("", "onyx.local", "kain", "SERVER LINK ircx.us", &out2);
+    try std.testing.expectEqualStrings(":onyx.local EVENT kain SERVER LINK ircx.us\r\n", plain);
 }
 
 test "render output is a chatsvc-faithful raw EVENT line (per-recipient target)" {
     var out: [256]u8 = undefined;
-    const line = try renderEvent("orochi.local", "kain", "SERVER LINK ircx.us", &out);
+    const line = try renderEvent("onyx.local", "kain", "SERVER LINK ircx.us", &out);
     try std.testing.expectEqualStrings(
-        ":orochi.local EVENT kain SERVER LINK ircx.us\r\n",
+        ":onyx.local EVENT kain SERVER LINK ircx.us\r\n",
         line,
     );
 }
@@ -710,9 +710,9 @@ test "render output is a chatsvc-faithful raw EVENT line (per-recipient target)"
 test "render carries a structured body with a trailing reason verbatim" {
     var out: [256]u8 = undefined;
     // A ':'-introduced reason and an IPv6 host (colons) must survive in the body.
-    const line = try renderEvent("orochi.local", "kain", "USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit", &out);
+    const line = try renderEvent("onyx.local", "kain", "USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit", &out);
     try std.testing.expectEqualStrings(
-        ":orochi.local EVENT kain USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit\r\n",
+        ":onyx.local EVENT kain USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit\r\n",
         line,
     );
 }
@@ -759,9 +759,9 @@ test "renderer validates unsafe wire text and caller-owned output size" {
     var out: [64]u8 = undefined;
 
     // Control bytes in the body are rejected.
-    try std.testing.expectError(error.InvalidMessage, renderEvent("orochi.local", "kain", "bad\nline", &out));
+    try std.testing.expectError(error.InvalidMessage, renderEvent("onyx.local", "kain", "bad\nline", &out));
     // A bad target (contains ':') is rejected.
-    try std.testing.expectError(error.InvalidMessage, renderEvent("orochi.local", "ka:in", "connected", &out));
+    try std.testing.expectError(error.InvalidMessage, renderEvent("onyx.local", "ka:in", "connected", &out));
     // Output buffer too small for the rendered line.
-    try std.testing.expectError(error.OutputTooSmall, renderEvent("orochi.local", "kain", "USER CONNECT n!u@host", out[0..8]));
+    try std.testing.expectError(error.OutputTooSmall, renderEvent("onyx.local", "kain", "USER CONNECT n!u@host", out[0..8]));
 }

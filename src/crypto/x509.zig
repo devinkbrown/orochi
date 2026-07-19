@@ -42,7 +42,7 @@ pub const Error = error{
     PemEndMissing,
     PemInvalidBase64,
     OutputTooSmall,
-    /// SubjectPublicKeyInfo uses an algorithm Orochi's verifier does not support.
+    /// SubjectPublicKeyInfo uses an algorithm Onyx Server's verifier does not support.
     UnsupportedKey,
     /// SubjectPublicKeyInfo is structurally malformed for its key family.
     InvalidKey,
@@ -336,7 +336,7 @@ pub fn parse(der: []const u8) Error!Certificate {
 //
 // Recovers the raw public-key material an issuer needs to verify a child
 // certificate's signature. Slices alias the caller-owned SPKI bytes; no
-// allocation, no copying. Only the key families Orochi's X.509 verifier
+// allocation, no copying. Only the key families Onyx Server's X.509 verifier
 // dispatches on are recognized — anything else is `UnsupportedKey`, so callers
 // fail closed rather than treating an unknown key as trusted.
 // ---------------------------------------------------------------------------

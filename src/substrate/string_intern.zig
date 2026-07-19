@@ -89,7 +89,7 @@ test "resolve round trips interned bytes" {
     defer table.deinit();
 
     const samples = [_][]const u8{
-        "orochi",
+        "onyx",
         "substrate",
         "string-intern",
         "with spaces",

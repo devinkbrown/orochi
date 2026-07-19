@@ -65,7 +65,7 @@ test "Wycheproof: ChaCha20-Poly1305 rejects tampered ciphertext/tag/nonce/aad" {
 
 // ── X25519: a low-order peer point (all-zero u) must be rejected, never yield
 //    a usable shared secret (RFC 7748 §6.1 / the classic contributory-behavior
-//    attack). Orochi's wrapper rejects an all-zero shared secret. ──
+//    attack). Onyx Server's wrapper rejects an all-zero shared secret. ──
 
 test "Wycheproof: X25519 rejects the all-zero low-order point" {
     const sk = kx.SecretKey.init(@as([32]u8, @splat(0x33)));

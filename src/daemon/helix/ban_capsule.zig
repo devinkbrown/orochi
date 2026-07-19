@@ -231,7 +231,7 @@ test "round-trip with four entries spanning all mask kinds" {
     };
 
     const original = BanCapsule{
-        .channel = "#orochi",
+        .channel = "#onyx",
         .entries = &entries,
     };
 

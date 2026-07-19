@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! DTLS 1.2 server-side handshake flight state machine (RFC 6347) for the
-//! WebRTC DTLS-SRTP media leg (RFC 5764 / RFC 8827). Orochi is always the DTLS
+//! WebRTC DTLS-SRTP media leg (RFC 5764 / RFC 8827). Onyx Server is always the DTLS
 //! *server* (`setup:passive`); the browser/mobile peer is the client and
 //! initiates.
 //!
@@ -183,7 +183,7 @@ pub const Terminator = struct {
         rng.bytes(&serial);
         serial[0] |= 0x01; // keep it non-zero after leading-zero trim
         const der = x509_selfsign.buildSelfSignedEcdsaP256(&self.cert_der, .{
-            .common_name = "orochi-dtls",
+            .common_name = "onyx-dtls",
             .not_before = not_before,
             .not_after = not_after,
             .serial = &serial,

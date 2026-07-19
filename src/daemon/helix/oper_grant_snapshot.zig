@@ -273,7 +273,7 @@ test "oper grant snapshot round-trips grants, tombstones, and the mint incarnati
         .privilege_bits = 0,
         .class = "revoked",
         .title = "",
-        .issuer_node = "orochi.local",
+        .issuer_node = "onyx.local",
         .incarnation = 42,
         .issued_ms = 100,
         .expiry_ms = 1_700_086_400_000,

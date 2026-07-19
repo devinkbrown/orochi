@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi structured announcement subsystem.
+//! Onyx Server structured announcement subsystem.
 //!
 //! `AnnounceBoard` is a retained, prioritized, expiring announcement store
 //! intended for bot/oper accounts. It replaces the legacy "announcement flag"
 //! with a real board: scoped (global or per-channel) entries with categories,
 //! priorities, expiry, per-account dismissal tracking, and explicit revocation.
 //!
-//! Clean-room Orochi-native implementation. Imports only `std`.
+//! Clean-room Onyx Server-native implementation. Imports only `std`.
 
 const std = @import("std");
 const toml = @import("../proto/toml.zig");
@@ -298,15 +298,15 @@ test "publish and active filter by scope and global" {
     const now: i64 = 1_000;
 
     _ = try board.publish("*", "news", "Global notice", "everyone sees this", "bot", .normal, now, 0);
-    _ = try board.publish("#orochi", "ops", "Channel notice", "channel only", "oper", .high, now, 0);
+    _ = try board.publish("#onyx", "ops", "Channel notice", "channel only", "oper", .high, now, 0);
     _ = try board.publish("#other", "ops", "Other channel", "not for us", "oper", .low, now, 0);
 
     var buf: [16]*const Announcement = undefined;
 
-    // #orochi sees its own + the global one.
-    const n_chan = board.active("#orochi", now, &buf);
+    // #onyx sees its own + the global one.
+    const n_chan = board.active("#onyx", now, &buf);
     try std.testing.expectEqual(@as(usize, 2), n_chan);
-    // Newest-first: #orochi was published after the global one.
+    // Newest-first: #onyx was published after the global one.
     try std.testing.expectEqualStrings("Channel notice", buf[0].title);
     try std.testing.expectEqualStrings("Global notice", buf[1].title);
 

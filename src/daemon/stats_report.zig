@@ -387,7 +387,7 @@ test "renderJson emits well-formed, escaped JSON" {
     const chans = [_]TopChannel{.{ .name = "#ops", .members = 12, .topic = "a \"quote\" & <tag>" }};
     const snap = Snapshot{
         .server_name = "suzu.example",
-        .network = "Orochi",
+        .network = "Onyx",
         .version = "onyx-server-0.1",
         .generated_unix = 1700000000,
         .uptime_secs = 3661,

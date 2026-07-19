@@ -50,7 +50,7 @@ pub const Pair = struct {
             .local_node_id = id_a,
             .remote_node_id = id_b,
             .local_epoch_ms = 1000,
-            .server_name = "a.orochi",
+            .server_name = "a.onyx",
         });
         errdefer a.deinit();
 
@@ -61,7 +61,7 @@ pub const Pair = struct {
             .local_node_id = id_b,
             .remote_node_id = id_a,
             .local_epoch_ms = 1001,
-            .server_name = "b.orochi",
+            .server_name = "b.onyx",
         });
         errdefer b.deinit();
 

@@ -4,7 +4,7 @@
 //! Ryusen: reactor-independent adaptive transport seam.
 //!
 //! This module defines only the transport contract and a deterministic
-//! in-memory loopback backend. It performs no OS calls and imports no Orochi
+//! in-memory loopback backend. It performs no OS calls and imports no Onyx Server
 //! siblings, so future io_uring, AF_XDP, QUIC, or other backends can implement
 //! the same vtable without coupling the seam to a reactor.
 const std = @import("std");

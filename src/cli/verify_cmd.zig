@@ -12,13 +12,13 @@
 //! is a noted substrate gap; the mirror here is string comparison only.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const x509 = orochi.crypto.x509;
-const x509_verify = orochi.crypto.x509_verify;
-const pem = orochi.proto.pem;
-const acme_cli = orochi.daemon.acme_cli;
+const x509 = onyx_server.crypto.x509;
+const x509_verify = onyx_server.crypto.x509_verify;
+const pem = onyx_server.proto.pem;
+const acme_cli = onyx_server.daemon.acme_cli;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;
@@ -184,8 +184,8 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 // ===========================================================================
 
 const testing = std.testing;
-const x509_selfsign = orochi.proto.x509_selfsign;
-const ecdsa_p256 = orochi.crypto.ecdsa_p256;
+const x509_selfsign = onyx_server.proto.x509_selfsign;
+const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
 
 test "armorcli verify accepts a root-issued leaf and rejects a stranger" {
     const gpa = testing.allocator;

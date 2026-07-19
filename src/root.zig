@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi library root — re-exports the package namespaces.
+//! Onyx Server library root — re-exports the package namespaces.
 //! See docs/planning/00-architecture.md for the canonical design.
 const std = @import("std");
 

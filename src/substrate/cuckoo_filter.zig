@@ -36,7 +36,7 @@ pub const slots_per_bucket: usize = 4;
 /// Default cap on eviction chain length before an insert is declared failed.
 pub const default_max_kicks: usize = 500;
 
-const hash_seed: u64 = 0x4d_69_7a_75_63_68_69_00; // "Orochi\0"
+const hash_seed: u64 = 0x4d_69_7a_75_63_68_69_00; // "OnyxServer\0"
 const fingerprint_seed: u64 = 0x43_75_63_6b_6f_6f_5f_46; // "Cuckoo_F"
 
 pub const InitError = error{

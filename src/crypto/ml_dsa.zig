@@ -3,7 +3,7 @@
 
 //! ML-DSA (FIPS 204) signature VERIFICATION — from scratch, verify-only.
 //!
-//! Orochi verifies post-quantum certificate signatures; it never *signs* them,
+//! Onyx Server verifies post-quantum certificate signatures; it never *signs* them,
 //! so this module implements only `ML-DSA.Verify` / `ML-DSA.Verify_internal`
 //! (FIPS 204 Algorithms 3 and 8). There is no key generation and no signing
 //! here by design.

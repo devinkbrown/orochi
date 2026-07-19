@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 #
-# DEEP QUIC/HTTP3 interop test for the Orochi from-scratch QUIC stack.
+# DEEP QUIC/HTTP3 interop test for the Onyx Server from-scratch QUIC stack.
 #
 # Where tools/quic_interop.sh proves a tiny `GET / → 200` completes, this script
 # drives the DEEP machinery a small request never touches, all against a REAL
@@ -27,7 +27,7 @@
 #
 # Usage:
 #   tools/quic_interop_deep.sh
-#   OROCHI_QUIC_DEBUG=1 tools/quic_interop_deep.sh   # with server-side tracing
+#   ONYX_QUIC_DEBUG=1 tools/quic_interop_deep.sh   # with server-side tracing
 #
 set -uo pipefail
 
@@ -205,10 +205,10 @@ if start_server --retry; then
                  -o "$rbody" -w '%{http_code}' "https://127.0.0.1:${PORT}/" 2>/dev/null)"
     crc=$?
     text="$(cat "$rbody")"; rm -f "$rbody"
-    if [[ $crc -ne 0 || "$code" != "200" || "$text" != "orochi quic ok" ]]; then
+    if [[ $crc -ne 0 || "$code" != "200" || "$text" != "onyx quic ok" ]]; then
         fail "Retry GET / failed (rc=$crc code=$code body='$text')"; dump_server_err; rc_all=1
     else
-        log "Retry GET / → 200, body 'orochi quic ok'  ✓"
+        log "Retry GET / → 200, body 'onyx quic ok'  ✓"
     fi
     # A large transfer must also complete through the validated path.
     log "GET /big?n=$BIG_256K_BYTES through Retry ..."

@@ -29,7 +29,7 @@ const sealed_magic_v2: u8 = 2;
 /// they simply do not get the window check.
 const sealed_magic: u8 = 3;
 const stored_magic = [_]u8{ 'O', 'T', 'S', '1' };
-const sealed_aad = "orochi tls13 session ticket v1";
+const sealed_aad = "onyx tls13 session ticket v1";
 
 pub const Error = error{
     BadTicket,

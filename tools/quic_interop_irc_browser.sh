@@ -4,20 +4,20 @@
 
 #
 # REAL end-to-end IRC-over-WebTransport interop test: a headless-Chromium
-# WebTransport client registers as a genuine IRC client against the REAL orochi
+# WebTransport client registers as a genuine IRC client against the REAL Onyx Server
 # daemon and gets a real RPL_WELCOME (001), joins a channel, and sends a message.
 #
 # Where tools/quic_interop_browser.sh bridges the browser's WT bidi stream to an
-# in-process TCP *echo*, this lane bridges it to a live orochi IRC daemon:
+# in-process TCP *echo*, this lane bridges it to a live Onyx Server IRC daemon:
 #
-#   browser ──QUIC/H3/WT bidi──▶ WT interop server ──loopback TCP──▶ orochi IRC
+#   browser ──QUIC/H3/WT bidi──▶ WT interop server ──loopback TCP──▶ Onyx Server IRC
 #
 # Pipeline:
-#   1. build orochi (the daemon) + the ECDSA-P256 WebTransport interop server;
+#   1. build onyx-server (the daemon) + the ECDSA-P256 WebTransport interop server;
 #   2. start the daemon with a minimal temp config (plaintext IRC on a loopback
 #      port, NO mesh/media/TLS/WT — the IRC leg is plaintext loopback; the WT
 #      interop server owns the ECDSA QUIC cert), wait for the IRC port to listen;
-#   3. start the WT interop server with OROCHI_WT_BRIDGE_PORT=<irc port> so its WT
+#   3. start the WT interop server with ONYX_WT_BRIDGE_PORT=<irc port> so its WT
 #      bidi bridge dials the daemon instead of the echo; parse PORT + CERTHASH;
 #   4. run tools/quic_interop_irc_browser.mjs (node built-ins only — no npm),
 #      which serves a secure-context page on http://127.0.0.1 and launches
@@ -31,21 +31,21 @@
 #
 # Usage:
 #   tools/quic_interop_irc_browser.sh
-#   OROCHI_QUIC_DEBUG=1 tools/quic_interop_irc_browser.sh   # server-side QUIC trace
+#   ONYX_QUIC_DEBUG=1 tools/quic_interop_irc_browser.sh   # server-side QUIC trace
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
-DAEMON_BIN="$ROOT/zig-out/bin/orochi"
+DAEMON_BIN="$ROOT/zig-out/bin/onyx-server"
 SERVER_BIN="$ROOT/zig-out/bin/quic_interop_wt_server"
 HARNESS="$ROOT/tools/quic_interop_irc_browser.mjs"
 CHROMIUM_BIN="${CHROMIUM:-/usr/bin/chromium}"
 HARNESS_TIMEOUT_MS="${HARNESS_TIMEOUT_MS:-25000}"
 
 # A fixed loopback IRC port for the daemon (the bridge target). Overridable.
-IRC_PORT="${OROCHI_IRC_PORT:-16767}"
+IRC_PORT="${ONYX_IRC_PORT:-16767}"
 
 log()  { printf '[irc-wt-interop] %s\n' "$*"; }
 fail() { printf '[irc-wt-interop] FAIL: %s\n' "$*" >&2; }
@@ -64,7 +64,7 @@ log "chromium: $("$CHROMIUM_BIN" --version 2>/dev/null | head -1)"
 log "node:     $(node --version)"
 
 # --- 1. build the daemon + the WebTransport interop server -------------------
-log "building orochi daemon (zig build) ..."
+log "building onyx daemon (zig build) ..."
 if ! zig build; then
     fail "zig build (daemon) failed"
     exit 1
@@ -82,16 +82,16 @@ fi
 # plaintext [listen].irc port. No mesh / media / TLS / WebTransport — the WT
 # interop server owns the QUIC cert; the daemon's IRC leg is plaintext loopback.
 # A private temp dir keeps the run hermetic: the daemon auto-generates its node
-# keyfile (orochi-node.key) beside the config, and the whole dir is removed on
+# keyfile (onyx-server-node.key) beside the config, and the whole dir is removed on
 # exit (so no /tmp node-key collision between runs/users).
-TMPD="$(mktemp -d -t orochi-irc-wt.XXXXXX)"
-CONF="$TMPD/orochi.toml"
+TMPD="$(mktemp -d -t onyx-irc-wt.XXXXXX)"
+CONF="$TMPD/onyx_server.toml"
 cat >"$CONF" <<EOF
 [node]
 id = 1
 
 [network]
-server_name = "orochi.interop.test"
+server_name = "onyx_server.interop.test"
 
 [listen]
 host = "127.0.0.1"
@@ -115,7 +115,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 3. start the daemon; wait for the IRC port to listen --------------------
-log "starting orochi daemon (IRC plaintext on 127.0.0.1:$IRC_PORT) ..."
+log "starting onyx daemon (IRC plaintext on 127.0.0.1:$IRC_PORT) ..."
 "$DAEMON_BIN" "$CONF" >"$OUT_LOG" 2>"$ERR_LOG" &
 DAEMON_PID=$!
 
@@ -144,7 +144,7 @@ log "daemon IRC port up on 127.0.0.1:$IRC_PORT"
 
 # --- 4. start the WT interop server, bridging WT -> the daemon's IRC port ----
 log "starting WebTransport interop server (bridge -> IRC $IRC_PORT) ..."
-OROCHI_WT_BRIDGE_PORT="$IRC_PORT" "$SERVER_BIN" >"$SRV_OUT" 2>"$SRV_ERR" &
+ONYX_WT_BRIDGE_PORT="$IRC_PORT" "$SERVER_BIN" >"$SRV_OUT" 2>"$SRV_ERR" &
 SRV_PID=$!
 
 PORT=""; CERTHASH=""
@@ -170,7 +170,7 @@ log "WT server on UDP 127.0.0.1:$PORT  cert sha-256=$CERTHASH"
 log "launching browser IRC harness (headless Chromium) ..."
 if node "$HARNESS" --port "$PORT" --certhash "$CERTHASH" \
         --chromium "$CHROMIUM_BIN" --timeout-ms "$HARNESS_TIMEOUT_MS"; then
-    log "PASS: Chrome registered over WebTransport against the real orochi daemon (001 + JOIN + PRIVMSG)."
+    log "PASS: Chrome registered over WebTransport against the real onyx daemon (001 + JOIN + PRIVMSG)."
     exit 0
 else
     rc=$?

@@ -3,7 +3,7 @@
 
 //! SFU-side SRTP/SRTCP crypto hub for the DTLS-SRTP media leg (RFC 3711 / 5764).
 //!
-//! Increment 1 terminates DTLS per peer (orochi is always the DTLS *server*) and
+//! Increment 1 terminates DTLS per peer (Onyx Server is always the DTLS *server*) and
 //! exposes each peer's exported SRTP keying material read-only. This hub turns
 //! that material into a *live* SFU crypto context: it decrypts a DTLS-SRTP peer's
 //! inbound media under that peer's own key and re-encrypts the recovered

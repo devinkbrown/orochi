@@ -634,7 +634,7 @@ pub fn Lotus(comptime params: Params) type {
             std.mem.sort([]const u8, keys[0..count], {}, bytesLessThan);
 
             var hasher = Blake3.init(.{});
-            hasher.update("orochi.lotus.root.v1");
+            hasher.update("onyx_server.lotus.root.v1");
             updateLen(&hasher, count);
             for (keys[0..count]) |target| {
                 const log = self.targets.get(target).?;
@@ -815,7 +815,7 @@ fn checkpointLenAdd(current: usize, additional: usize, max: usize) CheckpointErr
 
 fn checkpointChecksum(prefix: []const u8, out: *[checkpoint_checksum_len]u8) void {
     var hasher = Blake3.init(.{});
-    hasher.update("orochi.lotus.checkpoint.v1");
+    hasher.update("onyx_server.lotus.checkpoint.v1");
     hasher.update(prefix);
     hasher.final(out);
 }

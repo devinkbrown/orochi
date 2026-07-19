@@ -2,16 +2,16 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# news_update.sh — key-free headline updater for Orochi's !news bot.
+# news_update.sh — key-free headline updater for Onyx Server's !news bot.
 #
 # Fetches the RSS feeds bundled in src/proto/news_sources.zig with curl (which
 # uses the system CA bundle, so it reaches every feed the in-daemon clean-room
-# TLS cannot) and writes one headline per line into the directory Orochi reads
+# TLS cannot) and writes one headline per line into the directory Onyx Server reads
 # via `[geo] news_cache_dir`. File names match the daemon's cache keys with
 # ':' -> '_': general sources -> src_<key>.txt, country feeds -> cc_<cc>.txt.
 #
 # Usage:  news_update.sh <output_dir> [max_headlines]
-# Cron:   */5 * * * * /path/to/news_update.sh /var/lib/orochi/news 10
+# Cron:   */5 * * * * /path/to/news_update.sh /var/lib/onyx-server/news 10
 #
 # No API keys. Requires: bash, curl. Optional: a feed is simply skipped if it
 # is unreachable, leaving any previously written file intact.
@@ -19,7 +19,7 @@ set -uo pipefail
 
 OUT_DIR="${1:?usage: news_update.sh <output_dir> [max_headlines]}"
 MAX="${2:-10}"
-UA="Orochi-news/1 (+https://orochi.local)"
+UA="OnyxServer-news/1 (+https://onyx.local)"
 mkdir -p "$OUT_DIR"
 
 # General sources: key|url  (mirrors news_sources.sources)

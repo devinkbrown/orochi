@@ -517,7 +517,7 @@ test "token map adds replaces and formats tokens" {
 
 test "value and valueless tokens emit distinct parameters" {
     const tokens = [_]Token{
-        try Token.valued("NETWORK", "Orochi"),
+        try Token.valued("NETWORK", "Onyx"),
         try Token.valueless("UTF8ONLY"),
     };
     var line_slots: [2]ReplyLine = undefined;
@@ -532,7 +532,7 @@ test "value and valueless tokens emit distinct parameters" {
 
     try std.testing.expectEqual(@as(usize, 1), sink.slice().len);
     try std.testing.expectEqualStrings(
-        ":irc.test 005 dan NETWORK=Orochi UTF8ONLY :are supported by this server\r\n",
+        ":irc.test 005 dan NETWORK=Onyx UTF8ONLY :are supported by this server\r\n",
         sink.slice()[0].bytes,
     );
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! orochi-crypto — Argon2id password hashing for account credentials.
+//! onyx-crypto — Argon2id password hashing for account credentials.
 //!
 //! This is the modern upgrade path away from PBKDF2 for storing account
 //! passwords. Argon2id is a memory-hard KDF (winner of the Password Hashing
@@ -114,7 +114,7 @@ pub fn verify(allocator: std.mem.Allocator, password: []const u8, phc: []const u
 /// the operator secret with this fixed, purpose-labeled salt. The label pins the
 /// derivation to the cloak-key use so the same secret reused elsewhere would not
 /// yield the same key. Must be >= 8 bytes (Argon2 KDF minimum).
-pub const cloak_key_salt = "orochi/cloak-key/argon2id/v1";
+pub const cloak_key_salt = "onyx/cloak-key/argon2id/v1";
 
 /// Deterministically stretch an operator `secret` into `out` (fixed-width key
 /// material) with Argon2id and a FIXED `salt`. Unlike a bare `SHA256(secret)`,

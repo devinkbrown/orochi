@@ -78,7 +78,7 @@ pub const FieldSelector = struct {
     }
 };
 
-/// WHOX fields supported by Orochi M0.
+/// WHOX fields supported by Onyx Server M0.
 pub const Field = enum(u8) {
     channel = 'c',
     user = 'u',

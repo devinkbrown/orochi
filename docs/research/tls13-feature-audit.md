@@ -176,7 +176,7 @@ signal bytes zeroed. A naive `Hash(CH1inner ‖ HRR)` produces a wrong-but-plaus
 that fails only at interop. Per the crypto mandate, "round-trips with itself is necessary but
 NOT sufficient" — a self-consistent client↔server loopback can be self-consistently wrong, so
 this MUST be pinned against an external oracle (BoGo) before shipping. That oracle does not
-exist here yet (§8): the BoGo runner cannot exercise ANY orochi ECH path — base or HRR —
+exist here yet (§8): the BoGo runner cannot exercise ANY Onyx Server ECH path — base or HRR —
 because (a) `tools/bogo_shim.zig` has ZERO ECH flag wiring (`-ech-config-list`,
 `-ech-server-config`, `-expect-ech-accept`, `-on-retry-expect-ech-accept`, `-expect-hrr`), so
 those tests are skipped as unimplemented, and (b) `src/crypto/hpke.zig` supports only
@@ -196,7 +196,7 @@ zeroing) proven against BoGo — not the confirmation primitive itself.
 
 ## 8. External-peer interop status (BoGo)
 
-The external BoringSSL BoGo runner (`tools/bogo.sh`) drives the orochi TLS shim
+The external BoringSSL BoGo runner (`tools/bogo.sh`) drives the Onyx Server TLS shim
 (`tools/bogo_shim.zig`) against BoringSSL's reference test suite. It requires `go`, `cmake`,
 and a network fetch of a pinned BoringSSL. **This now RUNS and PASSES:** with Go 1.23.4
 installed and BoringSSL pinned to commit `5ac7567c2` (the harness default was the stale
@@ -211,7 +211,7 @@ documented inline). The external-interop leg is now closed **for the shipped fea
 **Not covered by BoGo: ECH (all of it, base and ×HRR).** `config.json` disables `*ECH*` and
 the ECH-carrying `*HelloRetryRequest*` cases because the shim has no ECH flag wiring and
 `hpke.zig` speaks only ChaCha20-Poly1305 while BoringSSL's ECH configs use AES-128-GCM (see the
-ECH×HRR prerequisite note in §7). So orochi's base-ECH accept/reject path is validated ONLY by
+ECH×HRR prerequisite note in §7). So Onyx Server's base-ECH accept/reject path is validated ONLY by
 the in-repo client↔server loopback + confirmation-primitive KATs, and ECH×HRR is not
 implemented (fail-closed). Standing up the ECH BoGo harness (AES-GCM HPKE + suite-agility + shim
 ECH flags) is the tracked follow-up that must land before ECH×HRR — or any expanded ECH — ships.

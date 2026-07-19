@@ -51,9 +51,9 @@ pub const sig_len = sign.signature_len; // 64
 pub const header_len = pubkey_len + sig_len; // 96
 
 /// Domain label folded into the Ed25519 transcript (via `sign.signCtx`). Distinct
-/// from every other Ed25519 use in Orochi (node identity, oper grants, migration
+/// from every other Ed25519 use in Onyx Server (node identity, oper grants, migration
 /// tokens), so a signed-frame signature can never validate in another context.
-pub const sign_domain = "orochi-s2s-signed-frame-v1";
+pub const sign_domain = "onyx-s2s-signed-frame-v1";
 
 pub const Error = error{
     /// The byte slice is shorter than the fixed `[pubkey][sig]` header.
@@ -88,7 +88,7 @@ pub fn wrap(
     // streamed (no contiguous copy) by the deterministic RFC 8032 signer. Binding
     // the type byte means a signature minted for one frame type can never be
     // replayed as another, and the domain isolates it from every other Ed25519
-    // use in Orochi.
+    // use in Onyx Server.
     const sig = try kp.signCtxInfix(sign_domain, &[_]u8{frame_type_byte}, payload);
 
     @memcpy(buf[0..pubkey_len], &kp.public_key);

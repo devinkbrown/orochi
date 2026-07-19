@@ -140,7 +140,7 @@ test "property keys and store operations round trip constructed values" {
 }
 
 test "property validation enforces name value entity and output limits" {
-    const entity = try ircx.Entity.init(.channel, "#orochi");
+    const entity = try ircx.Entity.init(.channel, "#onyx");
     var store = ircx.PropertyStore.init(std.testing.allocator);
     defer store.deinit();
 

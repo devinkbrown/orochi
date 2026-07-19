@@ -42,7 +42,7 @@ fn sampleSnap(fd: i32, secured: bool) session_snapshot.Snapshot {
         .realname = "User Example",
         .account = "user",
         .real_host = "10.0.0.2",
-        .host = "cloak-77.orochi",
+        .host = "cloak-77.onyx",
         .fd = fd,
         .was_secured = secured,
     };

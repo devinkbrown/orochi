@@ -1,4 +1,10 @@
-# Orochi v0.4.0 — Production Deploy Runbook (both mesh nodes)
+# Onyx Server v0.4.0 — Production Deploy Runbook (both mesh nodes)
+
+> **Naming note (2026-07):** This runbook records the **v0.4.0** deploy as executed.
+> The product is now **Onyx Server** (repo `/home/kain/onyx-server`, binary `onyx-server`).
+> Banner text `Onyx Server 0.4.0+…` and `journalctl -u onyx` below are **historical literals**
+> from that release/unit name — do not rewrite them into a modern checklist.
+
 
 Run top-to-bottom. This is a **hard restart** (`systemctl restart`, NOT USR2) of both
 live nodes, authorized by the operator. One static musl artifact serves both nodes
@@ -7,10 +13,10 @@ live nodes, authorized by the operator. One static musl artifact serves both nod
 | | Node A (home) | Node B (peer) |
 |---|---|---|
 | Host | `eshmaki.me` (LOCAL) | `ircx.us` (`ssh trev@ircx.us`) |
-| Run dir | `/home/kain/orochi-run/` | `/home/trev/orochi-run/` |
-| Config | `orochi.local.toml` | `orochi.ircxus.toml` |
+| Run dir | `/home/kain/onyx-server-run/` | `/home/trev/onyx-run/` |
+| Config | `onyx-server.local.toml` | `onyx-server.ircxus.toml` |
 | Improved config | `/tmp/claude-1000/config-improved/eshmaki.improved.toml` | `/tmp/claude-1000/config-improved/ircxus.improved.toml` |
-| systemd unit | `orochi` (system unit, `User=kain`) | `orochi` (system unit) |
+| systemd unit | `onyx-server` (system unit, `User=kain`) | `onyx-server` (system unit) |
 | node id / shards | id=1, num_shards=4 | id=2, num_shards=1 |
 | Ports | irc 6667 · tls 6697 · ws 8080 · s2s 6900 · metrics 9130(lo) | same, minus metrics scope |
 
@@ -24,7 +30,7 @@ home node with a known-good peer already up.
 > re-form. The mesh only reconverges once **both** nodes run 0.4.0. Do the real mesh-reattach
 > verification in **§4**, after both restarts — not between them.
 
-> ⚠️ **NEVER run the bare binary** (`./orochi` with no subcommand) — it strays a `:6680`
+> ⚠️ **NEVER run the bare binary** (`./onyx-server` with no subcommand) — it strays a `:6680`
 > listener. Only `--check-config <file>` (validates and exits) and `systemctl` are allowed
 > to launch it.
 
@@ -32,7 +38,7 @@ home node with a known-good peer already up.
 
 ## §1 — Pre-flight (on Node A / build host = eshmaki local)
 
-All commands from `/home/kain/orochi`.
+All commands from `/home/kain/onyx-server`.
 
 **1.1 Commit the pending 0.4.0 work — the tree is currently dirty.**
 The working tree has uncommitted TLS 1.3 hardening (5 files, ~682 insertions) plus an
@@ -40,7 +46,7 @@ untracked research doc. The build stamps the version **`-dirty`** if the tree is
 which fails the banner check in §3. Review and commit first:
 
 ```bash
-cd /home/kain/orochi
+cd /home/kain/onyx-server  # (repo path was /home/kain/onyx-server at the time of this deploy)
 git status --porcelain           # see what is pending
 git diff --stat HEAD             # 5 crypto/tls files expected
 # review the diff, then:
@@ -64,19 +70,19 @@ git rev-parse --short HEAD              # record the deploy hash → <HASH>
 **1.4 Build the musl ReleaseFast artifact.** (NOT `zig build release` = Debug.)
 ```bash
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
-file zig-out/bin/orochi     # MUST say: ELF 64-bit ... x86-64 ... statically linked
+file zig-out/bin/onyx-server     # MUST say: ELF 64-bit ... x86-64 ... statically linked
 ```
 
 **1.5 SHA256 the artifact — record it.**
 ```bash
-sha256sum zig-out/bin/orochi | tee /tmp/orochi-0.4.0.sha256
+sha256sum zig-out/bin/onyx-server | tee /tmp/onyx-0.4.0.sha256
 # record the hex → <SHA256>. This is verified on-node after transfer.
 ```
 
 **1.6 `--check-config` BOTH improved configs against the freshly built binary.**
 ```bash
-zig-out/bin/orochi --check-config /tmp/claude-1000/config-improved/eshmaki.improved.toml
-zig-out/bin/orochi --check-config /tmp/claude-1000/config-improved/ircxus.improved.toml
+zig-out/bin/onyx-server --check-config /tmp/claude-1000/config-improved/eshmaki.improved.toml
+zig-out/bin/onyx-server --check-config /tmp/claude-1000/config-improved/ircxus.improved.toml
 # BOTH must print OK. If either ERRORs, STOP — do not deploy.
 ```
 
@@ -90,18 +96,19 @@ Timestamp: `TS=$(date +%Y%m%d-%H%M%S)`.
 
 **2.1 Node B (ircx.us) — back up current binary + config.**
 ```bash
-ssh trev@ircx.us 'cd /home/trev/orochi-run && TS=$(date +%Y%m%d-%H%M%S) && \
-  cp -a orochi orochi.bak-$TS-pre-0.4.0 && \
-  cp -a orochi.ircxus.toml orochi.ircxus.toml.bak-$TS && \
-  ls -la orochi.bak-$TS-pre-0.4.0 orochi.ircxus.toml.bak-$TS'
+ssh trev@ircx.us 'cd /home/trev/onyx-run && TS=$(date +%Y%m%d-%H%M%S) && \
+  cp -a onyx onyx_server.bak-$TS-pre-0.4.0 && \
+  cp -a onyx-server.ircxus.toml onyx-server.ircxus.toml.bak-$TS && \
+  ls -la onyx_server.bak-$TS-pre-0.4.0 onyx-server.ircxus.toml.bak-$TS'
 ```
 
 **2.2 Node A (eshmaki, local) — back up current binary + config.**
 ```bash
-cd /home/kain/orochi-run && TS=$(date +%Y%m%d-%H%M%S) && \
-  cp -a orochi orochi.bak-$TS-pre-0.4.0 && \
-  cp -a orochi.local.toml orochi.local.toml.bak-$TS && \
-  ls -la orochi.bak-$TS-pre-0.4.0 orochi.local.toml.bak-$TS
+# Historical run dir (repo was /home/kain/onyx-server at the time of this deploy).
+cd /home/kain/onyx-server-run && TS=$(date +%Y%m%d-%H%M%S) && \
+  cp -a onyx onyx_server.bak-$TS-pre-0.4.0 && \
+  cp -a onyx-server.local.toml onyx-server.local.toml.bak-$TS && \
+  ls -la onyx_server.bak-$TS-pre-0.4.0 onyx-server.local.toml.bak-$TS
 ```
 
 Rollback is then one `mv` + restart (see §5). Note the exact backup filenames printed.
@@ -114,39 +121,39 @@ Rollback is then one `mv` + restart (see §5). Note the exact backup filenames p
 
 **3B.1 Stage the new binary atomically (transfer → verify sha → atomic rename).**
 ```bash
-scp /home/kain/orochi/zig-out/bin/orochi trev@ircx.us:/home/trev/orochi-run/orochi.new
-ssh trev@ircx.us 'sha256sum /home/trev/orochi-run/orochi.new'   # MUST equal <SHA256> from §1.5
+scp /home/kain/onyx-server/zig-out/bin/onyx-server trev@ircx.us:/home/trev/onyx-run/onyx_server.new
+ssh trev@ircx.us 'sha256sum /home/trev/onyx-run/onyx_server.new'   # MUST equal <SHA256> from §1.5
 ```
 
 **3B.2 `--check-config` the STAGED binary against the improved config (before swap).**
 ```bash
-scp /tmp/claude-1000/config-improved/ircxus.improved.toml trev@ircx.us:/home/trev/orochi-run/orochi.ircxus.toml.new
-ssh trev@ircx.us '/home/trev/orochi-run/orochi.new --check-config /home/trev/orochi-run/orochi.ircxus.toml.new'
+scp /tmp/claude-1000/config-improved/ircxus.improved.toml trev@ircx.us:/home/trev/onyx-run/onyx-server.ircxus.toml.new
+ssh trev@ircx.us '/home/trev/onyx-run/onyx_server.new --check-config /home/trev/onyx-run/onyx-server.ircxus.toml.new'
 # MUST print OK. If ERROR: STOP, do not swap, do not restart.
 ```
 
 **3B.3 Atomic swap of binary + config into place.**
 ```bash
-ssh trev@ircx.us 'cd /home/trev/orochi-run && \
-  mv orochi.new orochi && \
-  mv orochi.ircxus.toml.new orochi.ircxus.toml && \
-  chmod +x orochi'
+ssh trev@ircx.us 'cd /home/trev/onyx-run && \
+  mv onyx_server.new onyx && \
+  mv onyx-server.ircxus.toml.new onyx-server.ircxus.toml && \
+  chmod +x onyx'
 ```
 
 **3B.4 Hard restart.**
 ```bash
-ssh trev@ircx.us 'sudo systemctl restart orochi'
+ssh trev@ircx.us 'sudo systemctl restart onyx'
 ```
 > If the unit is not privileged for `trev`, use the operator's usual restart path for
-> node B. It is a system unit (`/etc/systemd/system/orochi.service`).
+> node B. It is a system unit (`/etc/systemd/system/onyx-server.service`).
 
 **3B.5 Post-restart health checks (Node B).**
 ```bash
 # a) service active, not restart-looping
-ssh trev@ircx.us 'systemctl is-active orochi && systemctl status orochi --no-pager | head -12'
+ssh trev@ircx.us 'systemctl is-active onyx && systemctl status onyx --no-pager | head -12'
 
 # b) version banner shows 0.4.0+<HASH> with NO -dirty suffix
-ssh trev@ircx.us 'journalctl -u orochi -n 40 --no-pager | grep -A1 "Orochi 0.4.0"'
+ssh trev@ircx.us 'journalctl -u onyx -n 40 --no-pager | grep -A1 "Onyx Server 0.4.0"'
 
 # c) listeners up (irc 6667, tls 6697, ws 8080, s2s 6900)
 ssh trev@ircx.us "ss -ltnp | grep -E ':(6667|6697|8080|6900)\b'"
@@ -154,7 +161,7 @@ ssh trev@ircx.us "ss -ltnp | grep -E ':(6667|6697|8080|6900)\b'"
 # d) TLS handshake on :6697 completes with a valid cert
 ssh trev@ircx.us "echo | openssl s_client -connect ircx.us:6697 -servername ircx.us 2>/dev/null | openssl x509 -noout -subject -dates"
 ```
-Expected: `active`; banner `Orochi 0.4.0+<HASH>` (no `-dirty`); all four ports LISTEN;
+Expected: `active`; banner `Onyx Server 0.4.0+<HASH>` (no `-dirty`); all four ports LISTEN;
 TLS subject + valid notBefore/notAfter.
 
 > At this point the mesh link to A will likely be **down** (A is still old, B now enforces
@@ -164,38 +171,39 @@ TLS subject + valid notBefore/notAfter.
 
 **3A.1 Stage the new binary atomically (local same-fs rename).**
 ```bash
-cp -a /home/kain/orochi/zig-out/bin/orochi /home/kain/orochi-run/orochi.new
-sha256sum /home/kain/orochi-run/orochi.new    # MUST equal <SHA256> from §1.5
+cp -a /home/kain/onyx-server/zig-out/bin/onyx-server /home/kain/onyx-server-run/onyx_server.new
+sha256sum /home/kain/onyx-server-run/onyx_server.new    # MUST equal <SHA256> from §1.5
 ```
 
 **3A.2 `--check-config` the staged binary against the improved config.**
 ```bash
-cp /tmp/claude-1000/config-improved/eshmaki.improved.toml /home/kain/orochi-run/orochi.local.toml.new
-/home/kain/orochi-run/orochi.new --check-config /home/kain/orochi-run/orochi.local.toml.new
+cp /tmp/claude-1000/config-improved/eshmaki.improved.toml /home/kain/onyx-server-run/onyx-server.local.toml.new
+/home/kain/onyx-server-run/onyx_server.new --check-config /home/kain/onyx-server-run/onyx-server.local.toml.new
 # MUST print OK. If ERROR: STOP, do not swap.
 ```
 
 **3A.3 Atomic swap.**
 ```bash
-cd /home/kain/orochi-run && \
-  mv orochi.new orochi && \
-  mv orochi.local.toml.new orochi.local.toml && \
-  chmod +x orochi
+# Historical run dir (repo was /home/kain/onyx-server at the time of this deploy).
+cd /home/kain/onyx-server-run && \
+  mv onyx_server.new onyx && \
+  mv onyx-server.local.toml.new onyx-server.local.toml && \
+  chmod +x onyx
 ```
 
 **3A.4 Hard restart.**
 ```bash
-sudo systemctl restart orochi
+sudo systemctl restart onyx
 ```
 
 **3A.5 Post-restart health checks (Node A).**
 ```bash
-systemctl is-active orochi && systemctl status orochi --no-pager | head -12
-journalctl -u orochi -n 40 --no-pager | grep -A1 "Orochi 0.4.0"
+systemctl is-active onyx && systemctl status onyx --no-pager | head -12
+journalctl -u onyx -n 40 --no-pager | grep -A1 "Onyx Server 0.4.0"
 ss -ltnp | grep -E ':(6667|6697|8080|6900|9130)\b'
 echo | openssl s_client -connect eshmaki.me:6697 -servername eshmaki.me 2>/dev/null | openssl x509 -noout -subject -dates
 ```
-Expected: `active`; banner `Orochi 0.4.0+<HASH>` (no `-dirty`); ports 6667/6697/8080/6900
+Expected: `active`; banner `Onyx Server 0.4.0+<HASH>` (no `-dirty`); ports 6667/6697/8080/6900
 LISTEN (+9130 on loopback); TLS handshake OK.
 
 ---
@@ -229,8 +237,8 @@ Convergence proof: from a client on eshmaki, `JOIN #deploytest`; from a client o
 
 **4.3 Log sanity on BOTH nodes.**
 ```bash
-journalctl -u orochi -n 80 --no-pager | grep -Ei 'resync|anti.?entropy|split|collision|zombie|panic'
-ssh trev@ircx.us "journalctl -u orochi -n 80 --no-pager | grep -Ei 'resync|anti.?entropy|split|collision|zombie|panic'"
+journalctl -u onyx -n 80 --no-pager | grep -Ei 'resync|anti.?entropy|split|collision|zombie|panic'
+ssh trev@ircx.us "journalctl -u onyx -n 80 --no-pager | grep -Ei 'resync|anti.?entropy|split|collision|zombie|panic'"
 ```
 Expected: a one-time RESYNC/anti-entropy convergence after relink; **no** persistent
 `split`, no collision storm, no `panic`. A single burst of collision renames right after
@@ -257,18 +265,19 @@ already live, roll A back — B on 0.4.0 alone is fine and will simply wait for 
 
 **5.1 Rollback Node B (ircx.us).**
 ```bash
-ssh trev@ircx.us 'cd /home/trev/orochi-run && \
-  mv orochi.bak-<TS>-pre-0.4.0 orochi && \
-  cp -a orochi.ircxus.toml.bak-<TS> orochi.ircxus.toml && \
-  sudo systemctl restart orochi && systemctl is-active orochi'
+ssh trev@ircx.us 'cd /home/trev/onyx-run && \
+  mv onyx_server.bak-<TS>-pre-0.4.0 onyx && \
+  cp -a onyx-server.ircxus.toml.bak-<TS> onyx-server.ircxus.toml && \
+  sudo systemctl restart onyx && systemctl is-active onyx'
 ```
 
 **5.2 Rollback Node A (eshmaki).**
 ```bash
-cd /home/kain/orochi-run && \
-  mv orochi.bak-<TS>-pre-0.4.0 orochi && \
-  cp -a orochi.local.toml.bak-<TS> orochi.local.toml && \
-  sudo systemctl restart orochi && systemctl is-active orochi
+# Historical run dir (repo was /home/kain/onyx-server at the time of this deploy).
+cd /home/kain/onyx-server-run && \
+  mv onyx_server.bak-<TS>-pre-0.4.0 onyx && \
+  cp -a onyx-server.local.toml.bak-<TS> onyx-server.local.toml && \
+  sudo systemctl restart onyx && systemctl is-active onyx
 ```
 Substitute the exact backup filenames recorded in §2. After rollback, re-verify §4 with
 both nodes back on the old binary.
@@ -277,7 +286,7 @@ both nodes back on the old binary.
 
 ## §6 — Post-deploy checklist
 
-- [ ] Both nodes report `Orochi 0.4.0+<HASH>` (no `-dirty`) in the banner / `VERSION`.
+- [ ] Both nodes report `Onyx Server 0.4.0+<HASH>` (no `-dirty`) in the banner / `VERSION`.
 - [ ] Mesh converged: each node sees the other in `MESH`/`LINKS`/`MAP`; LUSERS agree; no split-brain.
 - [ ] **Expected one-time cloak reshuffle.** The argon2id + auth-split anon-epoch cloak
       change means every user's cloaked host is recomputed on first boot of 0.4.0. This is
@@ -286,10 +295,10 @@ both nodes back on the old binary.
       **host/subnet-mask** WARDs no longer match and must be re-added after this deploy.
       (Account-based and raw IP/CIDR wards are unaffected — only cloaked-host/subnet wards.)
       Re-issue the needed `WARD` entries once both nodes are confirmed up.
-- [ ] Improved configs are now live (`orochi.local.toml`, `orochi.ircxus.toml`); backups
+- [ ] Improved configs are now live (`onyx-server.local.toml`, `onyx-server.ircxus.toml`); backups
       retained at the `*.bak-<TS>` paths from §2.
 - [ ] `github/main` is at `<HASH>` (pushed in §1.3).
-- [ ] Clean up staged temp files if any remain (`orochi.new`, `*.toml.new`) — none should
+- [ ] Clean up staged temp files if any remain (`onyx_server.new`, `*.toml.new`) — none should
       after a successful swap.
-- [ ] Update the deploy note / memory: `orochi-0.4.0+<HASH>` deployed to both nodes via
+- [ ] Update the deploy note / memory: `onyx-0.4.0+<HASH>` deployed to both nodes via
       hard `systemctl restart`, mesh reconverged, cloak reshuffle done, host/subnet WARDs re-added.

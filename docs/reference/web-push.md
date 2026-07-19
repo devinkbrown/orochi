@@ -152,7 +152,7 @@ The `[webpush]` section (`src/daemon/config_format.zig:717-727`):
 |-----------------|--------|------------------------------|---------|
 | `enabled`       | bool   | `false`                      | Master gate. Off ⇒ command rejected, no worker, nothing advertised. |
 | `subject`       | string | `mailto:ops@eshmaki.me`      | VAPID `sub` claim — an operator contact the push service may use. |
-| `vapid_key_path`| string | `orochi-webpush-vapid.key`   | Where the ES256 VAPID secret persists (64 hex chars). Created once if absent; **rotating it invalidates every stored subscription**. |
+| `vapid_key_path`| string | `onyx-webpush-vapid.key`   | Where the ES256 VAPID secret persists (64 hex chars). Created once if absent; **rotating it invalidates every stored subscription**. |
 
 The VAPID key file is load-or-create: a fresh P-256 secret is generated and written
 if the path is empty, so the key survives restarts and Helix upgrades.

@@ -86,7 +86,7 @@ fn fillArbitrary(random: std.Random, out: []u8, iteration: usize) void {
     const patterns = [_][]const u8{
         "\x01\x01",
         "\x01ACTION waves\x01",
-        "\x01VERSION Orochi\x01",
+        "\x01VERSION onyx-server\x01",
         "\x01PING token\x10n42\x01",
         "\x01PING token\x10x\x01",
         "\x01TOO-LONG-COMMAND-NAME-THAT-EXCEEDS-THE-DEFAULT hello\x01",

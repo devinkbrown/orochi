@@ -6,10 +6,10 @@
 //! (openssl default), `-hex`, or `-base64`.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const random = orochi.crypto.random;
+const random = onyx_server.crypto.random;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;

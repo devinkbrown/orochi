@@ -134,7 +134,7 @@ bare `SHA256(secret)` ([src/main.zig:491](../../src/main.zig),
 [deriveKey in src/crypto/argon2_kdf.zig:130](../../src/crypto/argon2_kdf.zig)).
 The secret is stretched with the memory-hard KDF (64 MiB / t=2 / p=1,
 `default_params`) under a fixed domain-separation salt
-`orochi/cloak-key/argon2id/v1` (`cloak_key_salt`). The whole cloak security model
+`onyx/cloak-key/argon2id/v1` (`cloak_key_salt`). The whole cloak security model
 rests on key secrecy — the IPv4 input space is fully enumerable — so a
 low-entropy operator passphrase must not be offline-brute-forceable: SHA-256
 costs one hash per guess, argon2id costs ~64 MiB + t iterations per guess.

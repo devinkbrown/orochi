@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi entry point (M1: Ringlane TCP server).
+//! Onyx Server entry point (M1: Ringlane TCP server).
 const std = @import("std");
 const builtin = @import("builtin");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const delegated_credential_cli = @import("daemon/delegated_credential_cli.zig");
 
 /// Shared context for the config-string resolver. Both `env:NAME` and
@@ -35,16 +35,16 @@ fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) 
 
 fn validateTlsChain(chain: []const []const u8) anyerror!void {
     if (chain.len == 0) return error.EmptyCertificateChain;
-    const now_unix: i64 = @divTrunc(orochi.substrate.platform.realtimeMillis(), 1000);
+    const now_unix: i64 = @divTrunc(onyx_server.substrate.platform.realtimeMillis(), 1000);
     // The daemon's OWN chain: validate the leaf only (a CA-issued server chain
     // ships leaf + intermediates, never a self-signed root, and its intermediate
     // may use a key type the server does not sign with). See validateServerChainAt.
-    try orochi.crypto.x509_verify.validateServerChainAt(chain, now_unix);
+    try onyx_server.crypto.x509_verify.validateServerChainAt(chain, now_unix);
 }
 
 const LoadedEchKeys = struct {
     configs: [][]u8 = &.{},
-    keys: []orochi.crypto.tls_server.EchKey = &.{},
+    keys: []onyx_server.crypto.tls_server.EchKey = &.{},
 
     fn deinit(self: *LoadedEchKeys, allocator: std.mem.Allocator) void {
         for (self.keys) |*key| std.crypto.secureZero(u8, &key.private_key);
@@ -58,14 +58,14 @@ const LoadedEchKeys = struct {
 fn loadTlsEchKeys(
     allocator: std.mem.Allocator,
     io: std.Io,
-    defs: []const orochi.daemon.config_format.Config.EchKeyDef,
+    defs: []const onyx_server.daemon.config_format.Config.EchKeyDef,
 ) !LoadedEchKeys {
     var configs: std.ArrayList([]u8) = .empty;
     errdefer {
         for (configs.items) |bytes| allocator.free(bytes);
         configs.deinit(allocator);
     }
-    var keys: std.ArrayList(orochi.crypto.tls_server.EchKey) = .empty;
+    var keys: std.ArrayList(onyx_server.crypto.tls_server.EchKey) = .empty;
     errdefer {
         for (keys.items) |*key| std.crypto.secureZero(u8, &key.private_key);
         keys.deinit(allocator);
@@ -94,15 +94,15 @@ fn loadTlsEchKeys(
 
 /// Services → live-world bridge: a channel registration marks the live channel
 /// REGISTERED (+r), materializing it if empty so the reservation persists.
-fn svcCreateChannel(ctx: *anyopaque, channel: []const u8) orochi.daemon.services.ServiceError!void {
-    const srv: *orochi.daemon.server.Server = @ptrCast(@alignCast(ctx));
+fn svcCreateChannel(ctx: *anyopaque, channel: []const u8) onyx_server.daemon.services.ServiceError!void {
+    const srv: *onyx_server.daemon.server.Server = @ptrCast(@alignCast(ctx));
     try srv.markChannelRegistered(channel, true);
 }
 
 /// Services → live-world bridge: dropping a registration clears +r so the
 /// channel reverts to ephemeral and is reclaimed once empty.
-fn svcDropChannel(ctx: *anyopaque, channel: []const u8) orochi.daemon.services.ServiceError!void {
-    const srv: *orochi.daemon.server.Server = @ptrCast(@alignCast(ctx));
+fn svcDropChannel(ctx: *anyopaque, channel: []const u8) onyx_server.daemon.services.ServiceError!void {
+    const srv: *onyx_server.daemon.server.Server = @ptrCast(@alignCast(ctx));
     try srv.markChannelRegistered(channel, false);
 }
 
@@ -113,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         \\  Zig-native mesh IRC daemon — Undertow + Mooring mesh
         \\
         \\
-    , .{orochi.version_full});
+    , .{onyx_server.version_full});
 
     const allocator = init.gpa;
 
@@ -125,16 +125,16 @@ pub fn main(init: std.process.Init) !void {
     // Default config (6680; 6667/6697 belong to the local eshmaki server). A
     // config file path may be passed as argv[1]: present values override the
     // defaults; a missing/invalid file keeps defaults (boot never fails on it).
-    var srv_cfg = orochi.daemon.server.Config{ .port = 6680 };
-    var held: ?orochi.daemon.config_boot.Loaded = null;
+    var srv_cfg = onyx_server.daemon.server.Config{ .port = 6680 };
+    var held: ?onyx_server.daemon.config_boot.Loaded = null;
     defer if (held) |*h| h.deinit(allocator);
     // Backing storage for the inherited per-shard listener fds (multi-shard
     // Helix handoff). Lives on main's frame so the slice stored on the config
     // stays valid for the whole boot.
-    var inherited_listeners: [orochi.daemon.helix.live.max_inherited_listeners]i32 = undefined;
+    var inherited_listeners: [onyx_server.daemon.helix.live.max_inherited_listeners]i32 = undefined;
     // Authoritative version-independent manifest of every client/S2S fd carried
     // in the state arena. This must outlive config parsing and server adoption.
-    var inherited_state_fds: [orochi.daemon.helix.live.max_inherited_state_fds]i32 = undefined;
+    var inherited_state_fds: [onyx_server.daemon.helix.live.max_inherited_state_fds]i32 = undefined;
     if (comptime builtin.os.tag != .linux) {
         _ = &inherited_listeners;
         _ = &inherited_state_fds;
@@ -152,24 +152,24 @@ pub fn main(init: std.process.Init) !void {
         // predecessor executes the exact already-open target image with this
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
-        if (std.mem.eql(u8, first, orochi.daemon.helix.live.upgrade_capability_arg)) {
-            std.debug.print("{s}\n", .{orochi.daemon.helix.live.upgrade_capability_token});
+        if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
+            std.debug.print("{s}\n", .{onyx_server.daemon.helix.live.upgrade_capability_token});
             return;
         } else
-        // `orochi --supervisor` is the Helix in-process-upgrade successor mode:
+        // `onyx-server --supervisor` is the Helix in-process-upgrade successor mode:
         // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
         // present we resume from them (listener + client fds + sessions + live TLS
         // state + mesh re-dial hints); otherwise it boots normally.
         if (std.mem.eql(u8, first, "--supervisor")) {
             if (comptime builtin.os.tag == .linux) {
-                if (orochi.daemon.helix.live.resumeFromEnv()) |r| {
+                if (onyx_server.daemon.helix.live.resumeFromEnv()) |r| {
                     if (r.listen_fd) |lfd| {
                         // Adopt the inherited listening socket so the port stays
                         // bound across the upgrade (no connection-refused window).
                         srv_cfg.inherited_listener_fd = lfd;
-                        std.debug.print("orochi: Helix resume — adopting listen fd {d}\n", .{lfd});
+                        std.debug.print("onyx-server: Helix resume — adopting listen fd {d}\n", .{lfd});
                     } else {
-                        std.debug.print("orochi: Helix resume (no listen fd; binding fresh)\n", .{});
+                        std.debug.print("onyx-server: Helix resume (no listen fd; binding fresh)\n", .{});
                     }
                     // Multi-shard predecessor: the full shard-ordered listener
                     // list (entry 0 duplicates the singular fd above). Each
@@ -179,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
                     if (r.listen_fd_count > 1) {
                         inherited_listeners = r.listen_fds;
                         srv_cfg.inherited_listener_fds = inherited_listeners[0..r.listen_fd_count];
-                        std.debug.print("orochi: Helix resume — adopting {d} per-shard listen fds\n", .{r.listen_fd_count});
+                        std.debug.print("onyx-server: Helix resume — adopting {d} per-shard listen fds\n", .{r.listen_fd_count});
                     }
                     // Hand the inherited state arena to the server, which reads it
                     // after boot and re-attaches the carried-over client connections.
@@ -189,20 +189,20 @@ pub fn main(init: std.process.Init) !void {
                     if (r.state_fd_count != 0) {
                         inherited_state_fds = r.state_fds;
                         srv_cfg.inherited_state_fds = inherited_state_fds[0..r.state_fd_count];
-                        std.debug.print("orochi: Helix resume — tracking {d} carried state fds\n", .{r.state_fd_count});
+                        std.debug.print("onyx-server: Helix resume — tracking {d} carried state fds\n", .{r.state_fd_count});
                     }
                 } else {
-                    std.debug.print("orochi: --supervisor with no Helix handoff env; normal boot\n", .{});
+                    std.debug.print("onyx-server: --supervisor with no Helix handoff env; normal boot\n", .{});
                 }
             } else {
-                std.debug.print("orochi: --supervisor is Linux-only\n", .{});
+                std.debug.print("onyx-server: --supervisor is Linux-only\n", .{});
             }
             // The successor carries its config path as the arg after --supervisor,
             // so it boots with the SAME config (ports/certs/opers/cloak) as the
             // predecessor — not the built-in defaults.
             config_path_arg = args.next();
         } else
-        // `orochi --check-config <path>` parses a config and reports OK/ERROR
+        // `onyx-server --check-config <path>` parses a config and reports OK/ERROR
         // WITHOUT booting (no ports bound, no mesh dialed) — safe pre-deploy
         // validation. Exits 0 on success, 1 on any read/parse error.
         if (std.mem.eql(u8, first, "--check-config")) {
@@ -210,14 +210,14 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("usage: onyx-server --check-config <path>\n", .{});
                 std.process.exit(2);
             };
-            const resolver = orochi.daemon.config_format.Resolver{
+            const resolver = onyx_server.daemon.config_format.Resolver{
                 .ctx = @ptrCast(&resolver_ctx),
                 .env = envLookup,
                 .file = fileLookup,
             };
             if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
                 defer allocator.free(text);
-                if (orochi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                     var l = loaded;
                     defer l.deinit(allocator);
                     // A meshed node with no shared [cloak] secret is a
@@ -236,12 +236,12 @@ pub fn main(init: std.process.Init) !void {
                     if (l.parsed.mesh.relay_v2_activation_epoch != 0 and
                         l.parsed.node.secret_key == null)
                     {
-                        const key_path = orochi.daemon.node_keyfile.derivePath(allocator, path) catch |err| {
+                        const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, path) catch |err| {
                             std.debug.print("config ERROR in {s}: cannot derive node keyfile path: {s}\n", .{ path, @errorName(err) });
                             std.process.exit(1);
                         };
                         defer allocator.free(key_path);
-                        orochi.daemon.node_keyfile.validateExistingPublicKey(
+                        onyx_server.daemon.node_keyfile.validateExistingPublicKey(
                             allocator,
                             init.io,
                             std.Io.Dir.cwd(),
@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
         } else
-        // `orochi acme-issue ...` runs an out-of-band ACME issuance and exits.
+        // `onyx-server acme-issue ...` runs an out-of-band ACME issuance and exits.
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
         // never analyze the linux-specific ACME path.
         if (std.mem.eql(u8, first, "acme-issue")) {
@@ -272,11 +272,11 @@ pub fn main(init: std.process.Init) !void {
                 var rest: std.ArrayList([]const u8) = .empty;
                 defer rest.deinit(allocator);
                 while (args.next()) |a| try rest.append(allocator, a);
-                const opts = orochi.daemon.acme_cli.parseArgs(rest.items) orelse {
-                    orochi.daemon.acme_cli.usage();
+                const opts = onyx_server.daemon.acme_cli.parseArgs(rest.items) orelse {
+                    onyx_server.daemon.acme_cli.usage();
                     return;
                 };
-                _ = orochi.daemon.acme_cli.runIssue(allocator, init.io, opts) catch |err| {
+                _ = onyx_server.daemon.acme_cli.runIssue(allocator, init.io, opts) catch |err| {
                     std.debug.print("acme-issue failed: {s}\n", .{@errorName(err)});
                     return;
                 };
@@ -286,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         } else
-        // `orochi delegated-credential inspect|validate ...` inspects a raw RFC
+        // `onyx-server delegated-credential inspect|validate ...` inspects a raw RFC
         // 9345 DelegatedCredential and optionally validates it against the leaf
         // certificate that signed it. It never boots the daemon or binds ports.
         if (std.mem.eql(u8, first, "delegated-credential")) {
@@ -327,7 +327,7 @@ pub fn main(init: std.process.Init) !void {
             // An unrecognized dash-flag must NEVER be treated as a config path — a
             // real config path never starts with '-'. Treating it as one silently
             // boots the DEFAULT identity (wrong ports/certs/opers). Fail loudly.
-            std.debug.print("orochi: unknown option '{s}' (try --help)\n", .{first});
+            std.debug.print("onyx-server: unknown option '{s}' (try --help)\n", .{first});
             std.process.exit(2);
         } else {
             config_path_arg = first;
@@ -338,14 +338,14 @@ pub fn main(init: std.process.Init) !void {
     // the path carried after --supervisor. One path for both so a hot-upgraded
     // process comes up on the real ports/certs/opers, not the defaults.
     if (config_path_arg) |path| {
-        const resolver = orochi.daemon.config_format.Resolver{
+        const resolver = onyx_server.daemon.config_format.Resolver{
             .ctx = @ptrCast(&resolver_ctx),
             .env = envLookup,
             .file = fileLookup,
         };
         if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser
-            if (orochi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+            if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                 held = loaded;
                 // Preserve the Helix handoff fields set above: `srv_cfg = loaded.config`
                 // replaces the whole struct, and these are not config-file keys.
@@ -367,12 +367,12 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
-                std.debug.print("orochi: loaded config from {s}\n", .{path});
+                std.debug.print("onyx-server: loaded config from {s}\n", .{path});
             } else |err| {
-                std.debug.print("orochi: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+                std.debug.print("onyx-server: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
             }
         } else |err| {
-            std.debug.print("orochi: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+            std.debug.print("onyx-server: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
         }
     }
 
@@ -382,39 +382,39 @@ pub fn main(init: std.process.Init) !void {
 
     // Install the configured network name before building ISUPPORT, so the
     // NETWORK= token and the welcome burst both reflect it. Write-once at boot.
-    orochi.proto.protocol_inventory.setNetworkName(srv_cfg.network_name);
-    orochi.proto.protocol_inventory.setServerName(srv_cfg.server_name);
+    onyx_server.proto.protocol_inventory.setNetworkName(srv_cfg.network_name);
+    onyx_server.proto.protocol_inventory.setServerName(srv_cfg.server_name);
     // Web Push VAPID key: loaded (or created) BEFORE ISUPPORT is built so the
     // 005 burst can advertise `VAPID=` — discovery is ISUPPORT, not a NOTE
     // round-trip. The delivery worker itself spawns later (needs `srv`).
-    var webpush_vapid: ?orochi.daemon.webpush.Vapid = null;
-    var webpush_pub_buf: [orochi.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
+    var webpush_vapid: ?onyx_server.daemon.webpush.Vapid = null;
+    var webpush_pub_buf: [onyx_server.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
     if (held) |h| {
         if (h.parsed.webpush.enabled and builtin.os.tag == .linux) {
-            if (orochi.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)) |v| {
+            if (onyx_server.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)) |v| {
                 webpush_vapid = v;
                 srv_cfg.webpush_vapid_pub = v.publicB64(&webpush_pub_buf);
             } else |err| {
-                std.debug.print("orochi: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
+                std.debug.print("onyx-server: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
             }
         }
     }
 
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
     // here, before any connection is served; owned for the process lifetime.
-    const isupport_tokens = try orochi.daemon.server.buildIsupportTokens(allocator, srv_cfg);
-    orochi.proto.protocol_inventory.setIsupportOverride(isupport_tokens);
+    const isupport_tokens = try onyx_server.daemon.server.buildIsupportTokens(allocator, srv_cfg);
+    onyx_server.proto.protocol_inventory.setIsupportOverride(isupport_tokens);
     // NICKLEN is enforced in the pre-registration dispatch path, which reads the
     // runtime-limits holder rather than a config handle.
-    orochi.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });
+    onyx_server.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });
 
     // PQ-secured S2S is ON BY DEFAULT: an explicit `[node] secret_key` takes
     // precedence (and never touches the keyfile); otherwise the daemon loads — or
-    // generates + persists (0600) — the seed from `orochi-node.key` next to the
+    // generates + persists (0600) — the seed from `onyx-server-node.key` next to the
     // config (CWD without one), so the secured Mooring mesh needs no manual key.
     // The identity outlives the server (it borrows a pointer); only a keyfile or
     // identity error leaves S2S plaintext.
-    var node_id_holder: ?orochi.daemon.node_identity.NodeIdentity = null;
+    var node_id_holder: ?onyx_server.daemon.node_identity.NodeIdentity = null;
     defer if (node_id_holder) |*n| n.deinit();
     const mesh_realm: []const u8 = if (held) |h| h.parsed.mesh.realm else "local";
     // Apply [mesh].require_secured before the node-identity setup below, so the
@@ -423,27 +423,27 @@ pub fn main(init: std.process.Init) !void {
     if (held) |h| srv_cfg.require_secured = h.parsed.mesh.require_secured;
     const configured_key: ?[]const u8 = if (held) |h| h.parsed.node.secret_key else null;
     if (configured_key) |sk| {
-        if (orochi.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {
+        if (onyx_server.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {
             node_id_holder = ident;
-            std.debug.print("orochi: PQ-secured S2S enabled (node identity configured)\n", .{});
+            std.debug.print("onyx-server: PQ-secured S2S enabled (node identity configured)\n", .{});
         } else |err| {
-            std.debug.print("orochi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+            std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     } else auto: {
-        const key_path = orochi.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch break :auto;
+        const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch break :auto;
         defer allocator.free(key_path);
-        const loaded_key = orochi.daemon.node_keyfile.loadOrCreate(allocator, init.io, std.Io.Dir.cwd(), key_path) catch |err| {
-            std.debug.print("orochi: node keyfile error in {s} ({s}); S2S stays plaintext\n", .{ key_path, @errorName(err) });
+        const loaded_key = onyx_server.daemon.node_keyfile.loadOrCreate(allocator, init.io, std.Io.Dir.cwd(), key_path) catch |err| {
+            std.debug.print("onyx-server: node keyfile error in {s} ({s}); S2S stays plaintext\n", .{ key_path, @errorName(err) });
             break :auto;
         };
-        if (orochi.daemon.node_identity.fromSeed(loaded_key.seed, mesh_realm)) |ident| {
+        if (onyx_server.daemon.node_identity.fromSeed(loaded_key.seed, mesh_realm)) |ident| {
             node_id_holder = ident;
             switch (loaded_key.source) {
-                .loaded => std.debug.print("orochi: node identity loaded from {s}\n", .{key_path}),
-                .generated => std.debug.print("orochi: node identity generated + persisted to {s}\n", .{key_path}),
+                .loaded => std.debug.print("onyx-server: node identity loaded from {s}\n", .{key_path}),
+                .generated => std.debug.print("onyx-server: node identity generated + persisted to {s}\n", .{key_path}),
             }
         } else |err| {
-            std.debug.print("orochi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+            std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     }
     if (node_id_holder != null) {
@@ -461,37 +461,37 @@ pub fn main(init: std.process.Init) !void {
     // WAL-backed account store and verify SASL PLAIN credentials against it. The
     // store/services/checker live for the server's lifetime (the checker fat
     // pointer is copied into every connection).
-    var account_store: ?orochi.daemon.services.OroStore = null;
+    var account_store: ?onyx_server.daemon.services.OroStore = null;
     defer if (account_store) |*s| s.deinit();
-    var account_services: orochi.daemon.services.Services = undefined;
-    var account_checker: orochi.daemon.sasl_bridge.ServicesPlainChecker = undefined;
-    var external_bridge: orochi.daemon.sasl_bridge.ServicesExternalLookup = undefined;
-    var session_token_bridge: orochi.daemon.sasl_bridge.ServicesSessionTokenLookup = undefined;
-    var oauth_key: ?orochi.daemon.oauth_jwt.OwnedKey = null;
+    var account_services: onyx_server.daemon.services.Services = undefined;
+    var account_checker: onyx_server.daemon.sasl_bridge.ServicesPlainChecker = undefined;
+    var external_bridge: onyx_server.daemon.sasl_bridge.ServicesExternalLookup = undefined;
+    var session_token_bridge: onyx_server.daemon.sasl_bridge.ServicesSessionTokenLookup = undefined;
+    var oauth_key: ?onyx_server.daemon.oauth_jwt.OwnedKey = null;
     defer if (oauth_key) |*key| key.deinit();
-    var oauth_verifier: orochi.daemon.oauth_jwt.Verifier = undefined;
+    var oauth_verifier: onyx_server.daemon.oauth_jwt.Verifier = undefined;
     var oauth_jwks_text: ?[]u8 = null;
     defer if (oauth_jwks_text) |bytes| allocator.free(bytes);
     // SCRAM-SHA-256 credential mirror: provisioned alongside each account so a
     // client can authenticate without sending its password. Must outlive the
     // server (the lookup fat-pointer captures &scram_store).
-    var scram_store = orochi.daemon.scram_store.ScramStore.init(allocator);
+    var scram_store = onyx_server.daemon.scram_store.ScramStore.init(allocator);
     defer scram_store.deinit();
     // Account ⇄ TLS certfp bindings for SASL EXTERNAL (CERTADD); outlives server.
-    var certfp_binds = orochi.daemon.certfp_bind.CertfpBindStore.init(allocator);
+    var certfp_binds = onyx_server.daemon.certfp_bind.CertfpBindStore.init(allocator);
     defer certfp_binds.deinit();
     // Account credential transparency root; services append CERTFP/WebAuthn changes.
-    var key_transparency_log = orochi.daemon.key_transparency.KeyTransparencyLog.init(allocator);
+    var key_transparency_log = onyx_server.daemon.key_transparency.KeyTransparencyLog.init(allocator);
     defer key_transparency_log.deinit();
     if (held) |h| {
         if (!srv_cfg.sasl_enabled) {
             if (h.parsed.sasl.account_db != null) {
-                std.debug.print("orochi: SASL account store configured but [sasl].enabled=false; SASL disabled\n", .{});
+                std.debug.print("onyx-server: SASL account store configured but [sasl].enabled=false; SASL disabled\n", .{});
             }
         } else if (h.parsed.sasl.account_db) |db| {
-            if (orochi.daemon.services.OroStore.openWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)) |store| {
+            if (onyx_server.daemon.services.OroStore.openWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)) |store| {
                 account_store = store;
-                account_services = orochi.daemon.services.Services.initWithConfig(&account_store.?, null, .{
+                account_services = onyx_server.daemon.services.Services.initWithConfig(&account_store.?, null, .{
                     .pbkdf2_rounds = h.parsed.accounts.pbkdf2_rounds,
                     .password_min_len = @intCast(h.parsed.accounts.password_min_len),
                     .password_max_len = @intCast(h.parsed.accounts.password_max_len),
@@ -502,8 +502,8 @@ pub fn main(init: std.process.Init) !void {
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works
                 // certfp-only without a prior runtime CERTADD. Coexists with (never
                 // wipes) runtime CERTADD binds; malformed entries warn-and-skip.
-                const seeded = orochi.daemon.config_boot.seedOperCertfpBinds(&certfp_binds, h.parsed.opers);
-                if (seeded != 0) std.debug.print("orochi: seeded {d} oper certfp binding(s) from config\n", .{seeded});
+                const seeded = onyx_server.daemon.config_boot.seedOperCertfpBinds(&certfp_binds, h.parsed.opers);
+                if (seeded != 0) std.debug.print("onyx-server: seeded {d} oper certfp binding(s) from config\n", .{seeded});
                 // Backfill SCRAM credentials from the durable mirror on a miss,
                 // so a SCRAM-SHA-256 login resolves after a restart.
                 scram_store.setLoader(account_services.scramLoader());
@@ -516,29 +516,29 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.sasl_external = external_bridge.lookup();
                 srv_cfg.sasl_session_token = session_token_bridge.lookup();
                 srv_cfg.account_services = &account_services;
-                std.debug.print("orochi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live\n", .{db});
+                std.debug.print("onyx-server: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live\n", .{db});
             } else |err| {
-                std.debug.print("orochi: account store error ({s}); SASL disabled\n", .{@errorName(err)});
+                std.debug.print("onyx-server: account store error ({s}); SASL disabled\n", .{@errorName(err)});
             }
         }
     }
     if (held) |h| {
         if (srv_cfg.sasl_enabled) {
-            const oauth_key_config: ?orochi.daemon.oauth_jwt.Key = if (h.parsed.sasl.oauth_hmac_key) |key|
+            const oauth_key_config: ?onyx_server.daemon.oauth_jwt.Key = if (h.parsed.sasl.oauth_hmac_key) |key|
                 .{ .hs256 = key }
             else if (h.parsed.sasl.oauth_jwks_file) |path| jwks: {
                 oauth_jwks_text = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| {
-                    std.debug.print("orochi: OAuth JWKS read failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                    std.debug.print("onyx-server: OAuth JWKS read failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :jwks null;
                 };
-                oauth_key = orochi.daemon.oauth_jwt.OwnedKey.fromJwks(allocator, oauth_jwks_text.?) catch |err| {
-                    std.debug.print("orochi: OAuth JWKS parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                oauth_key = onyx_server.daemon.oauth_jwt.OwnedKey.fromJwks(allocator, oauth_jwks_text.?) catch |err| {
+                    std.debug.print("onyx-server: OAuth JWKS parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :jwks null;
                 };
                 break :jwks oauth_key.?.key;
             } else if (h.parsed.sasl.oauth_pubkey) |pubkey| pubkey_blk: {
-                oauth_key = orochi.daemon.oauth_jwt.OwnedKey.fromPubkey(allocator, pubkey) catch |err| {
-                    std.debug.print("orochi: OAuth public key parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                oauth_key = onyx_server.daemon.oauth_jwt.OwnedKey.fromPubkey(allocator, pubkey) catch |err| {
+                    std.debug.print("onyx-server: OAuth public key parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :pubkey_blk null;
                 };
                 break :pubkey_blk oauth_key.?.key;
@@ -552,7 +552,7 @@ pub fn main(init: std.process.Init) !void {
                     .account_claim = h.parsed.sasl.oauth_account_claim orelse "sub",
                 };
                 srv_cfg.sasl_oauthbearer = oauth_verifier.lookup();
-                std.debug.print("orochi: SASL OAUTHBEARER live (local JWT verification)\n", .{});
+                std.debug.print("onyx-server: SASL OAUTHBEARER live (local JWT verification)\n", .{});
             }
         }
     }
@@ -579,30 +579,30 @@ pub fn main(init: std.process.Init) !void {
     // of retiring the weak KDF. (Separately, `[cloak] anon_epoch_secs` defaults to
     // 24 h, so anonymous clients also switch from the hierarchical `.ip` cloak to
     // the opaque `.opq` epoch cloak on upgrade unless the operator sets it to 0.)
-    var cloak_key_bytes: [orochi.proto.cloak.key_len]u8 = undefined;
-    const cloak_kdf_params = orochi.crypto.argon2_kdf.default_params;
-    const cloak_kdf_salt = orochi.crypto.argon2_kdf.cloak_key_salt;
+    var cloak_key_bytes: [onyx_server.proto.cloak.key_len]u8 = undefined;
+    const cloak_kdf_params = onyx_server.crypto.argon2_kdf.default_params;
+    const cloak_kdf_salt = onyx_server.crypto.argon2_kdf.cloak_key_salt;
     if (held) |h| {
         if (h.parsed.cloak.secret) |secret| {
-            if (orochi.crypto.argon2_kdf.deriveKey(allocator, &cloak_key_bytes, secret, cloak_kdf_salt, cloak_kdf_params)) {
-                srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
+            if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &cloak_key_bytes, secret, cloak_kdf_salt, cloak_kdf_params)) {
+                srv_cfg.cloak_key = onyx_server.proto.cloak.SecretKey.init(cloak_key_bytes);
             } else |err| {
                 // Only reachable under catastrophic conditions (OOM for the
                 // 64 MiB scratch / thread-spawn failure). Leave cloak_key null so
                 // the random per-boot fallback below still keeps privacy on, and
                 // warn loudly (the mesh-federation caveat is printed there too).
-                std.debug.print("orochi: cloak key derivation failed ({s}); falling back to a per-boot random key\n", .{@errorName(err)});
+                std.debug.print("onyx-server: cloak key derivation failed ({s}); falling back to a per-boot random key\n", .{@errorName(err)});
             }
         }
         // Previous cloak key (`[cloak] previous_secret`): kept live across a key
         // rotation so WARD host/mask bans written under the old key keep matching.
         // Derived through the same Argon2id path so old and new keys agree on KDF.
         if (h.parsed.cloak.previous_secret) |prev| {
-            var prev_bytes: [orochi.proto.cloak.key_len]u8 = undefined;
-            if (orochi.crypto.argon2_kdf.deriveKey(allocator, &prev_bytes, prev, cloak_kdf_salt, cloak_kdf_params)) {
-                srv_cfg.cloak_prev_key = orochi.proto.cloak.SecretKey.init(prev_bytes);
+            var prev_bytes: [onyx_server.proto.cloak.key_len]u8 = undefined;
+            if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &prev_bytes, prev, cloak_kdf_salt, cloak_kdf_params)) {
+                srv_cfg.cloak_prev_key = onyx_server.proto.cloak.SecretKey.init(prev_bytes);
             } else |err| {
-                std.debug.print("orochi: previous cloak key derivation failed ({s}); rotation grace disabled this boot\n", .{@errorName(err)});
+                std.debug.print("onyx-server: previous cloak key derivation failed ({s}); rotation grace disabled this boot\n", .{@errorName(err)});
             }
             std.crypto.secureZero(u8, &prev_bytes);
         }
@@ -622,15 +622,15 @@ pub fn main(init: std.process.Init) !void {
     }
     if (srv_cfg.cloak_key == null) {
         init.io.random(&cloak_key_bytes);
-        srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
-        std.debug.print("orochi: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
+        srv_cfg.cloak_key = onyx_server.proto.cloak.SecretKey.init(cloak_key_bytes);
+        std.debug.print("onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
         // On a MESHED node a per-boot random cloak key is a federation hazard:
         // cloaked hosts differ per node and change on every restart, so
         // `*!*@<cloak>` and subnet WARD bans neither cross the mesh nor survive a
         // restart. Warn loudly so the operator sets one shared [cloak] secret.
         if (held) |h| {
             if (h.parsed.meshCloakSecretMissing())
-                std.debug.print("orochi: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.\n", .{});
+                std.debug.print("onyx-server: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.\n", .{});
         }
     }
     // `srv_cfg.cloak_key` owns its own copy of the key; the local scratch buffer
@@ -641,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
     // Background forward-confirmed reverse-DNS resolver: client IPs are resolved
     // off the accept path so hosts present a cloaked hostname rather than a
     // cloaked IP. Inert (no thread) when /etc/resolv.conf yields no nameservers.
-    var rdns_resolver = orochi.daemon.rdns.Resolver.init(allocator) catch null;
+    var rdns_resolver = onyx_server.daemon.rdns.Resolver.init(allocator) catch null;
     defer if (rdns_resolver) |*r| r.deinit();
     if (rdns_resolver) |*r| {
         r.start();
@@ -651,11 +651,11 @@ pub fn main(init: std.process.Init) !void {
     // Connect-time DNS blocklist: built only when `[dnsbl]` is enabled with at
     // least one zone. Each client IP is checked off the accept path and a listed
     // IP is refused (or network-banned) at registration. Inert otherwise.
-    var dnsbl_res: ?orochi.daemon.dnsbl_resolver.Resolver = null;
+    var dnsbl_res: ?onyx_server.daemon.dnsbl_resolver.Resolver = null;
     defer if (dnsbl_res) |*r| r.deinit();
     if (held) |h| {
         if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len != 0) {
-            dnsbl_res = orochi.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch null;
+            dnsbl_res = onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch null;
             if (dnsbl_res) |*r| {
                 r.start();
                 srv_cfg.dnsbl = r;
@@ -667,13 +667,13 @@ pub fn main(init: std.process.Init) !void {
     // Background SMTP submission sender: built only when `[mail]` is enabled with
     // a relay host + sender address. Delivers account email-verification codes
     // out-of-band. Inert otherwise (emails are recorded unverified).
-    var mail_send: ?orochi.daemon.mail_sender.Sender = null;
+    var mail_send: ?onyx_server.daemon.mail_sender.Sender = null;
     defer if (mail_send) |*m| m.deinit();
     if (held) |h| {
         const m = h.parsed.mail;
         if (m.enabled) {
             if (m.relay_host) |relay| if (m.from) |from| {
-                mail_send = orochi.daemon.mail_sender.Sender.init(allocator, .{
+                mail_send = onyx_server.daemon.mail_sender.Sender.init(allocator, .{
                     .relay_host = relay,
                     .relay_port = m.relay_port,
                     .starttls = m.starttls,
@@ -695,9 +695,9 @@ pub fn main(init: std.process.Init) !void {
     // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
     // listener. The chain bytes + signing key live for the server's lifetime
     // (server.Config borrows them). No STARTTLS — this is a separate TLS port.
-    var tls_loaded: ?orochi.daemon.tls_certs.Loaded = null;
+    var tls_loaded: ?onyx_server.daemon.tls_certs.Loaded = null;
     defer if (tls_loaded) |*t| t.deinit(allocator);
-    var tls12_loaded: ?orochi.daemon.tls_certs.Tls12 = null;
+    var tls12_loaded: ?onyx_server.daemon.tls_certs.Tls12 = null;
     defer if (tls12_loaded) |*t| t.deinit(allocator);
     // [[tls.sni]] additional certs: each entry's on-disk cert+key is loaded with
     // the SAME loader as the default cert. The loaded material must outlive the
@@ -705,18 +705,18 @@ pub fn main(init: std.process.Init) !void {
     // RSA key storage), so the loads live on main's frame and free at process
     // exit — mirroring `tls_loaded`. `tls_sni_certs` is the selection list handed
     // to the listener; the array itself is freed here, its contents borrow above.
-    var tls_sni_loaded: std.ArrayList(orochi.daemon.tls_certs.Loaded) = .empty;
+    var tls_sni_loaded: std.ArrayList(onyx_server.daemon.tls_certs.Loaded) = .empty;
     defer {
         for (tls_sni_loaded.items) |*s| s.deinit(allocator);
         tls_sni_loaded.deinit(allocator);
     }
-    var tls_sni_certs: []orochi.crypto.tls_server.SniCert = &.{};
+    var tls_sni_certs: []onyx_server.crypto.tls_server.SniCert = &.{};
     defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
     var tls_ech_loaded: ?LoadedEchKeys = null;
     defer if (tls_ech_loaded) |*e| e.deinit(allocator);
     if (held) |h| {
         if (h.tls.enabled) {
-            if (orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
+            if (onyx_server.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
                 .enabled = true,
                 .cert_path = h.tls.cert_path,
                 .key_path = h.tls.key_path,
@@ -725,7 +725,7 @@ pub fn main(init: std.process.Init) !void {
                 validateTlsChain(loaded.cert_chain) catch |err| {
                     var rejected = loaded;
                     rejected.deinit(allocator);
-                    std.debug.print("orochi: TLS certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                    std.debug.print("onyx-server: TLS certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
                     break :tls_material;
                 };
                 tls_loaded = loaded;
@@ -744,27 +744,27 @@ pub fn main(init: std.process.Init) !void {
                     // defer above), the returned list is freed here, and on ANY
                     // error the helper frees its partial list + deinits the
                     // just-loaded entry, so we simply fail-fast into `break`.
-                    const built = orochi.daemon.tls_sni_load.buildSniCerts(
+                    const built = onyx_server.daemon.tls_sni_load.buildSniCerts(
                         allocator,
                         init.io,
                         h.tls.sni,
                         h.tls.dns_name,
                         &tls_sni_loaded,
                         validateTlsChain,
-                        orochi.daemon.tls_sni_load.default_loader,
+                        onyx_server.daemon.tls_sni_load.default_loader,
                     ) catch |err| {
-                        std.debug.print("orochi: [[tls.sni]] certificate setup failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        std.debug.print("onyx-server: [[tls.sni]] certificate setup failed ({s}); TLS disabled\n", .{@errorName(err)});
                         break :tls_material;
                     };
                     tls_sni_certs = built;
-                    std.debug.print("orochi: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
+                    std.debug.print("onyx-server: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
                 }
                 if (h.tls.ech_keys.len != 0) {
                     tls_ech_loaded = loadTlsEchKeys(allocator, init.io, h.tls.ech_keys) catch |err| {
-                        std.debug.print("orochi: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        std.debug.print("onyx-server: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
                         break :tls_material;
                     };
-                    var probe = orochi.crypto.tls_server.Server.init(allocator, .{
+                    var probe = onyx_server.crypto.tls_server.Server.init(allocator, .{
                         .cert_chain = tls_loaded.?.cert_chain,
                         .signing_key = tls_loaded.?.signing_key,
                         .ecdsa_p256_signing_key = tls_loaded.?.ecdsa_p256_signing_key,
@@ -772,11 +772,11 @@ pub fn main(init: std.process.Init) !void {
                         .sni_certs = tls_sni_certs,
                         .ech_keys = tls_ech_loaded.?.keys,
                     }) catch |err| {
-                        std.debug.print("orochi: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        std.debug.print("onyx-server: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
                         break :tls_material;
                     };
                     probe.deinit();
-                    std.debug.print("orochi: {d} ECH key(s) loaded\n", .{tls_ech_loaded.?.keys.len});
+                    std.debug.print("onyx-server: {d} ECH key(s) loaded\n", .{tls_ech_loaded.?.keys.len});
                 }
                 srv_cfg.tls_port = h.tls.port;
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
@@ -789,48 +789,48 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
-                std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
+                std.debug.print("onyx-server: TLS listener enabled on port {d}\n", .{h.tls.port});
                 // kTLS offload (roadmap 3.1): activate kernel record crypto only
                 // when the operator opted in via `[tls] ktls` AND the running
                 // kernel offers the TLS ULP. `tx` offloads server→client encryption;
                 // `txrx` additionally offloads client→server decryption.
-                const ktls_capable = orochi.daemon.ktls.probeUlpSupport();
+                const ktls_capable = onyx_server.daemon.ktls.probeUlpSupport();
                 srv_cfg.tls_ktls_tx = (h.tls.ktls != .off and ktls_capable);
                 srv_cfg.tls_ktls_rx = (h.tls.ktls == .txrx and ktls_capable);
                 if (h.tls.ktls != .off) {
                     if (ktls_capable) {
                         const dirs = if (h.tls.ktls == .txrx) "TX+RX" else "TX";
-                        std.debug.print("orochi: kTLS {s} offload ACTIVE ({s}) — TLS 1.3 record crypto runs in the kernel\n", .{ dirs, @tagName(h.tls.ktls) });
+                        std.debug.print("onyx-server: kTLS {s} offload ACTIVE ({s}) — TLS 1.3 record crypto runs in the kernel\n", .{ dirs, @tagName(h.tls.ktls) });
                     } else {
-                        std.debug.print("orochi: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
+                        std.debug.print("onyx-server: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
                     }
                 } else if (ktls_capable) {
-                    std.debug.print("orochi: kTLS-capable kernel detected (TLS ULP present); set [tls] ktls=tx to offload server→client encryption\n", .{});
+                    std.debug.print("onyx-server: kTLS-capable kernel detected (TLS ULP present); set [tls] ktls=tx to offload server→client encryption\n", .{});
                 } else {
-                    std.debug.print("orochi: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
+                    std.debug.print("onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
                 }
                 if (h.tls.enable_tls12) {
                     if (tls_loaded.?.key_kind == .ecdsa_p256) {
                         // The loaded ECDSA-P256 leaf serves the 1.2 leg natively.
                         srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
                         srv_cfg.tls12_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
-                        std.debug.print("orochi: hardened TLS 1.2 also accepted (ECDSA-P256 leaf)\n", .{});
+                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leaf)\n", .{});
                     } else if (tls_loaded.?.key_kind == .rsa) {
                         srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
-                        std.debug.print("orochi: hardened TLS 1.2 also accepted (RSA leg)\n", .{});
+                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (RSA leg)\n", .{});
                     } else {
-                        if (orochi.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {
+                        if (onyx_server.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {
                             tls12_loaded = t12;
                             srv_cfg.tls12_cert_chain = tls12_loaded.?.cert_chain;
                             srv_cfg.tls12_signing_key = tls12_loaded.?.key;
-                            std.debug.print("orochi: hardened TLS 1.2 also accepted (ECDSA-P256 leg)\n", .{});
+                            std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)\n", .{});
                         } else |err| {
-                            std.debug.print("orochi: TLS 1.2 bootstrap failed ({s}); 1.3-only\n", .{@errorName(err)});
+                            std.debug.print("onyx-server: TLS 1.2 bootstrap failed ({s}); 1.3-only\n", .{@errorName(err)});
                         }
                     }
                 }
             } else |err| {
-                std.debug.print("orochi: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
+                std.debug.print("onyx-server: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
             }
         }
     }
@@ -842,35 +842,35 @@ pub fn main(init: std.process.Init) !void {
     // unless the testing-only `[listen] ws_plain` flag is set.
     if (srv_cfg.ws_enabled) {
         if (srv_cfg.tls_cert_chain.len != 0) {
-            std.debug.print("orochi: WebSocket (wss) listener enabled on port {d}\n", .{srv_cfg.ws_port});
+            std.debug.print("onyx-server: WebSocket (wss) listener enabled on port {d}\n", .{srv_cfg.ws_port});
         } else if (srv_cfg.ws_allow_plain) {
-            std.debug.print("orochi: WebSocket listener on port {d} WITHOUT TLS ([listen] ws_plain testing mode)\n", .{srv_cfg.ws_port});
+            std.debug.print("onyx-server: WebSocket listener on port {d} WITHOUT TLS ([listen] ws_plain testing mode)\n", .{srv_cfg.ws_port});
         } else {
             srv_cfg.ws_enabled = false;
-            std.debug.print("orochi: [listen] ws ignored — no TLS certificate loaded (enable [tls]; browsers require wss)\n", .{});
+            std.debug.print("onyx-server: [listen] ws ignored — no TLS certificate loaded (enable [tls]; browsers require wss)\n", .{});
         }
     }
 
     // IRCv3 STS: when an operator enables `[sts]` AND a TLS listener is live,
     // build the advertised wire value so each session's `sts` cap is offered.
     // STS without a live TLS port would strand clients, so require both.
-    var sts_value_buf: [orochi.proto.sts.MAX_VALUE_LEN]u8 = undefined;
+    var sts_value_buf: [onyx_server.proto.sts.MAX_VALUE_LEN]u8 = undefined;
     if (held) |h| {
         if (h.sts.enabled) {
             if (srv_cfg.tls_cert_chain.len != 0) {
-                const policy = orochi.proto.sts_policy.Policy{
+                const policy = onyx_server.proto.sts_policy.Policy{
                     .duration_seconds = h.sts.duration,
                     .port = h.sts.port,
                     .preload = h.sts.preload,
                 };
-                if (orochi.proto.sts_policy.writeCapValue(policy, .combined, &sts_value_buf)) |value| {
+                if (onyx_server.proto.sts_policy.writeCapValue(policy, .combined, &sts_value_buf)) |value| {
                     srv_cfg.sts_value = value;
-                    std.debug.print("orochi: STS advertised ({s})\n", .{value});
+                    std.debug.print("onyx-server: STS advertised ({s})\n", .{value});
                 } else |err| {
-                    std.debug.print("orochi: STS value error ({s}); STS disabled\n", .{@errorName(err)});
+                    std.debug.print("onyx-server: STS value error ({s}); STS disabled\n", .{@errorName(err)});
                 }
             } else {
-                std.debug.print("orochi: [sts] enabled but no TLS listener; STS NOT advertised\n", .{});
+                std.debug.print("onyx-server: [sts] enabled but no TLS listener; STS NOT advertised\n", .{});
             }
         }
     }
@@ -895,13 +895,13 @@ pub fn main(init: std.process.Init) !void {
     // sampled that as 1<->2 oscillation). Fixed: servers come from a reactor-0
     // atomic, users from the shared world nick registry.
 
-    const Server = orochi.daemon.server.Server;
+    const Server = onyx_server.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // The reactor requires io_uring on a 64-bit Linux kernel. If it is
         // unavailable (old kernel / restricted sandbox) the daemon cannot serve,
         // so fail loudly and exit non-zero rather than pretending to have started.
-        std.debug.print("orochi: fatal — cannot start server: {s}\n", .{@errorName(err)});
-        std.debug.print("orochi: the reactor requires io_uring on a 64-bit Linux kernel.\n", .{});
+        std.debug.print("onyx-server: fatal — cannot start server: {s}\n", .{@errorName(err)});
+        std.debug.print("onyx-server: the reactor requires io_uring on a 64-bit Linux kernel.\n", .{});
         std.process.exit(1);
     };
     defer srv.deinit();
@@ -917,7 +917,7 @@ pub fn main(init: std.process.Init) !void {
     // inside it). No-op until a module declares lifecycle fns.
     srv.start();
 
-    const AcmeRenewalService = if (builtin.os.tag == .linux) orochi.daemon.acme_renewal.Service else void;
+    const AcmeRenewalService = if (builtin.os.tag == .linux) onyx_server.daemon.acme_renewal.Service else void;
     var acme_renewal: ?*AcmeRenewalService = null;
     defer if (comptime builtin.os.tag == .linux) {
         if (acme_renewal) |s| {
@@ -937,7 +937,7 @@ pub fn main(init: std.process.Init) !void {
                 acme_renewal = svc;
                 svc.start();
             } else {
-                std.debug.print("orochi: [acme] enabled but in-daemon renewal is Linux-only; renewal disabled\n", .{});
+                std.debug.print("onyx-server: [acme] enabled but in-daemon renewal is Linux-only; renewal disabled\n", .{});
             }
         }
     }
@@ -948,7 +948,7 @@ pub fn main(init: std.process.Init) !void {
     // (1.3) / CertificateStatus (1.2) then carries it when a client offers
     // status_request. Needs a real cert file (self-signed bootstrap leaves have
     // no AIA responder URL, so the worker simply no-ops there).
-    const OcspStapleService = if (builtin.os.tag == .linux) orochi.daemon.ocsp_staple.Service else void;
+    const OcspStapleService = if (builtin.os.tag == .linux) onyx_server.daemon.ocsp_staple.Service else void;
     var ocsp_staple: ?*OcspStapleService = null;
     defer if (comptime builtin.os.tag == .linux) {
         if (ocsp_staple) |s| {
@@ -969,19 +969,19 @@ pub fn main(init: std.process.Init) !void {
                 ocsp_staple = svc;
                 svc.start();
             } else {
-                std.debug.print("orochi: [ocsp] enabled but staple fetching is Linux-only; disabled\n", .{});
+                std.debug.print("onyx-server: [ocsp] enabled but staple fetching is Linux-only; disabled\n", .{});
             }
         } else if (h.parsed.ocsp.enabled) {
-            std.debug.print("orochi: [ocsp] enabled but requires [tls] with an on-disk cert_path; disabled\n", .{});
+            std.debug.print("onyx-server: [ocsp] enabled but requires [tls] with an on-disk cert_path; disabled\n", .{});
         }
     }
 
     // ── Web Push delivery worker ([webpush] enabled + account store) ────────
     // Offline DMs (tegami) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
-    const WebpushWorker = if (builtin.os.tag == .linux) orochi.daemon.webpush.Worker else void;
+    const WebpushWorker = if (builtin.os.tag == .linux) onyx_server.daemon.webpush.Worker else void;
     var webpush_worker: ?*WebpushWorker = null;
-    var webpush_resolver: ?*orochi.daemon.acme_runner.SystemResolver = null;
+    var webpush_resolver: ?*onyx_server.daemon.acme_runner.SystemResolver = null;
     defer if (comptime builtin.os.tag == .linux) {
         if (webpush_worker) |w| {
             w.shutdown();
@@ -993,24 +993,24 @@ pub fn main(init: std.process.Init) !void {
         if (h.parsed.webpush.enabled) {
             if (comptime builtin.os.tag == .linux) webpush_blk: {
                 if (srv_cfg.account_services == null) {
-                    std.debug.print("orochi: [webpush] enabled but no account store; web push disabled\n", .{});
+                    std.debug.print("onyx-server: [webpush] enabled but no account store; web push disabled\n", .{});
                     break :webpush_blk;
                 }
                 // Trust anchors + resolver live for the process lifetime.
                 const bundle_text = std.Io.Dir.cwd().readFileAlloc(init.io, h.parsed.acme.ca_bundle_path, allocator, .limited(@intCast(h.parsed.acme.ca_bundle_max_bytes))) catch |err| {
-                    std.debug.print("orochi: [webpush] CA bundle read failed ({s}); web push disabled\n", .{@errorName(err)});
+                    std.debug.print("onyx-server: [webpush] CA bundle read failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
                 defer allocator.free(bundle_text);
-                const anchors = orochi.daemon.acme_cli.loadTrustAnchors(allocator, bundle_text) catch |err| {
-                    std.debug.print("orochi: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
+                const anchors = onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, bundle_text) catch |err| {
+                    std.debug.print("onyx-server: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
                 const vapid = webpush_vapid orelse {
-                    std.debug.print("orochi: [webpush] no VAPID key; web push disabled\n", .{});
+                    std.debug.print("onyx-server: [webpush] no VAPID key; web push disabled\n", .{});
                     break :webpush_blk;
                 };
-                const resolver = try allocator.create(orochi.daemon.acme_runner.SystemResolver);
+                const resolver = try allocator.create(onyx_server.daemon.acme_runner.SystemResolver);
                 resolver.* = .{
                     .allocator = allocator,
                     .io = init.io,
@@ -1029,9 +1029,9 @@ pub fn main(init: std.process.Init) !void {
                 try w.spawn();
                 webpush_worker = w;
                 srv.webpush_worker = w;
-                std.debug.print("orochi: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
+                std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
             } else {
-                std.debug.print("orochi: [webpush] enabled but web push is Linux-only; disabled\n", .{});
+                std.debug.print("onyx-server: [webpush] enabled but web push is Linux-only; disabled\n", .{});
             }
         }
     }
@@ -1051,10 +1051,10 @@ pub fn main(init: std.process.Init) !void {
     srv.loadWasmPlugins();
 
     // SIGUSR2 → connection-preserving Helix UPGRADE: lets a shell-driven deploy
-    // (`systemctl kill -s USR2 orochi`, after staging the new binary) hot-swap
+    // (`systemctl kill -s USR2 onyx-server`, after staging the new binary) hot-swap
     // the running image while keeping every live client session attached,
     // instead of dropping them with a hard `systemctl restart`.
-    orochi.daemon.server.installUpgradeSignalHandler();
+    onyx_server.daemon.server.installUpgradeSignalHandler();
 
     // WebTransport (QUIC/HTTP3) listener: a real UDP endpoint built on the
     // from-scratch QUIC stack. It demuxes inbound QUIC datagrams to per-peer
@@ -1062,23 +1062,23 @@ pub fn main(init: std.process.Init) !void {
     // bridges each session to the daemon's IRC listener over a loopback TCP
     // proxy (the WT user is handled as an ordinary local IRC client — no reactor
     // changes). Requires the TLS cert chain + a signing key matching the leaf.
-    var wt_listener: ?orochi.daemon.webtransport_listener.WebTransportListener = null;
+    var wt_listener: ?onyx_server.daemon.webtransport_listener.WebTransportListener = null;
     defer if (wt_listener) |*l| l.deinit();
     if (srv_cfg.webtransport_port != 0) wt: {
         if (srv_cfg.tls_cert_chain.len == 0) {
-            std.debug.print("orochi: [listen] webtransport={d} ignored — no TLS certificate loaded (enable [tls]; QUIC needs a cert)\n", .{srv_cfg.webtransport_port});
+            std.debug.print("onyx-server: [listen] webtransport={d} ignored — no TLS certificate loaded (enable [tls]; QUIC needs a cert)\n", .{srv_cfg.webtransport_port});
             break :wt;
         }
-        const signing_key: orochi.proto.quic_handshake.SigningKey =
+        const signing_key: onyx_server.proto.quic_handshake.SigningKey =
             if (srv_cfg.tls_ecdsa_signing_key) |k| .{ .ecdsa_p256 = k } else if (srv_cfg.tls_signing_key) |k| .{ .ed25519 = k } else if (srv_cfg.tls_rsa_signing_key) |k| .{ .rsa = k } else {
-                std.debug.print("orochi: [listen] webtransport={d} ignored — no usable TLS signing key\n", .{srv_cfg.webtransport_port});
+                std.debug.print("onyx-server: [listen] webtransport={d} ignored — no usable TLS signing key\n", .{srv_cfg.webtransport_port});
                 break :wt;
             };
         const irc_port = srv.boundPort() catch {
-            std.debug.print("orochi: [listen] webtransport — IRC port not bound; WebTransport disabled\n", .{});
+            std.debug.print("onyx-server: [listen] webtransport — IRC port not bound; WebTransport disabled\n", .{});
             break :wt;
         };
-        wt_listener = orochi.daemon.webtransport_listener.WebTransportListener.init(
+        wt_listener = onyx_server.daemon.webtransport_listener.WebTransportListener.init(
             allocator,
             .{ .cert_chain = srv_cfg.tls_cert_chain, .signing_key = signing_key },
             irc_port,
@@ -1086,16 +1086,16 @@ pub fn main(init: std.process.Init) !void {
         // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
         // IPv4 (mapped) QUIC clients on one socket.
-        wt_listener.?.start(orochi.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port) catch |err| {
-            std.debug.print("orochi: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
+        wt_listener.?.start(onyx_server.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port) catch |err| {
+            std.debug.print("onyx-server: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
             wt_listener = null;
             break :wt;
         };
-        std.debug.print("orochi: WebTransport listening on UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ wt_listener.?.port, irc_port });
+        std.debug.print("onyx-server: WebTransport listening on UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ wt_listener.?.port, irc_port });
     }
 
     std.debug.print(
-        "orochi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",
+        "onyx-server: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",
         .{try srv.boundPort()},
     );
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).

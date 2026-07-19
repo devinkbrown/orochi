@@ -8,10 +8,10 @@
 //! typed error, never a crash.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const x509 = orochi.crypto.x509;
+const x509 = onyx_server.crypto.x509;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;
@@ -140,7 +140,7 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
         if (use_pem) {
             const buf = try gpa.alloc(u8, text.len);
             errdefer gpa.free(buf);
-            const first = try orochi.proto.pem.decodeFirst(text, buf);
+            const first = try onyx_server.proto.pem.decodeFirst(text, buf);
             const owned = try gpa.dupe(u8, first.der);
             gpa.free(buf);
             break :blk owned;

@@ -84,7 +84,7 @@ pub const KeyTransparencyLog = struct {
 
 pub fn eventDigest(event: Event) Hash {
     var h = Blake3.init(.{});
-    h.update("OROCHI-KT-EVENT-v1");
+    h.update("ONYX-KT-EVENT-v1");
     updateInt(u8, &h, @intFromEnum(event.kind));
     updateInt(u8, &h, @intFromEnum(event.action));
     updateBytes(&h, event.account);

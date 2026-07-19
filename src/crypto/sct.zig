@@ -46,7 +46,7 @@
 //! ## Verification pipeline and the pinned-log registry
 //!
 //! Beyond parsing, this module verifies an SCT signature against a
-//! CALLER-PROVIDED set of pinned CT logs (`[]const CtLog`). Orochi bundles NO
+//! CALLER-PROVIDED set of pinned CT logs (`[]const CtLog`). Onyx Server bundles NO
 //! log list; a deployment that wants CT enforcement supplies the logs it trusts
 //! from configuration. Each `CtLog` pairs a log's DER SubjectPublicKeyInfo with
 //! its RFC 6962 `log_id` (SHA-256 of that SPKI — derive it with `logIdFromSpki`
@@ -498,7 +498,7 @@ pub fn verifySct(sct: Sct, log_public_key_spki_der: []const u8, signed_data: []c
 // ---------------------------------------------------------------------------
 // Pinned-log registry and verification entrypoints.
 //
-// Orochi ships NO built-in CT log list. A deployment supplies its own pinned
+// Onyx Server ships NO built-in CT log list. A deployment supplies its own pinned
 // logs (from config) as a `[]const CtLog`. An empty set — or an SCT from an
 // unpinned log — yields `.no_applicable_log`; the caller's fail-open/closed
 // policy decides what that means. This module never fabricates a trusted log

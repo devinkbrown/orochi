@@ -528,7 +528,7 @@ test "malformed mesh node is rejected before sink emission" {
 
 test "excessive hops are rejected (indent amplification guard)" {
     var buf: [4096]u8 = undefined;
-    const ctx = ReplyContext{ .server_name = "orochi.local", .requester = "alice" };
+    const ctx = ReplyContext{ .server_name = "onyx.local", .requester = "alice" };
     // u16-max hops would otherwise render a ~128KB indent.
     try std.testing.expectError(error.TooManyHops, writeMapNode(&buf, ctx, .{ .name = "n", .hops = 65535, .peers = 1 }, true));
     // At/under the ceiling is accepted.
@@ -537,7 +537,7 @@ test "excessive hops are rejected (indent amplification guard)" {
 
 test "a single line cannot exceed the protocol limit even with a large scratch" {
     var buf: [4096]u8 = undefined;
-    const ctx = ReplyContext{ .server_name = "orochi.local", .requester = "alice" };
+    const ctx = ReplyContext{ .server_name = "onyx.local", .requester = "alice" };
     // 256-byte info + indent pushes the line past 512 -> LineTooLong, not a giant line.
     const info = @as([256]u8, @splat('x'));
     try std.testing.expectError(error.LineTooLong, writeMapNodeWith(.{}, &buf, ctx, .{ .name = &(@as([200]u8, @splat('n'))), .hops = DEFAULT_MAX_HOPS, .peers = 1, .info = &info }, true));

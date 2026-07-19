@@ -6,7 +6,7 @@
 # Upstream file SHA-256:
 #   SLH-DSA-sigVer-FIPS205/internalProjection.json a013fc2104f4ed4799d96d51141f65b965969b2cf10646626a021b6d456ce792
 #   SLH-DSA-sigGen-FIPS205/internalProjection.json 62b42e7c27fda5de8a94aba2943ae413b59b6ea08141f3bc035b1eceae235dba
-# INDEPENDENT published vectors (NOT self-generated): orochi has no SLH-DSA
+# INDEPENDENT published vectors (NOT self-generated): onyx has no SLH-DSA
 # signer or key generator, so the accept signatures cannot originate here.
 # Per set: smallest-message external + internal accept, one 'modified message'
 # reject and one 'modified signature' reject (real ACVP verdicts); a sigGen

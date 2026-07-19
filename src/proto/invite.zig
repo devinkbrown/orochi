@@ -137,7 +137,7 @@ pub fn parseInviteArgsWith(comptime params_config: Params, params: []const []con
 
 /// Check the INVITE channel preconditions.
 ///
-/// `is_operator` means op-or-higher in Orochi's member tiers:
+/// `is_operator` means op-or-higher in Onyx Server's member tiers:
 /// founder `!`, owner `.`, and op `@` all satisfy it. Invite-only channels
 /// require that privilege unless the channel has free-invite `+g`.
 pub fn checkInvitePreconditions(flags: InvitePreconditions) InviteCheckResult {
@@ -572,10 +572,10 @@ fn appendByte(out: []u8, n: *usize, byte: u8) InviteError!void {
 }
 
 test "parse invite args" {
-    const raw = [_][]const u8{ "bob", "#orochi" };
+    const raw = [_][]const u8{ "bob", "#onyx" };
     const parsed = try parseInviteArgs(&raw);
     try std.testing.expectEqualStrings("bob", parsed.nick);
-    try std.testing.expectEqualStrings("#orochi", parsed.channel);
+    try std.testing.expectEqualStrings("#onyx", parsed.channel);
 }
 
 test "malformed invite args are rejected" {
@@ -585,10 +585,10 @@ test "malformed invite args are rejected" {
     const missing_channel = [_][]const u8{"bob"};
     try std.testing.expectError(error.MissingChannel, parseInviteArgs(&missing_channel));
 
-    const too_many = [_][]const u8{ "bob", "#orochi", "extra" };
+    const too_many = [_][]const u8{ "bob", "#onyx", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseInviteArgs(&too_many));
 
-    const bad_nick = [_][]const u8{ "bad nick", "#orochi" };
+    const bad_nick = [_][]const u8{ "bad nick", "#onyx" };
     try std.testing.expectError(error.InvalidNick, parseInviteArgs(&bad_nick));
 
     const bad_channel = [_][]const u8{ "bob", "#bad channel" };
@@ -649,15 +649,15 @@ test "precondition checker denies each failure path" {
 
 test "success builders format rpl inviting and target invite" {
     var buf: [160]u8 = undefined;
-    const rpl = try buildInvitingNumeric(&buf, "irc.example", "alice", "bob", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 341 alice bob #orochi", rpl);
+    const rpl = try buildInvitingNumeric(&buf, "irc.example", "alice", "bob", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 341 alice bob #onyx", rpl);
 
     const invite = try buildTargetInviteLine(&buf, .{
         .nick = "alice",
         .user = "u",
         .host = "h",
-    }, "bob", "#orochi");
-    try std.testing.expectEqualStrings(":alice!u@h INVITE bob :#orochi", invite);
+    }, "bob", "#onyx");
+    try std.testing.expectEqualStrings(":alice!u@h INVITE bob :#onyx", invite);
 }
 
 test "error numeric builders format each required reply" {
@@ -669,40 +669,40 @@ test "error numeric builders format each required reply" {
     const nosuchchannel = try buildNoSuchChannelNumeric(&buf, "irc.example", "alice", "#missing");
     try std.testing.expectEqualStrings(":irc.example 403 alice #missing :No such channel", nosuchchannel);
 
-    const noton = try buildNotOnChannelNumeric(&buf, "irc.example", "alice", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 442 alice #orochi :You're not on that channel", noton);
+    const noton = try buildNotOnChannelNumeric(&buf, "irc.example", "alice", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 442 alice #onyx :You're not on that channel", noton);
 
-    const useron = try buildUserOnChannelNumeric(&buf, "irc.example", "alice", "bob", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 443 alice bob #orochi :is already on channel", useron);
+    const useron = try buildUserOnChannelNumeric(&buf, "irc.example", "alice", "bob", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 443 alice bob #onyx :is already on channel", useron);
 
-    const chanop = try buildChanOpPrivsNeededNumeric(&buf, "irc.example", "alice", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 482 alice #orochi :You're not channel operator", chanop);
+    const chanop = try buildChanOpPrivsNeededNumeric(&buf, "irc.example", "alice", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 482 alice #onyx :You're not channel operator", chanop);
 }
 
 test "builders reject invalid fields and small buffers" {
     var buf: [160]u8 = undefined;
     var small: [8]u8 = undefined;
 
-    try std.testing.expectError(error.InvalidServerName, buildInvitingNumeric(&buf, "bad server", "alice", "bob", "#orochi"));
-    try std.testing.expectError(error.InvalidNick, buildInvitingNumeric(&buf, "irc.example", "bad\rnick", "bob", "#orochi"));
+    try std.testing.expectError(error.InvalidServerName, buildInvitingNumeric(&buf, "bad server", "alice", "bob", "#onyx"));
+    try std.testing.expectError(error.InvalidNick, buildInvitingNumeric(&buf, "irc.example", "bad\rnick", "bob", "#onyx"));
     try std.testing.expectError(error.InvalidChannel, buildInvitingNumeric(&buf, "irc.example", "alice", "bob", "#bad\nchannel"));
     try std.testing.expectError(error.InvalidUser, buildTargetInviteLine(&buf, .{
         .nick = "alice",
         .user = "bad:user",
         .host = "h",
-    }, "bob", "#orochi"));
+    }, "bob", "#onyx"));
     try std.testing.expectError(error.InvalidHost, buildTargetInviteLine(&buf, .{
         .nick = "alice",
         .user = "u",
         .host = "bad\x00host",
-    }, "bob", "#orochi"));
+    }, "bob", "#onyx"));
 
     try std.testing.expectError(error.OutputTooSmall, buildTargetInviteLine(&small, .{
         .nick = "alice",
         .user = "u",
         .host = "h",
-    }, "bob", "#orochi"));
-    try std.testing.expectError(error.OutputTooSmall, buildUserOnChannelNumeric(&small, "irc.example", "alice", "bob", "#orochi"));
+    }, "bob", "#onyx"));
+    try std.testing.expectError(error.OutputTooSmall, buildUserOnChannelNumeric(&small, "irc.example", "alice", "bob", "#onyx"));
 }
 
 test "length limits reject oversized attacker-controlled fields" {

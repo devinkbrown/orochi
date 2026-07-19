@@ -455,11 +455,11 @@ test "parses embedded spans and keeps ACTIONGRAB distinct from ACTION" {
 }
 
 test "parses VERSION reply from NOTICE body" {
-    const view = (try parseFirst(.notice, "prefix \x01VERSION Orochi 0.1\x01 suffix")).?;
+    const view = (try parseFirst(.notice, "prefix \x01VERSION onyx-server-0.1\x01 suffix")).?;
     try std.testing.expect(view.isReply());
     try std.testing.expectEqual(CommandId.version, view.id);
     try std.testing.expectEqualStrings("VERSION", view.command);
-    try std.testing.expectEqualStrings("Orochi 0.1", view.argOrEmpty());
+    try std.testing.expectEqualStrings("onyx-server-0.1", view.argOrEmpty());
 }
 
 test "parses and dequotes PING argument" {
@@ -483,8 +483,8 @@ test "builds CTCP request and reply lines" {
     try std.testing.expectEqualStrings("PRIVMSG nick :\x01PING 12345\x01", request);
 
     var reply_buf: [128]u8 = undefined;
-    const reply = try buildReply("nick", "VERSION", "Orochi 0.1", &reply_buf);
-    try std.testing.expectEqualStrings("NOTICE nick :\x01VERSION Orochi 0.1\x01", reply);
+    const reply = try buildReply("nick", "VERSION", "onyx-server-0.1", &reply_buf);
+    try std.testing.expectEqualStrings("NOTICE nick :\x01VERSION onyx-server-0.1\x01", reply);
 }
 
 test "low-level quoting round trip" {

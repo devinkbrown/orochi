@@ -34,10 +34,10 @@ configured.
 | `extended-join` | none | Negotiates extended JOIN account/realname data. | `src/daemon/dispatch.zig:335` |
 | `invite-notify` | none | Negotiates invite notifications. | `src/daemon/dispatch.zig:336` |
 | `account-tag` | none | Adds `account` tags when an account is known and the recipient negotiated the cap. | `src/daemon/dispatch.zig:337`, `src/daemon/server.zig:37876-37890` |
-| `orochi/session-sync` | none | Opts into sibling-device direct-message mirroring and outgoing DM self-view. | `src/daemon/dispatch.zig:338-340`, `src/daemon/server.zig:29925-29939` |
-| `orochi/bouncer` | none | Replays missed channel history after the client's read marker on join. | `src/daemon/dispatch.zig:341-344`, `src/daemon/server.zig:14928-14947` |
-| `orochi/topics` | none | Allows `+orochi/topic` named-conversation tags without requiring generic `message-tags`; CHATHISTORY can filter by the topic tag. | `src/daemon/dispatch.zig:345-348`, `src/daemon/server.zig:15042-15046`, `src/daemon/server.zig:30355-30363` |
-| `orochi/e2ee` | none | Allows Onyx Server E2EE control-plane tags and supports channel encryption-policy enforcement. | `src/daemon/dispatch.zig:349-352`, `src/daemon/server.zig:29730-29737`, `src/daemon/server.zig:30355-30363` |
+| `onyx/session-sync` | none | Opts into sibling-device direct-message mirroring and outgoing DM self-view. | `src/daemon/dispatch.zig:338-340`, `src/daemon/server.zig:29925-29939` |
+| `onyx/bouncer` | none | Replays missed channel history after the client's read marker on join. | `src/daemon/dispatch.zig:341-344`, `src/daemon/server.zig:14928-14947` |
+| `onyx/topics` | none | Allows `+onyx/topic` named-conversation tags without requiring generic `message-tags`; CHATHISTORY can filter by the topic tag. | `src/daemon/dispatch.zig:345-348`, `src/daemon/server.zig:15042-15046`, `src/daemon/server.zig:30355-30363` |
+| `onyx/e2ee` | none | Allows Onyx Server E2EE control-plane tags and supports channel encryption-policy enforcement. | `src/daemon/dispatch.zig:349-352`, `src/daemon/server.zig:29730-29737`, `src/daemon/server.zig:30355-30363` |
 | `chghost` | none | Negotiates host-change notifications. | `src/daemon/dispatch.zig:353-355` |
 | `no-implicit-names` | none | Suppresses the automatic NAMES burst after JOIN. | `src/daemon/dispatch.zig:356-362` |
 | `draft/no-implicit-names` | none | Alias for `no-implicit-names`; either token maps to the same capability id. | `src/daemon/dispatch.zig:356-362`, `src/daemon/dispatch.zig:729-733` |
@@ -96,8 +96,8 @@ caps:
 
 | Tag key | Narrow cap |
 |---------|------------|
-| `+orochi/topic` | `orochi/topics` |
-| Onyx Server encrypted-message tag keys | `orochi/e2ee` |
+| `+onyx/topic` | `onyx/topics` |
+| Onyx Server encrypted-message tag keys | `onyx/e2ee` |
 | `+typing`, `+draft/typing` | `draft/typing` |
 | `+draft/react`, `+draft/unreact` | `draft/react` |
 | `+draft/reply` | `draft/reply` |

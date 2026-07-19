@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! RFC 8285 RTP header-extension codec for Orochi media bands.
+//! RFC 8285 RTP header-extension codec for Onyx Server media bands.
 //!
 //! This module is a pure, allocation-free codec for the RTP header-extension
 //! block that may follow the 12-byte fixed RTP header when the X bit is set.
@@ -17,7 +17,7 @@
 //!
 //! ASSUMPTION: parsing assumes the extension block begins immediately after the
 //! 12-byte fixed header, i.e. there are no CSRC entries (CC == 0). This is true
-//! for the SFU-forwarded streams Orochi cares about. Padding (P) and the CSRC
+//! for the SFU-forwarded streams Onyx Server cares about. Padding (P) and the CSRC
 //! count are not consulted; callers that may see CSRCs must strip them first.
 const std = @import("std");
 

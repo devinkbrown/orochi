@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Integration"
+  short_description: "Integrate daemon state transactionally"
+  default_prompt: "Use $onyx-server-integration to wire a completed module into server.zig without partial publication."

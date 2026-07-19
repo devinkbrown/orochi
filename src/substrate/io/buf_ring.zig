@@ -7,7 +7,7 @@
 //! provided-buffer rings: caller-owned recv buffers, logical head/tail counts,
 //! descriptor replenishment, and the lease lifecycle created by multishot recv
 //! completions. Live io_uring registration is intentionally a thin wrapper over
-//! Zig std's Linux helpers; the invariants that matter to Orochi are tested
+//! Zig std's Linux helpers; the invariants that matter to Onyx Server are tested
 //! without setting up a kernel ring.
 const std = @import("std");
 const builtin = @import("builtin");

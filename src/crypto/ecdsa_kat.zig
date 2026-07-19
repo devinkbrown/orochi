@@ -10,7 +10,7 @@
 //! independent — and what these tests pin — is verification: RFC 6979's
 //! published (public key, message, signature) triples MUST verify, and any
 //! corruption of the signature, message, or key MUST be rejected. The vectors
-//! come straight from the RFC and are independent of Orochi's implementation.
+//! come straight from the RFC and are independent of Onyx Server's implementation.
 const std = @import("std");
 const ecdsa = @import("ecdsa_p256.zig");
 

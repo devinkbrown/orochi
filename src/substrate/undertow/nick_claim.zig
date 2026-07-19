@@ -348,16 +348,16 @@ test "loser renames to UID and release exposes remaining winner" {
     const t3 = try Hlc.init(12, 0);
     const t4 = try Hlc.init(13, 0);
 
-    _ = try claims.claim("orochi", first, t1);
-    const outcome = try claims.claim("orochi", second, t2);
+    _ = try claims.claim("onyx", first, t1);
+    const outcome = try claims.claim("onyx", second, t2);
     try expectUid(second, outcome.winner_uid);
     try expectOptionalUid(first, outcome.loser_must_rename);
 
-    try claims.release("orochi", second, t3);
-    try expectUid(first, claims.resolve("orochi").?.winner_uid);
+    try claims.release("onyx", second, t3);
+    try expectUid(first, claims.resolve("onyx").?.winner_uid);
 
-    try claims.release("orochi", first, t4);
-    try std.testing.expect(claims.resolve("orochi") == null);
+    try claims.release("onyx", first, t4);
+    try std.testing.expect(claims.resolve("onyx") == null);
 }
 
 test "merge is commutative and idempotent" {

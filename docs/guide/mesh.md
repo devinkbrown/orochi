@@ -7,7 +7,7 @@ Onyx Server's server-to-server (S2S) linking runs on the [Undertow](../reference
 ```toml
 [node]
 id = 1
-secret_key = "env:OROCHI_NODE_SECKEY"
+secret_key = "env:ONYX_NODE_SECKEY"
 
 [listen]
 irc = 6680
@@ -15,7 +15,7 @@ s2s = 7700
 
 [mesh]
 realm = "example"
-mesh_pass = "env:OROCHI_MESH_PASS"
+mesh_pass = "env:ONYX_MESH_PASS"
 ```
 
 ## MESSAGE_V2 bridge and activation
@@ -121,7 +121,7 @@ design](../design/message-v2-exact-once.md) and [Helix upgrade](upgrade.md).
 
 ## Secured vs. plaintext links
 
-Post-quantum-secured S2S is enabled by default when a node identity and CSPRNG are available. An explicit `[node].secret_key` takes precedence; otherwise `main.zig` loads or creates `orochi-node.key` beside the config path, derives the identity using `[mesh].realm`, sets `server.Config.node_identity`, and copies `mesh_pass` if configured (`src/main.zig:310`, `src/main.zig:323`, `src/main.zig:331`, `src/main.zig:338`, `src/main.zig:348`, `src/main.zig:351`). Only keyfile or identity setup failure leaves S2S plaintext (`src/main.zig:329`, `src/main.zig:335`, `src/main.zig:345`). The live secured check is `node_identity != null and crypto_io != null` (`src/daemon/server.zig:6177`, `src/daemon/server.zig:6179`).
+Post-quantum-secured S2S is enabled by default when a node identity and CSPRNG are available. An explicit `[node].secret_key` takes precedence; otherwise `main.zig` loads or creates `onyx-server-node.key` beside the config path, derives the identity using `[mesh].realm`, sets `server.Config.node_identity`, and copies `mesh_pass` if configured (`src/main.zig:310`, `src/main.zig:323`, `src/main.zig:331`, `src/main.zig:338`, `src/main.zig:348`, `src/main.zig:351`). Only keyfile or identity setup failure leaves S2S plaintext (`src/main.zig:329`, `src/main.zig:335`, `src/main.zig:345`). The live secured check is `node_identity != null and crypto_io != null` (`src/daemon/server.zig:6177`, `src/daemon/server.zig:6179`).
 
 Outbound `CONNECT <host> <port>` is an operator command that requires `mesh_admin` (`src/daemon/server.zig:17161`, `src/daemon/server.zig:17165`). If the local server has secured S2S enabled, `CONNECT` starts a secured handshake; otherwise it starts a plaintext S2S link (`src/daemon/server.zig:17187`, `src/daemon/server.zig:17238`, `src/daemon/server.zig:17252`). `SQUIT <server>` tears down a peer link by handshake-learned server name and also requires `mesh_admin` (`src/daemon/server.zig:17312`, `src/daemon/server.zig:17315`, `src/daemon/server.zig:17343`, `src/daemon/server.zig:17345`).
 

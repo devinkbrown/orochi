@@ -79,7 +79,7 @@ system CA bundle to fetch every feed and writes one-headline-per-line files the
 daemon reads:
 
 ```text
-*/5 * * * * /path/to/orochi/tools/news_update.sh /var/lib/orochi/news 10
+*/5 * * * * /path/to/onyx-server/tools/news_update.sh /var/lib/onyx-server/news 10
 ```
 
 See `tools/news_update.sh` and [config.md](../config.md#geo).

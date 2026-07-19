@@ -5,10 +5,10 @@ search angles → 24 sources fetched → 100 claims extracted → 25 adversarial
 19 confirmed / 6 refuted / 0 left unverified).
 
 **Master copy:** `/home/kain/research/TLS_SSL_LIBRARY_RESEARCH.md` (cross-project reference; this
-is a synced copy for discoverability alongside orochi's own TLS research).
+is a synced copy for discoverability alongside Onyx Server's own TLS research).
 
-**Relevance to orochi:** this was commissioned for the xchat2 client's `xchat2-security` agent
-(which wraps OpenSSL directly), not for Armor — orochi's from-scratch, no-C-interop TLS stack is a
+**Relevance to Onyx Server:** this was commissioned for the xchat2 client's `xchat2-security` agent
+(which wraps OpenSSL directly), not for Armor — Onyx Server's from-scratch, no-C-interop TLS stack is a
 different animal entirely and this research does not evaluate it or suggest replacing it. It's
 included here because the licensing/governance/CVE findings on OpenSSL, BoringSSL, LibreSSL,
 mbedTLS, and wolfSSL are useful background when this repo's own research

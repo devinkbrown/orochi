@@ -486,7 +486,7 @@ test "round trip byte and text strings borrow input" {
     // Arrange.
     const allocator = std.testing.allocator;
     const bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
-    const text = "orochi cbor \xf0\x9f\x8c\x8a";
+    const text = "onyx cbor \xf0\x9f\x8c\x8a";
     const out = try allocator.alloc(u8, 64);
     defer allocator.free(out);
 

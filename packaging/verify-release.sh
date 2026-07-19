@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Independently verify an Orochi release is reproducible and untampered.
+# Independently verify an Onyx Server release is reproducible and untampered.
 #
 # Three checks, in order:
 #   1. REPRODUCIBILITY — rebuild the CURRENT checkout from source with a clean

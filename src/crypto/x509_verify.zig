@@ -1303,7 +1303,7 @@ test "valid Ed25519 two-cert chain (leaf signed by self-signed root) verifies" {
 
     var root_buf: [512]u8 = undefined;
     const root = try x509_selfsign.buildSelfSigned(&root_buf, .{
-        .common_name = "Orochi Test Root",
+        .common_name = "Onyx Test Root",
         .not_before = not_before,
         .not_after = not_after,
         .serial = &.{ 0x10, 0x01 },
@@ -1314,7 +1314,7 @@ test "valid Ed25519 two-cert chain (leaf signed by self-signed root) verifies" {
     var leaf_buf: [700]u8 = undefined;
     const leaf = try mintEd25519Leaf(
         &leaf_buf,
-        "Orochi Test Root", // issuer DN == root subject DN
+        "Onyx Test Root", // issuer DN == root subject DN
         "leaf.example.test",
         leaf_kp.public_key.toBytes(),
         root_kp,
@@ -1711,7 +1711,7 @@ fn testBuildPssParams(out: []u8, opts: PssBuildOpts) []const u8 {
 }
 
 test "verifyCertSignature accepts RSASSA-PSS over SHA-256/384/512 and rejects a flipped byte" {
-    const tbs = "orochi RSASSA-PSS cert-signature end-to-end test bytes";
+    const tbs = "onyx RSASSA-PSS cert-signature end-to-end test bytes";
     var spki_buf: [700]u8 = undefined;
     const spki = testBuildRsaSpki(&spki_buf, &m2203_n, &m2203_ed);
 

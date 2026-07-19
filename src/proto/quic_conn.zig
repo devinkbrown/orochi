@@ -2682,13 +2682,13 @@ const PnDecodeCtx = struct {
 /// requires receivers to accept it; the header's Length and Token fields are
 /// parsed with this tolerant decoder (our own sender emits a fixed 2-byte
 /// Length varint, which is non-minimal for small packets).
-/// QUIC handshake/interop tracing, gated on `OROCHI_QUIC_DEBUG` (any non-empty
+/// QUIC handshake/interop tracing, gated on `ONYX_QUIC_DEBUG` (any non-empty
 /// value). Off by default; only read by interop triage (`tools/quic_interop.sh`)
 /// and never on the normal data path beyond the cached env check.
 var conn_dbg_enabled: ?bool = null;
 fn connDbgEnabled() bool {
     return conn_dbg_enabled orelse blk: {
-        const on = envFlagSet("OROCHI_QUIC_DEBUG");
+        const on = envFlagSet("ONYX_QUIC_DEBUG");
         conn_dbg_enabled = on;
         break :blk on;
     };

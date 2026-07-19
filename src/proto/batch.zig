@@ -11,7 +11,7 @@ const std = @import("std");
 pub const max_reference_len: usize = 32;
 pub const default_max_line_body: usize = 8191;
 
-/// IRCv3 batch type tokens supported by Orochi.
+/// IRCv3 batch type tokens supported by Onyx Server.
 pub const BatchType = enum {
     netjoin,
     netsplit,
@@ -349,10 +349,10 @@ test "open and close emit BATCH lines" {
     var session = DefaultSession.init(0);
     var out: [128]u8 = undefined;
 
-    const opened = try session.open(.netjoin, &.{ "#orochi", "irc.example" }, &out);
+    const opened = try session.open(.netjoin, &.{ "#onyx", "irc.example" }, &out);
     try std.testing.expectEqualStrings("mz0000000000000001", opened.ref.slice());
     try std.testing.expectEqualStrings(
-        "BATCH +mz0000000000000001 netjoin #orochi irc.example\r\n",
+        "BATCH +mz0000000000000001 netjoin #onyx irc.example\r\n",
         opened.line,
     );
 
@@ -384,18 +384,18 @@ test "outbound lines are tagged with active ref" {
     var session = DefaultSession.init(41);
     var out: [160]u8 = undefined;
 
-    const opened = try session.open(.chathistory, &.{ "#orochi", "latest" }, &out);
+    const opened = try session.open(.chathistory, &.{ "#onyx", "latest" }, &out);
     try std.testing.expectEqualStrings("mz000000000000002a", opened.ref.slice());
 
-    const untagged = try session.wrapLine(":s PRIVMSG #orochi :hello\r\n", &out);
+    const untagged = try session.wrapLine(":s PRIVMSG #onyx :hello\r\n", &out);
     try std.testing.expectEqualStrings(
-        "@batch=mz000000000000002a :s PRIVMSG #orochi :hello\r\n",
+        "@batch=mz000000000000002a :s PRIVMSG #onyx :hello\r\n",
         untagged,
     );
 
-    const tagged = try session.wrapLine("@time=2026-06-02T00:00:00.000Z NOTICE #orochi :hi", &out);
+    const tagged = try session.wrapLine("@time=2026-06-02T00:00:00.000Z NOTICE #onyx :hi", &out);
     try std.testing.expectEqualStrings(
-        "@batch=mz000000000000002a;time=2026-06-02T00:00:00.000Z NOTICE #orochi :hi\r\n",
+        "@batch=mz000000000000002a;time=2026-06-02T00:00:00.000Z NOTICE #onyx :hi\r\n",
         tagged,
     );
 }

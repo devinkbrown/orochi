@@ -24,7 +24,7 @@ pub const ChannelMode = enum(u5) {
     no_external,
     topic_ops,
     secret,
-    // Orochi Tier-1 boolean flags (see docs/mode_rearchitecture.md).
+    // Onyx Server Tier-1 boolean flags (see docs/mode_rearchitecture.md).
     no_ctcp, // C: block channel CTCP (except ACTION) from non-ops
     no_notice, // T: block channel NOTICE from non-ops
     no_nick, // N: block nick changes by non-ops while joined
@@ -312,7 +312,7 @@ pub const ChannelModes = struct {
 };
 
 /// Stable member prefix mode identifiers. Builds on the IRCX draft and
-/// adds a Orochi-native FOUNDER tier above owner:
+/// adds an Onyx Server-native FOUNDER tier above owner:
 ///   founder +Q ('!') > owner +q ('.') > op +o ('@') > voice +v ('+')
 /// → ISUPPORT PREFIX=(Qqov)!.@+. The channel creator is the founder (a single
 /// top authority that ops/owners cannot strip). No halfop tier (IRCX `+h` is the
@@ -396,7 +396,7 @@ pub const MemberModes = struct {
         return out;
     }
 
-    /// ISUPPORT PREFIX token: (YQqov)*!.@+ — network-operator (*) above Orochi
+    /// ISUPPORT PREFIX token: (YQqov)*!.@+ — network-operator (*) above Onyx Server
     /// founder (!), then the IRCX owner (.) / op (@) / voice (+) tiers. The `*`
     /// tier is server-derived from the oper_override privilege (never set by
     /// MODE); clients use it only to render the prefix in NAMES/WHO. This is the
@@ -448,7 +448,7 @@ pub const TierOp = struct { mode: MemberMode, on: bool };
 /// Expand a single named status MODE change into the ordered set of concrete
 /// tier ops realizing a cumulative-authority tier hierarchy: the chain
 /// founder > owner > op means a tier carries every authority below it, so a
-/// member occupies exactly ONE chain level (Orochi stores the single highest
+/// member occupies exactly ONE chain level (Onyx Server stores the single highest
 /// tier — the creator holds founder alone, `world.zig`). Voice is independent.
 ///
 ///   ADD `+X` (X ∈ owner/op; `+Q` is creation-only and rejected by the caller):

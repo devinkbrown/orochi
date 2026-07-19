@@ -68,7 +68,7 @@ pub const crypto_info_header_len: usize = 4;
 /// Every kTLS cipher uses an 8-byte record sequence number.
 pub const rec_seq_len: usize = 8;
 
-/// The AEAD suites orochi can offload, with their kernel geometry. Sizes are the
+/// The AEAD suites Onyx Server can offload, with their kernel geometry. Sizes are the
 /// `TLS_CIPHER_*_{IV,KEY,SALT,REC_SEQ}_SIZE` constants from the UAPI header.
 pub const Cipher = enum {
     aes_gcm_128,

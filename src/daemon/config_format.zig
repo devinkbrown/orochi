@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi daemon configuration: a typed `Config` projected from standard TOML.
+//! Onyx Server daemon configuration: a typed `Config` projected from standard TOML.
 //!
 //! The canonical config format is **TOML v1.0** (parsed by `proto/toml.zig`).
 //! `parseToml` reads a TOML document and overlays it onto a defaulted `Config`,
@@ -129,7 +129,7 @@ pub const Config = struct {
         /// verification is wired — otherwise AUTH to a remote relay is refused, so
         /// submission credentials are never sent over an unverified TLS session.
         insecure_skip_verify: bool = false,
-        /// Envelope sender + `From:` address (e.g. "orochi@example.org").
+        /// Envelope sender + `From:` address (e.g. "onyx@example.org").
         from: ?[]const u8 = null,
         /// AUTH credentials for the relay (optional; omitted = no AUTH).
         user: ?[]const u8 = null,
@@ -169,8 +169,8 @@ pub const Config = struct {
 
     /// ADMIN command response (RPL_ADMIN*). Operator/network contact details.
     pub const Admin = struct {
-        location: []const u8 = "Orochi IRC network",
-        email: []const u8 = "admin@orochi.local",
+        location: []const u8 = "Onyx IRC network",
+        email: []const u8 = "admin@onyx.local",
     };
 
     /// Localized weather for the MOTD `{weather}` placeholder. The daemon reads
@@ -272,14 +272,14 @@ pub const Config = struct {
         s2s: u16 = 0,
         /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
         media: u16 = 0,
-        /// UDP port for the native media transport (our KaguraVox/KaguraVis codec leg);
+        /// UDP port for the native media transport (our CadenceVox/CadenceVis codec leg);
         /// 0 = ephemeral.
         native_media: u16 = 0,
         /// IP advertised to clients as the server media (ICE) candidate.
         media_host: []const u8 = "",
     };
 
-    /// An operator binding. Orochi grants oper SASL-only: `account` is the SASL
+    /// An operator binding. Onyx Server grants oper SASL-only: `account` is the SASL
     /// account elevated on login (no password — SASL is the auth), and `class`
     /// names its privilege class. There is no OPER-password credential.
     /// A role-based operator group: a named privilege set (optionally inheriting
@@ -315,7 +315,7 @@ pub const Config = struct {
         trust_roots: []const []const u8 = &.{},
         mesh_pass: ?[]const u8 = null,
         /// Encoded MeshPass signed-capability token this node presents in the
-        /// encrypted Tsumugi M1. Accepts hex or standard base64 text.
+        /// encrypted Mooring M1. Accepts hex or standard base64 text.
         admission_token: ?[]const u8 = null,
         /// Ed25519 signer roots accepted for signed MeshPass admission tokens.
         /// Distinct from `trust_roots`, which pins peer node identities.
@@ -333,7 +333,7 @@ pub const Config = struct {
         /// Full secured-mesh Ed25519 node-key roster for the staged generation.
         /// This is deliberately distinct from direct-neighbor `trust_roots`.
         relay_v2_roster: []const []const u8 = &.{},
-        /// Runtime Suimyaku peer-driver limits/timers/capacities projected from
+        /// Runtime Undertow peer-driver limits/timers/capacities projected from
         /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]`.
         s2s: s2s_peer_mod.Config = .{},
         /// Peers this node dials automatically at boot (and re-dials while the
@@ -341,7 +341,7 @@ pub const Config = struct {
         /// e.g. "[::1]:6900"). Empty = no auto-connect.
         connect: []const []const u8 = &.{},
         /// When true, refuse plaintext S2S entirely (reject inbound plaintext
-        /// peers, never dial plaintext outbound). Only the Tsumugi-secured path
+        /// peers, never dial plaintext outbound). Only the Mooring-secured path
         /// is permitted; if secured S2S is unavailable, all S2S is dropped rather
         /// than falling back to clear. Default false keeps the plaintext fallback.
         require_secured: bool = false,
@@ -481,7 +481,7 @@ pub const Config = struct {
         pins_max_per_channel: u64 = 50,
         pins_max_msgid_bytes: u64 = 64,
         reactions_max_token_bytes: u64 = 32,
-        /// Require HMAC-tagged native KaguraVox/KaguraVis datagrams. Defaults off until
+        /// Require HMAC-tagged native CadenceVox/CadenceVis datagrams. Defaults off until
         /// clients implement the matching Cadence-frame tag contract.
         native_media_require_mac: bool = false,
         /// Relay browser media datagrams (binary WebSocket frames) between a
@@ -755,7 +755,7 @@ pub const Config = struct {
         subject: []const u8 = "mailto:ops@eshmaki.me",
         /// Where the ES256 VAPID secret persists (rotating it invalidates
         /// every stored browser subscription).
-        vapid_key_path: []const u8 = "orochi-webpush-vapid.key",
+        vapid_key_path: []const u8 = "onyx-webpush-vapid.key",
     };
 
     pub const Acme = struct {
@@ -874,13 +874,13 @@ pub const Config = struct {
         errdefer allocator.free(acme_ca_bundle_path);
         const webpush_subject = try allocator.dupe(u8, "mailto:ops@eshmaki.me");
         errdefer allocator.free(webpush_subject);
-        const webpush_vapid_key_path = try allocator.dupe(u8, "orochi-webpush-vapid.key");
+        const webpush_vapid_key_path = try allocator.dupe(u8, "onyx-webpush-vapid.key");
         errdefer allocator.free(webpush_vapid_key_path);
         const network_name = try allocator.dupe(u8, "Onyx");
         errdefer allocator.free(network_name);
-        const admin_location = try allocator.dupe(u8, "Orochi IRC network");
+        const admin_location = try allocator.dupe(u8, "Onyx IRC network");
         errdefer allocator.free(admin_location);
-        const admin_email = try allocator.dupe(u8, "admin@orochi.local");
+        const admin_email = try allocator.dupe(u8, "admin@onyx.local");
         errdefer allocator.free(admin_email);
         const mesh_realm = try allocator.dupe(u8, "local");
         errdefer allocator.free(mesh_realm);
@@ -1885,7 +1885,7 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
 
     cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
     // Floor of 2: a single accuser must never bury a peer (see gossip_round.zig
-    // SazanamiConfig.sanitized). Reject a configured quorum of 0/1 at parse time.
+    // RippleConfig.sanitized). Reject a configured quorum of 0/1 at parse time.
     cfg.link.ripple_config.witness_quorum = @intCast(try uintField(doc, "mesh.sazanami.witness_quorum", cfg.link.ripple_config.witness_quorum, 2, 16));
 
     cfg.link.peer_link_config.send_credit = @intCast(try uintField(doc, "mesh.link.send_credit_bytes", cfg.link.peer_link_config.send_credit, 4096, 16_777_216));
@@ -2024,13 +2024,13 @@ test "parseToml: backup section projects directory and cadence" {
         \\[listen]
         \\irc = 6680
         \\[backup]
-        \\dir = "/var/backups/orochi"
+        \\dir = "/var/backups/onyx"
         \\interval = "12h"
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
-    try testing.expectEqualStrings("/var/backups/orochi", cfg.backup.dir);
+    try testing.expectEqualStrings("/var/backups/onyx", cfg.backup.dir);
     try testing.expectEqual(@as(i64, 12 * 60 * 60 * 1000), cfg.backup.interval_ms);
 }
 
@@ -2289,7 +2289,7 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
         \\account_db = "accounts.oro"
         \\allow_anonymous = true
         \\oauth_issuer = "https://issuer.example"
-        \\oauth_audience = "orochi"
+        \\oauth_audience = "onyx"
         \\oauth_account_claim = "preferred_username"
         \\oauth_hmac_key = "test-secret"
         \\
@@ -2305,7 +2305,7 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     try testing.expectEqualStrings("ircxnet", cfg.sasl.realm.?);
     try testing.expectEqualStrings("accounts.oro", cfg.sasl.account_db.?);
     try testing.expectEqualStrings("https://issuer.example", cfg.sasl.oauth_issuer.?);
-    try testing.expectEqualStrings("orochi", cfg.sasl.oauth_audience.?);
+    try testing.expectEqualStrings("onyx", cfg.sasl.oauth_audience.?);
     try testing.expectEqualStrings("preferred_username", cfg.sasl.oauth_account_claim.?);
     try testing.expectEqualStrings("test-secret", cfg.sasl.oauth_hmac_key.?);
 
@@ -3300,8 +3300,8 @@ test "parseToml: [tls] section projects onto Config" {
         \\[tls]
         \\enabled = true
         \\port = 7000
-        \\cert_path = "/etc/orochi/leaf.pem"
-        \\key_path = "/etc/orochi/leaf.key"
+        \\cert_path = "/etc/onyx/leaf.pem"
+        \\key_path = "/etc/onyx/leaf.key"
         \\dns_name = "irc.example.test"
         \\request_client_cert = true
         \\enable_tls12 = true
@@ -3310,7 +3310,7 @@ test "parseToml: [tls] section projects onto Config" {
         \\raw_public_key = true
         \\ktls = "tx"
         \\[[tls.ech_keys]]
-        \\config_path = "/etc/orochi/echconfig.bin"
+        \\config_path = "/etc/onyx/echconfig.bin"
         \\private_key = "1111111111111111111111111111111111111111111111111111111111111111"
         \\
     ;
@@ -3322,8 +3322,8 @@ test "parseToml: [tls] section projects onto Config" {
     // Assert
     try testing.expect(cfg.tls.enabled);
     try testing.expectEqual(@as(u16, 7000), cfg.tls.port);
-    try testing.expectEqualStrings("/etc/orochi/leaf.pem", cfg.tls.cert_path.?);
-    try testing.expectEqualStrings("/etc/orochi/leaf.key", cfg.tls.key_path.?);
+    try testing.expectEqualStrings("/etc/onyx/leaf.pem", cfg.tls.cert_path.?);
+    try testing.expectEqualStrings("/etc/onyx/leaf.key", cfg.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", cfg.tls.dns_name);
     try testing.expect(cfg.tls.request_client_cert);
     // These three keys were declared in the schema but never parsed — a TLS 1.2
@@ -3334,7 +3334,7 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expect(cfg.tls.raw_public_key);
     try testing.expectEqual(Config.KtlsMode.tx, cfg.tls.ktls);
     try testing.expectEqual(@as(usize, 1), cfg.tls.ech_keys.len);
-    try testing.expectEqualStrings("/etc/orochi/echconfig.bin", cfg.tls.ech_keys[0].config_path);
+    try testing.expectEqualStrings("/etc/onyx/echconfig.bin", cfg.tls.ech_keys[0].config_path);
     try testing.expectEqual(@as([32]u8, @splat(0x11)), cfg.tls.ech_keys[0].private_key);
 }
 
@@ -3348,7 +3348,7 @@ test "parseToml: [[tls.ech_keys]] rejects malformed private key" {
         \\[tls]
         \\enabled = true
         \\[[tls.ech_keys]]
-        \\config_path = "/etc/orochi/echconfig.bin"
+        \\config_path = "/etc/onyx/echconfig.bin"
         \\private_key = "abcd"
         \\
     ;
@@ -3366,16 +3366,16 @@ test "parseToml: [[tls.sni]] projects additional SNI certs onto Config" {
         \\irc = 6680
         \\[tls]
         \\enabled = true
-        \\cert_path = "/etc/orochi/default.pem"
-        \\key_path = "/etc/orochi/default.key"
+        \\cert_path = "/etc/onyx/default.pem"
+        \\key_path = "/etc/onyx/default.key"
         \\[[tls.sni]]
         \\server_names = ["irc.example.test", "*.example.test"]
-        \\cert_path = "/etc/orochi/example.pem"
-        \\key_path = "/etc/orochi/example.key"
+        \\cert_path = "/etc/onyx/example.pem"
+        \\key_path = "/etc/onyx/example.key"
         \\[[tls.sni]]
         \\server_names = ["alt.test"]
-        \\cert_path = "/etc/orochi/alt.pem"
-        \\key_path = "/etc/orochi/alt.key"
+        \\cert_path = "/etc/onyx/alt.pem"
+        \\key_path = "/etc/onyx/alt.key"
         \\
     ;
 
@@ -3384,16 +3384,16 @@ test "parseToml: [[tls.sni]] projects additional SNI certs onto Config" {
     defer cfg.deinit(allocator);
 
     // Assert: the default cert is unaffected and both SNI entries parse in order.
-    try testing.expectEqualStrings("/etc/orochi/default.pem", cfg.tls.cert_path.?);
+    try testing.expectEqualStrings("/etc/onyx/default.pem", cfg.tls.cert_path.?);
     try testing.expectEqual(@as(usize, 2), cfg.tls.sni.len);
     try testing.expectEqual(@as(usize, 2), cfg.tls.sni[0].server_names.len);
     try testing.expectEqualStrings("irc.example.test", cfg.tls.sni[0].server_names[0]);
     try testing.expectEqualStrings("*.example.test", cfg.tls.sni[0].server_names[1]);
-    try testing.expectEqualStrings("/etc/orochi/example.pem", cfg.tls.sni[0].cert_path);
-    try testing.expectEqualStrings("/etc/orochi/example.key", cfg.tls.sni[0].key_path);
+    try testing.expectEqualStrings("/etc/onyx/example.pem", cfg.tls.sni[0].cert_path);
+    try testing.expectEqualStrings("/etc/onyx/example.key", cfg.tls.sni[0].key_path);
     try testing.expectEqual(@as(usize, 1), cfg.tls.sni[1].server_names.len);
     try testing.expectEqualStrings("alt.test", cfg.tls.sni[1].server_names[0]);
-    try testing.expectEqualStrings("/etc/orochi/alt.pem", cfg.tls.sni[1].cert_path);
+    try testing.expectEqualStrings("/etc/onyx/alt.pem", cfg.tls.sni[1].cert_path);
 }
 
 test "parseToml: [[tls.sni]] absent keeps sni empty (byte-identical default path)" {
@@ -3473,7 +3473,7 @@ test "parseToml: [acme] section projects onto Config" {
         \\contact = "mailto:admin@example.test"
         \\renew_before_days = 45
         \\check_interval = "6h"
-        \\ca_bundle_path = "/etc/orochi/acme-ca.pem"
+        \\ca_bundle_path = "/etc/onyx/acme-ca.pem"
         \\ca_bundle_max_bytes = 1048576
         \\challenge_port = 14403
         \\max_steps = 96
@@ -3496,7 +3496,7 @@ test "parseToml: [acme] section projects onto Config" {
     try testing.expectEqualStrings("mailto:admin@example.test", cfg.acme.contact.?);
     try testing.expectEqual(@as(u16, 45), cfg.acme.renew_before_days);
     try testing.expectEqual(@as(u64, 6 * 60 * 60 * 1000), cfg.acme.check_interval_ms);
-    try testing.expectEqualStrings("/etc/orochi/acme-ca.pem", cfg.acme.ca_bundle_path);
+    try testing.expectEqualStrings("/etc/onyx/acme-ca.pem", cfg.acme.ca_bundle_path);
     try testing.expectEqual(@as(u64, 1048576), cfg.acme.ca_bundle_max_bytes);
     try testing.expectEqual(@as(u16, 14403), cfg.acme.challenge_port);
     try testing.expectEqual(@as(u32, 96), cfg.acme.max_steps);

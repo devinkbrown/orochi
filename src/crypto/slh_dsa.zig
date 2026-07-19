@@ -5,7 +5,7 @@
 //! verify-only, comptime-generic over ALL 12 standard parameter sets
 //! (SHA2 and SHAKE, {128,192,256}×{s,f}).
 //!
-//! Orochi verifies post-quantum certificate signatures; it never *signs* them,
+//! Onyx Server verifies post-quantum certificate signatures; it never *signs* them,
 //! so this module implements only `slh_verify` / `slh_verify_internal`
 //! (FIPS 205 Algorithms 24 and 20). There is no key generation and no signing.
 //!

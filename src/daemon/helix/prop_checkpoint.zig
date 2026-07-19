@@ -393,7 +393,7 @@ const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
 const channel_row_prefix_len: usize = 1 + 8 + 8 + 5 * 4;
 const entity_row_prefix_len: usize = 1 + 1 + 8 + 8 + 5 * 4;
 const max_checkpoint_bytes: usize = 512 * 1024 * 1024;
-const checksum_domain = "orochi-helix-prop-checkpoint-v1";
+const checksum_domain = "onyx-helix-prop-checkpoint-v1";
 
 const OrderedChannel = struct {
     map_key: []const u8,

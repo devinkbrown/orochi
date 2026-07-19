@@ -26,7 +26,7 @@
 //! so a relay cannot reclassify a user prop as a member prop (or vice-versa)
 //! without invalidating the signature. The transcript is domain-separated
 //! (`sign_domain`) so an ENTITY_PROP signature can never validate as a
-//! CHANNEL_PROP one (or any other Orochi Ed25519 use).
+//! CHANNEL_PROP one (or any other Onyx Server Ed25519 use).
 const std = @import("std");
 
 const sign = @import("../crypto/sign.zig");
@@ -256,11 +256,11 @@ const node_identity = @import("../daemon/node_identity.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 
 /// Domain label folded into the Ed25519 transcript (via `sign.signCtx`).
-/// Distinct from every other Ed25519 use in Orochi (node identity, oper grants,
+/// Distinct from every other Ed25519 use in Onyx Server (node identity, oper grants,
 /// migration tokens, the per-link `signed_frame`, the MESSAGE relay, and the
 /// channel-prop origin signature), so a user/member entity-prop signature can
 /// never validate in another context — including the channel-prop one.
-pub const sign_domain = "orochi-s2s-entityprop-v1";
+pub const sign_domain = "onyx-s2s-entityprop-v1";
 
 pub const SignError = sign.SignError || error{NoSpaceLeft};
 
@@ -630,7 +630,7 @@ test "entity prop signature does NOT validate under the channel-prop domain" {
     const sig: sign.Signature = ev.origin_sig[0..sig_len].*;
     const pubkey: sign.PublicKey = ev.origin_pubkey[0..pubkey_len].*;
     // Verifying the SAME signature under a different domain must fail.
-    const ok = try sign.verifyCtx("orochi-s2s-chanprop-v1", transcript, sig, pubkey);
+    const ok = try sign.verifyCtx("onyx-s2s-chanprop-v1", transcript, sig, pubkey);
     try testing.expect(!ok);
     // ...while it verifies under its own domain.
     const ok_own = try sign.verifyCtx(sign_domain, transcript, sig, pubkey);

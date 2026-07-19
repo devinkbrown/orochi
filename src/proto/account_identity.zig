@@ -21,7 +21,7 @@ pub const max_value_len: usize = public_key_hex_len + 1 + signature_hex_len;
 pub const max_account_len: usize = 64;
 pub const max_transcript_len: usize = transcript_domain.len + 1 + max_account_len + 1 + max_label_len + 1 + public_key_len;
 
-const transcript_domain = "OROCHI-ACCOUNT-IDENTITY-v1";
+const transcript_domain = "ONYX-ACCOUNT-IDENTITY-v1";
 
 pub const Claim = struct {
     public_key: [public_key_len]u8,
@@ -134,12 +134,12 @@ pub fn parseClaimValue(value: []const u8) ?Claim {
 //   magic:u32("ARP1") || len8(account) || account || node:u64 || epoch:u64
 //     || expiry_ms:u64 || sig:64
 // Signed message = residence_domain || 0x00 || wire[0 .. wire.len - 64]
-// (domain-separated from "OROCHI-ACCOUNT-IDENTITY-v1", signed_frame, and
+// (domain-separated from "ONYX-ACCOUNT-IDENTITY-v1", signed_frame, and
 // oper_cred_share "OCG1"). `expiry_ms` is WALL-CLOCK ms — cross-host absolute
 // times always use the real-time clock, never a per-node monotonic clock.
 
 pub const residence_prop_prefix = "identity.residence.";
-pub const residence_domain = "OROCHI-ACCOUNT-RESIDENCE-v1";
+pub const residence_domain = "ONYX-ACCOUNT-RESIDENCE-v1";
 pub const residence_magic: u32 = 0x41525031; // "ARP1"
 /// Node shortIds render as fixed-width 16-char lower hex in the prop key.
 pub const residence_node_hex_len: usize = 16;

@@ -196,14 +196,14 @@ test "mic only refuses irc with numeric 900" {
     try std.testing.expect(try emitJoinRefusal(
         std.testing.allocator,
         &out,
-        "orochi.test",
+        "onyx.test",
         "plain",
         "#comic",
         .mic_only,
         .irc,
     ));
     try std.testing.expectEqualStrings(
-        ":orochi.test 900 plain #comic :Cannot join MIC only channel with IRC client\r\n",
+        ":onyx.test 900 plain #comic :Cannot join MIC only channel with IRC client\r\n",
         out.items,
     );
 }

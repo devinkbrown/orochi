@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `armor` — the Armor crypto toolkit executable (openssl-parity verbs backed
-//! by orochi's pure-Zig substrate). Dispatches `armor <cmd> [opts]`, buffers
+//! by Onyx Server's pure-Zig substrate). Dispatches `armor <cmd> [opts]`, buffers
 //! subcommand output, and maps failures to deterministic, scriptable exits:
 //!   0 success · 1 operation failed · 2 usage error · 3 not implemented
 

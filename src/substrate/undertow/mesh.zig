@@ -502,7 +502,7 @@ test "join bootstrap forms a connected overlay and floods a broadcast to all" {
     // Broadcast from node 1 reaches every other node exactly once via the
     // Broadcast flood over the overlay (multi-hop eager fan-out).
     {
-        const envs = try sim.nodes[0].broadcast("orochi-rises");
+        const envs = try sim.nodes[0].broadcast("onyx-rises");
         defer sim.nodes[0].freeEnvelopes(envs);
         try sim.enqueue(1, envs);
     }

@@ -1148,7 +1148,7 @@ const max_scanned_streams: u64 = 64;
 
 /// Body returned for `GET /` — a short, fixed text/plain payload proving the
 /// QUIC + TLS-1.3-over-QUIC + HTTP/3 stack answered an independent client.
-const http_ok_body: []const u8 = "orochi quic ok\n";
+const http_ok_body: []const u8 = "onyx quic ok\n";
 /// Body returned for any other path (a clean 404; still a valid response).
 const http_not_found_body: []const u8 = "not found\n";
 /// Body returned for a non-WebTransport CONNECT (405 Method Not Allowed).
@@ -1168,7 +1168,7 @@ const big_default_bytes: usize = 256 * 1024;
 const big_max_bytes: usize = 1024 * 1024;
 
 /// The deterministic body byte at absolute offset `i`. The body is a stream of
-/// fixed-width lines `"<offset-of-line-start padded>: orochi big body line\n"`
+/// fixed-width lines `"<offset-of-line-start padded>: onyx big body line\n"`
 /// — but we don't need the textual form to verify it; what matters is that the
 /// byte at offset `i` is a pure function of `i`, so the client can recompute the
 /// full expected body (or its checksum/length) and catch any reordering,
@@ -1218,13 +1218,13 @@ fn parseSizeQuery(query: []const u8) usize {
     return big_default_bytes;
 }
 
-/// HTTP/3 interop tracing, gated on `OROCHI_QUIC_DEBUG` (any non-empty value).
+/// HTTP/3 interop tracing, gated on `ONYX_QUIC_DEBUG` (any non-empty value).
 /// Off by default; only read by interop triage. Linux-only (reads
 /// /proc/self/environ; no-libc Linux lacks std.posix.getenv / std.os.environ).
 var h3_dbg_enabled: ?bool = null;
 fn h3Dbg(comptime fmt: []const u8, args: anytype) void {
     const on = h3_dbg_enabled orelse blk: {
-        const e = h3EnvFlagSet("OROCHI_QUIC_DEBUG");
+        const e = h3EnvFlagSet("ONYX_QUIC_DEBUG");
         h3_dbg_enabled = e;
         break :blk e;
     };
@@ -1963,7 +1963,7 @@ test "h3 plain GET / is answered 200 text/plain with a body, stream finished" {
     defer result.body.deinit(alloc);
 
     try testing.expectEqualStrings("200", result.status[0..result.status_len]);
-    try testing.expectEqualStrings("orochi quic ok\n", result.body.items);
+    try testing.expectEqualStrings("onyx quic ok\n", result.body.items);
     try testing.expect(result.finished);
 
     // An http_responded event was queued (the WT session was NOT established).

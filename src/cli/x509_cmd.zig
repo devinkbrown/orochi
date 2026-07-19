@@ -8,11 +8,11 @@
 //! issuer/subject Name TLVs); no crypto is reimplemented.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const x509 = orochi.crypto.x509;
-const pem = orochi.proto.pem;
+const x509 = onyx_server.crypto.x509;
+const pem = onyx_server.proto.pem;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;
@@ -261,8 +261,8 @@ fn rsaModulusBits(modulus: []const u8) usize {
 // ===========================================================================
 
 const testing = std.testing;
-const x509_selfsign = orochi.proto.x509_selfsign;
-const ecdsa_p256 = orochi.crypto.ecdsa_p256;
+const x509_selfsign = onyx_server.proto.x509_selfsign;
+const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
 
 fn fixtureCert(out: []u8) ![]const u8 {
     const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
@@ -307,7 +307,7 @@ test "armorcli x509 -fingerprint matches the substrate certfp" {
     defer aw.deinit();
     try runOnDer(gpa, std.testing.io, .{ .fingerprint = true, .noout = true }, der, &aw.writer);
 
-    const fp = try orochi.crypto.x509_verify.certfp(der);
+    const fp = try onyx_server.crypto.x509_verify.certfp(der);
     var expect_hex = Writer.Allocating.init(gpa);
     defer expect_hex.deinit();
     try common.writeColonHex(&expect_hex.writer, &fp);

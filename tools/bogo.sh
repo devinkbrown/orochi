@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# tools/bogo.sh — drive BoringSSL's BoGo protocol-test runner against orochi's
+# tools/bogo.sh — drive BoringSSL's BoGo protocol-test runner against onyx's
 # TLS shim (roadmap 0.3). The runner (`ssl/test/runner`, a Go test) is an
 # OUT-OF-REPO dependency: this script pins a BoringSSL checkout, builds the
-# orochi shim, and runs `go test` with our shim + -shim-config. It is scaffolding
+# onyx shim, and runs `go test` with our shim + -shim-config. It is scaffolding
 # for a CI `bogo` job — the in-repo, self-contained proof is `zig build
 # bogo-shim-test` (no external harness required).
 #
@@ -27,7 +27,7 @@ bssl_dir="${cache_dir}/boringssl"
 shim_bin="${repo_root}/zig-out/bin/bogo_shim"
 shim_config="${repo_root}/tools/bogo/config.json"
 
-echo "[bogo] building orochi shim -> ${shim_bin}"
+echo "[bogo] building onyx shim -> ${shim_bin}"
 ( cd "${repo_root}" && zig build bogo-shim )
 
 if [[ ! -d "${bssl_dir}/.git" ]]; then
@@ -38,7 +38,7 @@ fi
 echo "[bogo] checking out BoringSSL @ ${BORINGSSL_COMMIT}"
 ( cd "${bssl_dir}" && git fetch --quiet origin && git checkout --quiet "${BORINGSSL_COMMIT}" )
 
-echo "[bogo] running the runner against the orochi shim"
+echo "[bogo] running the runner against the onyx shim"
 cd "${bssl_dir}/ssl/test/runner"
 exec go test \
   -shim-path "${shim_bin}" \

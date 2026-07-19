@@ -29,8 +29,8 @@ pub const Digest = [std.crypto.hash.Blake3.digest_length]u8;
 
 pub const claim_magic = [_]u8{ 'S', 'R', 'M', 2 };
 pub const consume_magic = [_]u8{ 'S', 'R', 'C', 2 };
-pub const claim_sign_domain = "orochi-session-reclaim-attachment-claim-v2";
-pub const consume_sign_domain = "orochi-session-reclaim-attachment-consume-v2";
+pub const claim_sign_domain = "onyx-session-reclaim-attachment-claim-v2";
+pub const consume_sign_domain = "onyx-session-reclaim-attachment-consume-v2";
 
 pub const max_account_len: usize = 64;
 pub const default_max_lifetime_ms: u64 = 12 * 60 * 60 * 1000;

@@ -239,7 +239,7 @@ Each exposes `encodeCheckpoint`/`decodeCheckpoint`
 (`relay_v2_event_log.zig:761`, `relay_v2_outbox.zig:390`,
 `relay_v2_replay_guard.zig:285`, `attachment_delivery_spool.zig:648`), but those
 checkpoints are sealed **only into the Helix in-memory upgrade capsule at
-re-exec** — `OROCHI_HELIX_UPGRADE_CAPS` advertises `relay-v2-event-log-v1`,
+re-exec** — `ONYX_HELIX_UPGRADE_CAPS` advertises `relay-v2-event-log-v1`,
 `relay-v2-outbox-v2`, `attachment-delivery-spool-v1`, and the `mesh-checkpoint-v2`
 capsule that carries RVG2 (`src/daemon/helix/live.zig:268`), and adoption
 requires exactly one of each (`src/daemon/helix/handoff_relations.zig:319-321`).
@@ -264,7 +264,7 @@ copy of that message is lost, and exact-once delivery to C is not recovered. Thi
 plane is therefore **not crash-durable**.
 
 **Supported contract.** The only custody-preserving transition is a
-connection-preserving Helix migration (`systemctl reload orochi`), where the
+connection-preserving Helix migration (`systemctl reload onyx-server`), where the
 checkpoints above ride the in-memory capsule across `execve`. A hard restart is
 supported only from a **drained, clean boundary** — a node with no unconfirmed
 custody obligations outstanding (no un-ACKed RVO2 rows, no unretired RVL2 wire).

@@ -1508,7 +1508,7 @@ test "TLS 1.2 client rejects an out-of-range server record_size_limit (RFC 8449)
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 const StdEd25519 = std.crypto.sign.Ed25519;
 
-const chain_test_san = "leaf.tls12.orochi.test";
+const chain_test_san = "leaf.tls12.onyx.test";
 
 fn hexConst(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
@@ -1550,7 +1550,7 @@ const RsaSigVariant = struct { sig_sha384: bool = false, sig_pss: bool = false }
 
 fn buildRsaChainCert(out: []u8, serial: u8, variant: RsaSigVariant) ![]const u8 {
     return x509_selfsign.buildSelfSignedRsa(out, .{
-        .common_name = "orochi tls12 rsa test",
+        .common_name = "onyx tls12 rsa test",
         .not_before = 1_704_067_200, // 2024-01-01
         .not_after = 1_924_991_999, // 2030-12-31
         .serial = &.{ 0x52, serial },
@@ -1585,7 +1585,7 @@ test "TLS 1.2 client anchors an ECDSA P-256 SHA-256 self-signed chain (regressio
     const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x2c)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(&buf, .{
-        .common_name = "orochi tls12 ecdsa test",
+        .common_name = "onyx tls12 ecdsa test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x52, 0x04 },
@@ -1599,7 +1599,7 @@ test "TLS 1.2 client anchors an Ed25519 self-signed chain (new)" {
     const kp = try StdEd25519.KeyPair.generateDeterministic(@as([StdEd25519.KeyPair.seed_length]u8, @splat(0x2d)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&buf, .{
-        .common_name = "orochi tls12 ed25519 test",
+        .common_name = "onyx tls12 ed25519 test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x52, 0x05 },
@@ -1645,8 +1645,8 @@ test "TLS 1.2 client rejects a name-constrained CA's cross-domain leaf (F1)" {
     var ca_buf: [1024]u8 = undefined;
     const ca_der = try x509_verify.mintEd25519CertExt(
         &ca_buf,
-        "Orochi Name-Constrained CA",
-        "Orochi Name-Constrained CA",
+        "Onyx Name-Constrained CA",
+        "Onyx Name-Constrained CA",
         ca_kp.public_key.toBytes(),
         ca_kp,
         1_704_067_200,
@@ -1658,7 +1658,7 @@ test "TLS 1.2 client rejects a name-constrained CA's cross-domain leaf (F1)" {
     var leaf_buf: [1024]u8 = undefined;
     const leaf_der = try x509_verify.mintEd25519CertExt(
         &leaf_buf,
-        "Orochi Name-Constrained CA",
+        "Onyx Name-Constrained CA",
         "login.victim-bank.com",
         leaf_kp.public_key.toBytes(),
         ca_kp,
@@ -1685,8 +1685,8 @@ test "TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)" {
     var root_buf: [1024]u8 = undefined;
     const root_der = try x509_verify.mintEd25519CertExt(
         &root_buf,
-        "Orochi PathLen0 Root",
-        "Orochi PathLen0 Root",
+        "Onyx PathLen0 Root",
+        "Onyx PathLen0 Root",
         root_kp.public_key.toBytes(),
         root_kp,
         1_704_067_200,
@@ -1699,8 +1699,8 @@ test "TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)" {
     var mid_buf: [1024]u8 = undefined;
     const mid_der = try x509_verify.mintEd25519CertExt(
         &mid_buf,
-        "Orochi PathLen0 Root",
-        "Orochi Spliced Intermediate",
+        "Onyx PathLen0 Root",
+        "Onyx Spliced Intermediate",
         mid_kp.public_key.toBytes(),
         root_kp,
         1_704_067_200,
@@ -1711,7 +1711,7 @@ test "TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)" {
     var leaf_buf: [1024]u8 = undefined;
     const leaf_der = try x509_verify.mintEd25519CertExt(
         &leaf_buf,
-        "Orochi Spliced Intermediate",
+        "Onyx Spliced Intermediate",
         "leaf.pathlen0.test",
         leaf_kp.public_key.toBytes(),
         mid_kp,
@@ -1791,7 +1791,7 @@ test "TLS 1.2 client reassembles a Certificate message split across two TLS reco
     const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x5a)));
     var cert_buf: [1024]u8 = undefined;
     const cert = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
-        .common_name = "orochi tls12 split test",
+        .common_name = "onyx tls12 split test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x5a, 0x01 },

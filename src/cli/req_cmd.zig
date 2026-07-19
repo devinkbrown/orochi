@@ -11,15 +11,15 @@
 //! is a noted substrate gap) and argument plumbing.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 const pkey_cmd = @import("pkey_cmd.zig");
 
-const csr = orochi.proto.csr;
-const pem = orochi.proto.pem;
-const ec_pkcs = orochi.proto.ec_pkcs;
-const ecdsa_p256 = orochi.crypto.ecdsa_p256;
-const ed25519 = orochi.crypto.sign;
+const csr = onyx_server.proto.csr;
+const pem = onyx_server.proto.pem;
+const ec_pkcs = onyx_server.proto.ec_pkcs;
+const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
+const ed25519 = onyx_server.crypto.sign;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;
@@ -176,7 +176,7 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 // ===========================================================================
 
 const testing = std.testing;
-const x509 = orochi.crypto.x509;
+const x509 = onyx_server.crypto.x509;
 
 test "armorcli req builds a verifiable ECDSA P-256 CSR" {
     // Arrange: a fresh EC key from genpkey.

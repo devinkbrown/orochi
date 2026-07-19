@@ -184,7 +184,7 @@ fn defaultHashes() [proof_depth + 1]Hash {
 
 fn emptyLeafHash() Hash {
     var hasher = Blake3.init(.{});
-    hasher.update("orochi.smt.empty.v1");
+    hasher.update("onyx_server.smt.empty.v1");
     hasher.update(&empty_tag);
     var out: Hash = undefined;
     hasher.final(&out);
@@ -196,7 +196,7 @@ fn leafHash(key: Key, value: []const u8) Hash {
     var len_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_bytes, value.len, .little);
 
-    hasher.update("orochi.smt.leaf.v1");
+    hasher.update("onyx_server.smt.leaf.v1");
     hasher.update(&leaf_tag);
     hasher.update(&key);
     hasher.update(&len_bytes);
@@ -209,7 +209,7 @@ fn leafHash(key: Key, value: []const u8) Hash {
 
 fn branchHash(left: Hash, right: Hash) Hash {
     var hasher = Blake3.init(.{});
-    hasher.update("orochi.smt.branch.v1");
+    hasher.update("onyx_server.smt.branch.v1");
     hasher.update(&branch_tag);
     hasher.update(&left);
     hasher.update(&right);

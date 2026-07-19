@@ -23,7 +23,7 @@ Use the current source before trusting older planning notes:
 | Need | Source |
 |---|---|
 | Build/test/deploy commands | `zig build --help`, `build.zig` |
-| Config schema | `src/daemon/config_format.zig`, `src/daemon/config_boot.zig`, `etc/orochi.reference.toml` |
+| Config schema | `src/daemon/config_format.zig`, `src/daemon/config_boot.zig`, `etc/onyx-server.reference.toml` |
 | Live capability list | `src/daemon/dispatch.zig` |
 | Command/module registry | `src/daemon/modules/manifest.zig`, `src/daemon/registry.zig` |
 | Server behavior proof | `src/daemon/server.zig` tests and focused build lanes |
@@ -37,7 +37,7 @@ source, fix the reference/guide docs or the code, not the evidence.
 <!-- AUTO-GENERATED: build-commands -->
 | Command | Purpose |
 |---|---|
-| `zig build` | Build and install the debug daemon to `zig-out/bin/orochi`. |
+| `zig build` | Build and install the debug daemon to `zig-out/bin/onyx-server`. |
 | `zig build check` | Fast semantic analysis without emitting a binary. |
 | `zig build test` | Full module plus executable-root test suite. |
 | `zig build test-smoke --summary all` | Fast roadmap gate: semantic check plus TLS/server/config suites. |
@@ -65,8 +65,8 @@ more than intended.
 After building:
 
 ```sh
-python3 tools/runtime_smoke.py zig-out/bin/orochi
-python3 tools/upgrade_smoke.py zig-out/bin/orochi
+python3 tools/runtime_smoke.py zig-out/bin/onyx-server
+python3 tools/upgrade_smoke.py zig-out/bin/onyx-server
 ```
 
 `runtime_smoke.py` cold-boots a loopback daemon, registers a client, checks PING/PONG,
@@ -99,7 +99,7 @@ the listener and carried session survive the exec.
 - When a doc claims a command, capability, config key, or runtime behavior, ground it
   in current source or a passing test.
 - Update `docs/README.md` when adding a new major guide/reference.
-- Keep `docs/reference/config.md` and `etc/orochi.reference.toml` synchronized when
+- Keep `docs/reference/config.md` and `etc/onyx-server.reference.toml` synchronized when
   config keys change.
 - Keep `docs/guide/testing.md` synchronized with `zig build --help`.
 
@@ -118,9 +118,9 @@ git diff --check
 Also run these when relevant:
 
 ```sh
-zig build run -- --check-config etc/orochi.reference.toml
-python3 tools/runtime_smoke.py zig-out/bin/orochi
-python3 tools/upgrade_smoke.py zig-out/bin/orochi
+zig build run -- --check-config etc/onyx-server.reference.toml
+python3 tools/runtime_smoke.py zig-out/bin/onyx-server
+python3 tools/upgrade_smoke.py zig-out/bin/onyx-server
 ```
 
 For TLS/crypto/S2S/auth changes, explicitly call out the security surface in the PR

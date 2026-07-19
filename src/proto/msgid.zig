@@ -45,7 +45,7 @@ pub const Generator = struct {
 /// Crockford format so local and remote clients can reference the same msgid.
 pub fn fromMeshEvent(origin_node: u64, hlc: u64, buf: []u8) []const u8 {
     std.debug.assert(buf.len >= id_len);
-    const domain = "orochi-msgid-mesh-event-v1\x00";
+    const domain = "onyx-msgid-mesh-event-v1\x00";
     var material: [domain.len + 16]u8 = undefined;
     @memcpy(material[0..domain.len], domain);
     std.mem.writeInt(u64, material[domain.len..][0..8], origin_node, .big);

@@ -126,7 +126,7 @@ ISUPPORT comes from `src/proto/protocol_inventory.zig` and runtime overrides bui
 
 | Token/source | Evidence |
 | --- | --- |
-| Default network name `Orochi` | `src/proto/protocol_inventory.zig:17`, `src/proto/protocol_inventory.zig:19` |
+| Default network name `Onyx` | `src/proto/protocol_inventory.zig:17`, `src/proto/protocol_inventory.zig:19` |
 | `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD` | `src/proto/protocol_inventory.zig:58`, `src/proto/protocol_inventory.zig:59` |
 | Static token array | `src/proto/protocol_inventory.zig:61`, `src/proto/protocol_inventory.zig:63`, `src/proto/protocol_inventory.zig:99` |
 | Runtime ISUPPORT override | `src/proto/protocol_inventory.zig:101`, `src/proto/protocol_inventory.zig:109`, `src/proto/protocol_inventory.zig:114`, `src/daemon/server.zig:1270` |

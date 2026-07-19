@@ -16,7 +16,7 @@ pub const version: u16 = 2;
 pub const magic = [_]u8{ 'H', 'W', 'C', '2' };
 
 const checksum_len = std.crypto.hash.Blake3.digest_length;
-const checksum_domain = "orochi-helix-world-checkpoint-v2";
+const checksum_domain = "onyx-helix-world-checkpoint-v2";
 const header_len: usize = 40;
 const max_checkpoint_bytes: usize = 64 * 1024 * 1024;
 const max_string_bytes: usize = 1024 * 1024;

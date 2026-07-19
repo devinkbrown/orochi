@@ -674,7 +674,7 @@ test "snapshot encode/decode round-trips identity + flags" {
         .realname = "Alice Example",
         .account = "alice",
         .real_host = "10.0.0.5",
-        .host = "cloak-ab12.orochi",
+        .host = "cloak-ab12.onyx",
         .away = "biab",
         .logged_in = true,
         .away_active = true,
@@ -709,7 +709,7 @@ test "snapshot encode/decode round-trips identity + flags" {
     try testing.expectEqualStrings("Alice Example", got.realname);
     try testing.expectEqualStrings("alice", got.account);
     try testing.expectEqualStrings("10.0.0.5", got.real_host);
-    try testing.expectEqualStrings("cloak-ab12.orochi", got.host);
+    try testing.expectEqualStrings("cloak-ab12.onyx", got.host);
     try testing.expectEqualStrings("biab", got.away);
     try testing.expect(got.logged_in and got.away_active and !got.is_oper);
 }
@@ -985,7 +985,7 @@ test "session_snapshot peekFd recovers the fd for a decode-failure drop on resum
         .realname = "Grace Example",
         .account = "grace",
         .real_host = "10.0.0.9",
-        .host = "cloak-99.orochi",
+        .host = "cloak-99.onyx",
         .away = "brb",
         .fd = 57,
         .was_secured = true,
@@ -1064,7 +1064,7 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
         .realname = "Lotus Current",
         .account = "lotus",
         .real_host = "192.0.2.4",
-        .host = "cloak-current.orochi",
+        .host = "cloak-current.onyx",
         .away = "migrating",
         .username = "ocean",
         .logged_in = true,
@@ -1086,7 +1086,7 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
         .oper_title = "Mesh Operator",
         .umode_bits = 0x55,
         .pending_in = "PRIVMSG #mesh :partial",
-        .pending_out = ":orochi NOTICE lotus :queued\r\n",
+        .pending_out = ":onyx NOTICE lotus :queued\r\n",
     });
     defer allocator.free(bytes);
 
@@ -1095,7 +1095,7 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
     try testing.expectEqualStrings("Lotus Current", got.realname);
     try testing.expectEqualStrings("lotus", got.account);
     try testing.expectEqualStrings("192.0.2.4", got.real_host);
-    try testing.expectEqualStrings("cloak-current.orochi", got.host);
+    try testing.expectEqualStrings("cloak-current.onyx", got.host);
     try testing.expectEqualStrings("migrating", got.away);
     try testing.expectEqualStrings("ocean", got.username);
     try testing.expect(got.logged_in and got.away_active and got.is_oper);
@@ -1110,7 +1110,7 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
     try testing.expectEqualStrings("Mesh Operator", got.oper_title);
     try testing.expectEqual(@as(u64, 0x55), got.umode_bits);
     try testing.expectEqualStrings("PRIVMSG #mesh :partial", got.pending_in);
-    try testing.expectEqualStrings(":orochi NOTICE lotus :queued\r\n", got.pending_out);
+    try testing.expectEqualStrings(":onyx NOTICE lotus :queued\r\n", got.pending_out);
 
     var channels = channelIter(got.channels_blob);
     const first = channels.next().?;
@@ -1133,7 +1133,7 @@ test "current snapshot encoding is leak-free across every allocation failure" {
         .realname = "Lotus OOM Sweep",
         .account = "lotus",
         .real_host = "192.0.2.9",
-        .host = "cloak-oom.orochi",
+        .host = "cloak-oom.onyx",
         .away = "migrating",
         .username = "ocean",
         .logged_in = true,
@@ -1152,7 +1152,7 @@ test "current snapshot encoding is leak-free across every allocation failure" {
         .oper_title = "Mesh Operator",
         .umode_bits = 0xAA,
         .pending_in = "PRIVMSG #mesh :partial",
-        .pending_out = ":orochi NOTICE lotus :queued\r\n",
+        .pending_out = ":onyx NOTICE lotus :queued\r\n",
     };
 
     const Sweep = struct {

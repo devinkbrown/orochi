@@ -198,7 +198,7 @@ pub const Config = struct {
     /// validated). Default false ⇒ this check never runs, the wire is
     /// byte-identical, and the existing `signature_algorithms` (CertificateVerify)
     /// enforcement is untouched. This is stricter than the RFC's SHOULD-send-anyway
-    /// fallback (§4.4.2.2) by deliberate operator opt-in: orochi presents one chain
+    /// fallback (§4.4.2.2) by deliberate operator opt-in: Onyx Server presents one chain
     /// per name, so refusing a chain the client declared it cannot validate is the
     /// safe choice for a server that opts into strict certificate-algorithm policy.
     enforce_cert_signature_algorithms: bool = false,
@@ -1537,7 +1537,7 @@ pub const Server = struct {
     // caller proceeds with the ClientHelloOuter (public_name) as an ordinary
     // handshake and NEVER aborts. Only genuine OOM propagates. Deferred (each
     // falls back to the outer path): ECH+HRR (only ClientHello1 is tried),
-    // ECH-over-PSK, and `ech_outer_extensions` decompression (the orochi client
+    // ECH-over-PSK, and `ech_outer_extensions` decompression (the Onyx Server client
     // sends the full inner extension set, so no reference is needed).
     // -----------------------------------------------------------------------
 
@@ -1557,7 +1557,7 @@ pub const Server = struct {
         @memcpy(&enc, found.enc);
 
         // ClientHelloOuterAAD (draft §5.2): the ClientHelloOuter body with the ECH
-        // payload zeroed in place. The orochi client authenticates over the
+        // payload zeroed in place. The Onyx Server client authenticates over the
         // header-less ClientHello body (see tls_client.buildOuterEchBody), so the
         // server reconstructs the same base and zeroes only the payload region.
         const aad = try self.allocator.dupe(u8, outer_body);
@@ -3517,7 +3517,7 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     try std.testing.expectEqualSlices(u8, &client_binding, &server_binding);
 
     var different_label: [32]u8 = undefined;
-    try client.exportKeyingMaterial("orochi-test-exporter", "", different_label[0..]);
+    try client.exportKeyingMaterial("onyx-test-exporter", "", different_label[0..]);
     try std.testing.expect(!std.mem.eql(u8, &client_binding, &different_label));
 
     var different_context: [32]u8 = undefined;
@@ -6603,7 +6603,7 @@ test "loopback: RFC 8879 cert compression — server sends CompressedCertificate
     try std.testing.expectEqualStrings("compressed cert ok", got);
 }
 
-/// Drive a full RFC 7250 loopback (both sides orochi): the client offers
+/// Drive a full RFC 7250 loopback (both sides Onyx Server): the client offers
 /// RawPublicKey, the server (with `enable_raw_public_key`) presents a bare SPKI,
 /// and application data round-trips both ways. `cfg` supplies the server's leaf
 /// chain + signing key. Returns nothing — a green run IS the proof that the

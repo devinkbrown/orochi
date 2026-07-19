@@ -433,7 +433,7 @@ fn startsChunk(level: u16, item: Key) bool {
 fn hashEmpty() Hash {
     @setEvalBranchQuota(5000);
     var h = Blake3.init(.{});
-    h.update("orochi.suimyaku.prolly.empty.v1");
+    h.update("onyx_server.suimyaku.prolly.empty.v1");
     var out: Hash = undefined;
     h.final(&out);
     return out;
@@ -441,7 +441,7 @@ fn hashEmpty() Hash {
 
 fn hashLeaf(keys: []const Key) Hash {
     var h = Blake3.init(.{});
-    h.update("orochi.suimyaku.prolly.leaf.v1");
+    h.update("onyx_server.suimyaku.prolly.leaf.v1");
     updateU64(&h, keys.len);
     for (keys) |item| h.update(&item);
     var out: Hash = undefined;
@@ -451,7 +451,7 @@ fn hashLeaf(keys: []const Key) Hash {
 
 fn hashInternal(level: u16, children: []const Child) Hash {
     var h = Blake3.init(.{});
-    h.update("orochi.suimyaku.prolly.node.v1");
+    h.update("onyx_server.suimyaku.prolly.node.v1");
     updateU16(&h, level);
     updateU64(&h, children.len);
     for (children) |child| {
@@ -467,7 +467,7 @@ fn hashInternal(level: u16, children: []const Child) Hash {
 
 fn boundaryHash(level: u16, item: Key) Hash {
     var h = Blake3.init(.{});
-    h.update("orochi.suimyaku.prolly.boundary.v1");
+    h.update("onyx_server.suimyaku.prolly.boundary.v1");
     updateU16(&h, level);
     h.update(&item);
     var out: Hash = undefined;

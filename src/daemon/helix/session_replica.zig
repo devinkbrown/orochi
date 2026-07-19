@@ -43,9 +43,9 @@ pub const Digest = [std.crypto.hash.Blake3.digest_length]u8;
 pub const offer_magic = [_]u8{ 'S', 'R', 'O', '2' };
 pub const ack_magic = [_]u8{ 'S', 'R', 'A', '2' };
 pub const attachment_lease_magic = [_]u8{ 'S', 'R', 'L', '2' };
-pub const offer_sign_domain = "orochi-session-replica-offer-v2";
-pub const ack_sign_domain = "orochi-session-replica-ack-v2";
-pub const attachment_lease_sign_domain = "orochi-session-replica-attachment-lease-v2";
+pub const offer_sign_domain = "onyx-session-replica-offer-v2";
+pub const ack_sign_domain = "onyx-session-replica-ack-v2";
+pub const attachment_lease_sign_domain = "onyx-session-replica-attachment-lease-v2";
 
 pub const max_account_len: usize = 128;
 pub const max_nick_len: usize = 64;

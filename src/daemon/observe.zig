@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Orochi OBSERVE — operator observation subscriptions on the Event Spine.
+//! Onyx Server OBSERVE — operator observation subscriptions on the Event Spine.
 //!
 //! This is NOT a stateless "spy and dump" query. An operator declares a standing
 //! *interest mask* with `EVENT OBSERVE <mask>`; the daemon then keeps that filter
@@ -260,10 +260,10 @@ test "set enforces limits" {
 test "formatEvent renders the chatsvc EVENT line with and without detail" {
     const subj = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .account = "bob" };
     var buf: [256]u8 = undefined;
-    const a = Registry.formatEvent(&buf, "orochi.local", "kain", .connect, subj).?;
-    try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE connect bob!~b@10.0.0.4 acct=bob\r\n", a);
+    const a = Registry.formatEvent(&buf, "onyx.local", "kain", .connect, subj).?;
+    try std.testing.expectEqualStrings(":onyx.local EVENT kain OBSERVE connect bob!~b@10.0.0.4 acct=bob\r\n", a);
     var buf2: [256]u8 = undefined;
     const subj2 = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .detail = "-> robert" };
-    const b = Registry.formatEvent(&buf2, "orochi.local", "kain", .nick, subj2).?;
-    try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE nick bob!~b@10.0.0.4 acct=* -> robert\r\n", b);
+    const b = Registry.formatEvent(&buf2, "onyx.local", "kain", .nick, subj2).?;
+    try std.testing.expectEqualStrings(":onyx.local EVENT kain OBSERVE nick bob!~b@10.0.0.4 acct=* -> robert\r\n", b);
 }

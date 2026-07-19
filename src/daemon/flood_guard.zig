@@ -462,7 +462,7 @@ test "a valid config passes validation" {
 
 test "burst then throttle then recover" {
     var guard = FloodGuard.init(testConfig(), 0);
-    const line = "WHOIS orochi\r\n";
+    const line = "WHOIS onyx\r\n";
     try testing.expectEqual(Decision.allow, guard.classifyRaw(0, line));
     try testing.expectEqual(Decision.allow, guard.classifyRaw(0, line));
     try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, line));

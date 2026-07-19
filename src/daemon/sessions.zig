@@ -3,7 +3,7 @@
 
 //! Multi-session registry: account -> set of live client sessions (Phase 3).
 //!
-//! Orochi treats an *account* as the durable identity, a reclaim token as one
+//! Onyx Server treats an *account* as the durable identity, a reclaim token as one
 //! logical resumable session, and each connection as an attachment to that
 //! session. Multiple attached rows may therefore deliberately carry the SAME
 //! token: presenting a valid token joins the logical session; it does not steal

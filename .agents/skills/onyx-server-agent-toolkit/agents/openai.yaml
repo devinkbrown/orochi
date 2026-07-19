@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Agent Toolkit"
+  short_description: "Evolve and validate Onyx Server agent tooling"
+  default_prompt: "Use $onyx-server-agent-toolkit to audit and improve the Onyx Server Codex and Claude workflow."

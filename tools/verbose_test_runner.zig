@@ -1,4 +1,4 @@
-//! Simple verbose test runner for long Orochi suites.
+//! Simple verbose test runner for long Onyx Server suites.
 //!
 //! Zig's build-system test runner uses the std.zig.Server protocol and usually
 //! prints only after the test artifact exits. That is great for compact logs but

@@ -187,7 +187,7 @@ pub const Options = struct {
     /// Borrowed for the call; the client copies it.
     cert_signature_schemes: ?[]const tls_signature_scheme.SignatureScheme = null,
     /// Optional caller-supplied set of pinned Certificate Transparency logs (RFC
-    /// 6962) for verifying SCTs embedded in the leaf certificate. Orochi ships NO
+    /// 6962) for verifying SCTs embedded in the leaf certificate. Onyx Server ships NO
     /// log list; a deployment that wants CT enforcement supplies the logs it
     /// trusts (each `CtLog` pairs a log's DER SubjectPublicKeyInfo with its
     /// `log_id` — derive the id with `sct.logIdFromSpki`).
@@ -6271,7 +6271,7 @@ test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
 // the certs carry no EKU, so the serverAuth gate passes.
 // ===========================================================================
 
-const chain_test_san = "leaf.tls13.orochi.test";
+const chain_test_san = "leaf.tls13.onyx.test";
 
 fn hexConst(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
@@ -6313,7 +6313,7 @@ const RsaSigVariant = struct { sig_sha384: bool = false, sig_pss: bool = false }
 
 fn buildRsaChainCert(out: []u8, serial: u8, variant: RsaSigVariant) ![]const u8 {
     return x509_selfsign.buildSelfSignedRsa(out, .{
-        .common_name = "orochi tls13 rsa test",
+        .common_name = "onyx tls13 rsa test",
         .not_before = 1_704_067_200, // 2024-01-01
         .not_after = 1_924_991_999, // 2030-12-31
         .serial = &.{ 0x53, serial },
@@ -6348,7 +6348,7 @@ test "TLS 1.3 client anchors an ECDSA P-256 SHA-256 self-signed chain (regressio
     const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x2c)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(&buf, .{
-        .common_name = "orochi tls13 ecdsa test",
+        .common_name = "onyx tls13 ecdsa test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x53, 0x04 },
@@ -6362,7 +6362,7 @@ test "TLS 1.3 client anchors an ECDSA P-384 SHA-384 self-signed chain (ecdsa-wit
     const kp = try EcdsaP384.KeyPair.generateDeterministic(@as([EcdsaP384.KeyPair.seed_length]u8, @splat(0x2e)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP384(&buf, .{
-        .common_name = "orochi tls13 p384 test",
+        .common_name = "onyx tls13 p384 test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x53, 0x06 },
@@ -6377,7 +6377,7 @@ test "TLS 1.3 client anchors an Ed25519 self-signed chain (regression)" {
     const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x2d)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSigned(&buf, .{
-        .common_name = "orochi tls13 ed25519 test",
+        .common_name = "onyx tls13 ed25519 test",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x53, 0x05 },
@@ -6407,7 +6407,7 @@ test "TLS 1.3 client rejects a P-384 self-signed chain whose signature byte was 
     const kp = try EcdsaP384.KeyPair.generateDeterministic(@as([EcdsaP384.KeyPair.seed_length]u8, @splat(0x2e)));
     var buf: [1024]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP384(&buf, .{
-        .common_name = "orochi tls13 p384 tamper",
+        .common_name = "onyx tls13 p384 tamper",
         .not_before = 1_704_067_200,
         .not_after = 1_924_991_999,
         .serial = &.{ 0x53, 0x07 },
@@ -6434,8 +6434,8 @@ test "TLS 1.3 client rejects a name-constrained CA's cross-domain leaf (F1 contr
     var ca_buf: [1024]u8 = undefined;
     const ca_der = try x509_verify.mintEd25519CertExt(
         &ca_buf,
-        "Orochi Name-Constrained CA",
-        "Orochi Name-Constrained CA",
+        "Onyx Name-Constrained CA",
+        "Onyx Name-Constrained CA",
         ca_kp.public_key.toBytes(),
         ca_kp,
         1_704_067_200,
@@ -6446,7 +6446,7 @@ test "TLS 1.3 client rejects a name-constrained CA's cross-domain leaf (F1 contr
     var leaf_buf: [1024]u8 = undefined;
     const leaf_der = try x509_verify.mintEd25519CertExt(
         &leaf_buf,
-        "Orochi Name-Constrained CA",
+        "Onyx Name-Constrained CA",
         "login.victim-bank.com",
         leaf_kp.public_key.toBytes(),
         ca_kp,

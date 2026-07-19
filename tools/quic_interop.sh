@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 #
-# Real QUIC/HTTP3 interop test for the Orochi from-scratch QUIC stack.
+# Real QUIC/HTTP3 interop test for the Onyx Server from-scratch QUIC stack.
 #
 # Builds the daemon's standalone QUIC/HTTP3 listener (`quic_interop_server`),
 # starts it on an ephemeral UDP port with a self-signed cert, then drives a REAL
@@ -18,7 +18,7 @@
 #
 # Usage:
 #   tools/quic_interop.sh           # build + run the full interop test
-#   OROCHI_QUIC_DEBUG=1 tools/quic_interop.sh   # with server-side QUIC tracing
+#   ONYX_QUIC_DEBUG=1 tools/quic_interop.sh   # with server-side QUIC tracing
 #
 set -uo pipefail
 
@@ -28,7 +28,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
 SERVER_BIN="$ROOT/zig-out/bin/quic_interop_server"
-EXPECT_BODY="orochi quic ok"
+EXPECT_BODY="onyx quic ok"
 CURL_TIMEOUT=8
 
 log()  { printf '[interop] %s\n' "$*"; }

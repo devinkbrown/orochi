@@ -74,7 +74,7 @@ pub const Request = struct {
 };
 
 /// Numeric hints a caller can use when translating this module's outcomes to
-/// IRC replies. The list numerics are Orochi extension numerics; the errors
+/// IRC replies. The list numerics are Onyx Server extension numerics; the errors
 /// are standard server numerics already used by IRC daemons.
 pub const Numeric = enum(u16) {
     ERR_UNKNOWNCOMMAND = 421,

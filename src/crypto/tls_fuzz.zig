@@ -44,8 +44,8 @@
 //!         THEN crashes DETERMINISTICALLY with
 //!         `panic: start index 1 is larger than end index 0`. That is a
 //!         slice-bounds bug in the compiler's OWN fuzzer runtime (the `[1..]`
-//!         mutation-copy path in `lib/zig/fuzzer.zig`), NOT in any orochi parser:
-//!         a trivial standalone `smith.slice` target containing zero orochi code
+//!         mutation-copy path in `lib/zig/fuzzer.zig`), NOT in any Onyx Server parser:
+//!         a trivial standalone `smith.slice` target containing zero Onyx Server code
 //!         reproduces the identical panic on every run, immediately after
 //!         "fuzz success". So coverage-guided `--fuzz` is unblocked at the BUILD
 //!         level but blocked at RUNTIME by this upstream 0.17-dev toolchain bug;

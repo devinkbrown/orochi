@@ -372,14 +372,14 @@ test "oversized and unmasked client frames reject without crashing" {
 }
 
 test "decoded payload slices stay within input or caller output buffers" {
-    const server_payload = "PING :orochi\r\n";
+    const server_payload = "PING :onyx\r\n";
     var server_encoded_buf: [64]u8 = undefined;
     const server_encoded = try websocket.encodeFrame(64, .{ .opcode = .text }, server_payload, &server_encoded_buf);
     const server_decoded = try websocket.decodeFrame(64, .server_to_client, server_encoded, &.{});
     try expectPayloadInBounds(server_encoded, &.{}, server_decoded);
     try std.testing.expectEqualStrings(server_payload, server_decoded.frame.payload);
 
-    const client_payload = "PRIVMSG #orochi :hello\r\n";
+    const client_payload = "PRIVMSG #onyx :hello\r\n";
     var client_encoded_buf: [96]u8 = undefined;
     var client_payload_out: [96]u8 = undefined;
     const client_encoded = try websocket.encodeFrame(96, .{

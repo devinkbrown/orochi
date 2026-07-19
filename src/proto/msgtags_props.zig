@@ -74,7 +74,7 @@ test "escaped tag values match reference escaping and round trip through unescap
             msgtags.default_config,
             capsWithAll(),
             .{ .account = raw },
-            "PRIVMSG #orochi :hello",
+            "PRIVMSG #onyx :hello",
             &out,
         );
         const emitted = try singleTagValue(rendered, "@account=");
@@ -240,7 +240,7 @@ fn randomServerTime(random: std.Random, iteration: usize) ?i64 {
 }
 
 fn randomLine(random: std.Random, out: []u8, iteration: usize) []const u8 {
-    const prefix = "PRIVMSG #orochi :";
+    const prefix = "PRIVMSG #onyx :";
     @memcpy(out[0..prefix.len], prefix);
     const body_len = switch (iteration % 11) {
         0 => 1,

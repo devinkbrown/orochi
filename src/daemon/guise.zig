@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Guise — Orochi's reinvented virtual-host system.
+//! Guise — Onyx Server's reinvented virtual-host system.
 //!
 //! Legacy ircds treat a vhost as a single string an operator hangs on a user,
 //! or a flat pool of literal offers a user can TAKE one at a time.

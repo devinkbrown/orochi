@@ -5,7 +5,7 @@
 //!
 //! An operator-created binding maps an opaque `{id, token}` pair to a channel.
 //! An external integration that already POSTs Discord's webhook JSON can target
-//! an Orochi node by swapping only the URL: `POST /api/webhooks/<id>/<token>`.
+//! an Onyx Server node by swapping only the URL: `POST /api/webhooks/<id>/<token>`.
 //!
 //! This module is the PURE core — no sockets, no server coupling. It owns:
 //!
@@ -397,7 +397,7 @@ pub const WebhookStore = struct {
     };
 
     const checkpoint_checksum_len = std.crypto.hash.Blake3.digest_length;
-    const checkpoint_checksum_domain = "orochi.webhook-store.checkpoint.v1";
+    const checkpoint_checksum_domain = "onyx_server.webhook-store.checkpoint.v1";
 
     /// Encode the complete in-memory binding image for a Helix exec handoff.
     /// Unlike the human-readable TSV file, this carries the live token-bucket

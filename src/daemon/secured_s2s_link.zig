@@ -1418,7 +1418,7 @@ fn runScenario(split: bool) !void {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     });
     defer a.deinit();
     var b = try SecuredLink.init(.{
@@ -1428,7 +1428,7 @@ fn runScenario(split: bool) !void {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
 
@@ -1475,7 +1475,7 @@ test "secured link threads inner peer config after AKE" {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
         .inner_config = inner_cfg,
     });
     defer a.deinit();
@@ -1486,7 +1486,7 @@ test "secured link threads inner peer config after AKE" {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
         .inner_config = inner_cfg,
     });
     defer b.deinit();
@@ -1524,7 +1524,7 @@ const EstablishedPair = struct {
             .local_prekey = pre_a,
             .cfg = cfgFor(ida.realm, "mp"),
             .rng = rng.io(),
-            .server_name = "a.orochi",
+            .server_name = "a.onyx",
         });
         errdefer a.deinit();
         var b = try SecuredLink.init(.{
@@ -1534,7 +1534,7 @@ const EstablishedPair = struct {
             .local_prekey = pre_b,
             .cfg = cfgFor(idb.realm, ""),
             .rng = rng.io(),
-            .server_name = "b.orochi",
+            .server_name = "b.onyx",
         });
         errdefer b.deinit();
         try pump(&a, &b, false);
@@ -1624,13 +1624,13 @@ test "event spine v2 is negotiated encrypted authored and drained through Secure
         13,
         2,
         0x300_000,
-        "a.orochi",
+        "a.onyx",
         "#secure",
         "encrypted event spine payload",
     ));
     try testing.expect(p.a.outbound().len != 0);
     try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "encrypted event spine payload") == null);
-    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "a.orochi") == null);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), "a.onyx") == null);
     try pump(&p.a, &p.b, false);
 
     const inbound = try p.b.takeOperEventsV2();
@@ -1642,7 +1642,7 @@ test "event spine v2 is negotiated encrypted authored and drained through Secure
     try testing.expectEqual(p.ida.shortId(), inbound[0].via_peer);
     const event = try oper_event.decodeV2(inbound[0].wire);
     try testing.expectEqual(p.ida.shortId(), event.origin_node);
-    try testing.expectEqualStrings("a.orochi", event.origin_server);
+    try testing.expectEqualStrings("a.onyx", event.origin_server);
     try testing.expectEqualStrings("#secure", event.subject);
     try testing.expectEqualStrings("encrypted event spine payload", event.message);
     try testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(event));
@@ -1829,7 +1829,7 @@ test "secured link retains session token resolver across lazy inner establishmen
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     });
     defer a.deinit();
     var b = try SecuredLink.init(.{
@@ -1839,7 +1839,7 @@ test "secured link retains session token resolver across lazy inner establishmen
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
 
@@ -1876,7 +1876,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     };
     var a = try SecuredLink.init(optsA);
     var a_live = true;
@@ -1888,7 +1888,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
 
@@ -1976,7 +1976,7 @@ test "resumeOuter without the carried s2s roster re-announces the survivor on RE
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     };
     var a = try SecuredLink.init(optsA);
     var a_live = true;
@@ -1988,7 +1988,7 @@ test "resumeOuter without the carried s2s roster re-announces the survivor on RE
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
     try pump(&a, &b, false);
@@ -2057,7 +2057,7 @@ test "resumeOuter primed with the carried s2s roster suppresses the spurious RES
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     };
     var a = try SecuredLink.init(optsA);
     var a_live = true;
@@ -2069,7 +2069,7 @@ test "resumeOuter primed with the carried s2s roster suppresses the spurious RES
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
     try pump(&a, &b, false);
@@ -2219,7 +2219,7 @@ test "a trust-pin mismatch rejects the peer prekey" {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
         .expected_remote = @as([20]u8, @splat(0xFF)),
     });
     defer a.deinit();
@@ -2230,7 +2230,7 @@ test "a trust-pin mismatch rejects the peer prekey" {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
 

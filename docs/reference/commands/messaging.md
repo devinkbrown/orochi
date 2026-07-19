@@ -79,7 +79,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 ## CHATHISTORY
 
 - Syntax: `CHATHISTORY <subcommand> <target> ...`
-- Description: Parses the IRCv3 CHATHISTORY request, checks visibility, reads the live Lotus history ring, applies optional `+orochi/topic=<label>` filtering, and renders history lines using standard batch framing when appropriate. Retained messages carry message ids and server-time tags; edits update the stored body and redactions tombstone future replay.
+- Description: Parses the IRCv3 CHATHISTORY request, checks visibility, reads the live Lotus history ring, applies optional `+onyx/topic=<label>` filtering, and renders history lines using standard batch framing when appropriate. Retained messages carry message ids and server-time tags; edits update the stored body and redactions tombstone future replay.
 - Privileges: Registered client that negotiated `draft/chathistory`.
 - Parameters: Parsed by the chathistory subsystem from the raw line.
 - Replies: History lines, usually in a `chathistory` `BATCH` when the client has `batch`.

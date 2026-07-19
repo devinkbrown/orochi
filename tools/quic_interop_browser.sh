@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 #
-# Real WebTransport interop test for the Orochi from-scratch QUIC/HTTP3 stack,
+# Real WebTransport interop test for the Onyx Server from-scratch QUIC/HTTP3 stack,
 # driven by a REAL browser (headless Chromium) speaking the actual WebTransport
 # API. Where tools/quic_interop.sh proves QUIC + HTTP/3 against curl, this proves
 # the WebTransport-specific path — Extended CONNECT (`:protocol=webtransport`),
@@ -23,7 +23,7 @@
 #
 # Usage:
 #   tools/quic_interop_browser.sh
-#   OROCHI_QUIC_DEBUG=1 tools/quic_interop_browser.sh   # server-side QUIC trace
+#   ONYX_QUIC_DEBUG=1 tools/quic_interop_browser.sh   # server-side QUIC trace
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

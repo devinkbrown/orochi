@@ -152,8 +152,8 @@ const v2_flags_none: u8 = 0;
 const v2_header_len: usize = v2_magic.len + 1 + 1 + 1 + 1 + 8 + 8 + 2 + 2 + 2 + pubkey_len + sig_len;
 pub const max_v2_encoded_len: usize = v2_header_len + max_origin_len + max_subject_len + max_message_len;
 const max_v2_transcript_len: usize = v2_magic.len + 1 + 1 + 1 + 8 + 8 + 2 + max_origin_len + 2 + max_subject_len + 2 + max_message_len;
-const sign_domain = "orochi-s2s-oper-event-v2";
-const event_id_domain = "orochi-s2s-oper-event-id-v2";
+const sign_domain = "onyx-s2s-oper-event-v2";
+const event_id_domain = "onyx-s2s-oper-event-id-v2";
 
 pub fn encodedLenV2(ev: SignedOperEventV2) Error!usize {
     try validateV2(ev, true);

@@ -3,7 +3,7 @@
 
 // Zero-dependency browser WebTransport interop harness (Node built-ins only).
 //
-// Proves the Orochi from-scratch WebTransport server interoperates with a REAL
+// Proves the Onyx Server from-scratch WebTransport server interoperates with a REAL
 // browser (headless Chromium) speaking the actual WebTransport API:
 //   1. Extended CONNECT (`:protocol=webtransport`) -> `await wt.ready`
 //   2. a WT bidi stream: write a known payload, read the echo, assert byte-exact
@@ -13,13 +13,13 @@
 // as secure (localhost), so we serve the test page over plain HTTP on 127.0.0.1
 // and the page connects to `https://127.0.0.1:<P>/echo`. Chrome accepts the
 // self-signed server cert via `serverCertificateHashes` (requires the cert be
-// ECDSA-P256, <=14-day validity, hash = SHA-256 of the cert DER) -- the Orochi
+// ECDSA-P256, <=14-day validity, hash = SHA-256 of the cert DER) -- the Onyx Server
 // WT interop server mints exactly that and prints PORT + CERTHASH.
 //
 // Usage:
 //   node tools/quic_interop_browser.mjs --port <UDP> --certhash <HEX>
 //     [--http-port <N>] [--chromium <path>] [--timeout-ms <N>]
-//   (or via env: OROCHI_WT_PORT / OROCHI_WT_CERTHASH / CHROMIUM)
+//   (or via env: ONYX_WT_PORT / ONYX_WT_CERTHASH / CHROMIUM)
 //
 // Exit 0 on a byte-exact bidi + datagram echo; non-zero with detail otherwise.
 
@@ -34,8 +34,8 @@ function argOf(name) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
 }
 
-const udpPort = argOf('port') ?? process.env.OROCHI_WT_PORT;
-const certHashHex = (argOf('certhash') ?? process.env.OROCHI_WT_CERTHASH ?? '').trim().toLowerCase();
+const udpPort = argOf('port') ?? process.env.ONYX_WT_PORT;
+const certHashHex = (argOf('certhash') ?? process.env.ONYX_WT_CERTHASH ?? '').trim().toLowerCase();
 const httpPort = parseInt(argOf('http-port') ?? '0', 10); // 0 -> ephemeral
 const chromiumBin = argOf('chromium') ?? process.env.CHROMIUM ?? '/usr/bin/chromium';
 const hardTimeoutMs = parseInt(argOf('timeout-ms') ?? '25000', 10);
@@ -49,14 +49,14 @@ if (!udpPort || !/^\d+$/.test(String(udpPort))) die('missing/invalid --port (ser
 if (!/^[0-9a-f]{64}$/.test(certHashHex)) die(`missing/invalid --certhash (need 64 hex chars), got '${certHashHex}'`);
 
 // Known payloads asserted byte-exact on the round trip.
-const BIDI_PAYLOAD = 'orochi-wt-ping';
-const DGRAM_PAYLOAD = 'orochi-wt-datagram';
+const BIDI_PAYLOAD = 'onyx-wt-ping';
+const DGRAM_PAYLOAD = 'onyx-wt-datagram';
 
 // ---- the test page --------------------------------------------------------
 
 function pageHtml() {
   // The cert hash is injected as a hex string; the page rebuilds the Uint8Array.
-  return `<!doctype html><meta charset="utf-8"><title>orochi wt interop</title>
+  return `<!doctype html><meta charset="utf-8"><title>onyx wt interop</title>
 <body><pre id="log"></pre><script>
 const UDP_PORT = ${JSON.stringify(String(udpPort))};
 const CERT_HASH_HEX = ${JSON.stringify(certHashHex)};
@@ -244,7 +244,7 @@ server.listen(httpPort, '127.0.0.1', () => {
     '--disable-dev-shm-usage',
     '--disable-gpu',
     // A throwaway profile dir keeps runs hermetic.
-    `--user-data-dir=${process.env.TMPDIR || '/tmp'}/orochi-wt-chrome-${process.pid}`,
+    `--user-data-dir=${process.env.TMPDIR || '/tmp'}/onyx-wt-chrome-${process.pid}`,
     pageUrl,
   ];
   console.log(`[browser-harness] launching ${chromiumBin} ${args.join(' ')}`);

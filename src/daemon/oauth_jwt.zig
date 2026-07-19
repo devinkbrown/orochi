@@ -303,14 +303,14 @@ fn fixedNow() i64 {
 
 test "HS256 OAuth verifier accepts issuer audience and subject" {
     const allocator = std.testing.allocator;
-    const claims = "{\"iss\":\"issuer-a\",\"aud\":\"orochi\",\"sub\":\"alice\",\"exp\":1100}";
+    const claims = "{\"iss\":\"issuer-a\",\"aud\":\"onyx\",\"sub\":\"alice\",\"exp\":1100}";
     const token = try jwt.sign(allocator, claims, .HS256, .{ .HS256 = "secret" });
     defer allocator.free(token);
 
     var verifier = Verifier{
         .key = .{ .hs256 = "secret" },
         .issuer = "issuer-a",
-        .audience = "orochi",
+        .audience = "onyx",
         .account_claim = "sub",
         .nowFn = fixedNow,
     };
@@ -321,7 +321,7 @@ test "HS256 OAuth verifier accepts issuer audience and subject" {
     var wrong = Verifier{
         .key = .{ .hs256 = "wrong" },
         .issuer = "issuer-a",
-        .audience = "orochi",
+        .audience = "onyx",
         .account_claim = "sub",
         .nowFn = fixedNow,
     };
@@ -330,7 +330,7 @@ test "HS256 OAuth verifier accepts issuer audience and subject" {
 
 test "OAuth verifier rejects expired and mismatched audience tokens" {
     const allocator = std.testing.allocator;
-    const expired = try jwt.sign(allocator, "{\"iss\":\"issuer-a\",\"aud\":\"orochi\",\"sub\":\"alice\",\"exp\":999}", .HS256, .{ .HS256 = "secret" });
+    const expired = try jwt.sign(allocator, "{\"iss\":\"issuer-a\",\"aud\":\"onyx\",\"sub\":\"alice\",\"exp\":999}", .HS256, .{ .HS256 = "secret" });
     defer allocator.free(expired);
     const wrong_aud = try jwt.sign(allocator, "{\"iss\":\"issuer-a\",\"aud\":\"other\",\"sub\":\"alice\",\"exp\":1100}", .HS256, .{ .HS256 = "secret" });
     defer allocator.free(wrong_aud);
@@ -338,7 +338,7 @@ test "OAuth verifier rejects expired and mismatched audience tokens" {
     var verifier = Verifier{
         .key = .{ .hs256 = "secret" },
         .issuer = "issuer-a",
-        .audience = "orochi",
+        .audience = "onyx",
         .account_claim = "sub",
         .nowFn = fixedNow,
     };
@@ -362,7 +362,7 @@ test "JWKS EC key parses and verifies ES256 token" {
 
     const header = try jwt.base64UrlEncodeAlloc(allocator, "{\"alg\":\"ES256\",\"typ\":\"JWT\"}");
     defer allocator.free(header);
-    const payload = try jwt.base64UrlEncodeAlloc(allocator, "{\"iss\":\"issuer-a\",\"aud\":[\"other\",\"orochi\"],\"sub\":\"alice\",\"exp\":1100}");
+    const payload = try jwt.base64UrlEncodeAlloc(allocator, "{\"iss\":\"issuer-a\",\"aud\":[\"other\",\"onyx\"],\"sub\":\"alice\",\"exp\":1100}");
     defer allocator.free(payload);
     const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header, payload });
     defer allocator.free(signing_input);
@@ -376,7 +376,7 @@ test "JWKS EC key parses and verifies ES256 token" {
     var verifier = Verifier{
         .key = owned.key,
         .issuer = "issuer-a",
-        .audience = "orochi",
+        .audience = "onyx",
         .account_claim = "sub",
         .nowFn = fixedNow,
     };

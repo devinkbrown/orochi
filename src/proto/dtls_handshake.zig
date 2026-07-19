@@ -308,7 +308,7 @@ test "fragment 1000-byte body into 300-byte fragments and reassemble" {
 }
 
 test "HelloVerifyRequest cookie round-trip" {
-    const cookie = "orochi-cookie";
+    const cookie = "onyx-cookie";
     var buf: [64]u8 = undefined;
     const body = try encodeHelloVerifyRequest(cookie, &buf);
 

@@ -467,7 +467,7 @@ const BlockTagWriter = struct {
 
     fn appendComponent(self: *BlockTagWriter, component: []const u8) void {
         if (self.count >= 8) return;
-        const prefix = "+orochi/block-kit=v1";
+        const prefix = "+onyx/block-kit=v1";
         const prefix_len = if (self.len == 0) prefix.len else 0;
         if (self.len + prefix_len + component.len > self.buf.len) return;
         if (self.len == 0) {
@@ -756,7 +756,7 @@ test "blocks render section context and action fallbacks" {
     try testing.expectEqualStrings("[select] Promote to: staging, prod", it.next().?);
     try testing.expect(it.next() == null);
     try testing.expectEqualStrings(
-        "+orochi/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3|s:Promote%20to,o:staging~prod",
+        "+onyx/block-kit=v1|b:Open%20run,u:https%3A%2F%2Fci.example%2Frun%2F3|s:Promote%20to,o:staging~prod",
         post.clientTags().?,
     );
 }
@@ -771,7 +771,7 @@ test "blocks sanitize interactive fallback text" {
     try renderBody(body, &post);
     try testing.expectEqualStrings("[button] OpenPRIVMSG #x :bad <https://ok.example>", post.body());
     try testing.expectEqualStrings(
-        "+orochi/block-kit=v1|b:OpenPRIVMSG%20%23x%20%3Abad,u:https%3A%2F%2Fok.example",
+        "+onyx/block-kit=v1|b:OpenPRIVMSG%20%23x%20%3Abad,u:https%3A%2F%2Fok.example",
         post.clientTags().?,
     );
     try testing.expect(std.mem.indexOfScalar(u8, post.body(), '\r') == null);

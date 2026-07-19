@@ -5,7 +5,7 @@
 //!
 //! When the operator configures no `[node] secret_key`, the daemon still turns
 //! the PQ-secured Mooring mesh on: it loads the 32-byte Ed25519 seed from a
-//! keyfile next to the config (`orochi-node.key`), generating a fresh random
+//! keyfile next to the config (`onyx-server-node.key`), generating a fresh random
 //! seed and persisting it (owner-only, 0600) on first boot. An explicitly
 //! configured `secret_key` always wins and never touches the keyfile.
 //!
@@ -21,7 +21,7 @@ pub const hex_len = seed_len * 2;
 
 /// Keyfile basename, placed next to the config file (or in the CWD when the
 /// daemon boots without a config path).
-pub const default_basename = "orochi-node.key";
+pub const default_basename = "onyx-server-node.key";
 
 /// Largest keyfile we will read: the hex seed plus generous whitespace slack.
 const max_keyfile_bytes = 4096;
@@ -47,7 +47,7 @@ pub const IdentityValidationError = error{
 };
 
 /// Derive the keyfile path: alongside the config file when one was used,
-/// otherwise `orochi-node.key` relative to the CWD. Caller owns the slice.
+/// otherwise `onyx-server-node.key` relative to the CWD. Caller owns the slice.
 pub fn derivePath(allocator: std.mem.Allocator, config_path: ?[]const u8) ![]u8 {
     if (config_path) |cp| {
         if (std.fs.path.dirname(cp)) |dir_name| {
@@ -189,11 +189,11 @@ test "parseSeedHex rejects wrong lengths and non-hex input" {
 }
 
 test "derivePath places the keyfile next to the config, or in the CWD" {
-    const beside = try derivePath(testing.allocator, "/etc/orochi/orochi.toml");
+    const beside = try derivePath(testing.allocator, "/etc/onyx/onyx-server.toml");
     defer testing.allocator.free(beside);
-    try testing.expectEqualStrings("/etc/orochi/" ++ default_basename, beside);
+    try testing.expectEqualStrings("/etc/onyx-server/" ++ default_basename, beside);
 
-    const bare = try derivePath(testing.allocator, "orochi.toml"); // no dir component
+    const bare = try derivePath(testing.allocator, "onyx_server.toml"); // no dir component
     defer testing.allocator.free(bare);
     try testing.expectEqualStrings(default_basename, bare);
 
@@ -206,25 +206,25 @@ test "loadOrCreate generates once, persists 0600, and reloads the same seed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const first = try loadOrCreate(testing.allocator, testing.io, tmp.dir, "orochi-node.key");
+    const first = try loadOrCreate(testing.allocator, testing.io, tmp.dir, "onyx-server-node.key");
     try testing.expectEqual(Source.generated, first.source);
 
     // The persisted body is exactly the hex line and parses back to the seed.
-    const text = try tmp.dir.readFileAlloc(testing.io, "orochi-node.key", testing.allocator, .limited(max_keyfile_bytes));
+    const text = try tmp.dir.readFileAlloc(testing.io, "onyx-server-node.key", testing.allocator, .limited(max_keyfile_bytes));
     defer testing.allocator.free(text);
     try testing.expectEqual(@as(usize, hex_len + 1), text.len);
     try testing.expectEqual(first.seed, try parseSeedHex(text));
 
     // Owner-only: no group/other permission bits on POSIX targets.
     if (comptime @hasDecl(std.Io.File.Permissions, "toMode")) {
-        var file = try tmp.dir.openFile(testing.io, "orochi-node.key", .{ .mode = .read_only, .allow_directory = false });
+        var file = try tmp.dir.openFile(testing.io, "onyx-server-node.key", .{ .mode = .read_only, .allow_directory = false });
         defer file.close(testing.io);
         const stat = try file.stat(testing.io);
         try testing.expectEqual(@as(@TypeOf(stat.permissions.toMode()), 0), stat.permissions.toMode() & 0o077);
     }
 
     // Second boot loads the same identity instead of generating a new one.
-    const second = try loadOrCreate(testing.allocator, testing.io, tmp.dir, "orochi-node.key");
+    const second = try loadOrCreate(testing.allocator, testing.io, tmp.dir, "onyx-server-node.key");
     try testing.expectEqual(Source.loaded, second.source);
     try testing.expectEqual(first.seed, second.seed);
 }
@@ -233,11 +233,11 @@ test "loadOrCreate refuses to clobber a corrupt keyfile" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "orochi-node.key", .data = "not a seed\n" });
-    try testing.expectError(error.BadSeed, loadOrCreate(testing.allocator, testing.io, tmp.dir, "orochi-node.key"));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "onyx-server-node.key", .data = "not a seed\n" });
+    try testing.expectError(error.BadSeed, loadOrCreate(testing.allocator, testing.io, tmp.dir, "onyx-server-node.key"));
 
     // The corrupt file is left untouched for the operator to inspect.
-    const text = try tmp.dir.readFileAlloc(testing.io, "orochi-node.key", testing.allocator, .limited(max_keyfile_bytes));
+    const text = try tmp.dir.readFileAlloc(testing.io, "onyx-server-node.key", testing.allocator, .limited(max_keyfile_bytes));
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("not a seed\n", text);
 }

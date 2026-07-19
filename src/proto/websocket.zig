@@ -5,7 +5,7 @@
 //!
 //! This module is intentionally allocation-free: callers provide request,
 //! response, frame, and payload buffers. It covers the browser-client side of
-//! the protocol that Orochi needs for IRC-over-WebSocket frontends.
+//! the protocol that Onyx Server needs for IRC-over-WebSocket frontends.
 const std = @import("std");
 
 const Sha1 = std.crypto.hash.Sha1;
@@ -681,7 +681,7 @@ test "known RFC masked frame decodes expected payload" {
 }
 
 test "masked and unmasked frames round trip" {
-    const client_payload = "PRIVMSG #orochi :hello\r\n";
+    const client_payload = "PRIVMSG #onyx :hello\r\n";
     var encoded_buf: [128]u8 = undefined;
     const encoded = try encodeFrame(128, .{
         .opcode = .text,
@@ -694,7 +694,7 @@ test "masked and unmasked frames round trip" {
     try std.testing.expectEqualStrings(client_payload, decoded.frame.payload);
     try std.testing.expectEqual(encoded.len, decoded.consumed);
 
-    const server_payload = "PING :orochi\r\n";
+    const server_payload = "PING :onyx\r\n";
     const server_encoded = try encodeFrame(128, .{ .opcode = .text }, server_payload, &encoded_buf);
     const server_decoded = try decodeFrame(128, .server_to_client, server_encoded, &.{});
     try std.testing.expect(!server_decoded.frame.masked);
@@ -865,7 +865,7 @@ test "deframer accepts a large binary media frame above the IRC-line limit" {
 }
 
 test "irc line helper extracts complete lines only" {
-    const first = nextIrcLine("NICK example\r\nUSER m 0 * :Orochi\r\n").?;
+    const first = nextIrcLine("NICK example\r\nUSER m 0 * :Onyx\r\n").?;
     try std.testing.expectEqualStrings("NICK example", first.line);
     try std.testing.expectEqual(@as(usize, 14), first.consumed);
     try std.testing.expect(nextIrcLine("PRIVMSG #chan :partial") == null);

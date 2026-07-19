@@ -1448,7 +1448,7 @@ const row_excluded_count_offset: usize = row_required_count_offset + 4;
 const row_prefix_len: usize = @sizeOf(RelayId) + message_relay_v2.pubkey_len + 8 + 8 + 4 + 4 + 4 + 4;
 const cursor_entry_len: usize = @sizeOf(u64) + message_relay_v2.pubkey_len;
 const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
-const checkpoint_checksum_domain = "orochi-relay-v2-event-log-checkpoint-v3";
+const checkpoint_checksum_domain = "onyx-relay-v2-event-log-checkpoint-v3";
 
 fn checkpointChecksum(prefix: []const u8, out: *[checksum_len]u8) void {
     var h = std.crypto.hash.Blake3.init(.{});

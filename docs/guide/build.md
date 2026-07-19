@@ -74,7 +74,7 @@ install so `zig build` stays a fast debug binary install. By default it stages u
 `zig-out/`; use `--prefix <dir>` for a release staging directory:
 
 ```sh
-zig build package --prefix /tmp/orochi-stage
+zig build package --prefix /tmp/onyx-server-stage
 ```
 
 The staged layout is:
@@ -82,7 +82,7 @@ The staged layout is:
 | Path | Contents |
 |---|---|
 | `bin/onyx-server` | ReleaseFast stripped daemon |
-| `etc/orochi/orochi.reference.toml` | Annotated reference config |
+| `etc/onyx-server/onyx-server.reference.toml` | Annotated reference config |
 | `lib/systemd/system/onyx-server.service` | systemd unit for production deployment |
 
 See the [runbook](../RUNBOOK.md) for install, reload, and rollback procedures.

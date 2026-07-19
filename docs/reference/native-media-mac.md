@@ -64,10 +64,10 @@ PRF root (`native_stream_key`); the 32-bit `stream_id` is not key material
 (`src/daemon/server.zig:2789-2794`, `src/substrate/cadence_frame.zig:248-268`):
 
 ```text
-PRK     = HMAC-SHA256("orochi native-media mac extract v1", native_stream_key)
+PRK     = HMAC-SHA256("onyx native-media mac extract v1", native_stream_key)
 mac_key = HMAC-SHA256(
             PRK,
-            "orochi native-media datagram mac v1" || 0x00 ||
+            "onyx native-media datagram mac v1" || 0x00 ||
             channel || 0x00 ||
             participant || 0x01)
 ```

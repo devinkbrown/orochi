@@ -168,7 +168,7 @@ fn upperHex(nibble: u8) u8 {
 }
 
 test "decodeDigest round-trips a formatted sha-256 fingerprint" {
-    const cert = "orochi dtls certificate";
+    const cert = "onyx dtls certificate";
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(cert, &digest, .{});
 
@@ -204,7 +204,7 @@ test "decodeDigest is fail-closed on malformed hex" {
 }
 
 test "compute sha-256 matches std" {
-    const cert = "orochi dtls certificate";
+    const cert = "onyx dtls certificate";
     var expected: [Sha256.digest_length]u8 = undefined;
     var actual: [Sha256.digest_length]u8 = undefined;
 
@@ -215,7 +215,7 @@ test "compute sha-256 matches std" {
 }
 
 test "format sha-256 has prefix uppercase colon hex and parses back" {
-    const cert = "orochi dtls certificate";
+    const cert = "onyx dtls certificate";
     var out: [128]u8 = undefined;
 
     const line = try format(.sha256, cert, &out);
@@ -240,7 +240,7 @@ test "format sha-256 has prefix uppercase colon hex and parses back" {
 }
 
 test "formatDigest accepts sha-1 digest" {
-    const cert = "orochi dtls certificate";
+    const cert = "onyx dtls certificate";
     var digest: [Sha1.digest_length]u8 = undefined;
     var out: [80]u8 = undefined;
 
@@ -260,7 +260,7 @@ test "parse rejects unsupported token" {
 }
 
 test "buffer too small" {
-    const cert = "orochi dtls certificate";
+    const cert = "onyx dtls certificate";
     var digest: [Sha256.digest_length - 1]u8 = undefined;
     var out: ["sha-256 ".len + 95 - 1]u8 = undefined;
 

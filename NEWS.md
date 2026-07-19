@@ -334,14 +334,14 @@ primitive, on top of the 0.2.0 security base.
   (`feat(webauthn): verify registration attestation + optional require_uv`)
 - **Named conversations (topics) within a channel.** A calm, opt-in threading
   model that rides existing IRCv3 machinery — no new persistence:
-  - Message tag `+orochi/topic=<label>` on channel `PRIVMSG`/`NOTICE` names the
+  - Message tag `+onyx/topic=<label>` on channel `PRIVMSG`/`NOTICE` names the
     conversation a message belongs to (label ≤ 50 bytes; no control chars, CR,
     LF, DEL, or comma; invalid labels are stripped fail-closed).
-  - Channel registry PROP `orochi.topics` — a comma-delimited list (≤ 64 labels,
+  - Channel registry PROP `onyx_server.topics` — a comma-delimited list (≤ 64 labels,
     ≤ 400 bytes) that auto-grows as topics are used and is op-manageable; it
     persists and mesh-propagates through the signed `CHANNEL_PROP` CRDT store,
     exactly like pins and ephemeral settings.
-  - `CHATHISTORY` accepts an optional `+orochi/topic=<label>` tag to replay only
+  - `CHATHISTORY` accepts an optional `+onyx/topic=<label>` tag to replay only
     a single conversation; absent = all messages.
   Untagged messages and non-tag clients are a pure pass-through — byte-identical
   on the wire when the feature is unused.
@@ -351,7 +351,7 @@ primitive, on top of the 0.2.0 security base.
   (`feat(webhook): Discord-compatible incoming webhook endpoint`)
 - **v1.0 "Gateway" packaging.** Reproducible, signed release tooling and a
   self-host quickstart: `packaging/release.sh`, `verify-release.sh`, a Dockerfile,
-  and `orochi.quickstart.toml` (`docker run` → live chat in ~60s).
+  and `onyx-server.quickstart.toml` (`docker run` → live chat in ~60s).
   (`feat(packaging): v1.0 Gateway self-host quickstart + reproducible signed release`)
 
 ### Notes

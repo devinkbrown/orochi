@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure CLEAR USERS mass-kick planning for the Orochi daemon.
+//! Pure CLEAR USERS mass-kick planning for the Onyx Server daemon.
 //!
 //! This module parses a real IRC command shape (`CLEAR <channel> USERS ...`),
 //! plans real `KICK` commands from an injected membership snapshot, and can

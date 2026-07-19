@@ -1169,14 +1169,14 @@ fn nowNs() u64 {
 }
 
 /// Diagnostic tracing for QUIC/HTTP3 interop debugging, gated on the
-/// `OROCHI_QUIC_DEBUG` environment variable (any non-empty value enables it).
+/// `ONYX_QUIC_DEBUG` environment variable (any non-empty value enables it).
 /// Off by default and zero-cost on the hot path beyond the env check; intended
 /// for `tools/quic_interop.sh` runs and field interop triage, never normal
 /// operation.
 var dbg_enabled: ?bool = null;
 fn dbg(comptime fmt: []const u8, args: anytype) void {
     const on = dbg_enabled orelse blk: {
-        const enabled = envIsSet("OROCHI_QUIC_DEBUG");
+        const enabled = envIsSet("ONYX_QUIC_DEBUG");
         dbg_enabled = enabled;
         break :blk enabled;
     };
@@ -2006,7 +2006,7 @@ test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
             return error.CurlFailed;
         },
     }
-    try testing.expect(asciiContainsIgnoreCase(res.stdout, "orochi quic ok"));
+    try testing.expect(asciiContainsIgnoreCase(res.stdout, "onyx quic ok"));
 }
 
 /// The deterministic `/big` body byte at absolute offset `i` — mirrors
@@ -2134,7 +2134,7 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
             },
             else => return error.CurlFailed,
         }
-        try testing.expect(asciiContainsIgnoreCase(res.stdout, "orochi quic ok"));
+        try testing.expect(asciiContainsIgnoreCase(res.stdout, "onyx quic ok"));
 
         lst.shutdown();
     }

@@ -29,12 +29,12 @@ pub const attachment_lease_magic = [_]u8{ 'S', 'R', 'L', '3' };
 pub const checkpoint_magic = [_]u8{ 'S', 'R', 'C', '3' };
 pub const checkpoint_version: u8 = 2;
 
-pub const offer_sign_domain = "orochi-session-replica-attachment-offer-v3";
-pub const ack_sign_domain = "orochi-session-replica-attachment-ack-v3";
-pub const revoke_sign_domain = "orochi-session-replica-attachment-revoke-v3";
-pub const attachment_lease_sign_domain = "orochi-session-replica-attachment-lease-v3";
-const checkpoint_digest_domain = "orochi-session-replica-attachment-checkpoint-v2\x00";
-const account_digest_domain = "orochi-session-replica-attachment-account-v1\x00";
+pub const offer_sign_domain = "onyx-session-replica-attachment-offer-v3";
+pub const ack_sign_domain = "onyx-session-replica-attachment-ack-v3";
+pub const revoke_sign_domain = "onyx-session-replica-attachment-revoke-v3";
+pub const attachment_lease_sign_domain = "onyx-session-replica-attachment-lease-v3";
+const checkpoint_digest_domain = "onyx-session-replica-attachment-checkpoint-v2\x00";
+const account_digest_domain = "onyx-session-replica-attachment-account-v1\x00";
 
 pub const max_account_len: usize = 64;
 pub const max_nick_len: usize = 64;
@@ -2052,7 +2052,7 @@ fn quarantineRecordIdentityDigest(scope: QuarantineScope, record: AnyRecord) Dig
 fn quarantineIdentityDigest(scope: QuarantineScope, token: Token, account_digest: Digest) Digest {
     if (scope == .token) return account_digest;
     var hasher = std.crypto.hash.Blake3.init(.{});
-    hasher.update("orochi-session-replica-attachment-quarantine-id-v1\x00");
+    hasher.update("onyx-session-replica-attachment-quarantine-id-v1\x00");
     hasher.update(&token);
     hasher.update(&account_digest);
     var digest: Digest = undefined;

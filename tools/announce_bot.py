@@ -2,18 +2,32 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Orochi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
-stats, changelog, progress, and planning, with the feature set of a normal IRC bot:
-IRCv3 CAP negotiation + optional SASL PLAIN, nick recovery (433), CTCP, rich
-!commands (channel + PM), admin (say/announce/topic/raw), auto-rejoin on KICK,
-uptime, throttled git commit watcher, periodic heartbeat, non-blocking paced
-output, and auto-reconnect with exponential backoff.
+"""Multi-project announce bot — lives in #root on the Onyx network (eshmaki.me) and
+announces build stats, changelog, progress, and planning for BOTH the Onyx
+(SolidJS web client) and Onyx Server (pure-Zig IRC daemon) repos from a single IRC
+presence, with the feature set of a normal IRC bot:
+IRCv3 CAP negotiation + optional SASL PLAIN, PASS, nick recovery (433), CTCP, rich
+!commands (channel + PM, each accepting an optional project name), admin
+(say/announce/topic/raw), auto-rejoin on KICK, uptime, per-project throttled git
+commit watcher, periodic heartbeat, non-blocking paced output, and auto-reconnect
+with exponential backoff.
 
-Config via env:
-  ORO_SERVER ORO_PORT ORO_NICK ORO_CHANNEL ORO_REPO ORO_ADMIN
-  ORO_PASS        — server password (PASS), optional
-  ORO_SASL_USER   — SASL PLAIN account, optional (enables SASL when the server offers it)
-  ORO_SASL_PASS   — SASL PLAIN password (defaults to ORO_PASS)
+This replaces two nearly-identical single-project bots (one nicked "Onyx" watching
+/home/kain/onyx, one nicked "Orochi" watching the old /home/kain/orochi path) with
+one process that watches both repos and tags each announcement with a colored
+[onyx]/[onyx-server] prefix. Legacy !commands still accept "orochi" as an alias
+for onyx-server.
+
+Config via env (new ANNOUNCE_* names; old ORO_* names are read as fallbacks so
+existing systemd unit overrides keep working):
+  ANNOUNCE_SERVER ANNOUNCE_PORT ANNOUNCE_NICK ANNOUNCE_CHANNEL ANNOUNCE_ADMIN
+  ANNOUNCE_PASS        — server password (PASS), optional
+  ANNOUNCE_SASL_USER   — SASL PLAIN account, optional (enables SASL when offered)
+  ANNOUNCE_SASL_PASS   — SASL PLAIN password (defaults to ANNOUNCE_PASS)
+  ANNOUNCE_DEBUG       — any truthy value enables DEBUG logging
+
+Repo paths, per-project labels, and blurb/changelog text are NOT configurable via
+env — they live in PROJECTS below, one entry per watched repo.
 """
 from __future__ import annotations
 
@@ -22,29 +36,37 @@ import logging
 import os
 import re
 import select
+import shlex
 import socket
 import subprocess
 import time
 from collections import deque
+from dataclasses import dataclass, field
 
-SERVER = os.environ.get("ORO_SERVER", "127.0.0.1")
-PORT = int(os.environ.get("ORO_PORT", "6667"))
-NICK = os.environ.get("ORO_NICK", "Orochi")
-CHANNEL = os.environ.get("ORO_CHANNEL", "#root")
-REPO = os.environ.get("ORO_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ADMIN = os.environ.get("ORO_ADMIN", "")  # nick allowed to run admin cmds
-PASSWORD = os.environ.get("ORO_PASS", "")
-SASL_USER = os.environ.get("ORO_SASL_USER", "")
-SASL_PASS = os.environ.get("ORO_SASL_PASS", PASSWORD)
 
-POLL_SECS = 15  # how often to check git HEAD for new commits
+def _env(new: str, old: str, default: str = "") -> str:
+    """Read ANNOUNCE_* first, falling back to the legacy ORO_* name."""
+    return os.environ.get(new, os.environ.get(old, default))
+
+
+SERVER = _env("ANNOUNCE_SERVER", "ORO_SERVER", "127.0.0.1")
+PORT = int(_env("ANNOUNCE_PORT", "ORO_PORT", "6667"))
+NICK = _env("ANNOUNCE_NICK", "ORO_NICK", "Announce")
+CHANNEL = _env("ANNOUNCE_CHANNEL", "ORO_CHANNEL", "#root")
+ADMIN = _env("ANNOUNCE_ADMIN", "ORO_ADMIN", "")  # nick allowed to run admin cmds
+PASSWORD = _env("ANNOUNCE_PASS", "ORO_PASS", "")
+SASL_USER = _env("ANNOUNCE_SASL_USER", "ORO_SASL_USER", "")
+SASL_PASS = _env("ANNOUNCE_SASL_PASS", "ORO_SASL_PASS", PASSWORD)
+DEBUG = bool(_env("ANNOUNCE_DEBUG", "ORO_DEBUG", ""))
+
+POLL_SECS = 15  # how often to check git HEAD for new commits, per project
 HEARTBEAT_SECS = 6 * 3600
 SEND_INTERVAL = 0.4  # min seconds between queued outbound lines (anti-flood)
 RECONNECT_MIN, RECONNECT_MAX = 6, 300
 MAX_MESSAGE_TEXT_BYTES = 360  # stay comfortably under IRC's 512-byte line cap
 # IRCv3 caps we use if the server offers them (graceful degrade otherwise).
 WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
-VERSION = "Orochi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
+VERSION = "Announce-bot 3.1 (multi-project: Onyx SolidJS · Onyx Server Zig)"
 START = time.time()
 PROTECTED_TOPIC_CHANNELS = {"#root"}
 
@@ -64,54 +86,223 @@ TYPE_COLOR = {
     "chore": SILVER, "perf": YEL, "build": BLUE, "ci": GREY, "style": PURPLE,
     "revert": ORANGE,
 }
+# Conventional-commit type -> glyph for richer commit announcements.
+TYPE_GLYPH = {
+    "feat": "✨", "fix": "\U0001f41b", "docs": "\U0001f4dd", "refactor": "♻️",
+    "test": "✅", "chore": "\U0001f527", "perf": "⚡", "build": "\U0001f3d7️",
+    "ci": "\U0001f916", "style": "\U0001f3a8", "revert": "⏪",
+}
 
 log = logging.getLogger("announce")
 
 
-def git(*a: str) -> str:
+@dataclass(frozen=True)
+class Project:
+    """Everything that differs between the projects this bot watches."""
+
+    key: str  # short id used in commands, e.g. "onyx"
+    name: str  # display name, e.g. "Onyx"
+    emoji: str  # leading glyph for the project blurb
+    accent: str  # mIRC color code used for the [key] tag + blurb heading
+    repo: str  # absolute path to the git repo
+    module_label: str  # "components" or "modules"
+    module_cmd: str  # shell command (bash -lc) returning a module/component count
+    loc_cmd: str  # shell command (bash -lc) returning a total LOC count
+    test_fallback_cmd: str | None  # optional shell command counting test files
+    stats_suffix: str  # trailing tag on the !stats build line, e.g. "Solid+Vite"
+    topic_label: str  # label used in the shared TOPIC, e.g. "Orochi M2"
+    user_realname: str  # USER command real-name field
+    project_lines: tuple[str, ...]  # !project / intro blurb, verbatim from source
+    roadmap: tuple[str, ...]  # !plan / !roadmap lines, verbatim from source
+    progress_text: str  # !progress / !status one-liner (module/test counts filled in)
+
+
+def _quoted_find_tsx(repo: str) -> str:
+    q = shlex.quote(repo)
+    return (
+        f"find {q} -name '*.tsx' | grep -vF -e /node_modules/ -e /.next/ "
+        f"-e /out/ -e /dist/ -e /.git/ -e /.wt/ -e /coverage/ | wc -l"
+    )
+
+
+def _quoted_loc_ts(repo: str) -> str:
+    q = shlex.quote(repo)
+    return (
+        f"{{ find {q} -name '*.ts'; find {q} -name '*.tsx'; }} | "
+        f"grep -vF -e /node_modules/ -e /.next/ -e /out/ -e /dist/ -e /.git/ "
+        f"-e /.wt/ -e /coverage/ | xargs cat 2>/dev/null | wc -l"
+    )
+
+
+def _quoted_test_files_ts(repo: str) -> str:
+    q = shlex.quote(repo)
+    return (
+        f"{{ find {q} -name '*.test.ts'; find {q} -name '*.test.tsx'; "
+        f"find {q} -name '*.spec.ts'; find {q} -name '*.spec.tsx'; }} | "
+        f"grep -vF -e /node_modules/ -e /.wt/ | wc -l"
+    )
+
+
+def _quoted_find_zig(repo: str) -> str:
+    q = shlex.quote(repo)
+    return f"find {q}/src -name '*.zig' ! -name 'root.zig' | wc -l"
+
+
+def _quoted_loc_zig(repo: str) -> str:
+    q = shlex.quote(repo)
+    return f"find {q}/src -name '*.zig' ! -name 'root.zig' -exec cat {{}} + | wc -l"
+
+
+ONYX_REPO = "/home/kain/onyx"
+ONYX_SERVER_REPO = "/home/kain/onyx-server"
+
+ONYX = Project(
+    key="onyx",
+    name="Onyx",
+    emoji="\U0001f48e",
+    accent=BLUE,
+    repo=ONYX_REPO,
+    module_label="components",
+    module_cmd=_quoted_find_tsx(ONYX_REPO),
+    loc_cmd=_quoted_loc_ts(ONYX_REPO),
+    test_fallback_cmd=_quoted_test_files_ts(ONYX_REPO),
+    stats_suffix="Solid+Vite",
+    topic_label="Onyx",
+    user_realname="Onyx build announcer",
+    project_lines=(
+        f"{B}{BLUE}\U0001f48e Onyx{RST} — first-party web client for the Onyx network. "
+        f"SolidJS, dark-luxury, mesh-native chat + realtime media (Vite + Solid signals).",
+        f"IRCv3/IRCX over WebSocket, SASL + SESSION-TOKEN resume, local-first vault, "
+        f"Home catch-up, E2EE DMs, Cadence voice/video (hop-honest; no fake padlock).",
+        f"Headline: deep theming + {B}Theme Studio{RST} + animated backgrounds · "
+        f"View Transitions · on-device hybrid search · time-native jump.",
+        f"Built max-parallel (Claude + Codex). repo: {ONYX_REPO}",
+    ),
+    roadmap=(
+        "Era 0 substrate ✔ · vault · push · E2EE DM · Cadence control plane",
+        "Era 1 thesis-visible: Home strata · jump-to-date · passkey primary · ribbon More",
+        "Era 2 app-complete: multi-device session · full MEDIA UI · channel admin",
+        "Era 3 moat: group E2EE · files · mention push · hierarchy",
+    ),
+    progress_text=(
+        f"{B}live{RST}: vault + Home · passkeys · labeled-response · Cadence shield · "
+        f"ribbon More. tests={{tests}}, components={{modules}}. "
+        f"Next: cold vault paint polish, A10 binary release, Era 2 multi-device."
+    ),
+)
+
+ONYX_SERVER = Project(
+    key="onyx-server",
+    name="Onyx Server",
+    emoji="\U0001f409",
+    accent=MAG,
+    repo=ONYX_SERVER_REPO,
+    module_label="modules",
+    module_cmd=_quoted_find_zig(ONYX_SERVER_REPO),
+    loc_cmd=_quoted_loc_zig(ONYX_SERVER_REPO),
+    test_fallback_cmd=None,
+    stats_suffix="zig 0.17",
+    topic_label="Onyx Server",
+    user_realname="Onyx Server build announcer",
+    project_lines=(
+        f"{B}{MAG}\U0001f409 Onyx Server{RST} — pure-Zig IRC/IRCX daemon (AGPL). "
+        f"Formerly codenamed Orochi; same engine, honest name.",
+        f"IRCv3/IRCX + accounts/SASL, multi-session bouncer, Event Spine, and Cadence "
+        f"media conferencing (rooms, roster, hop-secured SFU path).",
+        f"Mesh = Undertow CRDT over Mooring secure S2S, Warden anti-abuse, Tegami "
+        f"offline mail / Web Push. One static musl binary, zero external deps.",
+        f"Built max-parallel (Claude + Codex). repo: {ONYX_SERVER_REPO}",
+    ),
+    roadmap=(
+        "core ✔ · IRCv3/IRCX ✔ · accounts/SASL ✔ · multi-session bouncer ✔ · "
+        "host-cloak/VHOST/CHGHOST ✔",
+        "Warden + flood/clone ✔ · media plane ✔ · Tegami/Web Push ✔ · Helix USR2 ✔",
+        "mesh: Undertow CRDT + Mooring S2S + anti-entropy",
+        "next: public GitHub Release binary (A10) · operator packaging polish",
+    ),
+    progress_text=(
+        f"{B}live{RST}: accounts/SASL · multi-session · media plane · "
+        f"mesh + Helix. tests={{tests}}, modules={{modules}}. "
+        f"Next: attested release artifact, deeper services."
+    ),
+)
+
+PROJECTS: list[Project] = [ONYX, ONYX_SERVER]
+PROJECTS_BY_ALIAS: dict[str, Project] = {}
+for _p in PROJECTS:
+    PROJECTS_BY_ALIAS[_p.key] = _p
+    PROJECTS_BY_ALIAS[_p.name.lower()] = _p
+# Legacy aliases after the Orochi → Onyx Server rename.
+PROJECTS_BY_ALIAS["orochi"] = ONYX_SERVER
+PROJECTS_BY_ALIAS["server"] = ONYX_SERVER
+PROJECTS_BY_ALIAS["daemon"] = ONYX_SERVER
+PROJECTS_BY_ALIAS["onyxserver"] = ONYX_SERVER
+
+
+def select_projects(arg: str) -> list[Project] | None:
+    """Resolve an optional trailing project-name argument.
+
+    Empty arg -> both projects. Recognized name -> that one project.
+    Unrecognized non-empty arg -> None (caller should report an error).
+    """
+    token = arg.strip().lower()
+    if not token:
+        return list(PROJECTS)
+    return [PROJECTS_BY_ALIAS[token]] if token in PROJECTS_BY_ALIAS else None
+
+
+# ---- per-project git helpers ----
+
+
+def git(project: Project, *a: str) -> str:
     try:
         return subprocess.check_output(
-            ["git", "-C", REPO, *a], text=True, stderr=subprocess.DEVNULL
+            ["git", "-C", project.repo, *a], text=True, stderr=subprocess.DEVNULL
         ).strip()
     except Exception:
         return ""
 
 
-def module_count() -> str:
+def module_count(project: Project) -> str:
+    """Count source modules/components for this project, excluding build output."""
     try:
-        return subprocess.check_output(
-            ["bash", "-lc", f"find {REPO}/src -name '*.zig' ! -name 'root.zig' | wc -l"],
-            text=True,
-        ).strip()
+        return subprocess.check_output(["bash", "-lc", project.module_cmd], text=True).strip()
     except Exception:
         return "?"
 
 
-def test_count() -> str:
+def test_count(project: Project) -> str:
     """Best-effort '<n> tests' pulled from recent commit messages."""
-    body = git("log", "-1", "--format=%s") + " " + git("log", "-1", "--format=%b")
+    body = git(project, "log", "-1", "--format=%s") + " " + git(project, "log", "-1", "--format=%b")
     m = re.search(r"(\d+)\s+tests?\s+(?:pass|green|passing)", body)
     if m:
         return m.group(1)
-    for s in git("log", "-15", "--format=%s%n%b").splitlines():
+    for s in git(project, "log", "-15", "--format=%s%n%b").splitlines():
         m = re.search(r"(\d+)\s+tests", s)
         if m:
             return m.group(1)
+    if project.test_fallback_cmd:
+        try:
+            return subprocess.check_output(
+                ["bash", "-lc", project.test_fallback_cmd], text=True
+            ).strip() or "?"
+        except Exception:
+            return "?"
     return "?"
 
 
-def head_line() -> str:
-    return git("log", "-1", "--format=%h %s")
+def head_line(project: Project) -> str:
+    return git(project, "log", "-1", "--format=%h %s")
 
 
-def changed_files(rev: str = "HEAD") -> list[str]:
-    out = git("show", "--stat", "--format=", rev)
+def changed_files(project: Project, rev: str = "HEAD") -> list[str]:
+    out = git(project, "show", "--stat", "--format=", rev)
     return [l.strip() for l in out.splitlines() if l.strip()][:8]
 
 
-def commit_stat(rev: str = "HEAD") -> str:
+def commit_stat(project: Project, rev: str = "HEAD") -> str:
     """One-line diffstat like '7 files, +312/-40'."""
-    out = git("show", "--shortstat", "--format=", rev)
+    out = git(project, "show", "--shortstat", "--format=", rev)
     files = re.search(r"(\d+) files? changed", out)
     ins = re.search(r"(\d+) insertions?", out)
     dele = re.search(r"(\d+) deletions?", out)
@@ -126,29 +317,17 @@ def commit_stat(rev: str = "HEAD") -> str:
     return " ".join(parts) if parts else "no file changes"
 
 
-def loc_count() -> str:
+def loc_count(project: Project) -> str:
     try:
-        out = subprocess.check_output(
-            ["bash", "-lc",
-             f"find {REPO}/src -name '*.zig' ! -name 'root.zig' -exec cat {{}} + | wc -l"],
-            text=True,
-        ).strip()
+        out = subprocess.check_output(["bash", "-lc", project.loc_cmd], text=True).strip()
         n = int(out)
         return f"{n/1000:.1f}k" if n >= 1000 else str(n)
     except Exception:
         return "?"
 
 
-# Conventional-commit type -> glyph for richer commit announcements.
-TYPE_GLYPH = {
-    "feat": "✨", "fix": "\U0001f41b", "docs": "\U0001f4dd", "refactor": "♻️",
-    "test": "✅", "chore": "\U0001f527", "perf": "⚡", "build": "\U0001f3d7️",
-    "ci": "\U0001f916", "style": "\U0001f3a8", "revert": "⏪",
-}
-
-
-def commit_field(fmt: str, rev: str = "HEAD") -> str:
-    return git("log", "-1", f"--format={fmt}", rev)
+def commit_field(project: Project, fmt: str, rev: str = "HEAD") -> str:
+    return git(project, "log", "-1", f"--format={fmt}", rev)
 
 
 def commit_type(subject: str) -> str:
@@ -164,36 +343,24 @@ def uptime() -> str:
     return (f"{d}d " if d else "") + f"{h}h {m}m {s}s"
 
 
-def stats_lines() -> list[str]:
+def stats_lines(project: Project) -> list[str]:
     return [
-        f"{B}{CYAN}build{RST} :: modules={GREEN}{module_count()}{RST} "
-        f"tests={GREEN}{test_count()}{RST} loc={GREEN}{loc_count()}{RST} "
-        f"commits={GREEN}{git('rev-list','--count','HEAD')}{RST} zig 0.16",
-        f"{GREY}HEAD{RST} {head_line()}  {GREY}({commit_stat()}){RST}",
+        f"{B}{CYAN}[{project.key}]{RST} build :: {project.module_label}="
+        f"{GREEN}{module_count(project)}{RST} tests={GREEN}{test_count(project)}{RST} "
+        f"loc={GREEN}{loc_count(project)}{RST} "
+        f"commits={GREEN}{git(project,'rev-list','--count','HEAD')}{RST} {project.stats_suffix}",
+        f"{GREY}[{project.key}] HEAD{RST} {head_line(project)}  {GREY}({commit_stat(project)}){RST}",
     ]
 
 
-def project_lines() -> list[str]:
-    return [
-        f"{B}{MAG}\U0001f409 Orochi{RST} (水蛟) — a clean-room, from-scratch Zig 0.16 IRC + realtime daemon. A totally new architecture.",
-        f"IRCv3/IRCX + accounts/SASL, multi-session bouncer, and a full media conferencing surface "
-        f"(rooms, breakout, spatial audio, live captions/transcripts, raise-hand/reactions).",
-        f"Mesh = {B}Suimyaku{RST} (水脈 CRDT) over {B}Tsumugi{RST} (紬 PQ-hybrid ratchet), gossip = "
-        f"{B}Sazanami{RST}, content filter = {B}Koshi{RST}, offline mail = {B}Tegami{RST}. 64-bit, modern-only.",
-        f"Built max-parallel (Claude + Codex). repo: {REPO}",
-    ]
+def project_lines(project: Project) -> list[str]:
+    return list(project.project_lines)
 
-
-ROADMAP = [
-    "core ✔ · IRCv3/IRCX ✔ · accounts/SASL ✔ · multi-session bouncer ✔ · host-cloak/VHOST/CHGHOST ✔",
-    "moderation (Koshi filter · PRIVS · live REHASH) ✔ · media conferencing surface ✔ · Tegami offline mail ✔",
-    "mesh: Suimyaku CRDT + Tsumugi PQ ratchet + Sazanami gossip (secured S2S live)",
-    "next: implicit-TLS · hot UPGRADE · deeper services · Ocean client",
-]
 
 HELP = (
-    "commands: !project !stats !tests !modules !commit !changelog !diff !progress "
-    "!plan !uptime !version !ping !help"
+    "commands: !project !stats !tests !modules/!components !commit !changelog !diff "
+    "!progress !plan !uptime !version !ping !help  (each accepts an optional "
+    "onyx/onyx-server project name, e.g. !stats onyx-server; omit for both)"
     + ("  | admin: !say !announce !topic !raw" if ADMIN else "")
 )
 
@@ -277,10 +444,11 @@ class Bot:
     def __init__(self) -> None:
         self.sock: socket.socket | None = None
         self.nick = NICK
-        self.last_commit = git("rev-parse", "HEAD")
+        # Per-project state: last-seen HEAD and last-announced test count.
+        self.last_commit: dict[str, str] = {p.key: git(p, "rev-parse", "HEAD") for p in PROJECTS}
+        self.last_tests: dict[str, int] = {p.key: -1 for p in PROJECTS}
         self.last_beat = time.time()
         self.last_poll = 0.0
-        self.last_tests = -1
         self.outq: deque[str] = deque()
         self.last_send = 0.0
         self.caps: set[str] = set()
@@ -296,11 +464,17 @@ class Bot:
         self.intro_done = False
 
     # ---- io ----
-    def send_raw(self, line: str) -> None:
-        """Send immediately, bypassing the paced queue (PONG, registration, SASL)."""
+    def send_raw(self, line: str, trusted: bool = False) -> None:
+        """Send immediately, bypassing the paced queue (PONG, registration, SASL).
+
+        `trusted=True` is for lines the bot itself constructed (e.g. its own
+        automated status topic in set_topic()) — the protected-channel guard
+        below exists to block admin/`!raw`-relayed topic clobbering, not the
+        bot's own core feature.
+        """
         if not self.sock:
             return
-        if topic_change_protected(line):
+        if not trusted and topic_change_protected(line):
             log.info("blocked protected topic change: %s", line)
             return
         log.debug(">> %s", line)
@@ -357,7 +531,7 @@ class Bot:
         if PASSWORD:
             self.send_raw(f"PASS {PASSWORD}")
         self.send_raw(f"NICK {self.nick}")
-        self.send_raw(f"USER {NICK} 0 * :Orochi build announcer")
+        self.send_raw(f"USER {NICK} 0 * :Onyx+Onyx Server build announcer")
 
     def loop(self) -> None:
         buf = b""
@@ -400,44 +574,52 @@ class Bot:
 
             if joined and now - self.last_beat > HEARTBEAT_SECS:
                 self.last_beat = now
-                self.announce(stats_lines())
+                for p in PROJECTS:
+                    self.announce(stats_lines(p))
 
-            # Throttled git HEAD watcher (was previously polled every loop tick).
+            # Throttled git HEAD watcher, per project (was previously polled every
+            # loop tick, and only for a single repo).
             if joined and now - self.last_poll >= POLL_SECS:
                 self.last_poll = now
-                cur = git("rev-parse", "HEAD")
-                if cur and cur != self.last_commit:
-                    # Announce EVERY new commit since the last poll (oldest-first),
-                    # not just the newest — a burst of commits is fully reported.
-                    revs = git("rev-list", "--reverse", f"{self.last_commit}..{cur}").split()
-                    if not revs:
-                        revs = [cur]  # history diverged (rebase/reset): show the tip
-                    self.last_commit = cur
-                    tc = test_count()
-                    shown = revs[-5:]  # cap the burst; summarize the rest
-                    if len(revs) > len(shown):
-                        self.msg(CHANNEL, f"{GREY}… +{len(revs) - len(shown)} earlier commit(s){RST}")
-                    for i, rev in enumerate(shown):
-                        log.info("announcing commit %s", rev[:12])
-                        self.announce(self.commit_lines(rev, tc, with_delta=(i == len(shown) - 1)))
-                    self.set_topic()
+                for p in PROJECTS:
+                    self.poll_project(p)
 
-    def tests_delta(self, tc: str) -> str:
+    def poll_project(self, p: Project) -> None:
+        cur = git(p, "rev-parse", "HEAD")
+        if not cur or cur == self.last_commit[p.key]:
+            return
+        # Announce EVERY new commit since the last poll (oldest-first), not just
+        # the newest — a burst of commits is fully reported.
+        revs = git(p, "rev-list", "--reverse", f"{self.last_commit[p.key]}..{cur}").split()
+        if not revs:
+            revs = [cur]  # history diverged (rebase/reset): show the tip
+        self.last_commit[p.key] = cur
+        tc = test_count(p)
+        shown = revs[-5:]  # cap the burst; summarize the rest
+        if len(revs) > len(shown):
+            self.msg(CHANNEL, f"{GREY}[{p.key}] … +{len(revs) - len(shown)} earlier commit(s){RST}")
+        for i, rev in enumerate(shown):
+            log.info("announcing %s commit %s", p.key, rev[:12])
+            self.announce(self.commit_lines(p, rev, tc, with_delta=(i == len(shown) - 1)))
+        self.set_topic()
+
+    def tests_delta(self, p: Project, tc: str) -> str:
         """Colored (+N)/(-N) arrow vs the previously announced test count."""
         try:
             n = int(tc)
         except ValueError:
             return ""
         out = ""
-        if self.last_tests >= 0 and n != self.last_tests:
-            diff = n - self.last_tests
+        last = self.last_tests[p.key]
+        if last >= 0 and n != last:
+            diff = n - last
             out = f" {GREEN}(+{diff}){RST}" if diff > 0 else f" {RED}({diff}){RST}"
-        self.last_tests = n
+        self.last_tests[p.key] = n
         return out
 
-    def commit_lines(self, rev: str, tc: str, with_delta: bool) -> list[str]:
-        """Rich, colorized multi-line announcement for one commit."""
-        subj = commit_field("%s", rev)
+    def commit_lines(self, p: Project, rev: str, tc: str, with_delta: bool) -> list[str]:
+        """Rich, colorized multi-line announcement for one commit, tagged by project."""
+        subj = commit_field(p, "%s", rev)
         typ = commit_type(subj)
         accent = TYPE_COLOR.get(typ, CYAN)
         glyph = TYPE_GLYPH.get(typ, "▶")
@@ -445,31 +627,36 @@ class Bot:
         # the subject so it is not printed twice.
         clean = re.sub(r"^[a-z]+(?:\([^)]*\))?!?:\s*", "", subj) if typ else subj
         tag = f"{B}{accent}{typ}{RST} " if typ else ""
-        author = commit_field("%an", rev)
-        when = commit_field("%cr", rev)  # "3 minutes ago"
-        delta = self.tests_delta(tc) if with_delta else ""
-        total = git("rev-list", "--count", "HEAD")
+        author = commit_field(p, "%an", rev)
+        when = commit_field(p, "%cr", rev)  # "3 minutes ago"
+        delta = self.tests_delta(p, tc) if with_delta else ""
+        total = git(p, "rev-list", "--count", "HEAD")
+        proj_tag = f"{p.accent}{B}[{p.key}]{RST} "
         lines = [
-            f"{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field('%h', rev)}{RST} {tag}{WHITE}{clean}{RST}"
-            f" {GREY}by{RST} {TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(rev)}"
+            f"{proj_tag}{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field(p,'%h', rev)}{RST} "
+            f"{tag}{WHITE}{clean}{RST}"
+            f" {GREY}by{RST} {TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(p, rev)}"
             f" {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}"
-            f" {GREY}modules{RST} {B}{CYAN}{module_count()}{RST}"
-            f" {GREY}loc{RST} {B}{YEL}{loc_count()}{RST} {GREY}#{total}{RST}",
+            f" {GREY}{p.module_label}{RST} {B}{CYAN}{module_count(p)}{RST}"
+            f" {GREY}loc{RST} {B}{YEL}{loc_count(p)}{RST} {GREY}#{total}{RST}",
         ]
         # Compact changed-files line for focused commits.
-        files = [l.split("|")[0].strip() for l in changed_files(rev) if "|" in l]
+        files = [l.split("|")[0].strip() for l in changed_files(p, rev) if "|" in l]
         if files and len(files) <= 6:
-            lines.append(f"{SILVER}files: {' '.join(files)}{RST}")
+            lines.append(f"{SILVER}[{p.key}] files: {' '.join(files)}{RST}")
         return lines
 
     def set_topic(self) -> None:
-        if topic_protected(CHANNEL):
-            log.info("topic updates disabled for %s", CHANNEL)
-            return
-        self.send_raw(
-            f"TOPIC {CHANNEL} :Orochi M2 · {git('rev-parse','--short','HEAD')} · "
-            f"{test_count()} tests · {module_count()} modules · !help"
-        )
+        # PROTECTED_TOPIC_CHANNELS guards against admin/`!raw`-relayed topic
+        # clobbering (see send_raw / topic_change_protected); it must not
+        # block the bot's own automated status-topic refresh, which is the
+        # only topic writer for CHANNEL. Send as trusted.
+        segments = [
+            f"{p.topic_label} · {git(p,'rev-parse','--short','HEAD')} · "
+            f"{test_count(p)} tests · {module_count(p)} {p.module_label}"
+            for p in PROJECTS
+        ]
+        self.send_raw(f"TOPIC {CHANNEL} :" + "  ❘  ".join(segments) + "  ❘  !help", trusted=True)
 
     # ---- protocol ----
     def handle(self, line: str, joined: bool) -> bool:
@@ -522,7 +709,8 @@ class Bot:
                 self.send_raw(f"JOIN {CHANNEL}")
                 if not self.intro_done:
                     self.intro_done = True
-                    self.announce(project_lines() + stats_lines())
+                    for p in PROJECTS:
+                        self.announce(project_lines(p) + stats_lines(p))
                 self.set_topic()
                 return True
 
@@ -590,7 +778,7 @@ class Bot:
         elif cmd == "TIME":
             self.notice(nick, f"\x01TIME {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\x01")
         elif cmd == "SOURCE":
-            self.notice(nick, f"\x01SOURCE {REPO}\x01")
+            self.notice(nick, "\x01SOURCE " + " | ".join(f"{p.key}: {p.repo}" for p in PROJECTS) + "\x01")
         elif cmd == "CLIENTINFO":
             self.notice(nick, "\x01CLIENTINFO VERSION PING TIME SOURCE CLIENTINFO\x01")
 
@@ -599,39 +787,65 @@ class Bot:
             return
         cmd, _, arg = text[1:].partition(" ")
         cmd = cmd.lower()
+        arg = arg.strip()
         is_admin = bool(ADMIN) and nick == ADMIN
+
+        # Commands below accept an optional trailing project name (onyx/onyx-server);
+        # with no arg they summarize/apply to BOTH projects for a consistent UX.
+        per_project_cmds = {
+            "project", "about", "stats", "build", "tests", "modules", "components",
+            "commit", "head", "changelog", "diff", "files", "progress", "status",
+            "plan", "roadmap",
+        }
+        if cmd in per_project_cmds:
+            projects = select_projects(arg)
+            if projects is None:
+                self.notice(reply, f"unknown project '{arg}' (try: onyx, onyx-server)")
+                return
 
         if cmd == "help":
             self.msg(reply, HELP)
         elif cmd in ("project", "about"):
-            self.announce(project_lines(), reply)
+            for p in projects:
+                self.announce(project_lines(p), reply)
         elif cmd in ("stats", "build"):
-            self.announce(stats_lines(), reply)
+            for p in projects:
+                self.announce(stats_lines(p), reply)
         elif cmd == "tests":
-            self.msg(reply, f"tests: {GREEN}{test_count()}{RST} passing")
-        elif cmd == "modules":
-            self.msg(reply, f"modules: {GREEN}{module_count()}{RST} Zig source files")
+            for p in projects:
+                self.msg(reply, f"[{p.key}] tests: {GREEN}{test_count(p)}{RST} passing")
+        elif cmd in ("modules", "components"):
+            for p in projects:
+                self.msg(
+                    reply,
+                    f"[{p.key}] {p.module_label}: {GREEN}{module_count(p)}{RST} source files",
+                )
         elif cmd in ("commit", "head"):
-            self.msg(reply, f"HEAD {head_line()}")
+            for p in projects:
+                self.msg(reply, f"[{p.key}] HEAD {head_line(p)}")
         elif cmd == "changelog":
-            self.announce(
-                [f"{GREY}{l}{RST}" for l in git("log", "-5", "--format=%h %s").splitlines()]
-                or ["(none)"],
-                reply,
-            )
+            for p in projects:
+                self.announce(
+                    [f"{GREY}[{p.key}] {l}{RST}" for l in git(p, "log", "-5", "--format=%h %s").splitlines()]
+                    or [f"[{p.key}] (none)"],
+                    reply,
+                )
         elif cmd in ("diff", "files"):
-            self.announce(
-                [f"{GREY}{l}{RST}" for l in changed_files()] or ["(no changes)"], reply
-            )
+            for p in projects:
+                self.announce(
+                    [f"{GREY}[{p.key}] {l}{RST}" for l in changed_files(p)] or [f"[{p.key}] (no changes)"],
+                    reply,
+                )
         elif cmd in ("progress", "status"):
-            self.msg(
-                reply,
-                f"{B}live{RST}: accounts/SASL · multi-session bouncer · media conferencing · "
-                f"moderation + live REHASH. tests={test_count()}, modules={module_count()}. "
-                f"Next: implicit-TLS, hot UPGRADE, Ocean client.",
-            )
+            for p in projects:
+                self.msg(
+                    reply,
+                    f"[{p.key}] "
+                    + p.progress_text.format(tests=test_count(p), modules=module_count(p)),
+                )
         elif cmd in ("plan", "roadmap"):
-            self.announce([f"{YEL}{l}{RST}" for l in ROADMAP], reply)
+            for p in projects:
+                self.announce([f"{YEL}[{p.key}] {l}{RST}" for l in p.roadmap], reply)
         elif cmd == "uptime":
             self.msg(reply, f"uptime: {uptime()}")
         elif cmd == "version":
@@ -639,7 +853,7 @@ class Bot:
         elif cmd == "ping":
             self.msg(reply, "pong")
         elif cmd == "source":
-            self.msg(reply, REPO)
+            self.msg(reply, " | ".join(f"{p.key}: {p.repo}" for p in PROJECTS))
         # ---- admin ----
         elif is_admin and cmd == "say":
             tgt, _, body = arg.partition(" ")
@@ -661,7 +875,7 @@ class Bot:
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.DEBUG if os.environ.get("ORO_DEBUG") else logging.INFO,
+        level=logging.DEBUG if DEBUG else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     Bot().run()

@@ -26,11 +26,11 @@ id = 1
 
 # Optional Ed25519 identity keypair (hex), enabling PQ-secured S2S links. When
 # secret_key is set the daemon derives its node identity. Otherwise it loads or
-# creates `orochi-node.key` beside this config. Set public_key when a keyfile-backed
+# creates `onyx-server-node.key` beside this config. Set public_key when a keyfile-backed
 # node needs MESSAGE_V2 activation preflight; runtime requires it to match the
 # loaded private identity.
-# public_key = "env:OROCHI_NODE_PUBKEY"
-# secret_key = "env:OROCHI_NODE_SECKEY"
+# public_key = "env:ONYX_NODE_PUBKEY"
+# secret_key = "env:ONYX_NODE_SECKEY"
 
 
 # --- [network] — network presentation ----------------------------------------
@@ -41,7 +41,7 @@ name = "Onyx"
 # This server's OWN name — the source prefix of server-originated lines (welcome
 # numerics, the !weather/!news bot replies, etc.) and the identity presented to
 # S2S peers. MUST be unique per node in a mesh so replies/identities don't
-# collide. Default: "orochi.local".
+# collide. Default: "onyx.local".
 # server_name = "irc.alpha.example.net"
 # Optional per-node description shown in VERSION/WHOIS and mesh peer metadata.
 # description = "Alpha node"
@@ -245,7 +245,7 @@ preload = false
 realm = "local"
 # Shared passphrase for MeshPass admission when signed admission roots are not
 # configured. Used by plaintext S2S and as the secured-link fallback gate.
-# mesh_pass = "env:OROCHI_MESH_PASS"
+# mesh_pass = "env:ONYX_MESH_PASS"
 # Trusted peer identity roots (array of hex/base64 Ed25519 public keys), for
 # secured links. When set, secured S2S expects peers to match these keys.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
@@ -256,8 +256,8 @@ realm = "local"
 # key, carrying relay role and control/sync/irc_app/tsumugi frame families.
 # This requires secured S2S identity/crypto; if roots are configured but the
 # Tsumugi secured-S2S path is unavailable, server init fails closed.
-# admission_token = "env:OROCHI_MESHPASS_TOKEN"
-# admission_roots = ["env:OROCHI_MESHPASS_ROOT"]
+# admission_token = "env:ONYX_MESHPASS_TOKEN"
+# admission_roots = ["env:ONYX_MESHPASS_ROOT"]
 # admission_min_revocation_epoch = 0
 # MESSAGE_V2 authoring uses an explicit two-phase rollout. `compat` (the safe
 # default) still receives, ACKs, retains, and forwards MESSAGE_V2 but authors
@@ -585,7 +585,7 @@ allow_anonymous = false
 # OAUTHBEARER (RFC 7628): verify a signed JWT bearer token against a locally
 # configured key. Advertised ONLY when exactly one key source below is set. OAuth
 # identities are federated and are NEVER auto-elevated to oper.
-#   oauth_hmac_key  = "env:OROCHI_OAUTH_HS256_SECRET"  # HS256 shared secret
+#   oauth_hmac_key  = "env:ONYX_OAUTH_HS256_SECRET"  # HS256 shared secret
 #   oauth_jwks_file = "/etc/onyx-server/oauth/jwks.json"    # RS256/ES256 JWKS
 #   oauth_pubkey    = "/etc/onyx-server/oauth/pub.pem"      # RS256/ES256 PEM/DER public key
 # oauth_issuer        = "https://idp.example.net/"     # require this `iss` when set
@@ -684,12 +684,12 @@ allow_anonymous = false
 # cloaked with a key derived from this secret (stable across restarts). When
 # absent, a random per-boot key is used (privacy on by default, but cloaks
 # change each restart).
-# secret = "env:OROCHI_CLOAK_SECRET"
+# secret = "env:ONYX_CLOAK_SECRET"
 # Prior cloak key kept live across a `secret` rotation. New cloaks use `secret`,
 # but WARD host/mask bans are also matched against the cloak computed under this
 # previous key — so bans written before the rotation keep working during a grace
 # window. Remove it once the old bans have aged out.
-# previous_secret = "env:OROCHI_CLOAK_SECRET_PREV"
+# previous_secret = "env:ONYX_CLOAK_SECRET_PREV"
 # Optional network-identifying suffix used in generated cloak hostnames.
 # suffix = "onyx"
 # IP cloak granularity:

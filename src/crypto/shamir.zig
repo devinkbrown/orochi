@@ -234,7 +234,7 @@ test "split validates n and k" {
 
 test "any k of n shares reconstruct the secret" {
     const allocator = std.testing.allocator;
-    const secret = "orochi shamir secret";
+    const secret = "onyx shamir secret";
 
     var prng = seeded(0x12345678);
     const shares = try split(allocator, secret, 5, 3, prng.random());

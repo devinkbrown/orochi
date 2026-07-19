@@ -150,7 +150,7 @@ const checkpoint_version: u8 = 1;
 const checkpoint_header_len: usize = 10;
 const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
 const max_checkpoint_bytes: usize = replay.hard_max_checkpoint_bytes + checkpoint_header_len + checksum_len;
-const checkpoint_checksum_domain = "orochi-event-spine-replay-checkpoint-v1";
+const checkpoint_checksum_domain = "onyx-event-spine-replay-checkpoint-v1";
 
 /// Allocation-free outer discriminator for Helix mesh-checkpoint selection.
 /// This intentionally checks only the unambiguous ESG2 magic; callers must pass

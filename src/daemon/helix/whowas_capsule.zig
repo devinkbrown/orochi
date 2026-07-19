@@ -192,7 +192,7 @@ fn readStr(bytes: []const u8, pos: *usize) Error![]const u8 {
 test "round-trip three records" {
     const records = [_]Record{
         .{
-            .nick = "Orochi",
+            .nick = "Onyx",
             .user = "ident",
             .host = "host.example.org",
             .realname = "Real Name Here",

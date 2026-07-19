@@ -6,7 +6,7 @@
 //! This module is deliberately pure: callers provide transcript hashes and key
 //! inputs, and the helpers return typed secret material without touching record
 //! state, sockets, or daemon code. HKDF and HMAC come from `hash.zig` so the
-//! implementation stays on Orochi's typed crypto surface.
+//! implementation stays on Onyx Server's typed crypto surface.
 const std = @import("std");
 const hash = @import("hash.zig");
 const Secret = @import("secret.zig").Secret;

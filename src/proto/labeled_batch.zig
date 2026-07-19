@@ -16,7 +16,7 @@ pub const max_wire_line: usize = labeled_response.MAX_WIRE_LINE;
 
 /// Return true when `label` is acceptable for IRCv3 labeled-response emission.
 ///
-/// Orochi treats labels as already-decoded tag values. They must be non-empty,
+/// Onyx Server treats labels as already-decoded tag values. They must be non-empty,
 /// bounded, and contain no spaces or control bytes.
 pub fn isValidLabel(label: []const u8) bool {
     if (label.len == 0 or label.len > max_label_len) return false;

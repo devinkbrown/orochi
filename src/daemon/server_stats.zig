@@ -84,15 +84,15 @@ pub const Stats = struct {
 
     fn rows(self: *const Stats) [9]Row {
         return .{
-            .{ .prom = "orochi_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
-            .{ .prom = "orochi_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
-            .{ .prom = "orochi_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server peers accepted", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
-            .{ .prom = "orochi_s2s_links_active", .irc = "s2s_active", .help = "Currently established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
-            .{ .prom = "orochi_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total.load(.acquire) },
-            .{ .prom = "orochi_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total.load(.acquire) },
-            .{ .prom = "orochi_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
-            .{ .prom = "orochi_quits_total", .irc = "quits", .help = "Total client disconnects", .kind = .counter, .value = self.quits_total.load(.acquire) },
-            .{ .prom = "orochi_errors_total", .irc = "errors", .help = "Total recoverable hot-path errors", .kind = .counter, .value = self.errors_total.load(.acquire) },
+            .{ .prom = "onyx_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
+            .{ .prom = "onyx_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
+            .{ .prom = "onyx_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server peers accepted", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
+            .{ .prom = "onyx_s2s_links_active", .irc = "s2s_active", .help = "Currently established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
+            .{ .prom = "onyx_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total.load(.acquire) },
+            .{ .prom = "onyx_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total.load(.acquire) },
+            .{ .prom = "onyx_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
+            .{ .prom = "onyx_quits_total", .irc = "quits", .help = "Total client disconnects", .kind = .counter, .value = self.quits_total.load(.acquire) },
+            .{ .prom = "onyx_errors_total", .irc = "errors", .help = "Total recoverable hot-path errors", .kind = .counter, .value = self.errors_total.load(.acquire) },
         };
     }
 
@@ -175,9 +175,9 @@ test "prometheus export carries HELP, TYPE, and samples" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try s.writePrometheus(allocator, &out);
-    try testing.expect(std.mem.indexOf(u8, out.items, "# TYPE orochi_connections_total counter") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "orochi_bytes_in_total 42") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "orochi_connections_active 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "# TYPE onyx_connections_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "onyx_bytes_in_total 42") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "onyx_connections_active 1") != null);
 }
 
 test "forEachLine emits one token line per metric" {

@@ -6,7 +6,7 @@
 //! `CREATE <channel> [<modes>]` explicitly creates a new IRCX channel. Channel
 //! existence, policy checks, state mutation, and mode application are owned by
 //! the caller. This module validates attacker-controlled command parameters,
-//! returns borrowed parse slices, describes Orochi's initial founder status,
+//! returns borrowed parse slices, describes Onyx Server's initial founder status,
 //! and builds the JOIN/NAMES wire lines into caller-owned buffers.
 const std = @import("std");
 const numeric = @import("numeric.zig");
@@ -69,7 +69,7 @@ pub const CreateArgs = struct {
     clone_from: ?[]const u8 = null,
 };
 
-/// Orochi's ordered IRCX member tiers.
+/// Onyx Server's ordered IRCX member tiers.
 pub const MemberTier = enum(u8) {
     voice = 1,
     op = 2,
@@ -125,7 +125,7 @@ pub fn parseCreateArgsWith(comptime params_config: Params, params: []const []con
     };
 }
 
-/// Parse CREATE and attach Orochi's initial founder status.
+/// Parse CREATE and attach Onyx Server's initial founder status.
 pub fn parseCreate(params: []const []const u8) IrcxCreateError!CreateResult {
     return parseCreateWith(.{}, params);
 }
@@ -474,9 +474,9 @@ fn appendByte(out: []u8, n: *usize, byte: u8) IrcxCreateError!void {
 }
 
 test "parse create args without modes" {
-    const raw = [_][]const u8{"#orochi"};
+    const raw = [_][]const u8{"#onyx"};
     const parsed = try parseCreateArgs(&raw);
-    try std.testing.expectEqualStrings("#orochi", parsed.channel);
+    try std.testing.expectEqualStrings("#onyx", parsed.channel);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.modes);
 
     const result = try parseCreate(&raw);
@@ -486,9 +486,9 @@ test "parse create args without modes" {
 }
 
 test "parse create args with modes" {
-    const raw = [_][]const u8{ "#orochi", "+nt" };
+    const raw = [_][]const u8{ "#onyx", "+nt" };
     const parsed = try parseCreateArgs(&raw);
-    try std.testing.expectEqualStrings("#orochi", parsed.channel);
+    try std.testing.expectEqualStrings("#onyx", parsed.channel);
     try std.testing.expect(parsed.modes != null);
     try std.testing.expectEqualStrings("+nt", parsed.modes.?);
 
@@ -514,10 +514,10 @@ test "invalid create channel is rejected" {
     const missing = [_][]const u8{};
     try std.testing.expectError(error.MissingChannel, parseCreateArgs(&missing));
 
-    const too_many = [_][]const u8{ "#orochi", "+nt", "#tmpl", "extra" };
+    const too_many = [_][]const u8{ "#onyx", "+nt", "#tmpl", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseCreateArgs(&too_many));
 
-    const no_prefix = [_][]const u8{"orochi"};
+    const no_prefix = [_][]const u8{"onyx"};
     try std.testing.expectError(error.InvalidChannel, parseCreateArgs(&no_prefix));
 
     const bad_space = [_][]const u8{"#bad channel"};
@@ -528,10 +528,10 @@ test "invalid create channel is rejected" {
 }
 
 test "invalid create modes are rejected" {
-    const empty_modes = [_][]const u8{ "#orochi", "" };
+    const empty_modes = [_][]const u8{ "#onyx", "" };
     try std.testing.expectError(error.InvalidModes, parseCreateArgs(&empty_modes));
 
-    const bad_modes = [_][]const u8{ "#orochi", "+n t" };
+    const bad_modes = [_][]const u8{ "#onyx", "+n t" };
     try std.testing.expectError(error.InvalidModes, parseCreateArgs(&bad_modes));
 
     try std.testing.expectError(error.ModesTooLong, validateModesWith(.{ .max_mode_bytes = 3 }, "+ntk"));
@@ -541,14 +541,14 @@ test "create line builders format join and initial names replies" {
     var buf: [180]u8 = undefined;
     const creator = Prefix{ .nick = "alice", .user = "u", .host = "cloak.example" };
 
-    const join = try buildJoinBroadcast(&buf, creator, "#orochi");
-    try std.testing.expectEqualStrings(":alice!u@cloak.example JOIN #orochi", join);
+    const join = try buildJoinBroadcast(&buf, creator, "#onyx");
+    try std.testing.expectEqualStrings(":alice!u@cloak.example JOIN #onyx", join);
 
-    const names = try buildFounderNamesReply(&buf, "irc.example", "alice", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 353 alice = #orochi :!alice", names);
+    const names = try buildFounderNamesReply(&buf, "irc.example", "alice", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 353 alice = #onyx :!alice", names);
 
-    const end = try buildEndOfNamesReply(&buf, "irc.example", "alice", "#orochi");
-    try std.testing.expectEqualStrings(":irc.example 366 alice #orochi :End of /NAMES list", end);
+    const end = try buildEndOfNamesReply(&buf, "irc.example", "alice", "#onyx");
+    try std.testing.expectEqualStrings(":irc.example 366 alice #onyx :End of /NAMES list", end);
 }
 
 test "create error builders format numerics" {
@@ -569,24 +569,24 @@ test "builders reject invalid fields and small buffers" {
         .nick = "bad nick",
         .user = "u",
         .host = "h",
-    }, "#orochi"));
+    }, "#onyx"));
 
     try std.testing.expectError(error.InvalidUser, buildJoinBroadcast(&buf, .{
         .nick = "alice",
         .user = "bad:user",
         .host = "h",
-    }, "#orochi"));
+    }, "#onyx"));
 
     try std.testing.expectError(error.InvalidHost, buildJoinBroadcast(&buf, .{
         .nick = "alice",
         .user = "u",
         .host = "bad\x00host",
-    }, "#orochi"));
+    }, "#onyx"));
 
-    try std.testing.expectError(error.InvalidServerName, buildFounderNamesReply(&buf, "bad server", "alice", "#orochi"));
+    try std.testing.expectError(error.InvalidServerName, buildFounderNamesReply(&buf, "bad server", "alice", "#onyx"));
     try std.testing.expectError(error.OutputTooSmall, buildJoinBroadcast(&small, .{
         .nick = "alice",
         .user = "u",
         .host = "h",
-    }, "#orochi"));
+    }, "#onyx"));
 }

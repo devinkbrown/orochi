@@ -271,11 +271,11 @@ test "emit WARN exact bytes" {
     defer sink.deinit(allocator);
 
     try warn("CHATHISTORY", "MESSAGE_RATE_LIMITED", "History query was throttled")
-        .withContext(&.{"#orochi"})
+        .withContext(&.{"#onyx"})
         .appendLine(allocator, &sink);
 
     try std.testing.expectEqualStrings(
-        "WARN CHATHISTORY MESSAGE_RATE_LIMITED #orochi :History query was throttled\r\n",
+        "WARN CHATHISTORY MESSAGE_RATE_LIMITED #onyx :History query was throttled\r\n",
         sink.items,
     );
 }
@@ -286,11 +286,11 @@ test "append body omits CRLF for caller-framed sinks" {
     defer sink.deinit(allocator);
 
     try fail("PROP", .INVALID_PROPERTY, "Property cannot be set")
-        .withContext(&.{ "#orochi", "topic.locked" })
+        .withContext(&.{ "#onyx", "topic.locked" })
         .appendBody(allocator, &sink);
 
     try std.testing.expectEqualStrings(
-        "FAIL PROP INVALID_PROPERTY #orochi topic.locked :Property cannot be set",
+        "FAIL PROP INVALID_PROPERTY #onyx topic.locked :Property cannot be set",
         sink.items,
     );
 }
@@ -316,9 +316,9 @@ test "validate code tokens without requiring catalog spelling" {
     var sink: std.ArrayList(u8) = .empty;
     defer sink.deinit(allocator);
 
-    try failCustom("CMD", "orochi-policy.denied", "Denied").emit(allocator, &sink);
+    try failCustom("CMD", "onyx-policy.denied", "Denied").emit(allocator, &sink);
     try std.testing.expectEqualStrings(
-        "FAIL CMD orochi-policy.denied :Denied\r\n",
+        "FAIL CMD onyx-policy.denied :Denied\r\n",
         sink.items,
     );
 

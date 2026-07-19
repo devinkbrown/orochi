@@ -37,7 +37,7 @@ pub fn setNetworkName(name: ?[]const u8) void {
 
 /// Default server name (this node's own name, the source prefix of
 /// server-originated lines). Operators override it via `[network] server_name`.
-pub const server_name = "orochi.local";
+pub const server_name = "onyx.local";
 
 /// Boot-time override of this server's name. Write-once at startup; per-node so
 /// mesh servers don't collide in source prefixes / S2S identity.
@@ -64,7 +64,7 @@ pub const isupport_tokens = [_][]const u8{
     // IRCX capability advertisement. A bare `IRCX` token in 005 is the standard
     // signal that the server speaks the IRCX extension set (draft-pfenning); IRCX
     // clients (mIRC, Pirch) key off it to decide whether to issue the `IRCX`
-    // command and switch into IRCX mode. Orochi already answers `IRCX`/`ISIRCX`/
+    // command and switch into IRCX mode. Onyx Server already answers `IRCX`/`ISIRCX`/
     // `MODE [nick] ISIRCX` with RPL_IRCX (800), but without this token mIRC never
     // probes and so never detects IRCX. Advertised first, as IRCX servers do.
     "IRCX",

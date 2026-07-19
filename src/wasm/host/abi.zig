@@ -351,7 +351,7 @@ test "capability tokens parse case-insensitively and reject unknown names" {
 }
 
 test "WIT descriptor is ABI v1 and names every host function semantically" {
-    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "package orochi:orowasm@1.0.0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wit_v1, "package onyx:orowasm@1.0.0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, wit_v1, "world plugin-v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, wit_v1, "reply: func(text: string);") != null);
     try std.testing.expect(std.mem.indexOf(u8, wit_v1, "net-connect: func(host: string, port: u16)") != null);

@@ -1010,7 +1010,7 @@ const header_len: usize = 46;
 const event_id_len: usize = @sizeOf(EventId);
 const entry_prefix_len: usize = 8 + 8 + event_id_len + 4;
 const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
-const checkpoint_checksum_domain = "orochi-attachment-delivery-spool-v1";
+const checkpoint_checksum_domain = "onyx-attachment-delivery-spool-v1";
 
 fn checkpointChecksum(prefix: []const u8, out: *[checksum_len]u8) void {
     var hash = std.crypto.hash.Blake3.init(.{});

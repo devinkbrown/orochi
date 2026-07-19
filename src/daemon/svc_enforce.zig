@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-account SECURE / ENFORCE *settings* layer for the Orochi IRC daemon.
+//! Per-account SECURE / ENFORCE *settings* layer for the Onyx Server IRC daemon.
 //!
 //! This is the policy-configuration complement to `nick_enforcement.zig`. Where
 //! that module owns the protection *mechanism* (the grace timer, the claim

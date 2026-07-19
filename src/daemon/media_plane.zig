@@ -228,7 +228,7 @@ pub const MediaPlane = struct {
         // keeps the media plane serving.
         if (self.dtls_enabled) self.startDtls() catch |e| {
             self.dtls_enabled = false;
-            std.log.warn("orochi: DTLS-SRTP terminator disabled ({s})", .{@errorName(e)});
+            std.log.warn("onyx-server: DTLS-SRTP terminator disabled ({s})", .{@errorName(e)});
         };
 
         lockSpin(&self.rtcp_out_mutex);
@@ -274,7 +274,7 @@ pub const MediaPlane = struct {
         // fingerprint). Best-effort: a 1.3 failure leaves the 1.2 path serving.
         if (self.dtls13_enabled) self.startDtls13(term) catch |e| {
             self.stopDtls13();
-            std.log.warn("orochi: DTLS 1.3 engine disabled ({s})", .{@errorName(e)});
+            std.log.warn("onyx-server: DTLS 1.3 engine disabled ({s})", .{@errorName(e)});
         };
     }
 

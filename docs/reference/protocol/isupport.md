@@ -11,7 +11,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 | Token | Default Value | Meaning | Config / Runtime Notes | Evidence |
 | --- | --- | --- | --- | --- |
 | `IRCX` | present | Advertises IRCX support. | Bare token, advertised **first** (as IRCX servers do) so a passive client that never sends `IRCX` still detects it. | `src/proto/protocol_inventory.zig:70` |
-| `NETWORK` | `Orochi` | Advertised network name. | Default is `network_name`; operators can override via `[network] name`, installed by `setNetworkName` and rewritten by `buildIsupportTokens`. | `src/proto/protocol_inventory.zig:14`, `src/proto/protocol_inventory.zig:40`, `src/daemon/server.zig:860`, `src/main.zig:129` |
+| `NETWORK` | `Onyx` | Advertised network name. | Default is `network_name` (`Onyx`); operators can override via `[network] name`, installed by `setNetworkName` and rewritten by `buildIsupportTokens`. | `src/proto/protocol_inventory.zig:19`, `src/proto/protocol_inventory.zig:40`, `src/daemon/server.zig:860`, `src/main.zig:129` |
 | `CHANTYPES` | `#&` | Channel name prefixes accepted/advertised. | Static token. | `src/proto/protocol_inventory.zig:42` |
 | `NICKLEN` | `64` | Maximum nick length in bytes. | Config-overridable via `[limits]`; pre-registration NICK enforcement reads `currentLimits().nicklen`. | `src/proto/protocol_inventory.zig:43`, `src/proto/protocol_inventory.zig:82`, `src/daemon/server.zig:868`, `src/daemon/dispatch.zig:1269` |
 | `TOPICLEN` | `390` | Maximum topic bytes. | Config-overridable via `[limits]`; TOPIC truncates to configured `topiclen` on UTF-8 boundary. | `src/proto/protocol_inventory.zig:46`, `src/daemon/server.zig:862`, `src/daemon/server.zig:11195` |

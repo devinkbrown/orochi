@@ -8,14 +8,18 @@
 #   useradd --system --home-dir /var/lib/onyx-server --shell /usr/sbin/nologin onyx-server
 #   install -d -o onyx-server -g onyx-server /var/lib/onyx-server /etc/onyx-server
 #   install -m 0640 -o onyx-server -g onyx-server etc/onyx-server.reference.toml /etc/onyx-server/onyx-server.toml
+#   install -m 0755 zig-out/bin/onyx-server /usr/local/bin/onyx-server   # or package stage
+#   /usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
 #   systemctl daemon-reload && systemctl enable --now onyx-server
+# (enable/start also runs ExecStartPre=… --check-config …; a bad config fails closed.)
 #
 # HOT UPGRADE (the whole point — see ExecReload):
-#   # stage the freshly-built binary at the ExecStart path, then:
+#   # stage the freshly-built binary at the ExecStart path, --check-config, then:
 #   systemctl reload onyx-server          # -> kill -USR2 $MAINPID -> session-preserving execve
 # A plain `systemctl restart onyx-server` is the BOOTSTRAP / fallback path: it drops
 # sessions. SIGUSR2 (reload) re-execs in place, keeping the listener fd and all
-# live client sessions across the swap. See tools/upgrade_smoke.py.
+# live client sessions across the swap. Reload does NOT re-run ExecStartPre — always
+# --check-config yourself after a config change. See tools/upgrade_smoke.py.
 # =============================================================================
 
 [Unit]
@@ -29,6 +33,14 @@ Wants=network-online.target
 # systemd considers the unit started as soon as the binary is exec'd. If/when the
 # daemon learns sd_notify, switch to Type=notify for accurate "started" state.
 Type=simple
+
+# Fail closed on a bad config. A parse/load error on the normal boot path can
+# fall through to the built-in DEFAULT identity (wrong name/ports/keys) instead
+# of refusing to start — so production MUST preflight. `--check-config` is the
+# real flag (src/main.zig): it parses, resolves env:/@file:, runs mesh cloak and
+# MESSAGE_V2 identity preflight, prints `config OK`, and exits 0/1 without
+# binding listeners or dialing mesh. systemd aborts the start if this fails.
+ExecStartPre=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
 
 # argv[1] is the config path (src/main.zig parses the config from argv[1]).
 ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml

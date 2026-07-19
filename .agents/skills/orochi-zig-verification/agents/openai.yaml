@@ -1,4 +1,0 @@
-interface:
-  display_name: "Orochi Zig Verification"
-  short_description: "Run fault-aware Zig release evidence"
-  default_prompt: "Use $orochi-zig-verification to select and run the strongest relevant Orochi test gates."

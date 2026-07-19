@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Daemon-owned native media transport: the live UDP leg for Orochi's own
+//! Daemon-owned native media transport: the live UDP leg for Onyx Server's own
 //! codec (CadenceVox/CadenceVis). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
 //! carries `cadence_frame` datagrams instead of RTP, and forwards them through a
 //! per-channel `NativeMediaLink` (stream_id → publisher → recipients).

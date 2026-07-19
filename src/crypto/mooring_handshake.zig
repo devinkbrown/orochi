@@ -3,7 +3,7 @@
 
 //! Mooring S2S secure-channel handshake.
 //!
-//! This is a compact Noise-IK-shaped AKE for Orochi S2S. Ed25519 is the
+//! This is a compact Noise-IK-shaped AKE for Onyx Server S2S. Ed25519 is the
 //! static node identity and signs transport prekeys plus transcripts; X-Wing
 //! transport prekeys provide the hybrid KEM entropy. The initiator node id and
 //! MeshPass bytes are only present inside encrypted M1.

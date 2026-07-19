@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unified scoped access-list storage for Orochi.
+//! Unified scoped access-list storage for Onyx Server.
 //!
 //! A single ordered store carries both grants and restrictions. Entries own
 //! their text fields after insertion, and callers pass an allocator to every

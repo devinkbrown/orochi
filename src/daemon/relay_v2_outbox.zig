@@ -606,7 +606,7 @@ const receipt_prefix_len: usize = 8 + @sizeOf(RelayId) + 8 + 4;
 // Unreleased-format revision: entry rows gained a persisted excluded_peer, so
 // the domain rotates and any pre-revision blob fails closed (ChecksumMismatch)
 // instead of misparsing under the old row stride.
-const checksum_domain = "orochi-relay-v2-outbox-checkpoint-v2-excluded";
+const checksum_domain = "onyx-relay-v2-outbox-checkpoint-v2-excluded";
 
 comptime {
     std.debug.assert(entry_prefix_len == 48);

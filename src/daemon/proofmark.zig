@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Signed moderation proofs for Orochi policy decisions.
+//! Signed moderation proofs for Onyx Server policy decisions.
 //!
 //! A proof is a compact statement that an actor applied an action to a target
 //! under a specific policy version and reason digest. The signed bytes are a
@@ -22,7 +22,7 @@ pub const max_actor_len: usize = 256;
 pub const max_target_len: usize = 256;
 pub const max_canonical_len: usize = magic.len + 4 + max_actor_len + 4 + max_target_len + 1 + Sha256.digest_length + 4 + 8 + 8;
 
-const magic = "OROCHI-PROOFMARK-v1";
+const magic = "ONYX-PROOFMARK-v1";
 
 pub const Proof = struct {
     actor: []const u8,

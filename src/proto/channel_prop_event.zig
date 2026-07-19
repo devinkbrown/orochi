@@ -206,10 +206,10 @@ const node_identity = @import("../daemon/node_identity.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 
 /// Domain label folded into the Ed25519 transcript (via `sign.signCtx`).
-/// Distinct from every other Ed25519 use in Orochi (node identity, oper grants,
+/// Distinct from every other Ed25519 use in Onyx Server (node identity, oper grants,
 /// migration tokens, the per-link `signed_frame`, and the MESSAGE relay), so a
 /// channel-prop origin signature can never validate in another context.
-pub const sign_domain = "orochi-s2s-chanprop-v1";
+pub const sign_domain = "onyx-s2s-chanprop-v1";
 
 pub const SignError = sign.SignError || error{NoSpaceLeft};
 

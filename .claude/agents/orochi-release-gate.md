@@ -1,13 +1,13 @@
 ---
-name: orochi-release-gate
-description: Runs and audits Orochi focused, ReleaseSafe, full, and reproducible release evidence without editing source.
+name: onyx-release-gate
+description: Runs and audits Onyx Server focused, ReleaseSafe, full, and reproducible release evidence without editing source.
 tools: Read, Grep, Glob, Bash, Skill
 model: claude-sonnet-5
 effort: medium
 permissionMode: default
 maxTurns: 64
 skills:
-  - orochi-zig-verification
+  - onyx-server-zig-verification
 ---
 
 SERVER_ZIG_ROLE: excluded

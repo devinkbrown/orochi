@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Compound RTCP packet parser/builder for RFC 3550 packet types used by Orochi.
+//! Compound RTCP packet parser/builder for RFC 3550 packet types used by Onyx Server.
 const std = @import("std");
 const rtp_profile = @import("rtp_profile.zig");
 

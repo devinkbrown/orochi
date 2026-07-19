@@ -1396,13 +1396,13 @@ fn testKey(seed: u8) !KeyPair {
 }
 
 fn sampleSnapshot() Snapshot {
-    const channels = [_][]const u8{ "#orochi", "#helix" };
+    const channels = [_][]const u8{ "#onyx", "#helix" };
     return .{
         .nick = "kain",
         .umodes = "+iwx",
         .channels = channels[0..],
         .realname = "Kain Example",
-        .host = "cloak-ab12.orochi",
+        .host = "cloak-ab12.onyx",
         .account = "kain",
         .away = "biab",
         .is_oper = true,
@@ -1419,13 +1419,13 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     var target = MigrationTarget.init(allocator, origin.publicKey());
     defer target.deinit();
 
-    const channels = [_][]const u8{ "#orochi", "#helix" };
+    const channels = [_][]const u8{ "#onyx", "#helix" };
     const snapshot = Snapshot{
         .nick = "kain",
         .umodes = "+iwx",
         .channels = channels[0..],
         .realname = "Kain Example",
-        .host = "cloak-ab12.orochi",
+        .host = "cloak-ab12.onyx",
         .account = "kain",
         .away = "biab",
         .username = "webchat",
@@ -1443,11 +1443,11 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqualStrings("kain", capsule.snapshot.nick);
     try testing.expectEqualStrings("+iwx", capsule.snapshot.umodes);
     try testing.expectEqual(@as(usize, 2), capsule.snapshot.channels.len);
-    try testing.expectEqualStrings("#orochi", capsule.snapshot.channels[0]);
+    try testing.expectEqualStrings("#onyx", capsule.snapshot.channels[0]);
     try testing.expectEqualStrings("#helix", capsule.snapshot.channels[1]);
     // The widened identity/state fields survive too.
     try testing.expectEqualStrings("Kain Example", capsule.snapshot.realname);
-    try testing.expectEqualStrings("cloak-ab12.orochi", capsule.snapshot.host);
+    try testing.expectEqualStrings("cloak-ab12.onyx", capsule.snapshot.host);
     try testing.expectEqualStrings("kain", capsule.snapshot.account);
     try testing.expectEqualStrings("biab", capsule.snapshot.away);
     try testing.expectEqualStrings("webchat", capsule.snapshot.username);
@@ -1909,7 +1909,7 @@ test "snapshot encode/decode round-trips the widened identity + state fields" {
         .channels = channels[0..],
         .channel_modes = channel_modes[0..],
         .realname = "Alice Liddell",
-        .host = "cloak-1a2b.users.orochi",
+        .host = "cloak-1a2b.users.onyx",
         .account = "alice",
         .away = "in the rabbit hole",
         .is_oper = true,
@@ -1930,7 +1930,7 @@ test "snapshot encode/decode round-trips the widened identity + state fields" {
     try testing.expectEqualStrings("#dev", decoded.channels[2]);
     try testing.expectEqualSlices(u8, channel_modes[0..], decoded.channel_modes);
     try testing.expectEqualStrings("Alice Liddell", decoded.realname);
-    try testing.expectEqualStrings("cloak-1a2b.users.orochi", decoded.host);
+    try testing.expectEqualStrings("cloak-1a2b.users.onyx", decoded.host);
     try testing.expectEqualStrings("alice", decoded.account);
     try testing.expectEqualStrings("in the rabbit hole", decoded.away);
     try testing.expect(decoded.is_oper);

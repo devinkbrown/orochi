@@ -30,7 +30,7 @@ Source: struct fields at `src/daemon/config_format.zig:50`, parsing at `src/daem
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `id` | integer | `0` before validation | required, `>= 1` | Sovereign node id used by the runtime config (`src/daemon/config_boot.zig:60`) and mesh identity paths. |
-| `public_key` | string or null | unset | 32-byte Ed25519 key in hex/base64 | Optional explicit public identity. For a MESSAGE_V2 activation plan on a persisted-keyfile deployment, `--check-config` non-mutatingly reads the existing `orochi-node.key` beside the config and requires this key to match it; runtime init repeats the binding against the loaded identity. If `secret_key` is also set, preflight requires the derived and configured public keys to match. |
+| `public_key` | string or null | unset | 32-byte Ed25519 key in hex/base64 | Optional explicit public identity. For a MESSAGE_V2 activation plan on a persisted-keyfile deployment, `--check-config` non-mutatingly reads the existing `onyx-server-node.key` beside the config and requires this key to match it; runtime init repeats the binding against the loaded identity. If `secret_key` is also set, preflight requires the derived and configured public keys to match. |
 | `secret_key` | string or null | unset | exactly 64 hexadecimal characters (32-byte Ed25519 seed) | If set, `main.zig` derives a node identity and enables PQ-secured S2S (`src/main.zig:147`). |
 
 ## `[network]`
@@ -40,7 +40,7 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `name` | string | `"Onyx"` | any string | Network name advertised in ISUPPORT `NETWORK=` and the welcome burst (`src/main.zig:129`). |
-| `server_name` | string or null | `"orochi.local"` | any hostname | This node's own server name — the source prefix of all server-originated lines (welcome numerics, the `!weather`/`!news` bot replies, ERROR/PING) and the identity presented to S2S peers. MUST be unique per node in a mesh so replies/identities don't collide (`src/proto/protocol_inventory.zig` `setServerName`). |
+| `server_name` | string or null | `"onyx.local"` | any hostname | This node's own server name — the source prefix of all server-originated lines (welcome numerics, the `!weather`/`!news` bot replies, ERROR/PING) and the identity presented to S2S peers. MUST be unique per node in a mesh so replies/identities don't collide (`src/proto/protocol_inventory.zig` `setServerName`). |
 | `description` | string or null | unset | any string | Per-node description shown in VERSION/WHOIS and gossiped to mesh peers (`src/daemon/config_format.zig:67`, `src/daemon/config_boot.zig:22`). |
 | `icon_url` | string or null | unset | URL string | IRCv3 network icon: when set, advertised as the `NETWORKICON=<url>` ISUPPORT token (clients may render the logo); omitted when unset. NETWORKICON support (`src/daemon/server.zig` `buildIsupportTokens`, `src/daemon/config_boot.zig`). |
 | `discoverable` | boolean | `false` | `true`/`false` | Opt-in bit for public discovery directories. `status.json` exports `"discoverable":true` only when enabled, so private meshes are not indexed by accident (`src/daemon/server.zig` `buildStatusJson`). |
@@ -74,8 +74,8 @@ Source: struct at `src/daemon/config_format.zig:69`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `location` | string | `"Orochi IRC network"` | any string | ADMIN command location line (`src/daemon/server.zig:916`). |
-| `email` | string | `"admin@orochi.local"` | any string | ADMIN command contact email (`src/daemon/server.zig:916`). |
+| `location` | string | `"Onyx IRC network"` | any string | ADMIN command location line (`src/daemon/server.zig:916`). |
+| `email` | string | `"admin@onyx.local"` | any string | ADMIN command contact email (`src/daemon/server.zig:916`). |
 
 ## `[weather]`
 
@@ -156,7 +156,7 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 | `require_signed_frames` | bool | `true` | `true`/`false` | For secured S2S peers with a node signing key, require the remote handshake to advertise signed-frame support and reject unsigned direct-owned mesh state frames. Set false only for an explicit mixed-rollout window. |
 
-Plaintext S2S applies when no node identity is available and `require_secured` is false. Secured S2S uses `[node].secret_key` when set; otherwise the daemon loads or creates `orochi-node.key` beside the config. Signed MeshPass admission is not available on plaintext S2S: if `admission_roots` is non-empty but the secured S2S identity path is unavailable, server initialization fails closed.
+Plaintext S2S applies when no node identity is available and `require_secured` is false. Secured S2S uses `[node].secret_key` when set; otherwise the daemon loads or creates `onyx-server-node.key` beside the config. Signed MeshPass admission is not available on plaintext S2S: if `admission_roots` is non-empty but the secured S2S identity path is unavailable, server initialization fails closed.
 
 MESSAGE_V2 activation is deliberately multi-pass. Deploy a bridge-capable binary to the entire roster with `relay_v2_authoring = "compat"`; stage the same non-zero epoch and complete roster on every node; run the new binary's `--check-config` against that final staged config; Helix-reload every node once while still compatible; verify every live node reports the same epoch/digest/count and local bridge implementation marker; then change only `relay_v2_authoring` to `"active"` and Helix-reload sequentially. Run `--check-config` again before every activation reload. A non-zero plan requires an explicit `[node].secret_key` or `[node].public_key`, `require_secured = true`, `require_signed_frames = true`, 1..255 unique valid direct `trust_roots` keys, and 2..4096 unique roster keys. The local key and every direct root must be in the roster; no direct root may equal the local key, duplicate another root, or collide with another configured compact u64 node id. Roster order and hex/base64 representation are canonicalized and do not affect the digest.
 
@@ -531,7 +531,7 @@ OCSP stapling. Source: struct `Ocsp` at `src/daemon/config_format.zig:766`, pars
 
 Source: struct `Cloak` at `src/daemon/config_format.zig:611`, parsing at `src/daemon/config_format.zig:1272`, boot wiring at `src/main.zig:468`. See [Host cloaking](host-cloaking.md) for the full model.
 
-The cloak key is not a bare `SHA256(secret)`: `secret` (and `previous_secret`) are stretched through **argon2id** (memory-hard KDF, 64 MiB / t=2 / p=1) with a fixed domain-separation salt `orochi/cloak-key/argon2id/v1`, so a low-entropy operator passphrase is not offline-brute-forceable against the fully-enumerable IPv4 input space (`src/main.zig:491`, `src/crypto/argon2_kdf.zig:117`, `src/crypto/argon2_kdf.zig:130`). Derivation is deterministic (fixed salt), so cloaked hosts stay stable across restarts and identical mesh-wide.
+The cloak key is not a bare `SHA256(secret)`: `secret` (and `previous_secret`) are stretched through **argon2id** (memory-hard KDF, 64 MiB / t=2 / p=1) with a fixed domain-separation salt `onyx/cloak-key/argon2id/v1`, so a low-entropy operator passphrase is not offline-brute-forceable against the fully-enumerable IPv4 input space (`src/main.zig:491`, `src/crypto/argon2_kdf.zig:117`, `src/crypto/argon2_kdf.zig:130`). Derivation is deterministic (fixed salt), so cloaked hosts stay stable across restarts and identical mesh-wide.
 
 **Mesh requirement:** every mesh node MUST share one `[cloak] secret`. A meshed node with no shared secret generates a per-boot random key, so cloaked hosts differ per node and change on restart — `*!*@<cloak>` and subnet WARD bans neither federate nor persist. `--check-config` **hard-errors** (`meshCloakSecretMissing`) when `[mesh] connect` OR `[listen] s2s` is set without a `[cloak] secret` (`src/daemon/config_format.zig:829`, `src/main.zig:192`).
 
@@ -554,7 +554,7 @@ Browser [Web Push](web-push.md) delivery for offline direct messages (triggered 
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Master switch. When off, the `WEBPUSH` command is not registered. |
 | `subject` | string | `mailto:ops@eshmaki.me` | VAPID JWT `sub` claim (RFC 8292) — an operator contact the push service may use to reach the node. |
-| `vapid_key_path` | string | `orochi-webpush-vapid.key` | Where the ES256 VAPID secret persists. **Rotating it invalidates every stored browser subscription** (the advertised public key changes). |
+| `vapid_key_path` | string | `onyx-webpush-vapid.key` | Where the ES256 VAPID secret persists. **Rotating it invalidates every stored browser subscription** (the advertised public key changes). |
 
 ## `[webhook]`
 
@@ -564,7 +564,7 @@ Incoming channel webhooks are off by default. When enabled, channel operators an
 
 The listener is a single-threaded, one-connection-at-a-time HTTP/1.1 accept loop and requires a valid `Content-Length` on every POST body — a body-bearing request without one is rejected immediately with `411 Length Required` rather than being awaited. Because a stalled or dribbled request still occupies the loop for up to `conn_read_timeout_sec` (5s), a non-loopback `bind` MUST sit behind a buffering reverse proxy (nginx/Caddy) that terminates TLS and always forwards a complete, `Content-Length`-framed request. Keep the default loopback bind unless such a proxy is in front.
 
-The listener accepts sanitized JSON payloads with `content`, `embeds`, Discord-style `components`, and Block-Kit-lite `blocks`. Supported block fallback types are `header`, `section`, `context`, and `actions`; buttons and select menus always degrade to bounded text lines such as `[button] Open <https://...>` and `[select] Promote to: staging, prod`. For clients that negotiated `message-tags`, block action metadata is also delivered as a client-only IRCv3 tag: `+orochi/block-kit=v1|b:<label>,u:<url>|s:<label>,o:<opt>~<opt>`, with tag values percent-encoded and capped inline. CR/LF/NUL/control bytes are stripped before reactor handoff, and each post is capped by `max_body_bytes`, rendered line limits, metadata tag limits, and per-binding rate limits.
+The listener accepts sanitized JSON payloads with `content`, `embeds`, Discord-style `components`, and Block-Kit-lite `blocks`. Supported block fallback types are `header`, `section`, `context`, and `actions`; buttons and select menus always degrade to bounded text lines such as `[button] Open <https://...>` and `[select] Promote to: staging, prod`. For clients that negotiated `message-tags`, block action metadata is also delivered as a client-only IRCv3 tag: `+onyx/block-kit=v1|b:<label>,u:<url>|s:<label>,o:<opt>~<opt>`, with tag values percent-encoded and capped inline. CR/LF/NUL/control bytes are stripped before reactor handoff, and each post is capped by `max_body_bytes`, rendered line limits, metadata tag limits, and per-binding rate limits.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|

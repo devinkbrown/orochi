@@ -9,10 +9,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 
-const pem = orochi.proto.pem;
-const x509 = orochi.crypto.x509;
+const pem = onyx_server.proto.pem;
+const x509 = onyx_server.crypto.x509;
 
 const Allocator = std.mem.Allocator;
 pub const Writer = std.Io.Writer;
@@ -158,7 +158,7 @@ pub fn writePublicFile(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []co
 /// Wall-clock Unix seconds for validity checks (substrate seam; never a raw
 /// syscall in portable code).
 pub fn wallClockSeconds() i64 {
-    return @divTrunc(orochi.substrate.platform.realtimeMillis(), 1000);
+    return @divTrunc(onyx_server.substrate.platform.realtimeMillis(), 1000);
 }
 
 /// Tiny forward-only argument cursor shared by the subcommand parsers.

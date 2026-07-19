@@ -44,9 +44,9 @@ pub const CapId = enum(u6) {
     message_editing,
     message_redaction,
     typing,
-    orochi_session_sync,
-    orochi_bouncer,
-    orochi_undertow_media,
+    onyx_session_sync,
+    onyx_bouncer,
+    onyx_cadence_media,
 };
 
 pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".field_names.len;
@@ -409,9 +409,9 @@ const default_specs = [_]CapSpec{
     .{ .id = .message_editing, .name = "message-editing" },
     .{ .id = .message_redaction, .name = "message-redaction" },
     .{ .id = .typing, .name = "typing" },
-    .{ .id = .orochi_session_sync, .name = "orochi/session-sync" },
-    .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
-    .{ .id = .orochi_undertow_media, .name = "orochi/suimyaku-media" },
+    .{ .id = .onyx_session_sync, .name = "onyx/session-sync" },
+    .{ .id = .onyx_bouncer, .name = "onyx/bouncer" },
+    .{ .id = .onyx_cadence_media, .name = "onyx/cadence-media" },
 };
 
 fn parseRequestedSet(registry: CapRegistry, raw_list: []const u8) ?RequestedSet {

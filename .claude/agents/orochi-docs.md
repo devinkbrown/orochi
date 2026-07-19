@@ -1,13 +1,13 @@
 ---
-name: orochi-docs
-description: Updates only Orochi documentation from verified source and deployed runtime truth after release acceptance.
+name: onyx-docs
+description: Updates only Onyx Server documentation from verified source and deployed runtime truth after release acceptance.
 tools: Read, Grep, Glob, Bash, Write, Edit, Skill
 model: claude-sonnet-5
 effort: medium
 permissionMode: acceptEdits
 maxTurns: 48
 skills:
-  - orochi-release-deploy
+  - onyx-server-release-deploy
 ---
 
 SERVER_ZIG_ROLE: excluded

@@ -24,7 +24,7 @@ const linux = std.os.linux;
 /// unbounded size. The bound comfortably exceeds the sum of the mandatory
 /// checkpoint caps (prop 512 MiB + history 136 MiB + world/search 64 MiB each +
 /// event 8 MiB) plus a very large per-client capsule population, so it never
-/// rejects a legitimate handoff for orochi's scale while still fail-closing an
+/// rejects a legitimate handoff for Onyx Server's scale while still fail-closing an
 /// absurd one.
 pub const max_arena_bytes: usize = 2 * 1024 * 1024 * 1024;
 
@@ -239,11 +239,11 @@ pub fn handOff(prepared: *Prepared, fds: []const handoff.Fd, arena_fd: handoff.F
 }
 
 /// Environment-variable names used to pass inherited fds across execve to the successor.
-pub const env_arena_fd = "OROCHI_HELIX_ARENA_FD";
-pub const env_control_fd = "OROCHI_HELIX_CONTROL_FD";
+pub const env_arena_fd = "ONYX_HELIX_ARENA_FD";
+pub const env_control_fd = "ONYX_HELIX_CONTROL_FD";
 /// The inherited listening-socket fd, preserved across execve so the successor
 /// keeps the port bound (no connection-refused window during an UPGRADE).
-pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
+pub const env_listen_fd = "ONYX_HELIX_LISTEN_FD";
 /// Multi-shard listener handoff: comma-separated per-shard client-listener fds
 /// in shard order (`fd0,fd1,...`), preserved across execve so EVERY shard's
 /// SO_REUSEPORT listener survives the swap (no accept-queue drop on shards
@@ -253,7 +253,7 @@ pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
 /// binary that predates this ownership contract is refused while the
 /// predecessor keeps every listener and connection live; it can never inherit
 /// and strand unrecognized SO_REUSEPORT listeners.
-pub const env_listen_fds = "OROCHI_HELIX_LISTEN_FDS";
+pub const env_listen_fds = "ONYX_HELIX_LISTEN_FDS";
 /// Hard cap on inherited per-shard listener fds. Producer and parser share the
 /// fixed `Resume` bound; an upgrade with more listeners is refused rather than
 /// truncating the list and leaking unowned sockets in the successor.
@@ -262,7 +262,7 @@ pub const max_inherited_listeners = 64;
 /// state arena. Unlike the capsule stream this manifest is version-independent:
 /// a successor can close the sockets even when the arena is corrupt or uses a
 /// future schema that it cannot decode.
-pub const env_state_fds = "OROCHI_HELIX_STATE_FDS";
+pub const env_state_fds = "ONYX_HELIX_STATE_FDS";
 /// Hard cap for the authoritative state-fd manifest. Both producer and parser
 /// reject lists above this bound; the list is never silently truncated because
 /// losing even one fd would strand that connection across a refused upgrade.
@@ -276,7 +276,7 @@ pub const max_inherited_state_fds = 4096;
 /// `was_websocket` discriminator; a target lacking it must never receive fds.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
 pub const upgrade_capability_token =
-    "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
+    "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
 
 /// Require the capability token as a complete output line. Substring matching
 /// would let a diagnostic such as "missing TOKEN" accidentally authorize a
@@ -1002,15 +1002,15 @@ test "mesh state pieces advertise ordinary overlap and exact property requiremen
 
 test "exec plan with listener carries the listen fd env entry" {
     const allocator = std.testing.allocator;
-    var plan = try buildExecPlanWithListener(allocator, "/tmp/orochi", 10, 11, 12);
+    var plan = try buildExecPlanWithListener(allocator, "/tmp/onyx", 10, 11, 12);
     defer plan.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/orochi", plan.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/onyx", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
     try std.testing.expectEqual(@as(usize, 3), plan.envp.len);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=10", plan.envp[0]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=12", plan.envp[2]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_ARENA_FD=10", plan.envp[0]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_CONTROL_FD=11", plan.envp[1]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FD=12", plan.envp[2]);
 }
 
 test "ExecPlan.commit execve's the target (fork + /bin/true)" {
@@ -1041,37 +1041,37 @@ test "upgrade capability token must occupy a complete output line" {
     try std.testing.expect(hasUpgradeCapabilityLine("banner\r\n" ++ upgrade_capability_token ++ "\r\n"));
     try std.testing.expect(!hasUpgradeCapabilityLine("prefix " ++ upgrade_capability_token ++ "\n"));
     try std.testing.expect(!hasUpgradeCapabilityLine(upgrade_capability_token ++ " suffix\n"));
-    try std.testing.expect(!hasUpgradeCapabilityLine("OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v1\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine("ONYX_HELIX_UPGRADE_CAPS=mesh-checkpoint-v1\n"));
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     // The immediately preceding token understood RVO2 but not the mandatory
     // RVL2/ADS1 authorities. It must be refused before any fd loses CLOEXEC;
     // otherwise the successor would exec successfully and only then reject the
     // newly mandatory mesh checkpoints, disconnecting every carried client.
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     // The immediately preceding current token has no strict MHLC v3 activation
     // authority. Accepting it could exec a successor that resets an active
     // MESSAGE_V2 author back to compatibility mode.
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+        "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
     // A predecessor that predates whole-arena integrity or exact
     // World/history/webhook ownership must refuse the new handoff contract;
     // operators can still cold-restart it.
     try std.testing.expect(!hasUpgradeCapabilityLine(
-        "OROCHI_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1\n",
+        "ONYX_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1\n",
     ));
 }
 
@@ -1126,8 +1126,8 @@ test "arena+listener exec plan carries both fds, no control" {
     var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, &.{}, null);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_ARENA_FD=5", plan.envp[0]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FD=6", plan.envp[1]);
     try std.testing.expectEqual(@as(handoff.Fd, -1), plan.control_fd);
 }
 
@@ -1138,9 +1138,9 @@ test "arena+listener exec plan carries the per-shard listener list (multi-shard)
     // Singular var still carries shard 0 (older-successor compatibility), and
     // the full shard-ordered list rides the plural var.
     try std.testing.expectEqual(@as(usize, 3), plan.envp.len);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9,12", plan.envp[2]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_ARENA_FD=5", plan.envp[0]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FD=6", plan.envp[1]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FDS=6,9,12", plan.envp[2]);
     // An empty listener set is a caller bug — fail closed, never exec plan-less.
     try std.testing.expectError(error.NoListener, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{}, &.{}, null));
     try std.testing.expectError(error.InvalidArenaFd, buildArenaListenerExecPlan(allocator, "/proc/self/exe", -1, &.{6}, &.{}, null));
@@ -1164,8 +1164,8 @@ test "arena exec plan carries authoritative state fds without truncation" {
     );
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 4), plan.envp.len);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
 
     var too_many: [max_inherited_state_fds + 1]handoff.Fd = @splat(7);
     try std.testing.expectError(
@@ -1203,12 +1203,12 @@ test "arena exec plan with both fd manifests is allocation-failure clean" {
                 5,
                 &.{ 6, 9 },
                 &.{ 21, 34, 55 },
-                "/tmp/orochi.conf",
+                "/tmp/onyx_server.conf",
             );
             defer plan.deinit(allocator);
             try std.testing.expectEqual(@as(usize, 4), plan.envp.len);
-            try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
-            try std.testing.expectEqualStrings("OROCHI_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
+            try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FDS=6,9", plan.envp[2]);
+            try std.testing.expectEqualStrings("ONYX_HELIX_STATE_FDS=21,34,55", plan.envp[3]);
         }
     };
 
@@ -1245,14 +1245,14 @@ test "authoritative state fd parser rejects overflow rather than truncating" {
 
 test "resume env records valid and malformed authoritative manifests" {
     const good = resumeFromEnvBlock(
-        "OROCHI_HELIX_ARENA_FD=5\x00OROCHI_HELIX_LISTEN_FD=6\x00OROCHI_HELIX_STATE_FDS=21,34,55\x00",
+        "ONYX_HELIX_ARENA_FD=5\x00ONYX_HELIX_LISTEN_FD=6\x00ONYX_HELIX_STATE_FDS=21,34,55\x00",
     ).?;
     try std.testing.expect(good.state_fd_manifest_present);
     try std.testing.expect(good.state_fd_manifest_valid);
     try std.testing.expectEqualSlices(handoff.Fd, &.{ 21, 34, 55 }, good.stateFds());
 
     const bad = resumeFromEnvBlock(
-        "OROCHI_HELIX_ARENA_FD=5\x00OROCHI_HELIX_STATE_FDS=21,21\x00",
+        "ONYX_HELIX_ARENA_FD=5\x00ONYX_HELIX_STATE_FDS=21,21\x00",
     ).?;
     try std.testing.expect(bad.state_fd_manifest_present);
     try std.testing.expect(!bad.state_fd_manifest_valid);
@@ -1260,13 +1260,13 @@ test "resume env records valid and malformed authoritative manifests" {
 }
 
 test "findEnvValue locates the listener list in an environ block" {
-    const block = "FOO=bar\x00OROCHI_HELIX_LISTEN_FDS=6,9\x00BAZ=qux\x00";
+    const block = "FOO=bar\x00ONYX_HELIX_LISTEN_FDS=6,9\x00BAZ=qux\x00";
     try std.testing.expectEqualStrings("6,9", findEnvValue(block, env_listen_fds).?);
     try std.testing.expectEqual(@as(?[]const u8, null), findEnvValue("FOO=bar\x00", env_listen_fds));
 }
 
 test "findEnvValue locates the authoritative state fd list" {
-    const block = "FOO=bar\x00OROCHI_HELIX_STATE_FDS=21,34,55\x00BAZ=qux\x00";
+    const block = "FOO=bar\x00ONYX_HELIX_STATE_FDS=21,34,55\x00BAZ=qux\x00";
     try std.testing.expectEqualStrings("21,34,55", findEnvValue(block, env_state_fds).?);
 }
 
@@ -1277,11 +1277,11 @@ test "listener-only exec plan carries just the listen fd" {
     try std.testing.expectEqualStrings("/proc/self/exe", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
     try std.testing.expectEqual(@as(usize, 1), plan.envp.len);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=7", plan.envp[0]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_LISTEN_FD=7", plan.envp[0]);
 }
 
 test "readFdFromEnvBlock parses the listen fd, absent -> null" {
-    const block = "FOO=bar\x00OROCHI_HELIX_LISTEN_FD=37\x00BAZ=qux\x00";
+    const block = "FOO=bar\x00ONYX_HELIX_LISTEN_FD=37\x00BAZ=qux\x00";
     try std.testing.expectEqual(@as(?handoff.Fd, 37), readFdFromEnvBlock(block, env_listen_fd));
     const none = "FOO=bar\x00BAZ=qux\x00";
     try std.testing.expectEqual(@as(?handoff.Fd, null), readFdFromEnvBlock(none, env_listen_fd));
@@ -1290,11 +1290,11 @@ test "readFdFromEnvBlock parses the listen fd, absent -> null" {
 test "exec plan owns argv and envp without committing" {
     const allocator = std.testing.allocator;
 
-    var plan = try buildExecPlan(allocator, "/tmp/orochi", 10, 11);
+    var plan = try buildExecPlan(allocator, "/tmp/onyx", 10, 11);
     defer plan.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/orochi", plan.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/onyx", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=10", plan.envp[0]);
-    try std.testing.expectEqualStrings("OROCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_ARENA_FD=10", plan.envp[0]);
+    try std.testing.expectEqualStrings("ONYX_HELIX_CONTROL_FD=11", plan.envp[1]);
 }

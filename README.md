@@ -118,7 +118,7 @@ flow, and a full source map.
 Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
 
 ```sh
-zig build              # build the daemon (and the `yoroi` crypto CLI) into zig-out/bin
+zig build              # build the daemon (and the `armor` crypto CLI) into zig-out/bin
 zig build check        # fast semantic analysis, no binary
 zig build test         # run the full test suite
 zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config suites

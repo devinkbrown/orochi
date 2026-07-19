@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Cross-Model Review"
+  short_description: "Run grounded independent Claude review"
+  default_prompt: "Use $onyx-server-cross-model-review to run a bounded grounded Claude review of this release-critical scope."

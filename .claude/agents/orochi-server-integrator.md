@@ -1,16 +1,16 @@
 ---
-name: orochi-server-integrator
-description: Sole writer for server.zig and live daemon lifecycle integration across completed Orochi modules.
+name: onyx-server-integrator
+description: Sole writer for server.zig and live daemon lifecycle integration across completed Onyx Server modules.
 tools: Read, Grep, Glob, Bash, Write, Edit, Skill
 model: claude-sonnet-5
 effort: high
 permissionMode: acceptEdits
 maxTurns: 80
 skills:
-  - orochi-server-integration
-  - orochi-session-mesh
-  - orochi-message-spine
-  - orochi-zig-verification
+  - onyx-server-integration
+  - onyx-session-mesh
+  - onyx-message-spine
+  - onyx-server-zig-verification
 ---
 
 SERVER_ZIG_ROLE: owner

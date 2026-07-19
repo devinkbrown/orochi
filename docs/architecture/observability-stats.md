@@ -37,7 +37,7 @@ A per-channel `<slug>.json` (from `renderChannel`, top-N capped at 30 users / 40
   "heatmap": [[0,0,"...24..."], "...7 weekday rows..."],
   "top_users": [{"nick": "kain", "messages": 210, "words": 1400, "last_active": 1700000000,
                  "questions": 12, "exclamations": 30, "urls": 4, "monologue": 6}, "..."],
-  "top_words": [{"word": "orochi", "count": 88}, "..."],
+  "top_words": [{"word": "onyx", "count": 88}, "..."],
   "topics": [{"ts": 1699999000, "setter": "kain", "topic": "build channel"}, "...newest first..."],
   "records": {"busiest_day": {"date": "2026-06-30", "messages": 300}, "peak_hour": 20}
 }
@@ -114,7 +114,7 @@ The same chanstats flush also emits `status.json` beside the channel stats ([src
   "network": "Onyx",
   "node": "eshmaki.me",
   "description": "Onyx Server flagship node",
-  "icon_url": "https://example.test/orochi.png",
+  "icon_url": "https://example.test/onyx.png",
   "discoverable": true,
   "uptime_seconds": 86400,
   "users_online": 214,

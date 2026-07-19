@@ -51,7 +51,7 @@ upgrade also stops surfacing a spurious `TOPIC` line
 lacks the pieces and adopts with an empty roster/registry — the earlier behavior,
 not an error.
 
-The Helix live path passes inherited fds through environment variables. A single-shard or legacy handoff uses `OROCHI_HELIX_LISTEN_FD`; a multi-shard predecessor additionally passes the full shard-ordered set in `OROCHI_HELIX_LISTEN_FDS`. The sealed arena uses `OROCHI_HELIX_ARENA_FD` (`src/daemon/helix/live.zig:119`, `src/daemon/helix/live.zig:135`, `src/daemon/helix/live.zig:276`).
+The Helix live path passes inherited fds through environment variables. A single-shard or legacy handoff uses `ONYX_HELIX_LISTEN_FD`; a multi-shard predecessor additionally passes the full shard-ordered set in `ONYX_HELIX_LISTEN_FDS`. The sealed arena uses `ONYX_HELIX_ARENA_FD` (`src/daemon/helix/live.zig:119`, `src/daemon/helix/live.zig:135`, `src/daemon/helix/live.zig:276`).
 
 Current handoff also requires exactly one MHLC v3 mesh-clock capsule. Besides
 the mesh HLC and migration-offer floor, v3 carries the configured MESSAGE_V2
@@ -73,7 +73,7 @@ The carried roster/oper-grant registries above and the durable MESSAGE_V2 custod
 authorities — the accepted-event log (`RVL2`), per-hop outbox (`RVO2`), replay
 guard (`RVG2`), and rendered-record spool (`ADS1`) — are **in-memory checkpoints
 sealed only into the Helix upgrade capsule at re-exec**. They survive a `SIGUSR2`
-hot-upgrade (`systemctl reload orochi`), but there is no disk write-ahead log
+hot-upgrade (`systemctl reload onyx-server`), but there is no disk write-ahead log
 behind this plane: a power loss or systemd **cold** restart (`systemctl restart`)
 drops any in-flight custody obligation together with the carried roster and grant
 registries. Cold-restart a node only from a drained boundary with no un-ACKed

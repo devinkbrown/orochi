@@ -220,7 +220,7 @@ test "assemble concat vs newline chunks" {
     var assembler = Impl.init(std.testing.allocator);
     defer assembler.deinit();
 
-    try assembler.begin("abc", "#orochi", .privmsg);
+    try assembler.begin("abc", "#onyx", .privmsg);
     try assembler.chunk("abc", "hello", false);
     try assembler.chunk("abc", "how ", false);
     try assembler.chunk("abc", "are you?", true);
@@ -229,7 +229,7 @@ test "assemble concat vs newline chunks" {
     defer msg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.privmsg, msg.command);
-    try std.testing.expectEqualStrings("#orochi", msg.target);
+    try std.testing.expectEqualStrings("#onyx", msg.target);
     try std.testing.expectEqualStrings("hello\nhow are you?", msg.text);
     try std.testing.expectEqual(@as(usize, 3), msg.chunk_count);
     try std.testing.expectEqual(@as(usize, 0), assembler.count());

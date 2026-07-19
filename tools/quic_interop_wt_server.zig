@@ -18,20 +18,20 @@
 //! Bridge target: the listener bridges the client's first WT bidi stream to a
 //! TCP target on `127.0.0.1:<port>`, proxying raw bytes both ways. Two modes:
 //!
-//!   * DEFAULT (no `OROCHI_WT_BRIDGE_PORT`): spawn a tiny in-process loopback TCP
+//!   * DEFAULT (no `ONYX_WT_BRIDGE_PORT`): spawn a tiny in-process loopback TCP
 //!     echo server and point the bridge at it, so bytes the browser writes on the
 //!     WT bidi stream round-trip back byte-exact. This is the echo-interop lane
 //!     (`tools/quic_interop_browser.{mjs,sh}`).
-//!   * `OROCHI_WT_BRIDGE_PORT=<P>` (env): point the bridge at an already-running
+//!   * `ONYX_WT_BRIDGE_PORT=<P>` (env): point the bridge at an already-running
 //!     TCP server on `127.0.0.1:<P>` instead of the in-process echo. The IRC
 //!     interop lane (`tools/quic_interop_irc_browser.{mjs,sh}`) starts a REAL
-//!     orochi IRC daemon on a plaintext loopback port and passes that port here,
+//!     onyx IRC daemon on a plaintext loopback port and passes that port here,
 //!     so the browser registers as a genuine IRC client. (An env var, not an
 //!     argv flag: Zig 0.16 has no `std.os.argv`/arg iterator on the no-libc Linux
 //!     target this harness builds for.)
 //!
 //! WT datagrams are echoed by the listener's `echo_wt_datagrams` interop mode
-//! (received WT datagram -> re-queued back to the peer). In `OROCHI_WT_BRIDGE_PORT`
+//! (received WT datagram -> re-queued back to the peer). In `ONYX_WT_BRIDGE_PORT`
 //! (IRC) mode datagram echo is OFF — IRC rides the reliable bidi stream, and the
 //! IRC harness never exercises the datagram leg.
 //!
@@ -42,11 +42,11 @@
 //!   Then it blocks until killed.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 
-const WebTransportListener = orochi.daemon.webtransport_listener.WebTransportListener;
-const x509_selfsign = orochi.proto.x509_selfsign;
-const ecdsa_p256 = orochi.crypto.ecdsa_p256;
+const WebTransportListener = onyx_server.daemon.webtransport_listener.WebTransportListener;
+const x509_selfsign = onyx_server.proto.x509_selfsign;
+const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const linux = std.os.linux;
@@ -92,7 +92,7 @@ pub fn main() !void {
     Sha256.hash(cert, &hash, .{});
 
     // --- 2. Decide the WT bidi bridge target. --------------------------------
-    // `--bridge-port <P>` / `OROCHI_WT_BRIDGE_PORT` points the bridge at an
+    // `--bridge-port <P>` / `ONYX_WT_BRIDGE_PORT` points the bridge at an
     // already-running TCP server on 127.0.0.1:<P> (the IRC daemon). Absent it, we
     // spawn the in-process echo server (default echo-interop lane).
     const bridge_port_opt = try bridgePortArg();
@@ -257,7 +257,7 @@ fn wallClockSeconds() i64 {
     return @intCast(ts.sec);
 }
 
-/// Resolve the optional bridge target port from the `OROCHI_WT_BRIDGE_PORT`
+/// Resolve the optional bridge target port from the `ONYX_WT_BRIDGE_PORT`
 /// environment variable; null means "use the in-process echo". The port must
 /// parse as a non-zero u16. Zig 0.16 dropped `std.os.environ`/`getEnvVarOwned`
 /// on a no-libc Linux target (this harness builds without libc), so we read the
@@ -266,7 +266,7 @@ fn wallClockSeconds() i64 {
 fn bridgePortArg() !?u16 {
     var buf: [16384]u8 = undefined;
     const env = readSelfEnviron(&buf) orelse return null;
-    const key = "OROCHI_WT_BRIDGE_PORT=";
+    const key = "ONYX_WT_BRIDGE_PORT=";
     var it = std.mem.splitScalar(u8, env, 0);
     while (it.next()) |record| {
         if (std.mem.startsWith(u8, record, key)) {

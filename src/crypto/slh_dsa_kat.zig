@@ -12,7 +12,7 @@
 //! corpus (the X.509 certificate path uses an empty context, which most sigVer
 //! accept cases in this lean corpus do not). All are INDEPENDENT published
 //! vectors — triples of (public key, message, signature) with a NIST-supplied
-//! accept/reject verdict — NOT values this code produced (orochi has no SLH-DSA
+//! accept/reject verdict — NOT values this code produced (Onyx Server has no SLH-DSA
 //! signer or key generator). That independence is the whole point: a
 //! plausible-but-wrong hash-based verifier passes the module's own
 //! self-consistency checks but fails these ACVP accept vectors.

@@ -3,12 +3,12 @@
 
 //! IRCv3 standard-replies composer.
 //!
-//! Standard replies are Orochi's typed error/warning primitive for native
+//! Standard replies are Onyx Server's typed error/warning primitive for native
 //! services and command handlers. The hot path is allocation-free: callers pass
 //! command, code, context, description, and a destination buffer.
 const std = @import("std");
 
-/// Orochi's modern IRC line-body ceiling. Send paths may choose a lower cap.
+/// Onyx Server's modern IRC line-body ceiling. Send paths may choose a lower cap.
 pub const MAX_LINE_BODY: usize = 8191;
 
 /// Traditional IRC line body limit without CRLF.
@@ -27,7 +27,7 @@ pub const ReplyType = enum {
     }
 };
 
-/// Common IRCv3 standard-replies and Orochi/IRCX service reply codes.
+/// Common IRCv3 standard-replies and Onyx Server/IRCX service reply codes.
 ///
 /// The enum tag name is the wire token. Keep codes uppercase and descriptive so
 /// service results can carry this type directly.
@@ -359,11 +359,11 @@ test "builds FAIL and WARN replies" {
 test "builds replies with context params" {
     var buf: [256]u8 = undefined;
     const line = try fail("PROP", .INVALID_PROPERTY, "Property cannot be set")
-        .withContext(&.{ "#orochi", "topic.locked" })
+        .withContext(&.{ "#onyx", "topic.locked" })
         .write(&buf);
 
     try std.testing.expectEqualStrings(
-        "FAIL PROP INVALID_PROPERTY #orochi topic.locked :Property cannot be set",
+        "FAIL PROP INVALID_PROPERTY #onyx topic.locked :Property cannot be set",
         line,
     );
 }

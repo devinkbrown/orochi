@@ -549,7 +549,7 @@ test "user_profile provider includes extended profile fields" {
         .profile_url = "https://example.test/alice",
         .profile_gender = "nonbinary",
         .profile_picture = "https://example.test/a.png",
-        .profile_bio = "Orochi operator",
+        .profile_bio = "Onyx operator",
         .profile_email = "alice@example.test",
     };
 
@@ -557,7 +557,7 @@ test "user_profile provider includes extended profile fields" {
     const value = try registry.query("user_profile", &snapshot, out);
 
     // Assert
-    try expectText(value, "url=https://example.test/alice;gender=nonbinary;picture=https://example.test/a.png;bio=Orochi operator;email=alice@example.test");
+    try expectText(value, "url=https://example.test/alice;gender=nonbinary;picture=https://example.test/a.png;bio=Onyx operator;email=alice@example.test");
 }
 
 test "user_profile provider reports small caller buffers" {

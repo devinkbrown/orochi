@@ -66,7 +66,7 @@ pub fn candidateWins(candidate: Claim, incumbent: Claim) bool {
 pub fn loserUid(node_id: NodeId, nick: []const u8) uid_alloc.Uid {
     const node16: u16 = @truncate(node_id);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("orochi-mesh-loser-uid-v2\x00");
+    hasher.update("onyx-server-mesh-loser-uid-v2\x00");
     var node_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &node_buf, node_id, .big);
     hasher.update(&node_buf);

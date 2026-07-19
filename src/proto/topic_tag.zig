@@ -4,16 +4,16 @@
 //! Named conversations ("topics") within a channel — the Zulip-style projection
 //! of channel chat into browsable, named threads. This module is the pure,
 //! allocation-free core: it validates a topic label, extracts/strips the
-//! `+orochi/topic` IRCv3 client-only message tag, and maintains the per-channel
+//! `+onyx/topic` IRCv3 client-only message tag, and maintains the per-channel
 //! topic registry stored as a bounded, comma-delimited IRCX channel PROP value.
 //!
 //! Wire surface (all backward-compatible — absent means "no change"):
-//!   * message tag  `+orochi/topic=<label>` on a channel PRIVMSG/NOTICE stamps a
+//!   * message tag  `+onyx/topic=<label>` on a channel PRIVMSG/NOTICE stamps a
 //!     conversation label onto that message. It rides the ordinary client-only
 //!     tag path (members with `message-tags`, echo-message, mesh relay, history).
-//!   * channel PROP `orochi.topics` — a comma-separated bounded set of the labels
+//!   * channel PROP `onyx_server.topics` — a comma-separated bounded set of the labels
 //!     seen on a channel; auto-added on first use and op-manageable.
-//!   * CHATHISTORY filter — an optional `+orochi/topic=<label>` tag on the
+//!   * CHATHISTORY filter — an optional `+onyx/topic=<label>` tag on the
 //!     CHATHISTORY command restricts replay to one conversation.
 //!
 //! Labels are hostile user input: bounded length, no control/CRLF bytes, and no
@@ -29,12 +29,12 @@ const std = @import("std");
 const irc_line = @import("irc_line.zig");
 
 /// The IRCv3 client-only message-tag key that carries a conversation label.
-pub const tag_key = "+orochi/topic";
+pub const tag_key = "+onyx/topic";
 
 /// The IRCX channel PROP key holding the per-channel topic registry (a bounded,
 /// comma-delimited set of known labels). A generic channel prop (like PINS /
 /// EPHEMERAL) so it persists and mesh-propagates through the signed CRDT store.
-pub const registry_key = "orochi.topics";
+pub const registry_key = "onyx_server.topics";
 
 /// Maximum decoded topic-label length, in bytes. Conversation names are short;
 /// this bound keeps the registry small enough to mesh-propagate and render.
@@ -65,9 +65,9 @@ pub fn validateLabel(label: []const u8) Error!void {
     }
 }
 
-/// The escaped, on-the-wire value of the `+orochi/topic` tag within a raw
-/// client-only tag segment (`+a=1;+orochi/topic=general;+b`), or null if absent.
-/// A bare `+orochi/topic` with no `=` yields an empty slice (which decodes to an
+/// The escaped, on-the-wire value of the `+onyx/topic` tag within a raw
+/// client-only tag segment (`+a=1;+onyx/topic=general;+b`), or null if absent.
+/// A bare `+onyx/topic` with no `=` yields an empty slice (which decodes to an
 /// empty, and therefore invalid, label).
 pub fn rawValue(client_tags_raw: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, client_tags_raw, ';');
@@ -81,12 +81,12 @@ pub fn rawValue(client_tags_raw: []const u8) ?[]const u8 {
     return null;
 }
 
-/// True when the `+orochi/topic` tag key is present in the raw tag segment.
+/// True when the `+onyx/topic` tag key is present in the raw tag segment.
 pub fn present(client_tags_raw: []const u8) bool {
     return rawValue(client_tags_raw) != null;
 }
 
-/// Decode and validate the `+orochi/topic` label carried in a raw client-only tag
+/// Decode and validate the `+onyx/topic` label carried in a raw client-only tag
 /// segment, writing the decoded label into `out`. Returns the decoded slice, or
 /// null when the tag is absent, decodes larger than `out`/`max_label_len`, or
 /// fails validation. `out` must be at least `max_label_len` bytes.
@@ -98,7 +98,7 @@ pub fn labelFromTags(client_tags_raw: []const u8, out: []u8) ?[]const u8 {
     return decoded;
 }
 
-/// Rebuild a raw client-only tag segment with the `+orochi/topic` tag removed,
+/// Rebuild a raw client-only tag segment with the `+onyx/topic` tag removed,
 /// preserving the order of all other tags. Used to fail-closed strip an invalid
 /// label so it never reaches the wire, mesh, or history. `out` must be at least
 /// `client_tags_raw.len` bytes (removing a tag only ever shrinks the segment).
@@ -205,48 +205,48 @@ test "validateLabel accepts sane labels and rejects hostile ones" {
 }
 
 test "rawValue / present find the topic tag in a client-only segment" {
-    try std.testing.expect(present("+typing=active;+orochi/topic=general;+draft/reply=m0"));
-    try std.testing.expectEqualStrings("general", rawValue("+typing=active;+orochi/topic=general").?);
+    try std.testing.expect(present("+typing=active;+onyx/topic=general;+draft/reply=m0"));
+    try std.testing.expectEqualStrings("general", rawValue("+typing=active;+onyx/topic=general").?);
     // Bare key, no value → empty slice (decodes to an invalid empty label).
-    try std.testing.expectEqualStrings("", rawValue("+orochi/topic;+typing=active").?);
+    try std.testing.expectEqualStrings("", rawValue("+onyx/topic;+typing=active").?);
     try std.testing.expect(!present("+typing=active;+draft/react=ok"));
     try std.testing.expect(rawValue("") == null);
     // A key that merely contains the tag_key as a prefix must not match.
-    try std.testing.expect(!present("+orochi/topics=x"));
+    try std.testing.expect(!present("+onyx/topics=x"));
 }
 
 test "labelFromTags decodes escapes, validates, and bounds length" {
     var buf: [max_label_len]u8 = undefined;
     // `\s` decodes to a space per IRCv3 tag-value escaping.
-    try std.testing.expectEqualStrings("release plan", labelFromTags("+orochi/topic=release\\splan", &buf).?);
-    try std.testing.expectEqualStrings("general", labelFromTags("+a=1;+orochi/topic=general;+b", &buf).?);
+    try std.testing.expectEqualStrings("release plan", labelFromTags("+onyx/topic=release\\splan", &buf).?);
+    try std.testing.expectEqualStrings("general", labelFromTags("+a=1;+onyx/topic=general;+b", &buf).?);
 
     // Absent tag → null.
     try std.testing.expect(labelFromTags("+typing=active", &buf) == null);
     // Empty value → invalid (Empty) → null.
-    try std.testing.expect(labelFromTags("+orochi/topic=", &buf) == null);
+    try std.testing.expect(labelFromTags("+onyx/topic=", &buf) == null);
     // A decoded label longer than the cap → null (never truncated into a match).
     const long_val: [max_label_len + 10]u8 = @splat('y');
     var line_buf: [max_label_len + 40]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "+orochi/topic={s}", .{long_val[0..]}) catch unreachable;
+    const line = std.fmt.bufPrint(&line_buf, "+onyx/topic={s}", .{long_val[0..]}) catch unreachable;
     try std.testing.expect(labelFromTags(line, &buf) == null);
     // A literal comma in the decoded value is invalid (comma is the delimiter).
-    try std.testing.expect(labelFromTags("+orochi/topic=a,b", &buf) == null);
+    try std.testing.expect(labelFromTags("+onyx/topic=a,b", &buf) == null);
 }
 
 test "stripTag removes only the topic tag and preserves order" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "+typing=active;+draft/reply=m0",
-        stripTag("+typing=active;+orochi/topic=bad;+draft/reply=m0", &buf),
+        stripTag("+typing=active;+onyx/topic=bad;+draft/reply=m0", &buf),
     );
     // Topic tag first.
     try std.testing.expectEqualStrings(
         "+typing=active",
-        stripTag("+orochi/topic=x;+typing=active", &buf),
+        stripTag("+onyx/topic=x;+typing=active", &buf),
     );
     // Only the topic tag → empty.
-    try std.testing.expectEqualStrings("", stripTag("+orochi/topic=x", &buf));
+    try std.testing.expectEqualStrings("", stripTag("+onyx/topic=x", &buf));
     // No topic tag → unchanged.
     try std.testing.expectEqualStrings("+typing=active", stripTag("+typing=active", &buf));
 }

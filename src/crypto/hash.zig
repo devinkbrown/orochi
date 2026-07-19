@@ -3,7 +3,7 @@
 
 //! Typed hash / HMAC / HKDF primitives (planning/02, "Primitive Layer").
 //!
-//! These wrap `std.crypto` but expose a orochi-native surface where the
+//! These wrap `std.crypto` but expose an Onyx Server-native surface where the
 //! digest of one algorithm cannot be silently substituted for another: each
 //! `Hash(alg)` has a distinct fixed-size `Digest` array type, and HMAC / HKDF
 //! are parameterized by the same algorithm tag so the chain stays type-checked

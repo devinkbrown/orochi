@@ -857,7 +857,7 @@ test "two links handshake and converge over a byte loopback" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     });
     defer a.deinit();
 
@@ -867,7 +867,7 @@ test "two links handshake and converge over a byte loopback" {
         .local_node_id = 2,
         .remote_node_id = 1,
         .local_epoch_ms = 1001,
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
     });
     defer b.deinit();
 
@@ -904,10 +904,10 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     // Establish, then A announces alice (op) on #chat with her real identity;
@@ -917,7 +917,7 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     try a.sendMembership("#chat", "alice", 0b0010, 100, true, .{
         .username = "alice",
         .realname = "Alice Liddell",
-        .host = "cloak-1a2b.users.orochi",
+        .host = "cloak-1a2b.users.onyx",
     }, ""); // op bit
     var rounds: usize = 0;
     while (rounds < 32) : (rounds += 1) {
@@ -944,7 +944,7 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     try std.testing.expectEqual(@as(u4, 0b0010), members[0].status);
     try std.testing.expectEqualStrings("alice", members[0].username);
     try std.testing.expectEqualStrings("Alice Liddell", members[0].realname);
-    try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", members[0].host);
+    try std.testing.expectEqualStrings("cloak-1a2b.users.onyx", members[0].host);
 
     // The daemon-facing wrappers retain the receiver-only token contract; the
     // compatibility frame itself arrived unbound, then signed authority tags it.
@@ -965,7 +965,7 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     }
     try std.testing.expectEqual(@as(usize, 1), deltas.len);
     try std.testing.expectEqualStrings("alice", deltas[0].username);
-    try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", deltas[0].host);
+    try std.testing.expectEqualStrings("cloak-1a2b.users.onyx", deltas[0].host);
 
     // A part removes her on B too.
     try a.sendMembership("#chat", "alice", 0, 101, false, .{}, "");
@@ -987,10 +987,10 @@ test "CLONE_COUNT batch propagates across the link and decodes intact" {
     const mesh_clones = @import("mesh_clones.zig");
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1035,10 +1035,10 @@ test "CHANNEL_MODE_FLAGS propagates aggregate flag state across the link" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1089,10 +1089,10 @@ test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChang
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1136,10 +1136,10 @@ test "ENTITY_PROP payload round-trips across the link into takeEntityPropChanges
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1186,10 +1186,10 @@ test "CHANNEL_MODE_STATE propagates parameter and IRCX state across the link" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1261,10 +1261,10 @@ test "TOPIC payload round-trips across the link into takeTopicChanges" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1320,10 +1320,10 @@ test "NICKCHANGE renames a remote member and yields a delta" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     try a.start(10);
@@ -1407,7 +1407,7 @@ test "session replica v2 signed plaintext S2sLink remains disabled" {
         .local_node_id = a_short,
         .remote_node_id = b_short,
         .local_epoch_ms = 1000,
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
         .signing_key = kp_a,
     });
     defer a.deinit();
@@ -1417,7 +1417,7 @@ test "session replica v2 signed plaintext S2sLink remains disabled" {
         .local_node_id = b_short,
         .remote_node_id = a_short,
         .local_epoch_ms = 1001,
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
         .signing_key = kp_b,
     });
     defer b.deinit();
@@ -1440,10 +1440,10 @@ test "a remote nick colliding with a LOCAL nick is renamed to its UID, not overw
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     // b's local world already holds "kain". An incoming remote "kain" from a
@@ -1474,10 +1474,10 @@ test "a remote RENAME into a locally-held nick redirects the renamer to its UID"
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     // b's local world holds "kain". A remote user announces under Guest1, then
@@ -1509,10 +1509,10 @@ test "a same-node re-affirmation keeps the nick (no spurious collision rename)" 
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
     // No local holder; "mei" is uncontested.
     var stub = LocalNickStub{ .held = "someone-else" };
@@ -1534,10 +1534,10 @@ test "OPER_GRANT payload round-trips across the link into takeOperGrants" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi", .config = plaintext_link_config });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
     defer b.deinit();
 
     // Establish, then A sends an opaque signed grant blob; pump to B.
@@ -1578,7 +1578,7 @@ test "MeshPass admitted frame families drop app frames while sync still flows" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi", .config = plaintext_link_config });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
     defer a.deinit();
     var b: S2sLink = undefined;
     try b.init(.{
@@ -1586,7 +1586,7 @@ test "MeshPass admitted frame families drop app frames while sync still flows" {
         .local_node_id = 2,
         .remote_node_id = 1,
         .local_epoch_ms = 1001,
-        .server_name = "b.orochi",
+        .server_name = "b.onyx",
         .admitted_frame_families = meshpass.frameFamilies(&.{ .control, .sync }),
         .config = plaintext_link_config,
     });
@@ -1626,7 +1626,7 @@ test "consumeOutbound drops a partial-send prefix" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
     });
     defer link.deinit();
 
@@ -1662,7 +1662,7 @@ test "S2sLink.init threads peer driver config into live link state" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "a.orochi",
+        .server_name = "a.onyx",
         .config = cfg,
     });
     defer link.deinit();

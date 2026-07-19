@@ -5,7 +5,7 @@
 //!
 //! Channel membership lookup, channel existence, and delivery fanout are owned
 //! by the caller. This module validates attacker-controlled command fields,
-//! parses `KICK <channel> <user> [:reason]`, compares Orochi member-prefix
+//! parses `KICK <channel> <user> [:reason]`, compares Onyx Server member-prefix
 //! tiers for authorization, and builds KICK broadcasts plus common KICK
 //! numerics into caller-owned buffers without allocation.
 const std = @import("std");

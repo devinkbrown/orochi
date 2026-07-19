@@ -306,12 +306,12 @@ pub fn seedOperCertfpBinds(binds: *certfp_bind.CertfpBindStore, opers: []const c
     for (opers) |o| {
         if (o.certfp.len == 0) continue;
         if (o.account.len == 0) {
-            dlog.log("orochi: skipping certfp seed: oper binding has an empty account\n", .{});
+            dlog.log("onyx-server: skipping certfp seed: oper binding has an empty account\n", .{});
             continue;
         }
         for (o.certfp) |raw| {
             if (raw.len != certfp.fingerprint_len) {
-                dlog.log("orochi: skipping malformed certfp for account '{s}': expected {d} hex chars, got {d}\n", .{ o.account, certfp.fingerprint_len, raw.len });
+                dlog.log("onyx-server: skipping malformed certfp for account '{s}': expected {d} hex chars, got {d}\n", .{ o.account, certfp.fingerprint_len, raw.len });
                 continue;
             }
             // Normalize case to lowercase into a fixed buffer; validateFingerprint
@@ -319,7 +319,7 @@ pub fn seedOperCertfpBinds(binds: *certfp_bind.CertfpBindStore, opers: []const c
             var lowered: [certfp.fingerprint_len]u8 = undefined;
             for (raw, 0..) |ch, i| lowered[i] = std.ascii.toLower(ch);
             binds.bind(o.account, &lowered) catch |err| {
-                dlog.log("orochi: skipping invalid certfp for account '{s}': {s}\n", .{ o.account, @errorName(err) });
+                dlog.log("onyx-server: skipping invalid certfp for account '{s}': {s}\n", .{ o.account, @errorName(err) });
                 continue;
             };
             bound += 1;
@@ -498,12 +498,12 @@ pub fn loadFromText(
     errdefer bindings.deinit(allocator);
     for (parsed.opers) |o| {
         if (o.class.len == 0 or groups.get(o.class) == null) {
-            dlog.log("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            dlog.log("onyx-server: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
             continue;
         }
         const privileges = groups.effectivePrivileges(o.class);
         if (privileges.count() == 0) {
-            dlog.log("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            dlog.log("onyx-server: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
             continue;
         }
         try bindings.append(allocator, .{
@@ -538,7 +538,7 @@ pub fn loadFromText(
                 .oper_only = c.match_oper,
                 .ident_glob = c.ident_glob,
                 .host_glob = c.host_glob,
-            }) catch |e| dlog.log("orochi: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
+            }) catch |e| dlog.log("onyx-server: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
         }
         config.class_registry = try cb.finish();
     }
@@ -632,18 +632,18 @@ test "config text overlays the server config" {
         \\koshi_max_patterns = 512
         \\koshi_pattern_max_len = 128
         \\[backup]
-        \\dir = "/var/backups/orochi"
+        \\dir = "/var/backups/onyx"
         \\interval = "6h"
         \\[sasl]
         \\enabled = false
-        \\account_db = "/var/lib/orochi/accounts.db"
+        \\account_db = "/var/lib/onyx/accounts.db"
         \\realm = "ircxnet"
         \\[tls]
         \\enabled = true
         \\request_client_cert = true
         \\raw_public_key = true
         \\[[tls.ech_keys]]
-        \\config_path = "/etc/orochi/echconfig.bin"
+        \\config_path = "/etc/onyx/echconfig.bin"
         \\private_key = "2222222222222222222222222222222222222222222222222222222222222222"
         \\
     ;
@@ -711,16 +711,16 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 64), loaded.config.multiline_target_len);
     try testing.expectEqual(@as(usize, 512), loaded.config.content_filter_config.max_patterns);
     try testing.expectEqual(@as(usize, 128), loaded.config.content_filter_config.max_pattern_len);
-    try testing.expectEqualStrings("/var/backups/orochi", loaded.config.backup_dir);
+    try testing.expectEqualStrings("/var/backups/onyx", loaded.config.backup_dir);
     try testing.expectEqual(@as(i64, 6 * 60 * 60 * 1000), loaded.config.backup_interval_ms);
-    try testing.expectEqualStrings("/var/lib/orochi/accounts.db", loaded.config.account_store_path);
+    try testing.expectEqualStrings("/var/lib/onyx/accounts.db", loaded.config.account_store_path);
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
     try testing.expect(loaded.tls.enabled);
     try testing.expect(loaded.tls.request_client_cert);
     try testing.expect(loaded.tls.raw_public_key);
     try testing.expectEqual(@as(usize, 1), loaded.tls.ech_keys.len);
-    try testing.expectEqualStrings("/etc/orochi/echconfig.bin", loaded.tls.ech_keys[0].config_path);
+    try testing.expectEqualStrings("/etc/onyx/echconfig.bin", loaded.tls.ech_keys[0].config_path);
     try testing.expectEqual(@as([32]u8, @splat(0x22)), loaded.tls.ech_keys[0].private_key);
 }
 
@@ -941,7 +941,7 @@ test "wasm plugin_dir maps into the live config" {
         \\[listen]
         \\irc = 6680
         \\[wasm]
-        \\plugin_dir = "/var/lib/orochi/plugins"
+        \\plugin_dir = "/var/lib/onyx/plugins"
         \\max_plugin_bytes = 4096
         \\max_memory_bytes = 131072
         \\default_fuel = 1234
@@ -954,7 +954,7 @@ test "wasm plugin_dir maps into the live config" {
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
     defer loaded.deinit(allocator);
-    try testing.expectEqualStrings("/var/lib/orochi/plugins", loaded.config.wasm_plugin_dir);
+    try testing.expectEqualStrings("/var/lib/onyx/plugins", loaded.config.wasm_plugin_dir);
     try testing.expectEqual(@as(usize, 4096), loaded.config.wasm_max_plugin_bytes);
     try testing.expectEqual(@as(usize, 131072), loaded.config.wasm_max_memory_bytes);
     try testing.expectEqual(@as(u64, 1234), loaded.config.wasm_default_fuel);
@@ -1029,7 +1029,7 @@ test "acme section lifts onto the boot config" {
         \\contact = "mailto:admin@example.test"
         \\renew_before_days = 15
         \\check_interval = "2h"
-        \\ca_bundle_path = "/etc/orochi/acme-ca.pem"
+        \\ca_bundle_path = "/etc/onyx/acme-ca.pem"
         \\ca_bundle_max_bytes = 1048576
         \\challenge_port = 14403
         \\max_steps = 96
@@ -1052,7 +1052,7 @@ test "acme section lifts onto the boot config" {
     try testing.expectEqualStrings("mailto:admin@example.test", loaded.acme.contact.?);
     try testing.expectEqual(@as(u16, 15), loaded.acme.renew_before_days);
     try testing.expectEqual(@as(u64, 2 * 60 * 60 * 1000), loaded.acme.check_interval_ms);
-    try testing.expectEqualStrings("/etc/orochi/acme-ca.pem", loaded.acme.ca_bundle_path);
+    try testing.expectEqualStrings("/etc/onyx/acme-ca.pem", loaded.acme.ca_bundle_path);
     try testing.expectEqual(@as(u64, 1048576), loaded.acme.ca_bundle_max_bytes);
     try testing.expectEqual(@as(u16, 14403), loaded.acme.challenge_port);
     try testing.expectEqual(@as(u32, 96), loaded.acme.max_steps);

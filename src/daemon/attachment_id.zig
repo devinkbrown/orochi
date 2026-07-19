@@ -17,8 +17,8 @@ pub const SessionToken = [byte_len]u8;
 pub const PresenceId = [byte_len]u8;
 pub const RouteId = [byte_len]u8;
 
-const presence_id_domain = "orochi-session-presence-id-v1\x00";
-const route_id_domain = "orochi-session-route-id-v1\x00";
+const presence_id_domain = "onyx-session-presence-id-v1\x00";
+const route_id_domain = "onyx-session-route-id-v1\x00";
 const max_mint_attempts: usize = 4;
 
 pub const ParseError = error{

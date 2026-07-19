@@ -13,7 +13,7 @@ pub const digest_len = std.crypto.hash.Blake3.digest_length;
 pub const public_key_len: usize = 32;
 pub const PublicKey = [public_key_len]u8;
 pub const max_roster_entries: usize = 4096;
-const roster_digest_domain = "orochi-message-v2-activation-roster-v1\x00";
+const roster_digest_domain = "onyx-message-v2-activation-roster-v1\x00";
 
 pub const Mode = enum(u8) {
     compat = 0,
@@ -44,7 +44,7 @@ pub fn validate(state: State) Error!void {
         return error.MissingActivationPlan;
 }
 
-/// Decode one Ed25519 public identity from the two deployment spellings Orochi
+/// Decode one Ed25519 public identity from the two deployment spellings Onyx Server
 /// accepts. The canonical roster always hashes raw 32-byte keys, never their
 /// case-sensitive hex/base64 text.
 pub fn decodePublicKey(text: []const u8) Error!PublicKey {

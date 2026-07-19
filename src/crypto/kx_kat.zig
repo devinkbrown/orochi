@@ -111,7 +111,7 @@ test "HybridKx deterministic encapsulation and shared-secret agreement" {
         byte.* = @intCast((i * 29 + 0x47) & 0xff);
     }
 
-    const transcript = "orochi kx kat deterministic transcript";
+    const transcript = "onyx kx kat deterministic transcript";
     const responder_share = responder.publicShare();
 
     var first = try kx.HybridKx.encapsulateDeterministic(

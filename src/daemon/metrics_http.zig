@@ -363,12 +363,12 @@ test "MetricsSnapshot set/copyInto round-trips owned text" {
 
     try testing.expectEqual(@as(usize, 0), snap.len());
 
-    try snap.set("orochi_connections_total 7\n");
+    try snap.set("onyx_connections_total 7\n");
     try testing.expectEqual(@as(usize, 27), snap.len());
 
     var buf: [128]u8 = undefined;
     const got = try snap.copyInto(&buf);
-    try testing.expectEqualStrings("orochi_connections_total 7\n", got);
+    try testing.expectEqualStrings("onyx_connections_total 7\n", got);
 }
 
 test "MetricsSnapshot set replaces and frees the prior buffer" {
@@ -394,7 +394,7 @@ test "MetricsSnapshot copyInto reports NoSpaceLeft when body exceeds buffer" {
 test "handleRequest serves the snapshot for GET /metrics with the prom content type" {
     var snap = MetricsSnapshot.init(testing.allocator);
     defer snap.deinit();
-    try snap.set("# TYPE orochi_connections_total counter\norochi_connections_total 3\n");
+    try snap.set("# TYPE onyx_connections_total counter\nonyx_connections_total 3\n");
 
     var out: [1024]u8 = undefined;
     const resp = try handleRequest(&snap, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n", &out);
@@ -402,24 +402,24 @@ test "handleRequest serves the snapshot for GET /metrics with the prom content t
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.containsAtLeast(u8, resp, 1, "Content-Type: " ++ content_type ++ "\r\n"));
     try testing.expect(std.mem.containsAtLeast(u8, resp, 1, "Content-Length: 67\r\n"));
-    try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n# TYPE orochi_connections_total counter\norochi_connections_total 3\n"));
+    try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n# TYPE onyx_connections_total counter\nonyx_connections_total 3\n"));
 }
 
 test "handleRequest accepts a query string on /metrics" {
     var snap = MetricsSnapshot.init(testing.allocator);
     defer snap.deinit();
-    try snap.set("orochi_up 1\n");
+    try snap.set("onyx_up 1\n");
 
     var out: [512]u8 = undefined;
     const resp = try handleRequest(&snap, "GET /metrics?collect[]=all HTTP/1.1\r\n\r\n", &out);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\norochi_up 1\n"));
+    try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\nonyx_up 1\n"));
 }
 
 test "handleRequest returns 404 for other paths" {
     var snap = MetricsSnapshot.init(testing.allocator);
     defer snap.deinit();
-    try snap.set("orochi_up 1\n");
+    try snap.set("onyx_up 1\n");
 
     var out: [512]u8 = undefined;
     const root = try handleRequest(&snap, "GET / HTTP/1.1\r\n\r\n", &out);
@@ -432,7 +432,7 @@ test "handleRequest returns 404 for other paths" {
 test "handleRequest returns 405 for non-GET on /metrics" {
     var snap = MetricsSnapshot.init(testing.allocator);
     defer snap.deinit();
-    try snap.set("orochi_up 1\n");
+    try snap.set("onyx_up 1\n");
 
     var out: [512]u8 = undefined;
     const post = try handleRequest(&snap, "POST /metrics HTTP/1.1\r\n\r\n", &out);
@@ -455,7 +455,7 @@ test "MetricsServer serves the snapshot over loopback" {
     const allocator = testing.allocator;
     var snap = MetricsSnapshot.init(allocator);
     defer snap.deinit();
-    try snap.set("orochi_metrics_probe 1\n");
+    try snap.set("onyx_metrics_probe 1\n");
 
     var server = MetricsServer.init(&snap, 0) catch return error.SkipZigTest;
     try server.spawn();
@@ -477,7 +477,7 @@ test "MetricsServer serves the snapshot over loopback" {
     const got = buf[0..@intCast(rc)];
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.containsAtLeast(u8, got, 1, "Content-Type: " ++ content_type ++ "\r\n"));
-    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\norochi_metrics_probe 1\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nonyx_metrics_probe 1\n"));
 }
 
 test "initWithConfig honors a custom backlog and read timeout" {

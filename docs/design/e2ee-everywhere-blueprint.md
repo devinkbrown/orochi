@@ -41,7 +41,7 @@ with audited-design, post-quantum, end-to-end-encrypted text and (later) voice.*
 - **Trust boundary (hard):** the daemon MUST NOT possess any key that decrypts group
   content. It stores/forwards **opaque** blobs (KeyPackages, Welcomes, Commits,
   ciphertext) and enforces only *control-plane policy* it can see (channel
-  `encryption-policy`, the `+orochi/e2ee` tag, membership/authz gates). This is the
+  `encryption-policy`, the `+onyx/e2ee` tag, membership/authz gates). This is the
   DAVE "external sender / delivery service" pattern.
 - **Latency / hot path:** group crypto runs in the **browser**, off the daemon hot path.
   A steady-state encrypted message costs one symmetric AEAD seal on the sender and one
@@ -56,8 +56,8 @@ with audited-design, post-quantum, end-to-end-encrypted text and (later) voice.*
   `dmCipher.ts:30,230`). Constant-time secret compare, secure-zero of all group secrets
   (already the discipline in `treekem.zig:522`).
 - **Compatibility:** wire-format changes deploy **client-FIRST** (Onyx/Ruri is the live
-  consumer of every wire change — see `reference_orochi_ws_framing`, the MEDIA-plane
-  precedent). Old clients that never negotiate the `orochi/e2ee` cap keep working on
+  consumer of every wire change — see the WS framing / MEDIA-plane
+  precedent). Old clients that never negotiate the `onyx/e2ee` cap keep working on
   plaintext channels unchanged. Capsule-version discipline for anything Helix carries.
 - **Operability:** epoch state must survive USR2 (Helix) on the daemon side only insofar
   as it holds *opaque* material; the authoritative group state is client-side + the
@@ -97,9 +97,9 @@ The striking finding: **most of the primitives are already in the tree.** The wo
   either party — or a replay of history — derives the same key (`dmCipher.ts:144-182`).
 - `onyx/src/lib/e2ee/policy.ts` — control-plane contract already models the future:
   `EncryptionPolicy = off|optional|required`, `E2eeMessageKind = generic|mls|sframe`, the
-  `+orochi/e2ee` message tag, and `e2ee.device.*` device-prop keys (`policy.ts:2-31`).
+  `+onyx/e2ee` message tag, and `e2ee.device.*` device-prop keys (`policy.ts:2-31`).
   **`mls` is already a reserved tag value** — the wire is forward-designed for this work.
-- Store wiring: DM seal path only stamps `+orochi/e2ee` **after** the payload is sealed
+- Store wiring: DM seal path only stamps `+onyx/e2ee` **after** the payload is sealed
   (`store.ts:3222-3255`); this device's pubkey is published to METADATA `ocean.dm-key`
   and the E2EEKEY registry on login (`store.ts:5075`, `8769-8773`); inbound
   METADATA/envelope handling and the locked-placeholder path
@@ -128,7 +128,7 @@ correct *foundation* (a pairwise secure channel to bootstrap group key delivery)
 ### 2.3 Onyx Server — control plane + transport (untrusted-for-content)
 
 - `src/proto/e2ee_policy.zig` — server-enforceable policy: channel `encryption-policy`,
-  the `+orochi/e2ee` tag validator, bounded `e2ee.device.*` device-key PROP
+  the `+onyx/e2ee` tag validator, bounded `e2ee.device.*` device-key PROP
   validation (`e2ee_policy.zig:12-102`). The daemon **never decrypts** — it only checks
   presence of the tag and enforces the channel policy.
 - **Device keys already cross the mesh as signed CRDT PROP.** `handleE2eeKey ADD` stores
@@ -153,7 +153,7 @@ correct *foundation* (a pairwise secure channel to bootstrap group key delivery)
   ┌───────────────────────────┐        ┌──────────────────────────────────────────┐
   │ group crypto (MUST live    │        │ control plane it CAN see:                 │
   │ here): TreeKEM epoch, key   │  wss   │  • encryption-policy PROP (enforce)        │
-  │ schedule, sender ratchet,   │◄──────►│  • +orochi/e2ee tag (presence only)        │
+  │ schedule, sender ratchet,   │◄──────►│  • +onyx/e2ee tag (presence only)        │
   │ SFrame keys, KT audit       │        │  • authz/membership gate on the channel    │
   │                            │        │ opaque blobs it FORWARDS, never opens:     │
   │ device/identity keypair     │        │  • KeyPackage  (METADATA/ENTITY_PROP CRDT) │
@@ -283,7 +283,7 @@ DAVE flaws ourselves (§4.2) rather than inheriting a spec's mitigations.
   material.
 - **The daemon is external-sender / delivery-service.** It forwards four opaque blob
   kinds (KeyPackage, Welcome, Commit, ciphertext) and enforces three visible controls
-  (channel `encryption-policy`, `+orochi/e2ee` presence, channel membership/authz).
+  (channel `encryption-policy`, `+onyx/e2ee` presence, channel membership/authz).
 
 ### 4.2 DAVE-flaw corrections (must be in the design from day one)
 
@@ -308,9 +308,9 @@ The roadmap explicitly requires correcting Discord-DAVE's known weaknesses:
 
 ### 5.1 Capability & tags (wire)
 
-- Cap: `orochi/e2ee` (already reserved — `policy.ts:2`). Advertised only when the daemon
+- Cap: `onyx/e2ee` (already reserved — `policy.ts:2`). Advertised only when the daemon
   build has the E2EE control plane enabled; **absent → byte-identical old behavior.**
-- Message tag: `+orochi/e2ee=mls` on group ciphertext (the `mls` value is already
+- Message tag: `+onyx/e2ee=mls` on group ciphertext (the `mls` value is already
   validated server-side — `e2ee_policy.zig:50` — and client-side — `policy.ts:29`).
 - Channel policy PROP: `encryption-policy = off|optional|required`
   (`e2ee_policy.zig:12,20-24`). Server enforces `required` by rejecting untagged PRIVMSG
@@ -332,7 +332,7 @@ partition/USR2.
 Value length stays inside the metadata store bound (≤ 512 B — `metadata.zig:14`); a
 KeyPackage larger than that is chunked across `e2ee.kp.<id>.<n>` keys, or (preferred)
 the metadata value cap is raised for the `e2ee.*` namespace only via a bounded option
-(`metadata.zig:44` `Options.max_value_bytes`) — an `orochi-config` decision.
+(`metadata.zig:44` `Options.max_value_bytes`) — an `onyx-server-config` decision.
 
 ### 5.3 Group control blobs (server FORWARDS, never opens)
 
@@ -346,12 +346,12 @@ the metadata value cap is raised for the `e2ee.*` namespace only via a bounded o
   is the roadmap's stated design. The daemon forwards the blob and the (authenticated)
   sender leaf id; it does not interpret the tree.
 - **Ciphertext** — ordinary `PRIVMSG`/`TAGMSG` carrying `SFrame(payload)` with
-  `+orochi/e2ee=mls`. CHATHISTORY, session-sync, and the outbox already carry it
+  `+onyx/e2ee=mls`. CHATHISTORY, session-sync, and the outbox already carry it
   untouched (the DM precedent — `dmCipher.ts:14-16`).
 
 **Deploy-order:** every one of these is a wire change → **client-FIRST**. Onyx must
 tolerate a daemon that doesn't yet forward `E2EE`/`EPOCH` (feature-detect via the
-`orochi/e2ee` cap) and vice-versa.
+`onyx/e2ee` cap) and vice-versa.
 
 ### 5.4 Client group-state module (Onyx, new — `src/lib/e2ee/group/`)
 
@@ -451,22 +451,22 @@ Confirm against primary sources (RFC texts, the MLS/DAVE specs, PQ drafts) — d
 ## 7 — Phased, testable build order & ownership
 
 Each phase compiles, gates on its own suite, lands independently, and is **byte-identical
-/ no-op when `orochi/e2ee` is not advertised**. Wire phases deploy **client-FIRST**.
+/ no-op when `onyx/e2ee` is not advertised**. Wire phases deploy **client-FIRST**.
 
 | Phase | Deliverable | Owner | Gate / tests | Deploy note |
 | --- | --- | --- | --- | --- |
 | **0. Research** | §6 items confirmed; the tree-hash-binding gap in `treekem.zig` resolved as design input | **deep-researcher** | brief with citations + confidence | — |
-| **1. KT covers E2EE keys** | `CredentialKind.e2ee_device`/`identity`; KT append at `handleE2eeKey ADD/DEL`; `KEYTRANS` returns device-key proofs | zig-coder (orochi-ircx for command surface, orochi-crypto-reviewer review) | unit + KAT for `eventDigest`; additive, no wire break | server-safe (additive) |
+| **1. KT covers E2EE keys** | `CredentialKind.e2ee_device`/`identity`; KT append at `handleE2eeKey ADD/DEL`; `KEYTRANS` returns device-key proofs | zig-coder (onyx-server-ircx for command surface, onyx-server-crypto-reviewer review) | unit + KAT for `eventDigest`; additive, no wire break | server-safe (additive) |
 | **2. WASM group crypto** | Build `treekem.zig`+`mls_keyschedule.zig`+`sframe.zig` to a browser WASM module; thin TS `mlsGroup.ts` binding; parity tests vs the Zig unit tests | zig-coder (WASM build) + solidjs-coder (binding) | KAT parity WASM↔Zig; `onyx pnpm test` | client-only, no wire yet |
 | **3. Group state in store** | `groupEpochs` slice; KeyPackage publish to `e2ee.kp.*`; epoch state immutable in store | onyx-store | slice tests; no-op when cap absent | client-FIRST |
-| **4. Opaque transport** | Daemon forwards `E2EE WELCOME` + `EVENT ... E2EE EPOCH` blobs; membership/authz gate; **never opens** blobs; policy-`required` fail-closed tag-gate | orochi-ircx (+ orochi-mesh-reviewer for ENTITY_PROP/Event-Spine) | loopback e2e; DST for mesh crossing + USR2 opaque-carry | **client-FIRST**, then server |
+| **4. Opaque transport** | Daemon forwards `E2EE WELCOME` + `EVENT ... E2EE EPOCH` blobs; membership/authz gate; **never opens** blobs; policy-`required` fail-closed tag-gate | onyx-server-ircx (+ onyx-server-mesh-reviewer for ENTITY_PROP/Event-Spine) | loopback e2e; DST for mesh crossing + USR2 opaque-carry | **client-FIRST**, then server |
 | **5. Text E2EE end-to-end** | SFrame text sealing from the exporter; send/receive/CHATHISTORY/vault-at-rest; locked-placeholder on wrong epoch; DAVE-flaw AAD + committing-AEAD | solidjs-coder + onyx-vault (retention) | onyx-e2e critical flow (two contexts, encrypted channel); vault ciphertext-only regression | client-FIRST |
 | **6. KT audit loop** | Client audits own key history + peer inclusion + root consistency (split-view detection) | solidjs-coder | unit for proof verify; e2e for swap-detection | client-only |
 | **7. Multi-device** | N-leaf-per-user; add/remove device Commits | solidjs-coder + onyx-store | e2e: second device joins & reads; removed device locked | client-FIRST |
 | **8. PQ / voice** | (fast-follow / v2.3) PQXDH KeyPackage KEM; SFrame media keys from exporter for calls | per §6 outcome | — | staged |
 
 DST is **mandatory** for Phase 4 (mesh crossing of opaque blobs, epoch state across
-partition + USR2) — route to **orochi-dst** with a seeded partition/heal/upgrade campaign
+partition + USR2) — route to **onyx-server-dst** with a seeded partition/heal/upgrade campaign
 asserting: no plaintext ever in daemon memory, opaque blobs converge, epoch monotonicity.
 
 ---
@@ -476,7 +476,7 @@ asserting: no plaintext ever in daemon memory, opaque blobs converge, epoch mono
 - **Trust-boundary regression (CRITICAL).** If any group secret is ever derivable
   server-side, the whole claim collapses. *Mitigation:* group crypto is WASM-in-browser
   only; a CI/DST guard asserts the daemon never derives a real channel root; code review
-  by orochi-crypto-reviewer on any daemon file that touches `treekem`/exporter.
+  by onyx-server-crypto-reviewer on any daemon file that touches `treekem`/exporter.
 - **Mid-upgrade peer / old client.** An old daemon that doesn't forward `E2EE`/`EPOCH`, or
   an old client that can't decrypt, must degrade to *locked placeholder* + a visible "your
   peer can't do E2EE yet" state — never a silent plaintext leak and never a crash.
@@ -494,7 +494,7 @@ asserting: no plaintext ever in daemon memory, opaque blobs converge, epoch mono
   append-only so tampering breaks monotonicity.
 - **Clean-room / supply-chain.** Option C explicitly avoids a third-party MLS dependency;
   do not regress into pulling one in "just for framing."
-- **Rollback.** The feature is a cap + build flag. Dropping the `orochi/e2ee` advertisement
+- **Rollback.** The feature is a cap + build flag. Dropping the `onyx/e2ee` advertisement
   returns the fleet to byte-identical plaintext behavior (channels were `optional`);
   `required` channels stop accepting messages until the cap returns (fail-closed, by
   design). No persisted daemon state needs unwinding — all group state is client-side +
@@ -506,12 +506,12 @@ asserting: no plaintext ever in daemon memory, opaque blobs converge, epoch mono
 
 - **deep-researcher** first (Phase 0): §6 — especially the `treekem.zig` tree-hash-binding
   question and the key-committing-AEAD construction. **These gate the design.**
-- **zig-coder** (+ orochi-crypto-reviewer, orochi-mesh-reviewer, orochi-helix-reviewer):
+- **zig-coder** (+ onyx-server-crypto-reviewer, onyx-server-mesh-reviewer, onyx-server-helix-reviewer):
   Phases 1, 2 (WASM build), 4 (opaque transport). Additive, fail-closed, no plaintext
   server-side.
 - **solidjs-coder** (+ onyx-store, onyx-vault, onyx-e2e): Phases 2 (binding), 3, 5, 6, 7.
-- **orochi-dst**: Phase 4 seeded partition/USR2 campaign.
-- **orochi-config**: the `e2ee.*` metadata value-cap raise (§5.2).
+- **onyx-server-dst**: Phase 4 seeded partition/USR2 campaign.
+- **onyx-server-config**: the `e2ee.*` metadata value-cap raise (§5.2).
 
 **The one-line recommendation:** ship group E2EE as a **staged, in-house MLS-shaped
 TreeKEM ratchet compiled to WASM** (reusing the already-KAT-tested `treekem.zig` /

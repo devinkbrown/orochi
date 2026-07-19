@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! orochi-proto — IRC/IRCv3/IRCX/UNDERTOW/MOORING schemas, the comptime codec
+//! onyx-proto — IRC/IRCv3/IRCX/UNDERTOW/MOORING schemas, the comptime codec
 //! generator (Codec Loom) and the canonical wire format (CoilPack).
 //! Skeleton; see planning/04.
 

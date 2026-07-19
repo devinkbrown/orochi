@@ -92,7 +92,7 @@ boot" semantics), unlike the history ring which is.
 
 ## Structured IRCv3 message-tags
 
-`buildEventTags` produces `orochi.io/category=KILL;orochi.io/severity=warn` from the fixed `code()`/`token()` tables (already tag-safe, no escaping needed) ([src/daemon/event_spine.zig](../../src/daemon/event_spine.zig)). `renderEventTagged` prepends `@<tags> ` to the `:<origin> EVENT <target> <body>` line; empty tags degrade to the plain `renderEvent`. Tags are built once per event and delivered **only** to clients that negotiated the `message-tags` cap — everyone else gets the plain line, so there is no behavior change for non-negotiating clients. This is wired into both the same-shard render (`deliverOperEventLocal`) and the cross-shard fan-out (`drainFabric`). The renderer defensively rejects control bytes in the body, an unsafe target atom, and a too-small output buffer.
+`buildEventTags` produces `onyx_server.io/category=KILL;onyx_server.io/severity=warn` from the fixed `code()`/`token()` tables (already tag-safe, no escaping needed) ([src/daemon/event_spine.zig](../../src/daemon/event_spine.zig)). `renderEventTagged` prepends `@<tags> ` to the `:<origin> EVENT <target> <body>` line; empty tags degrade to the plain `renderEvent`. Tags are built once per event and delivered **only** to clients that negotiated the `message-tags` cap — everyone else gets the plain line, so there is no behavior change for non-negotiating clients. This is wired into both the same-shard render (`deliverOperEventLocal`) and the cross-shard fan-out (`drainFabric`). The renderer defensively rejects control bytes in the body, an unsafe target atom, and a too-small output buffer.
 
 ## OBSERVE targeted feed
 

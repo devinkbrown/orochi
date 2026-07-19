@@ -3,7 +3,7 @@
 
 //! SerpentRegistry comptime daemon module registry.
 //!
-//! Orochi statically assembles daemon modules instead of runtime-loading
+//! Onyx Server statically assembles daemon modules instead of runtime-loading
 //! runtime MAPI objects. This file keeps the registry self-contained for early
 //! daemon work: module metadata is validated at comptime, command and hook
 //! tables are generated once, and dispatch is a small table scan over immutable

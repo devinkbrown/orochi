@@ -16,7 +16,7 @@
 //! `null` ("unclassifiable"). A caller enforcing conformance must treat a
 //! `null`-classified (non-exempt) certificate as NON-conforming rather than
 //! guessing — better to refuse than to admit a chain signed with an algorithm
-//! the verifier cannot even name. The classical OIDs orochi's own certificates
+//! the verifier cannot even name. The classical OIDs Onyx Server's own certificates
 //! use (Ed25519, ECDSA P-256/P-384, RSA PKCS#1) are all modeled.
 //!
 //! Pure logic: no I/O, no clock, no RNG, no allocation. Only `std` is imported.

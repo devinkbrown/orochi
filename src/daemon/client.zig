@@ -315,7 +315,7 @@ pub const ChannelModes = struct {
     }
 };
 
-// Wire channel-member status, highest first: founder (+Q !, Orochi) > owner
+// Wire channel-member status, highest first: founder (+Q !, Onyx Server) > owner
 // (+q ., IRCX) > op (+o @) > voice (+v +). No halfop tier (IRCX `+h` is
 // the HIDDEN channel mode). PREFIX=(Qqov)!.@+.
 pub const MemberPrefix = packed struct {
@@ -590,7 +590,7 @@ test "basic client and channel create lookup free" {
         .cloaked_host = "cloak.example",
     }));
     const membership_id = try memberships.alloc(.{});
-    const channel_id = try channels.alloc(try Channel.init(std.testing.allocator, "#orochi"));
+    const channel_id = try channels.alloc(try Channel.init(std.testing.allocator, "#onyx"));
 
     const client = clients.get(client_id).?;
     try std.testing.expect(client.identity.nick.eql("kain"));
@@ -601,7 +601,7 @@ test "basic client and channel create lookup free" {
     try channel.addMember(client_id, membership_id, .{ .op = true }, 42);
     try channel.addBan("*!*@bad.example", client_id, 43);
 
-    try std.testing.expect(channel.name.eql("#orochi"));
+    try std.testing.expect(channel.name.eql("#onyx"));
     try std.testing.expect(channel.topic.eql("client/channel model"));
     try std.testing.expectEqual(@as(usize, 1), channel.members.count());
     try std.testing.expectEqual(@as(usize, 1), channel.bans.items.len);

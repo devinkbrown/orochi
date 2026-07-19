@@ -89,7 +89,7 @@ These are public, channel-operator-managed policy flags for future server-side
 AI/plugin paths. `channelBuiltinSet` accepts only `0` or `1`; other values return
 `906 ERR_BADVALUE`. They are ordinary signed channel properties after
 validation, so they persist, mesh-propagate, and survive the same PROP replay
-path as `EPHEMERAL`, `PINS`, `history-policy`, and `orochi.topics`.
+path as `EPHEMERAL`, `PINS`, `history-policy`, and `onyx_server.topics`.
 
 When multiple flags are present, daemon-side readers resolve precedence as:
 `no-ai` > `local-only` > `server-ai-ok` > unspecified. That makes the safest
@@ -120,7 +120,7 @@ existence/secret/private/hidden checks pass. DMs do not use this channel policy.
 ## Mesh note
 
 Channel properties (built-in, `EPHEMERAL`, `PINS`, `history-policy`,
-`orochi.topics`, and AI policy flags alike) are signed at the local origin and
+`onyx_server.topics`, and AI policy flags alike) are signed at the local origin and
 replicated as last-writer-wins CRDT facts. Commit `c2eee68` fixed cross-mesh
 PROP propagation so channel and entity properties now reach peers; the origin is
 stamped with the node's `shortId`.

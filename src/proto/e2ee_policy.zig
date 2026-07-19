@@ -10,7 +10,7 @@
 const std = @import("std");
 
 pub const policy_prop = "encryption-policy";
-pub const encrypted_tag_key = "+orochi/e2ee";
+pub const encrypted_tag_key = "+onyx/e2ee";
 pub const device_prop_prefix = "e2ee.device.";
 pub const max_device_id_len: usize = 32;
 pub const max_algorithm_len: usize = 32;
@@ -105,9 +105,9 @@ test "encryption policy values and tag validation" {
     try std.testing.expectEqual(Policy.required, policyValue("required").?);
     try std.testing.expect(validPolicyValue("optional"));
     try std.testing.expect(!validPolicyValue("mandatory"));
-    try std.testing.expect(encryptedTagPresent("+orochi/e2ee=1;+x=y"));
-    try std.testing.expect(encryptedTagPresent("+orochi/e2ee=mls"));
-    try std.testing.expect(!encryptedTagPresent("+orochi/e2ee=0"));
+    try std.testing.expect(encryptedTagPresent("+onyx/e2ee=1;+x=y"));
+    try std.testing.expect(encryptedTagPresent("+onyx/e2ee=mls"));
+    try std.testing.expect(!encryptedTagPresent("+onyx/e2ee=0"));
 }
 
 test "device key metadata is bounded and prop-safe" {

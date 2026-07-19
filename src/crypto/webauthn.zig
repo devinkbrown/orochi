@@ -1690,7 +1690,7 @@ test "verifyAttestation: packed basic attestation (x5c ES256 leaf) verifies" {
     const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
     var cert_buf: [2048]u8 = undefined;
     const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
-        .common_name = "Orochi Test Attestation",
+        .common_name = "Onyx Test Attestation",
         .not_before = 1_704_067_200,
         .not_after = 4_102_444_800,
         .serial = &.{0x01},
@@ -1782,7 +1782,7 @@ test "verifyAttestation: fido-u2f (x5c P-256 leaf) verifies" {
     const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
     var cert_buf: [2048]u8 = undefined;
     const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
-        .common_name = "Orochi Test U2F",
+        .common_name = "Onyx Test U2F",
         .not_before = 1_704_067_200,
         .not_after = 4_102_444_800,
         .serial = &.{0x02},
@@ -1846,7 +1846,7 @@ test "verifyAttestation: fido-u2f with a non-zero AAGUID is rejected" {
     const att_kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
     var cert_buf: [2048]u8 = undefined;
     const cert_der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
-        .common_name = "Orochi Test U2F",
+        .common_name = "Onyx Test U2F",
         .not_before = 1_704_067_200,
         .not_after = 4_102_444_800,
         .serial = &.{0x03},

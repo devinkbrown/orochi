@@ -68,7 +68,7 @@ third. This is the substrate for roadmap v2.0 **Ryūjin R1** (`CODEX_ROADMAP.md:
 | Memory/conn | Zero new per-connection state on client legs. The proof is a **replicated PROP** (`identity.residence.<node>`), not a per-session cache — it already fits the prop store's bounded model. |
 | Security posture | Fail-**closed**: any missing pubkey, missing/expired proof, decode error, or binding mismatch ⇒ `account_trusted = false` ⇒ conservative UID path, **and the caller forces `account=""` into `resolveIncomingNick`** so no downstream path trusts the raw wire account. Verify side holds no secrets. |
 | Back/forward compat | Old peer, mid-USR2 peer, unenrolled account, and pre-convergence cold node all degrade to today's safe behavior. **No membership wire change** — the proof rides existing ENTITY_PROP, so the membership frame is byte-identical. |
-| Operability | No new cap bit, **no Helix capsule bump** — the proof is prop state that already survives USR2 and re-converges via the existing prop burst / anti-entropy. `assertion_ttl_ms` is a config knob (orochi-config), not hardcoded. |
+| Operability | No new cap bit, **no Helix capsule bump** — the proof is prop state that already survives USR2 and re-converges via the existing prop burst / anti-entropy. `assertion_ttl_ms` is a config knob (onyx-server-config), not hardcoded. |
 
 ### 1.4 Invariants & §2.1.1 guard-rails
 - **Mesh identity = shortId.** The residence proof binds `origin_node` as the **shortId**; the
@@ -117,7 +117,7 @@ account-key substrate is already ~70% built, already replicates, and already sur
 
 ### 2.1 Seams already in the tree (cite `file:line`)
 - **Sovereign account key — `src/proto/account_identity.zig`.** Ed25519 pubkey + **self-signature**
-  over `"OROCHI-ACCOUNT-IDENTITY-v1" ++ account ++ label ++ pubkey` (`:23,55,77`
+  over `"ONYX-ACCOUNT-IDENTITY-v1" ++ account ++ label ++ pubkey` (`:23,55,77`
   `transcript`/`verifyClaim`). We add a **residence** transcript alongside it (§4.2).
 - **Registration + revocation — wired.** `IDENTITY ADD <label> <pub-hex> <sig-hex>` is
   **account-control gated** (`server.zig:24376` `session.account() orelse NOT_LOGGED_IN`),
@@ -229,7 +229,7 @@ construction here, proven by Phase-4 DST before the verify gate lands.
 **Residence transcript** (account device key signs; verified vs the replicated `identity.key.*`
 pubkey):
 ```
-domain  = "OROCHI-ACCOUNT-RESIDENCE-v1"       # DISTINCT from "OROCHI-ACCOUNT-IDENTITY-v1",
+domain  = "ONYX-ACCOUNT-RESIDENCE-v1"       # DISTINCT from "ONYX-ACCOUNT-IDENTITY-v1",
                                               #   signed_frame's domain, and oper_cred_share "OCG1"
 signed  = magic:u32("ARP1") || len8(account) || node:u64(shortId) || epoch:u64 || expiry_ms:u64
 wire    = signed || sig:64                    # Ed25519 verifyStrict over signCtx(domain, signed)
@@ -296,7 +296,7 @@ membership. Concretely:
 - **Must-implement + must-DST:** Phase 3 must not add any path where an established member's
   continued presence is gated on a *fresh* proof; Phase 4 DST proves a genuine multi-device member
   survives a partition/USR2 that delays its proof refresh (no mid-session UID rename). This is the
-  one HIGH; its owner is orochi-mesh and its gate is orochi-dst.
+  one HIGH; its owner is onyx-server-mesh and its gate is onyx-server-dst.
 
 ### 4.5 Client↔daemon carriage & deploy ordering
 - **client→home-daemon (`IDENTITY ADD`, `IDENTITY RESIDENCE`):** onyx-visible. The **daemon
@@ -319,18 +319,18 @@ Each phase compiles, gates on its own suite, and is **no-op when off**.
 
 | Phase | Deliverable | Gate | Owner | No-op-when-off |
 |---|---|---|---|---|
-| **0 (live now)** | Keep the conservative `wire_account_trusted=false` fix deployed as the baseline. | — | orochi-deploy (already) | This IS the safe baseline. |
-| **1** | Residence transcript + `signResidence`/`verifyResidence` in `account_identity.zig` (KATs: domain separation, replay/binding, verifyStrict rejects malleable, every failure ⇒ error). Pure, unwired. | `zig build test` | zig-coder → **orochi-crypto-reviewer** gate | Unreferenced additions; zero runtime effect. |
-| **2** | `IDENTITY RESIDENCE` command + prop store/tombstone + ISUPPORT advertise. No verify wiring in the mesh yet. | `zig build test` | zig-coder + **orochi-ircx** (command surface) | No client sends RESIDENCE ⇒ no residence prop ⇒ inert. |
-| **3** | `verifyResidenceTrust` + wire it into `recvMembership`/`recvNickChange` as the per-claim `account_trusted` (gated on `verifiedPayload`); drop the `wire_account_trusted` const; implement + assert the **sticky-trust** rule (§4.4). | `zig build test-mesh` | **orochi-mesh** (implement) → **orochi-mesh-reviewer** gate | No residence prop present ⇒ `false` ⇒ today's conservative behavior, byte-identical membership wire. |
-| **4** | DST: seeded convergence-after-partition + USR2-under-fault proving (a) a forged/non-home claim is UID-homed, (b) a genuine 3rd-node multi-device claim coexists, (c) a partition/USR2 that delays a proof refresh does **NOT** rename a live established member (sticky trust), (d) a cold/pre-convergence node falls to UID, never false-accepts. | `zig build test-mesh` (seeded) | **orochi-dst** | Test-only. |
+| **0 (live now)** | Keep the conservative `wire_account_trusted=false` fix deployed as the baseline. | — | onyx-server-deploy (already) | This IS the safe baseline. |
+| **1** | Residence transcript + `signResidence`/`verifyResidence` in `account_identity.zig` (KATs: domain separation, replay/binding, verifyStrict rejects malleable, every failure ⇒ error). Pure, unwired. | `zig build test` | zig-coder → **onyx-server-crypto-reviewer** gate | Unreferenced additions; zero runtime effect. |
+| **2** | `IDENTITY RESIDENCE` command + prop store/tombstone + ISUPPORT advertise. No verify wiring in the mesh yet. | `zig build test` | zig-coder + **onyx-server-ircx** (command surface) | No client sends RESIDENCE ⇒ no residence prop ⇒ inert. |
+| **3** | `verifyResidenceTrust` + wire it into `recvMembership`/`recvNickChange` as the per-claim `account_trusted` (gated on `verifiedPayload`); drop the `wire_account_trusted` const; implement + assert the **sticky-trust** rule (§4.4). | `zig build test-mesh` | **onyx-server-mesh** (implement) → **onyx-server-mesh-reviewer** gate | No residence prop present ⇒ `false` ⇒ today's conservative behavior, byte-identical membership wire. |
+| **4** | DST: seeded convergence-after-partition + USR2-under-fault proving (a) a forged/non-home claim is UID-homed, (b) a genuine 3rd-node multi-device claim coexists, (c) a partition/USR2 that delays a proof refresh does **NOT** rename a live established member (sticky trust), (d) a cold/pre-convergence node falls to UID, never false-accepts. | `zig build test-mesh` (seeded) | **onyx-server-dst** | Test-only. |
 | **5** | onyx: `deviceSign.ts` (device Ed25519 in `onyx-keys`), enroll on login, sign + `IDENTITY RESIDENCE` on join / node-change, gated on the advertised token; fail-closed. | `pnpm typecheck/lint/test` | **onyx-crypto** + solidjs-coder | Token not advertised ⇒ onyx never enrolls ⇒ UID path. |
 
 **Cross-repo deploy ordering:** Phases 1–4 are daemon-only and inert; they may land on `main` and
 even deploy (no-op) ahead of onyx. The feature turns on for an account only after Phase 5 onyx
 ships **and** that account enrolls a key **and** its home node runs Phase 2+3 — so there is **no
 window where F1 reopens**; unenrolled accounts stay on the conservative UID path throughout. onyx
-stays **local-only**; any orochi node deploy/USR2 is **human-gated** → orochi-deploy.
+stays **local-only**; any Onyx Server node deploy/USR2 is **human-gated** → onyx-server-deploy.
 
 ---
 
@@ -338,11 +338,11 @@ stays **local-only**; any orochi node deploy/USR2 is **human-gated** → orochi-
 
 | # | Sev | Scenario: inputs → what goes wrong → blast radius | Owner / mitigation |
 |---|---|---|---|
-| R1 | **HIGH** | **Liveness/value coupling.** If Phase 3 gates an *established* member's continued presence on a *fresh* proof, a partition/USR2/loss that delays the refresh renames a live multi-device member to a UID mid-session — the forbidden coupling. inputs: delayed proof refresh → true→false flip → `.rename_to_uid` → live device UID-renamed. blast radius: every logged-in multi-device user on every deploy/partition. | orochi-mesh implements the **sticky-trust** rule (§4.4: same-node re-affirm is `.keep` independent of `account_trusted`); **orochi-dst** proves it (Phase 4c). This is the gating HIGH — do not land Phase 3 without 4c green. |
+| R1 | **HIGH** | **Liveness/value coupling.** If Phase 3 gates an *established* member's continued presence on a *fresh* proof, a partition/USR2/loss that delays the refresh renames a live multi-device member to a UID mid-session — the forbidden coupling. inputs: delayed proof refresh → true→false flip → `.rename_to_uid` → live device UID-renamed. blast radius: every logged-in multi-device user on every deploy/partition. | onyx-server-mesh implements the **sticky-trust** rule (§4.4: same-node re-affirm is `.keep` independent of `account_trusted`); **onyx-server-dst** proves it (Phase 4c). This is the gating HIGH — do not land Phase 3 without 4c green. |
 | R2 | MEDIUM | **Compromised-home-node replay within expiry.** A node kain authenticated on, if Byzantine, re-publishes kain's current proof until `expiry_ms` after kain leaves. inputs: home node keeps vouching → phantom-kain homed to that node until expiry. blast radius: bounded to a node kain actually used (out-of-scope compromised-home class), bounded by TTL. | Short `expiry_ms` (≤30 min, config); session-close tombstone for honest nodes; epoch floor. Documented as the deferred threat, not F1. |
 | R3 | MEDIUM | **Pre-convergence / cold node.** A membership claim for kain arrives before kain's `identity.key.*`/residence props have replicated → `false` → kain briefly UID-disambiguated until convergence. inputs: cold/healed node, props in flight → temporary UID for a genuine multi-device claim. blast radius: transient, self-healing on the next re-burst after convergence. | Rides the same prop-convergence the mesh already depends on (channel props, etc.); re-burst re-runs `resolveIncomingNick`. Sticky trust means only the *initial* coexist is delayed, never an established member. Phase-4d DST bounds it. |
-| R4 | MEDIUM | **TTL vs re-sign cadence / clock skew.** Too-short TTL or verifier-ahead skew → genuine initial claims briefly hit UID. | TTL ≥ 2× the client re-sign interval + expected skew; login-time signing (not per-frame) lets TTL be generous. Config knob (orochi-config). |
-| R5 | LOW→CRITICAL-if-mishandled | **Fail-open regression.** A future edit takes the pubkey from the wire proof, or returns `true` on a decode/lookup error, or trusts an unsigned frame. | Pubkey is **receiver-owned replicated prop only** (check 2); `true` only on the single all-checks-pass branch; residence trust requires `verifiedPayload` non-null (check 1). KAT asserts every failure ⇒ `false`. orochi-crypto-reviewer gates Phases 1–3. **Designed closed.** |
+| R4 | MEDIUM | **TTL vs re-sign cadence / clock skew.** Too-short TTL or verifier-ahead skew → genuine initial claims briefly hit UID. | TTL ≥ 2× the client re-sign interval + expected skew; login-time signing (not per-frame) lets TTL be generous. Config knob (onyx-server-config). |
+| R5 | LOW→CRITICAL-if-mishandled | **Fail-open regression.** A future edit takes the pubkey from the wire proof, or returns `true` on a decode/lookup error, or trusts an unsigned frame. | Pubkey is **receiver-owned replicated prop only** (check 2); `true` only on the single all-checks-pass branch; residence trust requires `verifiedPayload` non-null (check 1). KAT asserts every failure ⇒ `false`. onyx-server-crypto-reviewer gates Phases 1–3. **Designed closed.** |
 
 **Rollback:** revert Phases 3→2→1 independently (each no-op-when-off); or restore
 `wire_account_trusted` to a const `false` to return to the conservative baseline instantly with no
@@ -365,7 +365,7 @@ Three fresh adversarial reviewers ran against the requirement + targets + first-
 | **Liveness-vs-value: a late refresh renames a live member** (Skeptic #4, CONFIRMED) | **Design-changing** | *Adopted* as the **sticky-trust** rule (§4.4) + the gating HIGH R1 + Phase-4c DST. The same-node `.keep` at `route_table.zig:504` is the mechanism. |
 | **Bearer-token replay within expiry after the user leaves node N** (Skeptic #3, Security H4, CONFIRMED) | Bounded/accepted | Session-close tombstone (honest nodes) + short expiry + `(account,node)` epoch floor. Residual is the **compromised-home-node** class (R2), out of scope for F1, bounded by TTL. |
 | **Must require origin-authenticated (signed) frame + `proof.node == frame.origin`** (Security H3, CONFIRMED-as-gap) | Accepted | Check 1 (gated on `verifiedPayload`) + check 5 (node binding). Fails closed when `require_signed_frames` off. |
-| **Domain separation / length-framing / verifyStrict** (Security H5) | Accepted | Distinct `"OROCHI-ACCOUNT-RESIDENCE-v1"` domain + magic `"ARP1"`, length-prefixed fields, `verifyStrict`. |
+| **Domain separation / length-framing / verifyStrict** (Security H5) | Accepted | Distinct `"ONYX-ACCOUNT-RESIDENCE-v1"` domain + magic `"ARP1"`, length-prefixed fields, `verifyStrict`. |
 | **Per-claim match, not frame-global** (Security H6) | Accepted | `account_trusted` is per-claim; check 5 matches `proof.account/node` to the exact roster entry; `account=""` forced on false. |
 | **Revocation currency ≠ MMR inclusion** (Security H2) | Dissolved | Source is the current prop value (LWW + DEL), not an inclusion proof. |
 | **Reactor-0 guard on any cache prune** (Skeptic #7) | Dissolved/answered | No cache; session-close tombstone is inline on the client shard; any future sweep is reactor-0 (§1.4). |
@@ -381,7 +381,7 @@ trusted.
 ### What I did NOT check / assumptions
 - I did **not** run `zig build` — this is design, not code.
 - I assume `IDENTITY ADD`/`RESIDENCE` are reachable over the current CAP/ISUPPORT surface; Phase 2
-  confirms the advertisement wiring (orochi-ircx).
+  confirms the advertisement wiring (onyx-server-ircx).
 - I assume the ENTITY_PROP burst re-delivers `identity.residence.*` on RESYNC/anti-entropy exactly
   as it does `identity.key.*` (same code path); Phase-4 DST is the proof.
 - I assume `route_table.zig:504` same-node `.keep` fully covers the established-member re-affirm
@@ -395,7 +395,7 @@ trusted.
 **GO** — no open CRITICAL (the fail-open path is designed closed against the receiver-owned
 replicated pubkey; no membership wire change; USR2-safe via durable props; the multi-reactor,
 shortId, deploy-order, and fail-closed guard-rails all answered). **One HIGH (R1, sticky-trust
-liveness)** with a named owner (orochi-mesh) and a hard gate (orochi-dst Phase-4c) — Phase 3 must
+liveness)** with a named owner (onyx-server-mesh) and a hard gate (onyx-server-dst Phase-4c) — Phase 3 must
 not land without it. MEDIUMs (R2 bounded home-node residual, R3 pre-convergence, R4 TTL/skew) are
 owned and bounded.
 

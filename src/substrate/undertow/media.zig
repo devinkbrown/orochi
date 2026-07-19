@@ -408,7 +408,7 @@ pub fn LayerDeclaration(comptime capacity: usize) type {
 
 /// Codecs negotiable on an Undertow media session.
 ///
-/// The native plane is CadenceVox/CadenceVis-first — Orochi's own `cadence`
+/// The native plane is CadenceVox/CadenceVis-first — Onyx Server's own `cadence`
 /// implementation (see `cadence_frame`), which is what capable clients use. The
 /// standard hardware codecs below exist ONLY as the interop set for the WebRTC
 /// mobile gateway (phones that need hardware decode); the SFU still never

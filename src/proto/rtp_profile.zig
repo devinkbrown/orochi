@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! RTP-like media transport profile helpers for Orochi media bands.
+//! RTP-like media transport profile helpers for Onyx Server media bands.
 //!
 //! This module deliberately does not own sockets or scheduling. It provides the
 //! byte-level packet header, RFC 3550-style jitter/loss accounting, and a small
-//! RTCP-like SR/RR report format suitable for embedding inside Orochi media
+//! RTCP-like SR/RR report format suitable for embedding inside Onyx Server media
 //! frames.
 const std = @import("std");
 
@@ -416,7 +416,7 @@ test "header round-trip" {
 }
 
 test "packet framing round-trip preserves payload slice" {
-    const payload = "orochi-media";
+    const payload = "onyx-media";
     const packet = Packet{
         .header = .{
             .marker = false,

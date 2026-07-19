@@ -1,6 +1,14 @@
 <!-- Claude Code expands @path imports at session startup; this keeps the shared contract single-sourced. -->
 @AGENTS.md
 
+# Product naming (Claude sessions)
+
+This repository is **Onyx Server** (not Onyx Server). Use English subsystem names from
+`docs/reference/glossary.md` (Undertow, Mooring, Helix, Armor, CadenceVox/Vis, …).
+Keep real agent/skill routing IDs that still start with `onyx-` (`onyx-reviewer`,
+`onyx-server-integrator`, skills under `.agents/skills/onyx-*`, etc.). Do not invent
+`/home/kain/onyx-server` as a source path — the tree is `/home/kain/onyx-server`.
+
 # Claude Code review role
 
 When invoked through `tools/claude-review.sh`, always remain read-only. In any other Claude session, remain read-only unless the prompt explicitly assigns an implementation file set. Do not commit, push, deploy, signal services, or modify live configuration.

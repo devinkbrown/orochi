@@ -5,7 +5,7 @@
 //! plane's DTLS terminators.
 //!
 //! WebRTC binds the SDP-signaled `a=fingerprint` to the certificate a peer
-//! presents in the DTLS handshake. orochi is the DTLS *server* (`setup:passive`),
+//! presents in the DTLS handshake. Onyx Server is the DTLS *server* (`setup:passive`),
 //! so the browser is the DTLS client: the daemon must verify the browser's
 //! presented certificate against the fingerprint the browser signaled in its
 //! MEDIA OFFER. This module owns that binding (per remote transport address) and
@@ -131,7 +131,7 @@ fn testAddr(last: u8, port: u16) TransportAddress {
 }
 
 test "certDigest matches std SHA-256" {
-    const der = "orochi dtls peer certificate DER";
+    const der = "onyx dtls peer certificate DER";
     var expected: [digest_len]u8 = undefined;
     Sha256.hash(der, &expected, .{});
     try testing.expectEqualSlices(u8, &expected, &certDigest(der));

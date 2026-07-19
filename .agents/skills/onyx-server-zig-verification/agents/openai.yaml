@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Zig Verification"
+  short_description: "Run fault-aware Zig release evidence"
+  default_prompt: "Use $onyx-server-zig-verification to select and run the strongest relevant Onyx Server test gates."

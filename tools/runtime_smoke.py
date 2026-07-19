@@ -16,7 +16,7 @@ This one proves a COLD boot from a config file serves IRC end-to-end:
 A hard wall-clock deadline guarantees it never hangs CI: any check that blocks
 past the deadline fails loudly with a non-zero exit and the daemon log dumped.
 
-Usage: python3 tools/runtime_smoke.py [path-to-orochi-binary]
+Usage: python3 tools/runtime_smoke.py [path-to-onyx-server-binary]
 Exit code 0 = PASS.
 """
 import os
@@ -31,7 +31,7 @@ HOST = "127.0.0.1"
 PORT = 16721
 NICK = "smoke"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "orochi")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "onyx-server")
 CONF = "/tmp/mz_runtime.toml"
 LOG = "/tmp/mz_runtime.log"
 
@@ -100,7 +100,7 @@ def main():
 
     # Minimal config: a single plaintext TCP listener on an ephemeral port. Bind
     # to loopback only so the smoke never exposes a port off-box. Mirrors the key
-    # structure documented in etc/orochi.reference.toml ([node].id + [listen]).
+    # structure documented in etc/onyx-server.reference.toml ([node].id + [listen]).
     with open(CONF, "w") as f:
         f.write(
             "[node]\nid = 1\n"

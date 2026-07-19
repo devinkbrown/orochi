@@ -35,8 +35,8 @@ pub const last_data_kind: u8 = 16;
 pub const data_kind_count: usize = last_data_kind - first_data_kind + 1;
 
 const digest_len = std.crypto.hash.Blake3.digest_length;
-const checksum_domain = "orochi:helix:whole-handoff:v1\x00";
-const counts_domain = "orochi:helix:whole-handoff:counts:v1\x00";
+const checksum_domain = "onyx:helix:whole-handoff:v1\x00";
+const counts_domain = "onyx:helix:whole-handoff:counts:v1\x00";
 
 /// magic + version + piece_count + table_len + (kind + count)*N + digest.
 pub const encoded_len: usize = magic.len + 1 + 4 + 1 + data_kind_count * (1 + 4) + digest_len;

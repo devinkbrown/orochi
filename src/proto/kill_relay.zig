@@ -119,7 +119,7 @@ const testing = std.testing;
 
 test "encode/decode round-trips a KILL relay" {
     const ev = KillRelay{
-        .origin_server = "orochi.local",
+        .origin_server = "onyx.local",
         .killer = "kain!~k@admin.example",
         .target = "spammer",
         .reason = "flooding the network",

@@ -314,7 +314,7 @@ test "field value types serialize correctly" {
     var event = Event.init(99, .security, "field_values");
     try event.addField("neg", .{ .int = -42 });
     try event.addField("pos", .{ .uint = 18446744073709551615 });
-    try event.addField("name", .{ .str = "orochi" });
+    try event.addField("name", .{ .str = "onyx" });
     try event.addField("ok", .{ .boolean = false });
 
     var out: std.ArrayList(u8) = .empty;
@@ -323,7 +323,7 @@ test "field value types serialize correctly" {
     try serializeEvent(&out, std.testing.allocator, &event);
 
     const expected =
-        "{\"time_us\":99,\"category\":\"security\",\"event_type\":\"field_values\",\"fields\":{\"neg\":-42,\"pos\":18446744073709551615,\"name\":\"orochi\",\"ok\":false}}";
+        "{\"time_us\":99,\"category\":\"security\",\"event_type\":\"field_values\",\"fields\":{\"neg\":-42,\"pos\":18446744073709551615,\"name\":\"onyx\",\"ok\":false}}";
     try std.testing.expectEqualStrings(expected, out.items);
 }
 

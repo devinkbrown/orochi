@@ -1,4 +1,4 @@
-package orochi:orowasm@1.0.0;
+package onyx:orowasm@1.0.0;
 
 interface host {
   // cap: reply

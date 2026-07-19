@@ -10,7 +10,7 @@ usage: tools/claude-review.sh <fast|integration|security> \
 
 Examples:
   tools/claude-review.sh fast --file src/proto/foo.zig -- 'Check codec bounds.'
-  tools/claude-review.sh security --agent orochi-helix-reviewer \
+  tools/claude-review.sh security --agent onyx-server-helix-reviewer \
     --file src/daemon/helix/live.zig --file src/daemon/server.zig -- \
     'Try to falsify transactional current-version adoption.'
 EOF
@@ -37,19 +37,19 @@ shift
 
 case "$lane" in
   fast)
-    default_agent="orochi-fast-auditor"
+    default_agent="onyx-fast-auditor"
     max_scope=4
     timeout_seconds=300
     max_budget_usd=0.75
     ;;
   integration)
-    default_agent="orochi-integration-reviewer"
+    default_agent="onyx-integration-reviewer"
     max_scope=10
     timeout_seconds=900
     max_budget_usd=3.00
     ;;
   security)
-    default_agent="orochi-security-reviewer"
+    default_agent="onyx-security-reviewer"
     max_scope=12
     timeout_seconds=1200
     max_budget_usd=6.00
@@ -92,11 +92,11 @@ prompt="$1"
 # intentionally excluded: they are broader, slower, and can fight the JSON
 # contract even when the CLI tool surface itself is read-only.
 case "$lane:$agent" in
-  fast:orochi-fast-auditor|\
-  integration:orochi-integration-reviewer|\
-  integration:orochi-reviewer|\
-  security:orochi-security-reviewer|\
-  security:orochi-reviewer)
+  fast:onyx-fast-auditor|\
+  integration:onyx-integration-reviewer|\
+  integration:onyx-reviewer|\
+  security:onyx-security-reviewer|\
+  security:onyx-reviewer)
     ;;
   *)
     echo "agent $agent is not a bounded read-only reviewer for lane $lane" >&2
@@ -113,7 +113,7 @@ cleanup_review() {
   local status="$?"
   if [ -n "$snapshot_root" ]; then
     case "$snapshot_root" in
-      /tmp/orochi-claude-snapshot.*)
+      /tmp/onyx-claude-snapshot.*)
         chmod -R u+w -- "$snapshot_root" 2>/dev/null || true
         rm -rf -- "$snapshot_root"
         ;;
@@ -218,7 +218,7 @@ declare -A starting_hashes=()
 declare -a manifest_lines=()
 declare -a read_rules=()
 declare -a permission_rules=("StructuredOutput")
-snapshot_root="$(mktemp -d /tmp/orochi-claude-snapshot.XXXXXX)"
+snapshot_root="$(mktemp -d /tmp/onyx-claude-snapshot.XXXXXX)"
 git -C "$snapshot_root" init -q
 mkdir -p -- "$snapshot_root/.claude/agents"
 cp -- "$agent_file" "$snapshot_root/$agent_file"
@@ -318,7 +318,7 @@ full_prompt="$(printf '%s\n\nReview nonce: %s\nReviewer definition SHA-256: %s\n
   'Return only one JSON object with exactly these top-level keys: review_nonce, verdict, summary, reviewed_files, findings. Do not wrap JSON in Markdown. Verdict must be exactly pass or findings, never fail. Severity must be exactly P0, P1, P2, or P3, never high/medium/low. Each reviewed_files item has file, line, anchor. Each findings item has severity, title, file, line, evidence, counterexample, impact, fix, test.' \
   "$prompt")"
 
-raw_file="$(mktemp /tmp/orochi-claude-review.XXXXXX.json)"
+raw_file="$(mktemp /tmp/onyx-claude-review.XXXXXX.json)"
 
 (
   cd "$snapshot_root"

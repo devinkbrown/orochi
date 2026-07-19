@@ -291,8 +291,8 @@ fn randomPossiblyInvalidChannel(random: std.Random, iteration: usize, storage: *
 
 fn randomChannel(random: std.Random, iteration: usize) list.ChannelInfo {
     const names = [_][]const u8{
-        "#orochi",
-        "#OROCHI",
+        "#onyx",
+        "#ONYX",
         "#ops",
         "#secret",
         "",

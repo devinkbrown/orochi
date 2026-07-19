@@ -40,13 +40,13 @@
 //!   * CT_RSA_ITERS  — samples per class for RSA          (default 1500).
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 
-const ecdsa = orochi.crypto.ecdsa_p256;
-const kx = orochi.crypto.kx;
-const rsa_sign = orochi.crypto.rsa_sign;
-const rsa_verify = orochi.crypto.rsa_verify;
-const random = orochi.crypto.random;
+const ecdsa = onyx_server.crypto.ecdsa_p256;
+const kx = onyx_server.crypto.kx;
+const rsa_sign = onyx_server.crypto.rsa_sign;
+const rsa_verify = onyx_server.crypto.rsa_verify;
+const random = onyx_server.crypto.random;
 
 /// |t| at or above this is reported as a FAIL. Generous on purpose (dudect's
 /// leak rule of thumb is ~4.5); the slack absorbs CI/desktop noise while still
@@ -96,7 +96,7 @@ pub fn main() !void {
 // -- ECDSA-P256 sign ---------------------------------------------------------
 
 fn runEcdsa(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
-    const msg = "orochi ct-check ecdsa-p256 fixed message";
+    const msg = "onyx ct-check ecdsa-p256 fixed message";
 
     // Fixed class: one canonical scalar reused for every fixed measurement.
     const fixed_scalar = [_]u8{

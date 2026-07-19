@@ -1,4 +1,0 @@
-interface:
-  display_name: "Orochi Roadmap Execution"
-  short_description: "Audit and execute the next Orochi roadmap slice"
-  default_prompt: "Use $orochi-roadmap-execution to audit current source and complete the next server-side roadmap slice."

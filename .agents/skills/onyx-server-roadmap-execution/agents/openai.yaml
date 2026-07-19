@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Roadmap Execution"
+  short_description: "Audit and execute the next Onyx Server roadmap slice"
+  default_prompt: "Use $onyx-server-roadmap-execution to audit current source and complete the next server-side roadmap slice."

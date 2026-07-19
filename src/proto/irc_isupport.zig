@@ -4,7 +4,7 @@
 //! IRCv3 RPL_ISUPPORT (005) token building and parsing.
 //!
 //! This module is intentionally self-contained: it owns parsed keys and values,
-//! imports only `std`, and does not depend on Orochi registration code.
+//! imports only `std`, and does not depend on Onyx Server registration code.
 const std = @import("std");
 
 pub const MAX_TOKENS_PER_LINE: usize = 13;
@@ -24,7 +24,7 @@ pub const Token = struct {
 };
 
 pub const BuildOptions = struct {
-    server: []const u8 = "orochi",
+    server: []const u8 = "onyx",
     target: []const u8 = "*",
 };
 
@@ -280,7 +280,7 @@ const common_tokens = [_]Token{
     .{ .key = "CHANMODES", .value = "b,k,l,imnpst" },
     .{ .key = "PREFIX", .value = "(ov)@+" },
     .{ .key = "CHANTYPES", .value = "#&" },
-    .{ .key = "NETWORK", .value = "Orochi Net" },
+    .{ .key = "NETWORK", .value = "Onyx" },
     .{ .key = "CASEMAPPING", .value = "rfc1459" },
     .{ .key = "TARGMAX", .value = "NAMES:1,LIST:1,KICK:1,PRIVMSG:4" },
 };
@@ -323,7 +323,7 @@ test "round-trip parse of common ISUPPORT tokens" {
     try std.testing.expectEqualStrings("b,k,l,imnpst", map.getStr("CHANMODES").?);
     try std.testing.expectEqualStrings("(ov)@+", map.getStr("PREFIX").?);
     try std.testing.expectEqualStrings("#&", map.getStr("CHANTYPES").?);
-    try std.testing.expectEqualStrings("Orochi Net", map.getStr("NETWORK").?);
+    try std.testing.expectEqualStrings("Onyx", map.getStr("NETWORK").?);
     try std.testing.expectEqualStrings("rfc1459", map.getStr("CASEMAPPING").?);
     try std.testing.expectEqualStrings("NAMES:1,LIST:1,KICK:1,PRIVMSG:4", map.getStr("TARGMAX").?);
     try std.testing.expect(map.has("PREFIX"));
@@ -331,7 +331,8 @@ test "round-trip parse of common ISUPPORT tokens" {
 
 test "value escape and unescape" {
     const tokens = [_]Token{
-        .{ .key = "NETWORK", .value = "Orochi Net" },
+        // Space in the NETWORK value forces \x20 encoding (round-trip fixture).
+        .{ .key = "NETWORK", .value = "Onyx Net" },
         .{ .key = "ESCAPE", .value = "a\\b=c" },
     };
 
@@ -339,14 +340,14 @@ test "value escape and unescape" {
     defer std.testing.allocator.free(out);
 
     try std.testing.expectEqualStrings(
-        ":irc.test 005 nick NETWORK=Orochi\\x20Net ESCAPE=a\\x5Cb\\x3Dc :are supported by this server\r\n",
+        ":irc.test 005 nick NETWORK=Onyx\\x20Net ESCAPE=a\\x5Cb\\x3Dc :are supported by this server\r\n",
         out,
     );
 
-    var map = try parseLine(std.testing.allocator, ":irc.test 005 nick NETWORK=Orochi\\x20Net ESCAPE=a\\x5cb\\x3Dc :are supported by this server\r\n");
+    var map = try parseLine(std.testing.allocator, ":irc.test 005 nick NETWORK=Onyx\\x20Net ESCAPE=a\\x5cb\\x3Dc :are supported by this server\r\n");
     defer map.deinit();
 
-    try std.testing.expectEqualStrings("Orochi Net", map.getStr("NETWORK").?);
+    try std.testing.expectEqualStrings("Onyx Net", map.getStr("NETWORK").?);
     try std.testing.expectEqualStrings("a\\b=c", map.getStr("ESCAPE").?);
 }
 

@@ -9,12 +9,12 @@
 //! configuration — it reflects the compiled stack.
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 const common = @import("common.zig");
 
-const tls = orochi.crypto.tls;
-const supported_groups = orochi.proto.supported_groups;
-const sig_scheme = orochi.proto.tls_signature_scheme;
+const tls = onyx_server.crypto.tls;
+const supported_groups = onyx_server.proto.supported_groups;
+const sig_scheme = onyx_server.proto.tls_signature_scheme;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;

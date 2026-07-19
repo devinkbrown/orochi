@@ -1215,7 +1215,7 @@ test "renderChannel emits valid JSON matching the dashboard contract" {
     var s = ChanStats.init(std.testing.allocator);
     defer s.deinit();
     const ts: i64 = 1_700_000_000_000;
-    s.recordMessage("#root", "kain", "orochi mesh build channel", ts);
+    s.recordMessage("#root", "kain", "onyx mesh build channel", ts);
     s.recordMessage("#root", "trev", "voice and video work", ts);
     s.recordEvent("#root", .join, ts);
     s.recordTopic("#root", "kain", "build channel", ts);
@@ -1246,7 +1246,7 @@ test "snapshot serialize/deserialize round-trips the full aggregate" {
     var s = ChanStats.init(std.testing.allocator);
     defer s.deinit();
     const ts: i64 = 1_700_000_000_000;
-    s.recordMessage("#root", "kain", "orochi mesh build channel?", ts);
+    s.recordMessage("#root", "kain", "onyx mesh build channel?", ts);
     s.recordMessage("#root", "kain", "shipping it!!", ts);
     s.recordMessage("#root", "trev", "voice and video http://example.com", ts);
     s.recordEvent("#root", .join, ts);
@@ -1282,7 +1282,7 @@ test "snapshot serialize/deserialize round-trips the full aggregate" {
     const tr = a.users.get("trev").?;
     try std.testing.expectEqual(@as(u64, 1), tr.urls);
 
-    try std.testing.expect(a.word_freq.get("orochi") != null);
+    try std.testing.expect(a.word_freq.get("onyx") != null);
     try std.testing.expectEqual(@as(usize, 1), a.topics.items.len);
     try std.testing.expectEqualStrings("build channel", a.topics.items[0].topic);
     try std.testing.expectEqualStrings("kain", a.topics.items[0].setter);

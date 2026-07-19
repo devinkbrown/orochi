@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Ed25519 signatures for Orochi identity and authorization boundaries.
+//! Ed25519 signatures for Onyx Server identity and authorization boundaries.
 //!
 //! This module wraps Zig 0.16's `std.crypto.sign.Ed25519` key/public/signature
 //! encodings while keeping private key material behind `Secret(T)`. Signing is
@@ -33,7 +33,7 @@ pub const SignError = std.crypto.errors.IdentityElementError ||
 
 pub const VerifyError = StdEd25519.Signature.VerifyError || error{InvalidInfixWidth};
 
-const domain_prefix_magic = "orochi-ed25519ctx-v1";
+const domain_prefix_magic = "onyx-ed25519ctx-v1";
 
 /// The `infix` in signCtxInfix/verifyCtxInfix is concatenated with `msg` WITHOUT
 /// a length delimiter, so (infix="AB",msg="C") and (infix="A",msg="BC") would
@@ -293,10 +293,10 @@ test "tampered signature is rejected" {
         "4449c5697b326919703bac031cae7f60"));
     defer kp.deinit();
 
-    var sig = try kp.sign("orochi");
+    var sig = try kp.sign("onyx");
     sig[32] ^= 0x01;
 
-    try std.testing.expect(!try verify("orochi", sig, kp.public_key));
+    try std.testing.expect(!try verify("onyx", sig, kp.public_key));
 }
 
 test "domain separation prevents cross-use" {
@@ -321,14 +321,14 @@ test "LOW-2: signCtxInfix/verifyCtxInfix reject a non-fixed-width infix" {
     defer kp.deinit();
 
     // The one width every real caller uses (a 1-byte frame-type tag) works.
-    const sig = try kp.signCtxInfix("orochi-low2-guard-test-v1", &[_]u8{0x07}, "msg");
-    try std.testing.expect(try verifyCtxInfix("orochi-low2-guard-test-v1", &[_]u8{0x07}, "msg", sig, kp.public_key));
+    const sig = try kp.signCtxInfix("onyx-low2-guard-test-v1", &[_]u8{0x07}, "msg");
+    try std.testing.expect(try verifyCtxInfix("onyx-low2-guard-test-v1", &[_]u8{0x07}, "msg", sig, kp.public_key));
 
     // A 0-byte or >1-byte infix is rejected fail-closed (the infix/msg-boundary
     // ambiguity guard), on both the sign and verify side — no ambiguous signature.
-    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("orochi-low2-guard-test-v1", "", "msg"));
-    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("orochi-low2-guard-test-v1", "AB", "msg"));
-    try std.testing.expectError(error.InvalidInfixWidth, verifyCtxInfix("orochi-low2-guard-test-v1", "AB", "msg", sig, kp.public_key));
+    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("onyx-low2-guard-test-v1", "", "msg"));
+    try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("onyx-low2-guard-test-v1", "AB", "msg"));
+    try std.testing.expectError(error.InvalidInfixWidth, verifyCtxInfix("onyx-low2-guard-test-v1", "AB", "msg", sig, kp.public_key));
 }
 
 test {

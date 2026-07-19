@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Standalone BoGo shim — the orochi-side adapter that lets BoringSSL's
-//! `ssl/test/runner` protocol-test suite ("BoGo") drive orochi's from-scratch
+//! Standalone BoGo shim — the onyx-side adapter that lets BoringSSL's
+//! `ssl/test/runner` protocol-test suite ("BoGo") drive onyx's from-scratch
 //! Yoroi TLS stack. Roadmap 0.3 (design: `docs/dev/tls-design/bogo.md`).
 //!
 //! Per test, BoGo stands up a Go TLS peer on a loopback TCP port and spawns this
@@ -17,20 +17,20 @@
 //!   * 0  — handshake completed, expectations met, app-data echoed, clean close.
 //!   * 89 — "unimplemented": any flag or case outside the scoped subset. With the
 //!          runner's `-allow-unimplemented` these report as skipped, not failed.
-//!   * 1  — an error: the shim prints the orochi error name to stderr (BoGo
+//!   * 1  — an error: the shim prints the onyx error name to stderr (BoGo
 //!          matches it via its `ErrorMap`) and, on a handshake failure, first
 //!          synthesizes a fatal TLS alert record on the wire (via the engine's
 //!          `takeAlert` / `alertRecordForError`) so the peer's `expectedLocalError`
 //!          assertion sees a real alert instead of a bare RST.
 //!
-//! This tool is TEST-ONLY: it links against the shared `orochi` module but is
+//! This tool is TEST-ONLY: it links against the shared `onyx_server` module but is
 //! gated behind its own `zig build bogo-shim` step and is NOT part of the daemon
 //! or `zig build test`. It adds only flag parsing, a socket pump, and the echo —
 //! it changes no `src/crypto` or `src/daemon` production code, and reuses the
 //! engines exactly as the daemon does (`TlsConn.onInbound`/`write`,
 //! `Client.start`/`feed`/`encrypt`, `tls_certs.loadOrBootstrap`).
 //!
-//! SCOPED SUBSET (orochi is modern-only). Handled flags:
+//! SCOPED SUBSET (onyx is modern-only). Handled flags:
 //!   -server, -port, -shim-id, -cert-file, -key-file, -min-version, -max-version,
 //!   -expect-version, -curves (client: 23→P-256, 4588→X25519MLKEM768),
 //!   -select-alpn (server), -expect-alpn (server).
@@ -43,17 +43,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 
 const posix = std.posix;
 const linux = std.os.linux;
 
-const tls_conn = orochi.daemon.tls_conn;
-const tls_certs = orochi.daemon.tls_certs;
-const tls_server = orochi.crypto.tls_server;
-const tls12_server = orochi.crypto.tls12_server;
-const tls_client = orochi.crypto.tls_client;
-const tls_record = orochi.crypto.tls_record;
+const tls_conn = onyx_server.daemon.tls_conn;
+const tls_certs = onyx_server.daemon.tls_certs;
+const tls_server = onyx_server.crypto.tls_server;
+const tls12_server = onyx_server.crypto.tls12_server;
+const tls_client = onyx_server.crypto.tls_client;
+const tls_record = onyx_server.crypto.tls_record;
 
 const TlsConn = tls_conn.TlsConn;
 const Client = tls_client.Client;
@@ -548,7 +548,7 @@ fn fdWrite(fd: linux.fd_t, bytes: []const u8) void {
 // Self-driven proof (NOT part of `zig build test`; run via `zig build
 // bogo-shim-test`, which builds+installs the shim and sets BOGO_SHIM_BIN).
 //
-// These spawn the REAL compiled shim as a subprocess and drive it with orochi's
+// These spawn the REAL compiled shim as a subprocess and drive it with onyx's
 // own loopback TLS engines standing in for BoringSSL's runner — proving the shim
 // completes a handshake, XOR-echoes app data, and returns the BoGo-expected exit
 // code (0 / 89 / nonzero) WITHOUT the external Go harness. The shim binary is
@@ -557,7 +557,7 @@ fn fdWrite(fd: linux.fd_t, bytes: []const u8) void {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const x509_selfsign = orochi.proto.x509_selfsign;
+const x509_selfsign = onyx_server.proto.x509_selfsign;
 const Ed25519 = std.crypto.sign.Ed25519;
 
 test "parse: valid server invocation" {
@@ -730,7 +730,7 @@ fn readExact(fd: linux.fd_t, buf: []u8) !void {
     }
 }
 
-const probe_msg = "orochi-bogo-shim-probe";
+const probe_msg = "onyx-bogo-shim-probe";
 
 /// Drive the accepted socket as a TLS 1.3 CLIENT peer (the shim is the server):
 /// complete the handshake, send `probe_msg`, and assert the shim echoed it back

@@ -25,7 +25,7 @@ test "generated multiline parts concatenate exactly within the byte cap" {
 
     for (0..concat_iterations) |iteration| {
         const ref = try refFor(iteration, &open_buf);
-        const open_line = try writeOpen(open_buf[32..], ref, "#orochi");
+        const open_line = try writeOpen(open_buf[32..], ref, "#onyx");
         const close_line = try writeClose(&close_buf, ref);
 
         const line_count = 1 + random.uintLessThan(usize, max_generated_lines);
@@ -46,7 +46,7 @@ test "generated multiline parts concatenate exactly within the byte cap" {
             body_lines[index] = try writeBody(
                 &line_storage[index],
                 ref,
-                "#orochi",
+                "#onyx",
                 .privmsg,
                 concat,
                 text_storage[index][0..text_len],

@@ -3568,8 +3568,8 @@ test "channelsForAccount: durable reverse access lookup (LISTCHANS)" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another good passphrase here", &scratch);
-    _ = try services.registerChannel("#orochi", "alice", &scratch);
-    _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
+    _ = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
 
     var count: usize = 0;
     var found_op = false;
@@ -3577,7 +3577,7 @@ test "channelsForAccount: durable reverse access lookup (LISTCHANS)" {
     services.channelsForAccount("BOB", Ctx{ .count = &count, .found = &found_op }, struct {
         fn cb(c: Ctx, channel: []const u8, level: AccessLevel) void {
             c.count.* += 1;
-            if (std.ascii.eqlIgnoreCase(channel, "#orochi") and level == .op) c.found.* = true;
+            if (std.ascii.eqlIgnoreCase(channel, "#onyx") and level == .op) c.found.* = true;
         }
     }.cb);
     try std.testing.expectEqual(@as(usize, 1), count);
@@ -3821,14 +3821,14 @@ test "channel transfer: only the founder may hand ownership to a registered acco
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another good passphrase here", &scratch);
-    _ = try services.registerChannel("#orochi", "alice", &scratch);
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
 
-    try std.testing.expectError(error.Forbidden, services.transferChannel("#orochi", "bob", "bob", &scratch)); // not founder
-    try std.testing.expectError(error.NotFound, services.transferChannel("#orochi", "alice", "carol", &scratch)); // unknown target
-    const res = try services.transferChannel("#orochi", "alice", "bob", &scratch);
+    try std.testing.expectError(error.Forbidden, services.transferChannel("#onyx", "bob", "bob", &scratch)); // not founder
+    try std.testing.expectError(error.NotFound, services.transferChannel("#onyx", "alice", "carol", &scratch)); // unknown target
+    const res = try services.transferChannel("#onyx", "alice", "bob", &scratch);
     try std.testing.expectEqualStrings("bob", res.registered_channel.founder.asSlice());
     // ownership moved: alice can no longer transfer
-    try std.testing.expectError(error.Forbidden, services.transferChannel("#orochi", "alice", "alice", &scratch));
+    try std.testing.expectError(error.Forbidden, services.transferChannel("#onyx", "alice", "alice", &scratch));
 }
 
 test "account email verification persists across store reopen" {
@@ -4341,18 +4341,18 @@ test "channel register and access grant" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-    const registered = try services.registerChannel("#Orochi", "alice", &scratch);
-    try std.testing.expectEqualStrings("#orochi", registered.registered_channel.name.asSlice());
+    const registered = try services.registerChannel("#OnyxServer", "alice", &scratch);
+    try std.testing.expectEqualStrings("#onyx", registered.registered_channel.name.asSlice());
     try std.testing.expectEqualStrings("alice", registered.registered_channel.founder.asSlice());
 
-    const granted = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
+    const granted = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
     try std.testing.expectEqual(AccessLevel.op, granted.access.level);
 
     // The founder (admin+) may read back another account's access level.
-    const queried = try services.channelAccess("#orochi", "alice", "bob", .query, .voice, &scratch);
+    const queried = try services.channelAccess("#onyx", "alice", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, queried.access.level);
     // But an actor lacking .admin (op-level bob) may NOT probe access state.
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "bob", "bob", .query, .voice, &scratch));
 }
 
 test "channel mlock access akick and ward replay from durable services" {
@@ -4367,10 +4367,10 @@ test "channel mlock access akick and ward replay from durable services" {
 
         _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
         _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-        _ = try services.registerChannel("#Orochi", "alice", &scratch);
-        _ = try services.setChannel("#orochi", "alice", .{ .mlock = "+nt-k" }, &scratch);
-        _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
-        _ = try services.channelAkick("#orochi", "alice", "Bad!*@*", .add, "go away", &scratch);
+        _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
+        _ = try services.setChannel("#onyx", "alice", .{ .mlock = "+nt-k" }, &scratch);
+        _ = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
+        _ = try services.channelAkick("#onyx", "alice", "Bad!*@*", .add, "go away", &scratch);
         try services.persistWard(.{
             .match = "mask",
             .pattern = "Bad!*@*",
@@ -4388,9 +4388,9 @@ test "channel mlock access akick and ward replay from durable services" {
         defer store.deinit();
         var services = Services.init(&store, null);
 
-        const info = try services.channelInfo("#orochi");
+        const info = try services.channelInfo("#onyx");
         try std.testing.expectEqualStrings("+nt-k", info.channel_info.mlock.asSlice());
-        try std.testing.expectEqual(AccessLevel.op, (try services.channelAccessLevelFor("#orochi", "bob")).?);
+        try std.testing.expectEqual(AccessLevel.op, (try services.channelAccessLevelFor("#onyx", "bob")).?);
 
         const ReplayRecorder = struct {
             channel: [channel_max]u8 = @splat(0),
@@ -4447,9 +4447,9 @@ test "channel mlock access akick and ward replay from durable services" {
         try std.testing.expectEqual(@as(usize, 1), summary.mlocks);
         try std.testing.expectEqual(@as(usize, 1), summary.akicks);
         try std.testing.expectEqual(@as(usize, 1), summary.wards);
-        try std.testing.expectEqualStrings("#orochi", recorder.channel[0..recorder.channel_len]);
+        try std.testing.expectEqualStrings("#onyx", recorder.channel[0..recorder.channel_len]);
         try std.testing.expectEqualStrings("+nt-k", recorder.mlock[0..recorder.mlock_len]);
-        try std.testing.expectEqualStrings("#orochi", recorder.akick_channel[0..recorder.akick_channel_len]);
+        try std.testing.expectEqualStrings("#onyx", recorder.akick_channel[0..recorder.akick_channel_len]);
         try std.testing.expectEqualStrings("Bad!*@*", recorder.akick_mask[0..recorder.akick_mask_len]);
         try std.testing.expectEqualStrings("go away", recorder.akick_reason[0..recorder.akick_reason_len]);
         try std.testing.expectEqualStrings("mask", recorder.ward_match[0..recorder.ward_match_len]);
@@ -4571,12 +4571,12 @@ test "non-admin channel mutations are forbidden" {
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
     _ = try services.registerAccount("carol", "carol correct battery staple", &scratch);
-    _ = try services.registerChannel("#orochi", "alice", &scratch);
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
 
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "carol", .grant, .op, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "carol", .revoke, .op, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .add, "bad", &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .remove, "", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "bob", "carol", .grant, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "bob", "carol", .revoke, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#onyx", "bob", "*!*@bad.test", .add, "bad", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#onyx", "bob", "*!*@bad.test", .remove, "", &scratch));
 }
 
 test "channel access and akick query require admin" {
@@ -4591,30 +4591,30 @@ test "channel access and akick query require admin" {
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
     _ = try services.registerAccount("mallory", "a third correct battery staple", &scratch);
-    _ = try services.registerChannel("#Orochi", "alice", &scratch);
-    _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
-    _ = try services.channelAkick("#orochi", "alice", "Bad!*@*", .add, "go away", &scratch);
+    _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
+    _ = try services.channelAccess("#onyx", "alice", "bob", .grant, .op, &scratch);
+    _ = try services.channelAkick("#onyx", "alice", "Bad!*@*", .add, "go away", &scratch);
 
-    // mallory has NO access to #orochi: both query paths must be Forbidden and
+    // mallory has NO access to #onyx: both query paths must be Forbidden and
     // must not leak the access level or the akick mask/reason.
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "mallory", "bob", .query, .voice, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "mallory", "Bad!*@*", .query, "", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "mallory", "bob", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#onyx", "mallory", "Bad!*@*", .query, "", &scratch));
 
     // bob holds op (below .admin): still Forbidden on either query.
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "Bad!*@*", .query, "", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "bob", "bob", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#onyx", "bob", "Bad!*@*", .query, "", &scratch));
 
     // A non-admin querying an UNREGISTERED target must get Forbidden, NOT
     // NotFound: the .admin gate is hoisted above the target-account existence
     // probe so the reply cannot distinguish a registered from an unregistered
     // account (a registration-enumeration oracle). Pre-hoist this returned
     // error.NotFound.
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "mallory", "no_such_account", .query, .voice, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#onyx", "mallory", "no_such_account", .query, .voice, &scratch));
 
     // The founder (admin+) may still read both back.
-    const acc = try services.channelAccess("#orochi", "alice", "bob", .query, .voice, &scratch);
+    const acc = try services.channelAccess("#onyx", "alice", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, acc.access.level);
-    const ak = try services.channelAkick("#orochi", "alice", "Bad!*@*", .query, "", &scratch);
+    const ak = try services.channelAkick("#onyx", "alice", "Bad!*@*", .query, "", &scratch);
     try std.testing.expectEqualStrings("go away", ak.akick.reason.asSlice());
 }
 
@@ -4670,10 +4670,10 @@ test "missing access and akick removals return not found" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-    _ = try services.registerChannel("#orochi", "alice", &scratch);
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
 
-    try std.testing.expectError(error.NotFound, services.channelAccess("#orochi", "alice", "bob", .revoke, .op, &scratch));
-    try std.testing.expectError(error.NotFound, services.channelAkick("#orochi", "alice", "*!*@missing.test", .remove, "", &scratch));
+    try std.testing.expectError(error.NotFound, services.channelAccess("#onyx", "alice", "bob", .revoke, .op, &scratch));
+    try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "*!*@missing.test", .remove, "", &scratch));
 }
 
 test "drop account and channel" {
@@ -4686,9 +4686,9 @@ test "drop account and channel" {
     var scratch: [record_max]u8 = undefined;
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
-    _ = try services.registerChannel("#orochi", "alice", &scratch);
-    _ = try services.dropChannel("#orochi", "alice");
-    try std.testing.expectError(error.NotFound, services.channelInfo("#orochi"));
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
+    _ = try services.dropChannel("#onyx", "alice");
+    try std.testing.expectError(error.NotFound, services.channelInfo("#onyx"));
 
     _ = try services.dropAccount("alice", "correct horse battery staple");
     try std.testing.expectError(error.NotFound, services.accountInfo("alice"));
@@ -4728,13 +4728,13 @@ test "state hook fires on channel register and drop" {
     var scratch: [record_max]u8 = undefined;
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
-    _ = try services.registerChannel("#Orochi", "alice", &scratch);
+    _ = try services.registerChannel("#OnyxServer", "alice", &scratch);
     // The canonical (lowercased) channel name is bridged to the live world.
-    try std.testing.expectEqualStrings("#orochi", rec.created[0..rec.created_len]);
+    try std.testing.expectEqualStrings("#onyx", rec.created[0..rec.created_len]);
     try std.testing.expectEqual(@as(usize, 0), rec.dropped_len);
 
-    _ = try services.dropChannel("#orochi", "alice");
-    try std.testing.expectEqualStrings("#orochi", rec.dropped[0..rec.dropped_len]);
+    _ = try services.dropChannel("#onyx", "alice");
+    try std.testing.expectEqualStrings("#onyx", rec.dropped[0..rec.dropped_len]);
 }
 
 test "Config default preserves historical account policy" {

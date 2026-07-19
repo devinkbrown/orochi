@@ -5,7 +5,7 @@
 //!
 //! Zig 0.16 std was checked at `/usr/lib/zig/std/crypto`: ML-KEM is present
 //! as `std.crypto.kem.ml_kem.MLKem768`, so this file implements the real
-//! X25519 || ML-KEM-768 hybrid path. The hybrid combiner used here is Orochi's
+//! X25519 || ML-KEM-768 hybrid path. The hybrid combiner used here is Onyx Server's
 //! MOORING v2 HMAC-based KDF: `HMAC(label, x25519_ss || mlkem_ss || transcript)`.
 //! No ML-KEM code is hand-rolled.
 const std = @import("std");
@@ -179,7 +179,7 @@ pub const HybridKx = struct {
         var pq_ss = SharedSecret.init(pq_raw);
         defer pq_ss.wipe();
 
-        return extractHybrid("orochi-tsumugi-v2 hybrid-kx", &x_ss, &pq_ss, transcript);
+        return extractHybrid("onyx-mooring-v2 hybrid-kx", &x_ss, &pq_ss, transcript);
     }
 
     fn finishEncapsulation(
@@ -198,7 +198,7 @@ pub const HybridKx = struct {
                 .x25519_public_key = local_x25519.public_key,
                 .mlkem_ciphertext = pq.ciphertext,
             },
-            .shared_secret = extractHybrid("orochi-tsumugi-v2 hybrid-kx", &x_ss, &pq_ss, transcript),
+            .shared_secret = extractHybrid("onyx-mooring-v2 hybrid-kx", &x_ss, &pq_ss, transcript),
         };
     }
 };
@@ -220,7 +220,7 @@ pub const KeySchedule = struct {
         shared_secret: *const SharedSecret,
         transcript: []const u8,
     ) !KeySchedule {
-        return derive("orochi-tsumugi-v2", role, shared_secret, transcript);
+        return derive("onyx-mooring-v2", role, shared_secret, transcript);
     }
 
     pub fn derive(
@@ -391,9 +391,9 @@ test "key-schedule domain separation" {
     var shared = SharedSecret.init(hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
     defer shared.wipe();
 
-    var mooring = try KeySchedule.derive("orochi-tsumugi-v2", .initiator, &shared, "transcript");
+    var mooring = try KeySchedule.derive("onyx-mooring-v2", .initiator, &shared, "transcript");
     defer mooring.wipe();
-    var tls = try KeySchedule.derive("orochi-tls13-v1", .initiator, &shared, "transcript");
+    var tls = try KeySchedule.derive("onyx-tls13-v1", .initiator, &shared, "transcript");
     defer tls.wipe();
 
     try std.testing.expect(!std.mem.eql(u8, &mooring.root.declassify(), &tls.root.declassify()));

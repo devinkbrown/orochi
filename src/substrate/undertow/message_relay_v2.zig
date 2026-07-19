@@ -26,9 +26,9 @@ pub const RelayId = [relay_id_len]u8;
 pub const SessionToken = [16]u8;
 pub const Verb = relay_v1.Verb;
 
-pub const sign_domain = "orochi-s2s-relay-msg-v2";
-pub const route_id_domain = "orochi-session-route-id-v1";
-pub const relay_id_domain = "orochi-s2s-relay-id-v2";
+pub const sign_domain = "onyx-s2s-relay-msg-v2";
+pub const route_id_domain = "onyx-session-route-id-v1";
+pub const relay_id_domain = "onyx-s2s-relay-id-v2";
 
 pub const ScopeKind = enum(u8) {
     /// Shared-channel delivery. WHISPER is deliberately excluded because it has
@@ -625,7 +625,7 @@ fn signedSample(
     const sender = try routeId(@splat(0x11));
     var msg = RelayMessage{
         .verb = .privmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .min_rank = 2,
         .source_prefix = "alice!u@example.invalid",
         .account = "alice",
@@ -713,7 +713,7 @@ test "secure relay v2 channel whisper signs display channel and exact recipient 
     var signature: [sig_len]u8 = undefined;
     var msg = RelayMessage{
         .verb = .whisper,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_prefix = "alice!u@example.invalid",
         .account = "alice",
         .text = "exact channel whisper",
@@ -824,7 +824,7 @@ test "secure relay v2 origin stamping rejects a mismatched self-certified node" 
     var signature: [sig_len]u8 = undefined;
     var msg = RelayMessage{
         .verb = .privmsg,
-        .target = "#orochi",
+        .target = "#onyx",
         .source_prefix = "alice!u@example.invalid",
         .text = "wrong origin",
         .scope_kind = .channel,

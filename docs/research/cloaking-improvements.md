@@ -1,4 +1,4 @@
-# Orochi Host-Cloaking — Prioritized Improvement Brief
+# Onyx Server Host-Cloaking — Prioritized Improvement Brief
 
 Research brief · 2026-07-11 · analyst: deep-researcher · scope: `src/proto/cloak.zig`,
 key derivation in `src/main.zig`, `applyVisibleHost`/`prevKeyCloakHost` in
@@ -15,20 +15,20 @@ privacy plumbing (`dnsbl_resolver.zig`, `ip_reputation.zig`, `crypto/argon2_kdf.
 
 ## BLUF
 
-**Orochi's cloak is already on the correct side of IRCd history — the improvement
+**Onyx Server's cloak is already on the correct side of IRCd history — the improvement
 opportunities are about the *policy layer* around a fundamentally-sound primitive, not
 the primitive itself.** The single highest-value change is to **split cloak policy by
 authentication state**: give logged-in users the stable, moderatable account cloak (already
 built) and give *anonymous* users an **opaque, epoch-rotated cloak by default**, then move
 abuse control up to account bans + registration friction. This is the exact balance the
 mature field (Libera, InspIRCd v4, UnrealIRCd 6) converged on, and it directly retires
-Orochi's two structural privacy weaknesses — *forever-linkability* of a static-IP anonymous
+Onyx Server's two structural privacy weaknesses — *forever-linkability* of a static-IP anonymous
 user and *subnet co-membership leakage* — without weakening moderation.
 
 - **Likelihood this assessment is correct:** *very likely (80–95%)* — every "what exists"
-  claim was read in Orochi source at file:line; every "state of the art" claim was
+  claim was read in Onyx Server source at file:line; every "state of the art" claim was
   triangulated against primary vendor docs and, where possible, the daemons' own source.
-- **Analytic confidence:** *High* on what Orochi does today and on the account-ban
+- **Analytic confidence:** *High* on what Onyx Server does today and on the account-ban
   direction (multiple primary IRCd sources agree); *Moderate* on specific tunables (epoch
   cadence, tier depth) — those are policy tradeoffs with no authoritative "correct" value.
 
@@ -37,7 +37,7 @@ Two axes kept separate throughout: **likelihood** a claim is true (calibrated wo
 
 ---
 
-## §0 — What Orochi already does WELL (VERIFIED, read in source)
+## §0 — What Onyx Server already does WELL (VERIFIED, read in source)
 
 Do not regress these; they are genuinely ahead of most of the field.
 
@@ -54,7 +54,7 @@ Do not regress these; they are genuinely ahead of most of the field.
 - **64-bit collision-resistant full token** (`token64`, `full_token_hex_len = 16`,
   `cloak.zig:47-51,349-353`) — deliberately widened from 32-bit to push birthday collisions
   past 4 billion addresses. This is *wider* than UnrealIRCd's `downsample()`-to-32-bit and
-  InspIRCd's truncated segments, so Orochi bans are more collision-precise.
+  InspIRCd's truncated segments, so Onyx Server bans are more collision-precise.
 - **Hierarchical subnet coherence + ban-able geo/ASN labels** (`cloakIPv4`/`cloakIPv6` +
   `appendGeo`, `cloak.zig:180-321`): `*.us.ip.<net>` bans a country, `*.a13335.*` bans an
   ASN, all without exposing the address. Strong moderation surface.
@@ -75,7 +75,7 @@ Do not regress these; they are genuinely ahead of most of the field.
 A deterministic keyed cloak is a **confirmation oracle, not a confidentiality primitive**
 (VERIFIED — UnrealIRCd docs state a known key lets an attacker "brute force the original
 host"; DerbyCon "Uncloaking IP Addresses on IRC" shows identical cloak ⇒ identical source
-IP, harvested via WHOIS/WHOWAS). Two consequences that Orochi inherits by construction:
+IP, harvested via WHOIS/WHOWAS). Two consequences that Onyx Server inherits by construction:
 
 1. **Forever-linkability.** `cloak = HMAC(key, IP)` is deterministic (by design —
    `docs/reference/host-cloaking.md:22`), so a static-IP anonymous user carries **one stable
@@ -90,12 +90,12 @@ IP, harvested via WHOIS/WHOWAS). Two consequences that Orochi inherits by constr
 
 The accepted field tradeoff is that hierarchical cloaks *intentionally* leak subnet
 co-membership because that is the exact property that makes wildcard subnet bans work — and
-the privacy-maximal alternative (opaque) is offered opt-in and loses subnet bans. Orochi
+the privacy-maximal alternative (opaque) is offered opt-in and loses subnet bans. Onyx Server
 already implements both forks; the improvement is to **choose the fork by who the user is**.
 
 **One myth to kill (VERIFIED reasoning):** shortening the token does **not** buy privacy —
 it does not defeat the online oracle (the attacker recomputes the short token from a guessed
-IP just as easily) and it *breaks ban precision* via collisions. Orochi's 64-bit choice is
+IP just as easily) and it *breaks ban precision* via collisions. Onyx Server's 64-bit choice is
 correct; keep it.
 
 ---
@@ -149,10 +149,10 @@ correct; keep it.
   secrecy because the IPv4 input space is fully enumerable). The mature daemons sidestep this
   by **refusing passphrases** — InspIRCd enforces a 30-char minimum key; UnrealIRCd mandates
   three ≥80-char *random* keys via `gencloak` (VERIFIED from their source per researcher).
-  Orochi currently accepts an arbitrary passphrase and single-hashes it — the one place the
+  Onyx Server currently accepts an arbitrary passphrase and single-hashes it — the one place the
   design is weaker than the field.
 - **Maps to cloak.zig.** Derivation is in `main.zig:459-490`, not `cloak.zig` — `cloak.zig`
-  just consumes a `SecretKey`. Add a `keygen` path to the `orochi` CLI and a
+  just consumes a `SecretKey`. Add a `keygen` path to the `onyx-server` CLI and a
   boot-time entropy/length check; swap the two `Sha256.hash` calls for argon2id-or-HKDF. The
   `deriveCloneKey` pattern (`server.zig:5837`, domain-tagged SHA256 → stable mesh-wide key) is
   the template for the HKDF `info`-label separation.
@@ -191,7 +191,7 @@ correct; keep it.
 
 - **Improvement.** At registration, run **non-blocking** lookups against DroneBL
   (`<rev-ip>.dnsbl.dronebl.org`), the Tor exit DNSEL (`<rev-ip>.dnsel.torproject.org` → A
-  `127.0.0.2`), and classify hosting/VPN origin from the **ASN Orochi already resolves**. Add
+  `127.0.0.2`), and classify hosting/VPN origin from the **ASN Onyx Server already resolves**. Add
   a **`mark`** action (not just refuse) that routes the connection into a restricted
   connect-class and appends a coarse origin-class label — `tor` / `vpn` / `dc` — to the cloak
   tail, reusing the existing `appendGeo` label machinery. Optionally require SASL for `tor`.
@@ -199,7 +199,7 @@ correct; keep it.
   `gline`/`zline`/`kill`/**`mark`**; Libera gates its Tor onion behind pubkey SASL). It gives
   ops a *moderation signal* ("this is a Tor/hosting connection") that is ban-able as a class
   (`*.tor.*`) and drives policy, while leaking **no raw address** — exactly the anonymity-vs-
-  moderation sweet spot. Orochi has the DNSBL resolver (`dnsbl_resolver.zig`) but its verdict
+  moderation sweet spot. Onyx Server has the DNSBL resolver (`dnsbl_resolver.zig`) but its verdict
   currently only *refuses/network-bans*; it does not feed the cloak or offer a mark path, and
   there is **no Tor detection at all** today (VERIFIED, grepped).
 - **Maps to cloak.zig.** Add an optional origin-class field to `Geo` (or a sibling struct) and
@@ -211,7 +211,7 @@ correct; keep it.
   accept path — preserve that). Marking (vs. dropping) is the right default: it avoids
   collateral bans on shared Tor/VPN exits while still enabling policy.
 - **Effort.** **M–L.** New Tor-DNSEL zone + classification + mark action + connect-class
-  routing + the cloak label. Route config schema to `orochi-config`, async lookup path to
+  routing + the cloak label. Route config schema to `onyx-server-config`, async lookup path to
   `zig-coder`.
   *Named gap:* confirm the live Tor DNSEL zone/response codes against a real query before
   wiring — Tor has changed this service before (the `127.0.0.2` reply is SINGLE-SOURCE + blog,
@@ -246,7 +246,7 @@ correct; keep it.
 
 ### P2-6 — Make IPv4/IPv6 tier depth configurable; consider dropping the coarsest tiers
 
-- **Improvement.** Orochi exposes **4 IPv4 tiers** (/32,/24,/16,/8) and **5 IPv6 tiers**
+- **Improvement.** Onyx Server exposes **4 IPv4 tiers** (/32,/24,/16,/8) and **5 IPv6 tiers**
   (/128,/64,/56,/48,/32) — more than InspIRCd v4 (3 IPv4 tiers) or UnrealIRCd (3). Each extra
   coarse tier is additional subnet co-membership leakage and another (cheap) confirmation-
   oracle rung for marginal ban utility (a `/8` ban is a rare, blunt instrument). Make tier
@@ -329,7 +329,7 @@ correct; keep it.
 
 ## Sources
 
-**Orochi (primary, in-repo, current):**
+**Onyx Server (primary, in-repo, current):**
 - `src/proto/cloak.zig` — HMAC-SHA256 engine, token widths, tiers, opaque, account cloak (read directly).
 - `src/main.zig:459-490` — `SHA256([cloak] secret)` key derivation + random per-boot fallback + `previous_secret`.
 - `src/daemon/server.zig:5739-5844` — `applyVisibleHost`, `cloakGeo`, `prevKeyCloakHost`, `deriveCloneKey`.

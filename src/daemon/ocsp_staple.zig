@@ -137,10 +137,10 @@ pub const Service = struct {
         if (self.thread != null) return;
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| {
-            dlog.log("orochi: ocsp stapler start failed ({s}); stapling disabled\n", .{@errorName(err)});
+            dlog.log("onyx-server: ocsp stapler start failed ({s}); stapling disabled\n", .{@errorName(err)});
             return;
         };
-        dlog.log("orochi: ocsp staple scheduler enabled (check interval {d}ms)\n", .{self.opts.check_interval_ms});
+        dlog.log("onyx-server: ocsp staple scheduler enabled (check interval {d}ms)\n", .{self.opts.check_interval_ms});
     }
 
     pub fn stop(self: *Service) void {
@@ -164,7 +164,7 @@ pub const Service = struct {
         const cert_path = self.tls.cert_path orelse return;
 
         const chain = tls_certs.loadCertChain(self.allocator, self.io, cert_path) catch |err| {
-            dlog.log("orochi: ocsp staple skipped: cannot read cert file {s} ({s})\n", .{ cert_path, @errorName(err) });
+            dlog.log("onyx-server: ocsp staple skipped: cannot read cert file {s} ({s})\n", .{ cert_path, @errorName(err) });
             return;
         };
         defer {
@@ -173,7 +173,7 @@ pub const Service = struct {
         }
         if (chain.len < 2) {
             if (!self.warned_no_issuer) {
-                dlog.log("orochi: ocsp staple disabled: cert file {s} has no issuer cert (need fullchain)\n", .{cert_path});
+                dlog.log("onyx-server: ocsp staple disabled: cert file {s} has no issuer cert (need fullchain)\n", .{cert_path});
                 self.warned_no_issuer = true;
             }
             return;
@@ -181,16 +181,16 @@ pub const Service = struct {
         self.warned_no_issuer = false;
 
         const leaf = x509.parse(chain[0]) catch |err| {
-            dlog.log("orochi: ocsp staple skipped: cannot parse leaf cert ({s})\n", .{@errorName(err)});
+            dlog.log("onyx-server: ocsp staple skipped: cannot parse leaf cert ({s})\n", .{@errorName(err)});
             return;
         };
         const issuer = x509.parse(chain[1]) catch |err| {
-            dlog.log("orochi: ocsp staple skipped: cannot parse issuer cert ({s})\n", .{@errorName(err)});
+            dlog.log("onyx-server: ocsp staple skipped: cannot parse issuer cert ({s})\n", .{@errorName(err)});
             return;
         };
         if (leaf.aia_ocsp_url.len == 0) {
             if (!self.warned_no_aia) {
-                dlog.log("orochi: ocsp staple disabled: leaf has no AIA OCSP responder URL\n", .{});
+                dlog.log("onyx-server: ocsp staple disabled: leaf has no AIA OCSP responder URL\n", .{});
                 self.warned_no_aia = true;
             }
             return;
@@ -223,20 +223,20 @@ pub const Service = struct {
         if (self.fail_count < std.math.maxInt(u32)) self.fail_count += 1;
         const delay = backoffSeconds(self.fail_count, self.opts.min_refresh_seconds, self.opts.max_refresh_seconds);
         self.next_retry_unix = now + delay;
-        dlog.log("orochi: ocsp fetch retry backing off {d}s after {d} consecutive failure(s)\n", .{ delay, self.fail_count });
+        dlog.log("onyx-server: ocsp fetch retry backing off {d}s after {d} consecutive failure(s)\n", .{ delay, self.fail_count });
     }
 
     /// Returns true when a fresh, servable staple was published; false on any
     /// failure (so the caller can apply backoff).
     fn fetchAndPublish(self: *Service, leaf: x509.Certificate, issuer: x509.Certificate, now: i64) bool {
         const req = ocsp.buildRequestForCerts(self.allocator, leaf, issuer) catch |err| {
-            dlog.log("orochi: ocsp staple skipped: cannot build request ({s})\n", .{@errorName(err)});
+            dlog.log("onyx-server: ocsp staple skipped: cannot build request ({s})\n", .{@errorName(err)});
             return false;
         };
         defer self.allocator.free(req);
 
         const url = http_fetch.parseUrl(leaf.aia_ocsp_url) catch {
-            dlog.log("orochi: ocsp staple skipped: malformed AIA URL\n", .{});
+            dlog.log("onyx-server: ocsp staple skipped: malformed AIA URL\n", .{});
             return false;
         };
         // The OCSPResponse is signature-verified against the issuer below, so the
@@ -248,13 +248,13 @@ pub const Service = struct {
             .recv_timeout_ms = self.opts.recv_timeout_ms,
             .max_response_bytes = self.opts.max_response_bytes,
         }) catch |err| {
-            dlog.log("orochi: ocsp fetch failed ({s}); keeping current staple\n", .{@errorName(err)});
+            dlog.log("onyx-server: ocsp fetch failed ({s}); keeping current staple\n", .{@errorName(err)});
             return false;
         };
         defer self.allocator.free(http_resp);
 
         const der = extractOcspBody(http_resp) orelse {
-            dlog.log("orochi: ocsp fetch: responder returned no usable OCSPResponse body\n", .{});
+            dlog.log("onyx-server: ocsp fetch: responder returned no usable OCSPResponse body\n", .{});
             return false;
         };
 
@@ -270,7 +270,7 @@ pub const Service = struct {
             if (ocsp.verifyResponseSignatureWithChain(parsed, issuer.spki_der, now)) {
                 if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
                     if (status == .revoked) {
-                        dlog.log("orochi: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
+                        dlog.log("onyx-server: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
                         return false;
                     }
                 }
@@ -278,12 +278,12 @@ pub const Service = struct {
         } else |_| {}
 
         if (!ocsp.isStapleServable(der, issuer.spki_der, leaf.serial_der, now, self.opts.skew_seconds)) {
-            dlog.log("orochi: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
+            dlog.log("onyx-server: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
             return false;
         }
 
         const owned = self.allocator.dupe(u8, der) catch {
-            dlog.log("orochi: ocsp staple skipped: out of memory copying response\n", .{});
+            dlog.log("onyx-server: ocsp staple skipped: out of memory copying response\n", .{});
             return false;
         };
         self.server.publishOcspStaple(owned);
@@ -323,7 +323,7 @@ pub const Service = struct {
             }
         } else |_| {}
         self.next_refresh_unix = now + delay;
-        dlog.log("orochi: ocsp staple published ({d} bytes); next refresh in {d}s\n", .{ der.len, delay });
+        dlog.log("onyx-server: ocsp staple published ({d} bytes); next refresh in {d}s\n", .{ der.len, delay });
     }
 };
 

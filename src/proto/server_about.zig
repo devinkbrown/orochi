@@ -119,14 +119,14 @@ test "renderInfo includes identity, build, and uptime" {
         .zig_version = "0.16.0",
         .target = "x86_64-linux",
         .optimize = "ReleaseFast",
-        .network = "Orochi",
+        .network = "Onyx",
         .online_since_unix = 1_700_000_000,
         .uptime_secs = 3661,
     }, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "Version onyx-server-0.1 (zig 0.16.0, x86_64-linux, ReleaseFast)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Undertow CRDT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Network:  Orochi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Network:  Onyx") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Running since 1700000000 (up 1h 01m 01s)") != null);
     // Every line is non-empty-terminated by '\n'; never a bare CR.
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);

@@ -11,7 +11,7 @@ const std = @import("std");
 const numeric = @import("numeric.zig");
 const limits_config = @import("limits_config.zig");
 
-// MODEX is an Orochi IRCX extension and is NOT in draft-pfenning-04, which
+// MODEX is an Onyx Server IRCX extension and is NOT in draft-pfenning-04, which
 // assigns 806/807 to EVENT ADD/DEL. To stay draft-faithful for EVENT, MODEX's
 // list/end numerics live just past the EVENT range at 826/827.
 pub const RPL_MODEXLIST: u16 = 826;

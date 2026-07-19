@@ -64,7 +64,7 @@ implemented.
 `src/daemon/key_transparency.zig` is the server-side substrate for verifiable
 account identity. It defines credential events for CERTFP and WebAuthn/passkey
 bind/delete mutations, hashes each event with BLAKE3 under the
-`OROCHI-KT-EVENT-v1` domain, length-frames account and key identifiers, and
+`ONYX-KT-EVENT-v1` domain, length-frames account and key identifiers, and
 appends the resulting leaf to the existing Merkle Mountain Range substrate
 (`src/daemon/key_transparency.zig:19`, `src/daemon/key_transparency.zig:24`,
 `src/daemon/key_transparency.zig:29`, `src/daemon/key_transparency.zig:49`,
@@ -86,8 +86,8 @@ path and peak hashes needed to verify one inclusion proof
 ## E2EE control plane
 
 Onyx Server's daemon does not decrypt client E2EE payloads. The implemented server
-surface is a control plane: the `orochi/e2ee` capability allows the client-only
-`+orochi/e2ee` message tag, and the channel PROP `encryption-policy` accepts
+surface is a control plane: the `onyx/e2ee` capability allows the client-only
+`+onyx/e2ee` message tag, and the channel PROP `encryption-policy` accepts
 `off`, `optional`, or `required`. Required rooms reject plaintext `PRIVMSG`
 delivery with `FAIL PRIVMSG E2EE_REQUIRED`; `NOTICE` is silently dropped per IRC
 NOTICE error rules. The policy value is an ordinary signed channel PROP, so it

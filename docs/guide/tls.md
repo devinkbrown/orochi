@@ -4,14 +4,67 @@
 
 Onyx Server is modern-only: TLS is implicit on a separate listener, and there is no STARTTLS command path (`src/main.zig:216`, `src/main.zig:219`, `src/daemon/dispatch.zig:369`). A TLS-first deployment enables `[tls]` and usually `[sts]`, while still providing the currently required `[listen].irc` parser key.
 
+## Production TLS card
+
+Short operator checklist for a **single public node** (not mesh). Full ACME field
+reference lives in `docs/reference/config.md` and `etc/onyx-server.reference.toml`.
+
+| Step | Requirement |
+|---|---|
+| 1. DNS | `A`/`AAAA` for the public name (e.g. `irc.example.net`) points at this host. |
+| 2. Ports | `6697/tcp` (IRCS) open to clients; for in-daemon ACME HTTP-01, either expose the challenge path on `80` (nginx → `[acme].challenge_port`) or place the node where LE can reach it. |
+| 3. Paths | Write durable PEM paths under e.g. `/etc/onyx-server/tls/{cert,key}.pem` owned by the service account (mode `0640` / `0600` on the key). |
+| 4. Config | `[tls] enabled = true` + `cert_path`/`key_path`/`dns_name`; `[acme] enabled = true` with `directory_url`, `domain`, `contact`; `[listen] ws_plain = false`; set a real `[network].server_name`. |
+| 5. Preflight | `onyx-server --check-config /etc/onyx-server/onyx-server.toml` must print `config OK` before every cold start and every config change. The packaged unit runs this as `ExecStartPre`. |
+| 6. Start | Prefer systemd (`systemctl enable --now onyx-server`). Day-2 upgrade is `systemctl reload` (Helix / SIGUSR2), not a blind restart. |
+
+Minimal production sketch (fill host, email, and paths):
+
+```toml
+[network]
+name = "Onyx"
+server_name = "irc.example.net"
+
+[listen]
+host = "::"
+irc = 6667          # optional plaintext; many operators drop it behind the firewall
+ws = 8080
+ws_plain = false    # browsers need wss for a public client
+
+[tls]
+enabled = true
+port = 6697
+cert_path = "/etc/onyx-server/tls/cert.pem"
+key_path = "/etc/onyx-server/tls/key.pem"
+dns_name = "irc.example.net"
+
+[sts]
+enabled = true
+duration = 2592000
+port = 6697
+
+[acme]
+enabled = true
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+domain = "irc.example.net"
+contact = "mailto:admin@example.net"
+# challenge_port = 14402   # loopback HTTP-01; reverse-proxy 80 → this port
+```
+
+**Do not** ship the quickstart (`ws_plain = true`, no `[tls]`) as a public deployment.
+Self-signed bootstrap (no `cert_path`/`key_path`) is for local eval only — browsers
+will not trust it for a production client origin.
+
+Also ship quickstart packaging notes: [`packaging/README.md`](../../packaging/README.md#production-tls-card).
+
 ## TLS listener
 
 ```toml
 [tls]
 enabled = true
 port = 6697
-cert_path = "/etc/orochi/tls/cert.pem"
-key_path = "/etc/orochi/tls/key.pem"
+cert_path = "/etc/onyx-server/tls/cert.pem"
+key_path = "/etc/onyx-server/tls/key.pem"
 dns_name = "irc.example.net"
 request_client_cert = false
 enable_tls12 = false

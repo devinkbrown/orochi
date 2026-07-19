@@ -181,7 +181,7 @@ fn addBounded(a: usize, b: usize, maximum: usize) Error!usize {
 
 fn checkpointChecksum(prefix: []const u8, out: *[checksum_len]u8) void {
     var hasher = Blake3.init(.{});
-    hasher.update("orochi.history.checkpoint.v1");
+    hasher.update("onyx_server.history.checkpoint.v1");
     hasher.update(prefix);
     hasher.final(out);
 }

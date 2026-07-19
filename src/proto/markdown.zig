@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Full Markdown subset parser and text renderers for Orochi bridge output.
+//! Full Markdown subset parser and text renderers for Onyx Server bridge output.
 //!
 //! This module owns a compact block-and-inline AST, parses a deliberate
 //! CommonMark-shaped subset, and renders either IRC formatting codes or plain

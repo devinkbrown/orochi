@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! TLS record and handshake skeleton for Orochi.
+//! TLS record and handshake skeleton for Onyx Server.
 //!
 //! This is deliberately not a full wire-complete TLS stack. It provides the
 //! security-critical seams that the rest of the stack can build on: hardened
@@ -201,7 +201,7 @@ pub fn isCompressionAllowed(method: u8) bool {
     return method == 0;
 }
 
-/// Renegotiation is never enabled in Orochi's TLS policy.
+/// Renegotiation is never enabled in Onyx Server's TLS policy.
 pub fn isRenegotiationAllowed() bool {
     return false;
 }

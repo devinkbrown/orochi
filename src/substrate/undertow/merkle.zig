@@ -269,7 +269,7 @@ fn hashRange(entries: []const Entry, prefix: Hash, bits: u16) Hash {
 
 fn hashEmpty(prefix: Hash, bits: u16) Hash {
     var h = Sha256.init(.{});
-    h.update("orochi.suimyaku.merkle.empty.v1");
+    h.update("onyx_server.suimyaku.merkle.empty.v1");
     updateU16(&h, bits);
     h.update(&prefix);
     var out: Hash = undefined;
@@ -279,7 +279,7 @@ fn hashEmpty(prefix: Hash, bits: u16) Hash {
 
 fn hashLeaf(entry: Entry) Hash {
     var h = Sha256.init(.{});
-    h.update("orochi.suimyaku.merkle.leaf.v1");
+    h.update("onyx_server.suimyaku.merkle.leaf.v1");
     updateU64(&h, entry.key.len);
     h.update(entry.key);
     h.update(&entry.value_hash);
@@ -290,7 +290,7 @@ fn hashLeaf(entry: Entry) Hash {
 
 fn hashNode(prefix: Hash, bits: u16, left: Hash, right: Hash) Hash {
     var h = Sha256.init(.{});
-    h.update("orochi.suimyaku.merkle.node.v1");
+    h.update("onyx_server.suimyaku.merkle.node.v1");
     updateU16(&h, bits);
     h.update(&prefix);
     h.update(&left);
@@ -302,7 +302,7 @@ fn hashNode(prefix: Hash, bits: u16, left: Hash, right: Hash) Hash {
 
 fn hashBucket(entries: []const Entry, prefix: Hash, bits: u16, count: usize) Hash {
     var h = Sha256.init(.{});
-    h.update("orochi.suimyaku.merkle.bucket.v1");
+    h.update("onyx_server.suimyaku.merkle.bucket.v1");
     updateU16(&h, bits);
     updateU64(&h, count);
     h.update(&prefix);

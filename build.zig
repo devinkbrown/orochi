@@ -20,13 +20,13 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Orochi targets 64-bit only (native x86_64/aarch64; the wasm32 browser
+    // Onyx Server targets 64-bit only (native x86_64/aarch64; the wasm32 browser
     // codec below is the lone, deliberate exception). Reject a 32-bit daemon
     // target at configure time with a clear message instead of a confusing later
     // failure.
     if (target.result.ptrBitWidth() != 64) {
         std.debug.panic(
-            "Orochi is 64-bit only; target '{s}' is {d}-bit. Use a 64-bit target (e.g. x86_64-linux, aarch64-linux).",
+            "Onyx Server is 64-bit only; target '{s}' is {d}-bit. Use a 64-bit target (e.g. x86_64-linux, aarch64-linux).",
             .{ @tagName(target.result.cpu.arch), target.result.ptrBitWidth() },
         );
     }
@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("orochi", .{
+    const mod = b.addModule("onyx_server", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
         // in this file, which means that if you have declarations that you
@@ -151,12 +151,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "orochi" is the name you will use in your source code to
-                // import this module (e.g. `@import("orochi")`). The name is
+                // Here "onyx" is the name you will use in your source code to
+                // import this module (e.g. `@import("onyx_server")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "orochi", .module = mod },
+                .{ .name = "onyx_server", .module = mod },
             },
         }),
     });
@@ -528,7 +528,7 @@ pub fn build(b: *std.Build) void {
 
     // `armor` — the standalone Armor crypto toolkit CLI (openssl-parity verbs,
     // every one a thin front-end over the src/crypto substrate). Declared like
-    // the daemon executable: its own root module importing "orochi".
+    // the daemon executable: its own root module importing "onyx_server".
     const armor_exe = b.addExecutable(.{
         .name = "armor",
         .root_module = b.createModule(.{
@@ -538,7 +538,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = needs_libc,
             .strip = strip_release,
             .imports = &.{
-                .{ .name = "orochi", .module = mod },
+                .{ .name = "onyx_server", .module = mod },
             },
         }),
     });
@@ -584,7 +584,7 @@ pub fn build(b: *std.Build) void {
         .strip = true,
     });
     // The codecs depend only on std, so expose them as standalone wasm-targeted
-    // modules (the full orochi root pulls in io_uring/sockets and won't build
+    // modules (the full onyx root pulls in io_uring/sockets and won't build
     // freestanding).
     const wasm_cadencevox = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
     const wasm_cadencevis = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
@@ -605,7 +605,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .strip = true,
     });
-    const wasm_transport = b.addExecutable(.{ .name = "orochi_transport", .root_module = wasm_transport_mod });
+    const wasm_transport = b.addExecutable(.{ .name = "onyx_transport", .root_module = wasm_transport_mod });
     wasm_transport.entry = .disabled;
     wasm_transport.rdynamic = true;
     wasm_step.dependOn(&b.addInstallArtifact(wasm_transport, .{}).step);
@@ -615,13 +615,13 @@ pub fn build(b: *std.Build) void {
     // and skips the (slow) machine-code emit + link the default install does.
     const check_step = b.step("check", "Type-check the daemon without emitting a binary");
     const check_exe = b.addExecutable(.{
-        .name = "orochi-check",
+        .name = "onyx-server-check",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
     check_exe.generated_bin = .none; // analyze only; do not codegen/link an artifact
@@ -669,25 +669,25 @@ pub fn build(b: *std.Build) void {
     // would make the suite flaky. Sample counts are tunable via the CT_ITERS /
     // CT_RSA_ITERS environment variables (see the harness's module doc comment).
     //
-    // The imported orochi crypto is built ReleaseFast in its OWN module (not the
+    // The imported onyx crypto is built ReleaseFast in its OWN module (not the
     // shared `mod`, which inherits -Doptimize and is Debug when unset): the CT
     // claim is about the codegen that ships, and ReleaseFast has surfaced bugs
     // Debug never did (e.g. the rsa_verify inline-asm earlyclobber regression).
-    const ct_orochi_mod = b.createModule(.{
+    const ct_onyx_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = needs_libc,
     });
-    ct_orochi_mod.addImport("build_info", build_info_mod);
+    ct_onyx_mod.addImport("build_info", build_info_mod);
     const ct_check_exe = b.addExecutable(.{
-        .name = "orochi-ct-check",
+        .name = "onyx-server-ct-check",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/constant_time_check.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = ct_orochi_mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = ct_onyx_mod }},
         }),
     });
     const ct_check_run = b.addRunArtifact(ct_check_exe);
@@ -711,7 +711,7 @@ pub fn build(b: *std.Build) void {
     // error is gone), but the compiler's own fuzzer runtime then crashes
     // deterministically (`panic: start index 1 is larger than end index 0`, a
     // slice-bounds bug in lib/zig/fuzzer.zig — reproducible with a trivial
-    // zero-orochi target). See the TOOLCHAIN NOTE in src/crypto/tls_fuzz.zig.
+    // zero-onyx target). See the TOOLCHAIN NOTE in src/crypto/tls_fuzz.zig.
     //
     // Kept SEPARATE from `zig build test` (which still runs these targets, but
     // only in bounded corpus-replay mode) so the fuzz filter never perturbs the
@@ -738,7 +738,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
     const interop_step = b.step("quic-interop-server", "Build the standalone QUIC/HTTP3 interop test server");
@@ -756,7 +756,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
     const interop_wt_step = b.step("quic-interop-wt-server", "Build the standalone WebTransport (browser) interop test server");
@@ -764,11 +764,11 @@ pub fn build(b: *std.Build) void {
 
     // `zig build bogo-shim` — the roadmap-0.3 BoGo shim: a standalone tool that
     // speaks BoringSSL's `ssl/test/runner` shim contract (dial the runner's TCP
-    // port, drive orochi's TlsConn/tls_client engine, XOR-echo, exit 0/89/nonzero)
+    // port, drive onyx's TlsConn/tls_client engine, XOR-echo, exit 0/89/nonzero)
     // so the external Go harness can protocol-test the Armor TLS stack. Kept out
     // of `zig build test` (it's a separate harness, not a unit-test module) and
     // linked to nothing in the daemon — it reuses the engines via the shared
-    // `orochi` module exactly as `tools/quic_interop_server.zig` does.
+    // `onyx_server` module exactly as `tools/quic_interop_server.zig` does.
     const bogo_shim_exe = b.addExecutable(.{
         .name = "bogo_shim",
         .root_module = b.createModule(.{
@@ -776,7 +776,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
     const bogo_shim_install = b.addInstallArtifact(bogo_shim_exe, .{});
@@ -786,7 +786,7 @@ pub fn build(b: *std.Build) void {
     // `zig build bogo-shim-test` — the self-driven proof: builds+installs the
     // shim, then runs the shim file's own `test` blocks (parse + framing units,
     // plus subprocess exit-code smokes that spawn the installed binary and drive
-    // it with orochi's own loopback engines). BOGO_SHIM_BIN points the subprocess
+    // it with onyx's own loopback engines). BOGO_SHIM_BIN points the subprocess
     // tests at the freshly-built binary; without it they skip.
     const bogo_shim_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -794,7 +794,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
     const run_bogo_shim_tests = b.addRunArtifact(bogo_shim_tests);
@@ -851,7 +851,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .link_libc = needs_libc,
             .strip = true,
-            .imports = &.{.{ .name = "orochi", .module = release_mod }},
+            .imports = &.{.{ .name = "onyx_server", .module = release_mod }},
         }),
     });
     release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);

@@ -6,7 +6,7 @@
 //! This module tracks the bounded set of servers known to a mesh node. It is a
 //! pure state container: callers supply time, allocator, and render context.
 //!
-//! Identity is the sovereign `NodeId` (u64) — Orochi's mesh has no legacy TS6
+//! Identity is the sovereign `NodeId` (u64) — Onyx Server's mesh has no legacy TS6
 //! server-id (SID) concept; a node is known solely by its node id.
 const std = @import("std");
 const membership_view = @import("membership_view.zig");

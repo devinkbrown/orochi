@@ -31,7 +31,7 @@ pub const DispatchError = error{
     TextTooLong,
 };
 
-const SERVER_NAME = "orochi.local";
+const SERVER_NAME = "onyx.local";
 const NETWORK_NAME = protocol_inventory.network_name;
 const SERVER_VERSION = "onyx-server-" ++ @import("build_info").version;
 const DEFAULT_HOST = "localhost";
@@ -253,10 +253,10 @@ pub const CapId = enum(u6) {
     account_notify,
     invite_notify,
     account_tag,
-    orochi_session_sync,
-    orochi_bouncer,
-    orochi_topics,
-    orochi_e2ee,
+    onyx_session_sync,
+    onyx_bouncer,
+    onyx_topics,
+    onyx_e2ee,
     chghost,
     no_implicit_names,
     chathistory,
@@ -335,21 +335,21 @@ const cap_specs = [_]CapSpec{
     .{ .id = .extended_join, .name = "extended-join" },
     .{ .id = .invite_notify, .name = "invite-notify" },
     .{ .id = .account_tag, .name = "account-tag" },
-    // orochi/session-sync: opt-in sibling-device mirroring for direct
+    // onyx/session-sync: opt-in sibling-device mirroring for direct
     // PRIVMSG/NOTICE delivery and outgoing DM self-view.
-    .{ .id = .orochi_session_sync, .name = "orochi/session-sync" },
-    // orochi/bouncer: opt-in to automatic rewind (replay of missed channel
+    .{ .id = .onyx_session_sync, .name = "onyx/session-sync" },
+    // onyx/bouncer: opt-in to automatic rewind (replay of missed channel
     // history on (re)join, bounded by the client's read marker). Multi-session
     // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
-    .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
-    // orochi/topics: opt in to Orochi's named-conversation surface. A receiver
-    // gets the `+orochi/topic=<label>` client-only tag without needing generic
+    .{ .id = .onyx_bouncer, .name = "onyx/bouncer" },
+    // onyx/topics: opt in to Onyx Server's named-conversation surface. A receiver
+    // gets the `+onyx/topic=<label>` client-only tag without needing generic
     // message-tags, and clients can discover the topic-filtered CHATHISTORY path.
-    .{ .id = .orochi_topics, .name = "orochi/topics" },
-    // orochi/e2ee: opt in to Orochi's E2EE control-plane tag. Clients with this
-    // cap may send/receive `+orochi/e2ee` on messages, letting required rooms
+    .{ .id = .onyx_topics, .name = "onyx/topics" },
+    // onyx/e2ee: opt in to Onyx Server's E2EE control-plane tag. Clients with this
+    // cap may send/receive `+onyx/e2ee` on messages, letting required rooms
     // reject plaintext without the daemon decrypting client payloads.
-    .{ .id = .orochi_e2ee, .name = "orochi/e2ee" },
+    .{ .id = .onyx_e2ee, .name = "onyx/e2ee" },
     // chghost: receive a native CHGHOST line when a common user's host changes
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
@@ -434,7 +434,7 @@ const cap_specs = [_]CapSpec{
     // so a default build that has not enabled STS advertises nothing -- never
     // stranding a client by promising TLS that no listener serves.
     .{ .id = .sts, .name = "sts", .requires_policy = true },
-    // IRCv3 discovery caps for behavior Orochi already implements unconditionally,
+    // IRCv3 discovery caps for behavior Onyx Server already implements unconditionally,
     // so clients can negotiate/use them: account-extban=a ($a account bans),
     // utf8-only (the server enforces valid UTF-8 globally), and draft/netsplit +
     // draft/netjoin (netsplit/netjoin are framed as typed BATCHes, gated on `batch`).
@@ -2327,7 +2327,7 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try s.setRealname("Alice Example");
     s.loginAs("alice");
     s.setRealHost("10.0.0.7");
-    s.setVisibleHost("cloak-ab12.orochi");
+    s.setVisibleHost("cloak-ab12.onyx");
     s.setAway("brb");
     s.is_oper = true;
     // Negotiated caps must survive the UPGRADE too (carried by name).
@@ -2350,7 +2350,7 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try std.testing.expect(s2.logged_in);
     try std.testing.expectEqualStrings("alice", s2.account().?);
     try std.testing.expectEqualStrings("10.0.0.7", s2.real_host_store.slice());
-    try std.testing.expectEqualStrings("cloak-ab12.orochi", s2.host_store.slice());
+    try std.testing.expectEqualStrings("cloak-ab12.onyx", s2.host_store.slice());
     try std.testing.expectEqualStrings("brb", s2.awayMessage().?);
     try std.testing.expect(s2.isOper());
     try std.testing.expect(s2.registered());
@@ -2397,7 +2397,7 @@ test "full registration handshake emits welcome numerics" {
     try std.testing.expect(!session.registered());
     try std.testing.expectEqual(@as(usize, 0), replies.written().len);
 
-    try dispatchText(&session, &replies, "USER kain 0 * :Kain Orochi");
+    try dispatchText(&session, &replies, "USER kain 0 * :Kain Onyx");
     try std.testing.expect(session.registered());
     try expectCodesInOrder(replies.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
     // ISUPPORT advertises extended-ban support so clients enable $-typed bans.
@@ -2420,11 +2420,11 @@ test "CAP negotiation holds registration until CAP END" {
     try expectContains(replies.written(), "utf8-only");
     try expectContains(replies.written(), "draft/netsplit");
     try expectContains(replies.written(), "draft/netjoin");
-    try expectContains(replies.written(), "orochi/topics");
+    try expectContains(replies.written(), "onyx/topics");
     replies.clear();
 
     try dispatchText(&session, &replies, "NICK kain");
-    try dispatchText(&session, &replies, "USER kain 0 * :Kain Orochi");
+    try dispatchText(&session, &replies, "USER kain 0 * :Kain Onyx");
     try std.testing.expect(!session.registered());
     try expectNotContains(replies.written(), " 001 ");
 
@@ -2524,15 +2524,15 @@ test "CAP REQ accepts bare and value-bearing tokens" {
     try std.testing.expect(session.cap.negotiated.contains(.sasl));
 }
 
-test "CAP REQ accepts orochi discovery caps" {
+test "CAP REQ accepts onyx discovery caps" {
     var session = ClientSession.init();
     var storage: [1024]u8 = undefined;
     var replies = ReplyCtx.init(&storage);
 
-    try dispatchText(&session, &replies, "CAP REQ :orochi/topics orochi/e2ee");
-    try expectContains(replies.written(), " CAP * ACK :orochi/topics orochi/e2ee\r\n");
-    try std.testing.expect(session.cap.negotiated.contains(.orochi_topics));
-    try std.testing.expect(session.cap.negotiated.contains(.orochi_e2ee));
+    try dispatchText(&session, &replies, "CAP REQ :onyx/topics onyx/e2ee");
+    try expectContains(replies.written(), " CAP * ACK :onyx/topics onyx/e2ee\r\n");
+    try std.testing.expect(session.cap.negotiated.contains(.onyx_topics));
+    try std.testing.expect(session.cap.negotiated.contains(.onyx_e2ee));
 }
 
 test "CAP REQ accepts SASL EXTERNAL value when available" {
@@ -2910,7 +2910,7 @@ test "PING with origin still answers PONG (no 409)" {
     var replies = ReplyCtx.init(&storage);
 
     try dispatchText(&session, &replies, "PING :tok");
-    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
+    try expectContains(replies.written(), "PONG onyx.local :tok\r\n");
     try expectNotContains(replies.written(), " 409 ");
 }
 
@@ -2944,7 +2944,7 @@ test "labeled single-line reply echoes @label on the one line" {
     try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
     // Single line: tagged directly (no BATCH wrapper).
     try expectContains(replies.written(), "@label=ping-1 ");
-    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
+    try expectContains(replies.written(), "PONG onyx.local :tok\r\n");
     try expectNotContains(replies.written(), "BATCH");
 }
 
@@ -2958,7 +2958,7 @@ test "labeled multi-line reply is wrapped in a labeled-response BATCH" {
     // burst under one label -> BATCH framing.
     try dispatchText(&session, &replies, "NICK kain");
     replies.clear();
-    try dispatchText(&session, &replies, "@label=reg-1 USER kain 0 * :Kain Orochi");
+    try dispatchText(&session, &replies, "@label=reg-1 USER kain 0 * :Kain Onyx");
     try std.testing.expect(session.registered());
 
     const out = replies.written();
@@ -2987,7 +2987,7 @@ test "label is ignored when the labeled-response cap is not negotiated" {
 
     try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
     try expectNotContains(replies.written(), "@label=");
-    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
+    try expectContains(replies.written(), "PONG onyx.local :tok\r\n");
 }
 
 const TestExternalChecker = struct {

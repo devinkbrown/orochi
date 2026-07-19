@@ -1,12 +1,12 @@
 {
   "//": "BoGo -shim-config for tools/bogo_shim.zig (roadmap 0.3). This is the",
-  "//_": "orochi-side integration surface for BoringSSL's ssl/test/runner, which",
+  "//_": "onyx-side integration surface for BoringSSL's ssl/test/runner, which",
   "//__": "is an OUT-OF-REPO harness: `tools/bogo.sh` pins a BoringSSL checkout and",
   "//___": "runs `go test` in ssl/test/runner with `-shim-config` pointed here.",
-  "//____": "DisabledTests encodes orochi's modern-only posture (families the shim",
+  "//____": "DisabledTests encodes onyx's modern-only posture (families the shim",
   "//_____": "intentionally does not implement ⇒ it exits 89, and -allow-unimplemented",
   "//______": "skips them). ErrorMap maps BoringSSL error constants to substrings of",
-  "//_______": "the orochi error names the shim prints to stderr. Both are the",
+  "//_______": "the onyx error names the shim prints to stderr. Both are the",
   "//________": "long-tail iteration surface — refine against the pinned revision.",
 
   "DisabledTests": {
@@ -34,7 +34,7 @@
 
   "//_________": "ErrorMap values are string ARRAYS as of BoringSSL's current runner",
   "//__________": "(ShimConfiguration.ErrorMap is map[string][]string); each expected",
-  "//___________": "BoringSSL error maps to the set of orochi error-name substrings.",
+  "//___________": "BoringSSL error maps to the set of onyx error-name substrings.",
   "ErrorMap": {
     ":UNEXPECTED_MESSAGE:": ["BadHandshake"],
     ":DECODE_ERROR:": ["DecodeError"],

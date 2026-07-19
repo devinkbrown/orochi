@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bot account registry and announcement gating for the Orochi IRC daemon.
+//! Bot account registry and announcement gating for the Onyx Server IRC daemon.
 //!
 //! Tracks which accounts are recognized bots, whether they are permitted to
 //! publish announcements, the scope of those announcements, and enforces a

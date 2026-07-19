@@ -86,8 +86,14 @@ After the basic setup, define connection classes under `[class.<name>]` to contr
 
 ## Production next steps
 
-- Use `zig build package --prefix /tmp/orochi-stage` to stage a ReleaseFast daemon,
-  reference config, and systemd unit.
+- Use `zig build package --prefix /tmp/onyx-server-stage` to stage a ReleaseFast
+  **`onyx-server`** binary, reference config, and systemd unit (the unit includes
+  `ExecStartPre=… --check-config …`).
+- For a public node: [Production TLS card](tls.md#production-tls-card) (DNS, ACME,
+  `ws_plain = false`) — also summarized in [`packaging/README.md`](../../packaging/README.md).
+- There is no prebuilt GitHub Release yet; the honest self-host path is still
+  build-from-source (`packaging/release.sh` or `zig build package`). Do not market
+  wall-clock "60 second install" until a published artifact is stopwatched.
 - Read the [runbook](../RUNBOOK.md) before deploying or hot-upgrading a live node.
 - Read [testing.md](testing.md) for the focused roadmap gates and long-run verbose
   assurance lanes.

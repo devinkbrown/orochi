@@ -10,16 +10,16 @@ mandatory contract; this document is the routing map.
 |---|---|---|---|
 | parent/orchestrator | integration decisions and Git | every task | assigns exact file owners and validates evidence |
 | `zig-coder` | assigned Zig leaf files | bounded implementation outside `server.zig` | focused tests and API seam to integrator |
-| `orochi-session` | session, migration, replica, and Helix leaf files | reusable-session work | exact live-call-site requirements to integrator |
-| `orochi-server-integrator` | assigned live daemon files; sole `server.zig` owner | leaf APIs are ready | live-path tests and unresolved leaf defects |
-| `orochi-dst` | tests and test-local scaffolding | fault or topology proof | reproducible seed/counterexample; no production fix |
-| `orochi-reviewer` | nothing | fresh adversarial gate | file:line finding or pass |
-| `orochi-release-gate` | build caches/artifacts only | writers stop | commands, exit codes, counts, hashes, and failures |
-| `orochi-deploy` | authorized runtime/config state only | verified release commit | both-node deployment and live evidence |
-| `orochi-docs` | documentation only | live acceptance passes | source/deployed truth for every changed claim |
-| `orochi-agent-architect` | nothing | toolkit audit only | evidence-backed roster change proposal |
+| `onyx-session` | session, migration, replica, and Helix leaf files | reusable-session work | exact live-call-site requirements to integrator |
+| `onyx-server-integrator` | assigned live daemon files; sole `server.zig` owner | leaf APIs are ready | live-path tests and unresolved leaf defects |
+| `onyx-server-dst` | tests and test-local scaffolding | fault or topology proof | reproducible seed/counterexample; no production fix |
+| `onyx-reviewer` | nothing | fresh adversarial gate | file:line finding or pass |
+| `onyx-release-gate` | build caches/artifacts only | writers stop | commands, exit codes, counts, hashes, and failures |
+| `onyx-server-deploy` | authorized runtime/config state only | verified release commit | both-node deployment and live evidence |
+| `onyx-docs` | documentation only | live acceptance passes | source/deployed truth for every changed claim |
+| `onyx-agent-architect` | nothing | toolkit audit only | evidence-backed roster change proposal |
 
-The `orochi-server-integrator` restriction is permanent role authority, not a
+The `onyx-server-integrator` restriction is permanent role authority, not a
 rotating lock. Every other role must hand required `server.zig` edits and tests
 to that integrator.
 
@@ -33,14 +33,14 @@ slot into release-gate, deploy, and docs at those handoffs.
 
 | Skill | Use |
 |---|---|
-| `orochi-roadmap-execution` | recover context, audit source, and select a coherent roadmap slice |
-| `orochi-session-mesh` | tokens, resume, migration, multi-attachment, replica, and Helix session state |
-| `orochi-message-spine` | Event Spine and MESSAGE_V2 authorship, exact-once relay, retention, and replay |
-| `orochi-server-integration` | transactional live-daemon wiring and lifecycle coverage |
-| `orochi-zig-verification` | focused gates, ReleaseSafe, OOM sweeps, topology, and release evidence |
-| `orochi-cross-model-review` | grounded, bounded, read-only Claude review |
-| `orochi-release-deploy` | ordered clean release, two-node hard restart, acceptance, docs, and push |
-| `orochi-agent-toolkit` | agent/skill/model/tooling evolution |
+| `onyx-server-roadmap-execution` | recover context, audit source, and select a coherent roadmap slice |
+| `onyx-session-mesh` | tokens, resume, migration, multi-attachment, replica, and Helix session state |
+| `onyx-message-spine` | Event Spine and MESSAGE_V2 authorship, exact-once relay, retention, and replay |
+| `onyx-server-integration` | transactional live-daemon wiring and lifecycle coverage |
+| `onyx-server-zig-verification` | focused gates, ReleaseSafe, OOM sweeps, topology, and release evidence |
+| `onyx-server-cross-model-review` | grounded, bounded, read-only Claude review |
+| `onyx-server-release-deploy` | ordered clean release, two-node hard restart, acceptance, docs, and push |
+| `onyx-server-agent-toolkit` | agent/skill/model/tooling evolution |
 
 Skills are canonical under `.agents/skills`. `.claude/skills` exposes the same
 tree, so a procedure is not copied into two model-specific prompts.
@@ -53,8 +53,8 @@ documentation; use xhigh for session, integration, DST, review, deployment, and
 toolkit architecture.
 
 Claude source implementation agents use Sonnet/high. Deterministic release
-evidence (`orochi-release-gate`) and post-acceptance documentation
-(`orochi-docs`) use Sonnet/medium. The structured review launcher overrides
+evidence (`onyx-release-gate`) and post-acceptance documentation
+(`onyx-docs`) use Sonnet/medium. The structured review launcher overrides
 review routing by lane:
 
 - `fast`: Haiku/low for small mechanical or codec consistency checks;
@@ -69,12 +69,12 @@ launcher even if a caller supplies their name.
 Validate the whole toolkit after any definition or skill change:
 
 ```sh
-.agents/skills/orochi-agent-toolkit/scripts/validate_toolkit.py
+.agents/skills/onyx-server-agent-toolkit/scripts/validate_toolkit.py
 PYTHONDONTWRITEBYTECODE=1 python3 \
-  .agents/skills/orochi-agent-toolkit/scripts/test_validate_toolkit.py
+  .agents/skills/onyx-server-agent-toolkit/scripts/test_validate_toolkit.py
 PYTHONDONTWRITEBYTECODE=1 python3 \
-  .agents/skills/orochi-agent-toolkit/scripts/test_claude_review_stub.py
-.agents/skills/orochi-agent-toolkit/scripts/test_claude_review.sh
+  .agents/skills/onyx-server-agent-toolkit/scripts/test_claude_review_stub.py
+.agents/skills/onyx-server-agent-toolkit/scripts/test_claude_review.sh
 bash -n tools/claude-review.sh
 git diff --check
 ```
@@ -82,10 +82,10 @@ git diff --check
 Select conservative gates for changed paths, including untracked files:
 
 ```sh
-.agents/skills/orochi-zig-verification/scripts/select-gates.py
-.agents/skills/orochi-zig-verification/scripts/select-gates.py --release
+.agents/skills/onyx-server-zig-verification/scripts/select-gates.py
+.agents/skills/onyx-server-zig-verification/scripts/select-gates.py --release
 PYTHONDONTWRITEBYTECODE=1 python3 \
-  .agents/skills/orochi-zig-verification/scripts/test_select_gates.py
+  .agents/skills/onyx-server-zig-verification/scripts/test_select_gates.py
 ```
 
 Run a bounded external review only after the scope stops changing:

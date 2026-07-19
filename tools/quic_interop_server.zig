@@ -3,7 +3,7 @@
 
 //! Standalone QUIC/HTTP3 interop test server.
 //!
-//! Stands up the real Orochi `WebTransportListener` (the same from-scratch QUIC
+//! Stands up the real Onyx Server `WebTransportListener` (the same from-scratch QUIC
 //! + TLS-1.3-over-QUIC + HTTP/3 stack the daemon uses) on an ephemeral UDP port
 //! with a freshly-minted self-signed certificate, then blocks forever. It is
 //! driven by `tools/quic_interop.sh`, which runs a real third-party HTTP/3
@@ -19,11 +19,11 @@
 //!   * Runs until killed (SIGTERM/SIGKILL).
 
 const std = @import("std");
-const orochi = @import("orochi");
+const onyx_server = @import("onyx_server");
 
-const WebTransportListener = orochi.daemon.webtransport_listener.WebTransportListener;
-const any_be = orochi.daemon.webtransport_listener.any_be;
-const x509_selfsign = orochi.proto.x509_selfsign;
+const WebTransportListener = onyx_server.daemon.webtransport_listener.WebTransportListener;
+const any_be = onyx_server.daemon.webtransport_listener.any_be;
+const x509_selfsign = onyx_server.proto.x509_selfsign;
 
 const Ed25519 = std.crypto.sign.Ed25519;
 

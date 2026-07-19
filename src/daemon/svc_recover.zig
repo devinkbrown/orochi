@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Account nick RECOVER / RELEASE decision logic for the Orochi IRC daemon.
+//! Account nick RECOVER / RELEASE decision logic for the Onyx Server IRC daemon.
 //!
-//! Orochi services are REAL server commands, NEVER pseudo-clients. There is no
+//! Onyx Server services are REAL server commands, NEVER pseudo-clients. There is no
 //! NickServ. An account owner issues RECOVER or RELEASE as first-class server
 //! commands and the daemon answers with numerics. This module is the PURE state
 //! machine that decides what the daemon should *do* in response — it performs no

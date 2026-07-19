@@ -1,6 +1,6 @@
 ---
-name: orochi-reviewer
-description: Fresh read-only adversarial reviewer for a bounded Orochi domain lens supplied by the parent.
+name: onyx-reviewer
+description: Fresh read-only adversarial reviewer for a bounded Onyx Server domain lens supplied by the parent.
 tools: Read
 model: claude-sonnet-5
 effort: high

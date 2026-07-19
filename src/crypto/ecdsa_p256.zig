@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! ECDSA over NIST P-256 with SHA-256 for Orochi's TLS and X.509 surfaces.
+//! ECDSA over NIST P-256 with SHA-256 for Onyx Server's TLS and X.509 surfaces.
 //!
 //! This module wraps Zig 0.16's `std.crypto.sign.ecdsa.EcdsaP256Sha256`,
 //! exposing the curve that TLS 1.2/1.3 ECDHE_ECDSA cipher suites and ECDSA
@@ -206,7 +206,7 @@ const testing = std.testing;
 test "sign then verify round-trips to true" {
     // Arrange
     const kp = KeyPair.generate(testing.io);
-    const msg = "orochi ecdsa p256 message";
+    const msg = "onyx ecdsa p256 message";
 
     // Act
     const sig = try sign(msg, kp);
@@ -219,7 +219,7 @@ test "sign then verify round-trips to true" {
 test "verifyPrehashed agrees with verify over the same message" {
     // Arrange
     const kp = KeyPair.generate(testing.io);
-    const msg = "orochi dtls 1.2 certificateverify transcript";
+    const msg = "onyx dtls 1.2 certificateverify transcript";
     const sig = try sign(msg, kp);
     var digest: [prehash_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});

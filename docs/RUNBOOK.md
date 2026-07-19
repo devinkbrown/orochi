@@ -12,10 +12,10 @@ Onyx Server runs as a long-lived network daemon with:
 - a config file passed as `argv[1]`;
 - a systemd unit source at `etc/systemd/onyx-server.service`, packaged to
   `lib/systemd/system/onyx-server.service` and normally installed as
-  `/etc/systemd/system/orochi.service`;
-- state under `/var/lib/orochi` in the packaged unit;
+  `/etc/systemd/system/onyx-server.service`;
+- state under `/var/lib/onyx-server` in the packaged unit;
 - ReleaseFast production binaries from `zig build release` or `zig build package`;
-- session-preserving reload via SIGUSR2/Helix, exposed as `systemctl reload orochi`.
+- session-preserving reload via SIGUSR2/Helix, exposed as `systemctl reload onyx-server`.
 
 Cold restart is the fallback path and drops sessions. Reload is the normal upgrade path.
 Cold restart is also **not crash-durable for the MESSAGE_V2 custody plane** and can lose an
@@ -29,16 +29,16 @@ zig build check
 zig build test-smoke --summary all
 zig build test-roadmap --summary all
 zig build test-smoke -Doptimize=ReleaseSafe --summary all
-zig build package --prefix /tmp/orochi-stage
+zig build package --prefix /tmp/onyx-server-stage
 ```
 
 The package step stages:
 
 | Path | Contents |
 |---|---|
-| `/tmp/orochi-stage/bin/onyx-server` | ReleaseFast stripped daemon |
-| `/tmp/orochi-stage/etc/onyx-server/onyx-server.reference.toml` | Annotated reference config |
-| `/tmp/orochi-stage/lib/systemd/system/onyx-server.service` | systemd service unit |
+| `/tmp/onyx-server-stage/bin/onyx-server` | ReleaseFast stripped daemon |
+| `/tmp/onyx-server-stage/etc/onyx-server/onyx-server.reference.toml` | Annotated reference config |
+| `/tmp/onyx-server-stage/lib/systemd/system/onyx-server.service` | systemd service unit |
 
 For local smoke tests against the debug binary:
 
@@ -50,42 +50,56 @@ python3 tools/upgrade_smoke.py zig-out/bin/onyx-server
 
 ## Pre-Deploy Config Validation
 
-Validate the exact config before staging a reload:
+Validate the exact config before staging a reload (and on every cold start):
 
 ```sh
-zig build run -- --check-config /etc/orochi/orochi.toml
+onyx-server --check-config /etc/onyx-server/onyx-server.toml
+# or from a source tree:
+zig build run -- --check-config /etc/onyx-server/onyx-server.toml
 ```
 
-`--check-config` reads and parses the file, resolves configured `env:` and `@file:`
-string indirection through the CLI resolver, reports `config OK`, and exits without
-binding listeners or dialing mesh peers.
+`--check-config` is a real daemon flag (`src/main.zig`): it reads and parses the
+file, resolves configured `env:` and `@file:` string indirection through the CLI
+resolver, runs mesh cloak / MESSAGE_V2 identity preflight, reports `config OK`,
+and exits without binding listeners or dialing mesh peers. Exit `0` on success,
+`1` on any read/parse/preflight error, `2` on usage.
+
+The packaged unit embeds this as `ExecStartPre` so a bad config **fails the start**
+instead of risking a silent fall-through to the built-in DEFAULT identity. Reload
+(`systemctl reload` / SIGUSR2) does **not** re-run `ExecStartPre`; always run
+`--check-config` yourself before a Helix reload when the config or binary changed.
 
 ## First Install
 
-After `zig build package --prefix /tmp/orochi-stage`, install the staged assets:
+After `zig build package --prefix /tmp/onyx-server-stage`, install the staged assets:
 
 ```sh
-useradd --system --home-dir /var/lib/orochi --shell /usr/sbin/nologin orochi
-install -d -o orochi -g orochi /var/lib/orochi /etc/orochi
-install -m 0640 -o orochi -g orochi /tmp/orochi-stage/etc/onyx-server/onyx-server.reference.toml /etc/orochi/orochi.toml
-install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
-install -m 0644 /tmp/orochi-stage/lib/systemd/system/onyx-server.service /etc/systemd/system/orochi.service
+useradd --system --home-dir /var/lib/onyx-server --shell /usr/sbin/nologin onyx-server
+install -d -o onyx-server -g onyx-server /var/lib/onyx-server /etc/onyx-server
+install -m 0640 -o onyx-server -g onyx-server /tmp/onyx-server-stage/etc/onyx-server/onyx-server.reference.toml /etc/onyx-server/onyx-server.toml
+install -m 0755 /tmp/onyx-server-stage/bin/onyx-server /usr/local/bin/onyx-server
+install -m 0644 /tmp/onyx-server-stage/lib/systemd/system/onyx-server.service /etc/systemd/system/onyx-server.service
+# unit ships ExecStartPre=… --check-config …; preflight before enable:
+/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
 systemctl daemon-reload
-systemctl enable --now orochi
+systemctl enable --now onyx-server
 ```
 
 If all listeners use high ports, remove `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` from the unit.
+
+For a public HTTPS / `wss` node, follow the [Production TLS card](guide/tls.md#production-tls-card)
+before opening the listeners.
 
 ## Hot Upgrade
 
 Use Helix reload for normal production upgrades:
 
 ```sh
-zig build package --prefix /tmp/orochi-stage
-zig build run -- --check-config /etc/orochi/orochi.toml
-install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
-systemctl reload orochi
+zig build package --prefix /tmp/onyx-server-stage
+zig build run -- --check-config /etc/onyx-server/onyx-server.toml
+install -m 0755 /tmp/onyx-server-stage/bin/onyx-server /usr/local/bin/onyx-server
+systemctl reload onyx-server
 ```
 
 `ExecReload=/bin/kill -USR2 $MAINPID` asks the live daemon to re-exec in place. The
@@ -102,8 +116,8 @@ state so remote attachments remain authorized after re-exec.
 Verify after reload:
 
 ```sh
-systemctl status orochi --no-pager
-journalctl -u orochi -n 100 --no-pager
+systemctl status onyx-server --no-pager
+journalctl -u onyx-server -n 100 --no-pager
 ```
 
 Then connect an IRC client or run an out-of-band probe against the configured listener.
@@ -143,7 +157,7 @@ The activation plan requires an explicit `[node].secret_key` or a
 frames, 1..255 valid direct trust roots, and a 2..4096-key full roster containing
 both the local key and every direct root. Direct roots and their compact u64 ids
 must be unique and must not collide with the local identity. For a persisted
-keyfile, derive `public_key` from the already-created `orochi-node.key` identity.
+keyfile, derive `public_key` from the already-created `onyx-server-node.key` identity.
 `--check-config` non-mutatingly reads that existing keyfile and proves the match;
 runtime initialization repeats the binding against the identity it actually
 loaded. A missing, corrupt, or mismatched keyfile rejects preflight. The first
@@ -166,8 +180,8 @@ Before MESSAGE_V2 activation, use cold restart only when changing host-level uni
 constraints, recovering from a bad state, or accepting session loss:
 
 ```sh
-systemctl restart orochi
-systemctl status orochi --no-pager
+systemctl restart onyx-server
+systemctl status onyx-server --no-pager
 ```
 
 Cold restart drops live client sessions and mesh links. Mesh peers should redial through
@@ -178,7 +192,7 @@ Cold restart is **not crash-durable for the MESSAGE_V2 custody plane**. The RVL2
 custody authorities are in-memory and survive only a connection-preserving Helix reload, whose
 checkpoints ride the upgrade capsule across re-exec. A cold restart (or power loss) discards them,
 so an intermediate node that has ACKed upstream but not yet repaired a message downstream can lose
-that message's last custody copy. Prefer `systemctl reload orochi`; hard-restart only from a drained
+that message's last custody copy. Prefer `systemctl reload onyx-server`; hard-restart only from a drained
 node with no outstanding custody obligations. See the
 [cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
 
@@ -187,12 +201,12 @@ node with no outstanding custody obligations. See the
 The generic procedures below apply only before any MESSAGE_V2 member activates.
 After activation, rollback is restricted to a compatible binary that preserves
 the exact active tuple. Keep the previous known-good binary before replacing
-`/usr/local/bin/orochi`:
+`/usr/local/bin/onyx-server`:
 
 ```sh
-install -m 0755 /usr/local/bin/orochi /usr/local/bin/orochi.prev
-install -m 0755 /tmp/orochi-stage/bin/onyx-server /usr/local/bin/orochi
-systemctl reload orochi
+install -m 0755 /usr/local/bin/onyx-server /usr/local/bin/onyx-server.prev
+install -m 0755 /tmp/onyx-server-stage/bin/onyx-server /usr/local/bin/onyx-server
+systemctl reload onyx-server
 ```
 
 If the new image fails after reload and the previous binary exposes the exact
@@ -200,20 +214,20 @@ full Helix capability token required by the running image, a second reload is
 allowed. Multi-shard listener compatibility is necessary but not sufficient:
 
 ```sh
-install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
-systemctl reload orochi
+install -m 0755 /usr/local/bin/onyx-server.prev /usr/local/bin/onyx-server
+systemctl reload onyx-server
 ```
 
 **Compatibility boundary:** never hot-roll back a multi-shard node from Onyx Server 0.5.2
 or newer to a pre-0.5.2 binary. The newer predecessor passes one inherited listener
-fd per shard through `OROCHI_HELIX_LISTEN_FDS`; an older successor only adopts shard
+fd per shard through `ONYX_HELIX_LISTEN_FDS`; an older successor only adopts shard
 0 and leaves the sibling fds open but unserved. Because those fds remain in the
 `SO_REUSEPORT` group, a share of new connections is silently hashed into queues no
 reactor accepts. Use a cold restart for that rollback:
 
 ```sh
-install -m 0755 /usr/local/bin/orochi.prev /usr/local/bin/orochi
-systemctl restart orochi
+install -m 0755 /usr/local/bin/onyx-server.prev /usr/local/bin/onyx-server
+systemctl restart onyx-server
 ```
 
 Use a cold restart as well when the process is already failed, the reload path is
@@ -224,9 +238,9 @@ closes every inherited listener and rebuilds the complete shard set safely.
 
 | Check | Command / Surface | Expected |
 |---|---|---|
-| systemd state | `systemctl status orochi --no-pager` | active running |
-| recent logs | `journalctl -u orochi -n 100 --no-pager` | no repeated panic/restart loop |
-| config parse | `orochi --check-config /etc/orochi/orochi.toml` | `config OK` |
+| systemd state | `systemctl status onyx-server --no-pager` | active running |
+| recent logs | `journalctl -u onyx-server -n 100 --no-pager` | no repeated panic/restart loop |
+| config parse | `onyx-server --check-config /etc/onyx-server/onyx-server.toml` | `config OK` |
 | IRC registration | connect to listener, send `NICK`/`USER` | `001` welcome |
 | PING/PONG | send `PING :token` | `PONG` with token |
 | INFO | `/INFO` | runtime limits, class count, mesh peer count |
@@ -243,7 +257,7 @@ the configured stats directory with nginx or another static file server if neede
 | Symptom | Likely Cause | Action |
 |---|---|---|
 | `--check-config` fails | Bad TOML, missing required fields, invalid range/`@file:` target, or a MESSAGE_V2 activation keyfile that is missing, corrupt, or mismatched | Fix config/identity and rerun `--check-config`; do not reload until clean. |
-| systemd starts then loops | Binary crash or invalid runtime dependency | Check `journalctl -u orochi`; restore previous binary and restart/reload. |
+| systemd starts then loops | Binary crash or invalid runtime dependency | Check `journalctl -u onyx-server`; restore previous binary and restart/reload. |
 | Privileged port bind fails | Unit lacks `CAP_NET_BIND_SERVICE` or port already bound | Add capability lines from unit or move listeners to high ports; inspect `ss -ltnup`. |
 | Reload drops sessions | Helix exact-handoff invariant violation | Stop the rollout, preserve evidence, check logs for `SIGUSR2 UPGRADE failed` or adoption errors, and run `tools/upgrade_smoke.py` locally. Current UPGRADE does not intentionally fall back to listener-only or partial adoption. |
 | Mesh peer absent after reload | Peer link not reattached or redial still pending | Inspect `/INFO`, `/STATS l`, status feed, and `[mesh].connect`; verify peer listener reachability. |

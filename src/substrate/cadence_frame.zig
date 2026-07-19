@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Opcodec media framing layer — container/packetization for Orochi media bands.
+//! Opcodec media framing layer — container/packetization for Onyx Server media bands.
 //!
 //! NOT the audio/video codec itself: this is the wire container that carries
 //! encoded payloads over Undertow mesh "media bands".
@@ -71,7 +71,7 @@ pub const MAC_TAG_BYTES: usize = 16;
 /// Per-stream MAC key size derived from the native stream-id PRF root.
 pub const MAC_KEY_BYTES: usize = 32;
 /// HKDF info/domain label used to derive per-stream native-media MAC keys.
-pub const MAC_KEY_DERIVE_LABEL = "orochi native-media datagram mac v1";
+pub const MAC_KEY_DERIVE_LABEL = "onyx native-media datagram mac v1";
 
 // -- Codec tag ---------------------------------------------------------------
 
@@ -255,7 +255,7 @@ pub fn deriveNativeMediaMacKey(
     out: *[MAC_KEY_BYTES]u8,
 ) void {
     const HmacSha256 = crypto_hash.HmacSha256;
-    var prk = HmacSha256.create("orochi native-media mac extract v1", stream_prf_key);
+    var prk = HmacSha256.create("onyx native-media mac extract v1", stream_prf_key);
     defer std.crypto.secureZero(u8, prk[0..]);
 
     var mac = HmacSha256.init(&prk);

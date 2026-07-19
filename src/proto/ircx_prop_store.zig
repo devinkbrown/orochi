@@ -77,7 +77,7 @@ const prop_checkpoint_header_len: usize = 17;
 const prop_checkpoint_checksum_len: usize = std.crypto.hash.Blake3.digest_length;
 const prop_checkpoint_entity_prefix_len: usize = 1 + 4 + 4;
 const prop_checkpoint_prop_prefix_len: usize = 4 + 4 + 4 + 1 + 1;
-const prop_checkpoint_checksum_domain = "orochi-ircx-prop-store-checkpoint-v1";
+const prop_checkpoint_checksum_domain = "onyx-ircx-prop-store-checkpoint-v1";
 
 pub const EntityKind = enum {
     channel,
@@ -1780,7 +1780,7 @@ test "set get overwrite delete and list properties" {
     var store = DefaultStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const entity = try Entity.fromId("#Orochi");
+    const entity = try Entity.fromId("#OnyxServer");
     const setter = Setter{ .id = "alice", .access = .owner };
 
     const first = try store.setProp(entity, "topic", "first", setter);
@@ -1796,7 +1796,7 @@ test "set get overwrite delete and list properties" {
 
     _ = try store.setProp(entity, "SUBJECT", "zig", setter);
     var out: [4]EntryView = undefined;
-    const listed = try store.listProps(try Entity.fromId("#orochi"), &out);
+    const listed = try store.listProps(try Entity.fromId("#onyx"), &out);
     try std.testing.expectEqual(@as(usize, 2), listed.len);
     try std.testing.expectEqualStrings("SUBJECT", listed[0].key);
     try std.testing.expectEqualStrings("TOPIC", listed[1].key);
@@ -1943,7 +1943,7 @@ test "user profile properties use the profile value limit" {
         .{ .key = "URL", .value = "https://example.test/alice" },
         .{ .key = "GENDER", .value = "nonbinary" },
         .{ .key = "PICTURE", .value = "https://example.test/a.png" },
-        .{ .key = "BIO", .value = "Orochi operator" },
+        .{ .key = "BIO", .value = "Onyx operator" },
         .{ .key = "EMAIL", .value = "alice@example.test" },
     };
 
@@ -1958,7 +1958,7 @@ test "user profile properties use the profile value limit" {
     try std.testing.expectError(error.InvalidValue, store.setProp(entity, "URL", too_long[0..], setter));
 
     // The tighter cap applies only to the newly added user-profile fields.
-    // Existing Orochi profile keys and generic user props retain the store-wide
+    // Existing Onyx Server profile keys and generic user props retain the store-wide
     // value budget.
     _ = try store.setProp(entity, "display", too_long[0..], setter);
     _ = try store.setProp(entity, "custom", too_long[0..], setter);
