@@ -263,16 +263,39 @@ def git(project: Project, *a: str) -> str:
         return ""
 
 
-def module_count(project: Project) -> str:
-    """Count source modules/components for this project, excluding build output."""
+def _shell_count(cmd: str, timeout: float = 3.0) -> str:
+    """Run a count command with a hard timeout so the IRC loop never freezes."""
     try:
-        return subprocess.check_output(["bash", "-lc", project.module_cmd], text=True).strip()
+        out = subprocess.check_output(
+            ["bash", "-lc", cmd],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        ).strip()
+        return out or "?"
     except Exception:
         return "?"
 
 
+def module_count(project: Project) -> str:
+    """Count source modules/components for this project, excluding build output."""
+    return _shell_count(project.module_cmd, timeout=3.0)
+
+
+def loc_count(project: Project) -> str:
+    """LOC estimate — hard-timeout so announce path cannot hang the IRC loop."""
+    out = _shell_count(project.loc_cmd, timeout=3.0)
+    if out == "?":
+        return "?"
+    try:
+        n = int(out)
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+    except ValueError:
+        return out
+
+
 def test_count(project: Project) -> str:
-    """Best-effort '<n> tests' pulled from recent commit messages."""
+    """Best-effort '<n> tests' pulled from recent commit messages (git-only, fast)."""
     body = git(project, "log", "-1", "--format=%s") + " " + git(project, "log", "-1", "--format=%b")
     m = re.search(r"(\d+)\s+tests?\s+(?:pass|green|passing)", body)
     if m:
@@ -281,13 +304,8 @@ def test_count(project: Project) -> str:
         m = re.search(r"(\d+)\s+tests", s)
         if m:
             return m.group(1)
-    if project.test_fallback_cmd:
-        try:
-            return subprocess.check_output(
-                ["bash", "-lc", project.test_fallback_cmd], text=True
-            ).strip() or "?"
-        except Exception:
-            return "?"
+    # Do NOT fall back to a tree-walk test-file count on the announce path —
+    # that blocked the IRC loop (no PING reply → disconnect → outq wiped).
     return "?"
 
 
@@ -315,15 +333,6 @@ def commit_stat(project: Project, rev: str = "HEAD") -> str:
     if dele:
         parts.append(f"{B}{RED}-{dele.group(1)}{RST}")
     return " ".join(parts) if parts else "no file changes"
-
-
-def loc_count(project: Project) -> str:
-    try:
-        out = subprocess.check_output(["bash", "-lc", project.loc_cmd], text=True).strip()
-        n = int(out)
-        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
-    except Exception:
-        return "?"
 
 
 def commit_field(project: Project, fmt: str, rev: str = "HEAD") -> str:
@@ -477,11 +486,15 @@ class Bot:
         if not trusted and topic_change_protected(line):
             log.info("blocked protected topic change: %s", line)
             return
-        log.debug(">> %s", line)
+        # Log channel traffic at INFO so "announcing" is not a silent no-op in the journal.
+        if line.startswith("PRIVMSG ") or line.startswith("NOTICE ") or line.startswith("TOPIC "):
+            log.info(">> %s", line[:200] + ("…" if len(line) > 200 else ""))
+        else:
+            log.debug(">> %s", line)
         try:
             self.sock.sendall((line + "\r\n").encode("utf-8", "replace"))
         except Exception as e:
-            log.debug("send failed: %s", e)
+            log.warning("send failed: %s", e)
 
     def enqueue(self, line: str) -> None:
         self.outq.append(line)
@@ -618,7 +631,12 @@ class Bot:
         return out
 
     def commit_lines(self, p: Project, rev: str, tc: str, with_delta: bool) -> list[str]:
-        """Rich, colorized multi-line announcement for one commit, tagged by project."""
+        """Fast, colorized commit announcement — git-only (no tree-walks).
+
+        Tree-walk module/loc counts used to block this call for minutes while
+        the IRC socket sat unanswered; reconnect then wiped the outq so
+        ``announcing`` never became a visible PRIVMSG.
+        """
         subj = commit_field(p, "%s", rev)
         typ = commit_type(subj)
         accent = TYPE_COLOR.get(typ, CYAN)
@@ -637,10 +655,9 @@ class Bot:
             f"{tag}{WHITE}{clean}{RST}"
             f" {GREY}by{RST} {TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(p, rev)}"
             f" {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}"
-            f" {GREY}{p.module_label}{RST} {B}{CYAN}{module_count(p)}{RST}"
-            f" {GREY}loc{RST} {B}{YEL}{loc_count(p)}{RST} {GREY}#{total}{RST}",
+            f" {GREY}#{total}{RST}",
         ]
-        # Compact changed-files line for focused commits.
+        # Compact changed-files line for focused commits (git show --stat is cheap).
         files = [l.split("|")[0].strip() for l in changed_files(p, rev) if "|" in l]
         if files and len(files) <= 6:
             lines.append(f"{SILVER}[{p.key}] files: {' '.join(files)}{RST}")
@@ -651,9 +668,10 @@ class Bot:
         # clobbering (see send_raw / topic_change_protected); it must not
         # block the bot's own automated status-topic refresh, which is the
         # only topic writer for CHANNEL. Send as trusted.
+        # Keep this git-only + fast — never tree-walk on the IRC hot path.
         segments = [
-            f"{p.topic_label} · {git(p,'rev-parse','--short','HEAD')} · "
-            f"{test_count(p)} tests · {module_count(p)} {p.module_label}"
+            f"{p.topic_label} · {git(p, 'rev-parse', '--short', 'HEAD')} · "
+            f"{test_count(p)} tests"
             for p in PROJECTS
         ]
         self.send_raw(f"TOPIC {CHANNEL} :" + "  ❘  ".join(segments) + "  ❘  !help", trusted=True)
