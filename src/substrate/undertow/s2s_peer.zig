@@ -7692,6 +7692,136 @@ test "a forged frame (attacker key, origin mismatch) is rejected and counted" {
     try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }
 
+test "exploit: Byzantine MEMBERSHIP with spoofed origin_node is rejected (no NAMES entry)" {
+    // CWE-290: a MEMBERSHIP frame whose origin_node is not the link shortId must
+    // never mutate the route table. Assert the REJECT (empty roster + reject
+    // counter), never that a forgery "works".
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    // Plaintext peers with require_signed_frames=false so we exercise the
+    // acceptsDirectOrigin gate (not the signed-frame origin check).
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    // newPeer leaves require_signed_frames at its default (true). For a
+    // non-signing pair that would reject every unsigned in-scope frame; the
+    // origin-spoof test needs the frame to reach applyMembershipPayload.
+    a.config.require_signed_frames = false;
+    b.config.require_signed_frames = false;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xB01);
+
+    // Legitimate membership from A lands.
+    try a.sendMembership(a_to_b.sink(), "#room", "alice", 0, 50, true, .{ .username = "u", .host = "h" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xB02);
+    try std.testing.expectEqual(@as(usize, 1), b.channelMembers("#room").len);
+
+    // Byzantine payload: claims origin_node=99 (not link peer 1), tries to PART
+    // alice and JOIN mallory. Both must be dropped by acceptsDirectOrigin.
+    var ev_buf: [membership_event.max_encoded_len]u8 = undefined;
+    const forged_part = membership_event.MembershipEvent{
+        .present = false,
+        .status = 0,
+        .origin_node = 99,
+        .hlc = 999,
+        .channel = "#room",
+        .nick = "alice",
+    };
+    const part_wire = try membership_event.encode(forged_part, &ev_buf);
+    var fbuf: [2048]u8 = undefined;
+    const part_frame = try s2s_frame.encode(.MEMBERSHIP, part_wire, &fbuf);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try b.feed(part_frame, sink.sink(), tc.now_ms, 1);
+
+    const forged_join = membership_event.MembershipEvent{
+        .present = true,
+        .status = 0b0100,
+        .origin_node = 99,
+        .hlc = 1000,
+        .channel = "#room",
+        .nick = "mallory",
+        .username = "evil",
+        .host = "evil.example",
+    };
+    const join_wire = try membership_event.encode(forged_join, &ev_buf);
+    const join_frame = try s2s_frame.encode(.MEMBERSHIP, join_wire, &fbuf);
+    try b.feed(join_frame, sink.sink(), tc.now_ms, 2);
+
+    // alice still present; mallory never appeared; rejects counted.
+    try std.testing.expectEqual(@as(usize, 1), b.channelMembers("#room").len);
+    try std.testing.expectEqualStrings("alice", b.channelMembers("#room")[0].nick);
+    try std.testing.expect(b.findRemoteMember("mallory") == null);
+    try std.testing.expect(b.takeRejectedOriginFrames() >= 2);
+}
+
+test "exploit: reordered MEMBERSHIP frames over the link converge to the same roster" {
+    // Deliver JOIN/PART/re-JOIN out of HLC order across an established link and
+    // assert the receiver's live roster matches the canonical in-order apply.
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
+    defer b.deinit();
+    a.config.require_signed_frames = false;
+    b.config.require_signed_frames = false;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xC01);
+
+    // Build three MEMBERSHIP frames offline, then feed B in reverse HLC order.
+    const events = [_]membership_event.MembershipEvent{
+        .{ .present = true, .status = 0b0100, .origin_node = 1, .hlc = 10, .channel = "#room", .nick = "alice", .username = "alice", .host = "a.host" },
+        .{ .present = false, .status = 0, .origin_node = 1, .hlc = 20, .channel = "#room", .nick = "alice" },
+        .{ .present = true, .status = 0b0010, .origin_node = 1, .hlc = 30, .channel = "#room", .nick = "alice", .username = "alice", .host = "a.host" },
+    };
+    var frames: [3][]u8 = undefined;
+    var frame_bufs: [3][512]u8 = undefined;
+    var enc_bufs: [3][membership_event.max_encoded_len]u8 = undefined;
+    for (events, 0..) |ev, i| {
+        const inner = try membership_event.encode(ev, &enc_bufs[i]);
+        const wire = try s2s_frame.encode(.MEMBERSHIP, inner, &frame_bufs[i]);
+        frames[i] = try allocator.dupe(u8, wire);
+    }
+    defer for (frames) |f| allocator.free(f);
+
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    // Reverse order: re-JOIN, PART, JOIN — PART tombstone + LWW must converge.
+    try b.feed(frames[2], sink.sink(), tc.now_ms, 1);
+    try b.feed(frames[1], sink.sink(), tc.now_ms, 2);
+    try b.feed(frames[0], sink.sink(), tc.now_ms, 3);
+
+    const members = b.channelMembers("#room");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("alice", members[0].nick);
+    try std.testing.expectEqual(@as(u4, 0b0010), members[0].status);
+    try std.testing.expectEqual(@as(u64, 30), members[0].hlc);
+}
+
 test "a signing peer rejects a non-signing peer by default" {
     // A has no signing key (plaintext-style peer); B has one and requires signed
     // frames, so B rejects A during capability negotiation.

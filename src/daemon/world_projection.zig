@@ -56,8 +56,12 @@ fn containsNick(members: []const Member, nick: []const u8) bool {
 }
 
 /// Merge `local` (already-projected local members) with `remote` mesh members,
-/// dropping any remote whose nick already appears locally. Returns an owned
-/// slice (free with `allocator.free`); strings borrow the inputs.
+/// dropping any remote whose nick already appears locally **or among earlier
+/// remotes**. Multi-link meshes can surface the same nick on more than one
+/// established peer (re-burst fanout / multi-hop echo); without remote-vs-remote
+/// dedup the NAMES projection doubles them and clients desync against the
+/// server's true single-identity roster. Returns an owned slice (free with
+/// `allocator.free`); strings borrow the inputs.
 pub fn mergeMembers(
     allocator: std.mem.Allocator,
     local: []const Member,
@@ -69,7 +73,10 @@ pub fn mergeMembers(
 
     for (local) |m| out.appendAssumeCapacity(m);
     for (remote) |r| {
-        if (containsNick(local, r.nick)) continue;
+        // Dedup against the growing output (locals + already-accepted remotes),
+        // not just the local slice — otherwise two peer links advertising the
+        // same nick both land and NAMES shows a ghost double.
+        if (containsNick(out.items, r.nick)) continue;
         out.appendAssumeCapacity(.{
             .prefixes = r.prefixes,
             .nick = r.nick,
@@ -171,4 +178,46 @@ test "the merged list feeds the NAMES writer end to end" {
         if (std.mem.indexOf(u8, line.bytes, "carol") != null) saw_carol = true;
     }
     try testing.expect(saw_alice and saw_carol);
+}
+
+test "duplicate remote nick across two mesh links is projected once (local+remote+remote dedup)" {
+    // Classic multi-link nicklist desync: peer A and peer B both advertise
+    // "carol" (re-burst / echo). NAMES must show her once — the same identity
+    // the server routes as a single nick, not two ghost rows.
+    const allocator = testing.allocator;
+    const locals = [_]Member{mkLocal("alice", "@")};
+    const remotes = [_]RemoteMember{
+        .{ .nick = "carol", .prefixes = "+", .server_name = "irc2.mesh" },
+        .{ .nick = "Carol", .prefixes = "@", .server_name = "irc3.mesh" }, // case-insensitive dup
+        .{ .nick = "dave", .prefixes = "", .server_name = "irc3.mesh" },
+    };
+    const merged = try mergeMembers(allocator, &locals, &remotes);
+    defer allocator.free(merged);
+    try testing.expectEqual(@as(usize, 3), merged.len);
+    try testing.expectEqualStrings("alice", merged[0].nick);
+    try testing.expectEqualStrings("carol", merged[1].nick); // first remote wins
+    try testing.expectEqualStrings("+", merged[1].prefixes); // not the second link's "@"
+    try testing.expectEqualStrings("dave", merged[2].nick);
+}
+
+test "merged mesh roster remains complete under local+many-remote membership" {
+    // Partial NAMES was the other half of the desync: if the projector drops
+    // remotes once locals fill a fixed cap, each side of the mesh sees a
+    // different subset. mergeMembers itself is unbounded (caller caps); assert
+    // every distinct remote survives the merge so sendNames is the only place
+    // a cap may apply.
+    const allocator = testing.allocator;
+    const locals = [_]Member{ mkLocal("L0", ""), mkLocal("L1", "@") };
+    var remotes: [32]RemoteMember = undefined;
+    var nick_storage: [32][8]u8 = undefined;
+    for (&remotes, 0..) |*r, i| {
+        const nick = try std.fmt.bufPrint(&nick_storage[i], "R{d}", .{i});
+        r.* = .{ .nick = nick, .prefixes = if (i % 2 == 0) "+" else "", .server_name = "peer.mesh" };
+    }
+    const merged = try mergeMembers(allocator, &locals, &remotes);
+    defer allocator.free(merged);
+    try testing.expectEqual(@as(usize, 34), merged.len);
+    // Spot-check first local + last remote still present.
+    try testing.expectEqualStrings("L0", merged[0].nick);
+    try testing.expectEqualStrings("R31", merged[33].nick);
 }

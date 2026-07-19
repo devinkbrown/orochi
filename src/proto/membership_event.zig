@@ -493,3 +493,56 @@ test "decode rejects an over-long identity length prefix" {
     std.mem.writeInt(u16, corrupt[user_len_off..][0..2], max_username_len + 1, .little);
     try testing.expectError(error.NameTooLong, decode(corrupt[0..wire.len]));
 }
+
+// ---------------------------------------------------------------------------
+// exploit: hostile MEMBERSHIP codec — CRLF injection + integer-boundary lengths
+// ---------------------------------------------------------------------------
+
+test "exploit: MEMBERSHIP decode rejects CRLF/NUL/space-smuggled identity fields" {
+    // CWE-93 / CWE-74: a Byzantine peer that injects CR/LF/NUL/space into a
+    // MEMBERSHIP identity field must be rejected at the codec so the daemon
+    // never projects a second IRC command line via NAMES/JOIN/WHOIS.
+    const cases = [_]MembershipEvent{
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c\r", .nick = "n" },
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n\nick" },
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .username = "u ser" },
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .host = "h\x00st" },
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "s\retter" },
+        .{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .account = "a\nccount" },
+    };
+    var buf: [max_encoded_len]u8 = undefined;
+    for (cases) |ev| {
+        // Encode bypasses validateLineField (it only checks lengths). Hand-build
+        // a wire frame with the hostile bytes so decode is the gate under test.
+        const wire = try encode(ev, &buf);
+        // encode succeeds (length-only); decode must reject the control bytes.
+        try testing.expectError(error.NameTooLong, decode(wire));
+    }
+}
+
+test "exploit: MEMBERSHIP decode rejects oversize status and empty required names" {
+    // CWE-20: status is a u4 on the wire; values > 0x0f must not pass into the
+    // route table bitset. Empty channel/nick are also fail-closed.
+    var buf: [max_encoded_len]u8 = undefined;
+    const base = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n" };
+    const wire = try encode(base, &buf);
+    var corrupt: [max_encoded_len]u8 = undefined;
+    @memcpy(corrupt[0..wire.len], wire);
+    corrupt[1] = 0x10; // status byte > 0x0f
+    try testing.expectError(error.NameTooLong, decode(corrupt[0..wire.len]));
+
+    // Hand-built frame: valid fixed prefix + "#c" + empty nick + empty identity.
+    // Layout after fixed_prefix: chan_len u16, chan, nick_len u16, nick,
+    // username_len, realname_len, host_len (all little-endian).
+    var empty_nick_frame: [fixed_prefix + 2 + 2 + 2 + 2 + 2 + 2]u8 = undefined;
+    @memset(&empty_nick_frame, 0);
+    empty_nick_frame[0] = 1; // present
+    empty_nick_frame[1] = 0; // status
+    std.mem.writeInt(u64, empty_nick_frame[2..][0..8], 1, .little); // origin
+    std.mem.writeInt(u64, empty_nick_frame[10..][0..8], 1, .little); // hlc
+    std.mem.writeInt(u16, empty_nick_frame[fixed_prefix..][0..2], 2, .little);
+    empty_nick_frame[fixed_prefix + 2] = '#';
+    empty_nick_frame[fixed_prefix + 3] = 'c';
+    // nick_len = 0, username/realname/host lens already 0 from memset.
+    try testing.expectError(error.NameTooLong, decode(&empty_nick_frame));
+}

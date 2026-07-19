@@ -122,6 +122,31 @@ pub fn writeNamesReplies(
     return writeNamesRepliesWith(.{}, out, server_name, requester_nick, channel, channel_status, members, caps, sink);
 }
 
+/// Write only folded RPL_NAMREPLY (353) lines — no trailing 366. Returns the
+/// number of bytes of `out` consumed. Callers that must stream a large roster
+/// across multiple output buffers (mesh NAMES can exceed a single
+/// `default_reply_bytes` arena under userhost-in-names) use this per chunk,
+/// then finish with `buildEndOfNamesLine` exactly once.
+///
+/// Members that fail wire validation or whose token cannot fit a single 353
+/// line are **skipped** rather than aborting the whole list: one hostile or
+/// malformed remote host must never collapse NAMES to a bare 366 (the
+/// late-partial / empty-roster desync). Capacity errors (`OutputTooSmall`,
+/// `TooManyRecipients`) still surface so the caller can shrink the chunk and
+/// retry.
+pub fn writeNamReplyLines(
+    out: []u8,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    channel: []const u8,
+    channel_status: u8,
+    members: []const Member,
+    caps: RequesterCaps,
+    sink: *NamesLineSink,
+) NamesReplyError!usize {
+    return writeNamReplyLinesWith(.{}, out, server_name, requester_nick, channel, channel_status, members, caps, sink);
+}
+
 /// Write NAMES replies using caller-selected compile-time limits. `channel_status`
 /// is the 353 visibility symbol: '=' public, '@' secret (+s), '*' private (+p).
 pub fn writeNamesRepliesWith(
@@ -135,6 +160,31 @@ pub fn writeNamesRepliesWith(
     caps: RequesterCaps,
     sink: *NamesLineSink,
 ) NamesReplyError!void {
+    const used = try writeNamReplyLinesWith(params, out, server_name, requester_nick, channel, channel_status, members, caps, sink);
+    const end_line = try buildEndOfNamesLineWith(
+        params,
+        out[used..],
+        server_name,
+        requester_nick,
+        channel,
+        default_end_text,
+    );
+    try sink.append(end_line);
+}
+
+/// 353-only writer (see `writeNamReplyLines`). Compile-time limits variant.
+/// Returns bytes of `out` consumed by the emitted 353 lines.
+pub fn writeNamReplyLinesWith(
+    comptime params: Params,
+    out: []u8,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    channel: []const u8,
+    channel_status: u8,
+    members: []const Member,
+    caps: RequesterCaps,
+    sink: *NamesLineSink,
+) NamesReplyError!usize {
     try validateServerNameWith(params, server_name);
     try validateNickWith(params, requester_nick);
     try validateChannelWith(params, channel);
@@ -149,10 +199,12 @@ pub fn writeNamesRepliesWith(
     var line_open = false;
 
     for (members) |member| {
-        try validateMemberWith(params, member);
-
+        // Skip a single bad/overlong token rather than failing the whole NAMES
+        // burst (one mesh peer advertising a hostile host used to empty the
+        // roster for every local client — 366-only, permanent nicklist desync).
+        validateMemberWith(params, member) catch continue;
         const token_len = memberTokenLen(member, caps);
-        if (header_len + token_len > params.max_line_bytes) return error.TokenTooLong;
+        if (header_len + token_len > params.max_line_bytes) continue;
 
         if (!line_open) {
             line_start = n;
@@ -181,17 +233,7 @@ pub fn writeNamesRepliesWith(
     if (line_open) {
         try sink.append(out[line_start .. line_start + line_len]);
     }
-
-    const end_start = n;
-    const end_line = try buildEndOfNamesLineWith(
-        params,
-        out[n..],
-        server_name,
-        requester_nick,
-        channel,
-        default_end_text,
-    );
-    try sink.append(out[end_start .. end_start + end_line.len]);
+    return n;
 }
 
 /// Build one member token as it appears in the trailing NAMES list.
@@ -569,28 +611,75 @@ test "output and line sink capacity errors are reported" {
     );
 }
 
-test "token too long for configured line size is rejected before overflow" {
+test "token too long for configured line size is skipped rather than aborting NAMES" {
+    // A single overlong token must not collapse the whole roster to a bare 366
+    // (mesh nicklist desync: one bad remote host → empty NAMES). The overlong
+    // member is dropped; the valid peer still appears; 366 still closes.
+    //
+    // max_line_bytes=50 fits the 366 terminator (~48) and bob's userhost token
+    // (header 32 + "bob!bobu@b.example" 18 = 50) but NOT alice's multi-prefix
+    // userhost token (header 32 + "@+alice!aliceu@a.example" 24 = 56).
     const members = [_]Member{
         .{ .prefixes = "@+", .nick = "alice", .user = "aliceu", .host = "a.example" },
+        .{ .prefixes = "", .nick = "bob", .user = "bobu", .host = "b.example" },
     };
     var out: [128]u8 = undefined;
     var line_storage: [2]NamesLine = undefined;
     var sink = NamesLineSink{ .lines = &line_storage };
 
-    try std.testing.expectError(
-        error.TokenTooLong,
-        writeNamesRepliesWith(
-            .{ .max_line_bytes = 37 },
-            &out,
-            "irc.example",
-            "guest",
-            "#test",
-            '=',
-            &members,
-            .{ .multi_prefix = true },
-            &sink,
-        ),
+    try writeNamesRepliesWith(
+        .{ .max_line_bytes = 50 },
+        &out,
+        "irc.example",
+        "guest",
+        "#test",
+        '=',
+        &members,
+        .{ .multi_prefix = true, .userhost_in_names = true },
+        &sink,
     );
+    const lines = sink.slice();
+    try std.testing.expectEqual(@as(usize, 2), lines.len); // one 353 + 366
+    try std.testing.expect(std.mem.indexOf(u8, lines[0].bytes, "alice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0].bytes, "bob") != null);
+    try std.testing.expectEqualStrings(":irc.example 366 guest #test :End of /NAMES list", lines[1].bytes);
+}
+
+test "a single malformed remote host is skipped so the rest of NAMES still lands" {
+    // Mesh regression: one remote member with a host that fails wire validation
+    // used to abort writeNamesReplies entirely; sendNames then emitted only 366
+    // and both sides of the mesh saw an empty nicklist until the next re-NAMES.
+    const members = [_]Member{
+        .{ .prefixes = "@", .nick = "alice", .user = "aliceu", .host = "a.example" },
+        .{ .prefixes = "", .nick = "evil", .user = "u", .host = "bad host" }, // space = InvalidHost
+        .{ .prefixes = "+", .nick = "carol", .user = "carolu", .host = "c.example" },
+    };
+    var out: [256]u8 = undefined;
+    var line_storage: [2]NamesLine = undefined;
+    var sink = NamesLineSink{ .lines = &line_storage };
+    try writeNamesReplies(&out, "irc.example", "guest", "#mesh", '=', &members, .{}, &sink);
+    const lines = sink.slice();
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0].bytes, "alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0].bytes, "carol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0].bytes, "evil") == null);
+    try std.testing.expectEqualStrings(":irc.example 366 guest #mesh :End of /NAMES list", lines[1].bytes);
+}
+
+test "writeNamReplyLines streams 353s without a trailing 366 so callers can chunk" {
+    const members = [_]Member{
+        .{ .prefixes = "@", .nick = "alice", .user = "u", .host = "h" },
+        .{ .prefixes = "", .nick = "bob", .user = "u", .host = "h" },
+    };
+    var out: [128]u8 = undefined;
+    var line_storage: [2]NamesLine = undefined;
+    var sink = NamesLineSink{ .lines = &line_storage };
+    const used = try writeNamReplyLines(&out, "irc.example", "guest", "#chat", '=', &members, .{}, &sink);
+    try std.testing.expect(used > 0);
+    try std.testing.expectEqual(@as(usize, 1), sink.slice().len);
+    try std.testing.expect(std.mem.startsWith(u8, sink.slice()[0].bytes, ":irc.example 353 "));
+    // No 366 — caller appends it once after every chunk.
+    try std.testing.expect(std.mem.indexOf(u8, sink.slice()[0].bytes, "366") == null);
 }
 
 test "invalid attacker controlled bytes are rejected" {
@@ -606,4 +695,125 @@ test "invalid attacker controlled bytes are rejected" {
         error.InvalidChannel,
         buildEndOfNamesLine(&buf, "irc.example", "guest", "not-channel", default_end_text),
     );
+}
+
+// ---------------------------------------------------------------------------
+// exploit: hostile NAMES — partial 353 + CRLF injection fail-closed
+// ---------------------------------------------------------------------------
+
+test "exploit: NAMES rejects CRLF/NUL-smuggled member fields (no wire injection)" {
+    // CWE-93: a hostile remote membership identity that reached the NAMES
+    // builder must never split an outbound 353 into a second command line.
+    // Validators still fail-closed at the field API; the writer SKIPS a bad
+    // member (so one hostile host cannot empty the whole roster) and never
+    // copies its bytes onto the wire. A pure-hostile list therefore yields
+    // only the terminating 366 — no smuggled 353 payload.
+    const cases = [_]struct { member: Member, err: NamesReplyError }{
+        .{ .member = .{ .prefixes = "", .nick = "al\rice", .user = "u", .host = "h.example" }, .err = error.InvalidNick },
+        .{ .member = .{ .prefixes = "", .nick = "alice", .user = "u\nX", .host = "h.example" }, .err = error.InvalidUser },
+        .{ .member = .{ .prefixes = "", .nick = "alice", .user = "u", .host = "h\x00.example" }, .err = error.InvalidHost },
+        .{ .member = .{ .prefixes = "@\n", .nick = "alice", .user = "u", .host = "h.example" }, .err = error.InvalidPrefix },
+    };
+    var out: [256]u8 = undefined;
+    var line_storage: [4]NamesLine = undefined;
+    for (cases) |case| {
+        // Field validators still reject (callers that want hard-fail use them).
+        try std.testing.expectError(case.err, validateMember(case.member));
+
+        var sink = NamesLineSink{ .lines = &line_storage };
+        const members = [_]Member{
+            case.member,
+            .{ .prefixes = "", .nick = "safe", .user = "u", .host = "h.example" },
+        };
+        try writeNamesReplies(&out, "irc.example", "guest", "#test", '=', &members, .{}, &sink);
+        const lines = sink.slice();
+        try std.testing.expect(lines.len >= 1);
+        // Hostile payload never appears; the safe peer still does; no CRLF/NUL.
+        for (lines) |line| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, line.bytes, '\r') == null);
+            try std.testing.expect(std.mem.indexOfScalar(u8, line.bytes, '\n') == null);
+            try std.testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0) == null);
+            try std.testing.expect(std.mem.indexOf(u8, line.bytes, "al\rice") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line.bytes, "u\nX") == null);
+        }
+        // Safe member survived the skip.
+        var saw_safe = false;
+        for (lines) |line| {
+            if (std.mem.indexOf(u8, line.bytes, "safe") != null) saw_safe = true;
+        }
+        try std.testing.expect(saw_safe);
+        try std.testing.expect(std.mem.indexOf(u8, lines[lines.len - 1].bytes, " 366 ") != null);
+    }
+}
+
+test "exploit: partial 353 fold always terminates with exactly one 366 (or errors fail-closed)" {
+    // Multi-line NAMES (partial 353s) must never strand a client without
+    // RPL_ENDOFNAMES, and must never emit a second 366. Sink exhaustion mid-list
+    // returns an error so the daemon can close with a clean 366 alone.
+    const members = [_]Member{
+        .{ .prefixes = "@+", .nick = "alice", .user = "aliceu", .host = "a.example" },
+        .{ .prefixes = "+", .nick = "bob", .user = "bobu", .host = "b.example" },
+        .{ .prefixes = "", .nick = "carol", .user = "carolu", .host = "c.example" },
+        .{ .prefixes = "", .nick = "dave", .user = "daveu", .host = "d.example" },
+    };
+
+    // Happy path: tight line budget forces multiple 353s + one 366.
+    {
+        var out: [512]u8 = undefined;
+        var line_storage: [8]NamesLine = undefined;
+        var sink = NamesLineSink{ .lines = &line_storage };
+        try writeNamesRepliesWith(
+            .{ .max_line_bytes = 64 },
+            &out,
+            "irc.example",
+            "guest",
+            "#test",
+            '=',
+            &members,
+            .{ .multi_prefix = true, .userhost_in_names = true },
+            &sink,
+        );
+        const lines = sink.slice();
+        try std.testing.expect(lines.len >= 2);
+        var namreply: usize = 0;
+        var endofnames: usize = 0;
+        for (lines) |line| {
+            if (std.mem.indexOf(u8, line.bytes, " 353 ") != null) namreply += 1;
+            if (std.mem.indexOf(u8, line.bytes, " 366 ") != null) endofnames += 1;
+            // No CRLF inside a stored line (terminator is applied by the caller).
+            try std.testing.expect(std.mem.indexOfScalar(u8, line.bytes, '\r') == null);
+            try std.testing.expect(std.mem.indexOfScalar(u8, line.bytes, '\n') == null);
+        }
+        try std.testing.expect(namreply >= 1);
+        try std.testing.expectEqual(@as(usize, 1), endofnames);
+        // 366 is always last.
+        try std.testing.expect(std.mem.indexOf(u8, lines[lines.len - 1].bytes, " 366 ") != null);
+    }
+
+    // Sink too small for the full fold: error, and the caller must discard any
+    // partial 353s already staged (sendNames shrinks the chunk and retries).
+    {
+        var out: [512]u8 = undefined;
+        var line_storage: [1]NamesLine = undefined; // cannot hold 353+366
+        var sink = NamesLineSink{ .lines = &line_storage };
+        try std.testing.expectError(
+            error.TooManyRecipients,
+            writeNamesRepliesWith(
+                .{ .max_line_bytes = 64 },
+                &out,
+                "irc.example",
+                "guest",
+                "#test",
+                '=',
+                &members,
+                .{ .userhost_in_names = true },
+                &sink,
+            ),
+        );
+        // Contract: on error the sink is incomplete — never treat it as a finished
+        // NAMES. (It may hold a partial 353; it must not hold a lone complete list.)
+        for (sink.slice()) |line| {
+            try std.testing.expect(std.mem.indexOf(u8, line.bytes, " 366 ") == null);
+        }
+    }
 }

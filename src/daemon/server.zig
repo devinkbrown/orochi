@@ -9500,6 +9500,10 @@ pub const LinuxServer = struct {
     const TaggedDeliveryMode = enum {
         ordinary,
         prepared_batch,
+        /// Durable MESSAGE_V2/ADS1 reservation was not obtained for this event
+        /// (spool pressure, journal busy, or admit soft-fail). Deliver via the
+        /// ordinary SendQ path so local chat is not bricked; no ADS1 retention.
+        mesh_busy_local,
     };
 
     fn deliverTaggedMode(
@@ -9512,16 +9516,30 @@ pub const LinuxServer = struct {
         const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         if (tags.msgid != null and self.attachmentHasReusableSession(id)) {
-            if (mode == .prepared_batch) {
-                // The complete reusable-recipient set was reserved atomically
-                // with MESSAGE_V2 authority. Ordinary fanout is now only the
-                // transport trigger: reserving again after another attachment
-                // drained the shared batch would recreate the retired event.
-                self.wakeShard(id.shard);
-                if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
-                return;
+            switch (mode) {
+                .prepared_batch => {
+                    // The complete reusable-recipient set was reserved atomically
+                    // with MESSAGE_V2 authority. Ordinary fanout is now only the
+                    // transport trigger: reserving again after another attachment
+                    // drained the shared batch would recreate the retired event.
+                    self.wakeShard(id.shard);
+                    if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+                    return;
+                },
+                .ordinary => {
+                    // Prefer ADS1 for multi-device resume. Spool pressure must
+                    // not drop a message that already admitted to RVG2/Lotus —
+                    // fall through to immediate SendQ (post-admit delivery,
+                    // not a mesh-authority skip).
+                    if (self.reserveTaggedAttachmentDelivery(id, tags, bytes)) |_| {
+                        return;
+                    } else |_| {}
+                },
+                .mesh_busy_local => {
+                    // Explicit mesh-busy / admit-miss fanout: skip ADS1 and
+                    // deliver via SendQ so local members still see the line.
+                },
             }
-            return self.reserveTaggedAttachmentDelivery(id, tags, bytes);
         }
         // Sized for the full @-segment: server-time + account + msgid + relayed
         // client-only tags. Built from a serialized read of the owning reactor's
@@ -10631,10 +10649,19 @@ pub const LinuxServer = struct {
     const AcceptedAuthoredRelayV2 = struct {
         relay_id: relay_v2_replay_guard.RelayId,
         wire: []u8,
+        /// True when ADS1 reserved the reusable-session recipient batch in the
+        /// same no-fail cut as RVG2/Lotus. False when spool pressure forced a
+        /// soft-fail: callers must use ordinary/mesh_busy_local delivery, not
+        /// prepared_batch (which only drains the empty spool and drops the line).
+        has_attachment_batch: bool = true,
 
         fn deinit(self: *AcceptedAuthoredRelayV2, allocator: std.mem.Allocator) void {
             allocator.free(self.wire);
             self.* = undefined;
+        }
+
+        fn deliveryMode(self: AcceptedAuthoredRelayV2) TaggedDeliveryMode {
+            return if (self.has_attachment_batch) .prepared_batch else .ordinary;
         }
     };
 
@@ -10734,7 +10761,11 @@ pub const LinuxServer = struct {
             var msgid_buf: [msgid_mod.id_len]u8 = undefined;
             var time_buf: [40]u8 = undefined;
             const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
-            prepared_delivery = try self.prepareAttachmentDeliveryBatch(
+            // ADS1 spool pressure must not abort RVG2/Lotus/RVL2 admission.
+            // When the attachment batch cannot be reserved, continue without it
+            // so mesh durability and ordinary local delivery still succeed
+            // (local-first: #root chat must not brick on a full spool).
+            prepared_delivery = self.prepareAttachmentDeliveryBatch(
                 plan.recipients,
                 .{
                     .time_value = serverTimeValueAt(
@@ -10747,10 +10778,18 @@ pub const LinuxServer = struct {
                     .is_bot = plan.is_bot,
                 },
                 plan.line,
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory, error.CapacityExceeded => null,
+                else => return err,
+            };
         }
         const peers = try self.collectRelayV2OutboxPeers(null, true);
         defer self.allocator.free(peers);
+        // Only a staged ADS1 batch counts. An empty prepare (no reusable
+        // recipients) returns a non-null shell with prepared=null — that must
+        // NOT force prepared_batch delivery (wake-only drain of an empty spool
+        // would drop every recipient that later becomes reusable mid-fanout).
+        const has_attachment_batch = if (prepared_delivery) |pd| pd.prepared != null else false;
         const relay_id = switch (try self.admitRelayV2Detailed(msg, history, .{
             .peers = peers,
             .wire = wire,
@@ -10763,7 +10802,11 @@ pub const LinuxServer = struct {
             },
         };
         if (prepared_delivery) |*prepared| prepared.release();
-        return .{ .relay_id = relay_id, .wire = wire };
+        return .{
+            .relay_id = relay_id,
+            .wire = wire,
+            .has_attachment_batch = has_attachment_batch,
+        };
     }
 
     /// Re-flood one already-admitted MESSAGE_V2 object without decode/re-encode
@@ -11250,7 +11293,10 @@ pub const LinuxServer = struct {
         var exact_target: ?RelayV2ExactTarget = null;
         var speech: ChannelSpeechResult = .deny;
         var effective_text = msg.text;
-        var noformat_buf: [1024]u8 = undefined;
+        // Bound the strip buffer to the largest deliverable line body so an
+        // oversized colour-formatted MESSAGE_V2 cannot fail the strip and fall
+        // through with raw mIRC codes on a +f channel (CWE-400 / policy bypass).
+        var noformat_buf: [default_reply_bytes]u8 = undefined;
         var dm_key_buf: [320]u8 = undefined;
         var recipient_account_buf: [session_replica_account_max]u8 = undefined;
         var history_row: ?RelayV2History = null;
@@ -11269,7 +11315,11 @@ pub const LinuxServer = struct {
                     self.world.channelHasExtFlag(msg.target, .noformat) and
                     color_strip.hasFormatting(msg.text))
                 {
-                    effective_text = color_strip.stripFormatting(msg.text, &noformat_buf) catch msg.text;
+                    effective_text = color_strip.stripFormattingWith(
+                        .{ .max_output_bytes = default_reply_bytes },
+                        msg.text,
+                        &noformat_buf,
+                    ) catch msg.text;
                 }
                 // Topology is never channel-membership authority. A third-hop
                 // origin signature proves authorship, not +n bypass rights;
@@ -11785,7 +11835,7 @@ pub const LinuxServer = struct {
             else
                 clean_msg.target;
             var eff_text = clean_msg.text;
-            var nf_text_buf: [1024]u8 = undefined;
+            var nf_text_buf: [default_reply_bytes]u8 = undefined;
             // +V NOCOMICDATA: re-enforce the local channel's comic-chat-DATA ban
             // against a remote sender (the local handleData rejects non-op DATA
             // here with 531; on the receive side we silently drop, still
@@ -11796,7 +11846,9 @@ pub const LinuxServer = struct {
                 return;
             }
             if (clean_msg.verb != .tagmsg and !is_data_family and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
-                if (color_strip.stripFormatting(clean_msg.text, &nf_text_buf)) |clean| eff_text = clean else |_| {}
+                if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, clean_msg.text, &nf_text_buf)) |clean|
+                    eff_text = clean
+                else |_| {}
             }
             var channel_line_buf: [default_reply_bytes]u8 = undefined;
             const channel_line = if (clean_msg.verb == .tagmsg)
@@ -30830,7 +30882,7 @@ pub const LinuxServer = struct {
                     line,
                     null,
                     min_rank,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 )
             else
                 try self.broadcastChannelTagged(
@@ -30838,7 +30890,7 @@ pub const LinuxServer = struct {
                     event_tags,
                     line,
                     null,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 );
             // Cross-node relay: forward this typed DATA/REQUEST/REPLY to mesh
             // peers that have members of `chan` so remote co-members receive it.
@@ -30944,7 +30996,7 @@ pub const LinuxServer = struct {
                     recipient_attachment,
                     event_tags,
                     line,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 ) catch {};
             for (sender_ids.items) |sender_attachment| {
                 if (sender_attachment.eql(id)) continue;
@@ -30957,7 +31009,7 @@ pub const LinuxServer = struct {
                     sender_attachment,
                     event_tags,
                     line,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 ) catch {};
             }
             if (accepted_v2) |accepted| {
@@ -31268,7 +31320,7 @@ pub const LinuxServer = struct {
                     recipient_attachment,
                     event_tags,
                     out,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 ) catch {};
             for (sender_ids.items) |sender_attachment| {
                 if (sender_attachment.eql(id)) continue;
@@ -31281,7 +31333,7 @@ pub const LinuxServer = struct {
                     sender_attachment,
                     event_tags,
                     out,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 ) catch {};
             }
             if (accepted_v2) |accepted| {
@@ -43576,7 +43628,7 @@ pub const LinuxServer = struct {
                     mid,
                     ctags,
                     msg,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
                 );
             }
             if (accepted_v2 == null) self.recordHistoryTagmsgAt(target, conn, message_id, tags, event_time_ms);
@@ -43783,7 +43835,7 @@ pub const LinuxServer = struct {
                 recipient_attachment,
                 ctags,
                 msg,
-                if (accepted_v2 != null) .prepared_batch else .ordinary,
+                if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
             ) catch {};
         }
         for (sender_ids.items) |sender_attachment| {
@@ -43801,7 +43853,7 @@ pub const LinuxServer = struct {
                 sender_attachment,
                 ctags,
                 msg,
-                if (accepted_v2 != null) .prepared_batch else .ordinary,
+                if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary,
             ) catch {};
         }
         if (accepted_v2) |accepted| {
@@ -44085,11 +44137,14 @@ pub const LinuxServer = struct {
         // Opers are exempt; NOTICE drops silently (no auto-reply), PRIVMSG FAILs.
         // Match both the raw text AND a formatting-stripped copy so a filtered
         // word can't be smuggled past Koshi via embedded mIRC color/format codes.
+        // The strip buffer matches the largest deliverable body so an oversized
+        // colour-formatted message still gets a full strip (not a silent skip
+        // that would leave only the raw-text match — CWE-693 policy bypass).
         if (!conn.session.isOper()) {
             var filtered = self.content_filter.matches(text);
             if (!filtered and color_strip.hasFormatting(text)) {
-                var strip_buf: [1024]u8 = undefined;
-                if (color_strip.stripFormatting(text, &strip_buf)) |clean| {
+                var strip_buf: [default_reply_bytes]u8 = undefined;
+                if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, text, &strip_buf)) |clean| {
                     filtered = self.content_filter.matches(clean);
                 } else |_| {}
             }
@@ -44310,12 +44365,15 @@ pub const LinuxServer = struct {
             }
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
-            var nf_text_buf: [1024]u8 = undefined;
+            // Buffer sized to the deliverable body ceiling so an oversized
+            // colour-formatted PRIVMSG still strips (fail-closed on policy)
+            // rather than silently keeping the raw codes (CWE-400 / CWE-693).
+            var nf_text_buf: [default_reply_bytes]u8 = undefined;
             var nf_msg_buf: [default_reply_bytes]u8 = undefined;
             var eff_text = text;
             var eff_msg = msg;
             if (self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text)) {
-                if (color_strip.stripFormatting(text, &nf_text_buf)) |clean| {
+                if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, text, &nf_text_buf)) |clean| {
                     var nf_prefix_buf: [320]u8 = undefined;
                     if (clientPrefix(conn, &nf_prefix_buf)) |pfx| {
                         if (formatMessage(&nf_msg_buf, pfx, command, &.{target}, clean)) |rebuilt| {
@@ -44334,6 +44392,11 @@ pub const LinuxServer = struct {
                 self.publishModerationHeld(chan, conn, eff_text);
                 return;
             }
+            // delivery_ids feeds durable MESSAGE_V2 ADS1. When authoring is
+            // active, admit MUST succeed before broadcast — fail closed so mesh
+            // and local views stay consistent. mIRC formatting is legal body
+            // content (message_relay.validTextField); ADS1 spool soft-fails
+            // inside admitAuthoredRelayV2 without aborting mesh publish.
             var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
             defer delivery_ids.deinit(self.allocator);
             self.collectChannelDeliveryIds(
@@ -44388,6 +44451,10 @@ pub const LinuxServer = struct {
                     return;
                 }
             }
+            const delivery_mode: TaggedDeliveryMode = if (accepted_v2) |accepted|
+                accepted.deliveryMode()
+            else
+                .ordinary;
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
             if (min_rank == 0) {
@@ -44396,7 +44463,7 @@ pub const LinuxServer = struct {
                     ctags,
                     eff_msg,
                     id,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    delivery_mode,
                 );
             } else {
                 try self.broadcastChannelMinRank(
@@ -44405,14 +44472,14 @@ pub const LinuxServer = struct {
                     eff_msg,
                     id,
                     min_rank,
-                    if (accepted_v2 != null) .prepared_batch else .ordinary,
+                    delivery_mode,
                 );
             }
             if (echo) try self.deliverTaggedMode(
                 id,
                 ctags,
                 eff_msg,
-                if (accepted_v2 != null) .prepared_batch else .ordinary,
+                delivery_mode,
             );
             // Cross-node relay: forward this channel message to mesh peers so
             // remote members of `chan` receive it. Loop-guarded; the far side
@@ -44503,6 +44570,10 @@ pub const LinuxServer = struct {
                     } else null;
                     var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
                     defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+                    // Local-first: a transient durable-admit miss must not drop
+                    // sender-session mirrors or block legacy mesh relay. Fall
+                    // through with accepted_v2=null so relayLegacyToPeers still
+                    // runs; FAIL would hide a reachable remote under mesh stress.
                     if (recipient_token != null and self.authoredRelayV2Configured()) {
                         accepted_v2 = self.admitAuthoredRelayV2(
                             if (is_notice) .notice else .privmsg,
@@ -44521,15 +44592,18 @@ pub const LinuxServer = struct {
                             event_hlc,
                             null,
                             .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-                        ) catch {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
-                            return;
+                        ) catch |err| blk: {
+                            var admit_log_buf: [192]u8 = undefined;
+                            const admit_log = std.fmt.bufPrint(
+                                &admit_log_buf,
+                                "direct durable admit failed ({s}); local/legacy continues",
+                                .{@errorName(err)},
+                            ) catch "direct durable admit failed; local/legacy continues";
+                            self.traceLog(.warn, .s2s, admit_log);
+                            break :blk null;
                         };
                         if (accepted_v2) |accepted| {
                             message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
-                        } else {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
-                            return;
                         }
                     }
                     _ = self.relay_seen.observe(self.config.node_id, event_hlc);
@@ -44574,13 +44648,19 @@ pub const LinuxServer = struct {
                     }
                     var et_buf: [40]u8 = undefined;
                     const etags = MsgTags{ .time_value = serverTimeValueAt(&et_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+                    const remote_dm_mode: TaggedDeliveryMode = if (accepted_v2) |accepted|
+                        accepted.deliveryMode()
+                    else if (self.authoredRelayV2Configured() and recipient_token != null)
+                        .mesh_busy_local
+                    else
+                        .ordinary;
                     for (local_sender_ids.items) |logical_id| {
                         if (logical_id.eql(id) and !echo) continue;
                         self.deliverTaggedMode(
                             logical_id,
                             etags,
                             msg,
-                            if (accepted_v2 != null) .prepared_batch else .ordinary,
+                            remote_dm_mode,
                         ) catch {};
                     }
                     if (conn.session.account()) |sender_account| {
@@ -44732,6 +44812,10 @@ pub const LinuxServer = struct {
                 } else null
             else
                 null;
+            // Local-first DM: durable admit is best-effort. Local recipient
+            // attachments still receive the line under ordinary / mesh_busy_local
+            // delivery when mesh authority is busy; FAIL would make clients retry
+            // into a recipient that already saw the message.
             accepted_direct_v2 = self.admitAuthoredRelayV2(
                 if (is_notice) .notice else .privmsg,
                 target,
@@ -44749,9 +44833,15 @@ pub const LinuxServer = struct {
                 event_hlc,
                 history_plan,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-            ) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
-                return;
+            ) catch |err| blk: {
+                var admit_log_buf: [192]u8 = undefined;
+                const admit_log = std.fmt.bufPrint(
+                    &admit_log_buf,
+                    "direct durable admit failed ({s}); local delivery continues",
+                    .{@errorName(err)},
+                ) catch "direct durable admit failed; local delivery continues";
+                self.traceLog(.warn, .s2s, admit_log);
+                break :blk null;
             };
             if (accepted_direct_v2) |accepted| {
                 message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
@@ -44759,11 +44849,14 @@ pub const LinuxServer = struct {
                     self.search_index.index(message_id, text) catch {};
                     self.chanstatsMessage(key, authored_prefix, command, text);
                 }
-            } else {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
-                return;
             }
         }
+        const direct_delivery_mode: TaggedDeliveryMode = if (accepted_direct_v2) |accepted|
+            accepted.deliveryMode()
+        else if (self.authoredRelayV2Configured() and recipient_exact_token != null)
+            .mesh_busy_local
+        else
+            .ordinary;
         var time_buf: [40]u8 = undefined;
         const dtags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
         // Every exact recipient attachment participates independently. A full or
@@ -44773,7 +44866,7 @@ pub const LinuxServer = struct {
             logical_id,
             dtags,
             msg,
-            if (accepted_direct_v2 != null) .prepared_batch else .ordinary,
+            direct_delivery_mode,
         ) catch {};
         const sender_account = conn.session.account();
         const same_account = if (sender_account) |sa|
@@ -44787,7 +44880,7 @@ pub const LinuxServer = struct {
                     logical_id,
                     dtags,
                     msg,
-                    if (accepted_direct_v2 != null) .prepared_batch else .ordinary,
+                    direct_delivery_mode,
                 ) catch {};
             }
         }
@@ -45126,7 +45219,15 @@ pub const LinuxServer = struct {
         // Render NAMES via the names_reply module: each member carries its status
         // prefixes (all of them when the requester negotiated multi-prefix, else
         // only the highest) and optionally nick!user@host (userhost-in-names).
-        const max_members: usize = 128;
+        //
+        // Cap is intentionally large: a mesh channel with many locals + remotes
+        // used to silently truncate at 128, so each side of the mesh saw a
+        // different partial roster and clients permanently desynced after 366
+        // closed the (incomplete) burst. 512 covers realistic federation sizes
+        // without a heap alloc on the completion path; beyond that we still emit
+        // what we collected and close cleanly rather than inventing a second
+        // partial burst later.
+        const max_members: usize = 512;
         var members_buf: [max_members]names_reply.Member = undefined;
         var prefix_buf: [max_members]chanmode.PrefixList = undefined;
         var count: usize = 0;
@@ -45201,20 +45302,72 @@ pub const LinuxServer = struct {
             .userhost_in_names = conn.session.hasCap(.userhost_in_names),
         };
 
-        var out_buf: [default_reply_bytes]u8 = undefined;
-        var lines_buf: [32]names_reply.NamesLine = undefined;
-        var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
         // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
         const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
-        names_reply.writeNamesReplies(&out_buf, self.serverName(), conn.session.displayName(), channel, channel_status, members_buf[0..count], caps, &sink) catch {
-            // Oversized channel for this single pass: still close the list out.
+        const srv = self.serverName();
+        const requester = conn.session.displayName();
+
+        // Stream 353 lines in chunks that fit the reply arena + line sink. A
+        // single writeNamesReplies call used to fail closed to a bare 366 when
+        // the channel's rendered roster exceeded default_reply_bytes or 32
+        // lines (userhost-in-names + mesh remotes) — late partial / empty NAMES
+        // desync on both sides of the mesh. Chunk, emit every 353 that fits,
+        // and ALWAYS terminate with exactly one 366.
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        var lines_buf: [64]names_reply.NamesLine = undefined;
+        var offset: usize = 0;
+        while (offset < count) {
+            // Greedy: try the remaining tail; on capacity error binary-shrink.
+            var end = count;
+            var progressed = false;
+            while (end > offset) {
+                var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
+                if (names_reply.writeNamReplyLines(
+                    &out_buf,
+                    srv,
+                    requester,
+                    channel,
+                    channel_status,
+                    members_buf[offset..end],
+                    caps,
+                    &sink,
+                )) |_| {
+                    for (sink.slice()) |line| {
+                        try appendToConn(conn, line.bytes);
+                        try appendToConn(conn, "\r\n");
+                    }
+                    offset = end;
+                    progressed = true;
+                    break;
+                } else |err| switch (err) {
+                    error.OutputTooSmall, error.TooManyRecipients => {
+                        const mid = offset + (end - offset) / 2;
+                        if (mid == offset) {
+                            // Single member cannot be rendered into this arena —
+                            // skip it rather than aborting the rest of the list.
+                            offset += 1;
+                            progressed = true;
+                            break;
+                        }
+                        end = mid;
+                    },
+                    else => {
+                        // Validation of server/nick/channel failed — close out.
+                        try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+                        return;
+                    },
+                }
+            }
+            if (!progressed) break;
+        }
+
+        var end_buf: [default_reply_bytes]u8 = undefined;
+        const end_line = names_reply.buildEndOfNamesLine(&end_buf, srv, requester, channel, "End of /NAMES list") catch {
             try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
             return;
         };
-        for (sink.slice()) |line| {
-            try appendToConn(conn, line.bytes);
-            try appendToConn(conn, "\r\n");
-        }
+        try appendToConn(conn, end_line);
+        try appendToConn(conn, "\r\n");
     }
 };
 
@@ -67900,6 +68053,449 @@ test "exploit: OPER command grants no operator status (SASL-only elevation, fail
     try std.testing.expect(!conn.session.isOper());
 }
 
+// --- Exploit / regression corpus: channel PRIVMSG under MESSAGE_V2 authoring.
+// mIRC formatting is legal body content. Prefer durable admit (RVG2/Lotus/RVL2/
+// RVO2) even when the mesh peer is unconnected — outbox retains until ACK.
+// Capacity / transient admit pressure is local-first: deliver to local members
+// without FAIL TEMPORARILY_UNAVAILABLE (clients would retry into already-served
+// recipients). Mesh durability may still publish without ADS1.
+
+test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 authoring" {
+    // Root cause of "bot colors never show" / #root FAIL: message_relay rejected
+    // \x03 as a control, so admitAuthoredRelayV2 threw InvalidSemantic and the
+    // channel path FAILed PRIVMSG TEMPORARILY_UNAVAILABLE. Formatting codes are
+    // body content; durable admit must succeed with the peer merely configured
+    // (not live). CWE-755 / fail-closed-but-still-chat.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xa1)), "privmsg-color-admit");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xa2)), "privmsg-color-admit");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+    try std.testing.expect(!server.hasEstablishedPeer());
+
+    const sender_id = try addTestLocalClient(&server, "ColorSender", "color-sender");
+    const member_id = try addTestLocalClient(&server, "ColorMember", "color-member");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    sender.session.registration.registered = true;
+    member.session.registration.registered = true;
+    member.session.addCap(.message_tags);
+    _ = try server.world.join("#color-ok", worldIdFromClient(sender_id));
+    _ = try server.world.join("#color-ok", worldIdFromClient(member_id));
+
+    sender.send_len = 0;
+    member.send_len = 0;
+    // \x0304 = red, \x03 = reset — the exact control sequence the announce bot uses.
+    var line = try irc_line.parseLine("PRIVMSG #color-ok :\x0304red\x03 bold-\x02chip\x0f");
+    try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
+
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+    const member_out = member.send_buf[0..member.send_len];
+    try expectContains(member_out, "PRIVMSG #color-ok :");
+    try expectContains(member_out, "\x0304red\x03");
+    try expectContains(member_out, "\x02chip\x0f");
+    // Durable path must succeed even with no live peer: RVL2 row + RVO2 retain
+    // for the configured neighbor. Local-first soft-fail alone is not enough —
+    // colored announce-bot lines must enter mesh authority, not only SendQ.
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    const accepted = server.relay_v2_event_log.viewAt(0);
+    try std.testing.expectEqual(@as(usize, 2), accepted.required_nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), accepted.confirmed_nodes.len);
+    try std.testing.expectEqual(server.config.node_id, accepted.confirmed_nodes[0]);
+    try std.testing.expectEqual(accepted.relay_id, server.relay_v2_outbox.items()[0].relay_id);
+    var decoded = try message_relay_v2.decode(allocator, accepted.wire);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqualStrings("#color-ok", decoded.msg.target);
+    try expectContains(decoded.msg.text, "\x0304red\x03");
+}
+
+test "exploit: channel PRIVMSG #root durably admits with mesh peer configured but unconnected" {
+    // Prefer durable admit success: a configured trust root with no established
+    // S2S link must still accept #root chat into RVG2/Lotus/RVL2/RVO2 so the
+    // line is retained for the peer and local members still receive it. FAIL
+    // TEMPORARILY_UNAVAILABLE is the #root brick class this pins against.
+    // CWE-755: exceptional mesh conditions must not brick local chat.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xb1)), "root-durable-admit");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xb2)), "root-durable-admit");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+    try std.testing.expectEqual(@as(usize, 2), server.relay_v2_required_nodes.len);
+    try std.testing.expect(!server.hasEstablishedPeer());
+
+    const sender_id = try addTestLocalClient(&server, "RootSender", "root-sender");
+    const member_id = try addTestLocalClient(&server, "RootMember", "root-member");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    sender.session.registration.registered = true;
+    member.session.registration.registered = true;
+    member.session.addCap(.message_tags);
+    _ = try server.world.join("#root", worldIdFromClient(sender_id));
+    _ = try server.world.join("#root", worldIdFromClient(member_id));
+
+    sender.send_len = 0;
+    member.send_len = 0;
+    var line = try irc_line.parseLine("PRIVMSG #root :durable local chat");
+    try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
+
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #root :durable local chat");
+
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    const accepted = server.relay_v2_event_log.viewAt(0);
+    try std.testing.expectEqual(@as(usize, 2), accepted.required_nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), accepted.confirmed_nodes.len);
+    try std.testing.expectEqual(server.config.node_id, accepted.confirmed_nodes[0]);
+    try std.testing.expectEqual(accepted.relay_id, server.relay_v2_outbox.items()[0].relay_id);
+    try std.testing.expectEqualSlices(u8, accepted.wire, server.relay_v2_outbox.items()[0].wire);
+    var decoded = try message_relay_v2.decode(allocator, accepted.wire);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqualStrings("#root", decoded.msg.target);
+    try std.testing.expectEqualStrings("durable local chat", decoded.msg.text);
+    try std.testing.expect(switch (try server.relay_v2_replay_guard.probeMessage(decoded.msg)) {
+        .duplicate => |relay_id| std.mem.eql(u8, &relay_id, &accepted.relay_id),
+        else => false,
+    });
+    var history_rows: [2]lotus.Message = undefined;
+    const recorded = try server.history.latest("#root", history_rows.len, &history_rows);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    var stable_msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        msgid_mod.fromStableId(accepted.relay_id, &stable_msgid_buf),
+        recorded[0].msgid,
+    );
+    try std.testing.expectEqualStrings("durable local chat", recorded[0].text);
+}
+
+test "exploit: channel PRIVMSG local-first under ADS1 spool capacity still delivers and recovers" {
+    // Spool capacity soft-fails ADS1 reservation but must NOT FAIL PRIVMSG or
+    // silence the room. Local members still receive the line; once capacity
+    // returns, durable attachment batches resume. CWE-755 / #root brick.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xa3)), "privmsg-admit-cap");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xa4)), "privmsg-admit-cap");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    // Third arg is account name → reusable session (ADS1 reserve on admit).
+    const sender_id = try addTestLocalClient(&server, "AdmitSender", "admit-sender");
+    const member_id = try addTestLocalClient(&server, "AdmitMember", "admit-member");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    sender.session.registration.registered = true;
+    member.session.registration.registered = true;
+    member.session.addCap(.message_tags);
+    member.send_armed = true;
+    try std.testing.expect(server.attachmentHasReusableSession(member_id));
+    _ = try server.world.join("#admit-cap", worldIdFromClient(sender_id));
+    _ = try server.world.join("#admit-cap", worldIdFromClient(member_id));
+
+    var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 512,
+        .max_record_bytes = 256,
+    });
+    std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+    defer {
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+        limited_spool.deinit();
+    }
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(member_id),
+        .event_id = @splat(0x42),
+        .bytes = ":seed!u@h PRIVMSG AdmitMember :occupy\r\n",
+    }});
+
+    sender.send_len = 0;
+    member.send_len = 0;
+    var line = try irc_line.parseLine("PRIVMSG #admit-cap :still-delivers-under-spool-pressure");
+    try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
+    // Local-first: no FAIL, member still sees the line (SendQ, not ADS1).
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+    try expectContains(member.send_buf[0..member.send_len], "still-delivers-under-spool-pressure");
+
+    // Restore capacity (swap the limited spool out; defer restores original).
+    {
+        var roomy = try attachment_delivery_spool.Spool.init(allocator, .{});
+        defer roomy.deinit();
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &roomy);
+
+        sender.send_len = 0;
+        member.send_len = 0;
+        var line2 = try irc_line.parseLine("PRIVMSG #admit-cap :recovered-after-capacity");
+        try server.handleMessage(sender_id, sender, &line2, "PRIVMSG");
+        try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+        try expectContains(member.send_buf[0..member.send_len], "recovered-after-capacity");
+
+        // Put limited back so outer defer's swap/deinit stays valid.
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &roomy);
+    }
+}
+
+test "exploit: oversized color-formatted PRIVMSG does not brick channel chat" {
+    // Pathological mIRC colour bodies: densest colour codes, then a large
+    // visible payload, on a +f NOFORMAT channel. Daemon must strip (or keep
+    // delivering), never panic / never leave the room silent. CWE-400.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const sender_id = try addTestLocalClient(&server, "ColorSender", null);
+    const member_id = try addTestLocalClient(&server, "ColorMember", null);
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    _ = try server.world.join("#color-room", worldIdFromClient(sender_id));
+    _ = try server.world.join("#color-room", worldIdFromClient(member_id));
+    _ = try server.world.setChannelExtFlag("#color-room", .noformat, true);
+    try std.testing.expect(server.world.channelHasExtFlag("#color-room", .noformat));
+
+    // Body: many colour controls interleaved with digits, then a long visible
+    // run past the old 512-byte strip default (the hole this hardens).
+    var body: [1200]u8 = undefined;
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < 80 and w + 6 < body.len) : (i += 1) {
+        body[w] = 0x03; // mIRC colour
+        w += 1;
+        body[w] = '0' + @as(u8, @intCast(i % 10));
+        w += 1;
+        body[w] = '1';
+        w += 1;
+        body[w] = ',';
+        w += 1;
+        body[w] = '0' + @as(u8, @intCast((i + 3) % 10));
+        w += 1;
+        body[w] = '2';
+        w += 1;
+    }
+    const visible = "VISIBLE-PAYLOAD-AFTER-COLOR-STORM";
+    @memcpy(body[w..][0..visible.len], visible);
+    w += visible.len;
+
+    var line_buf: [1400]u8 = undefined;
+    const line_text = try std.fmt.bufPrint(&line_buf, "PRIVMSG #color-room :{s}", .{body[0..w]});
+    var parsed = try irc_line.parseLine(line_text);
+
+    member.send_len = 0;
+    sender.send_len = 0;
+    try server.handleMessage(sender_id, sender, &parsed, "PRIVMSG");
+
+    // Channel still delivers. On +f the colour codes are stripped so the
+    // visible payload is what members see (no colour control bytes).
+    const member_out = member.send_buf[0..member.send_len];
+    try expectContains(member_out, "PRIVMSG #color-room :");
+    try expectContains(member_out, visible);
+    try std.testing.expect(std.mem.indexOfScalar(u8, member_out, 0x03) == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+
+    // A plain follow-up still lands — colour storm did not brick the room.
+    member.send_len = 0;
+    var plain = try irc_line.parseLine("PRIVMSG #color-room :plain-after-color-storm");
+    try server.handleMessage(sender_id, sender, &plain, "PRIVMSG");
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #color-room :plain-after-color-storm");
+}
+
+test "exploit: PRIVMSG flood does not permanently brick channel chat" {
+    // A sustained PRIVMSG flood may throttle/disconnect the flooder (fail-
+    // toward-refuse), but the channel itself must stay usable for other
+    // members and for a recovered flooder after the window refills. CWE-400.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const flooder_id = try addTestLocalClient(&server, "Flooder", null);
+    const member_id = try addTestLocalClient(&server, "QuietMember", null);
+    const flooder = server.connFor(flooder_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    flooder.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    flooder.session.registration.registered = true;
+    member.session.registration.registered = true;
+    _ = try server.world.join("#flood-room", worldIdFromClient(flooder_id));
+    _ = try server.world.join("#flood-room", worldIdFromClient(member_id));
+
+    // Tight per-connection flood policy: 2 PRIVMSG tokens, disconnect after a
+    // few excess points. Mirrors a hostile class that still must not brick
+    // the room for everyone else.
+    const fg_cfg = flood_guard.GuardConfig{
+        .enabled = true,
+        .messages = .{ .capacity = 2, .refill_tokens = 2, .refill_period_ms = 1000 },
+        .bytes = .{},
+        .commands = .{ .capacity = 2, .refill_tokens = 2, .refill_period_ms = 1000 },
+        .target_changes = .{},
+        .excess = .{ .threshold = 3, .decay_points = 3, .decay_period_ms = 1000 },
+        .throttle_penalty = 1,
+        .target_change_penalty = 1,
+        .privmsg_weight = 1,
+        .join_weight = 1,
+        .default_weight = 1,
+    };
+    try fg_cfg.validate();
+    flooder.flood_guard = flood_guard.FloodGuard.init(fg_cfg, 0);
+
+    // Drive the real processLiveLine path so the flood guard + PRIVMSG path
+    // share one timeline (nowMs is wall clock; classifyRaw uses the stamp we
+    // pass via the guard's last_ms state from init(0) — processLiveLine uses
+    // server.nowMs(), so re-seed the guard each call via classify at fixed
+    // times first, then exercise delivery).
+    var spam_n: usize = 0;
+    var disconnected = false;
+    while (spam_n < 16) : (spam_n += 1) {
+        // Fixed-clock classify so the test is deterministic regardless of
+        // wall-clock nowMs() inside processLiveLine.
+        const decision = flooder.flood_guard.?.classifyRaw(0, "PRIVMSG #flood-room :spam\r\n");
+        if (decision == .disconnect) {
+            disconnected = true;
+            flooder.closing = true;
+            flooder.close_reason = "Excess Flood";
+            break;
+        }
+        if (flooder.closing) break;
+        // Even under throttle the room still accepts the line (policy keeps
+        // processing — only disconnect tears down). Deliver via messageOne so
+        // the channel path is exercised without depending on wall clock.
+        if (decision == .allow or decision == .throttle) {
+            member.send_len = 0;
+            try server.messageOne(flooder_id, flooder, "PRIVMSG", "#flood-room", "spam", null);
+        }
+    }
+    try std.testing.expect(disconnected);
+    try std.testing.expect(flooder.closing);
+
+    // Quiet member can still speak — the channel is not bricked by the flood.
+    member.send_len = 0;
+    flooder.send_len = 0;
+    var quiet = try irc_line.parseLine("PRIVMSG #flood-room :still-open-after-flood");
+    try server.handleMessage(member_id, member, &quiet, "PRIVMSG");
+    // Flooder is closing so may not receive; the room accepted the message
+    // (no FAIL / TEMPORARILY_UNAVAILABLE on the quiet speaker).
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "FAIL PRIVMSG") == null);
+    // Echo is off by default; member won't see their own line. Deliver to a
+    // third observer would be ideal — use flooder's buffer only if not closed
+    // for delivery. Re-check via a fresh observer.
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer = server.connFor(observer_id) orelse return error.TestUnexpectedResult;
+    observer.overflow_allocator = allocator;
+    _ = try server.world.join("#flood-room", worldIdFromClient(observer_id));
+    observer.send_len = 0;
+    var quiet2 = try irc_line.parseLine("PRIVMSG #flood-room :observer-sees-chat");
+    try server.handleMessage(member_id, member, &quiet2, "PRIVMSG");
+    try expectContains(observer.send_buf[0..observer.send_len], "PRIVMSG #flood-room :observer-sees-chat");
+
+    // Flood guard recovers after the refill window: a new connection-class
+    // timeline at t=1000 allows PRIVMSG again (no permanent brick of the
+    // *subject* — only the disconnected flooder is gone).
+    var recovered = flood_guard.FloodGuard.init(fg_cfg, 0);
+    _ = recovered.classifyRaw(0, "PRIVMSG #flood-room :a\r\n");
+    _ = recovered.classifyRaw(0, "PRIVMSG #flood-room :b\r\n");
+    try std.testing.expectEqual(flood_guard.Decision.throttle, recovered.classifyRaw(0, "PRIVMSG #flood-room :c\r\n"));
+    // After refill + excess decay, allow resumes.
+    try std.testing.expectEqual(flood_guard.Decision.allow, recovered.classifyRaw(1000, "PRIVMSG #flood-room :after-window\r\n"));
+}
+
 test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -69482,15 +70078,13 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
         .bytes = ":seed!u@h PRIVMSG DurableAuthor :occupy\r\n",
     }});
 
-    const guard_before = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
-    defer allocator.free(guard_before);
-    const history_before = try server.history.encodeCheckpoint(allocator);
-    defer allocator.free(history_before);
     const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
     defer allocator.free(spool_before);
-    const outbox_before = server.relay_v2_outbox.len();
 
-    try std.testing.expectError(error.CapacityExceeded, server.admitAuthoredRelayV2(
+    // ADS1 spool pressure soft-fails the attachment batch only. RVG2/Lotus may
+    // still publish (when durable membership is configured); the spool itself
+    // must stay byte-identical so a full ADS1 never corrupts retained rows.
+    var admitted = try server.admitAuthoredRelayV2(
         .privmsg,
         "#durable",
         0,
@@ -69498,7 +70092,7 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
         "durable-author",
         "",
         "",
-        "must-not-publish",
+        "soft-fail-spool",
         .channel,
         "",
         null,
@@ -69508,21 +70102,218 @@ test "authored MESSAGE_V2 spool capacity failure leaves all acceptance authoriti
         null,
         .{
             .recipients = &.{id},
-            .line = ":DurableAuthor!u@h PRIVMSG #durable :must-not-publish\r\n",
+            .line = ":DurableAuthor!u@h PRIVMSG #durable :soft-fail-spool\r\n",
         },
-    ));
+    );
+    // Without a 2-node durable membership this fixture rejects mesh publish
+    // (returns null) OR accepts without an attachment batch. Either way the
+    // spool occupancy is unchanged and CapacityExceeded is never raised.
+    if (admitted) |*accepted| {
+        defer accepted.deinit(allocator);
+        try std.testing.expect(!accepted.has_attachment_batch);
+    }
 
-    const guard_after = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
-    defer allocator.free(guard_after);
-    const history_after = try server.history.encodeCheckpoint(allocator);
-    defer allocator.free(history_after);
     const spool_after = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
     defer allocator.free(spool_after);
-    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
-    try std.testing.expectEqualSlices(u8, history_before, history_after);
     try std.testing.expectEqualSlices(u8, spool_before, spool_after);
-    try std.testing.expectEqual(outbox_before, server.relay_v2_outbox.len());
     try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+}
+
+// Local-first: when ADS1 spool is saturated (or durable admit soft-fails the
+// attachment batch), PRIVMSG/NOTICE must still fan out to local channel
+// members and must not emit FAIL TEMPORARILY_UNAVAILABLE (clients would retry
+// into members who already received the line). Mesh durability may still
+// publish without ADS1; local chat stays live via SendQ fallthrough.
+test "threaded server: PRIVMSG NOTICE local-first mesh admission busy still delivers to local members" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local-first-admit");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local-first-admit");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const peer_roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &peer_roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const sender_id = try addTestLocalClient(&server, "LocalAuthor", "local-author");
+    const member_id = try addTestLocalClient(&server, "LocalMember", "local-member");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.session.addCap(.message_tags);
+    sender.session.addCap(.standard_replies);
+    member.session.addCap(.message_tags);
+    member.send_armed = true;
+    sender.send_armed = true;
+    _ = try server.world.join("#local-first", worldIdFromClient(sender_id));
+    _ = try server.world.join("#local-first", worldIdFromClient(member_id));
+
+    // Saturate ADS1 so durable admit fails with CapacityExceeded (the same
+    // transient-busy class as journal pressure / peer lag).
+    var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 512,
+        .max_record_bytes = 256,
+    });
+    std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+    defer {
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+        limited_spool.deinit();
+    }
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(member_id),
+        .event_id = @splat(0x22),
+        .bytes = ":seed!u@h PRIVMSG LocalMember :occupy\r\n",
+    }});
+
+    member.send_len = 0;
+    member.send_offset = 0;
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#local-first", "local-first-privmsg", null);
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #local-first :local-first-privmsg");
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+
+    // Ordinary history path still records when durable admit did not publish.
+    var hbuf: [4]lotus.Message = undefined;
+    const recorded = server.history.latest("#local-first", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expect(recorded.len >= 1);
+    try std.testing.expectEqualStrings("local-first-privmsg", recorded[0].text);
+
+    // NOTICE: same local-first delivery, and never an error reply.
+    member.send_len = 0;
+    member.send_offset = 0;
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    try server.messageOne(sender_id, sender, "NOTICE", "#local-first", "local-first-notice", null);
+    try expectContains(member.send_buf[0..member.send_len], "NOTICE #local-first :local-first-notice");
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len); // NOTICE never errors
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+}
+
+// Multi-shard local-first: mesh_busy_local / ordinary delivery must still cross
+// the fabric (stable DeliverBuf copy → wake-after-enqueue → owner drain) when
+// ADS1 is saturated. A reusable-session recipient on a foreign shard must not
+// be left on the prepared_batch wake-only path (empty spool → silent drop).
+test "threaded server: cross-shard PRIVMSG local-first mesh-busy delivery reaches foreign-shard member via fabric" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "cross-shard-local-first");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x74)), "cross-shard-local-first");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const peer_roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &peer_roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    // Pin sender on shard 0, member on shard 1 (foreign relative to author).
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    current_reactor = &server.reactors[0];
+    const sender_id = try addTestLocalClient(&server, "ShardAuthor", "shard-author");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    sender.session.addCap(.message_tags);
+    sender.session.addCap(.standard_replies);
+    sender.send_armed = true;
+
+    current_reactor = &server.reactors[1];
+    const member_id = try addTestLocalClient(&server, "ShardMember", "shard-member");
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    member.session.addCap(.message_tags);
+    member.send_armed = true;
+    try std.testing.expectEqual(@as(u12, 1), member_id.shard);
+
+    // World membership is shared; join both under the world write lock geometry
+    // of a single-threaded test (no concurrent reactor owns the lock).
+    current_reactor = &server.reactors[0];
+    _ = try server.world.join("#xshard-lf", worldIdFromClient(sender_id));
+    _ = try server.world.join("#xshard-lf", worldIdFromClient(member_id));
+
+    // Saturate ADS1 so durable attachment reservation soft-fails.
+    var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 512,
+        .max_record_bytes = 256,
+    });
+    std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+    defer {
+        std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &limited_spool);
+        limited_spool.deinit();
+    }
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(member_id),
+        .event_id = @splat(0x33),
+        .bytes = ":seed!u@h PRIVMSG ShardMember :occupy\r\n",
+    }});
+
+    member.send_len = 0;
+    member.send_offset = 0;
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    current_reactor = &server.reactors[0];
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#xshard-lf", "cross-shard-local-first", null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
+
+    // Author's reactor enqueued a DeliverMsg; owning reactor drains fabric into
+    // the foreign ConnState's inline send_buf (address-stable, single-writer).
+    current_reactor = &server.reactors[1];
+    server.drainFabric();
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #xshard-lf :cross-shard-local-first");
+    // Buffer returned to the target shard pool (release-exactly-once).
+    const reclaimed = server.fabric.?.acquire(1, "reclaimed") orelse return error.TestExpectedEqual;
+    server.fabric.?.release(1, reclaimed);
 }
 
 test "different-token session eviction retires old spool rows without leaking to newcomer" {

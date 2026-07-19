@@ -137,12 +137,27 @@ const RuntimeBucket = struct {
     }
 
     fn tryConsume(self: *RuntimeBucket, now_ms: i64, cost: u64) bool {
+        if (!self.canConsume(now_ms, cost)) return false;
+        self.consume(cost);
+        return true;
+    }
+
+    /// Refill, then report whether `cost` fits — does not mutate the balance.
+    /// Used by the all-or-nothing classifier so a miss on one dimension cannot
+    /// drain another (partial-charge was a recovery false-positive).
+    fn canConsume(self: *RuntimeBucket, now_ms: i64, cost: u64) bool {
         if (self.cfg.capacity == 0) return true;
         self.refill(now_ms);
         if (cost == 0) return true;
-        if (cost > self.tokens) return false;
-        self.tokens -= cost;
-        return true;
+        return cost <= self.tokens;
+    }
+
+    /// Subtract `cost` after a successful `canConsume`. No-op on a disabled
+    /// dimension or a zero cost. Caller must not invoke when `canConsume` failed.
+    fn consume(self: *RuntimeBucket, cost: u64) void {
+        if (self.cfg.capacity == 0 or cost == 0) return;
+        // Saturating floor: a buggy caller that over-charges must not wrap.
+        self.tokens -|= cost;
     }
 
     /// Adopt new policy live. Token balance is clamped into the new capacity so a
@@ -284,18 +299,37 @@ pub const FloodGuard = struct {
             return .allow;
         }
 
-        const message_ok = self.message_rate.tryConsume(now_ms, 1);
-        const bytes_ok = self.byte_rate.tryConsume(now_ms, line.byte_count);
-        const command_ok = self.command_rate.tryConsume(now_ms, weight);
-        const target_ok = self.classifyTargetChange(now_ms, line);
+        // All-or-nothing: peek every dimension first, charge only when the whole
+        // line is admitted. A partial charge (e.g. message tokens drained while
+        // the command bucket refused) left clients under-recovered after a brief
+        // burst — the next legitimate PRIVMSG still throttled on the drained
+        // dimension even though the refusing one had refilled. Throttle/disconnect
+        // never mutates token balances; only excess accrues.
+        //
+        // Verdict surface is {allow, throttle, disconnect} only. The guard never
+        // invents a TEMPORARILY_UNAVAILABLE / FAIL code — that class of reply is
+        // a mesh/session concern, not flood. Callers that still process `.throttle`
+        // lines (the live daemon) keep user input flowing; only `.disconnect`
+        // tears the socket down with Excess Flood.
+        const message_ok = self.message_rate.canConsume(now_ms, 1);
+        const bytes_ok = self.byte_rate.canConsume(now_ms, line.byte_count);
+        const command_ok = self.command_rate.canConsume(now_ms, weight);
+        const target = self.inspectTargetChange(now_ms, line);
 
-        if (message_ok and bytes_ok and command_ok and target_ok) {
+        if (message_ok and bytes_ok and command_ok and target.ok) {
+            self.message_rate.consume(1);
+            self.byte_rate.consume(line.byte_count);
+            self.command_rate.consume(weight);
+            if (target.charge) {
+                self.target_change_rate.consume(1);
+                self.rememberTarget(target.key);
+            }
             self.excess.decay(now_ms);
             if (self.excess.tripped()) return .disconnect;
             return .allow;
         }
 
-        const penalty = if (!target_ok) self.config.target_change_penalty else self.config.throttle_penalty;
+        const penalty = if (!target.ok) self.config.target_change_penalty else self.config.throttle_penalty;
         return self.excess.add(now_ms, penalty);
     }
 
@@ -327,15 +361,25 @@ pub const FloodGuard = struct {
         return self.config.default_weight;
     }
 
-    fn classifyTargetChange(self: *FloodGuard, now_ms: i64, line: ParsedLine) bool {
-        if (!eqIgnoreCase(line.command, "PRIVMSG")) return true;
-        if (line.first_param.len == 0) return true;
+    const TargetInspect = struct {
+        ok: bool,
+        /// True when admitting the line must burn one target-change token and
+        /// remember `key` (a not-yet-seen PRIVMSG target with budget remaining).
+        charge: bool = false,
+        key: TargetKey = TargetKey.empty,
+    };
+
+    /// Peek the distinct-target (spread-spam) dimension without mutating state.
+    /// Only PRIVMSG with a non-empty first parameter is tracked; NOTICE/TAGMSG
+    /// and bare PRIVMSG (no target) pass through free.
+    fn inspectTargetChange(self: *FloodGuard, now_ms: i64, line: ParsedLine) TargetInspect {
+        if (!eqIgnoreCase(line.command, "PRIVMSG")) return .{ .ok = true };
+        if (line.first_param.len == 0) return .{ .ok = true };
 
         const key = TargetKey.init(line.first_param);
-        if (self.hasTarget(key)) return true;
-        if (!self.target_change_rate.tryConsume(now_ms, 1)) return false;
-        self.rememberTarget(key);
-        return true;
+        if (self.hasTarget(key)) return .{ .ok = true, .key = key };
+        if (!self.target_change_rate.canConsume(now_ms, 1)) return .{ .ok = false, .key = key };
+        return .{ .ok = true, .charge = true, .key = key };
     }
 
     fn hasTarget(self: *const FloodGuard, key: TargetKey) bool {
@@ -557,4 +601,158 @@ test "invalid config rejected" {
     var bad = testConfig();
     bad.throttle_penalty = 0;
     try testing.expectError(GuardConfig.Error.InvalidFloodConfig, bad.validate());
+}
+
+test "PRIVMSG charge is all-or-nothing across dimensions" {
+    // A command-bucket miss must not drain the message bucket: partial charge
+    // used to leave a client under-recovered after a brief burst (next legitimate
+    // PRIVMSG still throttled on the drained dimension while the refusing one
+    // had already refilled).
+    var cfg = testConfig();
+    cfg.messages = .{ .capacity = 2, .refill_tokens = 2, .refill_period_ms = 1000 };
+    cfg.commands = .{ .capacity = 1, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.target_changes = .{};
+    cfg.excess = .{ .threshold = 0, .decay_points = 1, .decay_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #a :one\r\n"));
+    // Command empty; message still has 1. Throttle must not spend that 1.
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, "PRIVMSG #a :two\r\n"));
+    try testing.expectEqual(@as(u64, 1), guard.snapshot().message_tokens);
+    try testing.expectEqual(@as(u64, 0), guard.snapshot().command_tokens);
+
+    // Command refills at t=1000; message token preserved → admit, not a second wait.
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(1000, "PRIVMSG #a :three\r\n"));
+}
+
+test "same-target PRIVMSG burst does not trip spread throttle" {
+    var cfg = testConfig();
+    cfg.commands = .{ .capacity = 100, .refill_tokens = 100, .refill_period_ms = 1000 };
+    cfg.target_changes = .{ .capacity = 2, .refill_tokens = 1, .refill_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+    // First sight of #a burns one target token; every repeat is free.
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #chat :1\r\n"));
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #chat :spam\r\n"));
+    }
+    try testing.expectEqual(@as(usize, 1), guard.snapshot().tracked_targets);
+}
+
+test "production-like class rate admits normal PRIVMSG chat" {
+    // Mirrors live [class.user] knobs (flood_lines=120 / 10s / targets=30 /
+    // excess=200): a user talking in a few channels at a few lines/sec must not
+    // throttle, and the guard must never surface anything beyond allow/throttle/
+    // disconnect (no TEMPORARILY_UNAVAILABLE inventing).
+    const cfg = GuardConfig{
+        .enabled = true,
+        .messages = .{},
+        .bytes = .{},
+        .commands = .{ .capacity = 120, .refill_tokens = 120, .refill_period_ms = 10_000 },
+        .target_changes = .{ .capacity = 30, .refill_tokens = 30, .refill_period_ms = 10_000 },
+        .excess = .{ .threshold = 200, .decay_points = 1, .decay_period_ms = 1000 },
+    };
+    try cfg.validate();
+    var guard = FloodGuard.init(cfg, 0);
+
+    // ~5 channels × 4 lines in one second — well under 120/10s and 30 targets.
+    const channels = [_][]const u8{ "#a", "#b", "#c", "#d", "#e" };
+    var t: i64 = 0;
+    for (channels) |ch| {
+        var n: usize = 0;
+        while (n < 4) : (n += 1) {
+            var buf: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "PRIVMSG {s} :hello {d}\r\n", .{ ch, n }) catch unreachable;
+            try testing.expectEqual(Decision.allow, guard.classifyRaw(t, line));
+            t += 50; // 20 lines/sec peak, brief
+        }
+    }
+    const snap = guard.snapshot();
+    try testing.expect(snap.command_tokens > 90); // most of the budget remains
+    try testing.expectEqual(@as(usize, 5), snap.tracked_targets);
+    try testing.expectEqual(@as(u64, 0), snap.excess_points);
+}
+
+test "throttle never remembers a new target (no partial target charge)" {
+    var cfg = testConfig();
+    cfg.commands = .{ .capacity = 1, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.target_changes = .{ .capacity = 8, .refill_tokens = 8, .refill_period_ms = 1000 };
+    cfg.excess = .{ .threshold = 0, .decay_points = 1, .decay_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #a :one\r\n"));
+    try testing.expectEqual(@as(u64, 7), guard.snapshot().target_change_tokens); // #a spent one
+    // Command empty → throttle. #b must NOT be remembered or charged.
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, "PRIVMSG #b :two\r\n"));
+    try testing.expectEqual(@as(usize, 1), guard.snapshot().tracked_targets);
+    try testing.expectEqual(@as(u64, 7), guard.snapshot().target_change_tokens); // unchanged
+
+    // After refill, #b is still a new target and burns one token on allow.
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(1000, "PRIVMSG #b :three\r\n"));
+    try testing.expectEqual(@as(usize, 2), guard.snapshot().tracked_targets);
+}
+
+test "NOTICE is weighted like PRIVMSG but skips target tracking" {
+    var cfg = testConfig();
+    cfg.commands = .{ .capacity = 2, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.privmsg_weight = 1;
+    cfg.target_changes = .{ .capacity = 1, .refill_tokens = 1, .refill_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+    // Many distinct NOTICE targets: target dimension must not bite.
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "NOTICE #a :x\r\n"));
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "NOTICE #b :y\r\n"));
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, "NOTICE #c :z\r\n")); // command only
+    try testing.expectEqual(@as(usize, 0), guard.snapshot().tracked_targets);
+}
+
+// --- Exploit corpus: PRIVMSG flood must throttle/disconnect the subject and
+// then RECOVER after the refill window — never permanently brick the meter
+// for a well-behaved later timeline (CWE-400). Assert recovers, not "works".
+
+test "exploit: PRIVMSG flood recovers after window (no permanent brick)" {
+    var cfg = testConfig();
+    cfg.messages = .{ .capacity = 2, .refill_tokens = 2, .refill_period_ms = 1000 };
+    cfg.commands = .{ .capacity = 2, .refill_tokens = 2, .refill_period_ms = 1000 };
+    cfg.excess = .{ .threshold = 4, .decay_points = 4, .decay_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+
+    const line = "PRIVMSG #chan :flood\r\n";
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, line));
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, line));
+    // Bucket empty: throttle, then accumulate excess toward disconnect.
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, line));
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, line));
+    try testing.expectEqual(Decision.throttle, guard.classifyRaw(0, line));
+    try testing.expectEqual(Decision.disconnect, guard.classifyRaw(0, line));
+
+    // After the refill + excess-decay window the same subject is allowed again
+    // (a new connection would re-init; this proves the math itself recovers
+    // and is not a sticky permanent brick of the meter state).
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(1000, line));
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(1000, line));
+}
+
+test "exploit: PRIVMSG flood is bounded work per classify (no unbounded growth)" {
+    // Spray many distinct targets then hammer one channel: target slots are
+    // fixed (target_slots), so classify stays O(1) and never allocates.
+    var cfg = testConfig();
+    cfg.messages = .{};
+    cfg.commands = .{};
+    cfg.target_changes = .{ .capacity = 4, .refill_tokens = 4, .refill_period_ms = 1000 };
+    cfg.excess = .{ .threshold = 0, .decay_points = 1, .decay_period_ms = 1000 };
+    var guard = FloodGuard.init(cfg, 0);
+
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "PRIVMSG #t{d} :x\r\n", .{i}) catch unreachable;
+        // After the first 4 distinct targets every new target throttles; never
+        // panics, never grows past target_slots.
+        _ = guard.classifyRaw(0, line);
+    }
+    try testing.expect(guard.snapshot().tracked_targets <= target_slots);
+
+    // Same-target spam after the spray still classifies (target already known
+    // or ring-evicted) without sticky failure beyond throttle.
+    try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #t0 :again\r\n"));
 }

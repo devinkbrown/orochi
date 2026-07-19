@@ -384,6 +384,41 @@ const MemberList = struct {
     }
 };
 
+/// LWW PART tombstone for one (channel, nick, origin-node) triple.
+///
+/// Without these, a PART that arrives *before* a lower-HLC JOIN is discarded as
+/// "unknown member", and the later JOIN resurrects a member the origin already
+/// retracted — classic LWW-without-tombstone divergence under reordering. Channel
+/// list masks already keep tombstones for the same reason (`ChannelListEntry.present`);
+/// membership needs the same lattice so out-of-order gossip converges.
+const PartTombstone = struct {
+    nick: []u8,
+    node: NodeId,
+    hlc: u64,
+    /// Receiver-local stamp for `pruneStale` GC (same clock domain as Member.last_refreshed_ms).
+    stamped_ms: i64,
+
+    fn free(self: *const PartTombstone, allocator: std.mem.Allocator) void {
+        allocator.free(self.nick);
+    }
+};
+
+const PartTombList = struct {
+    entries: std.ArrayListUnmanaged(PartTombstone) = .empty,
+
+    fn deinit(self: *PartTombList, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |t| t.free(allocator);
+        self.entries.deinit(allocator);
+    }
+
+    fn find(self: *const PartTombList, nick: []const u8, node: NodeId) ?usize {
+        for (self.entries.items, 0..) |t, i| {
+            if (t.node == node and std.mem.eql(u8, t.nick, nick)) return i;
+        }
+        return null;
+    }
+};
+
 /// One remote channel MODE-flag aggregate, tracked last-writer-wins by HLC.
 pub const ChannelModeFlags = struct {
     flags: u16,
@@ -415,6 +450,10 @@ pub const RouteTable = struct {
     /// MEMBERSHIP propagation (see docs/planning/16). Independent of `channels`
     /// (which is node-level routing) so identity churn never disturbs routing.
     channel_members: std.StringHashMap(MemberList),
+    /// channel name -> LWW PART tombstones for (nick, origin-node). Prevents a
+    /// reordered lower-HLC JOIN from resurrecting a member after its PART. Never
+    /// projected into NAMES (live roster is `channel_members` only).
+    channel_part_tombs: std.StringHashMap(PartTombList),
     /// channel name -> last remote aggregate boolean MODE flags, populated by
     /// CHANNEL_MODE_FLAGS propagation. This is independent of route fanout and
     /// rosters; it is only an LWW cache that drives daemon-side world updates.
@@ -442,6 +481,7 @@ pub const RouteTable = struct {
             .best_nick_claims = std.AutoHashMap(NickKey, NickClaim).init(allocator),
             .channels = std.StringHashMap(ChannelState).init(allocator),
             .channel_members = std.StringHashMap(MemberList).init(allocator),
+            .channel_part_tombs = std.StringHashMap(PartTombList).init(allocator),
             .channel_mode_flags = std.StringHashMap(ChannelModeFlags).init(allocator),
             .channel_lists = std.StringHashMap(ChannelListState).init(allocator),
             .channel_topics = std.StringHashMap(TopicClock).init(allocator),
@@ -454,6 +494,7 @@ pub const RouteTable = struct {
         self.best_nick_claims.deinit();
         self.channels.deinit();
         self.channel_members.deinit();
+        self.channel_part_tombs.deinit();
         self.channel_mode_flags.deinit();
         self.channel_lists.deinit();
         self.channel_topics.deinit();
@@ -481,6 +522,13 @@ pub const RouteTable = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.channel_members.clearRetainingCapacity();
+
+        var tombs = self.channel_part_tombs.iterator();
+        while (tombs.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.channel_part_tombs.clearRetainingCapacity();
 
         var mode_flags = self.channel_mode_flags.iterator();
         while (mode_flags.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -1426,6 +1474,8 @@ pub const RouteTable = struct {
     /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
     /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
+    /// PART events also stamp an origin-scoped LWW tombstone so a reordered older
+    /// JOIN cannot resurrect a member after its PART (see `channel_part_tombs`).
     /// `ident` carries the member's propagated username/realname/visible-host;
     /// on a newer event the stored identity is replaced (LWW, like the status).
     /// Also maintains the `nick_to_node` routing index (so `nickNode` resolves the
@@ -1463,6 +1513,10 @@ pub const RouteTable = struct {
                         if (list.entries.items[uid_idx].node == node)
                             return self.applyMembership(chan, &uid, node, status, hlc, false, ident, now_ms);
                     }
+                    // Still record an origin-scoped PART tombstone under the wire
+                    // nick so a reordered older JOIN from THIS origin cannot land
+                    // later under the real nick after the UID path is gone.
+                    try self.notePartTombstone(chan, nick, node, hlc, now_ms);
                     return .{ .outcome = .unchanged };
                 }
             }
@@ -1491,6 +1545,8 @@ pub const RouteTable = struct {
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
+                // A newer JOIN supersedes any PART tombstone for this origin/nick.
+                self.clearPartTombstone(chan, nick, node);
                 // Keep the nick->node routing index in sync so PRIVMSG relay can
                 // resolve this remote nick (best-effort: a full index degrades to
                 // NAMES/WHOIS-only, never breaks membership). Re-run even on a
@@ -1500,6 +1556,9 @@ pub const RouteTable = struct {
                 return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
                 const claim_key = NickKey.init(cur.nick);
+                // Tombstone BEFORE free/remove so a reordered older JOIN cannot
+                // re-insert once the live row is gone.
+                try self.notePartTombstone(chan, nick, node, hlc, now_ms);
                 cur.freeStrings(self.allocator);
                 _ = list.entries.swapRemove(idx);
                 self.pruneIfEmpty(chan);
@@ -1524,6 +1583,10 @@ pub const RouteTable = struct {
                     const prev = cur.status;
                     if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev };
                     const claim_key = NickKey.init(cur.nick);
+                    // Tombstone both the wire nick and the UID alias so either
+                    // spelling of a reordered older JOIN is blocked.
+                    try self.notePartTombstone(chan, nick, node, hlc, now_ms);
+                    try self.notePartTombstone(chan, uid[0..], node, hlc, now_ms);
                     cur.freeStrings(self.allocator);
                     _ = list.entries.swapRemove(idx);
                     self.pruneIfEmpty(chan);
@@ -1532,7 +1595,17 @@ pub const RouteTable = struct {
                     return .{ .outcome = .parted, .prev_status = prev };
                 }
             }
-            return .{ .outcome = .unchanged }; // part for an unknown member
+            // Unknown member PART: still stamp the origin-scoped tombstone so a
+            // reordered older JOIN for the same origin cannot resurrect later.
+            try self.notePartTombstone(chan, nick, node, hlc, now_ms);
+            // ensureMemberList may have created an empty roster solely for this
+            // lookup — drop it so channelNames does not accumulate hollow keys.
+            self.pruneIfEmpty(chan);
+            return .{ .outcome = .unchanged };
+        }
+        // Fresh JOIN: a PART tombstone with equal-or-newer hlc blocks resurrection.
+        if (self.partTombstoneBlocks(chan, nick, node, hlc)) {
+            return .{ .outcome = .unchanged };
         }
         if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
         const owned = try self.allocator.dupe(u8, nick);
@@ -1563,6 +1636,7 @@ pub const RouteTable = struct {
             .hlc = hlc,
             .last_refreshed_ms = now_ms,
         });
+        self.clearPartTombstone(chan, nick, node);
         // Index this newly-learned remote nick for PRIVMSG relay routing
         // (best-effort, see the upsert branch above).
         self.setNickLocation(nick, node) catch {};
@@ -1646,6 +1720,36 @@ pub const RouteTable = struct {
         // Pass 3: prune channels emptied by the sweep (mutates the channels map, so
         // it runs after the outer iteration completes).
         for (empties.items) |chan| self.pruneIfEmpty(chan);
+
+        // Pass 4: age origin-scoped PART tombstones in the same receiver-local
+        // window. Once the window elapses a re-burst would have re-affirmed any
+        // still-present member, so the tombstone is no longer needed to block a
+        // reordered older JOIN — and retaining it forever would unbounded-grow
+        // under PART churn (CWE-400).
+        var tomb_empties: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer tomb_empties.deinit(self.allocator);
+        var tomb_it = self.channel_part_tombs.iterator();
+        while (tomb_it.next()) |entry| {
+            const list = entry.value_ptr;
+            var i: usize = 0;
+            while (i < list.entries.items.len) {
+                if (now_ms - list.entries.items[i].stamped_ms > window_ms) {
+                    list.entries.items[i].free(self.allocator);
+                    _ = list.entries.swapRemove(i);
+                    pruned += 1;
+                } else i += 1;
+            }
+            if (list.entries.items.len == 0) {
+                tomb_empties.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+        for (tomb_empties.items) |chan| {
+            const e = self.channel_part_tombs.getEntry(chan) orelse continue;
+            const owned_key = e.key_ptr.*;
+            e.value_ptr.deinit(self.allocator);
+            self.channel_part_tombs.removeByPtr(e.key_ptr);
+            self.allocator.free(owned_key);
+        }
 
         // `pruneStale` is the bounded periodic repair point as well as a bulk
         // mutation: retry a prior transient-OOM rebuild even when nothing aged
@@ -1940,6 +2044,77 @@ pub const RouteTable = struct {
         return self.channel_members.getPtr(chan).?;
     }
 
+    fn ensurePartTombList(self: *Self, chan: []const u8) Error!*PartTombList {
+        if (self.channel_part_tombs.getPtr(chan)) |list| return list;
+        const owned = try self.allocator.dupe(u8, chan);
+        errdefer self.allocator.free(owned);
+        try self.channel_part_tombs.putNoClobber(owned, .{});
+        return self.channel_part_tombs.getPtr(chan).?;
+    }
+
+    /// Record (or LWW-advance) an origin-scoped PART tombstone. Bounded by
+    /// `max_nicks` per channel — when full, the oldest stamp is evicted so a
+    /// hostile PART flood cannot grow the map without bound (CWE-400).
+    fn notePartTombstone(
+        self: *Self,
+        chan: []const u8,
+        nick: []const u8,
+        node: NodeId,
+        hlc: u64,
+        now_ms: i64,
+    ) Error!void {
+        const list = try self.ensurePartTombList(chan);
+        if (list.find(nick, node)) |idx| {
+            const cur = &list.entries.items[idx];
+            // Always refresh the receiver stamp so a still-relevant tombstone
+            // is not aged out while the origin keeps re-announcing the PART.
+            cur.stamped_ms = now_ms;
+            if (hlc > cur.hlc) cur.hlc = hlc;
+            return;
+        }
+        if (list.entries.items.len >= self.cfg.max_nicks) {
+            // Evict the oldest stamp (fail-toward-bound, not fail-open growth).
+            var oldest_i: usize = 0;
+            var oldest_ms = list.entries.items[0].stamped_ms;
+            for (list.entries.items, 0..) |t, i| {
+                if (t.stamped_ms < oldest_ms) {
+                    oldest_ms = t.stamped_ms;
+                    oldest_i = i;
+                }
+            }
+            list.entries.items[oldest_i].free(self.allocator);
+            _ = list.entries.swapRemove(oldest_i);
+        }
+        const owned_nick = try self.allocator.dupe(u8, nick);
+        errdefer self.allocator.free(owned_nick);
+        try list.entries.append(self.allocator, .{
+            .nick = owned_nick,
+            .node = node,
+            .hlc = hlc,
+            .stamped_ms = now_ms,
+        });
+    }
+
+    fn partTombstoneBlocks(self: *const Self, chan: []const u8, nick: []const u8, node: NodeId, hlc: u64) bool {
+        const list = self.channel_part_tombs.getPtr(chan) orelse return false;
+        const idx = list.find(nick, node) orelse return false;
+        return hlc <= list.entries.items[idx].hlc;
+    }
+
+    fn clearPartTombstone(self: *Self, chan: []const u8, nick: []const u8, node: NodeId) void {
+        const entry = self.channel_part_tombs.getEntry(chan) orelse return;
+        const list = entry.value_ptr;
+        const idx = list.find(nick, node) orelse return;
+        list.entries.items[idx].free(self.allocator);
+        _ = list.entries.swapRemove(idx);
+        if (list.entries.items.len == 0) {
+            const owned_key = entry.key_ptr.*;
+            list.deinit(self.allocator);
+            self.channel_part_tombs.removeByPtr(entry.key_ptr);
+            self.allocator.free(owned_key);
+        }
+    }
+
     fn ensureChannelList(self: *Self, chan: []const u8) Error!*ChannelListState {
         if (self.channel_lists.getPtr(chan)) |list| return list;
         if (self.list_channel_count == self.cfg.max_channels) return error.RouteTableFull;
@@ -1964,6 +2139,7 @@ pub const RouteTable = struct {
         self.removeNodeNicks(node);
         self.removeNodeChannels(node);
         self.removeNodeMembers(node);
+        self.removeNodePartTombs(node);
         _ = self.rebuildAllBestNickClaims();
     }
 
@@ -1995,6 +2171,32 @@ pub const RouteTable = struct {
             if (list.entries.items.len == 0) empties.append(self.allocator, entry.key_ptr.*) catch {};
         }
         for (empties.items) |chan| self.pruneIfEmpty(chan);
+    }
+
+    /// Drop every PART tombstone homed on a departed node. A dead origin can no
+    /// longer re-JOIN, so retaining its tombstones only wastes the bound.
+    fn removeNodePartTombs(self: *Self, node: NodeId) void {
+        var empties: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer empties.deinit(self.allocator);
+        var it = self.channel_part_tombs.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr;
+            var i: usize = 0;
+            while (i < list.entries.items.len) {
+                if (list.entries.items[i].node == node) {
+                    list.entries.items[i].free(self.allocator);
+                    _ = list.entries.swapRemove(i);
+                } else i += 1;
+            }
+            if (list.entries.items.len == 0) empties.append(self.allocator, entry.key_ptr.*) catch {};
+        }
+        for (empties.items) |chan| {
+            const e = self.channel_part_tombs.getEntry(chan) orelse continue;
+            const owned_key = e.key_ptr.*;
+            e.value_ptr.deinit(self.allocator);
+            self.channel_part_tombs.removeByPtr(e.key_ptr);
+            self.allocator.free(owned_key);
+        }
     }
 
     pub fn nickCount(self: *const Self) usize {
@@ -3299,4 +3501,249 @@ test "incumbentLoserUid derives a stable, owner-scoped fallback" {
     try std.testing.expectEqual(@as(u16, 42), (try uid_alloc.parse(uid[0..])).node);
     // Stable across calls.
     try std.testing.expectEqualSlices(u8, uid[0..], table.incumbentLoserUid("kain").?[0..]);
+}
+
+// ---------------------------------------------------------------------------
+// exploit: hostile NAMES/membership — reorder convergence + Byzantine PART
+// ---------------------------------------------------------------------------
+
+/// Snapshot the live (channel, nick, node, status, hlc) roster for convergence
+/// compares. Order-independent: sorted by (channel, nick).
+fn rosterFingerprint(table: *const RouteTable, allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var it = table.channelNames();
+    while (it.next()) |chan| try names.append(allocator, chan);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    for (names.items) |chan| {
+        const members = table.channelMembers(chan);
+        // Copy + sort by nick so fingerprint is order-independent.
+        const idxs = try allocator.alloc(usize, members.len);
+        defer allocator.free(idxs);
+        for (idxs, 0..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, idxs, members, struct {
+            fn less(ms: []const Member, a: usize, b: usize) bool {
+                return std.mem.order(u8, ms[a].nick, ms[b].nick) == .lt;
+            }
+        }.less);
+        for (idxs) |i| {
+            const m = members[i];
+            var line_buf: [256]u8 = undefined;
+            const line = try std.fmt.bufPrint(&line_buf, "{s}|{s}|{d}|{d}|{d};", .{ chan, m.nick, m.node, m.status, m.hlc });
+            try out.appendSlice(allocator, line);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "exploit: membership reorder converges (PART-before-JOIN cannot resurrect)" {
+    // CWE-362 / convergence: a PART that races ahead of its matching lower-HLC
+    // JOIN must still win LWW. Without a PART tombstone the early PART is
+    // discarded as "unknown member" and the late JOIN resurrects a departed user
+    // into NAMES — Byzantine-adjacent phantom membership under reordering.
+    const allocator = std.testing.allocator;
+    const seed: u64 = 0xA11CE_5EED;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+
+    const Event = struct {
+        present: bool,
+        status: u4,
+        hlc: u64,
+        nick: []const u8,
+        node: NodeId,
+    };
+    // Canonical history for alice@10 on #chat:
+    //   JOIN hlc=10 status=op → PART hlc=20 → JOIN hlc=30 status=voice
+    // Final: alice present, voice, hlc=30.
+    const canon = [_]Event{
+        .{ .present = true, .status = 0b0100, .hlc = 10, .nick = "alice", .node = 10 },
+        .{ .present = false, .status = 0, .hlc = 20, .nick = "alice", .node = 10 },
+        .{ .present = true, .status = 0b0010, .hlc = 30, .nick = "alice", .node = 10 },
+        .{ .present = true, .status = 0, .hlc = 15, .nick = "bob", .node = 20 },
+        .{ .present = false, .status = 0, .hlc = 25, .nick = "bob", .node = 20 },
+    };
+
+    var reference = try RouteTable.init(allocator, .{ .max_nicks = 16, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer reference.deinit();
+    for (canon) |ev| {
+        _ = try reference.applyMembership("#chat", ev.nick, ev.node, ev.status, ev.hlc, ev.present, .{}, 0);
+    }
+    const expected = try rosterFingerprint(&reference, allocator);
+    defer allocator.free(expected);
+    // Sanity: alice present voice, bob gone.
+    try std.testing.expect(reference.findMember("alice") != null);
+    try std.testing.expectEqual(@as(u4, 0b0010), reference.findMember("alice").?.status);
+    try std.testing.expect(reference.findMember("bob") == null);
+
+    // Apply the same multiset under many shuffles; every order must converge.
+    const order = try allocator.alloc(usize, canon.len);
+    defer allocator.free(order);
+    var trial: usize = 0;
+    while (trial < 64) : (trial += 1) {
+        for (order, 0..) |*slot, i| slot.* = i;
+        rng.shuffle(usize, order);
+
+        var table = try RouteTable.init(allocator, .{ .max_nicks = 16, .max_channels = 8, .max_nodes_per_channel = 8 });
+        defer table.deinit();
+        for (order) |i| {
+            const ev = canon[i];
+            _ = try table.applyMembership("#chat", ev.nick, ev.node, ev.status, ev.hlc, ev.present, .{}, 0);
+        }
+        const got = try rosterFingerprint(&table, allocator);
+        defer allocator.free(got);
+        if (!std.mem.eql(u8, expected, got)) {
+            std.debug.print("membership reorder divergence seed={d} trial={d} order={any}\nexpected={s}\ngot={s}\n", .{ seed, trial, order, expected, got });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "exploit: Byzantine cross-origin PART cannot delete another node's member" {
+    // CWE-290: an admitted peer (or a forged MEMBERSHIP that slipped past a
+    // weaker gate) must never PART a nick owned by a different origin. The
+    // route table is origin-owned: wrong-node PART is a no-op and the victim
+    // stays in the NAMES projection.
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    _ = try table.applyMembership("#ops", "trev", 10, 0b0100, 5, true, .{
+        .username = "trev",
+        .host = "trev.users",
+    }, 0);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#ops").len);
+
+    // Byzantine node 99 tries to PART trev with a *newer* hlc — still rejected.
+    const res = try table.applyMembership("#ops", "trev", 99, 0, 99, false, .{}, 0);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, res.outcome);
+    const victim = table.findMember("trev") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(NodeId, 10), victim.node);
+    try std.testing.expectEqual(@as(u4, 0b0100), victim.status);
+    try std.testing.expectEqual(@as(u64, 5), victim.hlc);
+    try std.testing.expectEqualStrings("trev", victim.username);
+}
+
+test "exploit: stale JOIN after PART tombstone cannot resurrect into NAMES" {
+    // Direct counterexample for the pre-tombstone hole: PART hlc=20 first, then
+    // JOIN hlc=10. Fail-closed final state is ABSENT (PART wins LWW).
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const part = try table.applyMembership("#chat", "alice", 10, 0, 20, false, .{}, 100);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, part.outcome); // unknown → tombstone only
+    const join = try table.applyMembership("#chat", "alice", 10, 0b0100, 10, true, .{ .username = "alice" }, 101);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, join.outcome);
+    try std.testing.expect(table.findMember("alice") == null);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
+
+    // A *newer* JOIN after the PART still lands (legitimate rejoin).
+    const rejoin = try table.applyMembership("#chat", "alice", 10, 0, 30, true, .{ .username = "alice" }, 102);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.joined, rejoin.outcome);
+    try std.testing.expect(table.findMember("alice") != null);
+}
+
+test "mesh NAMES projection converges after late partial membership burst + catch-up" {
+    // Regression for the live nicklist desync: each mesh node projects NAMES from
+    // its RouteTable.channelMembers. A late *partial* burst (only a subset of the
+    // peer's locals) must not permanently pin a divergent roster — the subsequent
+    // anti-entropy re-burst / individual MEMBERSHIP catch-up has to converge both
+    // sides to the same (channel, nick, node, status) set regardless of delivery
+    // order. Models two receivers applying the same multiset of facts under
+    // opposite orders and asserts channelMembers fingerprints match.
+    const allocator = std.testing.allocator;
+    const Event = struct {
+        chan: []const u8,
+        nick: []const u8,
+        node: NodeId,
+        status: u4,
+        hlc: u64,
+        present: bool,
+    };
+    // Canonical mesh history for #root across two origin nodes:
+    //   node 10: alice (op) joins, bob joins, alice parts, alice rejoins (voice)
+    //   node 20: carol joins (op) and stays
+    // Final NAMES projection: alice(voice)@10, bob@10, carol(op)@20.
+    const canon = [_]Event{
+        .{ .chan = "#root", .nick = "alice", .node = 10, .status = 0b0100, .hlc = 10, .present = true },
+        .{ .chan = "#root", .nick = "bob", .node = 10, .status = 0, .hlc = 11, .present = true },
+        .{ .chan = "#root", .nick = "carol", .node = 20, .status = 0b0100, .hlc = 12, .present = true },
+        .{ .chan = "#root", .nick = "alice", .node = 10, .status = 0, .hlc = 20, .present = false },
+        .{ .chan = "#root", .nick = "alice", .node = 10, .status = 0b0010, .hlc = 30, .present = true },
+    };
+
+    // "Partial burst first" order: only bob+carol land early (alice's first JOIN
+    // delayed), then the rest catch up — the shape of a truncated membership
+    // burst followed by individual events / re-burst.
+    const partial_first = [_]usize{ 1, 2, 0, 3, 4 };
+    // "Full history reversed" order — stresses PART-before-JOIN tombstones.
+    const reversed = [_]usize{ 4, 3, 2, 1, 0 };
+
+    var ref = try RouteTable.init(allocator, .{ .max_nicks = 16, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer ref.deinit();
+    for (canon) |ev| {
+        _ = try ref.applyMembership(ev.chan, ev.nick, ev.node, ev.status, ev.hlc, ev.present, .{}, 0);
+    }
+    const expected = try rosterFingerprint(&ref, allocator);
+    defer allocator.free(expected);
+
+    // Sanity on the reference final NAMES set.
+    try std.testing.expectEqual(@as(usize, 3), ref.channelMembers("#root").len);
+    try std.testing.expectEqual(@as(u4, 0b0010), ref.findMember("alice").?.status);
+    try std.testing.expect(ref.findMember("bob") != null);
+    try std.testing.expectEqual(@as(u4, 0b0100), ref.findMember("carol").?.status);
+
+    for ([_][]const usize{ &partial_first, &reversed }) |order| {
+        var table = try RouteTable.init(allocator, .{ .max_nicks = 16, .max_channels = 8, .max_nodes_per_channel = 8 });
+        defer table.deinit();
+        for (order) |i| {
+            const ev = canon[i];
+            _ = try table.applyMembership(ev.chan, ev.nick, ev.node, ev.status, ev.hlc, ev.present, .{}, 0);
+        }
+        const got = try rosterFingerprint(&table, allocator);
+        defer allocator.free(got);
+        if (!std.mem.eql(u8, expected, got)) {
+            std.debug.print("NAMES membership divergence\nexpected={s}\ngot={s}\n", .{ expected, got });
+            return error.TestExpectedEqual;
+        }
+        // Explicit NAMES-shaped assertions (not just the fingerprint).
+        try std.testing.expectEqual(@as(usize, 3), table.channelMembers("#root").len);
+        try std.testing.expectEqual(@as(u4, 0b0010), table.findMember("alice").?.status);
+        try std.testing.expectEqual(@as(NodeId, 10), table.findMember("bob").?.node);
+        try std.testing.expectEqual(@as(NodeId, 20), table.findMember("carol").?.node);
+    }
+}
+
+test "same-HLC re-burst after PART tombstone does not resurrect a departed member into NAMES" {
+    // sendMembershipBurstTo historically stamped ONE hlc across every present
+    // member. A PART and a later re-burst that somehow share an hlc (or the
+    // re-burst is older) must not undo the PART: the tombstone is equal-or-newer
+    // fail-closed so NAMES on the peer never re-grows a user who left.
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    _ = try table.applyMembership("#root", "ghost", 10, 0, 50, true, .{ .username = "ghost" }, 1_000);
+    _ = try table.applyMembership("#root", "ghost", 10, 0, 60, false, .{}, 1_001);
+    try std.testing.expect(table.findMember("ghost") == null);
+
+    // Re-burst with the SAME hlc as the PART (equal → blocked).
+    const same = try table.applyMembership("#root", "ghost", 10, 0, 60, true, .{ .username = "ghost" }, 1_002);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, same.outcome);
+    try std.testing.expect(table.findMember("ghost") == null);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#root").len);
+
+    // Re-burst with a strictly older hlc (partial/late) — still blocked.
+    const older = try table.applyMembership("#root", "ghost", 10, 0, 55, true, .{ .username = "ghost" }, 1_003);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.unchanged, older.outcome);
+    try std.testing.expect(table.findMember("ghost") == null);
+
+    // Only a strictly newer JOIN (genuine rejoin) repopulates NAMES.
+    const newer = try table.applyMembership("#root", "ghost", 10, 0, 70, true, .{ .username = "ghost" }, 1_004);
+    try std.testing.expectEqual(RouteTable.ApplyOutcome.joined, newer.outcome);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#root").len);
 }

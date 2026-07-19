@@ -305,3 +305,55 @@ test "DefaultStripper methods mirror module helpers" {
     try std.testing.expect(stripper.has(input));
     try std.testing.expectEqual(@as(usize, 4), stripper.len(input));
 }
+
+// --- Exploit corpus: hostile mIRC colour bodies. Assert bounded strip work
+// and fail-closed OutputTooSmall — never panic / never unbounded scan (CWE-400).
+
+test "exploit: stripFormatting bounds a pathological colour-code flood (fail-closed)" {
+    const allocator = std.testing.allocator;
+    // Densest colour storm: 0x03 + two fg digits + comma + two bg digits,
+    // repeated thousands of times, then a short visible tail. Pure algorithmic-
+    // complexity pressure on the colour digit consumer.
+    var input = std.ArrayList(u8).empty;
+    defer input.deinit(allocator);
+    try input.ensureTotalCapacity(allocator, 32 * 1024);
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        try input.append(allocator, Control.color.byte());
+        try input.appendSlice(allocator, "12,03");
+    }
+    try input.appendSlice(allocator, "VISIBLE");
+
+    // visibleLen / hasFormatting must stay O(n) and return without panic.
+    try std.testing.expect(hasFormatting(input.items));
+    try std.testing.expectEqual(@as(usize, 7), visibleLen(input.items));
+
+    // Default 512-byte policy rejects an oversized visible body after strip
+    // when the out buffer is tiny — fail-closed, not partial/corrupt output.
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, stripFormatting(input.items, &tiny));
+
+    // With a large enough buffer + matching max_output_bytes the storm strips
+    // cleanly to the visible tail (no colour digits leaked into the payload).
+    const out = try allocator.alloc(u8, 64);
+    defer allocator.free(out);
+    const stripped = try stripFormattingWith(.{ .max_output_bytes = 64 }, input.items, out);
+    try std.testing.expectEqualStrings("VISIBLE", stripped);
+}
+
+test "exploit: stripFormatting rejects oversize visible body without writing past out" {
+    // Visible payload larger than the configured max_output_bytes must error
+    // without a partial success that a caller could treat as complete.
+    var input: [600]u8 = undefined;
+    @memset(&input, 'A');
+    input[0] = Control.color.byte();
+    input[1] = '0';
+    input[2] = '4';
+    // After strip: 597 'A's (600 - 3 colour bytes). Default max is 512.
+    var out: [600]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, stripFormatting(&input, &out));
+    // Explicit high cap succeeds and returns the full visible body.
+    const stripped = try stripFormattingWith(.{ .max_output_bytes = 600 }, &input, &out);
+    try std.testing.expectEqual(@as(usize, 597), stripped.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, stripped, Control.color.byte()) == null);
+}
