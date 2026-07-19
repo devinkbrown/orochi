@@ -39,9 +39,11 @@ import select
 import shlex
 import socket
 import subprocess
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from queue import Empty, Queue
 
 
 def _env(new: str, old: str, default: str = "") -> str:
@@ -66,7 +68,7 @@ RECONNECT_MIN, RECONNECT_MAX = 6, 300
 MAX_MESSAGE_TEXT_BYTES = 360  # stay comfortably under IRC's 512-byte line cap
 # IRCv3 caps we use if the server offers them (graceful degrade otherwise).
 WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
-VERSION = "Announce-bot 3.1 (multi-project: Onyx SolidJS · Onyx Server Zig)"
+VERSION = "Announce-bot 3.2 (async build inventory · Onyx SolidJS · Onyx Server Zig)"
 START = time.time()
 PROTECTED_TOPIC_CHANNELS = {"#root"}
 
@@ -108,7 +110,8 @@ class Project:
     module_label: str  # "components" or "modules"
     module_cmd: str  # shell command (bash -lc) returning a module/component count
     loc_cmd: str  # shell command (bash -lc) returning a total LOC count
-    test_fallback_cmd: str | None  # optional shell command counting test files
+    test_cmd: str  # shell command returning the static test-block inventory
+    test_label: str  # honest unit: "test files" or "test blocks"
     stats_suffix: str  # trailing tag on the !stats build line, e.g. "Solid+Vite"
     topic_label: str  # label used in the shared TOPIC, e.g. "Orochi M2"
     user_realname: str  # USER command real-name field
@@ -120,26 +123,38 @@ class Project:
 def _quoted_find_tsx(repo: str) -> str:
     q = shlex.quote(repo)
     return (
-        f"find {q} -name '*.tsx' | grep -vF -e /node_modules/ -e /.next/ "
-        f"-e /out/ -e /dist/ -e /.git/ -e /.wt/ -e /coverage/ | wc -l"
+        f"find {q} -type d \\( -name node_modules -o -name .next -o -name out "
+        f"-o -name dist -o -name .git -o -name .wt -o -name .claude -o -name coverage \\) "
+        f"-prune -o -type f -name '*.tsx' -print | wc -l"
     )
 
 
 def _quoted_loc_ts(repo: str) -> str:
     q = shlex.quote(repo)
     return (
-        f"{{ find {q} -name '*.ts'; find {q} -name '*.tsx'; }} | "
-        f"grep -vF -e /node_modules/ -e /.next/ -e /out/ -e /dist/ -e /.git/ "
-        f"-e /.wt/ -e /coverage/ | xargs cat 2>/dev/null | wc -l"
+        f"find {q} -type d \\( -name node_modules -o -name .next -o -name out "
+        f"-o -name dist -o -name .git -o -name .wt -o -name .claude -o -name coverage \\) "
+        f"-prune -o -type f \\( -name '*.ts' -o -name '*.tsx' \\) -print0 | "
+        f"xargs -0 -r cat 2>/dev/null | wc -l"
     )
 
 
 def _quoted_test_files_ts(repo: str) -> str:
     q = shlex.quote(repo)
     return (
-        f"{{ find {q} -name '*.test.ts'; find {q} -name '*.test.tsx'; "
-        f"find {q} -name '*.spec.ts'; find {q} -name '*.spec.tsx'; }} | "
-        f"grep -vF -e /node_modules/ -e /.wt/ | wc -l"
+        f"find {q} -type d \\( -name node_modules -o -name .next -o -name out "
+        f"-o -name dist -o -name .git -o -name .wt -o -name .claude -o -name coverage \\) "
+        f"-prune -o -type f \\( -name '*.test.ts' -o -name '*.test.tsx' "
+        f"-o -name '*.spec.ts' -o -name '*.spec.tsx' \\) -print | wc -l"
+    )
+
+
+def _quoted_test_blocks_zig(repo: str) -> str:
+    """Count Zig `test` declarations, not an unverified passing-test claim."""
+    q = shlex.quote(repo)
+    return (
+        f"find {q}/src -type f -name '*.zig' -exec "
+        f"grep -hE '^[[:space:]]*test[[:space:]]+\"' {{}} + 2>/dev/null | wc -l"
     )
 
 
@@ -165,7 +180,8 @@ ONYX = Project(
     module_label="components",
     module_cmd=_quoted_find_tsx(ONYX_REPO),
     loc_cmd=_quoted_loc_ts(ONYX_REPO),
-    test_fallback_cmd=_quoted_test_files_ts(ONYX_REPO),
+    test_cmd=_quoted_test_files_ts(ONYX_REPO),
+    test_label="test files",
     stats_suffix="Solid+Vite",
     topic_label="Onyx",
     user_realname="Onyx build announcer",
@@ -186,7 +202,7 @@ ONYX = Project(
     ),
     progress_text=(
         f"{B}live{RST}: vault + Home · passkeys · labeled-response · Cadence shield · "
-        f"ribbon More. tests={{tests}}, components={{modules}}. "
+        f"ribbon More. static test inventory={{tests}}, components={{modules}}. "
         f"Next: cold vault paint polish, A10 binary release, Era 2 multi-device."
     ),
 )
@@ -200,7 +216,8 @@ ONYX_SERVER = Project(
     module_label="modules",
     module_cmd=_quoted_find_zig(ONYX_SERVER_REPO),
     loc_cmd=_quoted_loc_zig(ONYX_SERVER_REPO),
-    test_fallback_cmd=None,
+    test_cmd=_quoted_test_blocks_zig(ONYX_SERVER_REPO),
+    test_label="test blocks",
     stats_suffix="zig 0.17",
     topic_label="Onyx Server",
     user_realname="Onyx Server build announcer",
@@ -222,7 +239,7 @@ ONYX_SERVER = Project(
     ),
     progress_text=(
         f"{B}live{RST}: accounts/SASL · multi-session · media plane · "
-        f"mesh + Helix. tests={{tests}}, modules={{modules}}. "
+        f"mesh + Helix. static test inventory={{tests}}, modules={{modules}}. "
         f"Next: attested release artifact, deeper services."
     ),
 )
@@ -277,36 +294,132 @@ def _shell_count(cmd: str, timeout: float = 3.0) -> str:
         return "?"
 
 
+def _format_loc(value: str) -> str:
+    try:
+        n = int(value)
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+    except ValueError:
+        return value
+
+
+@dataclass(frozen=True)
+class BuildInventory:
+    """One explicit, static repository inventory measurement.
+
+    This is deliberately not a test-result report: it counts test declarations
+    (or test files for the web client) and never pretends that a test suite ran.
+    """
+
+    modules: str = "pending"
+    test_blocks: str = "pending"
+    loc: str = "pending"
+    commits: str = "?"
+    head: str = ""
+    dirty: bool = False
+    measured_at: float = 0.0
+
+
+def collect_inventory(project: Project) -> BuildInventory:
+    """Measure a repository off the IRC thread, with bounded subprocesses."""
+    modules = _shell_count(project.module_cmd, timeout=8.0)
+    tests = _shell_count(project.test_cmd, timeout=8.0)
+    loc = _format_loc(_shell_count(project.loc_cmd, timeout=8.0))
+    return BuildInventory(
+        modules=modules,
+        test_blocks=tests,
+        loc=loc,
+        commits=git(project, "rev-list", "--count", "HEAD") or "?",
+        head=git(project, "rev-parse", "HEAD"),
+        dirty=bool(git(project, "status", "--porcelain=v1")),
+        measured_at=time.time(),
+    )
+
+
+class InventoryCache:
+    """Asynchronous build inventory cache; IRC requests only read snapshots."""
+
+    def __init__(self, projects: list[Project]) -> None:
+        self._projects = {p.key: p for p in projects}
+        self._items: dict[str, BuildInventory] = {}
+        self._queued: set[str] = set()
+        self._lock = threading.Lock()
+        self._requests: Queue[str] = Queue()
+        self._started = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+        threading.Thread(target=self._worker, name="announce-inventory", daemon=True).start()
+        for project in self._projects.values():
+            self.request(project)
+
+    def request(self, project: Project) -> None:
+        with self._lock:
+            if project.key in self._queued:
+                return
+            self._queued.add(project.key)
+        self._requests.put(project.key)
+
+    def get(self, project: Project) -> BuildInventory:
+        with self._lock:
+            return self._items.get(project.key, BuildInventory())
+
+    def _worker(self) -> None:
+        while True:
+            try:
+                key = self._requests.get(timeout=60.0)
+            except Empty:
+                # A periodic refresh makes a long-lived bot truthful even when
+                # no commit watcher event arrives (for example after a rebase).
+                for project in self._projects.values():
+                    self.request(project)
+                continue
+            project = self._projects[key]
+            try:
+                item = collect_inventory(project)
+            except Exception:
+                log.exception("inventory refresh failed for %s", key)
+                item = BuildInventory()
+            with self._lock:
+                self._items[key] = item
+                self._queued.discard(key)
+
+
+INVENTORY = InventoryCache(PROJECTS)
+
+
 def module_count(project: Project) -> str:
-    """Count source modules/components for this project, excluding build output."""
-    return _shell_count(project.module_cmd, timeout=3.0)
+    return INVENTORY.get(project).modules
 
 
 def loc_count(project: Project) -> str:
-    """LOC estimate — hard-timeout so announce path cannot hang the IRC loop."""
-    out = _shell_count(project.loc_cmd, timeout=3.0)
-    if out == "?":
-        return "?"
-    try:
-        n = int(out)
-        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
-    except ValueError:
-        return out
+    return INVENTORY.get(project).loc
 
 
 def test_count(project: Project) -> str:
-    """Best-effort '<n> tests' pulled from recent commit messages (git-only, fast)."""
-    body = git(project, "log", "-1", "--format=%s") + " " + git(project, "log", "-1", "--format=%b")
-    m = re.search(r"(\d+)\s+tests?\s+(?:pass|green|passing)", body)
-    if m:
-        return m.group(1)
-    for s in git(project, "log", "-15", "--format=%s%n%b").splitlines():
-        m = re.search(r"(\d+)\s+tests", s)
-        if m:
-            return m.group(1)
-    # Do NOT fall back to a tree-walk test-file count on the announce path —
-    # that blocked the IRC loop (no PING reply → disconnect → outq wiped).
-    return "?"
+    return INVENTORY.get(project).test_blocks
+
+
+def inventory_status(project: Project) -> str:
+    """Human-readable freshness/provenance, without claiming a suite passed."""
+    item = INVENTORY.get(project)
+    if item.measured_at == 0:
+        return "inventory pending"
+    current = git(project, "rev-parse", "HEAD")
+    if item.head != current:
+        return "inventory refreshing"
+    age = max(0, int(time.time() - item.measured_at))
+    state = "dirty" if item.dirty else "clean"
+    return f"{state}, measured {age}s ago"
+
+
+def inventory_label(project: Project) -> str:
+    """The current static inventory, or an explicit refresh state."""
+    if inventory_status(project) in {"inventory pending", "inventory refreshing"}:
+        return "inventory updating"
+    return f"{test_count(project)} {project.test_label}"
 
 
 def head_line(project: Project) -> str:
@@ -353,12 +466,12 @@ def uptime() -> str:
 
 
 def stats_lines(project: Project) -> list[str]:
+    item = INVENTORY.get(project)
     return [
         f"{B}{CYAN}[{project.key}]{RST} build :: {project.module_label}="
-        f"{GREEN}{module_count(project)}{RST} tests={GREEN}{test_count(project)}{RST} "
-        f"loc={GREEN}{loc_count(project)}{RST} "
-        f"commits={GREEN}{git(project,'rev-list','--count','HEAD')}{RST} {project.stats_suffix}",
-        f"{GREY}[{project.key}] HEAD{RST} {head_line(project)}  {GREY}({commit_stat(project)}){RST}",
+        f"{GREEN}{item.modules}{RST} {project.test_label.replace(' ', '-')}={GREEN}{item.test_blocks}{RST} "
+        f"loc={GREEN}{item.loc}{RST} commits={GREEN}{item.commits}{RST} {project.stats_suffix}",
+        f"{GREY}[{project.key}] HEAD{RST} {head_line(project)} {GREY}({commit_stat(project)}; {inventory_status(project)}){RST}",
     ]
 
 
@@ -451,6 +564,9 @@ def topic_change_protected(line: str) -> bool:
 
 class Bot:
     def __init__(self) -> None:
+        # All source-tree inspection happens on this daemon worker, never in the
+        # socket loop. A slow disk or a large repository must not cost PONGs.
+        INVENTORY.start()
         self.sock: socket.socket | None = None
         self.nick = NICK
         # Per-project state: last-seen HEAD and last-announced test count.
@@ -458,6 +574,7 @@ class Bot:
         self.last_tests: dict[str, int] = {p.key: -1 for p in PROJECTS}
         self.last_beat = time.time()
         self.last_poll = 0.0
+        self.last_topic = ""
         self.outq: deque[str] = deque()
         self.last_send = 0.0
         self.caps: set[str] = set()
@@ -585,6 +702,7 @@ class Bot:
         self.sasl_active = False
         self.registered = False
         self.outq.clear()
+        self.last_topic = ""
         log.info("connecting to %s:%d as %s", SERVER, PORT, self.nick)
         log.info(
             "watching %d project(s): %s",
@@ -648,6 +766,7 @@ class Bot:
                 self.last_beat = now
                 for p in PROJECTS:
                     self.announce(stats_lines(p))
+                self.set_topic()
 
             # Throttled git HEAD watcher, per project (was previously polled every
             # loop tick, and only for a single repo).
@@ -655,6 +774,10 @@ class Bot:
                 self.last_poll = now
                 for p in PROJECTS:
                     self.poll_project(p)
+                # Inventory refreshes finish independently of git polling. This
+                # only writes when the rendered topic actually changed, so it
+                # promptly replaces an initial "pending" count without flooding.
+                self.set_topic()
 
     def poll_project(self, p: Project) -> None:
         if not os.path.isdir(p.repo):
@@ -673,7 +796,11 @@ class Bot:
         if not revs:
             revs = [cur]  # history diverged (rebase/reset): show the tip
         self.last_commit[p.key] = cur
-        tc = test_count(p)
+        # The new revision invalidates the static inventory. Do not hold the IRC
+        # loop while recounting it; commit cards show the last measured inventory
+        # only when it is current, otherwise they say it is refreshing.
+        INVENTORY.request(p)
+        tc = test_count(p) if inventory_status(p) not in {"inventory pending", "inventory refreshing"} else "updating"
         shown = revs[-5:]  # cap the burst; summarize the rest
         if len(revs) > len(shown):
             self.channel_notice(
@@ -745,7 +872,7 @@ class Bot:
         """Rich colorized multi-line commit announce — git-only (no tree-walks).
 
         Line 1: project · type · hash · subject
-        Line 2: author · when · diffstat · tests · commit #
+        Line 2: author · when · diffstat · static test inventory · commit #
         Line 3+: body explanation (why / what), then optional files
         """
         subj = commit_field(p, "%s", rev) or "(no subject)"
@@ -773,10 +900,11 @@ class Bot:
             f"{proj} {accent}{B}▌{RST}{glyph} {B}{accent}{short}{RST} "
             f"{type_chip} {WHITE}{B}{clean}{RST}"
         ]
-        # Meta — who / when / size / tests
+        # Meta — who / when / size / static inventory. This is intentionally
+        # not described as a passing test result: no test command ran here.
         lines.append(
             f"{proj} {GREY}by{RST} {TEAL}{author}{RST} {GREY}·{RST} {SILVER}{when}{RST} "
-            f"{GREY}·{RST} {stat} {GREY}· tests{RST} {B}{GREEN}{tc}{RST}{delta} "
+            f"{GREY}·{RST} {stat} {GREY}· test blocks{RST} {B}{GREEN}{tc}{RST}{delta} "
             f"{GREY}· #{total}{RST}"
         )
         # Explanation — body of the commit message (why / details)
@@ -825,13 +953,16 @@ class Bot:
         # clobbering (see send_raw / topic_change_protected); it must not
         # block the bot's own automated status-topic refresh, which is the
         # only topic writer for CHANNEL. Send as trusted.
-        # Keep this git-only + fast — never tree-walk on the IRC hot path.
+        # Read the async inventory cache only — never tree-walk on the IRC hot path.
         segments = [
-            f"{p.topic_label} · {git(p, 'rev-parse', '--short', 'HEAD')} · "
-            f"{test_count(p)} tests"
+            f"{p.topic_label} · {git(p, 'rev-parse', '--short', 'HEAD')} · {inventory_label(p)}"
             for p in PROJECTS
         ]
-        self.send_raw(f"TOPIC {CHANNEL} :" + "  ❘  ".join(segments) + "  ❘  !help", trusted=True)
+        topic = "  ❘  ".join(segments) + "  ❘  !help"
+        if topic == self.last_topic:
+            return
+        self.send_raw(f"TOPIC {CHANNEL} :{topic}", trusted=True)
+        self.last_topic = topic
 
     # ---- protocol ----
     def handle(self, line: str, joined: bool) -> bool:
@@ -996,7 +1127,11 @@ class Bot:
                 self.announce(stats_lines(p), reply)
         elif cmd == "tests":
             for p in projects:
-                self.msg(reply, f"[{p.key}] tests: {GREEN}{test_count(p)}{RST} passing")
+                self.msg(
+                    reply,
+                    f"[{p.key}] static test inventory: {GREEN}{test_count(p)}{RST} "
+                    f"{p.test_label} ({inventory_status(p)}; not a test run)",
+                )
         elif cmd in ("modules", "components"):
             for p in projects:
                 self.msg(
