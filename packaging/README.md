@@ -1,6 +1,6 @@
-# Orochi — self-host quickstart & reproducible releases
+# Onyx Server — self-host quickstart & reproducible releases
 
-Orochi is a single, static, **zero-external-dependency** binary. There is no
+Onyx Server is a single, static, **zero-external-dependency** binary. There is no
 database server to run, no OpenSSL to patch, no runtime to install — it ships
 its own TLS 1.3 stack, its own mesh, and its own services. This directory holds
 everything to run it and to prove the binary you run is the one from source.
@@ -68,7 +68,7 @@ version).
 its build times *and* its source `ref` to the commit (not the wall clock or the
 local branch), so re-running `release.sh` on the same commit with the same `zig`
 reproduces every file — binary, SBOM, provenance, and `SHA256SUMS` — bit-for-bit.
-(Reproducible builds always require a fixed toolchain; Orochi's is pinned in
+(Reproducible builds always require a fixed toolchain; Onyx Server's is pinned in
 `build.zig.zon`'s `minimum_zig_version`.) Only `git`, `zig`, and `sha256sum` are
 required; `cosign` and `jq` are optional and degrade to a note when absent.
 

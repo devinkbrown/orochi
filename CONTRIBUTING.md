@@ -1,10 +1,10 @@
-# Contributing to Orochi
+# Contributing to Onyx Server
 
-Orochi is a clean-room, Zig-native IRC daemon. Contributions are welcome, but the bar
+Onyx Server is a clean-room, Zig-native IRC daemon. Contributions are welcome, but the bar
 is intentionally high: changes should keep the daemon source-backed, tested, and
 operationally understandable.
 
-Orochi is licensed under **AGPL-3.0-or-later**. By contributing, you agree that your
+Onyx Server is licensed under **AGPL-3.0-or-later**. By contributing, you agree that your
 contributions are licensed under the same terms; see [LICENSE](LICENSE).
 
 ## Prerequisites
@@ -146,7 +146,7 @@ the change is intentionally a broad synchronization pass.
 
 Open a GitHub issue with:
 
-- Orochi commit hash or VERSION output.
+- Onyx Server commit hash or VERSION output.
 - Zig version.
 - Redacted config.
 - Reproduction steps.
