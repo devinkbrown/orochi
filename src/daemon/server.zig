@@ -44570,10 +44570,7 @@ pub const LinuxServer = struct {
                     } else null;
                     var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
                     defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
-                    // Local-first: a transient durable-admit miss must not drop
-                    // sender-session mirrors or block legacy mesh relay. Fall
-                    // through with accepted_v2=null so relayLegacyToPeers still
-                    // runs; FAIL would hide a reachable remote under mesh stress.
+                    // Fail closed: durable admit required when authoring active.
                     if (recipient_token != null and self.authoredRelayV2Configured()) {
                         accepted_v2 = self.admitAuthoredRelayV2(
                             if (is_notice) .notice else .privmsg,
@@ -44592,16 +44589,14 @@ pub const LinuxServer = struct {
                             event_hlc,
                             null,
                             .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-                        ) catch |err| blk: {
-                            var admit_log_buf: [192]u8 = undefined;
-                            const admit_log = std.fmt.bufPrint(
-                                &admit_log_buf,
-                                "direct durable admit failed ({s}); local/legacy continues",
-                                .{@errorName(err)},
-                            ) catch "direct durable admit failed; local/legacy continues";
-                            self.traceLog(.warn, .s2s, admit_log);
-                            break :blk null;
+                        ) catch {
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                            return;
                         };
+                        if (accepted_v2 == null) {
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                            return;
+                        }
                         if (accepted_v2) |accepted| {
                             message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
                         }
@@ -44812,10 +44807,7 @@ pub const LinuxServer = struct {
                 } else null
             else
                 null;
-            // Local-first DM: durable admit is best-effort. Local recipient
-            // attachments still receive the line under ordinary / mesh_busy_local
-            // delivery when mesh authority is busy; FAIL would make clients retry
-            // into a recipient that already saw the message.
+            // Fail closed on durable DM admit — same contract as channel.
             accepted_direct_v2 = self.admitAuthoredRelayV2(
                 if (is_notice) .notice else .privmsg,
                 target,
@@ -44833,15 +44825,9 @@ pub const LinuxServer = struct {
                 event_hlc,
                 history_plan,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-            ) catch |err| blk: {
-                var admit_log_buf: [192]u8 = undefined;
-                const admit_log = std.fmt.bufPrint(
-                    &admit_log_buf,
-                    "direct durable admit failed ({s}); local delivery continues",
-                    .{@errorName(err)},
-                ) catch "direct durable admit failed; local delivery continues";
-                self.traceLog(.warn, .s2s, admit_log);
-                break :blk null;
+            ) catch {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                return;
             };
             if (accepted_direct_v2) |accepted| {
                 message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
@@ -44849,6 +44835,9 @@ pub const LinuxServer = struct {
                     self.search_index.index(message_id, text) catch {};
                     self.chanstatsMessage(key, authored_prefix, command, text);
                 }
+            } else {
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                return;
             }
         }
         const direct_delivery_mode: TaggedDeliveryMode = if (accepted_direct_v2) |accepted|
