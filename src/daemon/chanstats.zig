@@ -308,6 +308,24 @@ pub const ChanStats = struct {
         const agg = self.channel(chan, now_ms) orelse return;
         agg.last_active = now_ms;
         agg.topic_changes += 1;
+        self.appendTopic(agg, setter, topic, now_ms);
+    }
+
+    /// Bring an already-tracked channel's current topic into line with the
+    /// authoritative World state. This is deliberately not an event: it must
+    /// not manufacture a topic-change count or move last_activity merely
+    /// because a periodic stats flush repaired an older snapshot.
+    pub fn syncTopic(self: *ChanStats, chan: []const u8, setter: []const u8, topic: []const u8, now_ms: i64) void {
+        const entry = self.channels.getEntry(chan) orelse return;
+        const agg = entry.value_ptr.*;
+        if (agg.topics.items.len != 0) {
+            const current = agg.topics.items[agg.topics.items.len - 1];
+            if (std.mem.eql(u8, current.setter, setter) and std.mem.eql(u8, current.topic, topic)) return;
+        }
+        self.appendTopic(agg, setter, topic, now_ms);
+    }
+
+    fn appendTopic(self: *ChanStats, agg: *ChannelAgg, setter: []const u8, topic: []const u8, now_ms: i64) void {
         const s = self.allocator.dupe(u8, setter) catch return;
         const t = self.allocator.dupe(u8, clampLen(topic, 400)) catch {
             self.allocator.free(s);
@@ -1101,6 +1119,24 @@ test "records membership events and topic history" {
     try std.testing.expectEqual(@as(u64, 1), agg.topic_changes);
     try std.testing.expectEqual(@as(usize, 1), agg.topics.items.len);
     try std.testing.expectEqualStrings("the new topic", agg.topics.items[0].topic);
+}
+
+test "syncTopic repairs a tracked current topic without inventing an event" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const ts: i64 = 1_700_000_000_000;
+    s.recordMessage("#root", "kain", "existing activity", ts);
+    s.recordTopic("#root", "kain", "#root :stale wire payload", ts);
+    s.syncTopic("#root", "kain", "current topic", ts + 1);
+
+    const agg = s.channels.get("#root").?;
+    try std.testing.expectEqual(@as(u64, 1), agg.topic_changes);
+    try std.testing.expectEqual(@as(usize, 2), agg.topics.items.len);
+    try std.testing.expectEqualStrings("current topic", agg.topics.items[1].topic);
+    try std.testing.expectEqual(ts, agg.last_active);
+
+    s.syncTopic("#untracked", "kain", "must not create a channel", ts + 2);
+    try std.testing.expect(s.channels.get("#untracked") == null);
 }
 
 test "writeJson prunes channels that no longer exist (unregistered + empty)" {
